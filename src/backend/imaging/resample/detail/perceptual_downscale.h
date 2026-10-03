@@ -19,23 +19,25 @@ public:
  [[nodiscard]] std::size_t retained_bytes() const noexcept;
  void run(RgbConstImageView source, RgbMutableImageView destination);
  void run_quantized_planar(RgbConstImageView source, RgbMutableImageView destination);
+ void run_selected(RgbConstImageView, RgbMutableImageView, RgbResizePath, bool quantized_planar = false, RgbResizeWork* observed = nullptr);
 
 private:
  friend struct CpuDownscalerTestAccess;
+ static void quantize_block(const TransferTable&, const float*, std::uint8_t*);
  // Owner-local, one-shot preparation seam; never exposed by the public
  // resizer or consulted during pixel execution.
  enum class PreparationStep : std::uint8_t { None, HorizontalAxis, VerticalAxis, FirstMoment, SecondMoment, FirstCoefficient, SecondCoefficient, FirstAlpha, SecondAlpha };
  PreparationStep fail_before_ = PreparationStep::None;
  void preparation_checkpoint(PreparationStep step);
- void prepare(const RgbImageLayout& source, const RgbImageLayout& destination);
+ void prepare(const RgbImageLayout& source, const RgbImageLayout& destination, RgbResizeWork* observed);
  template <RgbPixelFormat Format, bool Integer, bool QuantizedPlanar = false>
  void execute(RgbConstImageView source, RgbMutableImageView destination);
  TransferTable transfer_;
  bool prepared_ = false;
  std::uint32_t source_width_ = 0, source_height_ = 0, width_ = 0, height_ = 0;
  mmltk::common::types::WorkspaceBuffer<Footprint> x_, y_;
- std::array<mmltk::common::types::WorkspaceBuffer<Moment>, 2> moments_;
- std::array<mmltk::common::types::WorkspaceBuffer<Coefficient>, 2> coefficients_;
+ std::array<mmltk::common::types::WorkspaceBuffer<float>, 2> moments_;
+ std::array<mmltk::common::types::WorkspaceBuffer<float>, 2> coefficients_;
  std::array<mmltk::common::types::WorkspaceBuffer<float>, 2> alpha_;
 };
 }  // namespace mmltk::backend::imaging::resample::perceptual

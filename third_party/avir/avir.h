@@ -57,6 +57,8 @@
 #include <limits>
 #include <new>
 #include <utility>
+#include <stdexcept>
+#include <algorithm>
 
 #if __cplusplus >= 201103L
 
@@ -110,6 +112,23 @@ inline size_t workspaceSizeClass(size_t bytes) {
  }
  return value;
 }
+// Layout and execution follow the same buffer reservations. Payloads are never
+// materialized for layout inspection, and no coefficients are constructed.
+class CWorkspaceLayout final : public CWorkspaceAllocator {
+ size_t* Requests;
+ public:
+ explicit CWorkspaceLayout(size_t* requests) : Requests(requests) {}
+ size_t Bytes = 0;
+ char* acquire(size_t bytes, bool payload) override {
+  if (bytes > std::numeric_limits<size_t>::max() - 63) throw std::bad_alloc();
+  const size_t extent = (bytes + 63) / 64 * 64;
+  if (extent > std::numeric_limits<size_t>::max() - Bytes) throw std::bad_alloc();
+  Bytes += extent;
+  if (Requests) ++*Requests;
+  return payload ? nullptr : new char[bytes];
+ }
+ void release(char* data, size_t) override { delete[] data; }
+};
 class CThreadLocalBufferCache {
    public:
     ~CThreadLocalBufferCache() {
@@ -728,7 +747,7 @@ class CDSPWindowGenPeakedCosine {
 class CDSPFIREQ {
    public:
     void init(const double SampleRate, const double aFilterLength, const int aBandCount, const double MinFreq,
-              const double MaxFreq, const bool IsLogBands, const double WFAlpha) {
+              const double MaxFreq, const bool IsLogBands, const double WFAlpha, const bool LayoutOnly = false) {
         FilterLength = aFilterLength;
         BandCount = aBandCount;
 
@@ -739,15 +758,16 @@ class CDSPFIREQ {
         z2 = z * 2;
 
         CBuffer<double> oscbuf(z2);
-        initOscBuf(oscbuf);
+        if (!LayoutOnly) initOscBuf(oscbuf);
 
         CBuffer<double> winbuf(z);
-        initWinBuf(winbuf, WFAlpha);
+        if (!LayoutOnly) initWinBuf(winbuf, WFAlpha);
 
         UseFirstVirtBand = (MinFreq > 0.0);
         const int k = zi * (BandCount + (UseFirstVirtBand ? 1 : 0));
         Kernels1.alloc(k);
         Kernels2.alloc(k);
+        if (LayoutOnly) return;
 
         double m;
         double mo;
@@ -1028,9 +1048,10 @@ class CDSPFracFilterBankLin {
     AVIR_NOCTOR(CDSPFracFilterBankLin)
 
    public:
-    CDSPFracFilterBankLin() : Order(-1) {}
+    CDSPFracFilterBankLin() : Order(-1), LayoutOnly(false) {}
 
     void copyInitParams(const CDSPFracFilterBankLin& s) {
+        LayoutOnly = s.LayoutOnly;
         WFLen2 = s.WFLen2;
         WFFreq = s.WFFreq;
         WFAlpha = s.WFAlpha;
@@ -1057,7 +1078,8 @@ class CDSPFracFilterBankLin {
 
     void init(const int ReqFracCount, const int ReqOrder, const double BaseLen, const double Cutoff,
               const double aWFAlpha, const CFltBuffer& aExtFilter, const int aAlignment = 0,
-              const int FltLenAlign = 1) {
+              const int FltLenAlign = 1, const bool aLayoutOnly = false) {
+        LayoutOnly = aLayoutOnly;
         double NewWFLen2 = 0.5 * BaseLen * ReqFracCount;
         double NewWFFreq = AVIR_PI * Cutoff / ReqFracCount;
         double NewWFAlpha = aWFAlpha;
@@ -1117,6 +1139,7 @@ class CDSPFracFilterBankLin {
 
             if (Order > 0) {
                 createFilter(i + 1);
+                if (LayoutOnly) return Res;
                 const fptype* const Res2 = Res + FilterSize;
                 fptype* const op = Res + FilterLen;
                 int j;
@@ -1185,6 +1208,7 @@ class CDSPFracFilterBankLin {
     CFltBuffer ExtFilter;
     CBuffer<double> SrcTable;
     bool IsSrcTableBuilt;
+    bool LayoutOnly;
 
     void buildSrcTable() {
         IsSrcTableBuilt = true;
@@ -1197,11 +1221,11 @@ class CDSPFracFilterBankLin {
         const int BufCenter = SrcFilterLen * FracCount / 2 + BufOffs;
 
         CBuffer<double> Buf(BufLen);
-        memset(Buf, 0, (size_t)(BufCenter - p.fl2) * sizeof(double));
+        if (!LayoutOnly) memset(Buf, 0, (size_t)(BufCenter - p.fl2) * sizeof(double));
         int i = BufLen - BufCenter - p.fl2 - 1;
-        memset(&Buf[BufLen - i], 0, (size_t)i * sizeof(double));
+        if (!LayoutOnly) memset(&Buf[BufLen - i], 0, (size_t)i * sizeof(double));
 
-        p.generateLPF(&Buf[BufCenter - p.fl2], 0.0);
+        if (!LayoutOnly) p.generateLPF(&Buf[BufCenter - p.fl2], 0.0);
 
         SrcTable.alloc((FracCount + 1) * SrcFilterLen);
         TableFillFlags.alloc(FracCount + 1);
@@ -1210,6 +1234,7 @@ class CDSPFracFilterBankLin {
 
         for (i = FracCount; i >= 0; i--) {
             TableFillFlags[i] = 0;
+            if (LayoutOnly) continue;
             double* ip = Buf + BufOffs + i;
 
             for (j = 0; j < SrcFilterLen; j++) {
@@ -1230,6 +1255,7 @@ class CDSPFracFilterBankLin {
         }
 
         TableFillFlags[n] |= 1;
+        if (LayoutOnly) return;
         const int ExtFilterLatency = ExtFilter.getCapacity() / 2;
         const int ResLatency = ExtFilterLatency + SrcFilterLen / 2;
         int ResLen = SrcFilterLen;
@@ -2257,8 +2283,8 @@ class CImageResizer {
 
    public:
     CImageResizer(const int aResBitDepth = 8, const int aSrcBitDepth = 0,
-                  const CImageResizerParams& aParams = CImageResizerParamsDef())
-        : Params(aParams), ResBitDepth(aResBitDepth) {
+                  const CImageResizerParams& aParams = CImageResizerParamsDef(), const bool aLayoutOnly = false)
+        : Params(aParams), ResBitDepth(aResBitDepth), LayoutOnly(aLayoutOnly) {
         SrcBitDepth = (aSrcBitDepth == 0 ? ResBitDepth : aSrcBitDepth);
 
         initFilterBank(FixedFilterBank, 1.0, false, CFltBuffer());
@@ -2266,9 +2292,28 @@ class CImageResizer {
     }
 
     template <typename Tin, typename Tout>
+    static size_t workspaceBytes(const int SrcWidth, const int SrcHeight,
+                                 const int NewWidth, const int NewHeight, const int ElCountIO, size_t* const AllocationRequests = nullptr) {
+        if (SrcWidth <= 0 || SrcHeight <= 0 || NewWidth <= 0 || NewHeight <= 0 || ElCountIO <= 0)
+            throw std::invalid_argument("AVIR dimensions and channels must be positive");
+        // Scanline intermediates use signed int lengths, including doubled
+        // source spans and filter borders. Check before any library arithmetic.
+        const size_t limit = (size_t)std::numeric_limits<int>::max();
+        const size_t longest = (size_t)std::max(std::max(SrcWidth, SrcHeight), std::max(NewWidth, NewHeight));
+        if ((size_t)ElCountIO > limit / 65536 || longest > (limit / (size_t)ElCountIO - 65536) / 4)
+            throw std::length_error("AVIR scanline extent overflow");
+        detail::CWorkspaceLayout layout(AllocationRequests);
+        detail::CWorkspaceScope scope(layout);
+        CImageResizer resizer(8, 0, CImageResizerParamsDef(), true);
+        resizer.resizeImage(static_cast<const Tin*>(nullptr), SrcWidth, SrcHeight, 0,
+                            static_cast<Tout*>(nullptr), NewWidth, NewHeight, ElCountIO, 0.0);
+        return layout.Bytes;
+    }
+
+    template <typename Tin, typename Tout>
     void resizeImage(const Tin* const SrcBuf, const int SrcWidth, const int SrcHeight, int SrcScanlineSize,
                      Tout* const NewBuf, const int NewWidth, const int NewHeight, const int ElCountIO, const double k,
-                     CImageResizerVars* const aVars = nullptr, const bool PrepareOnly = false) const {
+                     CImageResizerVars* const aVars = nullptr) const {
         if (SrcWidth == 0 || SrcHeight == 0) {
             memset(NewBuf, 0, (size_t)NewWidth * (size_t)NewHeight * sizeof(Tout));
 
@@ -2392,7 +2437,7 @@ class CImageResizer {
 
         // Runs all queued scanline workloads across the pool and this thread.
         const auto runWorkloads = [&]() {
-            if (PrepareOnly) return;
+            if (LayoutOnly) return;
             ThreadPool.startAllWorkloads();
             td[0].processScanlineQueue();
             ThreadPool.waitAllWorkloadsToFinish();
@@ -2400,7 +2445,7 @@ class CImageResizer {
 
         CBuffer<fptype, size_t> FltBuf((size_t)NewWidthE * (size_t)SrcHeight, fpclass ::fpalign, true);
 
-        for (i = 0; !PrepareOnly && i < SrcHeight; i++) {
+        for (i = 0; !LayoutOnly && i < SrcHeight; i++) {
             td[i % ThreadCount].addScanlineToQueue((void*)&SrcBuf[(size_t)i * (size_t)SrcScanlineSize],
                                                    &FltBuf[(size_t)i * (size_t)NewWidthE]);
         }
@@ -2436,7 +2481,7 @@ class CImageResizer {
                 td[i].initScanlineQueue(td[i].sopResizeV, NewWidth, SrcHeight, NewWidthE, NewWidthE);
             }
 
-            for (i = 0; !PrepareOnly && i < NewWidth; i++) {
+            for (i = 0; !LayoutOnly && i < NewWidth; i++) {
                 td[i % ThreadCount].addScanlineToQueue(&FltBuf[i * ElCount], (fptype*)&NewBuf[i * ElCount]);
             }
 
@@ -2454,7 +2499,7 @@ class CImageResizer {
 
         const int im = (fpclass ::packmode == 0 ? ElCount : 1);
 
-        for (i = 0; !PrepareOnly && i < NewWidth; i++) {
+        for (i = 0; !LayoutOnly && i < NewWidth; i++) {
             td[i % ThreadCount].addScanlineToQueue(&FltBuf[i * im], &ResBuf[i * im]);
         }
 
@@ -2467,7 +2512,7 @@ class CImageResizer {
                 td[i].initScanlineQueue(sop, NewHeight, NewWidth);
             }
 
-            for (i = 0; !PrepareOnly && i < NewHeight; i++) {
+            for (i = 0; !LayoutOnly && i < NewHeight; i++) {
                 td[i % ThreadCount].addScanlineToQueue(&ResBuf[(size_t)i * (size_t)NewWidthE],
                                                        &NewBuf[(size_t)i * (size_t)(NewWidth * ElCountIO)]);
             }
@@ -2499,7 +2544,7 @@ class CImageResizer {
         if (CDitherer ::isRecursive()) {
             td[0].getDitherer().init(NewWidth, Vars, TrMul, PkOut);
 
-            for (i = 0; !PrepareOnly && i < NewHeight; i++) {
+            for (i = 0; !LayoutOnly && i < NewHeight; i++) {
                 fptype* const ResScanline = &ResBuf[(size_t)i * (size_t)NewWidthE];
 
                 if (Vars.UseSRGBGamma) {
@@ -2529,6 +2574,7 @@ class CImageResizer {
     CImageResizerParams Params;
     int SrcBitDepth;
     int ResBitDepth;
+    bool LayoutOnly;
     CDSPFracFilterBankLin<fptype> FixedFilterBank;
 
     typedef CStructArray<CFilterStep> CFilterSteps;
@@ -2554,7 +2600,7 @@ class CImageResizer {
         }
 
         FltBank.init(FracCount, UseOrder, Params.IntFltLen / CutoffMult, Params.IntFltCutoff * CutoffMult,
-                     Params.IntFltAlpha, ExtFilter, fpclass ::fpalign, fpclass ::elalign);
+                     Params.IntFltAlpha, ExtFilter, fpclass ::fpalign, fpclass ::elalign, LayoutOnly);
     }
 
     static void allocFilter(CBuffer<fptype>& Flt, const int ReqCapacity, const bool IsModel = false,
@@ -2628,10 +2674,10 @@ class CImageResizer {
         } else {
             fs.FltOrig.alloc(w.FilterLen);
 
-            w.generateLPF(&fs.FltOrig[0], fs.DCGain);
+            if (!LayoutOnly) w.generateLPF(&fs.FltOrig[0], fs.DCGain);
 
             allocFilter(fs.Flt, fs.FltOrig.getCapacity(), false, &FltExt);
-            copyArray(&fs.FltOrig[0], &fs.Flt[0], fs.FltOrig.getCapacity());
+            if (!LayoutOnly) copyArray(&fs.FltOrig[0], &fs.Flt[0], fs.FltOrig.getCapacity());
 
             if (!UseFltOrig) {
                 fs.FltOrig.free();
@@ -2644,7 +2690,7 @@ class CImageResizer {
             allocFilter(fs.PrefixDC, l, IsModel);
             allocFilter(fs.SuffixDC, fs.FltLatency, IsModel);
 
-            if (IsModel) {
+            if (IsModel || LayoutOnly) {
                 return;
             }
 
@@ -2740,7 +2786,7 @@ class CImageResizer {
 
             const double thm = AVIR_PI * bw / (curbw * BinCount1);
 
-            for (j = 0; j < BinCount; j++) {
+            for (j = 0; !LayoutOnly && j < BinCount; j++) {
                 calcFIRFilterResponse(Flt, FltLen, j * thm, re, im);
 
                 Bins[j] *= fs.DCGain / sqrt(re * re + im * im);
@@ -2757,22 +2803,22 @@ class CImageResizer {
     // Designs an FIR filter for the given band gains, normalizes it, and
     // stores it (with its latency) on a filter step. Shared by the correction
     // and sharpen filter builders.
-    static void buildFIREQFilter(const double bw, const double FltLen, const int BinCount, const double alpha,
-                                 const double* const Bins, int& FltLatency, CBuffer<fptype>& Flt) {
+    void buildFIREQFilter(const double bw, const double FltLen, const int BinCount, const double alpha,
+                                 const double* const Bins, int& FltLatency, CBuffer<fptype>& Flt) const {
         CDSPFIREQ EQ;
-        EQ.init(bw * 2.0, FltLen, BinCount, 0.0, bw, false, alpha);
+        EQ.init(bw * 2.0, FltLen, BinCount, 0.0, bw, false, alpha, LayoutOnly);
 
         FltLatency = EQ.getFilterLatency();
 
         CBuffer<double> Filter(EQ.getFilterLength());
-        EQ.buildFilter(Bins, &Filter[0]);
-        normalizeFIRFilter(&Filter[0], Filter.getCapacity(), 1.0);
+        if (!LayoutOnly) EQ.buildFilter(Bins, &Filter[0]);
+        if (!LayoutOnly) normalizeFIRFilter(&Filter[0], Filter.getCapacity(), 1.0);
 
         allocFilter(Flt, Filter.getCapacity());
-        copyArray(&Filter[0], &Flt[0], Filter.getCapacity());
+        if (!LayoutOnly) copyArray(&Filter[0], &Flt[0], Filter.getCapacity());
     }
 
-    static void addSharpenTest(CFilterSteps& Steps, const double bw, const bool IsModel) {
+    void addSharpenTest(CFilterSteps& Steps, const double bw, const bool IsModel) const {
         if (bw <= 1.0) {
             return;
         }
@@ -2821,7 +2867,7 @@ class CImageResizer {
                           const int SrcLen, const int NewLen, const int ComplLen, const int BuildModeCount) const {
         CImageResizerVars TmpVars(Vars0);
         int BestMode = 1;
-        int BestScore = 0x7FFFFFFF;
+        std::int64_t BestScore = std::numeric_limits<std::int64_t>::max();
         int m;
 
         for (m = 0; m < BuildModeCount; m++) {
@@ -2838,7 +2884,7 @@ class CImageResizer {
             updateFilterStepBuffers(TmpSteps, TmpVars, RPosBufArray, SrcLen, NewLen);
 
             fillUsedFracMap(TmpSteps[TmpVars.ResizeStep], UsedFracMap);
-            const int c = calcComplexity(TmpSteps, TmpVars, UsedFracMap, ComplLen);
+            const std::int64_t c = calcComplexity(TmpSteps, TmpVars, UsedFracMap, ComplLen);
 
             if (c < BestScore) {
                 BestMode = m;
@@ -3189,6 +3235,7 @@ class CImageResizer {
     }
 
     void modifyCorrFilterDCGain(CFilterSteps& Steps, const double m) const {
+        if (LayoutOnly) return;
         CBuffer<fptype>* Flt;
         const int z = Steps.getItemCount() - 1;
 
@@ -3219,7 +3266,7 @@ class CImageResizer {
         }
     }
 
-    static int calcComplexity(const CFilterSteps& Steps, const CImageResizerVars& Vars,
+    static std::int64_t calcComplexity(const CFilterSteps& Steps, const CImageResizerVars& Vars,
                               const CBuffer<char>& UsedFracMap, const int ScanlineCount) {
         int fcnum;
         int fcdenom;
@@ -3232,25 +3279,25 @@ class CImageResizer {
             fcdenom = 4;
         }
 
-        int s = 0;
-        int s2 = 0;
+        std::int64_t s = 0;
+        std::int64_t s2 = 0;
         int i;
 
         for (i = 0; i < Steps.getItemCount(); i++) {
             const CFilterStep& fs = Steps[i];
 
-            s2 += 65 * fs.Flt.getCapacity();
+            s2 += std::int64_t(65) * fs.Flt.getCapacity();
 
             if (fs.IsUpsample) {
                 if (fs.FltOrig.getCapacity() > 0) {
                     continue;
                 }
 
-                s += (fs.Flt.getCapacity() * (fs.InPrefix + fs.InLen + fs.InSuffix) + fs.SuffixDC.getCapacity() +
+                s += (std::int64_t(fs.Flt.getCapacity()) * (fs.InPrefix + fs.InLen + fs.InSuffix) + fs.SuffixDC.getCapacity() +
                       fs.PrefixDC.getCapacity()) *
                      Vars.ElCount;
             } else if (fs.ResampleFactor == 0) {
-                s += fs.FltBank->getFilterLen() * (fs.FltBank->getOrder() + Vars.ElCount) * fs.OutLen;
+                s += std::int64_t(fs.FltBank->getFilterLen()) * (fs.FltBank->getOrder() + Vars.ElCount) * fs.OutLen;
 
                 if (i == Vars.ResizeStep && Vars.IsResize2) {
                     s >>= 1;
@@ -3258,7 +3305,7 @@ class CImageResizer {
 
                 s2 += fs.FltBank->calcInitComplexity(UsedFracMap);
             } else {
-                s += fs.Flt.getCapacity() * Vars.ElCount * fs.OutLen * fcnum / fcdenom;
+                s += std::int64_t(fs.Flt.getCapacity()) * Vars.ElCount * fs.OutLen * fcnum / fcdenom;
             }
         }
 

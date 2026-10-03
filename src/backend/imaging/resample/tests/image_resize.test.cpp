@@ -22,10 +22,38 @@ namespace mmltk::backend::imaging::resample::perceptual {
 struct CpuDownscalerTestAccess {
  using Step = CpuDownscaler::PreparationStep;
  using Storage = std::array<std::pair<const void*, std::size_t>, 8>;
+ static void quantize(const TransferTable& table, const float* values, std::uint8_t* codes) { CpuDownscaler::quantize_block(table, values, codes); }
  static void fail_before(CpuDownscaler& owner, Step step) { owner.fail_before_ = step; }
  static bool prepared(const CpuDownscaler& owner) { return owner.prepared_; }
  static bool armed(const CpuDownscaler& owner) { return owner.fail_before_ != Step::None; }
  static std::size_t horizontal_size(const CpuDownscaler& owner) { return owner.x_.size(); }
+ // Reconstruct the final retained row with the original scalar arithmetic.
+ // Both required moment rows are still live after execution; this compares
+ // SIMD output with scalar operations on identical compensated moments.
+ static void scalar_final_row(const CpuDownscaler& owner, RgbMutableImageView destination) {
+  const auto width = destination.layout.width, y = destination.layout.height - 1;
+  const auto moment = [&](unsigned row, unsigned x) {
+   Moment result;
+   for (unsigned k = 0; k < 3; ++k) {
+    result.mean[k] = owner.moments_[row % 2][k * width + x];
+    result.variance[k] = owner.moments_[row % 2][(k + 3) * width + x];
+   }
+   return result;
+  };
+  const auto coefficient = [&](unsigned row, unsigned x) {
+   const auto right = std::min(x + 1, width - 1), below = std::min(row + 1, y);
+   return patch(moment(row, x), moment(row, right), moment(below, x), moment(below, right));
+  };
+  for (unsigned x = 0; x < width; ++x) {
+   const auto left = x ? x - 1 : 0, previous = y ? y - 1 : y;
+   const auto color = reconstruct(moment(y, x), coefficient(y, x), coefficient(y, left), coefficient(previous, x), coefficient(previous, left));
+   switch (destination.layout.format) {
+    case RgbPixelFormat::RGB8: store<RgbPixelFormat::RGB8>(destination, x, y, color, 1, owner.transfer_); break;
+    case RgbPixelFormat::RGBA8: store<RgbPixelFormat::RGBA8>(destination, x, y, color, owner.alpha_[y % 2][x], owner.transfer_); break;
+    case RgbPixelFormat::PlanarUnitSrgbF32: store<RgbPixelFormat::PlanarUnitSrgbF32>(destination, x, y, color, 1, owner.transfer_); break;
+   }
+  }
+ }
  static Storage storage(const CpuDownscaler& owner) {
   return {
    {{owner.x_.data(), owner.x_.capacity()}, {owner.y_.data(), owner.y_.capacity()}, {owner.moments_[0].data(), owner.moments_[0].capacity()}, {owner.moments_[1].data(), owner.moments_[1].capacity()},
@@ -124,7 +152,7 @@ TEST_CASE("perceptual SIMD handles lane boundaries and unequal fractional footpr
  using namespace test_perceptual;
  RgbImageResizer resizer;
  for (auto format : formats)
-  for (unsigned width : {1U, 7U, 8U, 9U, 15U, 16U, 17U})
+  for (unsigned width : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 15U, 16U, 17U})
    for (const auto& dims : std::array<std::array<unsigned, 4>, 6>{
          {{width * 2 + 1, 11, width, 7}, {width * 2, 11, width, 7}, {width * 2 + 1, 12, width, 6}, {width * 2, 12, width, 6}, {width * 2 + 1, 1, width, 1}, {width * 3 - 1, 101, width, 7}}
         })
@@ -558,4 +586,169 @@ TEST_CASE("Supplied resizer preparation preserves RGB and planar numerical outpu
  CHECK(supplied.retained_bytes() == retained);
  CHECK(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0);
  CHECK_THROWS_AS(supplied.prepare(plan, memory.first(memory.size() - 1)), std::length_error);
+}
+
+TEST_CASE("eight-lane transfer search preserves every threshold and adjacent float", "[backend][data][image_resize][perceptual]") {
+ perceptual::TransferTable table;
+ for (unsigned code = 0; code < 256; ++code) table.linear[code] = perceptual::decode(float(code) * (1.0F / 255.0F));
+ for (unsigned code = 0; code < 256; ++code) {
+  const float threshold = table.linear[code];
+  const std::array values{threshold, std::nextafter(threshold, -std::numeric_limits<float>::infinity()),
+   std::nextafter(threshold, std::numeric_limits<float>::infinity()), -1.0F, 2.0F, std::numeric_limits<float>::quiet_NaN(),
+   -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()};
+  std::array<std::uint8_t, 8> output{};
+  perceptual::CpuDownscalerTestAccess::quantize(table, values.data(), output.data());
+  CHECK(output[0] == code);
+  CHECK(output[1] == (code ? code - 1 : 0));
+  CHECK(output[2] == code);
+  for (unsigned lane = 0; lane < output.size(); ++lane) CHECK(output[lane] == table.quantize(values[lane]));
+ }
+}
+TEST_CASE("checked resize plans retain their selected algorithm independently of storage", "[backend][data][image_resize][workspace]") {
+ const std::array<std::pair<std::array<unsigned, 2>, RgbResizePath>, 7> cases{{
+  {{640, 480}, RgbResizePath::PerceptualFractional}, {{768, 768}, RgbResizePath::PerceptualInteger},
+  {{384, 384}, RgbResizePath::Identity}, {{640, 360}, RgbResizePath::Avir}, {{320, 240}, RgbResizePath::Avir},
+  {{1024, 768}, RgbResizePath::PerceptualFractional}, {{2048, 2048}, RgbResizePath::PerceptualFractional}}};
+ for (const auto& [source, expected] : cases) {
+  const auto plan = RgbImageResizer::workspace_plan(source[0], source[1], 384, 384, ImageResizeMode::Stretch, true);
+  CHECK(plan.path() == expected);
+  CHECK((plan.bytes() == 0) == (expected == RgbResizePath::Identity));
+ }
+ CHECK_THROWS(RgbImageResizer::workspace_plan(0, 1, 1, 1, ImageResizeMode::Stretch, true));
+ CHECK_THROWS(RgbImageResizer::workspace_plan(std::numeric_limits<unsigned>::max(), 1, 384, 384, ImageResizeMode::Stretch, false));
+}
+TEST_CASE("explicit supplied overwrite sizing preserves contents and ordinary resize clears", "[backend][data][image_resize][workspace]") {
+ std::array<std::uint8_t, 19> memory;
+ memory.fill(173);
+ mmltk::common::types::WorkspaceBuffer<std::uint8_t> buffer;
+ buffer.bind(memory);
+ buffer.resize_for_overwrite(17);
+ CHECK(buffer.size() == 17);
+ CHECK(std::ranges::all_of(memory, [](auto value) { return value == 173; }));
+ buffer.clear();
+ buffer.resize(17);
+ CHECK(std::ranges::all_of(memory.begin(), memory.begin() + 17, [](auto value) { return value == 0; }));
+ CHECK(memory[17] == 173);
+ CHECK_THROWS_AS(buffer.resize_for_overwrite(20), std::length_error);
+ CHECK(buffer.size() == 17);
+}
+TEST_CASE("one supplied arena supports poisoned mixed geometry and rejects stale plan use", "[backend][data][image_resize][workspace]") {
+ const auto mode = GENERATE(ImageResizeMode::Stretch, ImageResizeMode::Letterbox);
+ const auto perceptual = GENERATE(false, true);
+ constexpr std::array<std::array<unsigned, 4>, 7> geometries{{
+  {17, 13, 9, 7}, {18, 14, 9, 7}, {9, 7, 9, 7}, {19, 1, 8, 9}, {1, 19, 1, 8}, {8, 7, 17, 13}, {31, 19, 16, 9}}};
+ std::vector<RgbResizeWorkspacePlan> plans;
+ std::size_t maximum = 0;
+ for (const auto& d : geometries) {
+  plans.push_back(RgbImageResizer::workspace_plan(d[0], d[1], d[2], d[3], mode, perceptual));
+  maximum = std::max(maximum, plans.back().bytes());
+ }
+ std::vector<std::byte> backing(maximum + 127, std::byte{0x53});
+ const auto aligned = (reinterpret_cast<std::uintptr_t>(backing.data()) + 63) / 64 * 64;
+ const std::span memory(reinterpret_cast<std::byte*>(aligned), maximum);
+ RgbImageResizer supplied(1, perceptual), owned(1, perceptual);
+ // Repeated and shuffled geometry must not depend on retained pixels, old
+ // coefficient contents, or an allocator from a prior arena lease.
+ for (const auto i : {0U, 5U, 1U, 4U, 6U, 2U, 3U, 5U, 0U}) {
+  const auto& d = geometries[i];
+  const auto source = make_test_image(d[0], d[1]);
+  std::vector<float> actual(d[2] * d[3] * 3, -19), expected(actual);
+  const RgbConstImageView input{source.data(), {d[0], d[1], d[0] * 3, 0, source.size(), RgbPixelFormat::RGB8}};
+  const RgbImageLayout layout{d[2], d[3], d[2] * sizeof(float), d[2] * d[3] * sizeof(float), actual.size() * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32};
+  std::fill(memory.begin(), memory.end(), std::byte{0xA7});
+  supplied.prepare(plans[i], memory);
+  RgbResizeWork observed;
+  supplied.resize_to_planar(input, {actual.data(), layout}, mode, &observed);
+  owned.resize_to_planar(input, {expected.data(), layout}, mode);
+  CHECK(actual == expected);
+  CHECK(supplied.retained_bytes() == plans[i].bytes());
+  CHECK(observed.preparations == (plans[i].path() == RgbResizePath::Identity ? 0 : 1));
+  CHECK(observed.allocation_bytes <= plans[i].bytes());
+  CHECK((observed.allocation_requests > 0) == (plans[i].path() == RgbResizePath::Avir));
+  // All writes stay within the admitted range, despite a larger supplied span.
+  CHECK(std::all_of(memory.begin() + plans[i].bytes(), memory.end(), [](auto byte) { return byte == std::byte{0xA7}; }));
+  auto changed = input;
+  --changed.layout.width;
+  if (changed.layout.width) {
+   changed.layout.row_stride_bytes -= 3;
+   std::fill(actual.begin(), actual.end(), -19);
+   CHECK_THROWS_AS(supplied.resize_to_planar(changed, {actual.data(), layout}, mode), std::invalid_argument);
+   CHECK(std::ranges::all_of(actual, [](auto value) { return value == -19; }));
+  }
+  if (plans[i].bytes()) {
+   CHECK_THROWS_AS(supplied.prepare(plans[i], memory.first(plans[i].bytes() - 1)), std::length_error);
+   supplied.prepare(plans[i], memory);
+   supplied.resize_to_planar(input, {actual.data(), layout}, mode);
+   CHECK(actual == expected);
+  }
+ }
+}
+
+TEST_CASE("SIMD final rows retain scalar patch reconstruction and output bits", "[backend][data][image_resize][perceptual]") {
+ using namespace test_perceptual;
+ for (auto format : formats)
+  for (unsigned width : {1U, 3U, 7U, 8U, 9U, 15U, 16U, 17U})
+   for (unsigned height : {1U, 5U})
+    for (unsigned extra : {0U, 1U})
+     for (unsigned pattern : {0U, 3U, 5U, 7U}) {
+      Image source(width * 2 + extra, height * 2 + extra, format, 3), actual(width, height, format, 5), scalar(width, height, format, 5);
+      source.fill(pattern);
+      perceptual::CpuDownscaler owner;
+      owner.run(source.read(), actual.write());
+      perceptual::CpuDownscalerTestAccess::scalar_final_row(owner, scalar.write());
+      const auto layout = actual.read().layout;
+      const unsigned planes = format == RgbPixelFormat::PlanarUnitSrgbF32 ? 3 : 1;
+      const std::size_t row_bytes = width * (format == RgbPixelFormat::PlanarUnitSrgbF32 ? sizeof(float) : format == RgbPixelFormat::RGBA8 ? 4 : 3);
+      for (unsigned plane = 0; plane < planes; ++plane) {
+       const auto offset = plane * layout.plane_stride_bytes + (height - 1) * layout.row_stride_bytes;
+       CHECK(std::memcmp(static_cast<const std::byte*>(actual.read().data) + offset, static_cast<const std::byte*>(scalar.read().data) + offset, row_bytes) == 0);
+      }
+      CHECK(padding_intact(actual));
+     }
+}
+namespace {
+class ObservedAvirWorkspace final : public avir::detail::CWorkspaceAllocator {
+public:
+ std::size_t requests = 0, bytes = 0;
+ std::size_t fail_request = std::numeric_limits<std::size_t>::max();
+ char* acquire(std::size_t count, bool) override {
+  if (requests++ == fail_request) throw std::bad_alloc();
+  bytes += (count + 63) / 64 * 64;
+  return new char[count];
+ }
+ void release(char* pointer, std::size_t) override { delete[] pointer; }
+};
+}
+TEST_CASE("AVIR checked layout matches all execution reservations and preparation is fallible before stores", "[backend][data][image_resize][workspace]") {
+ using Resizer = avir::CImageResizer<avir::fpclass_float4>;
+ for (const auto& d : std::array<std::array<int, 4>, 5>{{{19, 3, 8, 9}, {17, 13, 9, 7}, {18, 14, 9, 7}, {1, 19, 1, 8}, {8, 7, 17, 13}}}) {
+  const auto source = make_test_image(d[0], d[1]);
+  std::vector<std::uint8_t> output(std::size_t(d[2]) * d[3] * 3), expected(output);
+  Resizer{}.resizeImage(source.data(), d[0], d[1], 0, expected.data(), d[2], d[3], 3, 0.0);
+  const auto layout = Resizer::workspaceBytes<std::uint8_t, std::uint8_t>(d[0], d[1], d[2], d[3], 3);
+  ObservedAvirWorkspace successful;
+  {
+   avir::detail::CWorkspaceScope scope(successful);
+   Resizer prepared;
+   prepared.resizeImage(source.data(), d[0], d[1], 0, output.data(), d[2], d[3], 3, 0.0);
+  }
+  CHECK(output == expected);
+  CHECK(successful.bytes == layout);
+  REQUIRE(successful.requests > 1);
+  for (const auto fail : {std::size_t{0}, successful.requests - 1}) {
+   std::fill(output.begin(), output.end(), 179);
+   ObservedAvirWorkspace failing;
+   failing.fail_request = fail;
+   {
+    avir::detail::CWorkspaceScope scope(failing);
+    CHECK_THROWS_AS(([&] {
+     Resizer prepared;
+     prepared.resizeImage(source.data(), d[0], d[1], 0, output.data(), d[2], d[3], 3, 0.0);
+    }()), std::bad_alloc);
+   }
+   CHECK(std::ranges::all_of(output, [](auto value) { return value == 179; }));
+   Resizer{}.resizeImage(source.data(), d[0], d[1], 0, output.data(), d[2], d[3], 3, 0.0);
+   CHECK(output == expected);
+  }
+ }
 }

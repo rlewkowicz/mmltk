@@ -12341,8 +12341,9 @@ TEST_CASE("pixel cost observations retain exact plan facts and cannot change fai
  const auto input = profile_image_fixture(8, 6, encoding);
  CompileImageDecoder decoder;
  const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark);
- const auto plan = compile_pixel_workspace_plan(header, 4, ImageResizeMode::Stretch, true);
- CHECK(plan.resize_plan().path(header.width, header.height) == RgbResizePath::PerceptualFractional);
+ const bool perceptual = GENERATE(false, true);
+ const auto plan = compile_pixel_workspace_plan(header, 4, ImageResizeMode::Stretch, perceptual);
+ CHECK(plan.resize_plan().path() == (perceptual ? RgbResizePath::PerceptualFractional : RgbResizePath::Avir));
  CompileExecution execution(1, {}, {.transient_bytes = plan.bytes()});
  CompilePixelWorkspace pixels;
  std::vector<float> output(4 * 4 * 3, -1), unobserved(output);
@@ -12366,10 +12367,14 @@ TEST_CASE("pixel cost observations retain exact plan facts and cannot change fai
  CHECK_FALSE(observations[1].failed);
  CHECK(observations[1].stage == CompilePixelStage::Complete);
  CHECK(observations[1].codec == header.encoding);
- CHECK(observations[1].path == plan.resize_plan().path(header.width, header.height));
+ CHECK(observations[1].path == plan.resize_plan().path());
  CHECK(observations[1].requested_bytes == plan.bytes());
  CHECK(observations[1].opaque_bytes == plan.resources().opaque_bytes);
  CHECK(observations[1].output_bytes == output.size() * sizeof(float));
+ CHECK(observations[0].resize_preparations == 0);
+ CHECK(observations[1].resize_preparations == 1);
+ CHECK((observations[1].resize_allocation_requests > 0) == !perceptual);
+ CHECK(observations[1].resize_allocation_bytes <= plan.resize_plan().bytes());
  CHECK(output == unobserved);
  CHECK(execution.snapshot().costs.eligibility_probes == 0);
  CHECK(execution.snapshot().costs.admission_lock_ns == 0);

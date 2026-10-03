@@ -18,6 +18,7 @@ struct CompilePixelObservation {
  bool failed = false;
  CompilePixelStage stage = CompilePixelStage::Validation;
  std::uint64_t failed_stage_ns = 0;
+ std::uint64_t resize_preparations = 0, resize_allocation_requests = 0, resize_allocation_bytes = 0;
  std::uint64_t cpu_ns = 0;
  bool cpu_incomplete = false;
 };
@@ -42,8 +43,8 @@ public:
 
 private:
  friend class CompilePixelWorkspace;
- friend CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy);
- CompilePixelWorkspacePlan(const CompileImageHeader&, CompilePixelPolicy);
+ friend CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy, imaging::resample::RgbResizeWork*);
+ CompilePixelWorkspacePlan(const CompileImageHeader&, CompilePixelPolicy, imaging::resample::RgbResizeWork*);
  CompileImageHeader header_;
  CompilePixelPolicy policy_;
  CompileImagePlan decoder_;
@@ -52,7 +53,7 @@ private:
  CompileResources resources_;
  imaging::resample::RgbImageLayout destination_;
 };
-[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy);
+[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy, imaging::resample::RgbResizeWork* observed = nullptr);
 [[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, std::uint32_t resolution, imaging::resample::ImageResizeMode, bool perceptual);
 // Session-owned controls bind only to the current arena. Pixels go directly
 // into the prepared destination; neither controls nor borrowed scratch escape.

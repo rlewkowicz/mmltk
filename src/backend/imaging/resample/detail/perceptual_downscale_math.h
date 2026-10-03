@@ -19,9 +19,11 @@ inline constexpr float low_variance_ratio = 2.0F;
 MMLTK_PERCEPTUAL_HD inline float unit(float value) { return !(value > 0.0F) ? 0.0F : (value < 1.0F ? value : 1.0F); }
 MMLTK_PERCEPTUAL_HD inline float decode(float v) { return v > 0.04045F ? ::powf((v + 0.055F) / 1.055F, 2.4F) : v / 12.92F; }
 MMLTK_PERCEPTUAL_HD inline float encode(float v) { return v > 0.0031308F ? 1.055F * ::powf(v, 1.0F / 2.4F) - 0.055F : 12.92F * v; }
-struct Color {
- float y, cb, cr;
+template <class Value>
+struct ColorValue {
+ Value y, cb, cr;
 };
+using Color = ColorValue<float>;
 struct ColorCoefficients {
  static constexpr float yr = 0.299F, yg = 0.587F, yb = 0.114F;
  static constexpr float cbr = -0.168736F, cbg = -0.331264F, cbb = 0.5F;
@@ -33,7 +35,8 @@ MMLTK_PERCEPTUAL_HD inline Color transform(float r, float g, float b) {
  // invariance of central moments removes that cancellation at dark colors.
  return {C::yr * r + C::yg * g + C::yb * b, C::cbr * r + C::cbg * g + C::cbb * b, C::crr * r + C::crg * g + C::crb * b};
 }
-MMLTK_PERCEPTUAL_HD inline Color inverse(Color v) { return {v.y + 1.402F * v.cr, v.y - 0.344136F * v.cb - 0.714136F * v.cr, v.y + 1.772F * v.cb}; }
+template <class Value>
+MMLTK_PERCEPTUAL_HD inline ColorValue<Value> inverse(ColorValue<Value> v) { return {v.y + 1.402F * v.cr, v.y - 0.344136F * v.cb - 0.714136F * v.cr, v.y + 1.772F * v.cb}; }
 // Integer rational endpoints avoid loss of coverage even at large uint32
 // extents. Interior weights are exactly one; only the two borders are partial.
 struct Footprint {
@@ -51,12 +54,16 @@ MMLTK_PERCEPTUAL_HD inline Footprint footprint(std::uint32_t src, std::uint32_t 
  const auto last = static_cast<std::uint32_t>((end - 1) / dst);
  return {first, last + 1, first == last ? float(double(end - begin) / dst) : float(double(dst - begin % dst) / dst), float(double(end - std::uint64_t(last) * dst) / dst)};
 }
-struct Moment {
- float mean[3], variance[3];
+template <class Value>
+struct MomentValue {
+ Value mean[3], variance[3];
 };
-struct Coefficient {
- float ratio[3]{}, center[3]{};
+template <class Value>
+struct CoefficientValue {
+ Value ratio[3]{}, center[3]{};
 };
+using Moment = MomentValue<float>;
+using Coefficient = CoefficientValue<float>;
 static_assert(sizeof(Moment) == 24 && sizeof(Coefficient) == 24);
 MMLTK_PERCEPTUAL_HD inline void compensated_add(float value, float& sum, float& error) {
  const float adjusted = value - error;
@@ -100,25 +107,28 @@ MMLTK_PERCEPTUAL_HD inline Moment merge(Moment a, float aw, Moment b, float bw) 
  return a;
 }
 MMLTK_PERCEPTUAL_HD inline float contrast_ratio(float low, float within) { return low >= variance_threshold ? ::sqrtf(1.0F + ::fmaxf(0, within) / low) : low_variance_ratio; }
-MMLTK_PERCEPTUAL_HD inline Coefficient patch(const Moment& a, const Moment& b, const Moment& c, const Moment& d) {
- Coefficient result;
+MMLTK_PERCEPTUAL_HD inline float multiply_add(float a, float b, float c) { return ::fmaf(a, b, c); }
+template <class Value>
+MMLTK_PERCEPTUAL_HD inline CoefficientValue<Value> patch(const MomentValue<Value>& a, const MomentValue<Value>& b, const MomentValue<Value>& c, const MomentValue<Value>& d) {
+ CoefficientValue<Value> result;
  for (int k = 0; k < 3; ++k) {
-  const float db = b.mean[k] - a.mean[k], dc = c.mean[k] - a.mean[k], dd = d.mean[k] - a.mean[k];
-  const float offset = (db + dc + dd) * 0.25F;
-  const float rb = db - offset, rc = dc - offset, rd = dd - offset;
-  const float low = (offset * offset + rb * rb + rc * rc + rd * rd) * 0.25F;
-  const float within = (a.variance[k] + b.variance[k] + c.variance[k] + d.variance[k]) * 0.25F;
+  const Value db = b.mean[k] - a.mean[k], dc = c.mean[k] - a.mean[k], dd = d.mean[k] - a.mean[k];
+  const Value offset = (db + dc + dd) * 0.25F;
+  const Value rb = db - offset, rc = dc - offset, rd = dd - offset;
+  const Value low = (offset * offset + rb * rb + rc * rc + rd * rd) * 0.25F;
+  const Value within = (a.variance[k] + b.variance[k] + c.variance[k] + d.variance[k]) * 0.25F;
   result.ratio[k] = contrast_ratio(low, within);
   result.center[k] = a.mean[k] + offset;
  }
  return result;
 }
-MMLTK_PERCEPTUAL_HD inline Color reconstruct(const Moment& m, const Coefficient& a, const Coefficient& b, const Coefficient& c, const Coefficient& d) {
- float v[3];
+template <class Value>
+MMLTK_PERCEPTUAL_HD inline ColorValue<Value> reconstruct(const MomentValue<Value>& m, const CoefficientValue<Value>& a, const CoefficientValue<Value>& b, const CoefficientValue<Value>& c, const CoefficientValue<Value>& d) {
+ Value v[3];
  for (int k = 0; k < 3; ++k) {
   // Centered reconstruction avoids subtracting large r*m terms.
-  v[k] = (::fmaf(a.ratio[k], m.mean[k] - a.center[k], a.center[k]) + ::fmaf(b.ratio[k], m.mean[k] - b.center[k], b.center[k]) + ::fmaf(c.ratio[k], m.mean[k] - c.center[k], c.center[k]) +
-          ::fmaf(d.ratio[k], m.mean[k] - d.center[k], d.center[k])) *
+  v[k] = (multiply_add(a.ratio[k], m.mean[k] - a.center[k], a.center[k]) + multiply_add(b.ratio[k], m.mean[k] - b.center[k], b.center[k]) + multiply_add(c.ratio[k], m.mean[k] - c.center[k], c.center[k]) +
+          multiply_add(d.ratio[k], m.mean[k] - d.center[k], d.center[k])) *
          0.25F;
  }
  return {v[0], v[1], v[2]};

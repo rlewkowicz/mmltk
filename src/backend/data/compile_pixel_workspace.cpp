@@ -3,11 +3,11 @@
 #include <stdexcept>
 #include "src/backend/data/detail/compile_observation.h"
 namespace mmltk::backend::data::detail {
-CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& header, CompilePixelPolicy policy)
+CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& header, CompilePixelPolicy policy, imaging::resample::RgbResizeWork* observed)
     : header_(header),
       policy_(policy),
       decoder_(CompileImageDecoder::plan(header)),
-      resize_(imaging::resample::RgbImageResizer::workspace_plan(header.width, header.height, policy.width, policy.height, policy.mode, policy.perceptual)) {
+      resize_(imaging::resample::RgbImageResizer::workspace_plan(header.width, header.height, policy.width, policy.height, policy.mode, policy.perceptual, imaging::resample::RgbPixelFormat::RGB8, observed)) {
  using common::math::checked_add;
  using common::math::checked_multiply;
  decoder_extent_ = checked_add(decoder_.bytes(), std::size_t{63}, "decode alignment overflow") / 64 * 64;
@@ -22,18 +22,19 @@ CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& h
  const auto plane = checked_multiply<std::size_t>(row, policy.height, "pixel plane overflow");
  destination_ = {policy.width, policy.height, row, plane, checked_multiply<std::size_t>(plane, 3, "pixel destination overflow"), imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
 }
-CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, CompilePixelPolicy policy) { return CompilePixelWorkspacePlan(header, policy); }
+CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, CompilePixelPolicy policy, imaging::resample::RgbResizeWork* observed) { return CompilePixelWorkspacePlan(header, policy, observed); }
 CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, std::uint32_t resolution, imaging::resample::ImageResizeMode mode, bool perceptual) {
- return compile_pixel_workspace_plan(header, {resolution, resolution, mode, perceptual});
+ return compile_pixel_workspace_plan(header, {resolution, resolution, mode, perceptual}, nullptr);
 }
 void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::span<const std::uint8_t> encoded, const CompileImageHeader& header, std::span<std::byte> memory,
  imaging::resample::RgbMutableImageView destination, std::function_ref<void()> prepare_destination, const CompilePixelObserver& observer) {
  CompilePixelObservation observation;
+ imaging::resample::RgbResizeWork resize_work;
  CompileObservationClock total{bool(observer)}, step{bool(observer)};
  CompileObservationClock cpu{bool(observer), true};
  if (observer) {
   observation.codec = header.encoding;
-  observation.path = plan.resize_.path(plan.header_.width, plan.header_.height);
+  observation.path = plan.resize_.path();
   observation.source_width = header.width;
   observation.source_height = header.height;
   observation.target_width = plan.policy_.width;
@@ -45,6 +46,9 @@ void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::sp
  }
  const auto report = [&](bool failed) noexcept {
   if (!observer) return;
+  observation.resize_preparations = resize_work.preparations;
+  observation.resize_allocation_requests = resize_work.allocation_requests;
+  observation.resize_allocation_bytes = resize_work.allocation_bytes;
   observation.failed = failed;
   if (failed) observation.failed_stage_ns = step.elapsed();
   observation.duration_ns = total.elapsed();
@@ -73,7 +77,7 @@ void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::sp
   prepare_destination();
   if (observer) { observation.destination_ns = step.lap(); observation.stage = CompilePixelStage::ResizeStore; }
   resizer_.resize_to_planar(
-   {decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, decoded.size(), imaging::resample::RgbPixelFormat::RGB8}}, destination, plan.policy_.mode);
+   {decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, decoded.size(), imaging::resample::RgbPixelFormat::RGB8}}, destination, plan.policy_.mode, observer ? &resize_work : nullptr);
   if (observer) { observation.resize_store_ns = step.lap(); observation.stage = CompilePixelStage::Complete; }
  } catch (...) {
   report(true);

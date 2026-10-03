@@ -180,6 +180,7 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  const auto setup_start = std::chrono::steady_clock::now();
  const CompilePixelPolicy policy{static_cast<unsigned>(opts.width), static_cast<unsigned>(opts.height), ImageResizeMode::Stretch, opts.perceptual};
  if (std::uint64_t(opts.width) * opts.height * 12 > (512ULL << 20) / workers) throw std::length_error("profile destinations exceed 512 MiB");
+ RgbResizeWork layout_work;
  std::vector<CompilePixelWorkspacePlan> pixel_plans;
  std::vector<RgbResizeWorkspacePlan> resize_plans;
  std::vector<std::vector<std::uint8_t>> decoded;
@@ -189,7 +190,7 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  NumaMemory decode_memory(NumaTopology::Capture().permitted_nodes.front());
  for (const auto& input : inputs) {
   const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark);
-  pixel_plans.push_back(compile_pixel_workspace_plan(header, policy));
+  pixel_plans.push_back(compile_pixel_workspace_plan(header, policy, &layout_work));
   resize_plans.push_back(pixel_plans.back().resize_plan());
   maximum = std::max(maximum, opts.mode == ProfileMode::Resample ? resize_plans.back().bytes() : pixel_plans.back().bytes());
   if (opts.mode == ProfileMode::Resample) {
@@ -210,6 +211,7 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  std::vector<std::unique_ptr<CompilePixelWorkspace>> pixels;
  std::vector<std::unique_ptr<RgbImageResizer>> resizers;
  std::vector<std::vector<float>> output;
+ std::vector<RgbResizeWork> resize_work(workers);
  for (std::size_t i = 0; i < workers; ++i) {
   pixels.push_back(std::make_unique<CompilePixelWorkspace>());
   resizers.push_back(std::make_unique<RgbImageResizer>(1, opts.perceptual));
@@ -230,11 +232,13 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
   RgbMutableImageView destination{output[lane].data(), pixel_plans[i].destination()};
   if (opts.mode == ProfileMode::Resample) {
    resizers[lane]->prepare(resize_plans[i], memory);
-   resizers[lane]->resize_to_planar({decoded[i].data(), {inputs[i].width, inputs[i].height, std::size_t(inputs[i].width) * 3, 0, decoded[i].size(), RgbPixelFormat::RGB8}}, destination, policy.mode);
+   resizers[lane]->resize_to_planar({decoded[i].data(), {inputs[i].width, inputs[i].height, std::size_t(inputs[i].width) * 3, 0, decoded[i].size(), RgbPixelFormat::RGB8}}, destination, policy.mode, &resize_work[lane]);
   } else {
-   CompilePixelObserver observed;
-   if (trace) observed = [&](const CompilePixelObservation& value) {
-    benchmark_internal::trace_benchmark_event(trace, "compile.pixel", [&] {
+   const CompilePixelObserver observed = [&](const CompilePixelObservation& value) {
+    resize_work[lane].preparations += value.resize_preparations;
+    resize_work[lane].allocation_requests += value.resize_allocation_requests;
+    resize_work[lane].allocation_bytes += value.resize_allocation_bytes;
+    if (trace) benchmark_internal::trace_benchmark_event(trace, "compile.pixel", [&] {
      auto fields = benchmark_internal::benchmark_observation_fields(value);
      fields["image_id"] = index;
      fields["input_index"] = i;
@@ -250,6 +254,16 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  std::printf("cpu_profile images=%zu workers=%zu sec=%.6f images_per_sec=%.3f source_bytes_per_sec=%.3f output_bytes_per_sec=%.3f retained_decoded_bytes=%llu plan_count=%zu setup_sec=%.6f\n",
   order.size(), workers, seconds, order.size() / seconds, source_bytes / seconds, order.size() * std::size_t(opts.width) * opts.height * 12 / seconds,
   static_cast<unsigned long long>(retained_decoded), inputs.size(), seconds_since(setup_start, start));
+ std::printf("cpu_profile layout_preparations=%llu layout_allocation_requests=%llu layout_allocation_bytes=%llu\n",
+  static_cast<unsigned long long>(layout_work.preparations), static_cast<unsigned long long>(layout_work.allocation_requests), static_cast<unsigned long long>(layout_work.allocation_bytes));
+ RgbResizeWork work;
+ for (const auto& lane : resize_work) {
+  work.preparations += lane.preparations;
+  work.allocation_requests += lane.allocation_requests;
+  work.allocation_bytes += lane.allocation_bytes;
+ }
+ std::printf("cpu_profile resize_preparations=%llu resize_allocation_requests=%llu resize_allocation_bytes=%llu\n",
+  static_cast<unsigned long long>(work.preparations), static_cast<unsigned long long>(work.allocation_requests), static_cast<unsigned long long>(work.allocation_bytes));
  record_duration_metric("pixels", "total", start, end);
 }
 void run_loader_case(const char* label, const DatasetLoader::Config& cfg, int num_epochs, bool overlap_consumer) {
