@@ -17,8 +17,10 @@ enum class ProfileMode : std::uint8_t { Loader, Compile, Pixels, Resample, Cocon
 MMLTK_REFLECT_ENUM(ProfileMode)
 enum class CompactionCase : std::uint8_t { Dense, Sparse, MixedLabels };
 MMLTK_REFLECT_ENUM(CompactionCase)
-enum class ProfileInputStorage : std::uint8_t { Mapped, Pooled };
+enum class ProfileInputStorage : std::uint8_t { Mapped, Pooled, Archive };
 MMLTK_REFLECT_ENUM(ProfileInputStorage)
+enum class ProfileArchivePressure : std::uint8_t { None, Arena, Bytes, Exclusive };
+MMLTK_REFLECT_ENUM(ProfileArchivePressure)
 struct Options {
  std::string test_dir = "/tmp/mmltk_profile";
  bool keep_artifacts = false;
@@ -33,6 +35,7 @@ struct Options {
  int warmup_runs = 1;
  int task_records = 0, output_cap_mib = 2048;
  ProfileInputStorage input_storage = ProfileInputStorage::Mapped;
+ ProfileArchivePressure archive_pressure = ProfileArchivePressure::None;
  bool completion_gaps = false;
  ProfileMode mode = ProfileMode::Loader;
  CompactionCase compaction_case = CompactionCase::MixedLabels;

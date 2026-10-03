@@ -14,6 +14,8 @@
 #include <map>
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include <stb_image_write.h>
+#include <archive.h>
+#include <archive_entry.h>
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -53,6 +55,42 @@ ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t hei
  if (output.overflow) throw std::length_error("profile encoded image exceeds input cap");
  if (!written) throw std::runtime_error("cannot encode profile fixture");
  return result;
+}
+std::vector<std::string> profile_archive_fixture(const fs::path& path, std::span<const ProfileImageFixture> inputs, std::span<const std::size_t> order, std::uint64_t byte_limit) {
+ if (order.empty() || order.size() > 256 || byte_limit > (64U << 20)) throw std::length_error("archive fixture exceeds bounded source policy");
+ std::uint64_t bytes = 1024;
+ for (auto index : order) {
+  if (index >= inputs.size()) throw std::out_of_range("archive fixture input index");
+  bytes = mmltk::common::math::checked_add(bytes, static_cast<std::uint64_t>(inputs[index].encoded.size()) + 2048, "archive fixture extent overflow");
+  if (bytes > byte_limit) throw std::length_error("archive fixture exceeds source byte cap");
+ }
+ std::unique_ptr<archive, decltype(&archive_write_free)> writer(archive_write_new(), archive_write_free);
+ if (!writer) throw std::bad_alloc{};
+ const auto require = [&](bool ok) {
+  if (!ok) throw std::runtime_error(std::string("cannot create archive fixture: ") + (archive_error_string(writer.get()) ? archive_error_string(writer.get()) : "archive write failure"));
+ };
+ require(archive_write_set_format_pax(writer.get()) == ARCHIVE_OK);
+ require(archive_write_add_filter_gzip(writer.get()) == ARCHIVE_OK);
+ // Identical fixture bytes must produce identical causal-profile source hashes.
+ require(archive_write_set_filter_option(writer.get(), "gzip", "timestamp", nullptr) == ARCHIVE_OK);
+ require(archive_write_open_filename(writer.get(), path.c_str()) == ARCHIVE_OK);
+ std::vector<std::string> names;
+ names.reserve(order.size());
+ for (std::size_t i = 0; i < order.size(); ++i) {
+  names.push_back((i ? "images/" : std::string(140, 'p') + "/") + std::to_string(i + 1) + ".jpg");
+  const auto& input = inputs[order[i]].encoded;
+  std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
+  if (!entry) throw std::bad_alloc{};
+  archive_entry_set_pathname(entry.get(), names.back().c_str());
+  archive_entry_set_filetype(entry.get(), AE_IFREG);
+  archive_entry_set_perm(entry.get(), 0600);
+  archive_entry_set_size(entry.get(), input.size());
+  require(archive_write_header(writer.get(), entry.get()) == ARCHIVE_OK);
+  require(archive_write_data(writer.get(), input.data(), input.size()) == static_cast<la_ssize_t>(input.size()));
+ }
+ require(archive_write_close(writer.get()) == ARCHIVE_OK);
+ if (fs::file_size(path) > byte_limit) throw std::length_error("compressed archive fixture exceeds source byte cap");
+ return names;
 }
 std::vector<std::vector<std::uint8_t>> retained_profile_rgb(std::span<const ProfileImageFixture> inputs, std::size_t retained_limit, std::size_t workspace_limit) {
  using namespace detail;

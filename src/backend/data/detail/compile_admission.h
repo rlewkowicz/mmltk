@@ -154,7 +154,7 @@ struct CompileAdmission {
    ++owners;
   else
    --owners;
-  if (previous != pressure()) notify(Change::Pressure);
+  if (after || previous != pressure()) notify(Change::Pressure);
  }
  [[nodiscard]] std::size_t descriptor_ceiling(CompileResources value) const {
   // An explicit dependent promise already reserves consumer headroom. Count
@@ -172,17 +172,19 @@ struct CompileAdmission {
   if (value.cpu_workers && value.cpu_workers >= cpu_capacity) throw std::invalid_argument("external benchmark work must retain a CPU for consumers");
   if (!feasible(value)) throw InsufficientCompileResources("benchmark operation exceeds resource admission");
  }
- [[nodiscard]] bool fits_bytes(CompileResources value, const Credits* parent = nullptr, std::uint64_t retiring_bytes = 0) const {
+ [[nodiscard]] bool fits_bytes(CompileResources value, const Credits* parent = nullptr, std::uint64_t retiring_bytes = 0, CompileRetryCustody retry = {}) const {
   if (value.retained_handles || !value.bytes) return true;
   const auto requested = reservation_bytes(value);
   const auto remaining = bytes - std::min(bytes, retiring_bytes);
-  if (requested <= target && remaining <= target - requested) return true;
+  if (requested <= target && retry.bytes_ <= target - requested && remaining <= target - requested - retry.bytes_) return true;
   // A legal oversized consumer may finish its own retained input. The complete
   // lineage is charged, and unrelated transient users must first retire.
   std::uint64_t lineage = 0;
   for (auto* credit = parent; credit; credit = credit->parent.get())
    if (!credit->resources.retained_handles) lineage += credit->charged_bytes();
-  return remaining == lineage;
+  // Returned local input belongs to the failed draw's prospective lineage.
+  // Subtract common ancestry instead of adding potentially oversized totals.
+  return remaining <= lineage && retry.bytes_ - retry.lineage_bytes_ == lineage - remaining;
  }
  [[nodiscard]] std::uint64_t reservation_bytes(CompileResources value) const {
   return value.supplied_workspace && value.bytes && arenas ? arenas->reservation_bytes(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window) : value.bytes;
@@ -237,6 +239,37 @@ struct CompileAdmission {
   const auto needed = uncovered > room ? uncovered - room : 0;
   if (needed > offered_bytes - loaned) return {.denial = CompileResourceDenial::LoanCapacity};
   return {.fits = true, .loan_bytes = needed};
+ }
+ [[nodiscard]] static std::size_t descriptor_return(const Credits* credit, const Credits* parent, std::span<const CompileAllowance> returning = {}) {
+  if (!credit) return 0;
+  const auto count = credit->resources.descriptors + credit->available;
+  auto borrowed = std::min(count, credit->borrowed);
+  auto* ancestor = credit->parent.get();
+  while (ancestor && borrowed) {
+   const bool retiring = std::ranges::any_of(returning, [&](const CompileAllowance& value) { return value.credits_.get() == ancestor; });
+   if (!retiring && !ancestor->descriptors_retired && !ancestor->continuations_released) return count - (ancestor == parent ? 0 : borrowed);
+   borrowed = std::min(borrowed, ancestor->borrowed);
+   ancestor = ancestor->parent.get();
+  }
+  return count;
+ }
+ // Retirement is supplied by the physical owner, never a diagnostic credit
+ // census. Count workspace only when its explicit retirement can return bytes;
+ // supplied arena storage and a live lending/CPU scope still own their backing.
+ [[nodiscard]] bool reclamation_useful(CompileResources demand, const Credits* parent, const Credits* workspace, const Credits* descriptor, CompileRetryCustody retry = {}) const {
+  const bool bytes_return = workspace && !workspace->resources.retained_handles && workspace->resources.bytes && !workspace->arena && !workspace->cpu_users && !workspace->workspace_offer;
+  const auto descriptors_return = descriptor_return(workspace, parent) + (descriptor == workspace ? 0 : descriptor_return(descriptor, parent));
+  if (!bytes_return && !descriptors_return) return false;
+  // An exclusive workspace must drain unrelated transient custody even when
+  // today's first denial is fragmentation or descriptor capacity.
+  if (draining_bytes || oversized(demand)) return true;
+  const bool unknown = !demand.bytes && !demand.descriptors && !demand.continuation_descriptors && !demand.cpu_workers && !demand.opaque_bytes;
+  if (unknown) return true;
+  const auto needed = demand.descriptors + demand.continuation_descriptors;
+  if (descriptors_return && needed - std::min(needed, retry.promised_) + retry.descriptors_ > descriptor_room(demand, parent)) return true;
+  // Inspect the independent byte constraint even when arena eligibility failed
+  // first. A matching contribution is useful when several owners must retire.
+  return bytes_return && !fits_bytes(demand, parent, 0, retry);
  }
  // Returned child promises pass through ancestors whose descriptor work has
  // explicitly ended. Only live ancestors can promise them to a new child.

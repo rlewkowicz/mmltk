@@ -31,7 +31,7 @@ std::pair<std::size_t, CompileAllowance> reserve_benchmark_transfers(detail::Com
   const auto observed = execution.admission_generation();
   for (auto count = requested; count; --count)
    if (auto allowance = execution.try_reserve(envelope.demand(count), parent)) return {count, std::move(*allowance)};
-  auto wait = execution.defer_resources();
+  auto wait = execution.defer_resources(envelope.demand(1), parent);
   execution.wait_for_admission_change(observed);
  }
 }
@@ -461,17 +461,28 @@ struct BenchmarkCurl::Impl {
   // when the event owner coalesces it with this rollback.
   CompileExecution::Readiness::Attempt attempt(readiness.get());
   auto& candidate = queue.front();
-  const auto defer = [&] {
+  CompileAllowance work;
+  std::list<Socket> admitted;
+  const auto defer = [&](CompileResources resources, const CompileAllowance& parent) {
+   const auto retry = [&] {
+    std::vector<CompileAllowance> returning;
+    returning.reserve(admitted.size() + 1);
+    returning.push_back(work);
+    for (const auto& socket : admitted) returning.push_back(socket.allowance);
+    return execution->retry_custody(resources, returning, parent, parent);
+   }();
+   admitted.clear();
+   work = {};
    // Nonblocking transport admission must advertise pressure too. Otherwise
    // an idle parser can retain the entire byte target while Curl waits for
    // a credit event that no active owner remains able to produce.
-   if (!candidate->deferred) candidate->deferred = execution->defer_resources();
+   if (!candidate->deferred) candidate->deferred = execution->defer_resources(resources, parent, retry);
+   else candidate->deferred->update(resources, parent, retry);
    return false;
   };
-  CompileAllowance work;
   if (execution && !candidate->work) {
    auto value = execution->try_reserve(benchmark_curl_input_resources(), fixed);
-   if (!value) return defer();
+   if (!value) return defer(benchmark_curl_input_resources(), fixed);
    work = std::move(*value);
   }
   const auto next_limit = std::max(connection_limit, active.size() + 1);
@@ -482,14 +493,13 @@ struct BenchmarkCurl::Impl {
    const std::lock_guard lock(socket_mutex);
    capacity = sockets.size();
   }
-  std::list<Socket> admitted;
   std::size_t new_fixed = 0;
   while (capacity + admitted.size() < needed) {
    CompileAllowance allowance;
    const bool fixed_child = fixed_socket_grants + new_fixed < kCurlNativeSocketCandidates;
    if (execution) {
     auto value = execution->try_reserve(CompileResources::handles(1), fixed_child ? socket_commitment : CompileAllowance{});
-    if (!value) return defer();  // Every partial draw and request workspace returns.
+    if (!value) return defer(CompileResources::handles(1), fixed_child ? socket_commitment : CompileAllowance{});  // Every partial draw and request workspace returns.
     allowance = std::move(*value);
    }
    admitted.push_back({std::move(allowance), CURL_SOCKET_BAD, fixed_child});

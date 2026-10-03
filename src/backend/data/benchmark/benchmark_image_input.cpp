@@ -141,7 +141,7 @@ BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::Opened::try_read(CompileExecut
    const auto bytes = mmltk::common::math::checked_add(identity_[2], header_bytes, "cached image workspace overflow");
    auto complete = execution->try_reserve({bytes, 0}, controls_);
    if (!complete) {
-    if (!wait_) wait_ = execution->defer_resources();
+    if (!wait_) wait_ = execution->defer_resources({bytes, 0}, controls_);
     return {};
    }
    wait_.reset();

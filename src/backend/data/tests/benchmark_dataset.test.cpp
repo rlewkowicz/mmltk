@@ -15517,3 +15517,221 @@ TEST_CASE("synthetic profile extents obey their input budget before encoding", "
  CHECK_FALSE(input.encoded.empty());
  CHECK(input.encoded.size() <= 4096);
 }
+
+TEST_CASE("reclamation uses failed dimensions and live promise ancestry", "[benchmark][pipeline][archive][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page = mmltk::common::system::host_page_size();
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, {}, 0, 0, page * 4));
+ CompileExecution execution(1, {}, {.transient_bytes = page * 32, .descriptors = 8, .workspace_plan = plan});
+ auto decoder = execution.reserve({.bytes = page, .descriptors = 1});
+ auto arena = execution.reserve({.bytes = page * 4, .supplied_workspace = true});
+ const CompileResources blocked{.bytes = page, .supplied_workspace = true};
+ REQUIRE_FALSE(execution.try_reserve(blocked));
+ auto wait = execution.defer_resources(blocked);
+ CHECK(execution.resource_pressure());
+ CHECK_FALSE(execution.reclamation_useful(decoder));
+ CompileExecution::Readiness pressure(execution, CompileChange::Pressure);
+ auto generation = pressure.generation();
+ wait->update(blocked);
+ CHECK(pressure.generation() == generation);
+ // A second genuinely blocked dimension arrives while pressure stays true.
+ auto descriptors = execution.reserve(CompileResources::handles(7));
+ const auto handles = CompileResources::handles(1);
+ REQUIRE_FALSE(execution.try_reserve(handles));
+ auto changed = execution.defer_resources(handles);
+ CHECK(pressure.generation() != generation);
+ CHECK(execution.reclamation_useful(decoder));
+ changed.reset();
+ generation = pressure.generation();
+ wait->update(handles);
+ CHECK(pressure.generation() != generation);
+ CHECK(execution.reclamation_useful(decoder));
+ wait->update(blocked);
+ CHECK_FALSE(execution.reclamation_useful(decoder));
+ // Unknown callers remain conservative; no diagnostic snapshot is enabled.
+ auto unknown = execution.defer_resources();
+ CHECK(execution.reclamation_useful(decoder));
+ unknown.reset();
+ wait.reset();
+ descriptors = {};
+ arena = {};
+ decoder = {};
+ auto parent = execution.reserve(CompileResources::handles(0, false, 1));
+ auto child = execution.reserve(CompileResources::handles(1), parent);
+ auto occupied = execution.reserve(CompileResources::handles(7));
+ auto unbound = execution.defer_resources(handles);
+ CHECK_FALSE(execution.reclamation_useful({}, child));
+ unbound.reset();
+ // A returned child draw becomes available to its own producer, rather than
+ // global descriptor headroom. Its exact parent can benefit from that return.
+ auto bound = execution.defer_resources(handles, parent);
+ CHECK(execution.reclamation_useful({}, child));
+ child.retire_descriptors();
+ REQUIRE(execution.try_reserve(handles, parent));
+ bound.reset();
+ child = {};
+ parent = {};
+ occupied = {};
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
+}
+TEST_CASE("archive retirement cooperates across byte and descriptor shortages", "[benchmark][archive][resources]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace mmltk::backend::data::testsupport;
+ const bool descriptors = GENERATE(false, true);
+ mmltk::testsupport::ScopedTempDir root("archive-cooperative-relief");
+ const std::array inputs{profile_image_fixture(33, 31, FixtureImageEncoding::Png), profile_image_fixture(41, 37, FixtureImageEncoding::Jpeg)};
+ std::vector<std::size_t> order(32);
+ for (std::size_t i = 0; i < order.size(); ++i) order[i] = i % inputs.size();
+ const auto path = root.path() / "source.tar.gz";
+ (void)profile_archive_fixture(path, inputs, order);
+ CompileExecution execution(1, {}, {.transient_bytes = 8U << 20, .descriptors = 6});
+ {
+  BenchmarkArchive first(path, &execution), second(path, &execution);
+  REQUIRE(first.next());
+  REQUIRE(second.next());
+  const auto demand = descriptors ? CompileResources::handles(4) : CompileResources{.bytes = 6U << 20};
+  REQUIRE_FALSE(execution.try_reserve(demand));
+  auto waiting = execution.defer_resources(demand);
+  REQUIRE(first.reclamation_useful());
+  REQUIRE(second.reclamation_useful());
+  first.suspend();
+  CHECK(first.retained_workspace_bytes() == 0);
+  CHECK(execution.resource_usage().descriptors == 3); // Two opened sources and the second decoder.
+  CHECK_FALSE(execution.try_reserve(demand));
+  REQUIRE(second.reclamation_useful());
+  second.suspend();
+  CHECK(execution.resource_usage().descriptors == 2);
+  auto accepted = execution.try_reserve(demand);
+  REQUIRE(accepted);
+  waiting.reset();
+  accepted.reset();
+  REQUIRE(first.try_resume(0));
+  CHECK(std::ranges::equal(first.read(inputs.front().encoded.size()), inputs.front().encoded));
+  first.suspend();
+  REQUIRE(second.try_resume(0));
+  CHECK(std::ranges::equal(second.read(inputs.front().encoded.size()), inputs.front().encoded));
+  second.pause();
+ }
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
+ CHECK_FALSE(execution.resource_pressure());
+}
+TEST_CASE("forward publication keeps a decoder for arena pressure and wakes for a useful changed demand", "[benchmark][archive][resources][pipeline]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace mmltk::backend::data::testsupport;
+ const bool cancel = GENERATE(false, true);
+ std::atomic<bool> cancelled{false};
+ mmltk::testsupport::ScopedTempDir root("archive-demand-change");
+ const auto path = root.path() / "source.tar.gz", images = root.path() / "images";
+ const std::array inputs{profile_image_fixture(41, 43, FixtureImageEncoding::Png), profile_image_fixture(39, 37, FixtureImageEncoding::Jpeg)};
+ std::vector<std::size_t> order(32);
+ std::vector<std::uint64_t> ids;
+ for (std::size_t i = 0; i < order.size(); ++i) { order[i] = i % inputs.size(); ids.push_back(i + 1); }
+ (void)profile_archive_fixture(path, inputs, order);
+ const auto page = mmltk::common::system::host_page_size();
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, {}, 4U << 20, 0, (4U << 20) + page));
+ mmltk::testsupport::TestGate held("first accepted publication keeps its physical callback");
+ std::promise<void> draining, suspended, peers;
+ std::atomic<unsigned> published{0}, suspensions{0};
+ std::uint64_t replays = 0, restores = 0;
+ const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.archive."}), [&](std::string_view event, const nlohmann::json& value) {
+  if (event == "benchmark.archive.suspended" && !suspensions.fetch_add(1)) mmltk::testsupport::release_test_promise(suspended);
+  if (event == "benchmark.archive.completed") { replays = value.at("replay_decoded_bytes"); restores = value.at("restores"); }
+ }};
+ BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 32U << 20, .workspace_plan = plan}, {}, trace);
+ auto& execution = pipeline.execution();
+ const CompileResources blocked{.bytes = page, .supplied_workspace = true};
+ auto arena = execution.reserve(blocked);
+ REQUIRE_FALSE(execution.try_reserve(blocked));
+ auto waiting = execution.defer_resources(blocked);
+ std::unique_ptr<CompileResourceWait> useful;
+ auto extracting = std::async(std::launch::async, [&] {
+  return extract_selected_archive_images({.archive_path = path, .source_identity = "bounded-gzip-pressure", .output_root = images, .source = "coco", .shard = "train2017",
+   .selected_image_ids = ids, .image_id_parser = benchmark_archive_image_candidate, .cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), .trace = trace,
+   .activity = [&](std::string_view message) { if (message == "Draining selected image cache writes") mmltk::testsupport::release_test_promise(draining); },
+   .image_ready = [&](const CachedImageReady& ready) {
+    require_condition(ready.payload && std::ranges::equal(ready.payload->encoded(), inputs[order[ready.image_id - 1]].encoded), "publication changed exact member bytes");
+    if (ready.image_id == 1) held.receipt().ArriveAndWait();
+    if (published.fetch_add(1) + 1 == order.size() - 1) mmltk::testsupport::release_test_promise(peers);
+   },
+   .execution = &pipeline});
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { useful.reset(); waiting.reset(); arena = {}; held.Release(); });
+ REQUIRE(held.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(draining, "all later source members progress past unrelated arena pressure", 5s);
+ mmltk::testsupport::await_test_promise(peers, "independent accepted callbacks complete while the first is held", 5s);
+ CHECK(published == order.size() - 1);
+ CHECK(suspensions == 0);
+ const CompileResources complete_bytes{.bytes = execution.transient_target()};
+ REQUIRE_FALSE(execution.try_reserve(complete_bytes));
+ useful = execution.defer_resources(complete_bytes);
+ mmltk::testsupport::await_test_promise(suspended, "useful bytes wake a source already waiting under pressure", 5s);
+ CHECK(execution.resource_pressure());
+ CHECK(extracting.wait_for(0ms) == std::future_status::timeout);
+ if (cancel) cancelled = true;
+ useful.reset();
+ waiting.reset();
+ arena = {};
+ held.Release();
+ if (cancel) {
+  CHECK_THROWS(mmltk::testsupport::await_test_future(extracting, "cancelled source joins every accepted callback", 5s));
+ } else {
+  const auto result = mmltk::testsupport::await_test_future(extracting, "accepted archive publications settle exactly once", 5s);
+  CHECK(result.image_count == order.size());
+ }
+ pipeline.files().join();
+ CHECK(published == order.size());
+ CHECK(replays == 0);
+ CHECK(restores == 0);
+ REQUIRE(execution.try_reserve(complete_bytes));
+ CHECK(execution.resource_usage().descriptors == 0);
+ CHECK(execution.resource_usage().bytes == 0);
+ if (cancel) {
+  cancelled = false;
+  const auto retry = extract_selected_archive_images({.archive_path = path, .source_identity = "bounded-gzip-pressure", .output_root = images, .source = "coco", .shard = "train2017",
+   .selected_image_ids = ids, .image_id_parser = benchmark_archive_image_candidate, .execution = &pipeline});
+  CHECK(retry.image_count == order.size());
+  CHECK(execution.resource_usage().bytes == 0);
+  CHECK(execution.resource_usage().descriptors == 0);
+ }
+}
+TEST_CASE("rolled-back archive input remains part of the complete retry demand", "[benchmark][pipeline][resources][archive]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page * 4, .descriptors = 8});
+ auto unrelated_decoder = execution.reserve({.bytes = page * 2});
+ const CompileResources encoded{.bytes = page - 1, .continuation_descriptors = 1, .supplied_workspace = true};
+ const CompileResources decoder{.bytes = page * 2, .descriptors = 1};
+ auto input = execution.reserve(encoded);
+ REQUIRE_FALSE(execution.try_reserve(decoder, input));
+ const auto retry = [&] {
+  // Aliases contribute once, including the arena slice's alignment charge.
+  const std::array returned{input, input};
+  return execution.retry_custody(decoder, returned, input);
+ }();
+ input = {};
+ auto independently_fitting = execution.try_reserve(decoder);
+ REQUIRE(independently_fitting);
+ independently_fitting.reset();
+ auto waiting = execution.defer_resources(decoder);
+ CHECK_FALSE(execution.reclamation_useful(unrelated_decoder));
+ CompileExecution::Readiness pressure(execution, CompileChange::Pressure);
+ const auto generation = pressure.generation();
+ waiting->update(decoder, {}, retry);
+ CHECK(pressure.generation() != generation);
+ CHECK(execution.reclamation_useful(unrelated_decoder));
+ const auto changed = pressure.generation();
+ waiting->update(decoder, {}, retry);
+ CHECK(pressure.generation() == changed);
+ unrelated_decoder = {};
+ input = execution.reserve(encoded);
+ auto resumed = execution.try_reserve(decoder, input);
+ REQUIRE(resumed);
+ waiting.reset();
+ resumed.reset();
+ input = {};
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
+ CHECK_FALSE(execution.resource_pressure());
+}

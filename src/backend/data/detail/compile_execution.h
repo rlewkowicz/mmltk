@@ -252,6 +252,10 @@ public:
  [[nodiscard]] std::size_t descriptor_limit() const noexcept;
  [[nodiscard]] CompileResources resource_usage() const;
  [[nodiscard]] bool resource_pressure() const;
+ // Quiescent physical owners identify the workspace and descriptor credits
+ // they will explicitly retire after destroying their backing. Borrowed parent
+ // storage is not a retirement candidate. Matching relief need not fit alone.
+ [[nodiscard]] bool reclamation_useful(const CompileAllowance& workspace, const CompileAllowance& descriptors = {}) const;
  // A legal oversized request needs every ordinary arena to retire. Ordinary
  // contention alone does not require a forward reader to discard its cursor.
  [[nodiscard]] bool oversized_workspace_pending() const;
@@ -307,7 +311,11 @@ public:
   std::shared_ptr<State> state_;
  };
  // Pressure/drain custody for resource owners without a successor record.
- [[nodiscard]] std::unique_ptr<CompileResourceWait> defer_resources(CompileResources = {}, const CompileAllowance& parent = {});
+ // Capture only quiescent unaccepted draws that will be destroyed before
+ // defer_resources/update. Aliases and actual arena padding count once; the
+ // failed parent may be one of those returned draws. No custody is retained.
+ [[nodiscard]] CompileRetryCustody retry_custody(CompileResources failed, std::span<const CompileAllowance> returning, const CompileAllowance& failed_parent = {}, const CompileAllowance& retry_parent = {}) const;
+ [[nodiscard]] std::unique_ptr<CompileResourceWait> defer_resources(CompileResources = {}, const CompileAllowance& parent = {}, CompileRetryCustody = {});
  // Bind one continuation demand before classification; retries keep its age
  // and resource predicate until admission or withdrawal.
  [[nodiscard]] std::unique_ptr<CompileResourceWait> defer_continuation(CompileTaskKind, CompileResources = {}, const CompileAllowance& parent = {}, bool finite_consumer = false);
@@ -380,13 +388,16 @@ private:
 class CompileResourceWait final {
 public:
  ~CompileResourceWait();
+ // Replace an external failed draw without unregistering pressure. A repeated
+ // identical draw is inert; record-backed continuation demands are immutable.
+ void update(CompileResources, const CompileAllowance& parent = {}, CompileRetryCustody = {});
  CompileResourceWait(const CompileResourceWait&) = delete;
  CompileResourceWait& operator=(const CompileResourceWait&) = delete;
 
 private:
  friend class CompileExecution;
  struct State;
- explicit CompileResourceWait(std::shared_ptr<CompileExecution::Impl>, CompileTaskKind, CompileResources, CompileAllowance, bool);
+ explicit CompileResourceWait(std::shared_ptr<CompileExecution::Impl>, CompileTaskKind, CompileResources, CompileAllowance, bool, CompileRetryCustody = {});
  std::unique_ptr<State> state_;
 };
 }  // namespace mmltk::backend::data::detail

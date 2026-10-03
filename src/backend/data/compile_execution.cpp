@@ -75,11 +75,12 @@ struct CompileResourceWait::State {
  std::shared_ptr<CompileExecution::Impl> execution;
  CompileExecution::Demand demand;
  CompileTaskKind successor;
+ CompileRetryCustody retry;
  struct Link {
   State* previous = nullptr;
   State* next = nullptr;
   bool linked = false;
- } exceptional;
+ } external;
  bool registered = false, pressure = false;
  State(std::shared_ptr<CompileExecution::Impl> owner, CompileTaskKind kind, CompileResources resources, CompileAllowance parent, bool finite)
      : execution(std::move(owner)), demand{.resources = resources, .parent = std::move(parent), .finite_consumer = finite, .needs_record = kind != CompileTaskKind::Count}, successor(kind) {}
@@ -240,7 +241,7 @@ struct CompileExecution::Impl {
   }
  };
  DemandQueue<Job> exceptional{&Job::exceptional};
- DemandQueue<CompileResourceWait::State> external_demands{&CompileResourceWait::State::exceptional};
+ DemandQueue<CompileResourceWait::State> external_demands{&CompileResourceWait::State::external};
  DemandQueue<Demand> aged_demands{&Demand::aged};
  const void* draining_request = nullptr;
  bool draining_external = false;
@@ -282,14 +283,14 @@ struct CompileExecution::Impl {
   // external requests retain order, skipping successors without record room.
   if (draining_request && !draining_external) return;
   auto* waiting = external_demands.head;
-  const auto records = waiting && waiting->demand.needs_record ? record_capacity() : 0;
-  while (waiting && !record_eligible(waiting->demand, records)) waiting = waiting->exceptional.next;
+  const auto records = record_capacity();
+  while (waiting && (!admission->oversized(waiting->demand.resources) || !record_eligible(waiting->demand, records))) waiting = waiting->external.next;
   drain(waiting, waiting ? waiting->demand.parent.credits_.get() : nullptr, waiting ? waiting->demand.resources.bytes : 0, waiting != nullptr);
  }
  void remove_wait(CompileResourceWait::State& waiting) noexcept {
   if (!std::exchange(waiting.registered, false)) return;
   remove_demand(waiting.demand);
-  if (waiting.exceptional.linked) {
+  if (waiting.external.linked) {
    external_demands.remove(waiting);
    if (draining_request == &waiting) drain(nullptr, nullptr, 0);
    refresh_external_drain();
@@ -1585,6 +1586,25 @@ bool CompileExecution::resource_pressure() const {
  const std::lock_guard lock(impl_->admission->mutex);
  return impl_->admission->pressure();
 }
+bool CompileExecution::reclamation_useful(const CompileAllowance& workspace, const CompileAllowance& descriptors) const {
+ const std::lock_guard lock(impl_->admission->mutex);
+ const auto* storage = workspace.credits_.get();
+ const auto* handles = descriptors.credits_.get();
+ if ((storage && storage->owner != impl_->admission) || (handles && handles->owner != impl_->admission)) throw std::invalid_argument("compile retirement belongs to another session");
+ const auto useful = [&](CompileResources demand, const Credits* parent, CompileRetryCustody retry = {}) { return impl_->admission->reclamation_useful(demand, parent, storage, handles, retry); };
+ if (impl_->draining_request && useful({}, nullptr)) return true;
+ std::size_t external_pressure = 0;
+ for (auto* waiting : impl_->external_demands) {
+  if (!waiting->pressure) continue;
+  ++external_pressure;
+  if (useful(waiting->demand.resources, waiting->demand.parent.credits_.get(), waiting->retry)) return true;
+ }
+ // Offer withdrawals and other unclassified owner waits remain conservative.
+ if (impl_->admission->resource_waiters > external_pressure && useful({}, nullptr)) return true;
+ for (auto* job : impl_->jobs)
+  if ((job->reason == CompileParkReason::Bytes || job->reason == CompileParkReason::Descriptors) && useful(job->demand.resources, job->demand.parent.credits_.get())) return true;
+ return false;
+}
 bool CompileExecution::oversized_workspace_pending() const {
  const std::lock_guard lock(impl_->admission->mutex);
  return impl_->draining_request != nullptr;
@@ -1674,9 +1694,10 @@ CompileExecution::Readiness::Attempt::~Attempt() {
  state.notified = true;
  impl->arm_locked();
 }
-CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileExecution::Impl> execution, CompileTaskKind successor, CompileResources resources, CompileAllowance parent, bool finite_consumer)
+CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileExecution::Impl> execution, CompileTaskKind successor, CompileResources resources, CompileAllowance parent, bool finite_consumer, CompileRetryCustody retry)
     : state_(std::make_unique<State>(std::move(execution), successor, resources, std::move(parent), finite_consumer)) {
  auto& state = *state_;
+ state.retry = retry;
  auto& owner = *state.execution;
  const std::lock_guard lock(owner.admission->mutex);
  if (state.demand.parent.credits_ && state.demand.parent.credits_->owner != owner.admission) throw std::invalid_argument("compile demand belongs to another session");
@@ -1684,11 +1705,8 @@ CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileExecution::Impl>
  // precedes intrusive publication; the remaining mutations cannot allocate.
  owner.admission->require(state.demand.resources, state.demand.needs_record);
  (void)owner.admission->reservation_bytes(state.demand.resources);
- const bool exceptional = owner.admission->oversized(state.demand.resources);
- if (exceptional) {
-  owner.external_demands.append(state);
-  owner.refresh_external_drain();
- }
+ owner.external_demands.append(state);
+ owner.refresh_external_drain();
  if (state.demand.needs_record) owner.wait_demand(state.demand);
  // A continuation first needs a successor record. Publish resource pressure
  // only after an actual resource denial; fitting and record-only attempts must
@@ -1697,14 +1715,68 @@ CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileExecution::Impl>
  owner.admission->change_waiters(true, state.pressure);
  state.registered = true;
 }
+void CompileResourceWait::update(CompileResources resources, const CompileAllowance& parent, CompileRetryCustody retry) {
+ auto& state = *state_;
+ auto& owner = *state.execution;
+ // Parent destruction may return credits and must happen outside the mutex.
+ auto previous_parent = parent;
+ const std::lock_guard lock(owner.admission->mutex);
+ if (!state.registered || state.demand.needs_record) throw std::logic_error("only registered external resource waits can change their draw");
+ if (parent.credits_ && parent.credits_->owner != owner.admission) throw std::invalid_argument("compile demand belongs to another session");
+ if (state.demand.resources == resources && state.demand.parent.credits_ == parent.credits_ && state.retry == retry) return;
+ owner.admission->require(resources);
+ (void)owner.admission->reservation_bytes(resources);
+ owner.remove_demand(state.demand);
+ state.demand.resources = resources;
+ state.retry = retry;
+ std::swap(state.demand.parent, previous_parent);
+ state.demand.blocked_generation = std::numeric_limits<std::uint64_t>::max();
+ if (owner.draining_request == &state) owner.drain(nullptr, nullptr, 0);
+ owner.refresh_external_drain();
+ owner.notify_locked(CompileChange::Pressure);
+}
 CompileResourceWait::~CompileResourceWait() {
  // Unlink while the state still owns its parent, then release final custody
  // after unlocking. A successful retain has already removed this registration.
  const std::lock_guard lock(state_->execution->admission->mutex);
  state_->execution->remove_wait(*state_);
 }
-std::unique_ptr<CompileResourceWait> CompileExecution::defer_resources(CompileResources resources, const CompileAllowance& parent) {
- return std::unique_ptr<CompileResourceWait>(new CompileResourceWait(impl_, CompileTaskKind::Count, resources, parent, false));
+CompileRetryCustody CompileExecution::retry_custody(CompileResources failed, std::span<const CompileAllowance> returning, const CompileAllowance& failed_parent, const CompileAllowance& retry_parent) const {
+ const std::lock_guard lock(impl_->admission->mutex);
+ CompileRetryCustody result;
+ if ((failed_parent.credits_ && failed_parent.credits_->owner != impl_->admission) || (retry_parent.credits_ && retry_parent.credits_->owner != impl_->admission))
+  throw std::invalid_argument("compile retry parent belongs to another session");
+ const auto in_lineage = [](const Credits* credit, const Credits* parent) {
+  for (; parent; parent = parent->parent.get()) if (parent == credit) return true;
+  return false;
+ };
+ for (std::size_t i = 0; i < returning.size(); ++i) {
+  const auto* credit = returning[i].credits_.get();
+  if (!credit) continue;
+  if (credit->owner != impl_->admission) throw std::invalid_argument("compile retry custody belongs to another session");
+  bool duplicate = false;
+  for (std::size_t previous = 0; previous < i; ++previous) duplicate |= returning[previous].credits_.get() == credit;
+  if (duplicate) continue;
+  if (in_lineage(credit, retry_parent.credits_.get())) throw std::invalid_argument("compile retry parent cannot retain returned custody");
+  // These are quiescent, unaccepted local draws, destroyed immediately after
+  // capture. Persisted/borrowed backing must never be passed as returned work.
+  if (credit->cpu_users || credit->workspace_offer) throw std::logic_error("compile retry custody is still physically active");
+  auto bytes = credit->resources.retained_handles ? 0 : credit->resources.bytes;
+  if (!credit->resources.retained_handles && credit->arena_padding) {
+   bool shared = false;
+   for (std::size_t previous = 0; previous < i; ++previous)
+    shared |= returning[previous].credits_ && returning[previous].credits_->arena_padding == credit->arena_padding;
+   if (!shared) bytes += credit->arena_padding->bytes;
+  }
+  result.bytes_ += bytes;
+  if (in_lineage(credit, failed_parent.credits_.get()) && !in_lineage(credit, retry_parent.credits_.get())) result.lineage_bytes_ += bytes;
+  result.descriptors_ += CompileAdmission::descriptor_return(credit, retry_parent.credits_.get(), returning);
+  if (credit == failed_parent.credits_.get() && credit != retry_parent.credits_.get()) result.promised_ = std::min(failed.descriptors + failed.continuation_descriptors, credit->available);
+ }
+ return result;
+}
+std::unique_ptr<CompileResourceWait> CompileExecution::defer_resources(CompileResources resources, const CompileAllowance& parent, CompileRetryCustody retry) {
+ return std::unique_ptr<CompileResourceWait>(new CompileResourceWait(impl_, CompileTaskKind::Count, resources, parent, false, retry));
 }
 std::unique_ptr<CompileResourceWait> CompileExecution::defer_continuation(CompileTaskKind successor, CompileResources resources, const CompileAllowance& parent, bool finite_consumer) {
  resources.workspace_class = work_class(successor);

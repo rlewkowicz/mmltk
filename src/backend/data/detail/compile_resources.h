@@ -43,6 +43,7 @@ struct CompileResources {
  // Checked upper bound for library-owned bookkeeping outside pinned payload.
  std::uint64_t opaque_bytes = 0;
  CompileWorkspaceWindow workspace_window = CompileWorkspaceWindow::Task;
+ bool operator==(const CompileResources&) const = default;
  [[nodiscard]] static CompileResources handles(std::size_t count, bool producer = false, std::size_t continuation = 0);
 };
 MMLTK_REFLECT_FIELDS(CompileResources)
@@ -51,6 +52,16 @@ struct CompileExecutionLimits {
  std::size_t descriptors = 0;
  std::size_t task_records = 0;
  std::shared_ptr<const CompileWorkspacePlan> workspace_plan{};
+};
+// Prospective custody of unaccepted draws returned before an external wait.
+// Only CompileExecution derives it from actual credits; it owns no resources.
+class CompileRetryCustody {
+ friend class CompileExecution;
+ friend struct CompileAdmission;
+ std::uint64_t bytes_ = 0, lineage_bytes_ = 0;
+ std::size_t descriptors_ = 0, promised_ = 0;
+public:
+ bool operator==(const CompileRetryCustody&) const = default;
 };
 // Shared custody charges backing once and returns it after its last reader.
 class CompileAllowance {

@@ -558,7 +558,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   });
  }};
  BenchmarkCompletionWindow publications(window_size, &execution.execution(), [&] {
-  if (archive_reader && execution.execution().resource_pressure()) {
+  if (archive_reader && archive_reader->reclamation_useful()) {
    trace_benchmark_event(publication_trace, "benchmark.images.pixel_wait", [&] {
     return nlohmann::json{{"member", archive_reader->member()}, {"decoder_bytes", archive_reader->retained_workspace_bytes()}};
    });
@@ -685,7 +685,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   return false;
  }
  replaying_inventory = false;
- archive_reader = std::make_unique<BenchmarkArchive>(archive.download.path, &execution.execution(), 0, lease->allowance(), 1, true);
+ archive_reader = std::make_unique<BenchmarkArchive>(archive.download.path, &execution.execution(), 0, lease->allowance(), 1, true, CompileAllowance{}, 1024, 0, 32768, publication_trace);
  auto& reader = *archive_reader;
  std::vector<CoconutPhysicalImage> inventory;
  std::unordered_set<std::uint64_t> encountered;

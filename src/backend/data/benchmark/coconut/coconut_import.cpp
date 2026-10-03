@@ -1610,7 +1610,7 @@ private:
   constexpr std::uint64_t source_window = 0;
   if (!archive_) {
    archive_ =
-    std::make_shared<Archive>(request_.mask_archive, request_.execution ? &request_.execution->execution() : nullptr, source_window, request_.parent_allowance, 1, true, CompileAllowance{}, 1024, 1);
+    std::make_shared<Archive>(request_.mask_archive, request_.execution ? &request_.execution->execution() : nullptr, source_window, request_.parent_allowance, 1, true, CompileAllowance{}, 1024, 1, 32768, request_.trace);
    records_.archive = archive_;
    admitted_ = true;
   } else if (paused_ || !admitted_) {
@@ -1620,7 +1620,7 @@ private:
     importer_.drain_normalization();
     if (archive_->try_resume(source_window, request_.parent_allowance, 1)) break;
     if (request_.execution) {
-     auto pressure = request_.execution->execution().defer_resources();
+     auto pressure = request_.execution->execution().defer_resources(archive_->resume_requirement(source_window, 1), request_.parent_allowance);
      request_.execution->execution().wait_for_admission_change(generation);
     }
    }
@@ -1887,7 +1887,7 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
  if (owned)
   owned->resume(workspace, request.parent_allowance);
  else
-  owned = std::make_shared<Archive>(request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), workspace, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0);
+  owned = std::make_shared<Archive>(request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), workspace, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0, 32768, request.trace);
  auto& archive = *owned;
  retained.archive = owned;
  std::unique_ptr<AnnotationMaskStream> masks;
@@ -1921,7 +1921,7 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
    if (archive.try_resume(workspace, request.parent_allowance)) break;
    // A parked controller must request reclamation of idle parser custody;
    // waiting for a generation alone cannot make that retained capacity free.
-   auto pressure = request.execution->execution().defer_resources();
+   auto pressure = request.execution->execution().defer_resources(archive.resume_requirement(workspace), request.parent_allowance);
    request.execution->execution().wait_for_admission_change(generation);
   }
   suspended = false;
@@ -2106,7 +2106,7 @@ void CoconutAnnotationRecords::discard() noexcept {
  prefixes_sealed_ = false;
 }
 std::shared_ptr<BenchmarkArchive> discover_coconut_masks(const CoconutImportRequest& request, std::stop_token stop) {
- auto archive = std::make_shared<Archive>(request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), 0, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0);
+ auto archive = std::make_shared<Archive>(request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), 0, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0, 32768, request.trace);
  // Keep only the archive owner's compact locators. The eventual annotation
  // consumer borrows this same generation and its forward compressed context.
  try {

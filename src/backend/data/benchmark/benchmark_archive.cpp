@@ -27,6 +27,7 @@ using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
 namespace {
 constexpr std::size_t kBlock = 128U << 10;
+constexpr std::array<std::uint8_t, 4096> kSparseZeros{};
 constexpr std::uint64_t kGzipIndexBytes = 64ULL << 20;
 // The library's soft chunk limit is checked at deflate block boundaries. A
 // valid single block can expand past it. Stop before retaining that backing;
@@ -121,6 +122,25 @@ struct BenchmarkArchive::Impl {
   std::optional<std::uint64_t> extent;
   bool raw = false, conflict = false;
  };
+ BenchmarkTraceSink trace;
+ bool observation_enabled = false, resumed_once = false;
+ std::string source;
+ mutable BenchmarkArchiveObservation observation;
+ std::uint64_t source_high = 0, decoded_high = 0;
+ void account_read(std::uint64_t start, std::size_t count, std::uint64_t source_start, std::uint64_t source_end) {
+  if (!observation_enabled) return;
+  const auto replay = std::min<std::uint64_t>(count, decoded_high > start ? decoded_high - start : 0);
+  observation.replay_decoded_bytes += replay;
+  observation.forward_decoded_bytes += count - replay;
+  decoded_high = std::max(decoded_high, start + count);
+  if (source_end >= source_start) {
+   const auto bytes = source_end - source_start;
+   const auto repeated = std::min(bytes, source_high > source_start ? source_high - source_start : 0);
+   observation.replay_source_bytes += repeated;
+   observation.forward_source_bytes += bytes - repeated;
+   source_high = std::max(source_high, source_end);
+  }
+ }
  CompileExecution* execution;
  CompileExecution::Producer producer;
  CompileAllowance parent_allowance, file_allowance, decoder_allowance, credits, supplied_workspace;
@@ -155,8 +175,8 @@ struct BenchmarkArchive::Impl {
  };
  std::optional<Suspended> suspended;
  Impl(const std::filesystem::path& path, CompileExecution* owner, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
-  CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries)
-     : execution(owner),
+  CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries, const BenchmarkTraceSink& sink)
+     : trace(sink), observation_enabled(sink.accepts("benchmark.archive.completed") || sink.accepts("benchmark.archive.suspended")), source(observation_enabled ? path.string() : std::string{}), execution(owner),
        producer(owner ? owner->open_class(detail::CompileWorkClass::Extraction) : CompileExecution::Producer{}),
        parent_allowance(parent),
        file_allowance(owner ? owner->reserve(CompileResources::handles(1), parent) : CompileAllowance{}),
@@ -180,19 +200,29 @@ struct BenchmarkArchive::Impl {
   resume(workspace);
  }
  ~Impl() {
+  trace_benchmark_event(trace, "benchmark.archive.completed", [&] {
+   auto fields = benchmark_observation_fields(observation);
+   fields["source"] = source;
+   return fields;
+  });
   reader.reset();
   gzip.reset();
   streaming.reset();
+  decoder_allowance.retire_descriptors();
   decoder_allowance = {};
   file = {};
   file_allowance.retire_descriptors();
   file_allowance.retire_workspace();
   std::vector<std::uint8_t>().swap(bytes);
   std::vector<char>().swap(block);
-  if (owns_workspace) credits.retire_workspace();
+  if (owns_workspace) { credits.retire_workspace(); credits.retire_descriptors(); }
  }
  void resume(std::uint64_t workspace) {
   if (reader) return;
+  if (observation_enabled) {
+   if (resumed_once) ++observation.restores;
+   resumed_once = true;
+  }
   workspace_bytes = workspace;
   external_cpus = false;
   if (!credits) owns_workspace = false;
@@ -234,6 +264,7 @@ struct BenchmarkArchive::Impl {
   });
  }
  void reset_decoder() {
+  if (observation_enabled) ++observation.decoder_opens;
   // Retire worker, cache, dictionary and compressed-reader backing before
   // constructing a replacement under the same allowance.
   gzip.reset();
@@ -269,7 +300,10 @@ struct BenchmarkArchive::Impl {
  std::size_t stream_read(char* output, std::size_t count) {
   for (;;) {
    throw_if_benchmark_cancelled(cancellation);
+   const auto source_start = observation_enabled ? streaming->tellCompressed() / 8 : 0;
+   const auto decoded_start = observation_enabled ? stream_offset : 0;
    const auto [read, footer] = streaming->readStream(reinterpret_cast<std::uint8_t*>(output), count);
+   if (observation_enabled) account_read(decoded_start, read, source_start, streaming->tellCompressed() / 8);
    stream_crc.update(output, read);
    stream_member_bytes += static_cast<std::uint32_t>(read);
    stream_offset = checked_add(stream_offset, read, "gzip stream offset overflow");
@@ -298,7 +332,11 @@ struct BenchmarkArchive::Impl {
     while (gzip && gzip->tell() < start) {
      throw_if_benchmark_cancelled(cancellation);
      roll_windows();
-     if (!gzip->read(-1, nullptr, std::min<std::uint64_t>(kBlock, start - gzip->tell()))) throw BenchmarkArchiveError("gzip seek exceeds consumed source");
+     const auto decoded_start = observation_enabled ? gzip->tell() : 0;
+     const auto source_start = observation_enabled ? gzip->tellCompressed() / 8 : 0;
+     const auto count = gzip->read(-1, nullptr, std::min<std::uint64_t>(kBlock, start - gzip->tell()));
+     if (observation_enabled) account_read(decoded_start, count, source_start, gzip->tellCompressed() / 8);
+     if (!count) throw BenchmarkArchiveError("gzip seek exceeds consumed source");
      roll_windows();
     }
    } catch (const ArchiveChunkCapacity&) { use_streaming(); } catch (const rapidgzip::IndexCapacityExceeded&) {
@@ -317,12 +355,16 @@ struct BenchmarkArchive::Impl {
   if (!compressed) {
    const auto count = checked_cast<std::size_t>(std::min<std::uint64_t>(block.size(), file_size - offset), "archive read size overflow");
    if (count) file.pread_all(block.data(), count, offset);
+   if (observation_enabled) account_read(offset, count, offset, offset + count);
    return count;
   }
   roll_windows();
   if (gzip) {
    try {
+    const auto decoded_start = observation_enabled ? gzip->tell() : 0;
+    const auto source_start = observation_enabled ? gzip->tellCompressed() / 8 : 0;
     const auto count = gzip->read(block.data(), block.size());
+    if (observation_enabled) account_read(decoded_start, count, source_start, gzip->tellCompressed() / 8);
     roll_windows();
     return count;
    } catch (const ArchiveChunkCapacity&) { use_streaming(); } catch (const rapidgzip::IndexCapacityExceeded&) {
@@ -429,6 +471,71 @@ struct BenchmarkArchive::Impl {
   if (!inserted && stored->second.ordinal != s.current.ordinal) stored->second.conflict = true;
   return true;
  }
+ // Libarchive owns each pending span until the next block request. Both public
+ // consumption paths share extent, sparse-hole, EOF and direct-range checks.
+ struct MemberRead {
+  std::uint64_t written = 0, offset = 0;
+  std::span<const std::uint8_t> pending;
+  std::optional<std::uint64_t> extent;
+  bool contiguous = false, eof = false;
+ };
+ void validate_direct() const {
+  if (!current.extent || *current.extent > file_size || current.bytes > file_size - *current.extent) throw BenchmarkArchiveError("archive member position exceeds opened file bounds");
+ }
+ void read_block(MemberRead& state) {
+  throw_if_benchmark_cancelled(cancellation);
+  const void* data = nullptr;
+  std::size_t count = 0;
+  la_int64_t offset = 0;
+  int status = ARCHIVE_RETRY;
+  for (int retry = 0; retry < 8 && status == ARCHIVE_RETRY; ++retry) status = archive_read_data_block(reader.get(), &data, &count, &offset);
+  throw_if_benchmark_cancelled(cancellation);
+  if (observation_enabled) ++observation.read_blocks;
+  if (status == ARCHIVE_EOF) {
+   state.eof = true;
+   state.offset = current.bytes;
+   if (state.written != current.bytes && (!entry || archive_entry_sparse_count(entry) == 0)) throw BenchmarkArchiveError("truncated archive member: " + name);
+   return;
+  }
+  if (status != ARCHIVE_OK) failure(reader.get(), "cannot read archive member");
+  if (offset < 0 || static_cast<std::uint64_t>(offset) < state.written || static_cast<std::uint64_t>(offset) > current.bytes || count > current.bytes - static_cast<std::uint64_t>(offset))
+   throw BenchmarkArchiveError("archive data block exceeds member extent");
+  const auto address = reinterpret_cast<std::uintptr_t>(data), base = reinterpret_cast<std::uintptr_t>(block.data());
+  const bool borrowed = address >= base && address - base <= block_size && count <= block_size - (address - base);
+  if (state.contiguous && borrowed && static_cast<std::uint64_t>(offset) == state.written) {
+   const auto physical = checked_add(block_offset, address - base, "archive extent overflow");
+   if (!state.extent) state.extent = physical;
+   else state.contiguous = physical == *state.extent + state.written;
+  } else state.contiguous = false;
+  state.offset = static_cast<std::uint64_t>(offset);
+  state.pending = {static_cast<const std::uint8_t*>(data), count};
+ }
+ template <class Consumer>
+ std::uint64_t emit(MemberRead& state, std::uint64_t budget, Consumer&& consumer) {
+  const auto before = state.written;
+  while (budget && state.written < state.offset) {
+   throw_if_benchmark_cancelled(cancellation);
+   const auto count = std::min({budget, state.offset - state.written, static_cast<std::uint64_t>(kSparseZeros.size())});
+   consumer(std::span(kSparseZeros).first(count), state.written);
+   state.written += count;
+   budget -= count;
+  }
+  if (budget && !state.pending.empty()) {
+   throw_if_benchmark_cancelled(cancellation);
+   const auto count = std::min<std::uint64_t>(budget, state.pending.size());
+   consumer(state.pending.first(count), state.written);
+   state.pending = state.pending.subspan(count);
+   state.written += count;
+  }
+  return state.written - before;
+ }
+ void finish_member(const MemberRead& state) {
+  if (state.contiguous && state.extent && *state.extent <= file_size && current.bytes <= file_size - *state.extent) {
+   current.extent = state.extent;
+   auto& position = positions.at(name);
+   if (position.header == current.header) position.extent = state.extent;
+  }
+ }
  template <class Match>
  bool scan(Match&& match, Cancellation observed) {
   for (;;) {
@@ -446,14 +553,30 @@ struct BenchmarkArchive::Impl {
       found = true;
       break;
      }
+     if (observation_enabled) ++observation.skipped_headers;
     }
    });
    if (found || exhausted) return found;
   }
  }
- void cpu(const std::function<void()>& work) const {
+ void cpu(const std::function<void()>& work, bool read_turn = false) const {
+  const auto body = [&] {
+   detail::CompileObservationClock clock(observation_enabled, true);
+   const auto finish = [&] {
+    if (!observation_enabled) return;
+    const auto elapsed = clock.elapsed();
+    observation.body_cpu_ns += elapsed;
+    observation.cpu_incomplete |= clock.incomplete() || external_cpus;
+    if (read_turn) {
+     ++observation.read_turns;
+     observation.max_turn_cpu_ns = std::max(observation.max_turn_cpu_ns, elapsed);
+    }
+   };
+   try { work(); } catch (...) { finish(); throw; }
+   finish();
+  };
   if (execution && !external_cpus)
-   execution->run(CompileTaskKind::Archive, {}, [&](std::size_t) { work(); }, credits);
+   execution->run(CompileTaskKind::Archive, {}, [&](std::size_t) { body(); }, credits);
   else if (external_cpus) {
    // Native decoder workers inherit exactly the elastic CPUs held by this
    // allowance. Restore each caller's affinity across shared reader handoffs.
@@ -461,14 +584,14 @@ struct BenchmarkArchive::Impl {
    const auto granted = credits.cpus();
    mmltk::common::system::set_thread_affinity(std::vector<int>(granted.begin(), granted.end()));
    try {
-    work();
+    body();
    } catch (...) {
     mmltk::common::system::set_thread_affinity(previous);
     throw;
    }
    mmltk::common::system::set_thread_affinity(previous);
   } else
-   work();
+   body();
  }
 };
 BenchmarkArchive::InputRequirement BenchmarkArchive::input_requirement(const std::filesystem::path& path, std::uint64_t workspace, std::size_t workers) {
@@ -477,8 +600,8 @@ BenchmarkArchive::InputRequirement BenchmarkArchive::input_requirement(const std
  return {archive_workspace(compressed, std::max<std::size_t>(1, workers), workspace), compressed ? 2U : 1U};
 }
 BenchmarkArchive::BenchmarkArchive(const std::filesystem::path& path, CompileExecution* execution, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
- CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t consumer_descriptors, std::size_t gzip_index_entries)
-    : impl_(std::make_unique<Impl>(path, execution, workspace, parent, workers, verify_gzip_crc, std::move(workspace_allowance), retained_gzip_windows, consumer_descriptors, gzip_index_entries)) {}
+ CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t consumer_descriptors, std::size_t gzip_index_entries, const BenchmarkTraceSink& trace)
+    : impl_(std::make_unique<Impl>(path, execution, workspace, parent, workers, verify_gzip_crc, std::move(workspace_allowance), retained_gzip_windows, consumer_descriptors, gzip_index_entries, trace)) {}
 BenchmarkArchive::~BenchmarkArchive() = default;
 bool BenchmarkArchive::next(Cancellation cancellation) {
  restore(cancellation);
@@ -525,75 +648,73 @@ void BenchmarkArchive::consume(std::uint64_t limit, const std::function<void(std
  s.cancellation = cancellation;
  require_regular(limit);
  if (s.direct) {
+  s.validate_direct();
   const auto buffer = std::span(reinterpret_cast<std::uint8_t*>(s.block.data()), s.block.size());
   for (std::uint64_t offset = 0; offset < size();) {
    throw_if_benchmark_cancelled(cancellation);
    const auto count = std::min<std::uint64_t>(buffer.size(), size() - offset);
    s.file.pread_all(buffer.data(), count, *s.current.extent + offset);
+   if (s.observation_enabled) s.account_read(*s.current.extent + offset, count, *s.current.extent + offset, *s.current.extent + offset + count);
    consumer(buffer.first(count), offset);
    offset += count;
   }
   return;
  }
- std::uint64_t written = 0;
- std::optional<std::uint64_t> extent;
- bool contiguous = s.raw_tar;
- const auto hole = [&](std::uint64_t end) {
-  const std::array<std::uint8_t, 4096> zeros{};
-  while (written < end) {
-   const auto count = std::min<std::uint64_t>(end - written, zeros.size());
-   consumer(std::span(zeros).first(count), written);
-   written += count;
-  }
- };
- for (;;) {
-  throw_if_benchmark_cancelled(cancellation);
-  const void* data = nullptr;
-  std::size_t count = 0;
-  la_int64_t offset = 0;
-  int status = ARCHIVE_RETRY;
-  s.cpu([&] {
-   for (int retry = 0; retry < 8 && status == ARCHIVE_RETRY; ++retry) status = archive_read_data_block(s.reader.get(), &data, &count, &offset);
-  });
-  throw_if_benchmark_cancelled(cancellation);
-  if (status == ARCHIVE_EOF) break;
-  if (status != ARCHIVE_OK) failure(s.reader.get(), "cannot read archive member");
-  if (offset < 0 || static_cast<std::uint64_t>(offset) < written || static_cast<std::uint64_t>(offset) > size() || count > size() - static_cast<std::uint64_t>(offset))
-   throw BenchmarkArchiveError("archive data block exceeds member extent");
-  const auto address = reinterpret_cast<std::uintptr_t>(data), base = reinterpret_cast<std::uintptr_t>(s.block.data());
-  const bool borrowed = address >= base && address - base <= s.block_size && count <= s.block_size - (address - base);
-  if (contiguous && borrowed && static_cast<std::uint64_t>(offset) == written) {
-   const auto physical = checked_add(s.block_offset, address - base, "archive extent overflow");
-   if (!extent)
-    extent = physical;
-   else
-    contiguous = physical == *extent + written;
-  } else
-   contiguous = false;
-  hole(static_cast<std::uint64_t>(offset));
-  consumer({static_cast<const std::uint8_t*>(data), count}, written);
-  written += count;
- }
- if (written != size()) {
-  if (!s.entry || archive_entry_sparse_count(s.entry) == 0) throw BenchmarkArchiveError("truncated archive member: " + s.name);
-  hole(size());
- }
- if (contiguous && extent && *extent <= s.file_size && size() <= s.file_size - *extent) {
-  s.current.extent = extent;
-  auto& position = s.positions.at(s.name);
-  if (position.header == s.current.header) position.extent = extent;
- }
+ Impl::MemberRead state{.contiguous = s.raw_tar};
+ do {
+  s.cpu([&] { s.read_block(state); });
+  // Arbitrary consumers can admit, publish or wait; none holds a CPU grant.
+  (void)s.emit(state, std::numeric_limits<std::uint64_t>::max(), consumer);
+ } while (!state.eof);
+ s.finish_member(state);
 }
 void BenchmarkArchive::read_into(std::span<std::uint8_t> output, Cancellation cancellation) {
  restore(cancellation);
+ auto& s = *impl_;
+ s.cancellation = cancellation;
  if (size() != output.size()) throw BenchmarkArchiveError("archive member size disagrees with destination");
- if (impl_->direct) {
-  require_regular(output.size());
-  throw_if_benchmark_cancelled(cancellation);
-  impl_->file.pread_all(output.data(), output.size(), *impl_->current.extent);
-  return;
- }
- consume(output.size(), [&](std::span<const std::uint8_t> bytes, std::uint64_t offset) { std::memcpy(output.data() + offset, bytes.data(), bytes.size()); }, cancellation);
+ require_regular(output.size());
+ constexpr std::uint64_t turn_bytes = 1U << 20;
+ constexpr unsigned turn_blocks = 8;
+ Impl::MemberRead state{.contiguous = s.raw_tar};
+ if (s.direct) s.validate_direct();
+ do {
+  s.cpu([&] {
+   unsigned blocks = 0;
+   std::uint64_t copied = 0;
+   const auto copy = [&](std::span<const std::uint8_t> bytes, std::uint64_t offset) {
+    std::memcpy(output.data() + offset, bytes.data(), bytes.size());
+    if (s.observation_enabled) s.observation.copied_bytes += bytes.size();
+   };
+   while (copied < turn_bytes) {
+    throw_if_benchmark_cancelled(cancellation);
+    if (s.direct) {
+     if (state.written == size()) { state.eof = true; break; }
+     if (blocks == turn_blocks) break;
+     const auto count = std::min({static_cast<std::uint64_t>(kBlock), size() - state.written, turn_bytes - copied});
+     s.file.pread_all(output.data() + state.written, count, *s.current.extent + state.written);
+     if (s.observation_enabled) {
+      s.account_read(*s.current.extent + state.written, count, *s.current.extent + state.written, *s.current.extent + state.written + count);
+      s.observation.copied_bytes += count;
+      ++s.observation.read_blocks;
+     }
+     state.written += count;
+     copied += count;
+     ++blocks;
+     continue;
+    }
+    copied += s.emit(state, turn_bytes - copied, copy);
+    if (state.eof || copied == turn_bytes || blocks == turn_blocks) break;
+    s.read_block(state);
+    ++blocks;
+   }
+   if (s.observation_enabled) {
+    s.observation.max_turn_blocks = std::max<std::uint64_t>(s.observation.max_turn_blocks, blocks);
+    s.observation.max_turn_bytes = std::max(s.observation.max_turn_bytes, copied);
+   }
+  }, true);
+ } while (!state.eof || state.written != size());
+ if (!s.direct) s.finish_member(state);
 }
 std::span<const std::uint8_t> BenchmarkArchive::read(std::uint64_t limit, Cancellation cancellation) {
  restore(cancellation);
@@ -702,18 +823,36 @@ void BenchmarkArchive::restore(Cancellation cancellation) {
 }
 void BenchmarkArchive::pause() noexcept {
  auto& s = *impl_;
+ if (s.reader && s.observation_enabled) {
+  ++s.observation.suspensions;
+  if (s.observation.suspensions <= 8) trace_benchmark_event(s.trace, "benchmark.archive.suspended", [&] {
+   auto fields = benchmark_observation_fields(s.observation);
+   fields["source"] = s.source;
+   fields["member"] = s.name;
+   return fields;
+  });
+ }
  s.reader.reset();
  s.entry = nullptr;
  s.gzip.reset();
  s.streaming.reset();
+ s.decoder_allowance.retire_descriptors();
  s.decoder_allowance = {};
  std::vector<std::uint8_t>().swap(s.bytes);
  std::vector<char>().swap(s.block);
- if (s.owns_workspace) s.credits.retire_workspace();
+ if (s.owns_workspace) { s.credits.retire_workspace(); s.credits.retire_descriptors(); }
  s.credits = {};
  s.supplied_workspace = {};
  s.external_cpus = false;
 }
+bool BenchmarkArchive::reclamation_useful() const {
+ const auto& s = *impl_;
+ return s.reader && s.execution && s.execution->reclamation_useful(s.owns_workspace ? s.credits : CompileAllowance{}, s.decoder_allowance);
+}
+CompileResources BenchmarkArchive::resume_requirement(std::uint64_t workspace, std::size_t consumer_descriptors) const {
+ return {archive_workspace(impl_->compressed, 1, workspace), impl_->compressed ? 1U : 0U, consumer_descriptors == 0, 0, false, consumer_descriptors};
+}
+BenchmarkArchiveObservation BenchmarkArchive::observation() const { return impl_->observation; }
 void BenchmarkArchive::resume(std::uint64_t workspace, const CompileAllowance& parent, std::size_t consumer_descriptors) {
  if (impl_->reader) throw std::logic_error("archive continuation handoff requires a paused reader");
  impl_->parent_allowance = parent;
@@ -727,7 +866,7 @@ bool BenchmarkArchive::try_resume(std::uint64_t workspace, const CompileAllowanc
   resume(workspace, parent, consumer_descriptors);
   return true;
  }
- auto admitted = s.execution->try_reserve({archive_workspace(s.compressed, 1, workspace), s.compressed ? 1U : 0U, consumer_descriptors == 0, 0, false, consumer_descriptors}, parent);
+ auto admitted = s.execution->try_reserve(resume_requirement(workspace, consumer_descriptors), parent);
  if (!admitted) return false;
  auto previous_parent = std::exchange(s.parent_allowance, parent);
  s.consumer_descriptors = consumer_descriptors;

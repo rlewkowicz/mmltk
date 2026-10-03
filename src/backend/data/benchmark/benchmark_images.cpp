@@ -207,7 +207,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  std::unique_ptr<BenchmarkArchive> archive_reader;
  CompileAllowance directory_allowance;
  const auto quiesce = [&] {
-  if (archive_reader && request.execution && request.execution->execution().resource_pressure()) archive_reader->suspend(directory_allowance);
+  if (archive_reader && archive_reader->reclamation_useful()) archive_reader->suspend(directory_allowance);
  };
  BenchmarkCompletionWindow pixels(
   request.execution ? std::clamp<std::size_t>(request.execution->execution().workers() * 2, 2, 64) : 1, request.execution ? &request.execution->execution() : nullptr, quiesce);
@@ -297,7 +297,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  std::unordered_map<std::uint64_t, std::uint64_t> required_positions;
  required_positions.reserve(pending_writes);
  archive_reader =
-  std::make_unique<BenchmarkArchive>(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), 0, directory_allowance, request.decompression_workers, true);
+  std::make_unique<BenchmarkArchive>(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), 0, directory_allowance, request.decompression_workers, true, CompileAllowance{}, 1024, 0, 32768, request.trace);
  auto& reader = *archive_reader;
  BenchmarkImagePublication write_pool(
   request.output_root, request.cancel_requested, request.storage, directory_allowance, request.execution, output_directory.get(), request.retain_encoded, reader, request.trace);

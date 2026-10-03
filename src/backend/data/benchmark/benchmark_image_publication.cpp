@@ -3,6 +3,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/detail/file_work_queue.h"
 #include <optional>
+#include <array>
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -31,7 +32,7 @@ BenchmarkImagePublication::BenchmarkImagePublication(std::filesystem::path outpu
       reader_(reader),
       trace_(trace),
       writes_(execution ? std::clamp<std::size_t>(execution->execution().workers() * 2, 2, 8) : 1, execution ? &execution->execution() : nullptr, [this] {
-       if (execution_ && execution_->execution().resource_pressure()) reader_.suspend(parent_);
+       if (reader_.reclamation_useful()) reader_.suspend(parent_);
       }) {
  buffers_->free = execution ? std::clamp<std::size_t>(execution->execution().workers() * 2, 2, 8) : 1;
  if (execution) {
@@ -74,7 +75,7 @@ BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t 
    break;
   }
   lock.unlock();
-  if (execution_ && execution_->execution().resource_pressure()) reader_.suspend(parent_);
+  if (reader_.reclamation_useful()) reader_.suspend(parent_);
   trace_benchmark_event(trace_, "benchmark.images.buffer_wait", [&] { return nlohmann::json{{"member", reader_.member()}, {"bytes", size}, {"decoder_bytes", reader_.retained_workspace_bytes()}}; });
   if (!execution_) throw std::logic_error("standalone image input did not retire synchronously");
   buffer_readiness_->wait(observed);
@@ -109,18 +110,22 @@ BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t 
      // The output descriptor and pinned input are unaccepted local custody.
      // A paused decoder joins that same input lineage nonblockingly before
      // either owner can wait behind a newly ready exclusive consumer.
-     auto output = owner.try_reserve(CompileResources::handles(1, true), parent_);
+     auto failed = CompileResources::handles(1, true);
+     const CompileAllowance* failed_parent = &parent_;
+     auto output = owner.try_reserve(failed, parent_);
      if (output) {
       input->output = std::move(*output);
-      auto granted = owner.try_reserve({.bytes = size,
-                                        .continuation_descriptors = active_decoder ? 0U : 1U,
-                                        .supplied_workspace = true,
-                                        .workspace_class = detail::CompileWorkClass::Extraction,
-                                        .workspace_window = detail::CompileWorkspaceWindow::SharedSource},
-       parent_);
+      failed = {.bytes = size,
+                .continuation_descriptors = active_decoder ? 0U : 1U,
+                .supplied_workspace = true,
+                .workspace_class = detail::CompileWorkClass::Extraction,
+                .workspace_window = detail::CompileWorkspaceWindow::SharedSource};
+      auto granted = owner.try_reserve(failed, parent_);
       if (granted) {
        input->allowance = std::move(*granted);
        if (!active_decoder) trace_benchmark_event(trace_, "benchmark.images.decoder_admission", [&] { return nlohmann::json{{"member", reader_.member()}, {"bytes", size}}; });
+       failed = reader_.resume_requirement(0);
+       failed_parent = &input->allowance;
        if (active_decoder || reader_.try_resume(0, input->allowance)) {
         input->restored_decoder = !active_decoder;
         attempt.commit();
@@ -129,15 +134,20 @@ BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t 
       }
      }
      if (trace_.accepts("benchmark.images.input_pressure")) trace_compile_execution(trace_, "benchmark.images.input_pressure", owner.snapshot());
-     reader_.suspend(parent_);
+     const auto retry = [&] {
+      const std::array returning{input->allowance, input->output};
+      return owner.retry_custody(failed, returning, *failed_parent, parent_);
+     }();
      input->allowance = {};
      input->output = {};
-     // Self-induced pressure must quiesce even before a resource waiter exists.
+     // Advertise only the failed draw after rolling back every unaccepted
+     // input/output. Arena fragmentation cannot benefit from decoder bytes.
      trace_benchmark_event(trace_, "benchmark.images.input_wait", [&] { return nlohmann::json{{"member", reader_.member()}, {"bytes", size}}; });
-     pressure = owner.defer_resources();
-     // Retiring our live decoder can itself make the complete draw fit. Probe
-     // once again; subsequent failed draws wait only for external readiness.
-     retry_after_quiesce = active_decoder;
+     pressure = owner.defer_resources(failed, parent_, retry);
+     retry_after_quiesce = active_decoder && reader_.reclamation_useful();
+     if (retry_after_quiesce) reader_.suspend(parent_);
+     // A useful physical retirement warrants one retry. Otherwise wait for
+     // external readiness, including a changed draw while pressure stays set.
     }
     if (retry_after_quiesce) continue;
     std::unique_lock lock(resource_mutex_);
@@ -183,7 +193,7 @@ void BenchmarkImagePublication::submit(std::uint64_t id, Input admitted_input, B
    // busy; under resource pressure release and replay this exact opened member.
    trace_benchmark_event(trace_, "benchmark.images.file_wait", [&] { return nlohmann::json{{"image_id", id}, {"member", reader_.member()}, {"decoder_bytes", reader_.retained_workspace_bytes()}}; });
    if (owner.resource_pressure()) {
-    reader_.suspend(parent_);
+    if (reader_.reclamation_useful()) reader_.suspend(parent_);
     const auto position = reader_.member_position();
     const auto size = admitted_input->encoded.size();
     admitted_input.reset();

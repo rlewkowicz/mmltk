@@ -1,4 +1,5 @@
 #include "src/backend/data/tests/profile_support.h"
+#include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
@@ -7,6 +8,7 @@
 #include "src/backend/data/detail/compile_workspace.h"
 #include "src/backend/data/detail/compile_pixel_workspace.h"
 #include "src/common/io/staging_directory.h"
+#include "src/common/io/file_digest.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
 #include <array>
@@ -44,7 +46,74 @@ public:
  }
 };
 }
+// Focused archive input variant uses the same production transport/admission
+// owners and bounded fixture inventory; it never downloads a source.
+static void run_archive_input_profile(const Options& opts, std::span<const ProfileImageFixture> inputs, const BenchmarkTraceSink& trace) {
+ using namespace detail;
+ using namespace benchmark_internal;
+ const auto setup = Clock::now();
+ const auto order = profile_order(opts, inputs.size());
+ fs::create_directories(opts.test_dir);
+ mmltk::common::io::StagingDirectory fixture(fs::path(opts.test_dir) / "archive", ".", ".XXXXXX", "cannot create bounded archive fixture");
+ const auto path = fixture.path() / "source.tar.gz";
+ const auto names = profile_archive_fixture(path, inputs, order, 64U << 20);
+ const auto source_hash = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, {}, 0, 0, 8U << 20));
+ CompileExecution execution(profile_workers(opts), {}, {.transient_bytes = 32U << 20, .workspace_plan = plan}, {}, observe_compile_execution(trace));
+ std::uint64_t copied = 0, reclaimed = 0, pressure_checks = 0;
+ const auto started = Clock::now();
+ {
+  BenchmarkArchive reader(path, &execution, 0, {}, 1, true, {}, 1024, 0, 32768, trace);
+  std::vector<std::uint8_t> output;
+  for (std::size_t i = 0; i < order.size(); ++i) {
+   if (!reader.next() || reader.member() != names[i]) throw std::runtime_error("archive profile lost source ordering");
+   if (i && i % 16 == 0 && opts.archive_pressure != ProfileArchivePressure::None) {
+    CompileResources demand;
+    CompileAllowance held;
+    switch (opts.archive_pressure) {
+     case ProfileArchivePressure::Arena:
+      demand = {.bytes = execution.workspace_capacity(), .supplied_workspace = true};
+      held = execution.reserve(demand);
+      break;
+     case ProfileArchivePressure::Bytes:
+      held = execution.reserve({.bytes = execution.transient_target() - reader.allowance().bytes()});
+      demand = {.bytes = 1};
+      break;
+     case ProfileArchivePressure::Exclusive:
+      demand = {.bytes = execution.workspace_capacity() + 1, .supplied_workspace = true};
+      break;
+     case ProfileArchivePressure::None: break;
+    }
+    if (execution.try_reserve(demand)) throw std::runtime_error("archive profile pressure was not blocked");
+    auto wait = execution.defer_resources(demand);
+    ++pressure_checks;
+    if (reader.reclamation_useful()) { reader.suspend(); ++reclaimed; }
+    held = {};
+    auto accepted = execution.try_reserve(demand);
+    if (!accepted) throw std::runtime_error("archive profile competing demand did not progress");
+    execution.run(CompileTaskKind::Pixels, {}, [](std::size_t) {}, *accepted);
+   }
+   output.resize(inputs[order[i]].encoded.size());
+   reader.read_into(output);
+   if (!std::ranges::equal(output, inputs[order[i]].encoded)) throw std::runtime_error("archive profile changed member bytes");
+   copied += output.size();
+  }
+  reader.pause();
+ }
+ execution.join();
+ const auto remaining = execution.resource_usage();
+ if (remaining.bytes || remaining.descriptors || remaining.continuation_descriptors) throw std::runtime_error("archive profile retained resource custody");
+ const auto ended = Clock::now();
+ nlohmann::json result{{"members", order.size()}, {"compressed_bytes", fs::file_size(path)}, {"source_sha256", source_hash}, {"copied_bytes", copied}, {"pressure_checks", pressure_checks}, {"reclaimed", reclaimed},
+  {"pressure", std::string(mmltk::frameworks::reflection::enum_name(opts.archive_pressure))}, {"setup_sec", seconds_since(setup, started)}, {"read_sec", seconds_since(started, ended)},
+  {"input_order", order}};
+ std::printf("archive_profile %s\n", result.dump().c_str());
+ trace_benchmark_event(trace, "profile.archive.completed", [&] { return result; });
+ record_duration_metric("archive", "setup", setup, started);
+ record_duration_metric("archive", "read", started, ended);
+}
 void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixture> inputs, const BenchmarkTraceSink& trace) {
+ if (opts.input_storage == ProfileInputStorage::Archive) { run_archive_input_profile(opts, inputs, trace); return; }
  using namespace benchmark_internal;
  using namespace detail;
  using namespace mmltk::backend::imaging::resample;

@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/common/types/cancellation_observation.h"
 #include <array>
@@ -21,6 +22,15 @@ class BenchmarkArchiveError : public std::runtime_error {
 public:
  using std::runtime_error::runtime_error;
 };
+struct BenchmarkArchiveObservation {
+ std::uint64_t decoder_opens = 0, suspensions = 0, restores = 0;
+ // Decoder cursor bytes consumed; parallel prefetch is not physical I/O evidence.
+ std::uint64_t forward_source_bytes = 0, replay_source_bytes = 0, forward_decoded_bytes = 0, replay_decoded_bytes = 0;
+ std::uint64_t skipped_headers = 0, copied_bytes = 0, read_blocks = 0, read_turns = 0, max_turn_blocks = 0, max_turn_bytes = 0;
+ std::uint64_t body_cpu_ns = 0, max_turn_cpu_ns = 0;
+ bool cpu_incomplete = false;
+};
+MMLTK_REFLECT_FIELDS(BenchmarkArchiveObservation)
 // One opened inode and decoder generation. Positions and gzip dictionary/bit
 // state belong to this owner; no index export or validation walk finishes EOF.
 class BenchmarkArchive final {
@@ -33,7 +43,7 @@ public:
  };
  [[nodiscard]] static InputRequirement input_requirement(const std::filesystem::path&, std::uint64_t consumer_workspace, std::size_t gzip_workers = 1);
  explicit BenchmarkArchive(const std::filesystem::path&, CompileExecution* = nullptr, std::uint64_t workspace = 0, const CompileAllowance& parent = {}, std::size_t gzip_workers = 1,
-  bool verify_gzip_crc = true, CompileAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768);
+  bool verify_gzip_crc = true, CompileAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768, const BenchmarkTraceSink& trace = {});
  ~BenchmarkArchive();
  BenchmarkArchive(const BenchmarkArchive&) = delete;
  BenchmarkArchive& operator=(const BenchmarkArchive&) = delete;
@@ -71,6 +81,12 @@ public:
  // Release decoder/buffer capacity between discovery and later consumption.
  // The opened inode and encountered positions stay bound to this generation.
  void pause() noexcept;
+ // This reader contributes only storage/descriptors physically destroyed by
+ // pause; the opened source file and borrowed parent workspace remain live.
+ [[nodiscard]] bool reclamation_useful() const;
+ [[nodiscard]] detail::CompileResources resume_requirement(std::uint64_t workspace, std::size_t consumer_descriptors = 0) const;
+ // Effect-only aggregates are zero when their trace events were not selected.
+ [[nodiscard]] BenchmarkArchiveObservation observation() const;
  // Quiesce an active forward cursor under resource pressure. The next read or
  // advance restores this exact consumed position on the retained inode.
  // Retirement allocates nothing: the cursor borrows this owner's stable member

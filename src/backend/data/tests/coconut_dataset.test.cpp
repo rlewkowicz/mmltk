@@ -5046,6 +5046,8 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
  CHECK(input.member() == name);
  auto first = input.read(1024);
  CHECK(std::string(first.begin(), first.end()) == members[0].second);
+ CHECK(input.observation().read_turns == 0);
+ CHECK(input.observation().body_cpu_ns == 0);
  const auto first_position = input.member_position();
  {
   BenchmarkArchive resumed(path);
@@ -5179,9 +5181,9 @@ TEST_CASE("archive consumed-member checks retain sparse payloads and reject requ
  ScopedTempDir root("archive-member-boundaries");
  const auto path = root.path() / "members.tar";
  SECTION("PAX sparse payloads retain logical holes through a late reread") {
-  std::string bytes(8192, '\0');
+  std::string bytes((2U << 20) + 8192, '\0');
   bytes.replace(0, 4, "head");
-  bytes.replace(8188, 4, "tail");
+  bytes.replace(bytes.size() - 4, 4, "tail");
   std::unique_ptr<archive, decltype(&archive_write_free)> output(archive_write_new(), archive_write_free);
   REQUIRE(archive_write_set_format_pax(output.get()) == ARCHIVE_OK);
   REQUIRE(archive_write_open_filename(output.get(), path.c_str()) == ARCHIVE_OK);
@@ -5191,7 +5193,7 @@ TEST_CASE("archive consumed-member checks retain sparse payloads and reject requ
   archive_entry_set_perm(entry.get(), 0600);
   archive_entry_set_size(entry.get(), bytes.size());
   archive_entry_sparse_add_entry(entry.get(), 0, 4);
-  archive_entry_sparse_add_entry(entry.get(), 8188, 4);
+  archive_entry_sparse_add_entry(entry.get(), bytes.size() - 4, 4);
   REQUIRE(archive_write_header(output.get(), entry.get()) == ARCHIVE_OK);
   REQUIRE(archive_write_data(output.get(), bytes.data(), bytes.size()) == static_cast<la_ssize_t>(bytes.size()));
   REQUIRE(archive_write_close(output.get()) == ARCHIVE_OK);
@@ -11394,4 +11396,123 @@ TEST_CASE("admitted physical headers recover labels before the same image finish
  CHECK(retired_rows.load() == 1);
  CHECK(gathered_validation.load() == 0);
  CHECK(writer.completed() == 1);
+}
+
+TEST_CASE("bounded gzip read turns preserve members and yield one CPU to a peer", "[benchmark][coconut][archive][resources]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace mmltk::backend::data::testsupport;
+ using mmltk::common::concurrency::CancellationObservation;
+ ScopedTempDir root("archive-copy-turns");
+ const std::array inputs{profile_image_fixture(641, 641, FixtureImageEncoding::Png), profile_image_fixture(29, 31, FixtureImageEncoding::Jpeg)};
+ REQUIRE(inputs[0].encoded.size() > (1U << 20));
+ std::vector<std::size_t> order(32, 1);
+ order[0] = 0;
+ const auto path = root.path() / "source.tar.gz";
+ const auto names = profile_archive_fixture(path, inputs, order);
+ CompileExecution execution(1, {}, {.transient_bytes = 8U << 20});
+ const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.archive."}), [](std::string_view, const Json&) {}};
+ BenchmarkArchive input(path, &execution, 0, {}, 1, true, {}, 1024, 0, 32768, trace);
+ REQUIRE(input.next());
+ CHECK(input.member() == names.front());
+ mmltk::testsupport::TestGate copying("archive entered its first bounded read grant");
+ struct Boundary {
+  std::function<void()> entered;
+  mutable std::atomic<bool> first{true};
+  bool cancelled() const noexcept { if (first.exchange(false)) entered(); return false; }
+ } boundary{[&] { copying.receipt().ArriveAndWait(); }};
+ std::vector<std::uint8_t> bytes(inputs[0].encoded.size());
+ auto reading = std::async(std::launch::async, [&] { input.read_into(bytes, CancellationObservation::Borrow(boundary)); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { copying.Release(); });
+ REQUIRE(copying.WaitEntered(5s));
+ std::uint64_t peer_turn = 0;
+ auto peer = execution.submit({.kind = CompileTaskKind::Pixels, .work = [&](std::size_t, const CompileAllowance&) { peer_turn = input.observation().read_turns; }});
+ copying.Release();
+ peer.wait();
+ mmltk::testsupport::await_test_future(reading, "multi-block copy yields bounded archive grants", 5s);
+ CHECK(std::ranges::equal(bytes, inputs[0].encoded));
+ auto evidence = input.observation();
+ CHECK(peer_turn >= 1);
+ CHECK(peer_turn < evidence.read_turns);
+ CHECK(evidence.read_turns < evidence.read_blocks);
+ CHECK(evidence.max_turn_blocks <= 8);
+ CHECK(evidence.max_turn_bytes <= (1U << 20));
+ CHECK(evidence.copied_bytes == bytes.size());
+ for (std::size_t i = 1; i < order.size(); ++i) {
+  REQUIRE(input.next());
+  REQUIRE(input.member() == names[i]);
+  bytes.resize(inputs[order[i]].encoded.size());
+  input.read_into(bytes);
+  CHECK(std::ranges::equal(bytes, inputs[order[i]].encoded));
+ }
+ // Cancellation interrupts real prefix replay, then the same retained source
+ // generation can restore and consume the last member successfully.
+ input.suspend();
+ struct CancelReplay {
+  mutable unsigned checks = 0;
+  bool cancelled() const noexcept { return ++checks > 20; }
+ } cancellation;
+ CHECK_THROWS(input.read_into(bytes, CancellationObservation::Borrow(cancellation)));
+ CHECK(input.retained_workspace_bytes() == 0);
+ input.read_into(bytes);
+ CHECK(std::ranges::equal(bytes, inputs.back().encoded));
+ // The arbitrary callback remains outside the Archive CPU grant and may
+ // reserve work through the same execution owner without recursive waiting.
+ REQUIRE(input.seek(names.back()));
+ std::size_t consumed = 0;
+ input.consume(bytes.size(), [&](std::span<const std::uint8_t> block, std::uint64_t offset) {
+  CHECK_FALSE(execution.on_lane());
+  auto admitted = execution.reserve({.bytes = 1});
+  CHECK(std::ranges::equal(block, std::span(inputs.back().encoded).subspan(offset, block.size())));
+  consumed += block.size();
+ });
+ CHECK(consumed == bytes.size());
+ evidence = input.observation();
+ CHECK(evidence.restores >= 2);
+ CHECK(evidence.replay_decoded_bytes > 0);
+ CHECK(evidence.replay_source_bytes > 0);
+ CHECK(evidence.skipped_headers >= order.size() - 1);
+ input.pause();
+ CHECK(execution.resource_usage().descriptors == 1);
+ CHECK(input.retained_workspace_bytes() == 0);
+}
+TEST_CASE("borrowed archive workspace stays charged while explicit and exclusive retirement close decoders", "[benchmark][coconut][archive][resources]") {
+ using namespace mmltk::backend::data::detail;
+ ScopedTempDir root("archive-physical-custody");
+ const auto path = root.path() / "source.tar.gz";
+ const std::array<std::pair<std::string, std::string>, 1> members{{{"member.bin", "physical decoder custody"}}};
+ tar(path, members);
+ CompileExecution execution(1, {}, {.transient_bytes = 8U << 20});
+ SECTION("borrowed pinned envelope is not returned by local alias reset") {
+  auto supplied = execution.reserve({.bytes = 4U << 20, .supplied_workspace = true});
+  BenchmarkArchive input(path, &execution, 0, {}, 1, true, supplied);
+  auto occupied = execution.reserve({.bytes = 4U << 20});
+  auto wait = execution.defer_resources({.bytes = 1});
+  CHECK_FALSE(input.reclamation_useful());
+  input.suspend();
+  CHECK(supplied.workspace().size() == (4U << 20));
+  CHECK(execution.resource_usage().bytes >= (8U << 20));
+  CHECK(execution.resource_usage().descriptors == 1);
+ }
+ SECTION("oversized workspace drains even when one decoder is smaller than the request") {
+  BenchmarkArchive input(path, &execution);
+  const CompileResources demand{.bytes = 9U << 20, .supplied_workspace = true};
+  REQUIRE_FALSE(execution.try_reserve(demand));
+  auto wait = execution.defer_resources(demand);
+  CHECK(execution.oversized_workspace_pending());
+  REQUIRE(input.reclamation_useful());
+  input.suspend();
+  auto accepted = execution.try_reserve(demand);
+  REQUIRE(accepted);
+  CHECK(accepted->exceptional_workspace());
+  CHECK(execution.resource_usage().descriptors == 1);
+  accepted.reset();
+  wait.reset();
+  REQUIRE(input.try_resume(0));
+  REQUIRE(input.next());
+  const auto payload = input.read(1024);
+  CHECK(std::string(payload.begin(), payload.end()) == members.front().second);
+  input.pause();
+ }
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
 }
