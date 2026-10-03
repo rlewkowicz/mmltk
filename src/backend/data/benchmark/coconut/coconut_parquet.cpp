@@ -740,7 +740,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     if (!state.initialized) {
      std::uint64_t inspected = 0;
      const bool ready = std::ranges::all_of(rows, [&](const auto& row) {
-      if (trace) ++inspected;
+      if (trace.accepts("benchmark.coconut.metadata_readiness")) ++inspected;
       return row.metadata_ready();
      });
      trace_benchmark_event(

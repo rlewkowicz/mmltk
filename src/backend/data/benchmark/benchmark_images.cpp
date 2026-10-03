@@ -259,14 +259,14 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  std::size_t inspected = 0U;
  for (const std::uint64_t image_id : request.selected_image_ids) {
   throw_if_benchmark_cancelled(request.cancel_requested);
-  if (request.trace && inspected != 0U && inspected % 128U == 0U) {
+  if (request.trace.accepts("benchmark.images.cache_scan") && inspected != 0U && inspected % 128U == 0U) {
    trace_benchmark_event(request.trace, "benchmark.images.cache_scan", [&] {
     return nlohmann::json{
      {"source", request.source}, {"shard", request.shard}, {"inspected_images", inspected}, {"reused_images", completed.size()}, {"total_images", request.selected_image_ids.size()}
     };
    });
   }
-  if (request.trace) { ++inspected; }
+  if (request.trace.accepts("benchmark.images.cache_scan")) { ++inspected; }
   auto allowance = request.execution ? request.execution->execution().reserve(CompileResources::handles(1, true), directory_allowance) : CompileAllowance{};
   std::shared_ptr<const BenchmarkEncodedImage> payload;
   try {
@@ -308,7 +308,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  while (scheduled.size() < pending_writes) {
   throw_if_benchmark_cancelled(request.cancel_requested);
   if (!reader.next(request.cancel_requested)) break;
-  if (request.trace && (++inspected_headers % 1024U == 0U)) {
+  if (request.trace.accepts("benchmark.archive.scan") && (++inspected_headers % 1024U == 0U)) {
    trace_benchmark_event(request.trace, "benchmark.archive.scan", [&] {
     return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_headers", inspected_headers}, {"scheduled_images", scheduled.size()}, {"reused_images", completed.size()}};
    });

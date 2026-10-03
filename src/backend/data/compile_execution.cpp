@@ -8,9 +8,10 @@
 #include <array>
 #include <cerrno>
 #include <condition_variable>
+#include <cstddef>
 #include <dirent.h>
+#include <iterator>
 #include <limits>
-#include <list>
 #include <mutex>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -99,7 +100,8 @@ struct CompileExecution::Job {
   Job* next = nullptr;
   bool linked = false;
  };
- Link exceptional;
+ Link exceptional, active, ready;
+ std::size_t record = 0;
  bool retained = false;
  CompileTaskKind successor = CompileTaskKind::Count;
 };
@@ -186,14 +188,6 @@ struct CompileExecution::Impl {
  std::vector<int> cpus;
  std::vector<Lane> lanes;
  std::array<Class, class_count> classes;
- struct ReadyQueue {
-  std::list<std::shared_ptr<Job>> jobs;
-  decltype(jobs)::iterator fallback = jobs.end();
-  auto erase(decltype(jobs)::iterator position) {
-   if (fallback == position) fallback = std::next(position);
-   return jobs.erase(position);
-  }
- };
  // Nonowning indexes of existing bounded records. No per-probe allocation or
  // full-bank discovery is needed for exceptional drainage or aged byte demand.
  template <class Entry>
@@ -201,6 +195,23 @@ struct CompileExecution::Impl {
   typename Entry::Link Entry::* link;
   Entry* head = nullptr;
   Entry* tail = nullptr;
+  std::size_t count = 0;
+  [[nodiscard]] std::size_t size() const noexcept { return count; }
+  [[nodiscard]] bool empty() const noexcept { return !head; }
+  struct Iterator {
+   using value_type = Entry*;
+   using difference_type = std::ptrdiff_t;
+   using iterator_concept = std::input_iterator_tag;
+   using iterator_category = std::input_iterator_tag;
+   Entry* value = nullptr;
+   typename Entry::Link Entry::* link = nullptr;
+   Entry* operator*() const noexcept { return value; }
+   Iterator& operator++() noexcept { value = (value->*link).next; return *this; }
+   Iterator operator++(int) noexcept { auto previous = *this; ++*this; return previous; }
+   bool operator==(const Iterator&) const noexcept = default;
+  };
+  Iterator begin() const noexcept { return {head, link}; }
+  Iterator end() const noexcept { return {nullptr, link}; }
   void remove(Entry& job) noexcept {
    auto& value = job.*link;
    if (!value.linked) return;
@@ -213,6 +224,7 @@ struct CompileExecution::Impl {
    else
     tail = value.previous;
    value = {};
+   --count;
   }
   void append(Entry& job) noexcept {
    auto& value = job.*link;
@@ -224,6 +236,7 @@ struct CompileExecution::Impl {
    else
     head = &job;
    tail = &job;
+   ++count;
   }
  };
  DemandQueue<Job> exceptional{&Job::exceptional};
@@ -283,16 +296,25 @@ struct CompileExecution::Impl {
   }
   admission->change_waiters(false, waiting.pressure);
  }
+ struct ReadyQueue {
+  DemandQueue<Job> jobs{&Job::ready};
+  Job* fallback = nullptr;
+  void erase(Job& job) noexcept {
+   if (fallback == &job) fallback = job.ready.next;
+   jobs.remove(job);
+  }
+ };
  std::array<ReadyQueue, kind_count> ready;
- std::list<std::shared_ptr<Job>> jobs;
+ DemandQueue<Job> jobs{&Job::active};
+ std::vector<std::shared_ptr<Job>> record_bank;
  std::vector<std::shared_ptr<Job>> available_records;
  std::vector<std::shared_ptr<Readiness::State>> observers;
  std::size_t cursor = 0, record_limit = 0, services = 0;
  std::uint64_t admitted = 0, completed = 0;
  std::array<std::uint64_t, kind_count> task_completed{}, task_duration_ns{}, task_max_duration_ns{};
  std::array<std::uint64_t, kind_count> task_body_ns{}, task_cpu_ns{}, ready_to_start_ns{};
- CompileExecutionCosts costs{};
- bool stopping = false, shutdown = false, floors = true, withdrawal_pending = false;
+ mutable CompileExecutionCosts costs{};
+ bool stopping = false, shutdown = false, floors = true, withdrawal_pending = false, event_armed = false;
  std::array<std::size_t, class_count> service_waiters{};
  std::exception_ptr failure;
  std::exception_ptr cancellation_error = std::make_exception_ptr(std::runtime_error("dataset compilation cancelled"));
@@ -302,9 +324,15 @@ struct CompileExecution::Impl {
  mmltk::common::io::ScopedFd event;
  std::jthread notifier;
  std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
+ void arm_locked() noexcept {
+  if (event_armed || event.get() < 0) return;
+  event_armed = true;
+  if (observer.demand().aggregates) ++costs.eventfd_writes;
+  signal_event(event.get());
+ }
  void publish_locked(CompileChange change) noexcept {
   if (includes(change, CompileChange::Interruption)) withdrawal_pending = true;
-  bool wake = bool(observer) || shutdown || stopping || includes(change, CompileChange::Interruption);
+  bool wake = observer.demand().snapshots || shutdown || stopping || includes(change, CompileChange::Interruption);
   for (const auto& state : observers) {
    const auto delivered = state->interests & change;
    if (delivered == CompileChange::None) continue;
@@ -323,7 +351,7 @@ struct CompileExecution::Impl {
      state->pending.retry = true;
    }
   }
-  if (wake && event.get() >= 0) signal_event(event.get());
+  if (wake) arm_locked();
  }
  void notify_locked(CompileAdmission::Change change = CompileAdmission::Change::Cpu) noexcept { admission->notify(change); }
  void park(Job& job, CompileParkReason reason) noexcept {
@@ -497,19 +525,20 @@ struct CompileExecution::Impl {
   return jobs.size() < record_limit - protected_records ? all : protected_classes;
  }
  [[nodiscard]] bool has_record(CompileTaskKind kind) const noexcept { return record_capacity() & (std::uint32_t{1} << index(work_class(kind))); }
- [[nodiscard]] std::shared_ptr<Job> claim_record(std::shared_ptr<CompletionState> completion) {
+ [[nodiscard]] std::shared_ptr<Job> claim_record(std::shared_ptr<CompletionState> completion) noexcept {
   auto job = available_records.back();
-  jobs.push_back(job);  // The only fallible mutation precedes published custody.
   available_records.pop_back();
+  const auto record = job->record;
   *job = Job{};
+  job->record = record;
+  jobs.append(*job);
   completion->job = job;
   job->completion = std::move(completion);
   return job;
  }
  void enqueue(const std::shared_ptr<Job>& job) {
-  // Complete the only fallible queue mutation before publishing demand custody.
-  ready[static_cast<std::size_t>(job->task.kind)].jobs.push_back(job);
-  if (observer) job->ready_at = std::chrono::steady_clock::now();
+  ready[static_cast<std::size_t>(job->task.kind)].jobs.append(*job);
+  if (observer.demand().aggregates) job->ready_at = std::chrono::steady_clock::now();
   park(*job, CompileParkReason::None);
   job->demand = Demand{.resources = job->task.resources, .parent = job->task.parent, .finite_consumer = job->task.finite_consumer};
   if (!job->task.allowance && admission->oversized(job->task.resources)) exceptional.append(*job);
@@ -517,11 +546,11 @@ struct CompileExecution::Impl {
  void recycle(const std::shared_ptr<Job>& job) noexcept {
   unindex(*job);
   --classes[index(work_class(job->task.kind))].pending;
-  jobs.remove(job);
+  jobs.remove(*job);
   if (draining_request == job.get()) drain(nullptr, nullptr, 0);
   job->done = true;
   available_records.push_back(job);
-  if (observer) ++completed;
+  if (observer.demand().aggregates) ++completed;
   reconcile();
   notify_locked(CompileChange::Records | CompileChange::Cpu);
  }
@@ -547,7 +576,7 @@ struct CompileExecution::Impl {
    callbacks.swap(job->completion->callbacks);
   }
   job->completion->changed.notify_all();
-  CompileObservationClock callbacks_clock{bool(observer)};
+  CompileObservationClock callbacks_clock{observer.demand().aggregates};
   for (auto& callback : callbacks) {
    try {
     callback(error);
@@ -561,7 +590,7 @@ struct CompileExecution::Impl {
   {
    const std::lock_guard lock(admission->mutex);
    job->task.kind = kind;
-   if (observer) costs.completion_callback_ns += callbacks_clock.elapsed();
+   if (observer.demand().aggregates) costs.completion_callback_ns += callbacks_clock.elapsed();
    if (job->retained) {
     // The physical owner may release custody inside a completion callback.
     // Only park after all callbacks return, so a successor cannot race them.
@@ -594,8 +623,8 @@ struct CompileExecution::Impl {
   return {kind, denial, demand, epoch, extent};
  }
  void observe_rejection(std::unique_lock<std::mutex>& lock, CompileTaskKind kind, const CompileResources& demand, CompileResourceDenial denial) noexcept {
-  if (!observer) return;
-  if (denial == CompileResourceDenial::Records) ++costs.record_denials;
+  if (observer.demand().aggregates && denial == CompileResourceDenial::Records) ++costs.record_denials;
+  if (!(denial == CompileResourceDenial::Records ? observer.demand().record_rejections : observer.demand().continuation_rejections)) return;
   CompileExecutionSnapshot observation;
   try {
    observation = snapshot_locked();
@@ -607,7 +636,8 @@ struct CompileExecution::Impl {
    observer(denial == CompileResourceDenial::Records ? "compile.record.rejected" : "compile.continuation.rejected", observation);
   } catch (...) {}
  }
- [[nodiscard]] CompileExecutionSnapshot snapshot_locked() const {
+ [[nodiscard]] CompileExecutionSnapshot snapshot_locked(bool demands = true) const {
+  if (observer.demand().aggregates) ++costs.snapshots_built;
   CompileExecutionSnapshot result;
   for (std::size_t i = 0; i < class_count; ++i) {
    result.live[i] = live(i);
@@ -658,7 +688,7 @@ struct CompileExecution::Impl {
   result.task_completed = task_completed;
   result.task_duration_ns = task_duration_ns;
   result.task_max_duration_ns = task_max_duration_ns;
-  if (observer) {
+  if (observer.demand().aggregates) {
    result.costs = costs;
    result.costs.eligibility_probes = admission->eligibility_probes;
    result.costs.resource_epoch = admission->resource_generation;
@@ -667,7 +697,7 @@ struct CompileExecution::Impl {
    result.task_cpu_ns = task_cpu_ns;
    result.ready_to_start_ns = ready_to_start_ns;
    try {
-    for (const auto& job : jobs) {
+    if (demands) for (const auto& job : jobs) {
      if (job->done || job->running || job->denial == CompileResourceDenial::None) continue;
      const auto& demand = job->task.resources;
      result.demands.push_back(observe_demand(job->task.kind, demand, job->denial, job->observed_epoch, job->observed_extent));
@@ -690,7 +720,7 @@ bool CompileExecution::Impl::Lane::owns(Workspace* workspace) const {
  return false;
 }
 bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
- CompileObservationClock lock_clock{bool(observer)};
+ CompileObservationClock lock_clock{observer.demand().aggregates};
  std::shared_ptr<Job> selected;
  Idle retired_idle;
  std::size_t retirement_lane = lane_index;
@@ -699,7 +729,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
  CompileAllowance allowance;
  {
   std::unique_lock lock(admission->mutex);
-  if (observer) admission->admission_lock_ns += lock_clock.elapsed();
+  if (observer.demand().aggregates) admission->admission_lock_ns += lock_clock.elapsed();
   const auto select = [&] {
    if (shutdown) {
     finished = true;
@@ -745,23 +775,23 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
      if (index(work_class(static_cast<CompileTaskKind>(kind))) != class_index) continue;
      auto& candidates = ready[kind];
      auto& queue = candidates.jobs;
-     auto next = queue.begin();
+     auto* next = queue.head;
      for (std::size_t examined = 0; examined < queue.size(); ++examined) {
-      const auto position = next;
+      auto* position = next;
       // Reconsider the oldest request first, then resume beyond the last
       // successful bypass. The queue owns its cursor through cancellation.
-      if (!examined && candidates.fallback != queue.end() && candidates.fallback != queue.begin())
+      if (!examined && candidates.fallback && candidates.fallback != queue.head)
        next = candidates.fallback;
       else {
-       ++next;
-       if (next == queue.end()) next = std::next(queue.begin());
+       next = next->ready.next;
+       if (!next) next = queue.head->ready.next;
       }
-      auto& job = **position;
+      auto& job = *position;
       const auto& task = job.task;
       const bool reusable = task.retain_workspace && task.workspace && lane.idle.workspace == task.workspace && CompileAdmission::covers(*lane.idle.allowance.credits_, task.resources);
       if (!job.cancelled && !discard) {
        if (admission->arenas->exceptional_active() && !CompileAdmission::exceptional_custody(task.allowance.credits_.get()) && !CompileAdmission::exceptional_custody(task.parent.credits_.get())) {
-        if (observer) {
+        if (observer.demand().aggregates) {
          job.denial = CompileResourceDenial::ExceptionalLineage;
          job.observed_epoch = admission->resource_generation;
          job.observed_extent = 0;
@@ -774,7 +804,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
         // this record already checked. Retain its pressure until rechecked;
         // otherwise CPU acquire/release would manufacture pressure wake loops.
         if (job.reason != CompileParkReason::Bytes && job.reason != CompileParkReason::Descriptors && job.reason != CompileParkReason::Fairness) {
-         if (observer) {
+         if (observer.demand().aggregates) {
           job.denial = CompileResourceDenial::Cpu;
           job.observed_epoch = admission->resource_generation;
           job.observed_extent = 0;
@@ -791,7 +821,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
         const auto* parent = task.parent.credits_.get();
         const auto eligible = resource_eligible(job.demand);
         job.denial = job.demand.denial;
-        if (observer) {
+        if (observer.demand().detailed_demands()) {
          job.observed_epoch = admission->resource_generation;
          job.observed_extent = admission->arenas->largest_available(task.resources.completion_workspace, task.resources.workspace_class, task.resources.workspace_window);
         }
@@ -808,13 +838,13 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
         }
        }
       }
-      selected = *position;
+      selected = record_bank[position->record];
       ++selections;
-      if (position != queue.begin()) candidates.fallback = std::next(position);
-      candidates.erase(position);
+      if (position != queue.head) candidates.fallback = position->ready.next;
+      candidates.erase(*position);
       unindex(job);
       job.running = true;
-      if (observer) {
+      if (observer.demand().aggregates) {
        job.denial = CompileResourceDenial::None;
        if (job.ready_at != std::chrono::steady_clock::time_point{})
         ready_to_start_ns[static_cast<std::size_t>(task.kind)] +=
@@ -855,7 +885,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
  if (retired_idle.workspace) release_idle(std::move(retired_idle), retirement_lane);
  if (!selected) return !finished;
  const auto class_index = index(work_class(selected->task.kind));
- const auto started = observer ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+ const auto started = observer.demand().aggregates ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
  std::uint64_t body_ns = 0;
  std::uint64_t cpu_ns = 0;
  bool cpu_incomplete = false;
@@ -871,13 +901,13 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
    const std::lock_guard lock(admission->mutex);
    if (!error && selected->task.workspace) error = selected->task.workspace->failure_;
   }
-  CompileObservationClock body_clock{bool(observer)};
-  CompileObservationClock cpu_clock{bool(observer), true};
+  CompileObservationClock body_clock{observer.demand().aggregates};
+  CompileObservationClock cpu_clock{observer.demand().aggregates, true};
   if (!error) try {
     selected->task.work(lane_index, frame.allowance);
    } catch (...) { error = std::current_exception(); }
-  if (observer) body_ns = body_clock.elapsed();
-  if (observer) {
+  if (observer.demand().aggregates) body_ns = body_clock.elapsed();
+  if (observer.demand().aggregates) {
    cpu_ns = cpu_clock.elapsed();
    cpu_incomplete = cpu_clock.incomplete();
   }
@@ -916,7 +946,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
  {
   const std::lock_guard lock(admission->mutex);
   --classes[class_index].running;
-  if (observer) {
+  if (observer.demand().aggregates) {
    const auto kind = static_cast<std::size_t>(selected->task.kind);
    const auto duration = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
    ++task_completed[kind];
@@ -982,16 +1012,9 @@ void CompileExecution::Impl::events() noexcept {
      unindex(*job);
      job->dependency.reset();
      park(*job, CompileParkReason::None);
-     withdrawn.push_back(job);
+     ready[static_cast<std::size_t>(job->task.kind)].erase(*job);
+     withdrawn.push_back(record_bank[job->record]);
     }
-   if (!withdrawn.empty()) {
-    for (auto& queue : ready)
-     for (auto position = queue.jobs.begin(); position != queue.jobs.end();)
-      if ((*position)->running)
-       position = queue.erase(position);
-      else
-       ++position;
-   }
    admission->changed.notify_all();
    for (const auto& callback : observers)
     if (callback->notified) {
@@ -1000,7 +1023,11 @@ void CompileExecution::Impl::events() noexcept {
      callbacks.emplace_back(callback, std::exchange(callback->pending, {}));
      callback->notified = false;
     }
-   if (observer) observation = snapshot_locked();
+   // The fd read and this acknowledgement form one admission-locked turn.
+   // Producers racing the read are in this batch; callback arrivals re-arm.
+   event_armed = false;
+   if (observer.demand().aggregates) ++costs.notifier_batches;
+   if (observer.demand().snapshots) observation = snapshot_locked();
   }
   for (const auto& job : withdrawn) complete(job, withdrawal_error);
   withdrawn.clear();
@@ -1010,7 +1037,7 @@ void CompileExecution::Impl::events() noexcept {
     if (value->removed) continue;
     value->active = true;
    }
-   CompileObservationClock callback_clock{bool(observer)};
+   CompileObservationClock callback_clock{observer.demand().aggregates};
    try {
     value->callback(changes);
    } catch (...) {
@@ -1020,7 +1047,7 @@ void CompileExecution::Impl::events() noexcept {
      notify_locked(CompileAdmission::Change::Interruption);
     }
    }
-   if (observer) {
+   if (observer.demand().aggregates) {
     const std::lock_guard lock(admission->mutex);
     ++costs.notifier_deliveries;
     costs.callback_ns += callback_clock.elapsed();
@@ -1032,7 +1059,7 @@ void CompileExecution::Impl::events() noexcept {
    }
   }
   callbacks.clear();
-  if (observer) try {
+  if (observer.demand().snapshots) try {
     observer("compile.execution", observation);
    } catch (...) {}
   // The token remains readable. Keep completion/readiness dispatch armed on
@@ -1058,9 +1085,12 @@ CompileExecution::CompileExecution(std::size_t workers, std::span<const int> eli
  state.lanes.resize(workers);
  state.record_limit = limits.task_records ? limits.task_records : workers * 8 + class_count;
  state.available_records.reserve(state.record_limit);
+ state.record_bank.reserve(state.record_limit);
  for (std::size_t record = 0; record < state.record_limit; ++record) {
   auto job = std::make_shared<Job>();
   job->done = true;
+  job->record = record;
+  state.record_bank.push_back(job);
   state.available_records.push_back(std::move(job));
  }
  if (state.record_limit < workers) throw std::invalid_argument("compile record capacity is smaller than its CPU grant");
@@ -1075,7 +1105,7 @@ CompileExecution::CompileExecution(std::size_t workers, std::span<const int> eli
    const std::lock_guard lock(admission->mutex);
    admission->notify(CompileAdmission::Change::Resources);
   }
- }, bool(observer));
+ }, observer.demand().aggregates);
  const auto descriptors = descriptor_headroom();
  state.admission->descriptor_capacity = limits.descriptors ? std::min(limits.descriptors, descriptors) : descriptors;
  if (state.admission->descriptor_capacity < 2) throw std::invalid_argument("compile descriptor admission requires completion headroom");
@@ -1083,7 +1113,8 @@ CompileExecution::CompileExecution(std::size_t workers, std::span<const int> eli
  state.cancellation = cancellation;
  if (cancellation_error) state.cancellation_error = std::move(cancellation_error);
  state.observer = std::move(observer);
- state.admission->tracing = bool(state.observer);
+ state.admission->tracing = state.observer.demand().aggregates;
+ state.admission->observe_credits = state.observer.demand().reservations;
  state.event = mmltk::common::io::ScopedFd(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
  if (state.event.get() < 0) throw std::system_error(errno, std::generic_category(), "cannot create compile event descriptor");
  state.admission->publish_change = [weak = std::weak_ptr<Impl>(impl_)](CompileAdmission::Change change) {
@@ -1100,12 +1131,12 @@ CompileExecution::CompileExecution(std::size_t workers, std::span<const int> eli
   for (std::size_t worker = 0; worker < workers; ++worker)
    state.pool->enqueue_detached([owner = impl_] {
     const auto lane = owner->pool->current_worker_index();
-    if (owner->observer) {
+    if (owner->observer.demand().aggregates) {
      const std::lock_guard lock(owner->admission->mutex);
      ++owner->costs.workers_created;
     }
     while (owner->consume(lane, true)) {}
-    if (owner->observer) {
+    if (owner->observer.demand().aggregates) {
      const std::lock_guard lock(owner->admission->mutex);
      ++owner->costs.workers_retired;
     }
@@ -1130,8 +1161,10 @@ CompileExecution::~CompileExecution() {
  }
  impl_->pool.reset();
  impl_->notifier.join();
- if (impl_->observer) try {
-   impl_->observer("compile.execution.retired", snapshot());
+ if (impl_->observer.demand().retired) try {
+   CompileExecutionSnapshot retired;
+   { const std::lock_guard lock(impl_->admission->mutex); retired = impl_->snapshot_locked(false); }
+   impl_->observer("compile.execution.retired", retired);
   } catch (...) {}
 }
 CompileExecution::Producer::Producer(std::shared_ptr<Impl> owner, CompileWorkClass kind) : owner_(std::move(owner)), class_(kind) {}
@@ -1317,7 +1350,7 @@ std::optional<CompileExecution::Continuation> CompileExecution::retain(
  impl_->refresh_external_drain();
  impl_->admission->require(resources, true);
  if (parent.credits_ && parent.credits_->owner != impl_->admission) throw std::invalid_argument("compile continuation parent belongs to another session");
- if (impl_->observer) ++impl_->costs.submission_attempts;
+ if (impl_->observer.demand().aggregates) ++impl_->costs.submission_attempts;
  const auto reject = [&](CompileResourceDenial reason) -> std::optional<Continuation> {
   if (deferred) {
    auto& state = *deferred->state_;
@@ -1341,7 +1374,7 @@ std::optional<CompileExecution::Continuation> CompileExecution::retain(
  auto completion = std::make_shared<CompletionState>();
  completion->owner = impl_;
  if (needs_resources) allowance = impl_->charge(resources, parent, finite_consumer);
- // A failed record-link allocation returns charged custody after unlocking.
+ // The stable bank publishes both memberships without per-task allocation.
  auto job = impl_->claim_record(completion);
  if (needs_resources) ++impl_->selections;
  job->task.kind = successor;
@@ -1351,7 +1384,7 @@ std::optional<CompileExecution::Continuation> CompileExecution::retain(
  completion->done = true;  // No predecessor or callback remains to settle.
  ++impl_->classes[index(work_class(successor))].pending;
  if (deferred) impl_->remove_wait(*deferred->state_);
- if (impl_->observer) ++impl_->admitted;
+ if (impl_->observer.demand().aggregates) ++impl_->admitted;
  impl_->reconcile();
  impl_->notify_locked(CompileChange::Cpu);
  Continuation retained(impl_, std::move(completion));
@@ -1392,8 +1425,6 @@ std::optional<CompileExecution::Completion> CompileExecution::Continuation::try_
  completion->job = job;
  try {
   if (task.completed) completion->callbacks.push_back(std::move(task.completed));
-  // Allocate the queue link before changing the parked record's identity.
-  owner->ready[static_cast<std::size_t>(task.kind)].jobs.push_back(job);
  } catch (...) {
   // A callback capture may own credits; destroy it outside admission locks.
   lock.unlock();
@@ -1402,10 +1433,11 @@ std::optional<CompileExecution::Completion> CompileExecution::Continuation::try_
  job->task = std::move(task);
  job->completion = completion;
  job->retained = false;
+ owner->ready[static_cast<std::size_t>(job->task.kind)].jobs.append(*job);
  job->demand = Demand{.resources = job->task.resources, .parent = job->task.parent, .finite_consumer = job->task.finite_consumer};
  if (!job->task.allowance && owner->admission->oversized(job->task.resources)) owner->exceptional.append(*job);
  owner->park(*job, CompileParkReason::None);
- if (owner->observer) {
+ if (owner->observer.demand().aggregates) {
   job->ready_at = std::chrono::steady_clock::now();
   job->denial = CompileResourceDenial::None;
  }
@@ -1418,14 +1450,14 @@ std::optional<CompileExecution::Completion> CompileExecution::Continuation::try_
  return Completion(std::move(completion));
 }
 std::optional<CompileExecution::Completion> CompileExecution::submit_impl(Task task, const std::shared_ptr<DependencyState>& dependency, std::uint64_t observed) {
- CompileObservationClock lock_clock{bool(impl_->observer)};
+ CompileObservationClock lock_clock{impl_->observer.demand().aggregates};
  CompileAllowance retired_demand_parent;
  std::unique_lock lock(impl_->admission->mutex);
- if (impl_->observer) impl_->admission->admission_lock_ns += lock_clock.elapsed();
+ if (impl_->observer.demand().aggregates) impl_->admission->admission_lock_ns += lock_clock.elapsed();
  task.resources.workspace_class = work_class(task.kind);
  impl_->check();
  impl_->validate(task);
- if (impl_->observer) ++impl_->costs.submission_attempts;
+ if (impl_->observer.demand().aggregates) ++impl_->costs.submission_attempts;
  if (!impl_->has_record(task.kind)) {
   impl_->observe_rejection(lock, task.kind, task.resources, CompileResourceDenial::Records);
   return {};
@@ -1434,14 +1466,7 @@ std::optional<CompileExecution::Completion> CompileExecution::submit_impl(Task t
  auto completion = std::make_shared<CompletionState>();
  completion->owner = impl_;
  if (task.completed) completion->callbacks.push_back(std::move(task.completed));
- std::shared_ptr<Job> job;
- try {
-  job = impl_->claim_record(completion);
- } catch (...) {
-  // Callback captures can own resource custody and retire outside this lock.
-  lock.unlock();
-  throw;
- }
+ auto job = impl_->claim_record(completion);
  job->task = std::move(task);
  try {
   if (dependency && dependency->generation == observed) {
@@ -1457,7 +1482,7 @@ std::optional<CompileExecution::Completion> CompileExecution::submit_impl(Task t
  } catch (...) {
   impl_->unindex(*job);
   retired_demand_parent = std::move(job->demand.parent);
-  impl_->jobs.remove(job);
+  impl_->jobs.remove(*job);
   job->done = true;
   impl_->available_records.push_back(job);
   task = std::move(job->task);
@@ -1466,7 +1491,7 @@ std::optional<CompileExecution::Completion> CompileExecution::submit_impl(Task t
   throw;
  }
  ++impl_->classes[index(work_class(job->task.kind))].pending;
- if (impl_->observer) ++impl_->admitted;
+ if (impl_->observer.demand().aggregates) ++impl_->admitted;
  impl_->reconcile();
  impl_->notify_locked();
  return Completion(job->completion);
@@ -1606,7 +1631,7 @@ void CompileExecution::Readiness::notify() noexcept {
  if (!state_->callback) return;
  state_->pending.causes |= CompileChange::Local;
  state_->notified = true;
- signal_event(impl->event.get());
+ impl->arm_locked();
 }
 std::uint64_t CompileExecution::Readiness::generation() const {
  const std::lock_guard lock(owner_.impl_->admission->mutex);
@@ -1647,7 +1672,7 @@ CompileExecution::Readiness::Attempt::~Attempt() {
  state.pending.causes |= causes_;
  state.pending.retry = true;
  state.notified = true;
- signal_event(impl->event.get());
+ impl->arm_locked();
 }
 CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileExecution::Impl> execution, CompileTaskKind successor, CompileResources resources, CompileAllowance parent, bool finite_consumer)
     : state_(std::make_unique<State>(std::move(execution), successor, resources, std::move(parent), finite_consumer)) {
@@ -1698,9 +1723,9 @@ std::optional<CompileAllowance> CompileExecution::try_reserve(CompileResources r
 }
 std::optional<CompileAllowance> CompileExecution::try_reserve_observed(
  CompileResources resources, const CompileAllowance& parent, std::source_location location, CompileExecutionSnapshot* observation) {
- CompileObservationClock lock_clock{bool(impl_->observer)};
+ CompileObservationClock lock_clock{impl_->observer.demand().aggregates};
  const std::lock_guard lock(impl_->admission->mutex);
- if (impl_->observer) impl_->admission->admission_lock_ns += lock_clock.elapsed();
+ if (impl_->observer.demand().aggregates) impl_->admission->admission_lock_ns += lock_clock.elapsed();
  impl_->check();
  if (parent.credits_ && parent.credits_->owner != impl_->admission) throw std::invalid_argument("compile parent allowance belongs to another session");
  const auto denied = [&](CompileResourceDenial denial) -> std::optional<CompileAllowance> {
@@ -1751,7 +1776,7 @@ CompileAllowance CompileExecution::reserve(CompileResources resources, const Com
  for (;;) {
   const auto observed = resources.cpu_workers ? admission_generation() : resource_generation();
   CompileExecutionSnapshot observation;
-  const bool report = impl_->observer && !reported;
+  const bool report = impl_->observer.demand().reservations && !reported;
   if (auto value = try_reserve_observed(resources, parent, location, report ? &observation : nullptr)) return std::move(*value);
   if (report) {
    reported = true;

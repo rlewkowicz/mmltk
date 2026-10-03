@@ -11,6 +11,7 @@
 #include <mutex>
 #include <memory>
 #include "src/backend/data/detail/compile_progress_delivery.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -34,6 +35,7 @@ struct DirectoryCompileObservation {
  void (*task)(void*, detail::CompileTaskKind, std::uint32_t, bool completed) = nullptr;
  void (*execution)(void*, std::string_view, const detail::CompileExecutionSnapshot&) = nullptr;
  void (*pixel)(void*, std::uint32_t, const detail::CompilePixelObservation&) = nullptr;
+ detail::CompileExecution::ObservationDemand execution_demand = detail::CompileExecution::ObservationDemand::all();
 };
 namespace compiler_internal {
 struct ProgressCounter;

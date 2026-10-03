@@ -128,7 +128,7 @@ BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t 
        }
       }
      }
-     if (trace_) trace_compile_execution(trace_, "benchmark.images.input_pressure", owner.snapshot());
+     if (trace_.accepts("benchmark.images.input_pressure")) trace_compile_execution(trace_, "benchmark.images.input_pressure", owner.snapshot());
      reader_.suspend(parent_);
      input->allowance = {};
      input->output = {};

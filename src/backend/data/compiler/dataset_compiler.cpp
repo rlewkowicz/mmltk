@@ -255,7 +255,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
   {width, height, effective_config.resize_mode, effective_config.perceptual_downscale}, classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));
  detail::CompileExecution::Observer observer;
  if (effective_config.observation && effective_config.observation->execution)
-  observer = [&](std::string_view event, const detail::CompileExecutionSnapshot& snapshot) { effective_config.observation->execution(effective_config.observation->context, event, snapshot); };
+  observer = {effective_config.observation->execution_demand, [&](std::string_view event, const detail::CompileExecutionSnapshot& snapshot) { effective_config.observation->execution(effective_config.observation->context, event, snapshot); }};
  detail::CompileExecution execution(
   static_cast<std::size_t>(configured_workers), worker_cpus, limits, cancellation, std::move(observer), std::make_exception_ptr(std::runtime_error("dataset compilation cancelled")));
  auto output = execution.open_class(detail::CompileWorkClass::Output);

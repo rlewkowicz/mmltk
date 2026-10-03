@@ -1274,11 +1274,11 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  std::vector<domain::ArtifactProgress> displayed;
  bool traced_restart = false;
  bool traced_completion = false;
- const auto trace = make_trace_sink([&](const std::string_view event, const std::string_view fields) {
+ const auto trace = make_trace_sink({data::CompileTraceSelection({"benchmark.download.progress", "benchmark.download.complete"}), [&](const std::string_view event, const std::string_view fields) {
   const auto value = nlohmann::json::parse(fields);
   if (event == "benchmark.download.progress" && value.at("redownload").get<bool>()) { traced_restart = true; }
   if (event == "benchmark.download.complete") { traced_completion = value.at("redownload").get<bool>(); }
- });
+ }});
  std::vector<DownloadResult> completed;
  {
   ProgressReporter reporter([&](const auto& update) { displayed.push_back(project_artifact_progress(update)); }, trace);

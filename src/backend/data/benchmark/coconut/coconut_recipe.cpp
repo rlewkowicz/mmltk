@@ -827,7 +827,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   request.rejected_object = [&](const CoconutPhysicalImage& physical_image, const CoconutRecord& record, const CoconutSegment& segment, std::string_view reason, std::uint32_t policy) {
    if (!policy) failures.reject(physical_image, record.image_id, release.name, segment.id, segment.category_id, reason);
   };
-  if (progress.normalization_observer_enabled() || trace) {
+  if (progress.normalization_observer_enabled() || trace.accepts("benchmark.annotations.preparation")) {
    request.preparation_progress = [&](CoconutPreparationStage stage, std::uint64_t completed) {
     const auto activity = [stage]() -> std::string_view {
      switch (stage) {
@@ -847,7 +847,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
      trace, "benchmark.annotations.preparation", [&] { return nlohmann::json{{"edition", release.edition}, {"stage", activity}, {"completed", completed}, {"total", total}, {"unit", unit}}; });
    };
   }
-  if (progress.normalization_observer_enabled() || trace || row_progress)
+  if (progress.normalization_observer_enabled() || trace.accepts("benchmark.annotations.progress") || row_progress)
    request.progress = [&](std::uint64_t rows) {
     if (row_progress) row_progress(rows);
     if (indexing) indexing->update(release_index, rows, progress);
@@ -938,7 +938,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
      };
      if (!artifact.expected_sha256.empty())
       diagnose();
-     else if (trace)
+     else if (trace.accepts("benchmark.download.failure_sha256"))
       try {
        diagnose();
       } catch (...) { throw_if_benchmark_cancelled(cancellation); }

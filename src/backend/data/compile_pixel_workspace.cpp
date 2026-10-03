@@ -30,7 +30,7 @@ CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&
  return compile_pixel_workspace_plan(header, {resolution, resolution, mode, perceptual}, nullptr);
 }
 void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::span<const std::uint8_t> encoded, const CompileImageHeader& header, std::span<std::byte> memory,
- imaging::resample::RgbMutableImageView destination, std::function_ref<void()> prepare_destination, const CompilePixelObserver& observer) {
+ imaging::resample::RgbMutableImageView destination, std::function_ref<void()> prepare_destination, const CompilePixelObserver& observer, imaging::resample::RgbResizeWork* resize_observed) {
  CompilePixelObservation observation;
  imaging::resample::RgbResizeWork resize_work;
  CompileObservationClock total{bool(observer)}, step{bool(observer)};
@@ -48,6 +48,9 @@ void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::sp
   observation.output_bytes = plan.destination_.capacity_bytes;
  }
  const auto report = [&](bool failed) noexcept {
+  if (resize_observed) mmltk::frameworks::reflection::visit_materialized_members<imaging::resample::RgbResizeWork>([&]<class Declaration>(const auto&) {
+   resize_observed->*Declaration::pointer += resize_work.*Declaration::pointer;
+  });
   if (!observer) return;
   observation.resize_preparations = resize_work.preparations;
   observation.resize_allocation_requests = resize_work.allocation_requests;
@@ -94,7 +97,7 @@ void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::sp
    observation.stage = CompilePixelStage::ResizeStore;
   }
   resizer_.resize_to_planar({decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, decoded.size(), imaging::resample::RgbPixelFormat::RGB8}}, destination,
-   plan.policy_.mode, observer ? &resize_work : nullptr);
+   plan.policy_.mode, observer || resize_observed ? &resize_work : nullptr);
   if (observer) {
    observation.resize_store_ns = step.lap();
    observation.stage = CompilePixelStage::Complete;

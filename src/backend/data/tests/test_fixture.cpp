@@ -7,6 +7,7 @@
 #include "src/backend/data/detail/compile_pixel_workspace.h"
 #include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/common/math/checked_arithmetic.h"
 #include <map>
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include <stb_image_write.h>
@@ -23,27 +24,58 @@
 #include <vector>
 namespace fs = std::filesystem;
 namespace mmltk::backend::data::testsupport {
-ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding encoding, std::uint32_t seed) {
+ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding encoding, std::uint32_t seed, std::size_t byte_limit) {
  if (!width || !height || width > MAX_IMAGE_EXTENT || height > MAX_IMAGE_EXTENT) throw std::invalid_argument("profile fixture geometry is invalid");
- if (std::uint64_t(width) * height * 3 > (256ULL << 20)) throw std::length_error("profile synthetic image exceeds 256 MiB");
+ const auto pixels = mmltk::common::math::checked_multiply<std::size_t>(width, height, "profile synthetic extent overflow");
+ const auto bytes = mmltk::common::math::checked_multiply(pixels, std::size_t{3}, "profile synthetic RGB extent overflow");
+ if (bytes > byte_limit) throw std::length_error("profile synthetic image exceeds input cap before allocation");
  ProfileImageFixture result{width, height, {}};
- std::vector<std::uint8_t> rgb(std::size_t(width) * height * 3);
+ std::vector<std::uint8_t> rgb(bytes);
  for (std::size_t i = 0; i < rgb.size(); ++i) {
   seed ^= seed << 13;
   seed ^= seed >> 17;
   seed ^= seed << 5;
   rgb[i] = static_cast<std::uint8_t>(seed);
  }
- const auto append = +[](void* context, void* data, int bytes) {
-  auto& target = *static_cast<std::vector<std::uint8_t>*>(context);
+ struct Encoding { std::vector<std::uint8_t>& bytes; std::size_t limit; bool overflow = false; } output{result.encoded, byte_limit};
+ const auto append = +[](void* context, void* data, int count) {
+  auto& output = *static_cast<Encoding*>(context);
+  if (output.overflow || count < 0 || static_cast<std::size_t>(count) > output.limit - output.bytes.size()) { output.overflow = true; return; }
   const auto* begin = static_cast<std::uint8_t*>(data);
-  target.insert(target.end(), begin, begin + bytes);
+  output.bytes.insert(output.bytes.end(), begin, begin + count);
  };
  const auto written = encoding == FixtureImageEncoding::Jpeg
-                       ? stbi_write_jpg_to_func(append, &result.encoded, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), 95)
-                       : stbi_write_png_to_func(append, &result.encoded, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), static_cast<int>(width * 3));
+                       ? stbi_write_jpg_to_func(append, &output, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), 95)
+                       : stbi_write_png_to_func(append, &output, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), static_cast<int>(width * 3));
+ if (output.overflow) throw std::length_error("profile encoded image exceeds input cap");
  if (!written) throw std::runtime_error("cannot encode profile fixture");
  return result;
+}
+benchmark_internal::NormalizedAnnotationReadView pipeline_annotation_fixture(std::span<const ProfileImageFixture> inputs, std::span<const std::size_t> order) {
+ using namespace benchmark_internal;
+ if (order.empty() || order.size() > 1024) throw std::length_error("pipeline fixture row count exceeds 1024");
+ NormalizedAnnotationBuilder builder;
+ builder.split = "train";
+ builder.images.reserve(order.size());
+ builder.boxes.reserve(order.size());
+ for (std::size_t i = 0; i < order.size(); ++i) {
+  if (order[i] >= inputs.size()) throw std::out_of_range("pipeline fixture input index");
+  const auto& input = inputs[order[i]];
+  const auto count = i % 4 ? 1U : 0U;
+  builder.images.push_back({i + 1, builder.boxes.size(), count, input.width, input.height, 0, 0});
+  if (count) {
+   NormalizedBox box;
+   box.x1 = box.y1 = 0.25F;
+   box.x2 = box.y2 = 0.75F;
+   box.annotation_id = i + 1;
+   box.source_category_id = 1;
+   box.source_ordinal = i;
+   box.original_area = static_cast<double>(input.width) * input.height / 4;
+   box.flags = kAnnotationId | kAnnotationCategory;
+   builder.boxes.push_back(box);
+  }
+ }
+ return NormalizedAnnotationReadView(seal_normalized_annotations(std::move(builder)));
 }
 benchmark_internal::BenchmarkTraceSink benchmark_trace() {
  if (!std::getenv("MMLTK_TEST_BENCHMARK_TRACE")) return {};

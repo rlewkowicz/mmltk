@@ -35,7 +35,7 @@ std::uint64_t additional_download_bytes(const std::filesystem::path& destination
 }
 namespace {
 detail::StorageReservationPool::Observer observe_storage(const BenchmarkTraceSink& trace, bool preflight) {
- if (!trace) return {};
+ if (preflight ? !trace.accepts("benchmark.storage.preflight") : !trace.accepts("benchmark.storage.capacity_failed") && !trace.accepts("benchmark.storage.reserved")) return {};
  return [trace, preflight](const detail::StorageReservationPool::Observation& value) {
   trace_benchmark_event(trace,
    preflight      ? "benchmark.storage.preflight"

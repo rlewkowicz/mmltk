@@ -1349,6 +1349,22 @@ TEST_CASE("file dialog client bounds output and reaps cancellation-resistant hel
  CHECK(::kill(helper_pid, 0) == -1);
  CHECK(errno == ESRCH);
 }
+TEST_CASE("artifact diagnostic selection survives the public compiler adapter", "[gui][services]") {
+ using namespace mmltk::backend::data;
+ using namespace mmltk::backend::data::benchmark_internal;
+ std::size_t delivered = 0, constructed = 0;
+ const ArtifactBenchmarkTraceObserver observer{
+  .context = &delivered,
+  .report = [](const void* context, std::string_view, std::string_view) noexcept { ++*const_cast<std::size_t*>(static_cast<const std::size_t*>(context)); },
+  .selection = CompileTraceSelection({"benchmark.selected"})};
+ const auto sink = make_trace_sink({observer.selection, [observer](std::string_view event, std::string_view fields) { observer(event, fields); }});
+ trace_benchmark_event(sink, "benchmark.excluded", [&] { ++constructed; return nlohmann::json::object(); });
+ CHECK(constructed == 0);
+ CHECK(delivered == 0);
+ trace_benchmark_event(sink, "benchmark.selected", [&] { ++constructed; return nlohmann::json::object(); });
+ CHECK(constructed == 1);
+ CHECK(delivered == 1);
+}
 TEST_CASE("backend benchmark diagnostic failures preserve operations and delivery policy", "[gui][services]") {
  using namespace mmltk::backend::data::benchmark_internal;
  const bool complete = GENERATE(false, true);
@@ -1364,7 +1380,7 @@ TEST_CASE("backend benchmark diagnostic failures preserve operations and deliver
   .context = &target,
   .report = [](const void* context, std::string_view event, std::string_view fields) noexcept { static_cast<const RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields); },
  };
- const auto sink = make_trace_sink([observer](std::string_view event, std::string_view fields) noexcept { observer(event, fields); });
+ const auto sink = make_trace_sink({observer.selection, [observer](std::string_view event, std::string_view fields) noexcept { observer(event, fields); }});
  bool operation_completed = false;
  CHECK_NOTHROW([&] {
   trace_benchmark_event(sink, "benchmark.test.failure", [&]() -> nlohmann::json {

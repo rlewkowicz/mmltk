@@ -272,7 +272,7 @@ std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetad
   static_cast<NormalizedAnnotationMetadata&>(membership) = metadata;
   if (metadata_only) membership.images.reserve(rows.size());
   for (const auto& row : rows) {
-   if (trace) {
+   if (trace.accepts("benchmark.cost.completed")) {
     ++rows_revisited;
     bytes_revisited += row.boxes.size_bytes() + row.runs.size_bytes();
    }

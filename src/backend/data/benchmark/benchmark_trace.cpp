@@ -3,6 +3,20 @@
 #include "src/backend/data/detail/compile_resources.h"
 namespace mmltk::backend::data::benchmark_internal {
 namespace reflection = mmltk::frameworks::reflection;
+detail::CompileExecution::Observer observe_compile_execution(const BenchmarkTraceSink& sink, std::string_view reservation_event) {
+ if (!sink) return {};
+ detail::CompileExecution::ObservationDemand demand{
+  .snapshots = sink.accepts("compile.execution"),
+  .record_rejections = sink.accepts("compile.record.rejected"),
+  .continuation_rejections = sink.accepts("compile.continuation.rejected"),
+  .reservations = sink.accepts(reservation_event),
+  .retired = sink.accepts("compile.execution.retired")};
+ demand.aggregates = demand.any();
+ if (!demand.any()) return {};
+ return {demand, [sink, reservation_event](std::string_view event, const detail::CompileExecutionSnapshot& value) {
+  trace_compile_execution(sink, value.reservation ? reservation_event : event, value);
+ }};
+}
 nlohmann::json benchmark_observation_fields(const detail::CompileAdmissionObservation& observation) {
  nlohmann::json result = nlohmann::json::object();
  reflection::visit_materialized_members<detail::CompileAdmissionObservation>([&]<class Declaration>(const auto& field) {

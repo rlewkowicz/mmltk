@@ -1510,7 +1510,7 @@ struct LocalCoconutRecipe {
   config.overwrite = overwrite;
   config.selection = selection;
   if (auto trace = mmltk::backend::data::testsupport::benchmark_trace())
-   config.trace = [trace = std::move(trace)](std::string_view event, std::string_view fields) { trace(event, Json::parse(fields)); };
+   config.trace = {trace.selection(), [trace](std::string_view event, std::string_view fields) { trace(event, fields.empty() ? Json{} : Json::parse(fields)); }};
   return config;
  }
  CoconutRecipeCatalog selected(CoconutValidation choice) const {

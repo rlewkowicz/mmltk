@@ -57,6 +57,7 @@ mmltk_register_public_headers(
     mmltk_backend_data
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        compile_trace_selection.h
         benchmark/benchmark_dataset_compiler.h
         benchmark/benchmark_dataset_options.h
         compiled/compiled_image_stream.h
@@ -303,7 +304,13 @@ function(mmltk_add_backend_data_tests)
         mmltk_backend_data_profile_runner PRIVATE_DECLARATIONS)
     mmltk_register_retained_module_importers(
         mmltk_backend_data_profile_runner
-        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_runner.cpp)
+        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_runner.cpp
+        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_support.cpp)
+    mmltk_register_ordinary_sources(mmltk_backend_data_profile_runner
+        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_pipeline.cpp)
+    mmltk_register_private_headers(mmltk_backend_data_profile_runner
+        BASE_DIRS ${CMAKE_SOURCE_DIR}
+        FILES ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_support.h)
     target_include_directories(mmltk_backend_data_profile_runner PRIVATE
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests
     )

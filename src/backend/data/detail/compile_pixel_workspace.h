@@ -60,8 +60,10 @@ private:
 // A supplied storage preparation runs after successful decoding, before stores.
 class CompilePixelWorkspace final {
 public:
+ // Both optional observations borrow their targets only for this synchronous
+ // call. Resize aggregates require no detail emitter or per-pixel clocks.
  void write(const CompilePixelWorkspacePlan&, std::span<const std::uint8_t> encoded, const CompileImageHeader&, std::span<std::byte> workspace, imaging::resample::RgbMutableImageView destination,
-  std::function_ref<void()> prepare_destination = +[] {}, const CompilePixelObserver& observer = {});
+  std::function_ref<void()> prepare_destination = +[] {}, const CompilePixelObserver& observer = {}, imaging::resample::RgbResizeWork* resize_observed = nullptr);
 
 private:
  CompileImageDecoder decoder_;

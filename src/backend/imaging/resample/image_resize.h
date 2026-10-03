@@ -4,7 +4,7 @@
 #include <memory>
 #include <span>
 #if !defined(__CUDACC__)
-#include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #endif
 namespace mmltk::backend::imaging::resample {
 enum class RgbPixelFormat : std::uint8_t { RGB8, RGBA8, PlanarUnitSrgbF32 };
@@ -68,6 +68,9 @@ private:
 struct RgbResizeWork {
  std::uint64_t preparations = 0, allocation_requests = 0, allocation_bytes = 0;
 };
+#if !defined(__CUDACC__)
+MMLTK_REFLECT_FIELDS(RgbResizeWork)
+#endif
 class RgbImageResizer {
 public:
  explicit RgbImageResizer(int thread_count = 1, bool perceptual_downscale = false);

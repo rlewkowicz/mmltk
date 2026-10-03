@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/compile_trace_selection.h"
 #include "src/backend/data/benchmark/benchmark_dataset_options.h"
 #include <array>
 #include <filesystem>
@@ -57,8 +58,9 @@ struct ArtifactProgressObserver final {
 struct ArtifactBenchmarkTraceObserver final {
  const void* context = nullptr;
  void (*report)(const void*, std::string_view, std::string_view) noexcept = nullptr;
+ mmltk::backend::data::CompileTraceSelection selection;
  void operator()(const std::string_view event, const std::string_view fields) const noexcept {
-  if (report != nullptr) report(context, event, fields);
+  if (report != nullptr && (event.empty() || selection.accepts(event))) report(context, event, fields);
  }
 };
 struct ArtifactDiagnosticObserver final {

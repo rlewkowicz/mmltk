@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <time.h>
+#include <sys/resource.h>
 namespace mmltk::backend::data::detail {
 // Optional clocks are inert when disabled. No timestamp participates in product
 // scheduling, resource eligibility, or lifetime.
@@ -42,6 +43,34 @@ public:
   const auto elapsed = valid_ && value >= started_ ? value - started_ : 0;
   started_ = value;
   return elapsed;
+ }
+};
+struct CompileObservationUsage {
+ std::uint64_t wall_ns = 0, cpu_ns = 0, minor_faults = 0, major_faults = 0;
+ bool incomplete = false;
+};
+// One shared optional physical-body clock/fault probe. Construct only on the
+// executing thread; elapsed() runs there before callback or grant settlement.
+class CompileObservationBody final {
+ bool enabled_;
+ CompileObservationClock wall_, cpu_;
+ rusage started_{};
+ bool valid_ = false;
+
+public:
+ explicit CompileObservationBody(bool enabled) noexcept : enabled_(enabled), wall_(enabled), cpu_(enabled, true) {
+  if (enabled_) valid_ = ::getrusage(RUSAGE_THREAD, &started_) == 0;
+ }
+ [[nodiscard]] CompileObservationUsage elapsed() const noexcept {
+  if (!enabled_) return {};
+  CompileObservationUsage value{.wall_ns = wall_.elapsed(), .cpu_ns = cpu_.elapsed()};
+  rusage ended{};
+  value.incomplete = cpu_.incomplete() || !valid_ || ::getrusage(RUSAGE_THREAD, &ended) != 0;
+  if (!value.incomplete) {
+   value.minor_faults = static_cast<std::uint64_t>(ended.ru_minflt - started_.ru_minflt);
+   value.major_faults = static_cast<std::uint64_t>(ended.ru_majflt - started_.ru_majflt);
+  }
+  return value;
  }
 };
 }  // namespace mmltk::backend::data::detail

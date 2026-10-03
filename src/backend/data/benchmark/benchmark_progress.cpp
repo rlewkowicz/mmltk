@@ -12,9 +12,9 @@ std::uint64_t replace_progress(const std::uint64_t aggregate, const std::uint64_
 }  // namespace
 using Clock = std::chrono::steady_clock;
 ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources, std::function<void(std::exception_ptr)> failed)
-    : callback_(std::move(callback)), failed_(std::move(failed)), trace_(trace) {
+    : callback_(std::move(callback)), failed_(std::move(failed)), trace_(trace), trace_progress_(trace.accepts("benchmark.progress.activity") || trace.accepts("benchmark.pixel_compile.throughput") || trace.accepts("benchmark.progress.delivery")) {
  state_.tracks.labels.unit = DatasetCompileUnit::Items;
- if (!callback_ && !trace_) { return; }
+ if (!callback_ && !trace_progress_) { return; }
  const auto source_progress = [](const BenchmarkDatasetSource source) {
   BenchmarkSourceProgress progress;
   progress.source = source;
@@ -38,7 +38,7 @@ ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const Ben
   });
   if (callback_) callback_(snapshot.progress);
  }, failed_,
-  trace_ ? Delivery::Diagnostic{[this](const Delivery::Counts& counts) {
+  trace_.accepts("benchmark.progress.delivery") ? Delivery::Diagnostic{[this](const Delivery::Counts& counts) {
   trace_benchmark_event(trace_, "benchmark.progress.delivery", [&] {
    return nlohmann::json{
     {"produced", counts.produced}, {"materialized", counts.materialized}, {"coalesced", counts.coalesced}, {"delivered", counts.delivered}, {"pending", counts.pending},
@@ -70,12 +70,12 @@ void ProgressReporter::invalidate_indexing_unlocked(std::unique_lock<std::mutex>
  emit(lock, DeliveryMode::Boundary);
 }
 void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
- if (!callback_ && !trace_) { return; }
+ if (!callback_ && !trace_progress_) { return; }
  std::unique_lock lock(mutex_);
  phase_unlocked(lock, phase, completed, total);
 }
 void ProgressReporter::compacting(std::size_t split, std::size_t completed, std::size_t total) {
- if (!callback_ && !trace_) return;
+ if (!callback_ && !trace_progress_) return;
  std::unique_lock lock(mutex_);
  compaction_.at(split) = {completed, total};
  phase_unlocked(lock, DatasetCompilePhase::Compacting, compaction_[0].first + compaction_[1].first, compaction_[0].second + compaction_[1].second);
@@ -194,7 +194,7 @@ void ProgressReporter::discard_label_plans() {
  emit(lock, DeliveryMode::Boundary);
 }
 void ProgressReporter::activity(std::string activity) {
- if (!callback_ && !trace_) { return; }
+ if (!callback_ && !trace_progress_) { return; }
  std::unique_lock lock(mutex_);
  state_.current_source.reset();
  set_activity_unlocked(std::move(activity));
@@ -215,7 +215,7 @@ void ProgressReporter::pixels(const std::uint64_t completed, const std::uint64_t
  pixels.complete = total_known && completed == total;
  pixels.active = !pixels.complete;
  pixels.activity = pixels.complete ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling;
- if (trace_ && pixel_started_.time_since_epoch().count() == 0) pixel_started_ = Clock::now();
+ if (trace_.accepts("benchmark.pixel_compile.throughput") && pixel_started_.time_since_epoch().count() == 0) pixel_started_ = Clock::now();
  emit(lock, DeliveryMode::Boundary);
 }
 void ProgressReporter::invalidate_pixels(std::uint64_t count) {
@@ -271,7 +271,7 @@ void ProgressReporter::acquisition_complete() {
  emit(lock, DeliveryMode::Boundary);
 }
 void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std::string activity, bool foreground, bool preserve) {
- if (!callback_ && !trace_) { return; }
+ if (!callback_ && !trace_progress_) { return; }
  std::unique_lock lock(mutex_);
  if (!callback_) {
   if (state_.activity != activity || state_.current_source != source) { trace_activity(state_.phase, source, activity); }
@@ -297,7 +297,7 @@ void ProgressReporter::set_source_activity_unlocked(const BenchmarkDatasetSource
 }
 bool ProgressReporter::transfer_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
 bool ProgressReporter::normalization_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
-bool ProgressReporter::pixel_observer_enabled() const noexcept { return callback_ || static_cast<bool>(trace_); }
+bool ProgressReporter::pixel_observer_enabled() const noexcept { return callback_ || trace_.accepts("benchmark.pixel_compile.throughput") || trace_.accepts("benchmark.progress.delivery"); }
 void ProgressReporter::projected(const std::uint64_t bytes) {
  if (!callback_) { return; }
  std::unique_lock lock(mutex_);
@@ -405,9 +405,9 @@ std::string ProgressReporter::default_phase_activity(const DatasetCompilePhase p
  std::unreachable();
 }
 void ProgressReporter::set_activity_unlocked(std::string activity) {
- if (trace_ && state_.current_source) activity_trace_pending_ = false;
+ if (trace_.accepts("benchmark.progress.activity") && state_.current_source) activity_trace_pending_ = false;
  if (state_.activity == activity) { return; }
- if (trace_ && !state_.current_source) activity_trace_pending_ = true;
+ if (trace_.accepts("benchmark.progress.activity") && !state_.current_source) activity_trace_pending_ = true;
  state_.activity = std::move(activity);
  state_.activity_elapsed_seconds = 0U;
  if (callback_) { activity_started_ = Clock::now(); }
@@ -600,7 +600,7 @@ ProgressReporter::Snapshot ProgressReporter::materialize() {
  // Materialization and phase selection only capture facts. Both activity and
  // throughput effects run with this snapshot after the progress mutex is released.
  return {
-  state_, trace_ && pixel_started_.time_since_epoch().count() ? std::chrono::duration<double>(Clock::now() - pixel_started_).count() : 0, trace_ && std::exchange(activity_trace_pending_, false)
+  state_, trace_.accepts("benchmark.pixel_compile.throughput") && pixel_started_.time_since_epoch().count() ? std::chrono::duration<double>(Clock::now() - pixel_started_).count() : 0, trace_.accepts("benchmark.progress.activity") && std::exchange(activity_trace_pending_, false)
  };
 }
 void ProgressReporter::emit(std::unique_lock<std::mutex>&, DeliveryMode mode) {
@@ -611,7 +611,7 @@ void ProgressReporter::flush() {
 }
 void ProgressReporter::warning(std::string activity) noexcept {
  try {
-  if (!callback_ && !trace_) return;
+  if (!callback_ && !trace_progress_) return;
   std::unique_lock lock(mutex_);
   state_.current_source.reset();
   set_activity_unlocked(std::move(activity));

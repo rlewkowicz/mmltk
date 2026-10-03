@@ -182,7 +182,7 @@ std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequ
  ArtifactProgressTotals& totals, std::size_t workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution,
  const CompileAllowance& parent, detail::StorageReservationPool* storage) {
  for (auto& request : requests) {
-  if (trace) try {
+  if (trace.accepts("benchmark.download.failure_sha256")) try {
     if (std::filesystem::is_regular_file(request.destination)) {
      const auto sha = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
      trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", sha}, {"reason", reason}}; });

@@ -64,7 +64,7 @@ BenchmarkTraceSink make_trace_sink(const BenchmarkTraceCallback& callback) noexc
  if (!callback) { return {}; }
  try {
   const auto mutex = std::make_shared<std::mutex>();
-  return [callback, mutex](const std::string_view event, const nlohmann::json& fields) noexcept {
+  return {callback.selection(), [callback, mutex](const std::string_view event, const nlohmann::json& fields) noexcept {
    std::string serialized;
    try {
     if (fields.is_object()) { serialized = fields.dump(); }
@@ -77,7 +77,7 @@ BenchmarkTraceSink make_trace_sink(const BenchmarkTraceCallback& callback) noexc
    } catch (...) {
     // Delivery is attempted once, even if the callback throws.
    }
-  };
+  }};
  } catch (...) {
   try {
    callback({}, {});
@@ -326,7 +326,7 @@ public:
    }
    if (attempt_reported != 0U) { transfer_progress->images(source, artifact.artifact_id, 0, source_total_images, *progress, "Withdrawing failed " + archive_name + " attempt"); }
    throw_if_benchmark_cancelled(cancel_requested);
-   if (trace) try {
+   if (trace.accepts("benchmark.download.failure_sha256")) try {
      if (std::filesystem::is_regular_file(request.destination)) {
       const auto digest = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancel_requested.requested(); }));
       trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", digest}, {"reason", failure_reason}}; });
@@ -525,7 +525,7 @@ void publish_dataset_directory(const std::filesystem::path& staging, const std::
 void write_split_with_progress(BenchmarkSplitWriter& writer, const BenchmarkWriteRequest& request, ProgressReporter* progress, const BenchmarkTraceSink& trace) {
  progress->phase(DatasetCompilePhase::Pixels);
  progress->activity("Decoding and resizing " + request.split.name + " JPEG pixels");
- const Clock::time_point started = trace ? Clock::now() : Clock::time_point{};
+ const Clock::time_point started = trace.accepts("benchmark.pixel_compile.complete") ? Clock::now() : Clock::time_point{};
  BenchmarkWriteRequest observed = request;
  if (progress->pixel_observer_enabled()) {
   observed.progress = {.context = progress, .image_completed = [](void* context) {
@@ -651,7 +651,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
   pipeline.bind_source(membership.identity_root(source), val ? validation_writer : train_writer,
    source == CoconutImageNamespace::CocoValidation && config.selection.validation == CoconutValidation::Stock ? AnnotationSource::Coco : coconut_annotation_source(source));
  }
- if (trace)
+ if (trace.accepts("benchmark.labels.placed"))
   pipeline.label_configuration(config.resolution, config.resize_mode, {}, [&](const std::filesystem::path& root, std::uint64_t id) {
    const bool is_validation = root == membership.identity_root(CoconutImageNamespace::CocoValidation) || root == membership.identity_root(CoconutImageNamespace::Objects365V1);
    trace_benchmark_event(trace, "benchmark.labels.placed", [&] { return nlohmann::json{{"split", is_validation ? "val" : "train"}, {"image_id", id}}; });
@@ -703,7 +703,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
       };
       if (!archive.origin.artifact.expected_sha256.empty() && std::filesystem::is_regular_file(archive.download.path))
        diagnose();
-      else if (trace)
+      else if (trace.accepts("benchmark.download.failure_sha256"))
        try {
         diagnose();
        } catch (...) { throw_if_benchmark_cancelled(cancellation); }
@@ -794,7 +794,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
   const auto count = std::exchange(settlement_counts[val], 0);
   if (!count) return;
   (val ? validation_writer : train_writer).settle_labels(std::span(settlements[val]).first(count));
-  if (trace) {
+  if (trace.accepts("benchmark.cost.completed")) {
    ++settlement_batches;
    settled_images += count;
   }
@@ -803,7 +803,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  BenchmarkCompletionWindow restored(std::clamp<std::size_t>(pipeline.execution().workers() * 2, 2, 64));
  const auto select = [&](const NormalizedAnnotationReadView& index, std::size_t position, const CoconutPhysicalImage& physical, const CoconutComponent* component, std::uint64_t original_generation,
                       bool val) {
-  if (trace) ++rows_revisited;
+  if (trace.accepts("benchmark.cost.completed")) ++rows_revisited;
   const auto& image = index.image(position);
   const auto physical_member = membership.find(physical.source, physical.image_id);
   if (!physical_member || *physical_member != physical) {
@@ -1027,13 +1027,14 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   compile_cpus.assign(pipeline.execution().cpus().begin(), pipeline.execution().cpus().end());
   std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> observe_label_projection;
   std::function<void(const std::filesystem::path&, std::uint64_t)> observe_label_write;
-  if (trace) {
+  if (trace.accepts("benchmark.labels.projection_started")) {
    observe_label_projection = [&](const auto& root, auto id, const BenchmarkLabelWorkspace& workspace) {
     trace_benchmark_event(
      trace, "benchmark.labels.projection_started", [&] { return nlohmann::json{{"root", root.string()}, {"image_id", id}, {"retained_workspace_bytes", workspace.retained_bytes()}}; });
    };
-   observe_label_write = [&](const auto& root, auto id) { trace_benchmark_event(trace, "benchmark.labels.slot_written", [&] { return nlohmann::json{{"root", root.string()}, {"image_id", id}}; }); };
   }
+  if (trace.accepts("benchmark.labels.slot_written"))
+   observe_label_write = [&](const auto& root, auto id) { trace_benchmark_event(trace, "benchmark.labels.slot_written", [&] { return nlohmann::json{{"root", root.string()}, {"image_id", id}}; }); };
   pipeline.label_configuration(config.resolution, config.resize_mode, std::move(observe_label_projection), std::move(observe_label_write));
   // Inventory, annotation prerequisites, prefetched archives and later repair
   // may retain source leases before their first transfer. Protect their shared
@@ -1359,9 +1360,9 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     trace, "benchmark.pixel_compile.cache_repair", [&] { return nlohmann::json{{"source", source_root.string()}, {"image_id", error.source_image_id()}, {"attempt", 1}, {"reason", error.what()}}; });
    // Retain the failed generation before withdrawing its pipeline product.
    {
-    const auto failed_input = trace ? pipeline.image_input(source_root, error.source_image_id()) : nullptr;
+    const auto failed_input = trace.accepts("benchmark.images.failure_sha256") ? pipeline.image_input(source_root, error.source_image_id()) : nullptr;
     pipeline.retire_image(source_root, error.source_image_id());
-    if (trace) try {
+    if (trace.accepts("benchmark.images.failure_sha256")) try {
       const auto image_path = cached_image_path(source_root, error.source_image_id());
       if ((failed_input && !failed_input->encoded().empty()) || std::filesystem::is_regular_file(image_path)) {
        throw_if_benchmark_cancelled(cancel_requested);

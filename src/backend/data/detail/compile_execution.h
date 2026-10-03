@@ -4,6 +4,8 @@
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <array>
+#include <concepts>
+#include <type_traits>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -68,6 +70,7 @@ struct CompileExecutionCosts {
  std::uint64_t eligibility_probes = 0, notifier_deliveries = 0, resource_epoch = 0, admission_lock_ns = 0;
  std::uint64_t callback_ns = 0, completion_callback_ns = 0, workers_created = 0, workers_retired = 0;
  std::uint64_t submission_attempts = 0, record_denials = 0;
+ std::uint64_t snapshots_built = 0, eventfd_writes = 0, notifier_batches = 0;
  bool incomplete = false;
 };
 MMLTK_REFLECT_FIELDS(CompileExecutionCosts)
@@ -103,7 +106,26 @@ class CompileExecution final {
  std::optional<CompileAllowance> try_reserve_observed(CompileResources, const CompileAllowance&, std::source_location, CompileExecutionSnapshot*);
 
 public:
- using Observer = std::function<void(std::string_view, const CompileExecutionSnapshot&)>;
+ struct ObservationDemand {
+  bool aggregates = false, snapshots = false, record_rejections = false, continuation_rejections = false, reservations = false, retired = false;
+  [[nodiscard]] bool any() const noexcept { return aggregates || snapshots || record_rejections || continuation_rejections || reservations || retired; }
+  [[nodiscard]] bool detailed_demands() const noexcept { return snapshots || record_rejections || continuation_rejections || reservations; }
+  [[nodiscard]] static constexpr ObservationDemand all() noexcept { return {true, true, true, true, true, true}; }
+ };
+ class Observer final {
+  ObservationDemand demand_{};
+  std::function<void(std::string_view, const CompileExecutionSnapshot&)> delivery_;
+
+ public:
+  Observer() = default;
+  template <class F> requires (!std::same_as<std::remove_cvref_t<F>, Observer> && std::is_invocable_r_v<void, F&, std::string_view, const CompileExecutionSnapshot&>)
+  Observer(F&& delivery) : Observer(ObservationDemand::all(), std::forward<F>(delivery)) {}
+  template <class F> requires std::is_invocable_r_v<void, F&, std::string_view, const CompileExecutionSnapshot&>
+  Observer(ObservationDemand demand, F&& delivery) : demand_(demand), delivery_(std::forward<F>(delivery)) { if (!delivery_) demand_ = {}; }
+  [[nodiscard]] explicit operator bool() const noexcept { return delivery_ && demand_.any(); }
+  [[nodiscard]] const ObservationDemand& demand() const noexcept { return demand_; }
+  void operator()(std::string_view event, const CompileExecutionSnapshot& value) const { if (delivery_) delivery_(event, value); }
+ };
  explicit CompileExecution(std::size_t workers, std::span<const int> cpus = {}, CompileExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {}, Observer = {},
   std::exception_ptr cancellation_error = {});
  ~CompileExecution();

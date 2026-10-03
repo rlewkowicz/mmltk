@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/compile_trace_selection.h"
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -35,12 +36,15 @@ public:
   std::array<std::size_t, static_cast<std::size_t>(CompileWorkClass::Count)> queued{}, running{}, completing{};
   std::size_t records = 0, capacity = 0, services = 0, busy = 0;
   std::uint64_t admitted = 0, completed = 0, operation = 0, bytes = 0, duration_ns = 0;
+  std::uint64_t queue_ns = 0, cpu_ns = 0, callback_ns = 0, minor_faults = 0, major_faults = 0;
+  std::uint64_t total_bytes = 0, total_queue_ns = 0, total_physical_ns = 0, total_cpu_ns = 0, total_callback_ns = 0, total_minor_faults = 0, total_major_faults = 0;
+  bool incomplete = false;
   CompileWorkClass work_class = CompileWorkClass::Count;
   bool failed = false;
  };
  // Optional effects only, delivered outside queue/admission locks on callers
  // and service workers. Counters and clocks stay disabled with no observer.
- using Observer = std::function<void(std::string_view, const Observation&)>;
+ using Observer = CompileTraceSink<const Observation&>;
  struct RuntimeReadiness {
   void* context = nullptr;
   // After physical completion, completed, and actual capacity return. May
@@ -97,4 +101,5 @@ public:
 private:
  std::shared_ptr<Impl> impl_;
 };
+MMLTK_REFLECT_FIELDS(FileWorkQueue::Observation)
 }  // namespace mmltk::backend::data::detail

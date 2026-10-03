@@ -2035,6 +2035,7 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
  }
 }
 TEST_CASE("segmented downloads retain durable ranges through failure cancellation and unobserved resume", "[backend][data][benchmark][download]") {
+ const bool completion_only = GENERATE(false, true);
  mmltk::testsupport::ScopedTempDir root("segmented-download");
  constexpr std::size_t bytes = 512U * 1024U * 1024U;
  HttpServer server(bytes);
@@ -2093,20 +2094,29 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
  }
  request.maximum_attempts = 3U;
  server.TruncateNextTransfer();
+ std::uint64_t retained_before_retry = 0;
+ const auto resumed_checkpoint = read_json_file(metadata_path);
+ for (const auto& segment : resumed_checkpoint.at("segments")) retained_before_retry += segment.at("completed").get<std::uint64_t>();
  std::atomic<bool> traced_retry{false}, traced_complete{false}, traced_bytes{false}, traced_second_attempt{false}, invalid_byte_facts{false};
- const auto resumed = download_artifacts({request}, 1U, {}, {}, [&](const std::string_view event, const nlohmann::json& fields) {
+ const BenchmarkTraceSink resume_trace{completion_only ? CompileTraceSelection({"benchmark.download.segmented_complete"}) : CompileTraceSelection{}, [&](const std::string_view event, const nlohmann::json& fields) {
   if (event == "benchmark.download.progress") {
    traced_bytes.store(true, std::memory_order_relaxed);
    if (fields.at("attempt") == 2U) { traced_second_attempt.store(true, std::memory_order_relaxed); }
    if (fields.at("retained_bytes").get<std::uint64_t>() == 0U || fields.at("durable_bytes") > fields.at("completed_bytes")) { invalid_byte_facts.store(true, std::memory_order_relaxed); }
   }
   if (event == "benchmark.download.segment_retry") traced_retry.store(true, std::memory_order_relaxed);
-  if (event == "benchmark.download.segmented_complete") traced_complete.store(true, std::memory_order_relaxed);
- });
- CHECK(traced_retry.load(std::memory_order_relaxed));
+  if (event == "benchmark.download.segmented_complete") {
+   traced_complete.store(true, std::memory_order_relaxed);
+   CHECK(fields.at("resumed") == true);
+   CHECK(fields.at("retained_bytes").get<std::uint64_t>() > retained_before_retry);
+   CHECK(fields.at("retained_bytes").get<std::uint64_t>() <= bytes);
+  } else if (completion_only) FAIL("completion-only selection delivered an excluded event");
+ }};
+ const auto resumed = download_artifacts({request}, 1U, {}, {}, resume_trace);
+ CHECK(traced_retry.load(std::memory_order_relaxed) == !completion_only);
  CHECK(traced_complete.load(std::memory_order_relaxed));
- CHECK(traced_bytes.load(std::memory_order_relaxed));
- CHECK(traced_second_attempt.load(std::memory_order_relaxed));
+ CHECK(traced_bytes.load(std::memory_order_relaxed) == !completion_only);
+ CHECK(traced_second_attempt.load(std::memory_order_relaxed) == !completion_only);
  CHECK_FALSE(invalid_byte_facts.load(std::memory_order_relaxed));
  REQUIRE(resumed.size() == 1U);
  CHECK(resumed.front().resumed);
@@ -2297,6 +2307,147 @@ TEST_CASE("benchmark trace failures are lazy and delivered once", "[backend][dat
  trace_benchmark_event(success, "benchmark.test.first", [] { return nlohmann::json{{"value", 1U}}; });
  trace_benchmark_event(success, "benchmark.test.second", [] { return nlohmann::json{{"value", 2U}}; });
  CHECK((events == std::vector<std::string>{"benchmark.test.first", "benchmark.test.second"}));
+}
+TEST_CASE("trace selection crosses serialized and enriching adapters before construction", "[backend][data][benchmark][trace]") {
+ std::size_t builds = 0, deliveries = 0;
+ const BenchmarkTraceCallback selected{CompileTraceSelection({"benchmark.test.accepted"}), [&](std::string_view event, std::string_view fields) {
+  ++deliveries;
+  CHECK(event == "benchmark.test.accepted");
+  if (!fields.empty()) CHECK(nlohmann::json::parse(fields).at("artifact") == "selected");
+ }};
+ const auto serialized = make_trace_sink(selected);
+ const BenchmarkTraceSink enriched{serialized.selection(), [serialized](std::string_view event, const nlohmann::json& fields) {
+  trace_benchmark_event(serialized, event, [&] {
+   if (fields.is_null()) return fields;
+   auto copy = fields;
+   copy["artifact"] = "selected";
+   return copy;
+  });
+ }};
+ trace_benchmark_event(enriched, "benchmark.test.excluded", [&] { ++builds; return nlohmann::json::object(); });
+ CHECK(builds == 0);
+ CHECK(deliveries == 0);
+ trace_benchmark_event(enriched, "benchmark.test.accepted", [&] { ++builds; return nlohmann::json::object(); });
+ CHECK(builds == 1);
+ CHECK(deliveries == 1);
+ trace_benchmark_event(enriched, "benchmark.test.accepted", [&]() -> nlohmann::json { ++builds; throw std::runtime_error("selected construction failed"); });
+ CHECK(builds == 2);
+ CHECK(deliveries == 2);
+ CHECK_FALSE(BenchmarkTraceSink{}.accepts("benchmark.test.accepted"));
+ CHECK(BenchmarkTraceSink([](std::string_view, const nlohmann::json&) {}).accepts("anything"));
+}
+TEST_CASE("cost spans collect independently selected endpoints", "[backend][data][benchmark][trace]") {
+ const bool completed = GENERATE(false, true);
+ std::size_t built = 0, delivered = 0;
+ const auto event = completed ? "benchmark.cost.completed" : "benchmark.cost.started";
+ const BenchmarkTraceSink sink{CompileTraceSelection({event}), [&](std::string_view name, const nlohmann::json& fields) {
+  CHECK(name == event);
+  CHECK(fields.contains("duration_ns"));
+  CHECK(fields.at("failed") == false);
+  ++delivered;
+ }};
+ {
+  BenchmarkCostSpan span(sink, BenchmarkCostKind::Selection, [&] { ++built; return nlohmann::json::object(); });
+  span.finish();
+  span.finish();
+ }
+ CHECK(built == 1);
+ CHECK(delivered == 1);
+}
+TEST_CASE("retired execution demand accumulates complete costs without transient snapshots", "[backend][data][benchmark][trace][resources]") {
+ std::optional<nlohmann::json> retired;
+ const BenchmarkTraceSink sink{CompileTraceSelection({"compile.execution.retired"}), [&](std::string_view event, const nlohmann::json& fields) {
+  CHECK(event == "compile.execution.retired");
+  CHECK_FALSE(retired.has_value());
+  retired = fields;
+ }};
+ const auto observer = observe_compile_execution(sink);
+ CHECK(observer.demand().aggregates);
+ CHECK(observer.demand().retired);
+ CHECK_FALSE(observer.demand().snapshots);
+ CHECK_FALSE(observer.demand().reservations);
+ CHECK_FALSE(observer.demand().record_rejections);
+ CHECK_FALSE(observer.demand().detailed_demands());
+ {
+  CompileExecution execution(1, {}, {.transient_bytes = 4096, .task_records = 1}, {}, observer);
+  CompileExecution::Dependency parked(execution);
+  auto first = execution.try_subscribe(parked, parked.generation(), {.kind = CompileTaskKind::Metadata, .work = [](std::size_t, const CompileAllowance&) {}});
+  REQUIRE(first);
+  CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels));
+  parked.notify();
+  first->wait();
+  execution.join();
+  for (unsigned i = 0; i < 16; ++i) execution.run(CompileTaskKind::Pixels, {}, [](std::size_t) {});
+ }
+ REQUIRE(retired);
+ CHECK(retired->at("admitted") == 17);
+ CHECK(retired->at("completed") == 17);
+ CHECK(retired->at("demands").empty());
+ const auto& costs = retired->at("costs");
+ CHECK(costs.at("snapshots_built") == 1);
+ CHECK(costs.at("record_denials").get<unsigned>() >= 1);
+ CHECK(costs.at("workers_created") == 1);
+ CHECK(costs.at("workers_retired") == 1);
+ CHECK(retired->at("task_completed").at(static_cast<std::size_t>(CompileTaskKind::Pixels)) == 16);
+}
+TEST_CASE("selected rejection snapshots retain parked resource demand facts", "[backend][data][benchmark][trace][resources]") {
+ const bool records = GENERATE(false, true);
+ const auto event = records ? "compile.record.rejected" : "compile.continuation.rejected";
+ std::optional<nlohmann::json> rejected;
+ const BenchmarkTraceSink sink{CompileTraceSelection({event}), [&](std::string_view name, const nlohmann::json& fields) {
+  CHECK(name == event);
+  rejected = fields;
+ }};
+ const auto observer = observe_compile_execution(sink);
+ CHECK_FALSE(observer.demand().snapshots);
+ CHECK(observer.demand().detailed_demands());
+ CompileExecution execution(1, {}, {.transient_bytes = 4096, .task_records = 2}, {}, observer);
+ auto held = execution.reserve({4096, 0});
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] { held = {}; execution.cancel(); });
+ auto blocked = execution.submit({.kind = CompileTaskKind::Normalize, .resources = {1, 0}, .work = [](std::size_t, const CompileAllowance&) {}});
+ // A fitting same-kind successor passes the older demand after it is probed.
+ // Borrowed custody leaves its resource epoch stable through the barrier.
+ execution.run(CompileTaskKind::Normalize, {}, [](std::size_t) {}, held);
+ CompileExecution::Readiness returned(execution, CompileChange::Records);
+ for (;;) {
+  const auto generation = returned.generation();
+  if (execution.snapshot().records == 1) break;
+  returned.wait(generation);
+ }
+ REQUIRE_FALSE(blocked.ready());
+ const auto epoch = execution.resource_generation();
+ if (records) {
+  auto filler = execution.try_retain(CompileTaskKind::Pixels);
+  REQUIRE(filler);
+  CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels));
+ } else {
+  CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels, {1, 0}));
+ }
+ REQUIRE(rejected);
+ const auto& demands = rejected->at("demands");
+ const auto parked = std::ranges::find_if(demands, [](const nlohmann::json& demand) {
+  return demand.at("kind") == static_cast<unsigned>(CompileTaskKind::Normalize);
+ });
+ REQUIRE(parked != demands.end());
+ CHECK(parked->at("requested_bytes") == 1);
+ CHECK(parked->at("denial") == static_cast<unsigned>(detail::CompileResourceDenial::Bytes));
+ CHECK(parked->at("resource_epoch") == epoch);
+ CHECK(parked->at("resource_epoch").get<std::uint64_t>() > 0);
+ CHECK(parked->at("largest_eligible_extent").get<std::uint64_t>() > 0);
+ held = {};
+ blocked.wait();
+ execution.join();
+}
+TEST_CASE("execution reservation demand selects the final adapter event", "[backend][data][benchmark][trace][resources]") {
+ const BenchmarkTraceSink sink{CompileTraceSelection({"benchmark.resource.wait"}), [](std::string_view, const nlohmann::json&) {}};
+ const auto benchmark = observe_compile_execution(sink);
+ CHECK(benchmark.demand().reservations);
+ CHECK_FALSE(benchmark.demand().snapshots);
+ CHECK_FALSE(benchmark.demand().retired);
+ const auto native = observe_compile_execution(sink, "compile.resource.wait");
+ CHECK_FALSE(native);
+ const BenchmarkTraceSink unrelated{CompileTraceSelection({"benchmark.cost.completed"}), [](std::string_view, const nlohmann::json&) {}};
+ CHECK_FALSE(observe_compile_execution(unrelated));
 }
 TEST_CASE("compile admission traces preserve every requested resource in the flat format", "[backend][data][benchmark][trace]") {
  using namespace mmltk::backend::data::detail;
@@ -7141,6 +7292,74 @@ TEST_CASE("admission readiness retains external returns across local rollback an
  CHECK(execution.try_reserve(CompileResources::handles(0, false, 2), parent).has_value());
  pressure.reset();
  CHECK_FALSE(execution.resource_pressure());
+}
+TEST_CASE("one armed event turn retains coalesced causes and callback arrivals", "[backend][data][benchmark][pipeline][resources][trace]") {
+ using Changes = CompileExecution::Readiness::Changes;
+ detail::CompileExecutionSnapshot retired;
+ const CompileExecution::ObservationDemand demand{.aggregates = true, .retired = true};
+ {
+  CompileExecution execution(1, {}, {.transient_bytes = 4096}, {}, {demand, [&](std::string_view event, const detail::CompileExecutionSnapshot& value) {
+   if (event == "compile.execution.retired") retired = value;
+  }});
+  mmltk::testsupport::TestGate delivering("acknowledged callback retains notifier"), second("coalesced callback retains notifier");
+  std::promise<Changes> batch, arrival;
+  unsigned calls = 0;
+  auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Records, [&](Changes changes) {
+   if (++calls == 1) delivering.receipt().ArriveAndWait();
+   else if (calls == 2) { batch.set_value(changes); second.receipt().ArriveAndWait(); }
+   else if (calls == 3) arrival.set_value(changes);
+  });
+  const mmltk::testsupport::ScopedTestCleanup cleanup([&] { delivering.Release(); second.Release(); readiness.reset(); });
+  readiness->notify();
+  REQUIRE(delivering.WaitEntered(5s));
+  const auto before = execution.snapshot().costs.eventfd_writes;
+  for (unsigned i = 0; i < 128; ++i) execution.notify_change(CompileChange::Resources | CompileChange::Records);
+  CHECK(execution.snapshot().costs.eventfd_writes == before + 1);
+  delivering.Release();
+  const auto coalesced = mmltk::testsupport::await_test_promise(batch, "coalesced causes survive acknowledgement", 5s);
+  CHECK(coalesced.causes == (CompileChange::Resources | CompileChange::Records));
+  CHECK(coalesced.retry);
+  REQUIRE(second.WaitEntered(5s));
+  readiness->notify();
+  second.Release();
+  CHECK(mmltk::testsupport::await_test_promise(arrival, "local arrival during delivery arms a later turn", 5s).causes == CompileChange::Local);
+ }
+ CHECK(retired.costs.notifier_batches >= 3);
+ CHECK(retired.costs.eventfd_writes < 128);
+}
+TEST_CASE("bounded record turnover keeps stale physical completions independent", "[backend][data][benchmark][pipeline][resources]") {
+ CompileExecution execution(1, {}, {.transient_bytes = 4096, .task_records = 3});
+ std::vector<CompileExecution::Completion> old;
+ std::atomic<unsigned> bodies{0}, callbacks{0};
+ for (unsigned turn = 0; turn < 24; ++turn) {
+  CompileExecution::Dependency parked(execution);
+  const auto task = [&](CompileTaskKind kind) { return CompileExecution::Task{.kind = kind,
+   .work = [&](std::size_t, const CompileAllowance&) { ++bodies; }, .completed = [&](std::exception_ptr) { ++callbacks; }}; };
+  auto cancelled = execution.try_subscribe(parked, parked.generation(), task(CompileTaskKind::Normalize));
+  auto ready = execution.try_submit(task(CompileTaskKind::Header));
+  auto resumed = execution.try_subscribe(parked, parked.generation(), task(CompileTaskKind::Pixels));
+  REQUIRE(cancelled);
+  REQUIRE(ready);
+  REQUIRE(resumed);
+  ready->wait();
+  cancelled->cancel();
+  CHECK_THROWS(cancelled->wait());
+  parked.notify();
+  resumed->wait();
+  execution.join();
+  old.push_back(*cancelled);
+  old.push_back(*ready);
+  old.push_back(*resumed);
+  // Late cancellation of all previous handles cannot reach a reused record.
+  for (const auto& completion : old) completion.cancel();
+ }
+ CHECK(bodies == 48);
+ CHECK(callbacks == 72);
+ CHECK(execution.snapshot().records == 0);
+ for (std::size_t i = 0; i < old.size(); ++i) {
+  CHECK(old[i].ready());
+  CHECK(bool(old[i].failure()) == (i % 3 == 0));
+ }
 }
 TEST_CASE("accepted local readiness retries after custody commits", "[backend][data][benchmark][pipeline][resources]") {
  // CLEANUP-IGNORE: Independent readiness scenarios share only type aliases and optional-observer fixture setup; their state transitions differ.
@@ -12672,6 +12891,7 @@ TEST_CASE("pixel cost observations retain exact plan facts and cannot change fai
  CompilePixelWorkspace pixels;
  std::vector<float> output(4 * 4 * 3, -1), unobserved(output);
  std::vector<CompilePixelObservation> observations;
+ RgbResizeWork aggregate;
  const CompilePixelObserver observer = [&](const CompilePixelObservation& value) {
   observations.push_back(value);
   throw std::runtime_error("diagnostic delivery failure");
@@ -12680,10 +12900,10 @@ TEST_CASE("pixel cost observations retain exact plan facts and cannot change fai
   const auto memory = execution.current_allowance().workspace();
   auto wrong = header;
   ++wrong.width;
-  CHECK_THROWS_AS(pixels.write(plan, input.encoded, wrong, memory, {output.data(), plan.destination()}, +[] {}, observer), CompileImageError);
+  CHECK_THROWS_AS(pixels.write(plan, input.encoded, wrong, memory, {output.data(), plan.destination()}, +[] {}, observer, &aggregate), CompileImageError);
   CHECK(std::ranges::all_of(output, [](float value) { return value == -1; }));
-  pixels.write(plan, input.encoded, header, memory, {output.data(), plan.destination()}, +[] {}, observer);
-  pixels.write(plan, input.encoded, header, memory, {unobserved.data(), plan.destination()});
+  pixels.write(plan, input.encoded, header, memory, {output.data(), plan.destination()}, +[] {}, observer, &aggregate);
+  pixels.write(plan, input.encoded, header, memory, {unobserved.data(), plan.destination()}, +[] {}, {}, &aggregate);
  });
  REQUIRE(observations.size() == 2);
  CHECK(observations[0].failed);
@@ -12700,6 +12920,9 @@ TEST_CASE("pixel cost observations retain exact plan facts and cannot change fai
  CHECK((observations[1].resize_allocation_requests > 0) == !perceptual);
  CHECK(observations[1].resize_allocation_bytes <= plan.resize_plan().bytes());
  CHECK(output == unobserved);
+ CHECK(aggregate.preparations == 2);
+ CHECK(aggregate.allocation_requests == 2 * observations[1].resize_allocation_requests);
+ CHECK(aggregate.allocation_bytes == 2 * observations[1].resize_allocation_bytes);
  CHECK(execution.snapshot().costs.eligibility_probes == 0);
  CHECK(execution.snapshot().costs.admission_lock_ns == 0);
  CHECK(execution.snapshot().arena.live_allocations == 0);
@@ -14171,7 +14394,8 @@ struct PendingImageEvidence {
   const auto accepted = fields.at("image_admitted").get<std::size_t>();
   const auto probes = fields.at("image_head_probes").get<std::size_t>();
   if (pending != fields.at("pending_images").get<std::size_t>() || probes != accepted + denied + fields.at("workspace_resource_denied").get<std::size_t>() || denied > 5 ||
-      fields.at("workspace_resource_denied").get<std::size_t>() > fields.at("workspace_probe_limit").get<std::size_t>())
+      fields.at("workspace_resource_denied").get<std::size_t>() > fields.at("workspace_probe_limit").get<std::size_t>() ||
+      fields.at("probes").get<std::size_t>() > fields.at("probe_quantum").get<std::size_t>())
    bounded = false;
   ++observations;
  }
@@ -14827,4 +15051,127 @@ TEST_CASE("immutable row admission survives identity rebinding and rejects chang
  NormalizedAnnotationAssembler assembly({}, {}, {});
  CHECK_THROWS(assembly.gather(std::span(&slice, 1)));
  CHECK_THROWS(assembly.finish());
+}
+
+TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under selected summaries", "[backend][data][benchmark][pipeline][resources][trace]") {
+ using namespace mmltk::backend::data::testsupport;
+ const bool pooled = GENERATE(false, true);
+ mmltk::testsupport::ScopedTempDir root("pipeline-selected-summary");
+ const std::array inputs{profile_image_fixture(32, 24, FixtureImageEncoding::Png), profile_image_fixture(24, 32, FixtureImageEncoding::Jpeg)};
+ const std::array<std::size_t, 8> order{0, 1, 1, 0, 1, 0, 0, 1};
+ const auto annotations = pipeline_annotation_fixture(inputs, order);
+ const auto images = root.path() / "images";
+ PreparedBenchmarkSplit split{.name = "train", .class_names = {"object"}, .sources = {{images}}};
+ std::vector<BenchmarkEncodedImage::Ptr> encoded;
+ for (std::size_t i = 0; i < order.size(); ++i) {
+  const auto& input = inputs[order[i]];
+  encoded.push_back(BenchmarkEncodedImage::publish(cached_image_path(images, i + 1), input.encoded, {}));
+  split.images.push_back({i + 1, input.width, input.height, static_cast<std::uint16_t>(annotations.image(i).box_count), 0});
+ }
+ std::optional<nlohmann::json> summary, execution_summary;
+ std::size_t queues = 0;
+ const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.pipeline.retired", "compile.execution.retired", "file.service.stopped"}),
+  [&](std::string_view event, const nlohmann::json& fields) {
+   if (event == "benchmark.pipeline.retired") summary = fields;
+   else if (event == "compile.execution.retired") execution_summary = fields;
+   else if (event == "file.service.stopped") { CHECK(fields.at("admitted") == fields.at("completed")); ++queues; }
+   else FAIL("excluded detailed event reached selected summary");
+  }};
+ {
+  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 4U << 20}, {}, trace);
+  auto request = benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline);
+  request.trace = trace;
+  BenchmarkSplitWriter writer(request);
+  BenchmarkCompilePipeline::Attempt attempt(pipeline);
+  bind_benchmark_slots(pipeline, writer, split);
+  pipeline.bind_source(images, writer, AnnotationSource::Generic);
+  pipeline.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+  pipeline.membership_ready();
+  const auto publication = pipeline.source_publication(images, {}, {}, true);
+  for (std::size_t i = 0; i < order.size(); ++i) {
+   auto payload = encoded[i];
+   if (pooled) {
+    auto allowance = pipeline.execution().reserve({.bytes = payload->size(), .supplied_workspace = true, .workspace_class = detail::CompileWorkClass::Extraction});
+    pipeline.files().submit({.work = [&] { payload = payload->preload(allowance, {}); }, .service_class = detail::CompileWorkClass::Extraction}).wait();
+   }
+   publication({i + 1, {}, true, std::move(payload)});
+   REQUIRE(pipeline.labels_ready(publication, i + 1, BenchmarkLabelInput(annotations, i), "fixture"));
+  }
+  pipeline.drain();
+  CHECK(writer.completed() == order.size());
+  writer.finish(request);
+  const auto output = CompiledDataset::open(request.output_path);
+  CHECK(output.header().num_images == order.size());
+  CHECK(output.label_count() == annotations.box_count());
+  for (std::size_t i = 0; i < order.size(); ++i) {
+   const auto& entry = output.image_entry(static_cast<std::uint32_t>(i));
+   CHECK(entry.source_image_id == i + 1);
+   CHECK(entry.num_instances == (i % 4 ? 1 : 0));
+  }
+ }
+ REQUIRE(summary);
+ CHECK(summary->at("stage_calls").at(4) == order.size());
+ CHECK(summary->at("max_probes").get<std::size_t>() <= 8);
+ for (auto bytes : summary->at("retained_bytes")) CHECK(bytes == 0);
+ for (auto bytes : summary->at("retained_input_bytes")) CHECK(bytes == 0);
+ REQUIRE(execution_summary);
+ CHECK(execution_summary->at("costs").at("snapshots_built") == 1);
+ CHECK(queues == 2);
+}
+
+TEST_CASE("a finite Workspace pass yields to other owners and reaches a fitting tail", "[benchmark][pipeline][images][resources]") {
+ using namespace mmltk::backend::data::detail;
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPUs");
+ constexpr std::size_t count = 32;
+ constexpr std::uint64_t budget = 4U << 20;
+ mmltk::testsupport::ScopedTempDir root("pipeline-workspace-quantum");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images.clear();
+ const auto large = make_large_cached_jpeg();
+ for (std::size_t id = 1; id <= count + 1; ++id) {
+  BenchmarkEncodedImage::publish(cached_image_path(images, id), id <= count ? large : make_jpeg(3, 4, 5), {});
+  split.images.push_back({id, 16, 8, 0, 0});
+ }
+ PendingImageEvidence evidence;
+ std::promise<void> parked, other_owner, tail;
+ std::atomic<bool> first_yield{true}, first_park{true};
+ std::unique_ptr<CompileExecution::Readiness> peer;
+ const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.pipeline.ready"}), [&](std::string_view, const nlohmann::json& fields) {
+  evidence.observe(fields);
+  if (fields.at("yielded").get<bool>() && first_yield.exchange(false)) peer->notify();
+  if (fields.at("header") == 0 && fields.at("workspace") == count && !fields.at("yielded").get<bool>() && first_park.exchange(false))
+   mmltk::testsupport::release_test_promise(parked);
+ }};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, {}, 0, 0, budget));
+ BenchmarkCompilePipeline pipeline(3, {}, {.transient_bytes = budget, .workspace_plan = plan}, {}, trace);
+ BoundBenchmarkWriter fixture(pipeline, benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline, true));
+ peer = std::make_unique<CompileExecution::Readiness>(pipeline.execution(), CompileChange::None, [&](auto) { mmltk::testsupport::release_test_promise(other_owner); });
+ auto retained = pipeline.execution().reserve({.bytes = budget - (80U << 10)});
+ const mmltk::testsupport::ScopedTestCleanup release([&] { retained = {}; pipeline.retire_attempt(); peer.reset(); });
+ const auto publication = pipeline.source_publication(images, {}, {}, true);
+ for (std::size_t id = 1; id <= count; ++id) publication({id});
+ mmltk::testsupport::await_test_promise(parked, "the complete denied Workspace pass parks", 5s);
+ mmltk::testsupport::await_test_promise(other_owner, "another owner runs between bounded Local turns", 5s);
+ publication({count + 1});
+ pipeline.image_completion(images, count + 1).subscribe([&](std::exception_ptr error) {
+  if (error) tail.set_exception(error); else mmltk::testsupport::release_test_promise(tail);
+ });
+ mmltk::testsupport::await_test_promise(tail, "fitting tail advances through a bounded blocked Workspace backlog", 5s);
+ CHECK_FALSE(pipeline.image_completion(images, 1).ready());
+ CHECK(fixture.writer.image_complete(count));
+ retained = {};
+ pipeline.drain();
+ CHECK(fixture.writer.completed() == count + 1);
+ CHECK(evidence.bounded);
+}
+
+TEST_CASE("synthetic profile extents obey their input budget before encoding", "[backend][data][benchmark][profile]") {
+ using namespace mmltk::backend::data::testsupport;
+ const auto encoding = GENERATE(FixtureImageEncoding::Png, FixtureImageEncoding::Jpeg);
+ CHECK_THROWS_AS(profile_image_fixture(32767, 32767, encoding, 7, 64U << 20), std::length_error);
+ CHECK_THROWS_AS(profile_image_fixture(32, 32, encoding, 7, 32U * 32U * 3U - 1U), std::length_error);
+ const auto input = profile_image_fixture(16, 8, encoding, 7, 4096);
+ CHECK_FALSE(input.encoded.empty());
+ CHECK(input.encoded.size() <= 4096);
 }

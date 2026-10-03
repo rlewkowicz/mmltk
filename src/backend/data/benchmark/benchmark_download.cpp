@@ -469,7 +469,7 @@ struct Transfer {
   Transfer& transfer = *static_cast<Transfer*>(opaque);
   try {
    if (transfer.cancel_requested.requested()) { return 1; }
-   if (!transfer.progress && !transfer.trace) { return 0; }
+   if (!transfer.progress && !transfer.trace.accepts("benchmark.download.progress")) { return 0; }
    const Clock::time_point now = Clock::now();
    if (transfer.last_progress.time_since_epoch().count() == 0 || now - transfer.last_progress >= std::chrono::milliseconds{100} ||
        (download_total > 0 && download_now >= download_total && download_now != transfer.last_reported_download_now)) {
@@ -637,7 +637,7 @@ public:
   return segments_.at(index);
  }
  void report_in_flight(const std::size_t index, const std::uint64_t bytes) {
-  if (!progress_ && !trace_) return;
+  if (!progress_ && !trace_.accepts("benchmark.download.progress")) return;
   const std::lock_guard lock(mutex_);
   in_flight_bytes_ -= in_flight_.at(index);
   in_flight_bytes_ = checked_u64_add(in_flight_bytes_, bytes, "segmented in-flight byte overflow");
@@ -648,11 +648,14 @@ public:
   last_progress_ = now;
  }
  void begin_attempt(const std::uint32_t attempt) {
-  if (!progress_ && !trace_) { return; }
+  const bool progress = progress_ || trace_.accepts("benchmark.download.progress");
+  if (!progress && !trace_.accepts("benchmark.download.segmented_complete")) { return; }
   const std::lock_guard lock(mutex_);
-  active_attempt_ = std::max(active_attempt_, attempt);
   if (attempt > 1U) retained_bytes_ = committed_bytes_;
-  emit_progress_locked(true);
+  if (progress) {
+   active_attempt_ = std::max(active_attempt_, attempt);
+   emit_progress_locked(true);
+  }
  }
  void commit_attempt(const std::size_t index, const std::uint64_t attempt_begin, const std::uint64_t transferred, const std::uint32_t attempt) {
   std::vector<DownloadSegment> checkpoint;
@@ -775,7 +778,7 @@ public:
 
 private:
  void emit_progress_locked(const bool force) const {
-  if (!progress_ && !trace_) { return; }
+  if (!progress_ && !trace_.accepts("benchmark.download.progress")) { return; }
   const auto completed = checked_u64_add(committed_bytes_, in_flight_bytes_, "segmented progress byte overflow");
   if (completed > request_.expected_size) throw std::runtime_error("segmented download progress exceeds artifact size");
   const auto attempts = std::max(maximum_attempt_, active_attempt_);

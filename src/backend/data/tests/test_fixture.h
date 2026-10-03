@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -23,6 +24,7 @@ struct PreparedBenchmarkSplit;
 struct EncodedImageRecord;
 struct BenchmarkWriteRequest;
 struct BenchmarkLabelChunk;
+class NormalizedAnnotationReadView;
 }  // namespace benchmark_internal
 }  // namespace mmltk::backend::data
 namespace mmltk::backend::data::testsupport {
@@ -32,7 +34,9 @@ struct ProfileImageFixture {
  std::uint32_t width = 0, height = 0;
  std::vector<std::uint8_t> encoded;
 };
-[[nodiscard]] ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding, std::uint32_t seed = 7);
+[[nodiscard]] ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding, std::uint32_t seed = 7, std::size_t byte_limit = 256U << 20);
+// Deterministic source-ordered rows: every fourth image is a background.
+[[nodiscard]] benchmark_internal::NormalizedAnnotationReadView pipeline_annotation_fixture(std::span<const ProfileImageFixture>, std::span<const std::size_t> order);
 // Enabled only by MMLTK_TEST_BENCHMARK_TRACE for focused failure diagnosis.
 [[nodiscard]] benchmark_internal::BenchmarkTraceSink benchmark_trace();
 // Seed the mixed known/unknown Coconut extents at the reported progress boundary.

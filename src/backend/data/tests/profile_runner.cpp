@@ -1,4 +1,5 @@
 #include "src/backend/data/benchmark/detail/benchmark_trace.h"
+#include "src/backend/data/tests/profile_support.h"
 #include <cuda_runtime.h>
 #include <array>
 #include <charconv>
@@ -43,149 +44,17 @@ using namespace mmltk::common::logging;
 using namespace mmltk::common::system;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 using namespace mmltk::backend::data::testsupport;
+using namespace mmltk::backend::data::testsupport::profile;
 namespace fs = std::filesystem;
 namespace {
-enum class ProfileMode : std::uint8_t { Loader, Compile, Pixels, Resample, Coconut };
-MMLTK_REFLECT_ENUM(ProfileMode)
-double seconds_since(const std::chrono::steady_clock::time_point start, const std::chrono::steady_clock::time_point end) { return std::chrono::duration<double>(end - start).count(); }
-std::string metric_name(const char* label, const char* suffix) { return std::string("benchmark.") + label + "." + suffix; }
-void record_duration_metric(const char* label, const char* suffix, const std::chrono::steady_clock::time_point start, const std::chrono::steady_clock::time_point end) {
- profile_record_duration_ns(metric_name(label, suffix).c_str(), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
-}
-void record_value_metric(const char* label, const char* suffix, const std::uint64_t value) { profile_add_value(metric_name(label, suffix).c_str(), value); }
-std::string iteration_label(const int repetition) {
- std::array<char, 64> buffer{};
- std::snprintf(buffer.data(), buffer.size(), "backend.data[%02d]", repetition);
- return buffer.data();
-}
-struct Options {
- std::string test_dir = "/tmp/mmltk_profile";
- bool keep_artifacts = false;
- int width = 384;
- int height = 384;
- int num_images = 256;
- int batch_size = 32;
- int num_epochs = 2;
- int compile_workers = -1;
- int shuffle_prefetch = 3;
- int repetitions = 10;
- int warmup_runs = 1;
- ProfileMode mode = ProfileMode::Loader;
- FixtureImageEncoding encoding = FixtureImageEncoding::Png;
- int source_width = 0, source_height = 0;
- bool perceptual = false, mixed_geometry = false, shuffle_geometry = false;
- std::string input_manifest, cache_dir, trace_file, cpu_affinity;
- std::vector<std::string> trace_prefix;
-};
-MMLTK_REFLECT_FIELDS(Options)
-using ProfileOptions = mmltk::frameworks::reflection::CliScope<Options>;
-inline constexpr std::array profile_options{
- MMLTK_CLI_OPTION(ProfileOptions, mode, "loader, compile (Directory STB), pixels (benchmark decode), resample (retained RGB), coconut (Stock + recovery)", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, encoding, "PNG or JPEG synthetic input", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, input_manifest, "Retained JPEG/PNG paths, one per line; pixels/resample only", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, cache_dir, "Retained production benchmark cache; required for coconut", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, trace_file, "Opt-in causal JSONL; omit for throughput", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, trace_prefix, "Retain matching event prefixes (repeatable); observation costs remain enabled", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, test_dir, "Synthetic working directory or isolated Coconut output root", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, keep_artifacts, "Retain generated fixtures", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, perceptual, "Enable perceptual shrinking", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, mixed_geometry, "Cycle the seven acceptance geometries", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, shuffle_geometry, "Shuffle input order with seed 1729", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, source_width, "Synthetic source width; zero uses target width", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, source_height, "Synthetic source height; zero uses target height", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, width, "Target width", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, height, "Target height", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, num_images, "Images per measured iteration", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, batch_size, "Loader batch size", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, num_epochs, "Loader epochs", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, compile_workers, "CPU workers, -1 automatic", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, shuffle_prefetch, "Loader shuffle prefetch", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, repetitions, "Measured iterations", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, warmup_runs, "Unmeasured iterations", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, cpu_affinity, "Linux CPU list, inherited by all production workers", "Profiling"),
-};
-Options parse_options(int argc, char** argv) {
- std::vector<std::string_view> arguments;
- for (int i = 1; i < argc; ++i) {
-  if (std::string_view(argv[i]) == "--help") {
-   std::puts(mmltk::frameworks::reflection::help(argv[0], "Opt-in production CPU and loader profiles", profile_options).c_str());
-   std::exit(0);
-  }
-  arguments.emplace_back(argv[i]);
- }
- auto parsed = mmltk::frameworks::reflection::parse<Options>(arguments, profile_options);
- if (!parsed) throw parsed.error();
- Options opts = std::move(parsed->request);
- if (!opts.source_width) opts.source_width = opts.width;
- if (!opts.source_height) opts.source_height = opts.height;
- const auto valid_extent = [](int extent) { return extent > 0 && std::cmp_less_equal(extent, MAX_IMAGE_EXTENT); };
- if (!valid_extent(opts.width) || !valid_extent(opts.height) || !valid_extent(opts.source_width) || !valid_extent(opts.source_height) || opts.num_images <= 0 || opts.batch_size <= 0 ||
-     opts.num_epochs <= 0 || opts.shuffle_prefetch <= 0 || opts.repetitions <= 0 || opts.warmup_runs < 0 || opts.compile_workers == 0 || opts.compile_workers < -1)
-  throw std::invalid_argument("invalid profile dimensions or counts");
- if (opts.mode == ProfileMode::Coconut && (opts.cache_dir.empty() || opts.width != opts.height)) throw std::invalid_argument("coconut mode requires --cache-dir and square target dimensions");
- if (!opts.trace_prefix.empty() && opts.trace_file.empty()) throw std::invalid_argument("trace-prefix requires trace-file");
- if (!opts.input_manifest.empty() && opts.mode != ProfileMode::Pixels && opts.mode != ProfileMode::Resample) throw std::invalid_argument("retained input manifests require pixels or resample mode");
- return opts;
-}
-class ProfileTrace final {
- std::ofstream output_;
- std::mutex mutex_;
- std::uint64_t run_ = 0;
- std::vector<std::string> prefixes_;
-
-public:
- explicit ProfileTrace(const std::string& path, std::vector<std::string> prefixes) : prefixes_(std::move(prefixes)) {
-  if (path.empty()) return;
-  if (const auto parent = fs::path(path).parent_path(); !parent.empty()) fs::create_directories(parent);
-  output_.open(path, std::ios::app);
-  run_ = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-  if (!output_) throw std::runtime_error("cannot open profile trace");
- }
- [[nodiscard]] benchmark_internal::BenchmarkTraceSink sink() {
-  if (!output_.is_open()) return {};
-  return [this](std::string_view event, const nlohmann::json& fields) {
-   if (!prefixes_.empty() && std::ranges::none_of(prefixes_, [&](const auto& prefix) { return event.starts_with(prefix); })) return;
-   const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-   const std::lock_guard lock(mutex_);
-   output_ << nlohmann::json{{"event", event}, {"steady_ns", stamp}, {"run_id", run_}, {"fields", fields}}.dump() << '\n';
-   if (!prefixes_.empty()) output_.flush();
-  };
- }
-};
-std::vector<ProfileImageFixture> profile_inputs(const Options& opts) {
- std::vector<ProfileImageFixture> inputs;
- if (!opts.input_manifest.empty()) {
-  std::ifstream manifest(opts.input_manifest);
-  if (!manifest) throw std::runtime_error("cannot open profile input manifest");
-  std::string line;
-  std::uint64_t retained_bytes = 0;
-  while (std::getline(manifest, line)) {
-   if (line.empty()) continue;
-   if (inputs.size() == 64) throw std::length_error("profile manifest exceeds 64 retained images");
-   auto path = fs::path(line);
-   if (path.is_relative()) path = fs::path(opts.input_manifest).parent_path() / path;
-   const auto input = mmltk::common::io::MappedFile::open_readonly(path.string());
-   retained_bytes += input.size();
-   if (retained_bytes > (256ULL << 20)) throw std::length_error("profile encoded inputs exceed 256 MiB");
-   detail::CompileImageDecoder decoder;
-   const auto header = decoder.read_header({input.data(), input.size()}, detail::CompileImagePolicy::Benchmark);
-   inputs.push_back({header.width, header.height, {input.data(), input.data() + input.size()}});
-  }
- } else if (opts.mixed_geometry) {
-  for (const auto [width, height] : std::array<std::pair<unsigned, unsigned>, 7>{{{384, 384}, {640, 480}, {768, 768}, {1024, 768}, {2048, 2048}, {640, 360}, {320, 240}}})
-   inputs.push_back(profile_image_fixture(width, height, opts.encoding));
- } else
-  inputs.push_back(profile_image_fixture(static_cast<unsigned>(opts.source_width), static_cast<unsigned>(opts.source_height), opts.encoding));
- if (inputs.empty()) throw std::invalid_argument("profile input manifest is empty");
- return inputs;
-}
 void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixture>& inputs, const benchmark_internal::BenchmarkTraceSink& trace) {
  using namespace detail;
  using namespace mmltk::backend::imaging::resample;
- const auto workers = opts.compile_workers < 0 ? std::max<std::size_t>(1, NumaTopology::Capture().permitted_cpus.size()) : static_cast<std::size_t>(opts.compile_workers);
+ const auto workers = profile_workers(opts);
  const auto setup_start = std::chrono::steady_clock::now();
  const CompilePixelPolicy policy{static_cast<unsigned>(opts.width), static_cast<unsigned>(opts.height), ImageResizeMode::Stretch, opts.perceptual};
  if (std::uint64_t(opts.width) * opts.height * 12 > (512ULL << 20) / workers) throw std::length_error("profile destinations exceed 512 MiB");
+ const bool observe_resize = trace.accepts("compile.pixel") || trace.accepts("profile.resize.completed");
  RgbResizeWork layout_work;
  std::vector<CompilePixelWorkspacePlan> pixel_plans;
  std::vector<RgbResizeWorkspacePlan> resize_plans;
@@ -196,7 +65,7 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  NumaMemory decode_memory(NumaTopology::Capture().permitted_nodes.front());
  for (const auto& input : inputs) {
   const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark);
-  pixel_plans.push_back(compile_pixel_workspace_plan(header, policy, trace ? &layout_work : nullptr));
+  pixel_plans.push_back(compile_pixel_workspace_plan(header, policy, observe_resize ? &layout_work : nullptr));
   resize_plans.push_back(pixel_plans.back().resize_plan());
   maximum = std::max(maximum, opts.mode == ProfileMode::Resample ? resize_plans.back().bytes() : pixel_plans.back().bytes());
   if (opts.mode == ProfileMode::Resample) {
@@ -213,24 +82,18 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  const auto budget = backing > CompileWorkspacePlan::ceiling / workers ? CompileWorkspacePlan::ceiling : backing * workers;
  const std::array profiles{CompileWorkspaceProfile{backing, 0}};
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(workers, profiles, 0, 0, budget));
- CompileExecution::Observer observer;
- if (trace) observer = [&](std::string_view event, const CompileExecutionSnapshot& value) { benchmark_internal::trace_compile_execution(trace, event, value); };
+ auto observer = benchmark_internal::observe_compile_execution(trace, "compile.resource.wait");
  CompileExecution execution(workers, {}, {.workspace_plan = plan}, {}, std::move(observer));
  std::vector<std::unique_ptr<CompilePixelWorkspace>> pixels;
  std::vector<std::unique_ptr<RgbImageResizer>> resizers;
  std::vector<std::vector<float>> output;
- std::vector<RgbResizeWork> resize_work(trace ? workers : 0);
+ std::vector<RgbResizeWork> resize_work(observe_resize ? workers : 0);
  for (std::size_t i = 0; i < workers; ++i) {
   pixels.push_back(std::make_unique<CompilePixelWorkspace>());
   resizers.push_back(std::make_unique<RgbImageResizer>(1, opts.perceptual));
   output.emplace_back(std::size_t(opts.width) * opts.height * 3);
  }
- std::vector<std::size_t> order(static_cast<std::size_t>(opts.num_images));
- for (std::size_t i = 0; i < order.size(); ++i) order[i] = i % inputs.size();
- if (opts.shuffle_geometry) {
-  std::mt19937 random(1729);
-  std::shuffle(order.begin(), order.end(), random);
- }
+ const auto order = profile_order(opts, inputs.size());
  std::uint64_t source_bytes = 0;
  for (const auto i : order) source_bytes += opts.mode == ProfileMode::Resample ? decoded[i].size() : inputs[i].encoded.size();
  const auto start = std::chrono::steady_clock::now();
@@ -245,13 +108,10 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
    resizers[lane]->prepare(resize_plans[i], memory);
    resizers[lane]->resize_to_planar(
     {decoded[i].data(), {inputs[i].width, inputs[i].height, std::size_t(inputs[i].width) * 3, 0, decoded[i].size(), RgbPixelFormat::RGB8}}, destination, policy.mode,
-    trace ? &resize_work[lane] : nullptr);
+    observe_resize ? &resize_work[lane] : nullptr);
   } else {
    CompilePixelObserver observed;
-   if (trace) observed = [&](const CompilePixelObservation& value) {
-    resize_work[lane].preparations += value.resize_preparations;
-    resize_work[lane].allocation_requests += value.resize_allocation_requests;
-    resize_work[lane].allocation_bytes += value.resize_allocation_bytes;
+   if (trace.accepts("compile.pixel")) observed = [&](const CompilePixelObservation& value) {
     benchmark_internal::trace_benchmark_event(trace, "compile.pixel", [&] {
      auto fields = benchmark_internal::benchmark_observation_fields(value);
      fields["image_id"] = index;
@@ -259,7 +119,7 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
      return fields;
     });
    };
-   pixels[lane]->write(pixel_plans[i], inputs[i].encoded, pixel_plans[i].header(), memory, destination, +[] {}, observed);
+   pixels[lane]->write(pixel_plans[i], inputs[i].encoded, pixel_plans[i].header(), memory, destination, +[] {}, observed, observe_resize ? &resize_work[lane] : nullptr);
   }
  });
  const auto end = std::chrono::steady_clock::now();
@@ -268,15 +128,15 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  std::printf("cpu_profile images=%zu workers=%zu sec=%.6f images_per_sec=%.3f source_bytes_per_sec=%.3f output_bytes_per_sec=%.3f retained_decoded_bytes=%llu plan_count=%zu setup_sec=%.6f\n",
   order.size(), workers, seconds, static_cast<double>(order.size()) / seconds, static_cast<double>(source_bytes) / seconds,
   static_cast<double>(order.size() * std::size_t(opts.width) * opts.height * 12) / seconds, static_cast<unsigned long long>(retained_decoded), inputs.size(), seconds_since(setup_start, start));
- if (trace) {
+ if (observe_resize) {
   std::printf("cpu_profile layout_preparations=%llu layout_allocation_requests=%llu layout_allocation_bytes=%llu\n", static_cast<unsigned long long>(layout_work.preparations),
    static_cast<unsigned long long>(layout_work.allocation_requests), static_cast<unsigned long long>(layout_work.allocation_bytes));
   RgbResizeWork work;
-  for (const auto& lane : resize_work) {
-   work.preparations += lane.preparations;
-   work.allocation_requests += lane.allocation_requests;
-   work.allocation_bytes += lane.allocation_bytes;
-  }
+  for (const auto& lane : resize_work)
+   mmltk::frameworks::reflection::visit_materialized_members<RgbResizeWork>([&]<class Declaration>(const auto&) { work.*Declaration::pointer += lane.*Declaration::pointer; });
+  benchmark_internal::trace_benchmark_event(trace, "profile.resize.completed", [&] {
+   return nlohmann::json{{"layout", benchmark_internal::benchmark_observation_fields(layout_work)}, {"resize", benchmark_internal::benchmark_observation_fields(work)}};
+  });
   std::printf("cpu_profile resize_preparations=%llu resize_allocation_requests=%llu resize_allocation_bytes=%llu\n", static_cast<unsigned long long>(work.preparations),
    static_cast<unsigned long long>(work.allocation_requests), static_cast<unsigned long long>(work.allocation_bytes));
  }
@@ -329,10 +189,11 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts, cons
  DirectoryCompileObservation observation;
  if (trace) {
   observation.context = const_cast<benchmark_internal::BenchmarkTraceSink*>(&trace);
+  observation.execution_demand = benchmark_internal::observe_compile_execution(trace, "compile.resource.wait").demand();
   observation.execution = +[](void* context, std::string_view event, const detail::CompileExecutionSnapshot& value) {
    benchmark_internal::trace_compile_execution(*static_cast<benchmark_internal::BenchmarkTraceSink*>(context), event, value);
   };
-  observation.pixel = +[](void* context, std::uint32_t image, const detail::CompilePixelObservation& value) {
+  if (trace.accepts("compile.pixel")) observation.pixel = +[](void* context, std::uint32_t image, const detail::CompilePixelObservation& value) {
    const auto& sink = *static_cast<benchmark_internal::BenchmarkTraceSink*>(context);
    benchmark_internal::trace_benchmark_event(sink, "compile.pixel", [&] {
     auto fields = benchmark_internal::benchmark_observation_fields(value);
@@ -389,7 +250,7 @@ int main(int argc, char** argv) {
    opts.num_images,
   };
   auto inputs = opts.mode == ProfileMode::Coconut ? std::vector<ProfileImageFixture>{} : profile_inputs(opts);
-  if (opts.shuffle_geometry && opts.mode != ProfileMode::Pixels && opts.mode != ProfileMode::Resample) {
+  if (opts.shuffle_geometry && opts.mode != ProfileMode::Pixels && opts.mode != ProfileMode::Resample && opts.mode != ProfileMode::Pipeline) {
    std::mt19937 random(1729);
    std::shuffle(inputs.begin(), inputs.end(), random);
   }
@@ -422,6 +283,8 @@ int main(int argc, char** argv) {
   const auto run = [&] {
    if (opts.mode == ProfileMode::Pixels || opts.mode == ProfileMode::Resample)
     run_pixel_profile(opts, inputs, trace_sink);
+   else if (opts.mode == ProfileMode::Pipeline)
+    run_pipeline_profile(opts, inputs, trace_sink);
    else if (opts.mode == ProfileMode::Coconut) {
     BenchmarkCompilerConfig config;
     config.selection = {BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock, true};
@@ -432,7 +295,7 @@ int main(int argc, char** argv) {
     config.perceptual_downscale = opts.perceptual;
     config.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
     config.overwrite = true;
-    if (trace_sink) config.trace = [&](std::string_view event, std::string_view fields) { trace_sink(event, nlohmann::json::parse(fields)); };
+    if (trace_sink) config.trace = {trace_sink.selection(), [&](std::string_view event, std::string_view fields) { trace_sink(event, fields.empty() ? nlohmann::json{} : nlohmann::json::parse(fields)); }};
     const auto started = std::chrono::steady_clock::now();
     config.progress = [started, next = started, phase = DatasetCompilePhase::Planning](const BenchmarkCompileProgress& value) mutable {
      const auto now = std::chrono::steady_clock::now();

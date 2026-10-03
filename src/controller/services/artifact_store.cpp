@@ -101,7 +101,7 @@ private:
    configuration.progress = [progress](const mmltk::backend::data::BenchmarkCompileProgress& update) { progress(project_artifact_progress(update)); };
   }
   if (trace.report != nullptr) {
-   configuration.trace = [trace](const std::string_view event, const std::string_view json_fields) noexcept { trace(event, json_fields); };
+   configuration.trace = {trace.selection, [trace](const std::string_view event, const std::string_view json_fields) noexcept { trace(event, json_fields); }};
   }
   mmltk::backend::data::compile_benchmark_dataset(std::move(configuration));
  }

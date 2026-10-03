@@ -2138,3 +2138,56 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
  CHECK(bounds.max_y == 4096);
  CHECK(std::ranges::equal(result.instance_rle(0, label), expected, [](const auto& a, const auto& b) { return a.start == b.start && a.length == b.length; }));
 }
+
+TEST_CASE("progress tracing requires its own selected demand", "[backend][data][benchmark][progress][trace]") {
+ using namespace mmltk::backend::data;
+ using namespace mmltk::backend::data::benchmark_internal;
+ std::size_t delivered = 0;
+ const BenchmarkTraceSink unrelated{CompileTraceSelection({"compile.execution.retired"}), [&](std::string_view, const nlohmann::json&) { ++delivered; }};
+ ProgressReporter quiet({}, unrelated);
+ CHECK_FALSE(quiet.pixel_observer_enabled());
+ CHECK_FALSE(quiet.transfer_observer_enabled());
+ CHECK_FALSE(quiet.normalization_observer_enabled());
+ quiet.pixels(10, 0, true);
+ quiet.pixel_completed();
+ quiet.flush();
+ CHECK(delivered == 0);
+ const BenchmarkTraceSink throughput{CompileTraceSelection({"benchmark.pixel_compile.throughput"}), [&](std::string_view event, const nlohmann::json& fields) {
+  CHECK(event == "benchmark.pixel_compile.throughput");
+  CHECK(fields.is_object());
+  ++delivered;
+ }};
+ ProgressReporter observed({}, throughput);
+ CHECK(observed.pixel_observer_enabled());
+ observed.pixels(1, 0, true);
+ observed.pixel_completed();
+ observed.flush();
+ CHECK(delivered > 0);
+}
+
+TEST_CASE("Directory forwards retired-only execution demand without live observation", "[backend][data][progress][trace]") {
+ using namespace mmltk::backend::data;
+ using namespace mmltk::backend::data::testsupport;
+ mmltk::testsupport::ScopedTempDir root("directory-selected-execution");
+ FixtureSpec fixture{root.path().string(), "train", 33, 33, 2};
+ create_synthetic_dataset(fixture);
+ auto config = compiler_config(fixture);
+ config.num_workers = 1;
+ struct Observation { std::size_t deliveries = 0; detail::CompileExecutionSnapshot retired; } result;
+ DirectoryCompileObservation observation;
+ observation.context = &result;
+ observation.execution_demand = {.aggregates = true, .retired = true};
+ observation.execution = +[](void* context, std::string_view event, const detail::CompileExecutionSnapshot& snapshot) {
+  auto& result = *static_cast<Observation*>(context);
+  CHECK(event == "compile.execution.retired");
+  result.retired = snapshot;
+  ++result.deliveries;
+ };
+ config.observation = &observation;
+ DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0);
+ CHECK(result.deliveries == 1);
+ CHECK(result.retired.costs.snapshots_built == 1);
+ CHECK(result.retired.completed > 0);
+ CHECK(result.retired.completed == result.retired.admitted);
+ CHECK(result.retired.costs.workers_created == result.retired.costs.workers_retired);
+}

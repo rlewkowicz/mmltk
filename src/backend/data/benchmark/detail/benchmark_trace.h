@@ -1,5 +1,7 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/detail/compile_observation.h"
+#include "src/backend/data/compile_trace_selection.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include <concepts>
 #include <cstdint>
@@ -15,7 +17,8 @@ struct CompileExecutionSnapshot;
 }  // namespace mmltk::backend::data::detail
 namespace mmltk::backend::data::benchmark_internal {
 // A null value reports diagnostic construction failure; it is never product state.
-using BenchmarkTraceSink = std::function<void(std::string_view, const nlohmann::json&)>;
+using BenchmarkTraceSink = CompileTraceSink<const nlohmann::json&>;
+[[nodiscard]] detail::CompileExecution::Observer observe_compile_execution(const BenchmarkTraceSink&, std::string_view reservation_event = "benchmark.resource.wait");
 void trace_compile_execution(const BenchmarkTraceSink&, std::string_view, const detail::CompileExecutionSnapshot&) noexcept;
 template <class Observation>
 [[nodiscard]] nlohmann::json benchmark_observation_fields(const Observation& observation) {
@@ -27,7 +30,7 @@ template <class Observation>
 template <class Builder>
  requires std::invocable<Builder> && std::convertible_to<std::invoke_result_t<Builder>, nlohmann::json>
 inline void trace_benchmark_event(const BenchmarkTraceSink& sink, const std::string_view event, Builder&& fields) noexcept {
- if (!sink) { return; }
+ if (!sink.accepts(event)) { return; }
  nlohmann::json payload;
  try {
   payload = std::invoke(std::forward<Builder>(fields));
@@ -62,8 +65,8 @@ class BenchmarkCostSpan final {
  }
 
 public:
- BenchmarkCostSpan(const BenchmarkTraceSink& sink, BenchmarkCostKind kind, Fields fields) : sink_(sink), kind_(kind), fields_(std::move(fields)), clock_(bool(sink)) {
-  if (sink_) {
+ BenchmarkCostSpan(const BenchmarkTraceSink& sink, BenchmarkCostKind kind, Fields fields) : sink_(sink), kind_(kind), fields_(std::move(fields)), clock_(sink.accepts("benchmark.cost.completed")) {
+  if (sink_.accepts("benchmark.cost.started") || sink_.accepts("benchmark.cost.completed")) {
    exceptions_ = std::uncaught_exceptions();
    report("benchmark.cost.started", false);
   }
@@ -72,7 +75,7 @@ public:
  BenchmarkCostSpan(const BenchmarkCostSpan&) = delete;
  BenchmarkCostSpan& operator=(const BenchmarkCostSpan&) = delete;
  void finish() noexcept {
-  if (!sink_ || finished_) return;
+  if (!sink_.accepts("benchmark.cost.completed") || finished_) return;
   finished_ = true;
   report("benchmark.cost.completed", std::uncaught_exceptions() > exceptions_);
  }

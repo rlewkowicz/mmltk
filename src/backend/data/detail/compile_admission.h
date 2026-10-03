@@ -134,7 +134,7 @@ struct CompileAdmission {
  [[nodiscard]] bool oversized(CompileResources value) const {
   return value.supplied_workspace && value.bytes && arenas && !arenas->normal_fit(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window);
  }
- bool tracing = false;
+ bool tracing = false, observe_credits = false;
  mutable std::uint64_t eligibility_probes = 0;
  std::uint64_t admission_lock_ns = 0;
  std::vector<Credits*> observed_credits;
@@ -301,7 +301,7 @@ struct CompileAdmission {
   if (credit.parent) credit.parent->available -= borrowed;
   credit.charged = true;
   notify((value.bytes || value.descriptors || value.continuation_descriptors ? Change::Resources : Change::None) | (value.cpu_workers ? Change::Cpu : Change::None));
-  if (tracing) try {
+  if (observe_credits) try {
     observed_credits.push_back(&credit);
     credit.location = location;
    } catch (...) { /* Diagnostic tracking cannot change admission. */
@@ -330,7 +330,7 @@ struct CompileAdmission {
   {
    const std::lock_guard lock(mutex);
    const auto value = credit.resources;
-   if (tracing) std::erase(observed_credits, &credit);
+   if (observe_credits) std::erase(observed_credits, &credit);
    credit.workspace_loans.retire();
    (value.retained_handles ? handle_bytes : bytes) -= value.bytes;
    descriptors -= value.descriptors;

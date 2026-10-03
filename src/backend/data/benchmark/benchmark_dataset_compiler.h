@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/compile_trace_selection.h"
 #include "src/backend/data/benchmark/benchmark_dataset_options.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include <atomic>
@@ -31,7 +32,7 @@ using BenchmarkProgressCallback = std::function<void(const BenchmarkCompileProgr
 // Synchronous borrowed views. Empty json_fields reports diagnostic construction or
 // encoding failure; setup failure also has an empty event. Consumers must not
 // publish it as a successful record. Callback failures never affect compilation.
-using BenchmarkTraceCallback = std::function<void(std::string_view event, std::string_view json_fields)>;
+using BenchmarkTraceCallback = CompileTraceSink<std::string_view>;
 [[nodiscard]] std::string format_benchmark_source_status(const BenchmarkSourceProgress& progress, std::string_view default_status);
 struct BenchmarkCompilerConfig {
  BenchmarkDatasetSelection selection;

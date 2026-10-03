@@ -431,7 +431,7 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  try {
   auto destination = state.slots_storage->pixels(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow"));
   detail::CompilePixelObserver observer;
-  if (state.trace)
+  if (state.trace.accepts("compile.pixel"))
    observer = [&](const detail::CompilePixelObservation& value) {
     trace_benchmark_event(state.trace, "compile.pixel", [&] {
      auto fields = benchmark_observation_fields(value);
@@ -632,8 +632,9 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
  output.pwrite_all(index.data(), state.layout.index_size, state.layout.index_offset);
  state.staging.resize_sparse(state.layout.total_size);
  trace_benchmark_event(request.trace, "benchmark.split_sync.started", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}}; });
+ detail::CompileObservationClock sync_clock{request.trace.accepts("benchmark.split_sync.completed")};
  output.sync_data();
- trace_benchmark_event(request.trace, "benchmark.split_sync.completed", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}}; });
+ trace_benchmark_event(request.trace, "benchmark.split_sync.completed", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}, {"duration_ns", sync_clock.elapsed()}}; });
  const auto persisted = read_compiled_header(output);
  (void)validate_compiled_file_sections(persisted, output.size());
  if (std::memcmp(&persisted, &header, sizeof(header))) throw std::runtime_error("staged benchmark header differs");

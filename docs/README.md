@@ -53,6 +53,9 @@
   source-generation reconciliation, immutable row-admission and cache custody,
   healthy subsets and incomplete provenance, row/component progress accounting,
   and capacity limits.
+- [Benchmark compiler performance](benchmark-performance.md): complete-run
+  aggregate costs, source-reviewed optimization candidates, bounded measurement
+  design, and the limits of the current evidence.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA selection,
   transfers, runtime retirement, inference lanes, readbacks, Vulkan/CUDA import,
   canvas descriptor/submission custody, sparse display damage, Upscale

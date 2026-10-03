@@ -109,6 +109,7 @@ private:
  BenchmarkProgressCallback callback_;
  std::function<void(std::exception_ptr)> failed_;
  BenchmarkTraceSink trace_;
+ bool trace_progress_ = false;
  BenchmarkCompileProgress state_;
  std::array<std::pair<std::size_t, std::size_t>, 2> compaction_{};
  std::chrono::steady_clock::time_point activity_started_{};

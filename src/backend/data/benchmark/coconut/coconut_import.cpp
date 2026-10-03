@@ -389,6 +389,7 @@ class Importer final {
   std::size_t count = 0;
   {
    const std::lock_guard lock(outputs_mutex_);
+   output_readiness_->interests(CompileChange::Resources | CompileChange::Records);
    for (auto& entry : outputs_) {
     if (!entry) continue;
     const auto job = entry;
@@ -438,6 +439,15 @@ class Importer final {
     }
     if (job->state == NativeJob::State::Done) finished[count++] = std::move(entry);
    }
+   CompileChange interests = CompileChange::None;
+   for (const auto& entry : outputs_) {
+    if (!entry) continue;
+    if (entry->state == NativeJob::State::Prepare) interests |= CompileChange::Resources | CompileChange::Records;
+    // Completion callbacks publish Copy before their retained scheduler record
+    // becomes Continuation; its later Records return is still indispensable.
+    if (entry->state == NativeJob::State::Copy) interests |= CompileChange::Records;
+   }
+   output_readiness_->interests(interests);
   }
   for (const auto& job : std::span(finished).first(count)) {
    // No accepted operation or copy can still touch these PMR objects. Destroy
@@ -502,7 +512,7 @@ public:
        assembly_workspace_(request.limits, request.cancellation),
        normalizations_(native_window, request.execution ? &request.execution->execution() : nullptr) {
   if (request.execution)
-   output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::Resources | CompileChange::Records, [this](auto changes) {
+   output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::None, [this](auto changes) {
     if (changes.retry || includes(changes.causes, CompileChange::Records | CompileChange::Local | CompileChange::Interruption)) pump_outputs();
    });
   if (request.input_identity.empty()) invalid("missing pinned input identity");
@@ -1364,7 +1374,7 @@ private:
     const std::lock_guard lock(mutex);
     const auto found = originals.find(key);
     if (found == originals.end()) return;
-    if (trace) count = found->second.rows.size();
+    if (trace.accepts("benchmark.coconut.original_notified")) count = found->second.rows.size();
     for (const auto& [position, weak] : found->second.rows) {
      (void)position;
      if (auto row = weak.lock()) {

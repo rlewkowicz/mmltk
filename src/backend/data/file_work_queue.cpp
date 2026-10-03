@@ -1,4 +1,5 @@
 #include "src/backend/data/detail/file_work_queue.h"
+#include "src/backend/data/detail/compile_observation.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/system/cpu_affinity.h"
 #include <algorithm>
@@ -21,6 +22,7 @@ struct FileWorkQueue::Impl {
   State state = State::Free;
   CompileWorkClass work_class = CompileWorkClass::Output;
   std::uint64_t observation = 0;
+  CompileObservationClock queued_at{false};
   // A borrowed runtime dispatch may still be queued after local cancellation.
   // This prepared record keeps only its scheduler custody alive until dispatch;
   // the cancelled operation and its context have already settled independently.
@@ -46,14 +48,16 @@ struct FileWorkQueue::Impl {
  bool stopping = false, shutdown = false;
  Observer observer;
  std::uint64_t admitted = 0, completed = 0;
+ Observation totals;
+ bool timing = false;
  explicit Impl(std::size_t capacity) : records(capacity) {
   if (!capacity) throw std::invalid_argument("file queue requires prepared records");
  }
  void observe(std::string_view event) noexcept {
-  if (observer) observe(event, Observation{});
+  if (observer.accepts(event)) observe(event, Observation{});
  }
  void observe(std::string_view event, Observation value) noexcept {
-  if (!observer) return;
+  if (!observer.accepts(event)) return;
   {
    const std::lock_guard lock(mutex);
    value.records = pending;
@@ -62,6 +66,14 @@ struct FileWorkQueue::Impl {
    value.busy = busy_services;
    value.admitted = admitted;
    value.completed = completed;
+   value.total_bytes = totals.total_bytes;
+   value.total_queue_ns = totals.total_queue_ns;
+   value.total_physical_ns = totals.total_physical_ns;
+   value.total_cpu_ns = totals.total_cpu_ns;
+   value.total_callback_ns = totals.total_callback_ns;
+   value.total_minor_faults = totals.total_minor_faults;
+   value.total_major_faults = totals.total_major_faults;
+   value.incomplete |= totals.incomplete;
    for (const auto& record : records) {
     const auto kind = static_cast<std::size_t>(record.work_class);
     if (record.state == State::Queued || record.state == State::Waiting) ++value.queued[kind];
@@ -105,7 +117,8 @@ struct FileWorkQueue::Impl {
   --queued[static_cast<std::size_t>(records[index].operation.service_class)];
   cursor = (index + 1) % records.size();
  }
- void finish(std::size_t index, std::exception_ptr error) noexcept {
+ void finish(std::size_t index, std::exception_ptr error, Observation value = {}) noexcept {
+  CompileObservationClock callback_clock{timing};
   auto operation = std::move(records[index].operation);
   const auto observation = records[index].observation;
   auto completion = records[index].completion;
@@ -120,6 +133,10 @@ struct FileWorkQueue::Impl {
   auto* const context = operation.context;
   operation = {};
   if (!runtime_readiness.available) completion.settle(error);
+  if (timing) {
+   value.callback_ns = callback_clock.elapsed();
+   if (!value.operation) value.queue_ns = records[index].queued_at.elapsed();
+  }
   {
    const std::lock_guard lock(mutex);
    records[index].state = State::Free;
@@ -128,10 +145,23 @@ struct FileWorkQueue::Impl {
    if (runtime_readiness.available) ++notifying;
    ++generation;
    if (observer) ++completed;
+   if (timing) {
+    totals.total_bytes += value.bytes;
+    totals.total_queue_ns += value.queue_ns;
+    totals.total_physical_ns += value.duration_ns;
+    totals.total_cpu_ns += value.cpu_ns;
+    totals.total_callback_ns += value.callback_ns;
+    totals.total_minor_faults += value.minor_faults;
+    totals.total_major_faults += value.major_faults;
+    totals.incomplete |= value.incomplete;
+   }
   }
   changed.notify_all();
   if (execution) execution->notify_change(CompileChange::Records);
-  if (observer) observe("file.completed", {.operation = observation, .work_class = static_cast<CompileWorkClass>(service_class), .failed = bool(error)});
+  value.operation = observation;
+  value.work_class = static_cast<CompileWorkClass>(service_class);
+  value.failed = bool(error);
+  observe("file.completed", value);
   if (runtime_readiness.available) {
    runtime_readiness.available(runtime_readiness.context, context);
    completion.settle(error);
@@ -146,12 +176,13 @@ struct FileWorkQueue::Impl {
   auto* dispatcher = std::exchange(current, nullptr);
   std::exception_ptr error;
   std::optional<Observation> observation;
-  std::chrono::steady_clock::time_point started;
-  if (observer) {
+  std::optional<CompileObservationBody> body;
+  if (timing || observer.accepts("file.running")) {
    observation.emplace();
    observation->operation = records[index].observation;
    observation->bytes = records[index].operation.bytes;
    observation->work_class = records[index].operation.service_class;
+   if (timing) observation->queue_ns = records[index].queued_at.elapsed();
   }
   try {
    if (grant) mmltk::common::system::set_thread_affinity({grant->cpu()});
@@ -163,14 +194,20 @@ struct FileWorkQueue::Impl {
     records[index].state = State::Running;
    }
    if (observation) observe("file.running", *observation);
-   if (observer) started = std::chrono::steady_clock::now();
+   if (timing) body.emplace(true);
    if (records[index].operation.work)
     records[index].operation.work();
    else
     records[index].operation.call(records[index].operation.context);
   } catch (...) { error = std::current_exception(); }
-  if (observer && started != std::chrono::steady_clock::time_point{})
-   observation->duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+  if (body) {
+   const auto elapsed = body->elapsed();
+   observation->duration_ns = elapsed.wall_ns;
+   observation->cpu_ns = elapsed.cpu_ns;
+   observation->minor_faults = elapsed.minor_faults;
+   observation->major_faults = elapsed.major_faults;
+   observation->incomplete = elapsed.incomplete;
+  }
   // A callback retains the dispatcher and producer, but not its CPU grant.
   grant.reset();
   current = dispatcher;
@@ -182,7 +219,7 @@ struct FileWorkQueue::Impl {
    observation->failed = bool(error);
    observe("file.physical_completed", *observation);
   }
-  finish(index, error);
+  finish(index, error, observation.value_or(Observation{}));
  }
  void dispatch(std::size_t index) noexcept {
   {
@@ -217,7 +254,7 @@ struct FileWorkQueue::Impl {
      }
     }
     if (selected != records.size()) break;
-    if (observer && std::ranges::any_of(queued, [](std::size_t count) { return count != 0; })) {
+    if (observer.accepts("file.wait_cpu") && std::ranges::any_of(queued, [](std::size_t count) { return count != 0; })) {
      lock.unlock();
      observe("file.wait_cpu");
      lock.lock();
@@ -256,6 +293,7 @@ FileWorkQueue::FileWorkQueue(CompileExecution& execution, std::size_t records, s
  impl_->execution = &execution;
  impl_->service_capacity = services;
  impl_->observer = std::move(observer);
+ impl_->timing = impl_->observer.accepts("file.physical_completed") || impl_->observer.accepts("file.completed") || impl_->observer.accepts("file.service.stopped");
  impl_->demand = std::make_unique<CompileExecution::ServiceDemand>(execution);
  impl_->readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::None, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes) {
   if (auto owner = weak.lock()) {
@@ -398,6 +436,7 @@ CompileExecution::Completion FileWorkQueue::Reservation::submit(Operation operat
   }
  }
  if (owner->observer) record.observation = ++owner->admitted;
+ record.queued_at = CompileObservationClock(owner->timing);
  ++owner->queued[static_cast<std::size_t>(record.work_class)];
  owner->update_demand();
  ++owner->generation;
