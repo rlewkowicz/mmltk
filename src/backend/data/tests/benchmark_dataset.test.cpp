@@ -4280,6 +4280,156 @@ TEST_CASE("filesystem reservations share allocation settlement across destinatio
  moved.release();
  CHECK(second.outstanding() == 0);
 }
+TEST_CASE("filesystem capacity transactions sample once during sibling settlement", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("concurrent-storage-transactions");
+ std::size_t observations = 0, invalid_observations = 0;
+ detail::StorageReservationPool* observed = nullptr;
+ detail::StorageReservationPool pool(root.path(), [&](const detail::StorageReservationPool::Observation& value) {
+  ++observations;
+  const auto expected = value.description == "reduction" ? 0U : 1U;
+  if (value.capacity_samples != expected || value.retries || value.failed) ++invalid_observations;
+  // Reading the same ledger from a callback must not retain its transaction lock.
+  (void)observed->outstanding();
+ });
+ observed = &pool;
+ detail::StorageReservationPool sibling(root.path() / "sibling", {}, &pool);
+ auto file = FileHandle::create_output((root.path() / "allocated").string(), 0);
+ std::atomic<bool> stop = false;
+ std::promise<void> active;
+ auto settlement = std::async(std::launch::async, [&] {
+  std::size_t rounds = 0;
+  do {
+   auto allocation = sibling.reserve(8192, "sibling allocation");
+   file.preallocate(4096);
+   allocation.reconcile(file.get());
+   allocation.withdraw_allocation();
+   file.resize_sparse(0);
+   allocation.reconcile(file.get());
+   allocation.release();
+   if (++rounds == 1) active.set_value();
+  } while (!stop.load());
+  return rounds;
+ });
+ const mmltk::testsupport::ScopedTestCleanup finish([&] { stop.store(true); });
+ mmltk::testsupport::await_test_promise(active, "storage sibling activity");
+ constexpr std::size_t rounds = 128;
+ for (std::size_t i = 0; i < rounds; ++i) {
+  auto reservation = pool.reserve(4096, "reservation");
+  reservation.grow(8192, "growth");
+  reservation.resize(1024, "reduction");
+ }
+ stop.store(true);
+ CHECK(mmltk::testsupport::await_test_future(settlement, "storage sibling settlement") > 0);
+ CHECK(observations == rounds * 3);
+ CHECK(invalid_observations == 0);
+ CHECK(pool.outstanding() == 0);
+ CHECK(sibling.outstanding() == 0);
+}
+TEST_CASE("shared storage ledger accounts for independent filesystems", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("independent-storage-filesystems");
+ struct stat source{}, other{};
+ REQUIRE(::stat(root.path().c_str(), &source) == 0);
+ REQUIRE(::stat("/dev/shm", &other) == 0);
+ const fs::path different = source.st_dev == other.st_dev ? "/" : "/dev/shm";
+ REQUIRE(::stat(different.c_str(), &other) == 0);
+ REQUIRE(source.st_dev != other.st_dev);
+ detail::StorageReservationPool first(root.path());
+ detail::StorageReservationPool second(different, {}, &first);
+ auto left = first.reserve(16384, "first filesystem");
+ auto right = second.reserve(8192, "second filesystem");
+ left.grow(32768, "first growth");
+ right.reconcile_allocated(4096);
+ CHECK(first.outstanding() == 32768);
+ CHECK(second.outstanding() == 4096);
+ left.release();
+ CHECK(first.outstanding() == 0);
+ CHECK(second.outstanding() == 4096);
+ right.withdraw_allocation();
+ CHECK(second.outstanding() == 8192);
+ right.release();
+ CHECK(second.outstanding() == 0);
+}
+TEST_CASE("capacity observation failures retain promises and their original cause", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("storage-observation-failure");
+ const auto anchor = root.path() / "anchor";
+ fs::create_directory(anchor);
+ std::uint64_t samples = 0, retries = 0, required = 0;
+ std::size_t observations = 0;
+ bool failed = false;
+ detail::StorageReservationPool storage(anchor, [&](const detail::StorageReservationPool::Observation& value) {
+  ++observations;
+  samples = value.capacity_samples;
+  retries = value.retries;
+  required = value.required;
+  failed = value.failed;
+  throw std::runtime_error("diagnostic rejection");
+ });
+ auto reservation = storage.reserve(4096, "retained promise");
+ fs::rename(anchor, root.path() / "moved");
+ const auto cause = "cannot inspect storage: " + anchor.string() + ": " + std::strerror(ENOENT);
+ SECTION("new reservation still observes zero demand") {
+  CHECK_THROWS_WITH(storage.reserve(0, "empty promise"), cause);
+  CHECK(required == 0);
+ }
+ SECTION("growth keeps its preceding promise") {
+  CHECK_THROWS_WITH(reservation.grow(8192, "failed growth"), cause);
+  CHECK(required == 8192);
+ }
+ CHECK(samples == 1);
+ CHECK(retries == 0);
+ CHECK(failed);
+ CHECK(storage.outstanding() == 4096);
+ const auto before = observations;
+ reservation.grow(4096, "unchanged promise");
+ CHECK(observations == before);
+ // Reductions require no capacity observation, even after the anchor disappears.
+ reservation.resize(2048, "smaller promise");
+ CHECK(samples == 0);
+ CHECK_FALSE(failed);
+ CHECK(storage.outstanding() == 2048);
+ fs::rename(root.path() / "moved", anchor);
+ reservation.grow(8192, "recovered observation");
+ CHECK(samples == 1);
+ CHECK_FALSE(failed);
+ CHECK(storage.outstanding() == 8192);
+ auto empty = storage.reserve(0, "successful empty promise");
+ CHECK(samples == 1);
+ CHECK(required == 0);
+ CHECK_FALSE(failed);
+ CHECK(storage.outstanding() == 8192);
+ reservation.release();
+ CHECK(storage.outstanding() == 0);
+}
+TEST_CASE("storage capacity and arithmetic rejection leave accounting unchanged", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("storage-capacity-boundaries");
+ detail::StorageReservationPool storage(root.path());
+ constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+ SECTION("insufficient capacity preserves an existing reservation") {
+  auto reservation = storage.reserve(4096, "existing promise");
+  CHECK_THROWS_AS(reservation.grow(maximum, "impossible growth"), detail::InsufficientStorage);
+  CHECK_THROWS_AS(storage.reserve(maximum, "impossible reservation"), detail::InsufficientStorage);
+  CHECK(storage.outstanding() == 4096);
+  reservation.grow(8192, "ordinary growth");
+  CHECK(storage.outstanding() == 8192);
+ }
+ SECTION("allocation withdrawal overflow preserves its credited bytes") {
+  // Exercise the public allocation-accounting boundary without filling a disk.
+  auto large = storage.reserve(maximum, "credited allocation", maximum);
+  auto small = storage.reserve(1, "other credited allocation", 1);
+  large.withdraw_allocation();
+  CHECK(storage.outstanding() == maximum);
+  CHECK_THROWS_WITH(small.withdraw_allocation(), "storage reservation overflow");
+  CHECK(storage.outstanding() == maximum);
+  // Zero growth queries capacity but does not reject existing outstanding debt.
+  auto empty = storage.reserve(0, "empty promise");
+  CHECK(storage.outstanding() == maximum);
+  large.resize(0, "retire large promise");
+  CHECK(storage.outstanding() == 0);
+  small.withdraw_allocation();
+  CHECK(storage.outstanding() == 1);
+ }
+ CHECK(storage.outstanding() == 0);
+}
 TEST_CASE("membership metadata shares one CPU with ready headers and pixels", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("shared-stage-fairness");
  const auto images = root.path() / "images";
@@ -5137,13 +5287,23 @@ TEST_CASE("staged artifact owns cleanup across file-operation and publication fa
   original.pwrite_all("old", 3, 0);
  }
  SECTION("creation") { CHECK_THROWS(detail::StagedArtifact::create(storage, root.path() / "absent" / "file", 4096, "failed creation")); }
+ SECTION("capacity observation") {
+  const auto anchor = root.path() / "capacity";
+  fs::create_directory(anchor);
+  detail::StorageReservationPool failed(anchor, [](const detail::StorageReservationPool::Observation&) { throw std::runtime_error("diagnostic rejection"); });
+  fs::remove(anchor);
+  const auto cause = "cannot inspect storage: " + anchor.string() + ": " + std::strerror(ENOENT);
+  CHECK_THROWS_WITH(detail::StagedArtifact::create(failed, target, 4096, "failed capacity observation"), cause);
+  CHECK(failed.outstanding() == 0);
+ }
  SECTION("preallocation") {
   fs::path temporary;
   {
    auto stage = detail::StagedArtifact::create(storage, target, 4096, "failed preallocation");
    temporary = stage.path();
    stage.file() = {};
-   CHECK_THROWS(stage.preallocate(4096));
+   CHECK_THROWS_WITH(stage.preallocate(4096), std::string("sparse file resize failed: ") + std::strerror(EBADF));
+   CHECK(storage.outstanding() == 4096);
   }
   CHECK_FALSE(fs::exists(temporary));
  }
@@ -12681,21 +12841,34 @@ TEST_CASE("held occupied extent preparation leaves source claims and unrelated c
 }
 TEST_CASE("occupied allocation distinguishes overwrite and reclaimed growth", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("occupied-page-mutations");
- detail::StorageReservationPool reservations(root.path());
+ std::uint64_t capacity_samples = 0, retries = 0;
+ detail::StorageReservationPool reservations(root.path(), [&](const detail::StorageReservationPool::Observation& value) {
+  capacity_samples += value.capacity_samples;
+  retries += value.retries;
+ });
+ auto sibling = reservations.reserve(8192, "independent pending output");
  auto stage = detail::StagedArtifact::create(reservations, root.path() / "pixels", 0, "occupied fixture");
  stage.resize_sparse(32768);
+ CHECK(reservations.outstanding() == 8192);
  stage.allocate_range(4096, 8192);
  const auto before = detail::StorageReservationPool::allocated_bytes(stage.file().get());
+ const auto prepared_samples = capacity_samples;
  stage.file().pwrite_all("pixels", 6, 4096);
  stage.allocate_range(4096, 4096);
  CHECK(detail::StorageReservationPool::allocated_bytes(stage.file().get()) == before);
- CHECK(reservations.outstanding() == 0);
+ CHECK(capacity_samples == prepared_samples);
+ CHECK(reservations.outstanding() == 8192);
  const bool punched = stage.reclaim_range(4096, 4096);
  if (punched) CHECK(detail::StorageReservationPool::allocated_bytes(stage.file().get()) < before);
+ CHECK(capacity_samples == prepared_samples);
  stage.allocate_range(4096, 4096);
- CHECK(reservations.outstanding() == 0);
+ CHECK(capacity_samples == prepared_samples + (punched ? 1 : 0));
+ CHECK(reservations.outstanding() == 8192);
  stage.resize_sparse(4096);
  CHECK(stage.file().size() == 4096);
+ CHECK(reservations.outstanding() == 8192);
+ CHECK(retries == 0);
+ sibling.release();
  CHECK(reservations.outstanding() == 0);
  stage.file() = {};
  CHECK_THROWS(stage.allocate_range(16384, 4096));

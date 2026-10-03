@@ -11,8 +11,10 @@ public:
  using std::runtime_error::runtime_error;
 };
 // Physical allocation promises are shared by filesystem, independently of recipes.
-// A reservation has one mutation owner. The shared ledger protects only numbers;
-// all capacity/allocation observations happen outside its lock.
+// A reservation has one mutation owner. Each filesystem serializes capacity
+// observation and accounting; unrelated filesystems share only registration.
+// Physical mutations retain their promises until allocation reconciliation.
+// Diagnostic callbacks observe completed transactions outside ledger locks.
 class StorageReservationPool final {
  struct Ledger;
  struct Destination;

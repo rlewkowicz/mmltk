@@ -84,6 +84,8 @@ void StagedArtifact::discard() noexcept {
  allocation_.release();
 }
 std::uint64_t StagedArtifact::reconcile_locked() {
+ // The existing promise remains charged while fstat runs. Its settlement joins
+ // the filesystem transaction only after the physical observation completes.
  const auto allocated = StorageReservationPool::allocated_bytes(file_.get());
  allocation_.reconcile_allocated(allocated);
  return allocated;
@@ -122,7 +124,8 @@ void StagedArtifact::forget_range(std::size_t begin, std::size_t end) {
 }
 void StagedArtifact::resize_sparse(std::size_t bytes) {
  const std::lock_guard lock(mutation_->mutex);
- // Invalidate the allocation observation before even a zero-growth mutation.
+ // Withdraw credited backing before truncate can remove it. Keep that promise
+ // charged until reconciliation, including when sparse length only grows.
  allocation_.withdraw_allocation();
  file_.resize_sparse(bytes);
  const auto occupied_end = common::math::checked_add(bytes, std::size_t{4095}, "staged page extent overflow") / 4096 * 4096;
