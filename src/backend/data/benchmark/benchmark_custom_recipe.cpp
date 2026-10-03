@@ -11,6 +11,7 @@
 #include "src/pch_std.h"
 #include <thread>
 #include "src/common/system/cpu_affinity.h"
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResources;
@@ -181,7 +182,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
   BenchmarkCompilePipeline* execution;
   ~RetireSources() {
    cancellation.stopped.store(true, std::memory_order_relaxed);
-   if (execution) execution->execution().notify_admission_change();
+   if (execution) execution->execution().notify_change(CompileChange::Interruption);
    controllers.clear();
   }
  } retire_sources{source_cancellation, controllers, execution};
@@ -198,7 +199,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
     const std::lock_guard lock(failure_mutex);
     if (!failure) failure = std::current_exception();
     source_cancellation.stopped.store(true, std::memory_order_relaxed);
-    if (execution) execution->execution().notify_admission_change();
+    if (execution) execution->execution().notify_change(CompileChange::Interruption);
    }
   });
  controllers.clear();

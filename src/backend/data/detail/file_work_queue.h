@@ -20,6 +20,7 @@ namespace mmltk::backend::data::detail {
 // grant are both available. Completion callbacks keep dispatcher/producer custody
 // after the physical call releases its CPU grant.
 class FileWorkQueue final {
+ struct Impl;
 public:
  struct Operation {
   void* context = nullptr;
@@ -58,6 +59,24 @@ public:
  // completed or retains the operation, a pending record, or a new class producer;
  // the caller still owns settlement and may retry only the full outcome.
  // Execution interruption is checked before either acceptance or the full result.
+ // Claim bounded custody before constructing operation captures. An unused
+ // reservation returns capacity without accepting or invoking an operation.
+ class Reservation final {
+ public:
+  ~Reservation();
+  Reservation(Reservation&&) noexcept;
+  Reservation& operator=(Reservation&&) noexcept;
+  Reservation(const Reservation&) = delete;
+  Reservation& operator=(const Reservation&) = delete;
+  [[nodiscard]] CompileExecution::Completion submit(Operation);
+ private:
+  friend class FileWorkQueue;
+  Reservation(std::shared_ptr<Impl>, std::size_t);
+  void release() noexcept;
+  std::shared_ptr<Impl> owner_;
+  std::size_t index_ = 0;
+ };
+ [[nodiscard]] std::optional<Reservation> try_reserve_record(CompileWorkClass = CompileWorkClass::Output);
  [[nodiscard]] std::optional<CompileExecution::Completion> try_submit(Operation);
  // Advisory only: reserves no record and shares try_submit's terminal policy.
  // Compile callers capture admission_generation before this predicate and wait
@@ -74,7 +93,6 @@ public:
  void cancel() noexcept;
 
 private:
- struct Impl;
  std::shared_ptr<Impl> impl_;
 };
 }  // namespace mmltk::backend::data::detail

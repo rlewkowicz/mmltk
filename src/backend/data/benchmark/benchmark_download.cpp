@@ -30,6 +30,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResources;
@@ -1216,7 +1217,7 @@ class DownloadBatch final {
  std::vector<std::jthread> controllers_;
  void retire() noexcept {
   stopped_.store(true, std::memory_order_relaxed);
-  if (execution_) execution_->execution().notify_admission_change();
+  if (execution_) execution_->execution().notify_change(CompileChange::Interruption);
   jobs_changed_.notify_all();
   controllers_.clear();
  }
@@ -1247,7 +1248,7 @@ class DownloadBatch final {
     const std::lock_guard lock(mutex_);
     if (!error_) error_ = std::current_exception();
     stopped_.store(true, std::memory_order_relaxed);
-    if (execution_) execution_->execution().notify_admission_change();
+    if (execution_) execution_->execution().notify_change(CompileChange::Interruption);
     jobs_changed_.notify_all();
    }
    // The slot is reusable only after its complete borrowed job has retired.

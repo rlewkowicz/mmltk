@@ -23,6 +23,7 @@
 #include "src/common/system/cpu_affinity.h"
 #include <array>
 #include "src/pch_std.h"
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResources;
@@ -67,7 +68,7 @@ struct CoconutRecipeInputs {
   for (const auto& notification : stop_changes)
    if (notification) notification->settle();
   changed.notify_all();
-  if (execution) execution->execution().notify_admission_change();
+  if (execution) execution->execution().notify_change(CompileChange::Local);
  }
  void settle() {
   OriginalChanges stop_changes;
@@ -165,7 +166,7 @@ struct CoconutRecipeInputs {
       execution->labels_ready(execution->source_publication(root, {}, id), id, BenchmarkLabelInput(index, row), index.annotation_sha256, generation, 1);
      }
     }
-    execution->execution().notify_admission_change();
+    execution->execution().notify_change(CompileChange::Local);
    }
   } catch (...) { failure = std::current_exception(); }
   {

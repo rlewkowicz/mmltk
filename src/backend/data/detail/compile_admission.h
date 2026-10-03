@@ -98,9 +98,10 @@ struct CompileAllowance::Credits {
      : owner(std::move(value)), resources(demand), parent(std::move(producing)), available(demand.continuation_descriptors) {}
  ~Credits();
 };
+class CompileResourceWait;
 struct CompileAdmission {
  using Credits = CompileAllowance::Credits;
- enum class Change { Scheduling, Resources, Pressure, Interruption };
+ using Change = CompileChange;
  struct Eligibility {
   bool fits = false;
   std::uint64_t loan_bytes = 0;
@@ -109,7 +110,7 @@ struct CompileAdmission {
  std::shared_ptr<CompileArenaBank> arenas;
  std::mutex mutex;
  std::condition_variable changed;
- std::uint64_t generation = 0;
+ std::uint64_t generation = 0, resource_generation = 0;
  // Called only under mutex; publication records readiness and signals the
  // existing event owner. User callbacks run later, outside this mutex.
  std::function<void(Change)> publish_change;
@@ -129,6 +130,9 @@ struct CompileAdmission {
  const Credits* draining_parent = nullptr;
  std::uint64_t draining_bytes = 0;
  bool draining_external = false;
+ CompileResourceWait* drain_head = nullptr;
+ CompileResourceWait* drain_tail = nullptr;
+ void refresh_external_drain() noexcept;
  [[nodiscard]] static bool exceptional_custody(const Credits* credit) {
   for (; credit; credit = credit->parent.get())
    if (credit->arena.exceptional()) return true;
@@ -147,10 +151,11 @@ struct CompileAdmission {
  }
  bool tracing = false;
  mutable std::uint64_t eligibility_probes = 0;
- std::uint64_t resource_epoch = 0, admission_lock_ns = 0;
+ std::uint64_t admission_lock_ns = 0;
  std::vector<Credits*> observed_credits;
  void notify(Change change) noexcept {
-  if (tracing && change == Change::Resources) ++resource_epoch;
+  if (change == Change::None) return;
+  if (includes(change, Change::Resources)) ++resource_generation;
   // Pressure registration must not invalidate its own failed reserve attempt.
   if (change != Change::Pressure) ++generation;
   changed.notify_all();
@@ -309,7 +314,7 @@ struct CompileAdmission {
   credit.borrowed = borrowed;
   if (credit.parent) credit.parent->available -= borrowed;
   credit.charged = true;
-  notify(value.bytes || value.descriptors || value.continuation_descriptors ? Change::Resources : Change::Scheduling);
+  notify((value.bytes || value.descriptors || value.continuation_descriptors ? Change::Resources : Change::None) | (value.cpu_workers ? Change::Cpu : Change::None));
   if (tracing) try {
     observed_credits.push_back(&credit);
     credit.location = location;
@@ -329,7 +334,7 @@ struct CompileAdmission {
   credit.cpu_lanes.clear();
   (value.retained_handles ? handle_bytes : bytes) -= std::exchange(value.bytes, 0);
   credit.workspace_loans.retire();
-  notify(resources_changed ? Change::Resources : Change::Scheduling);
+  notify(resources_changed ? Change::Resources : Change::Cpu);
   // Live descriptor draws still need their producing promise chain. Storage
   // descendants retain their own charges and loans regardless of this parent.
   return credit.borrowed ? std::shared_ptr<Credits>{} : std::move(credit.parent);
@@ -349,7 +354,7 @@ struct CompileAdmission {
    // destruction. Return the borrowed promise atomically with physical release.
    committed = committed - credit.available + credit.borrowed;
    return_promise(credit.parent.get(), credit.borrowed);
-   notify(value.bytes || value.descriptors || credit.available || credit.borrowed ? Change::Resources : Change::Scheduling);
+   notify((value.bytes || value.descriptors || credit.available || credit.borrowed ? Change::Resources : Change::None) | (value.cpu_workers ? Change::Cpu : Change::None));
   }
   changed.notify_all();
  }
@@ -366,7 +371,7 @@ struct CompileAdmission {
   if (previous != pressure())
    notify(Change::Pressure);
   else if (publish_change)
-   publish_change(Change::Scheduling);
+   publish_change(Change::Cpu);
  }
  struct Waiter {
   CompileAdmission& owner;

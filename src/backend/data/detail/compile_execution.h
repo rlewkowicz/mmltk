@@ -95,6 +95,7 @@ class CompileResourceWait;
 class CompileExecution final {
  struct Impl;
  struct Job;
+ struct Demand;
  struct CompletionState;
  struct DependencyState;
  using Credits = CompileAllowance::Credits;
@@ -194,8 +195,8 @@ public:
   bool retain_workspace = true;
   std::function<void(std::exception_ptr)> completed{};
  };
- // Retain the current record across externally owned physical work, without a
- // CPU grant. The current task still settles its own Completion normally. Its
+ // Retain a record across externally owned physical work without a CPU grant.
+ // When retained from a task, that task settles its Completion normally. Its
  // successor uses this same record after those callbacks return; successful
  // submission consumes the custody. Destruction returns an unused record.
  // Cancellation/join wait for the physical owner to submit or release custody.
@@ -209,6 +210,7 @@ public:
   Continuation& operator=(const Continuation&) = delete;
   [[nodiscard]] explicit operator bool() const noexcept { return bool(owner_); }
   [[nodiscard]] std::optional<Completion> try_submit(Task);
+  [[nodiscard]] const CompileAllowance& allowance() const noexcept { return allowance_; }
 
  private:
   friend class CompileExecution;
@@ -216,7 +218,12 @@ public:
   void release() noexcept;
   std::shared_ptr<Impl> owner_;
   std::shared_ptr<CompletionState> completion_;
+  CompileAllowance allowance_;
  };
+ // One transaction retains the full envelope and a successor record without a
+ // compute grant. Rejection retains neither; deferred demand owns retry/drain.
+ [[nodiscard]] std::optional<Continuation> try_retain(CompileTaskKind, CompileResources = {}, const CompileAllowance& parent = {}, bool finite_consumer = false, CompileResourceDenial* = nullptr);
+ [[nodiscard]] std::optional<Continuation> try_retain(CompileTaskKind, CompileResourceWait&, CompileResourceDenial* = nullptr);
  [[nodiscard]] Continuation retain_current(CompileTaskKind successor);
  [[nodiscard]] std::optional<Completion> try_submit(Task);
  [[nodiscard]] Completion submit(Task);
@@ -248,18 +255,22 @@ public:
  [[nodiscard]] bool oversized_workspace_pending() const;
  [[nodiscard]] std::uint64_t admission_generation() const;
  void wait_for_admission_change(std::uint64_t, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
- void notify_admission_change() noexcept;
+ void notify_change(CompileChange) noexcept;
+ [[nodiscard]] std::uint64_t resource_generation() const;
  // A bounded owner registration receives readiness events, not CPU work. Its
  // destructor joins callbacks, so captured owner state cannot outlive custody.
  class Readiness final {
  public:
   struct Changes {
-   bool resources = false, pressure = false, interrupted = false;
+   bool resources = false, cpu = false, records = false, local = false, pressure = false, fairness = false, interrupted = false;
    // Resource/pressure changes from outside an unsuccessful local attempt.
-   // CPU-only scheduler activity never requests a resource retry.
+   // CPU, record and owner-local activity never requests a resource retry.
    bool retry = false;
   };
-  Readiness(CompileExecution&, std::function<void(Changes)>);
+  Readiness(CompileExecution&, CompileChange interests, std::function<void(Changes)>);
+  // Publish only to this owner; the common wait generation still advances.
+  void notify() noexcept;
+  void interests(CompileChange) noexcept;
   ~Readiness();
   Readiness(const Readiness&) = delete;
   Readiness& operator=(const Readiness&) = delete;
@@ -288,7 +299,9 @@ public:
   CompileExecution& owner_;
   std::shared_ptr<State> state_;
  };
- [[nodiscard]] std::unique_ptr<CompileResourceWait> defer_resources();
+ // Without a finite-consumer value this is a pressure/drain registration.
+ // An explicit value retains one ordinary continuation demand through retries.
+ [[nodiscard]] std::unique_ptr<CompileResourceWait> defer_resources(CompileResources = {}, const CompileAllowance& parent = {}, std::optional<bool> finite_consumer = {});
  void require_feasible(CompileResources) const;
  [[nodiscard]] std::size_t descriptor_ceiling(CompileResources) const;
  [[nodiscard]] std::optional<CompileAllowance> try_reserve(CompileResources, const CompileAllowance& parent = {}, std::source_location = std::source_location::current());
@@ -352,6 +365,7 @@ private:
  void retire_workspace(Workspace*) noexcept;
  [[nodiscard]] std::optional<Completion> submit_impl(Task, const std::shared_ptr<DependencyState>&, std::uint64_t);
  void for_each_impl(CompileTaskKind, std::size_t, const std::function<CompileResources(std::size_t)>&, const std::function<void(std::size_t)>&, Workspace*);
+ std::optional<Continuation> retain(CompileTaskKind, CompileResources, const CompileAllowance&, bool, CompileResourceDenial*, Demand*);
  std::shared_ptr<Impl> impl_;
 };
 class CompileResourceWait final {
@@ -362,7 +376,15 @@ public:
 
 private:
  friend class CompileExecution;
- explicit CompileResourceWait(std::shared_ptr<CompileAdmission>);
+ friend struct CompileAdmission;
+ explicit CompileResourceWait(std::shared_ptr<CompileExecution::Impl>, CompileResources, CompileAllowance, std::optional<bool>);
+ std::shared_ptr<CompileExecution::Impl> execution_;
+ std::unique_ptr<CompileExecution::Demand> demand_;
+ CompileAllowance parent_;
+ std::uint64_t bytes_ = 0;
+ CompileResourceWait* previous_ = nullptr;
+ CompileResourceWait* next_ = nullptr;
+ bool exceptional_ = false;
  std::shared_ptr<CompileAdmission> owner_;
 };
 }  // namespace mmltk::backend::data::detail

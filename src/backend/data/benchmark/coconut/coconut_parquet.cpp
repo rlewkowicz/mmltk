@@ -525,7 +525,7 @@ struct ParquetContiguousFit final : std::exception {
 };
 std::size_t replay_envelope(std::size_t observed, CompileExecution* execution) {
  if (execution) {
-  const auto normal = execution->workspace_capacity(false, CompileWorkClass::Count, CompileWorkspaceWindow::SharedSource);
+  const auto normal = execution->workspace_capacity(false, detail::CompileWorkClass::Count, detail::CompileWorkspaceWindow::SharedSource);
   observed = std::max(observed, common::math::checked_add(normal, std::size_t{1}, "Parquet exceptional envelope overflow"));
  }
  // Leave room for the bank's page rounding as well as Arrow's signed sizes.

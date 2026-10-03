@@ -8,6 +8,14 @@
 #include <stdexcept>
 namespace mmltk::backend::data::detail {
 enum class CompileWorkClass : std::uint8_t { Acquisition, Extraction, Annotations, Pixels, Gather, Output, Count };
+// Product readiness facts. A subscription selects only predicates it owns.
+enum class CompileChange : std::uint8_t { None = 0, Resources = 1, Cpu = 2, Records = 4, Local = 8, Pressure = 16, Interruption = 32, Fairness = 64 };
+[[nodiscard]] constexpr CompileChange operator|(CompileChange left, CompileChange right) noexcept {
+ return static_cast<CompileChange>(static_cast<unsigned>(left) | static_cast<unsigned>(right));
+}
+[[nodiscard]] constexpr bool includes(CompileChange interests, CompileChange cause) noexcept {
+ return (static_cast<unsigned>(interests) & static_cast<unsigned>(cause)) != 0;
+}
 enum class CompileWorkspaceWindow : std::uint8_t { Task, SharedSource, Compaction };
 enum class CompileResourceDenial : std::uint8_t {
  None, Infeasible, ExceptionalDrain, ExceptionalLineage, ArenaBusy, RetainedLineage, Cpu, Descriptors, Bytes, LoanCapacity, AgedDemand, Records
@@ -52,6 +60,7 @@ struct CompileExecutionLimits {
 class CompileAllowance {
  struct Credits;
  friend struct CompileAdmission;
+ friend class CompileResourceWait;
 
 public:
  CompileAllowance() = default;

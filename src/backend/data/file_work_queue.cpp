@@ -14,7 +14,7 @@
 namespace mmltk::backend::data::detail {
 struct FileWorkQueue::Impl {
  static thread_local Impl* current;
- enum class State { Free, Queued, Waiting, Running, Completing };
+ enum class State { Free, Reserved, Queued, Waiting, Running, Completing };
  struct Record {
   Operation operation;
   CompileExecution::CompletionSource completion;
@@ -98,6 +98,7 @@ struct FileWorkQueue::Impl {
   if (!stopping && !shutdown && busy_services < service_capacity)
    for (std::size_t kind = 0; kind < classes.size(); ++kind) classes[kind] = queued[kind] != 0;
   demand->update(classes);
+  if (readiness) readiness->interests(std::ranges::any_of(classes, [](bool selected) { return selected; }) ? CompileChange::Cpu : CompileChange::None);
  }
  void claim(std::size_t index) noexcept {
   records[index].state = State::Waiting;
@@ -129,7 +130,7 @@ struct FileWorkQueue::Impl {
    if (observer) ++completed;
   }
   changed.notify_all();
-  if (execution) execution->notify_admission_change();
+  if (execution) execution->notify_change(CompileChange::Records);
   if (observer) observe("file.completed", {.operation = observation, .work_class = static_cast<CompileWorkClass>(service_class), .failed = bool(error)});
   if (runtime_readiness.available) {
    runtime_readiness.available(runtime_readiness.context, context);
@@ -256,7 +257,7 @@ FileWorkQueue::FileWorkQueue(CompileExecution& execution, std::size_t records, s
  impl_->service_capacity = services;
  impl_->observer = std::move(observer);
  impl_->demand = std::make_unique<CompileExecution::ServiceDemand>(execution);
- impl_->readiness = std::make_unique<CompileExecution::Readiness>(execution, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes) {
+ impl_->readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::None, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes) {
   if (auto owner = weak.lock()) {
    {
     const std::lock_guard lock(owner->mutex);
@@ -325,9 +326,30 @@ void FileWorkQueue::wait(const CompileExecution::Completion& completion) {
  while (!completion.ready() && impl_->dispatch_one(&completion)) {}
  completion.wait();
 }
-std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation operation) {
- if (!operation.call && !operation.work) throw std::invalid_argument("empty borrowed file operation");
- const auto service_class = static_cast<std::size_t>(operation.service_class);
+FileWorkQueue::Reservation::Reservation(std::shared_ptr<Impl> owner, std::size_t index) : owner_(std::move(owner)), index_(index) {}
+FileWorkQueue::Reservation::~Reservation() { release(); }
+FileWorkQueue::Reservation::Reservation(Reservation&& other) noexcept : owner_(std::move(other.owner_)), index_(other.index_) {}
+FileWorkQueue::Reservation& FileWorkQueue::Reservation::operator=(Reservation&& other) noexcept {
+ if (this != &other) { release(); owner_ = std::move(other.owner_); index_ = other.index_; }
+ return *this;
+}
+void FileWorkQueue::Reservation::release() noexcept {
+ if (!owner_) return;
+ auto owner = std::move(owner_);
+ {
+  const std::lock_guard lock(owner->mutex);
+  auto& record = owner->records[index_];
+  record.state = Impl::State::Free;
+  --owner->pending;
+  const auto kind = static_cast<std::size_t>(record.work_class);
+  if (!--owner->class_pending[kind]) owner->producers[kind].reset();
+  ++owner->generation;
+ }
+ owner->changed.notify_all();
+ if (owner->execution) owner->execution->notify_change(CompileChange::Records);
+}
+std::optional<FileWorkQueue::Reservation> FileWorkQueue::try_reserve_record(CompileWorkClass kind) {
+ const auto service_class = static_cast<std::size_t>(kind);
  if (service_class >= impl_->class_pending.size()) throw std::invalid_argument("invalid file operation service class");
  std::unique_lock lock(impl_->mutex);
  impl_->check_admission();
@@ -337,39 +359,54 @@ std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation 
   impl_->observe("file.wait_records");
   return {};
  }
- // Prepare every fallible owner before publishing the record. In particular,
- // completion allocation cannot leave an otherwise empty service class live.
  CompileExecution::CompletionSource completion{impl_->execution};
  std::optional<CompileExecution::Producer> producer;
- if (!impl_->class_pending[service_class] && impl_->execution) producer.emplace(impl_->execution->open_class(operation.service_class));
+ if (!impl_->class_pending[service_class] && impl_->execution) producer.emplace(impl_->execution->open_class(kind));
  position->completion = std::move(completion);
- auto result = position->completion.completion();
- position->operation = std::move(operation);
- if (impl_->observer) position->work_class = position->operation.service_class;
- position->state = Impl::State::Queued;
- if (impl_->pool) {
-  position->dispatch_owner = impl_;
-  try {
-   impl_->pool->enqueue_borrowed(*position->dispatch);
-  } catch (...) {
-   position->dispatch_owner.reset();
-   operation = std::move(position->operation);
-   position->state = Impl::State::Free;
+ position->work_class = kind;
+ position->state = Impl::State::Reserved;
+ if (producer) impl_->producers[service_class] = std::move(producer);
+ ++impl_->class_pending[service_class];
+ ++impl_->pending;
+ return Reservation(impl_, static_cast<std::size_t>(position - impl_->records.begin()));
+}
+CompileExecution::Completion FileWorkQueue::Reservation::submit(Operation operation) {
+ if (!owner_) throw std::logic_error("file operation has no reserved record");
+ if (!operation.call && !operation.work) throw std::invalid_argument("empty borrowed file operation");
+ auto owner = owner_;
+ std::unique_lock lock(owner->mutex);
+ owner->check_admission();
+ auto& record = owner->records[index_];
+ if (operation.service_class != record.work_class) throw std::invalid_argument("file operation changed its reserved service class");
+ auto result = record.completion.completion();
+ record.operation = std::move(operation);
+ record.state = Impl::State::Queued;
+ if (owner->pool) {
+  record.dispatch_owner = owner;
+  try { owner->pool->enqueue_borrowed(*record.dispatch); }
+  catch (...) {
+   record.dispatch_owner.reset();
+   operation = std::move(record.operation);
+   record.state = Impl::State::Reserved;
    lock.unlock();
    throw;
   }
  }
- if (producer) impl_->producers[service_class] = std::move(producer);
- ++impl_->class_pending[service_class];
- ++impl_->pending;
- if (impl_->observer) position->observation = ++impl_->admitted;
- ++impl_->queued[service_class];
- impl_->update_demand();
- ++impl_->generation;
+ if (owner->observer) record.observation = ++owner->admitted;
+ ++owner->queued[static_cast<std::size_t>(record.work_class)];
+ owner->update_demand();
+ ++owner->generation;
+ owner_.reset();
  lock.unlock();
- impl_->changed.notify_all();
- impl_->observe("file.admitted");
+ owner->changed.notify_all();
+ owner->observe("file.admitted");
  return result;
+}
+std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation operation) {
+ if (!operation.call && !operation.work) throw std::invalid_argument("empty borrowed file operation");
+ auto record = try_reserve_record(operation.service_class);
+ if (!record) return {};
+ return record->submit(std::move(operation));
 }
 bool FileWorkQueue::has_capacity() const {
  const std::lock_guard lock(impl_->mutex);
@@ -401,7 +438,7 @@ void FileWorkQueue::cancel() noexcept {
  // here even while every service is in a physical call. Local stop withdraws
  // only this queue's demand and never interrupts the execution owner.
  impl_->changed.notify_all();
- if (impl_->execution) impl_->execution->notify_admission_change();
+ if (impl_->execution) impl_->execution->notify_change(CompileChange::Records);
  for (std::size_t index = 0; index < impl_->records.size(); ++index) {
   {
    const std::lock_guard lock(impl_->mutex);

@@ -80,6 +80,7 @@ using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileResourceWait;
 using mmltk::backend::data::detail::CompileTaskKind;
+using mmltk::backend::data::detail::CompileChange;
 using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 namespace {
@@ -7571,7 +7572,7 @@ TEST_CASE("a Parquet group joins native recovery before JPEG geometry", "[benchm
   cancelled.store(true);
   original_terminal.store(true);
   originals.settle();
-  execution.execution().notify_admission_change();
+  execution.execution().notify_change(CompileChange::Interruption);
  });
  if (fail_labels) {
   CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(importing, "fatal label conversion before JPEG geometry", 5s), "mask run length overflow");
@@ -8228,7 +8229,7 @@ TEST_CASE("ready recovery that fits retains its forward Parquet reader on one CP
   cancelled.store(true);
   terminal.store(true);
   originals.settle();
-  execution.execution().notify_admission_change();
+  execution.execution().notify_change(CompileChange::Interruption);
  });
  mmltk::testsupport::await_test_future(advanced, "next group while completed recovery retains no blocking input demand", 10s);
  const auto result = mmltk::testsupport::await_test_future(importing, "forward reader and all native rows settle", 10s);
@@ -8387,7 +8388,7 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
   cancelled.store(true);
   original_terminal.store(true);
   originals.settle();
-  execution.execution().notify_admission_change();
+  execution.execution().notify_change(CompileChange::Interruption);
  });
  mmltk::testsupport::await_test_promise(all_offered, "every native input precedes original readiness");
  for (auto id : ids) {
@@ -10394,7 +10395,7 @@ TEST_CASE("Parquet staged batches retain one forward reader and reusable source 
  CompileExecution::Completion blocked;
  std::promise<void> waiting;
  std::atomic<bool> observed{false};
- CompileExecution::Readiness readiness(pipeline.execution(), [&](auto) {
+ CompileExecution::Readiness readiness(pipeline.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](auto) {
   if (pressure && pipeline.execution().resource_pressure() && !observed.exchange(true)) mmltk::testsupport::release_test_promise(waiting);
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { pipeline.execution().cancel(); });

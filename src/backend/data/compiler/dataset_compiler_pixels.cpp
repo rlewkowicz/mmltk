@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <utility>
 import mmltk.common.logging.profile_utils;
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::compiler_internal {
 namespace {
 using common::io::MappedFile;
@@ -93,7 +94,7 @@ LabelBlocks compile_directory_images(const std::filesystem::path& split, std::ui
  std::uint32_t next = 0;
  std::exception_ptr failure;
  std::vector<CompileDiagnostic> diagnostics;
- CompileExecution::Readiness readiness(execution, [&](CompileExecution::Readiness::Changes) {
+ CompileExecution::Readiness readiness(execution, CompileChange::Resources | CompileChange::Records | CompileChange::Local, [&](CompileExecution::Readiness::Changes) {
   const std::lock_guard lock(mutex);
   ++revision;
   changed.notify_all();

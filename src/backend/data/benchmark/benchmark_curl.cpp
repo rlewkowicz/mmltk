@@ -14,6 +14,7 @@
 #include <new>
 #include <thread>
 #include <vector>
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::benchmark_internal {
 CompileResources BenchmarkTransferEnvelope::demand(std::size_t count) const {
  using mmltk::common::math::checked_add;
@@ -198,7 +199,7 @@ struct BenchmarkCurl::Impl {
   ensure_curl_global_initialized("cannot initialize benchmark Curl: ");
   require_supported_curl();
   if (execution)
-   readiness = std::make_unique<CompileExecution::Readiness>(*execution, [this](CompileExecution::Readiness::Changes changes) {
+   readiness = std::make_unique<CompileExecution::Readiness>(*execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Pressure, [this](CompileExecution::Readiness::Changes changes) {
     const std::lock_guard lock(mutex);
     if (!changes.resources && !changes.pressure && !changes.interrupted && !waiting_cpu) return;
     if (changes.resources || changes.pressure || changes.interrupted) notify_readers_locked();

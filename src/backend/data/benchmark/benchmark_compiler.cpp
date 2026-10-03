@@ -53,6 +53,7 @@ using mmltk::backend::data::detail::CompileExecutionLimits;
 using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
 using mmltk::backend::data::detail::InsufficientCompileResources;
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data {
 namespace common_concurrency = mmltk::common::concurrency;
 namespace common_io = mmltk::common::io;
@@ -1142,7 +1143,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
        const std::lock_guard lock(mutex);
        ready = true;
       }
-      pipeline.execution().notify_admission_change();
+      pipeline.execution().notify_change(CompileChange::Local);
      }
     } ready{archive_readiness_mutex, early_coco_ready[source], pipeline};
     try {
@@ -1495,7 +1496,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      }
      if (selected.first != archive_tasks.size() || waiting_archives.empty()) {
       lock.unlock();
-      pipeline.execution().notify_admission_change();
+      pipeline.execution().notify_change(CompileChange::Local);
       return selected;
      }
      lock.unlock();

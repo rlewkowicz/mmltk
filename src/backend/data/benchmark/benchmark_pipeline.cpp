@@ -22,6 +22,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileAllowance;
 using detail::CompileExecution;
@@ -143,7 +144,7 @@ void BenchmarkCompletionWindow::push(CompileExecution::Completion completion, st
     const std::lock_guard lock(wake->mutex);
     wake->changed.notify_all();
    }
-   if (execution) execution->notify_admission_change();
+   if (execution) execution->notify_change(CompileChange::Local);
   });
   impl_->entries.back().subscribed = true;
  } catch (...) {
@@ -188,15 +189,15 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  // detached settlement uses a separate link and runs outside the facts lock.
  class PixelQueue {
  public:
-  void push(Job& job) noexcept {
+  void push(Job& job, bool first = false) noexcept {
    assert(!job.queued && !job.ready_previous && !job.ready_next && !job.retired_next);
    const auto stage = static_cast<std::size_t>(job.stage);
-   job.ready_previous = tails_[stage];
-   if (tails_[stage])
-    tails_[stage]->ready_next = &job;
-   else
-    heads_[stage] = &job;
-   tails_[stage] = &job;
+   job.ready_previous = first ? nullptr : tails_[stage];
+   job.ready_next = first ? heads_[stage] : nullptr;
+   if (job.ready_previous) job.ready_previous->ready_next = &job;
+   else heads_[stage] = &job;
+   if (job.ready_next) job.ready_next->ready_previous = &job;
+   else tails_[stage] = &job;
    job.queued = true;
    ++counts_[stage];
    ++size_;
@@ -219,10 +220,11 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
    --size_;
    return true;
   }
+  void advance(PixelStage stage) noexcept { cursor_ = (static_cast<std::size_t>(stage) + 1) % pixel_stage_count; }
   void accept(Job& job) noexcept {
    // Denied probes do not spend a turn: the next freed record starts after
    // the last accepted stage, even when every other head was blocked.
-   cursor_ = (static_cast<std::size_t>(job.stage) + 1) % pixel_stage_count;
+   advance(job.stage);
    remove(job);
   }
   void detach(Job& job, Job*& retired) noexcept {
@@ -268,6 +270,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   std::shared_ptr<const BenchmarkEncodedImage> payload;
   CompileAllowance pixel_allowance;
   CompileExecution::Continuation continuation;
+  std::unique_ptr<detail::CompileResourceWait> resource_wait;
   std::mutex label_write;
   Label* selected_label = nullptr;
  };
@@ -435,7 +438,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
     changed.wait(lock);
    else {
     changed.wait_for(lock, std::chrono::milliseconds(100));
-    if (cancellation.requested()) execution.notify_admission_change();
+    if (cancellation.requested()) execution.notify_change(detail::CompileChange::Interruption);
    }
   }
  }
@@ -446,13 +449,14 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  }
  void push(Job& job) {
   pixels.push(job);
-  execution.notify_admission_change();
+  readiness->notify();
  }
  void settle(Job&, std::exception_ptr = {}, bool recoverable = false) noexcept;
  void settle_list(Job*, std::exception_ptr) noexcept;
  void dispatch();
  void header_input(Slot&);
  [[nodiscard]] bool submit_pixel(Job&);
+ [[nodiscard]] bool retain_pixel(Job&, std::unique_lock<std::mutex>&, bool&);
  void run_pixel(Slot&, std::size_t, const CompileAllowance&);
  template <class Work>
  void pixel_work(Slot& slot, PixelStage stage, Work work) {
@@ -608,7 +612,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::ready_labels(Label& label) {
  else
   labels_head_ = &label;
  labels_tail_ = &label;
- execution_.execution.notify_admission_change();
+ execution_.readiness->notify();
 }
 void BenchmarkCompilePipeline::Impl::ImageState::unlink_labels(Label& label) {
  if (!label.waiting) return;
@@ -644,7 +648,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_image(const std::filesys
  (void)inserted;
  const auto generation = ++value.counter;
  replacement->second = generation;
- execution.execution.notify_admission_change();
+ execution.readiness->notify();
  const auto found_image = value.images.find(id);
  auto* image = found_image == value.images.end() ? nullptr : &found_image->second;
  if (image) {
@@ -778,7 +782,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_source(const std::filesy
  source.retiring = true;
  source.generation = ++source.counter;
  source.replacements.clear();
- execution.execution.notify_admission_change();
+ execution.readiness->notify();
  for (auto& [id, image] : source.images) {
   (void)id;
   withdraw_labels(image);
@@ -842,7 +846,7 @@ void BenchmarkCompilePipeline::retire_labels(const std::filesystem::path& root, 
  if (label->active)
   label->active->handle.cancel();
  else { impl_->retired_completions.push_back({label->completion, std::move(label->producer)}); }
- impl_->execution.notify_admission_change();
+ impl_->readiness->notify();
  impl_->changed.notify_all();
  impl_->wait(lock, [&] { return label->active == nullptr; });
  lock.unlock();
@@ -856,7 +860,7 @@ void BenchmarkCompilePipeline::retire_labels(const std::filesystem::path& root, 
   std::erase(image.labels, label);
  }
  lock.lock();
- impl_->execution.notify_admission_change();
+ impl_->readiness->notify();
  impl_->changed.notify_all();
 }
 void BenchmarkCompilePipeline::original_generation(const std::filesystem::path& root, std::uint64_t original_generation, bool withdrawn) {
@@ -866,7 +870,7 @@ void BenchmarkCompilePipeline::original_generation(const std::filesystem::path& 
  source.label_attempt = impl_->images.attempt();
  const bool changed = source.label_generation != original_generation;
  source.label_generation = original_generation;
- impl_->execution.notify_admission_change();
+ impl_->readiness->notify();
  if (withdrawn || changed) {
   source.labels_retiring = true;
   for (auto& [id, image] : source.images) {
@@ -1084,7 +1088,8 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(
  if (!limits.workspace_plan)
   limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers, 1, false, 0, limits.transient_bytes, BenchmarkEncodedImage::normal_window_bytes));
  impl_ = std::make_shared<Impl>(workers, cpus, limits, cancellation, std::move(trace));
- impl_->readiness = std::make_unique<CompileExecution::Readiness>(impl_->execution, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes) {
+ impl_->readiness = std::make_unique<CompileExecution::Readiness>(impl_->execution, CompileChange::Resources | CompileChange::Records | CompileChange::Local | CompileChange::Fairness, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes changes) {
+  if (!changes.retry && !changes.records && !changes.local && !changes.fairness && !changes.interrupted) return;
   if (auto owner = weak.lock()) {
    try {
     owner->dispatch();
@@ -1123,6 +1128,7 @@ void BenchmarkCompilePipeline::Impl::settle(Job& job, std::exception_ptr error, 
  job.allowance = {};
  job.parent = {};
  slot.continuation = {};
+ slot.resource_wait.reset();
  auto completion = job.completion;
  CompileExecution::Producer retained_headers, retained_pixels;
  {
@@ -1140,7 +1146,7 @@ void BenchmarkCompilePipeline::Impl::settle(Job& job, std::exception_ptr error, 
   retained_pixels = std::move(slot.pixels);
  }
  completion.settle(error);
- execution.notify_admission_change();
+ readiness->notify();
  changed.notify_all();
 }
 void BenchmarkCompilePipeline::Impl::settle_list(Job* jobs, std::exception_ptr error) noexcept {
@@ -1172,13 +1178,6 @@ void BenchmarkCompilePipeline::Impl::run_pixel(Slot& slot, std::size_t lane, con
          slot.writer == writer && slot.index == index;
  };
  throw_if_benchmark_cancelled(cancellation);
- if (slot.job.stage == PixelStage::Workspace) {
-  // Reserve the entire consumer before its input becomes resident. The task
-  // keeps its record through I/O so later arena waiters cannot strand Pixels.
-  slot.continuation = execution.retain_current(CompileTaskKind::Pixels);
-  slot.pixel_allowance = allowance;
-  return;
- }
  if (slot.job.stage == PixelStage::Pixels) {
   writer->write_pixel(index, lane, slot.input, allowance, *pixel_workspaces[lane]);
   return;
@@ -1222,12 +1221,59 @@ void BenchmarkCompilePipeline::Impl::run_pixel(Slot& slot, std::size_t lane, con
   if (dimensions) images.geometry_ready(*slot.source, slot.image_id, generation, *dimensions);
  }
 }
+bool BenchmarkCompilePipeline::Impl::retain_pixel(Job& job, std::unique_lock<std::mutex>& lock, bool& records_full) {
+ auto& slot = *job.slot;
+ const auto generation = slot.generation;
+ const auto attempt = images.attempt();
+ const auto resources = job.resources;
+ const auto parent = job.parent;
+ // Detaching makes this dispatch the physical owner until commit/settlement.
+ // A concurrent retirement cannot settle or clear this stable source slot.
+ pixels.remove(job);
+ auto waiting = std::move(slot.resource_wait);
+ lock.unlock();
+ CompileExecution::Readiness::Attempt admission(readiness.get());
+ std::optional<CompileExecution::Continuation> retained;
+ std::exception_ptr error;
+ detail::CompileResourceDenial denial{};
+ try {
+  if (!waiting) waiting = execution.defer_resources(resources, parent, true);
+  retained = execution.try_retain(CompileTaskKind::Pixels, *waiting, &denial);
+ } catch (...) { error = std::current_exception(); }
+ if (retained || error) waiting.reset();
+ lock.lock();
+ if (!error && (stopping || slot.retiring || slot.source->retiring || images.attempt() != attempt || slot.generation != generation || generation != slot.source->image_generation(slot.image_id)))
+  error = retired_failure;
+ if (error) {
+  lock.unlock();
+  retained.reset();
+  waiting.reset();
+  settle(job, error);
+  lock.lock();
+  return true;
+ }
+ slot.resource_wait = std::move(waiting);
+ if (!retained) {
+  records_full = denial == detail::CompileResourceDenial::Records;
+  pixels.push(job, records_full);
+  return false;
+ }
+ pixels.advance(PixelStage::Workspace);
+ slot.pixel_allowance = retained->allowance();
+ slot.continuation = std::move(*retained);
+ job.stage = PixelStage::Input;
+ push(job);
+ admission.commit();
+ return true;
+}
 bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
  auto& slot = *job.slot;
  const auto weak = weak_from_this();
  if (job.stage == PixelStage::Input || job.stage == PixelStage::Output) {
   const auto stage = job.stage;
-  auto task = image_files.try_submit(
+  auto record = image_files.try_reserve_record(stage == PixelStage::Input ? CompileWorkClass::Extraction : CompileWorkClass::Pixels);
+  if (!record) return false;
+  auto task = record->submit(
    {.completed =
      [weak, &slot, stage](std::exception_ptr error) {
    auto owner = weak.lock();
@@ -1263,10 +1309,11 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
   },
     .service_class = stage == PixelStage::Input ? CompileWorkClass::Extraction : CompileWorkClass::Pixels,
     .bytes = trace && stage == PixelStage::Input ? slot.writer->pixel_input_bytes(*slot.input) : 0});
-  if (!task) return false;
-  job.handle = std::move(*task);
+  job.handle = std::move(task);
   return true;
  }
+ auto header_record = job.stage == PixelStage::Header ? execution.try_retain(CompileTaskKind::Header) : std::optional<CompileExecution::Continuation>{};
+ if (job.stage == PixelStage::Header && !header_record) return false;
  CompileExecution::Task work{
   .kind = job.stage == PixelStage::Header ? CompileTaskKind::Header : CompileTaskKind::Pixels,
   .resources = job.resources,
@@ -1299,12 +1346,6 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
     owner->changed.notify_all();
     return;
    }
-   if (!error && slot.job.stage == PixelStage::Workspace) {
-    slot.job.stage = PixelStage::Input;
-    owner->push(slot.job);
-    owner->changed.notify_all();
-    return;
-   }
    if (!error && slot.job.stage == PixelStage::Header && slot.input && !owner->stopping && !slot.retiring && !slot.source->retiring) {
     slot.headers.close();
     slot.job.stage = slot.pixel_allowance ? PixelStage::Output : PixelStage::Workspace;
@@ -1318,7 +1359,7 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
   owner->settle(slot.job, error, recoverable);
  }
  };
- auto task = job.stage == PixelStage::Pixels ? slot.continuation.try_submit(std::move(work)) : execution.try_submit(std::move(work));
+ auto task = job.stage == PixelStage::Pixels ? slot.continuation.try_submit(std::move(work)) : header_record->try_submit(std::move(work));
  if (!task) return false;
  job.handle = std::move(*task);
  slot.pixel_allowance = {};
@@ -1368,25 +1409,26 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
   if (file_full || label_outputs.empty()) return false;
   const auto work = label_outputs.front();
   const auto weak = weak_from_this();
-  auto completion = files.try_submit({.completed = [weak, work](std::exception_ptr error) {
+  auto record = files.try_reserve_record();
+  if (!record) { file_full = true; return false; }
+  auto completion = record->submit({.completed = [weak, work](std::exception_ptr error) {
    if (auto owner = weak.lock()) owner->finish_label(work, error);
   }, .work = [weak, work] {
    if (auto owner = weak.lock()) owner->write_label(*work);
   }});
-  if (!completion) {
-   file_full = true;
-   return false;
-  }
-  work->handle = std::move(*completion);
+  work->handle = std::move(completion);
   label_outputs.pop_front();
   return true;
  };
- // Fair stage turns preserve FIFO within each stage. Callbacks need this lock,
- // so the eligible set can only shrink during a pass. Each head probe either
- // admits one job or excludes that stage until the next readiness event.
+ // Record exhaustion excludes a stage. Resource-denied Workspace requests
+ // rotate within a snapshot-sized pass so fitting successors can progress.
+ // Concurrent publication retains its own readiness notice.
  std::array<bool, pixel_stage_count> blocked{};
  auto eligible = pixels.ready_stages();
  std::size_t image_head_probes = 0, image_admitted = 0;
+ const auto workspace_limit = pixels.counts()[static_cast<std::size_t>(PixelStage::Workspace)];
+ auto workspace_remaining = workspace_limit;
+ std::size_t resource_denied = 0;
  bool any_admitted = false;
  for (;;) {
   bool accepted = admit_output();
@@ -1395,20 +1437,36 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
    auto& job = pixels.next(eligible);
    const auto stage = static_cast<std::size_t>(job.stage);
    if (trace) ++image_head_probes;
-   if (submit_pixel(job)) {
-    pixels.accept(job);
+   const bool workspace = job.stage == PixelStage::Workspace;
+   bool records_full = false;
+   if (workspace) --workspace_remaining;
+   if (workspace ? retain_pixel(job, lock, records_full) : submit_pixel(job)) {
+    if (!workspace) pixels.accept(job);
     eligible &= pixels.ready_stages();
+    if (workspace && !workspace_remaining) eligible &= ~(std::uint32_t{1} << stage);
     if (trace) ++image_admitted;
     accepted = true;
     break;
    }
-   if (trace) blocked[stage] = true;
-   eligible &= ~(std::uint32_t{1} << stage);
+   if (trace) {
+    if (workspace && !records_full) ++resource_denied;
+    else blocked[stage] = true;
+   }
+   if (!workspace || records_full || !workspace_remaining) eligible &= ~(std::uint32_t{1} << stage);
+   eligible &= pixels.ready_stages();
   }
   if (!labels_first) accepted = images.admit_labels() || accepted;
   if (trace) any_admitted |= accepted;
   labels_first = !labels_first;
   if (!accepted) break;
+  // Each bounded admission gives completion/publication/retirement its lock.
+  lock.unlock();
+  lock.lock();
+  if (stopping || failure || cancellation.requested()) {
+   readiness->notify();
+   break;
+  }
+  eligible &= pixels.ready_stages();
  }
  if (trace) {
   const auto queued = pixels.counts();
@@ -1419,7 +1477,7 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
   trace_benchmark_event(trace, "benchmark.pipeline.ready", [&] {
    return nlohmann::json{
     {"header", queued[0]}, {"workspace", queued[1]}, {"input", queued[2]}, {"output", queued[3]}, {"pixels", queued[4]}, {"pending_images", pending_images}, {"image_head_probes", image_head_probes},
-    {"image_admitted", image_admitted}, {"label_outputs", outputs}, {"stage_records_blocked", blocked}, {"label_file_records_blocked", file_full}
+    {"image_admitted", image_admitted}, {"workspace_resource_denied", resource_denied}, {"workspace_probe_limit", workspace_limit}, {"label_outputs", outputs}, {"stage_records_blocked", blocked}, {"label_file_records_blocked", file_full}
     , {"empty_dispatch", !any_admitted}, {"lock_wait_ns", lock_ns}, {"body_ns", body_ns}
    };
   });
@@ -1436,6 +1494,8 @@ bool BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
    candidate = next;
    continue;
   }
+  auto record = execution.execution.try_retain(CompileTaskKind::Labels);
+  if (!record) return false;
   auto work = std::make_shared<LabelWork>();
   work->label = &label;
   work->input = label.input;
@@ -1444,7 +1504,7 @@ bool BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
   work->width = canvas.width ? canvas.width : label.image->width;
   work->height = canvas.height ? canvas.height : label.image->height;
   const auto weak = execution.weak_from_this();
-  auto task = execution.execution.try_submit(
+  auto task = record->try_submit(
    {.kind = CompileTaskKind::Labels,
     .resources = {.bytes = BenchmarkLabelWorkspace::required_bytes(work->width), .supplied_workspace = true, .completion_workspace = true},
     .work =
@@ -1465,7 +1525,7 @@ bool BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
     if (!error && (owner->label_retired(*work) || owner->cancellation.requested())) error = owner->retired_failure;
     if (!error && work->target) {
      owner->label_outputs.push_back(work);
-     owner->execution.notify_admission_change();
+     owner->readiness->notify();
      return;
     }
    } catch (...) { error = std::current_exception(); }
@@ -1518,7 +1578,7 @@ void BenchmarkCompilePipeline::Impl::finish_label(const std::shared_ptr<LabelWor
   producer = std::move(product.producer);
  }
  completion.settle(error);
- owner->execution.notify_admission_change();
+ owner->readiness->notify();
  owner->changed.notify_all();
 }
 void BenchmarkCompilePipeline::Impl::run_label(LabelWork& label, std::size_t lane) {
@@ -1628,7 +1688,7 @@ void BenchmarkCompilePipeline::write_remaining(BenchmarkSplitWriter& writer, con
   failure = std::current_exception();
   withdraw();
  }
- impl_->execution.notify_admission_change();
+ impl_->readiness->notify();
  for (auto index : slots) {
   const auto [root, id] = writer.identity(index);
   try {

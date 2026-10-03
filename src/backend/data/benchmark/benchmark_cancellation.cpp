@@ -2,13 +2,14 @@
 #include "src/backend/data/detail/compile_execution.h"
 #include <stdexcept>
 #include <utility>
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::benchmark_internal {
 BenchmarkCompileCancellation::BenchmarkCompileCancellation(mmltk::common::concurrency::CancellationObservation external) noexcept : external_(external) {}
 void BenchmarkCompileCancellation::cancel_locked() noexcept {
  internal_.store(true, std::memory_order_relaxed);
  // Notification only takes the execution admission lock; it never joins work
  // or calls back synchronously into this owner. Detachment uses this same lock.
- if (execution_) execution_->notify_admission_change();
+ if (execution_) execution_->notify_change(CompileChange::Interruption);
 }
 void BenchmarkCompileCancellation::cancel() noexcept {
  const std::lock_guard lock(mutex_);
@@ -38,7 +39,7 @@ BenchmarkCompileCancellation::ExecutionBinding::ExecutionBinding(BenchmarkCompil
  const std::lock_guard lock(owner_.mutex_);
  if (owner_.execution_) throw std::logic_error("benchmark cancellation already has an execution binding");
  owner_.execution_ = &execution;
- if (owner_.cancelled()) execution.notify_admission_change();
+ if (owner_.cancelled()) execution.notify_change(CompileChange::Interruption);
 }
 BenchmarkCompileCancellation::ExecutionBinding::~ExecutionBinding() {
  // Wait for an in-flight notification, then withdraw the borrowed target before

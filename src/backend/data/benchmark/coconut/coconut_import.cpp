@@ -41,6 +41,7 @@
 #include <deque>
 #include <thread>
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileAllowance;
 using detail::CompileExecution;
@@ -380,7 +381,7 @@ class Importer final {
    job->state = error ? NativeJob::State::Done : state;
    job->error = error;
   }
-  request_.execution->execution().notify_admission_change();
+  output_readiness_->notify();
  }
  void pump_outputs() {
   auto& execution = request_.execution->execution();
@@ -500,7 +501,7 @@ public:
        archive_worker_(request),
        assembly_workspace_(request.limits, request.cancellation),
        normalizations_(native_window, request.execution ? &request.execution->execution() : nullptr) {
-  if (request.execution) output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), [this](auto) { pump_outputs(); });
+  if (request.execution) output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::Resources | CompileChange::Records | CompileChange::Local, [this](auto changes) { if (changes.retry || changes.records || changes.local || changes.interrupted) pump_outputs(); });
   if (request.input_identity.empty()) invalid("missing pinned input identity");
   if (!request.physical_membership) invalid("missing physical membership admission");
   assembly_workspace_.recovery(request.recovery);
@@ -1118,7 +1119,7 @@ private:
   const std::stop_callback stopping(stop, [signal] { signal->notify(); });
   std::unique_ptr<CompileExecution::Readiness> interrupted;
   if (request_.execution)
-   interrupted = std::make_unique<CompileExecution::Readiness>(request_.execution->execution(), [signal](auto change) {
+   interrupted = std::make_unique<CompileExecution::Readiness>(request_.execution->execution(), CompileChange::Interruption, [signal](auto change) {
     if (change.interrupted) signal->notify();
    });
   std::vector<std::unique_ptr<Worker>> idle_recovery;

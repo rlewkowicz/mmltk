@@ -14,6 +14,7 @@
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
+using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
 using mmltk::backend::data::detail::CompileAllowance;
@@ -56,7 +57,7 @@ public:
      const std::lock_guard lock(pool->mutex);
      ++pool->free;
     }
-    if (pool->execution) pool->execution->notify_admission_change();
+    if (pool->execution) pool->execution->notify_change(CompileChange::Local);
    }
   }
  };
@@ -80,8 +81,8 @@ public:
   buffers_->free = execution ? std::clamp<std::size_t>(execution->execution().workers() * 2, 2, 8) : 1;
   buffers_->execution = execution ? &execution->execution() : nullptr;
   if (execution)
-   readiness_ = std::make_unique<CompileExecution::Readiness>(execution->execution(), [this](CompileExecution::Readiness::Changes changes) {
-    if (!changes.retry && !changes.interrupted) return;
+   readiness_ = std::make_unique<CompileExecution::Readiness>(execution->execution(), CompileChange::Resources | CompileChange::Pressure | CompileChange::Local, [this](CompileExecution::Readiness::Changes changes) {
+    if (!changes.retry && !changes.local && !changes.interrupted) return;
     {
      const std::lock_guard lock(resource_mutex_);
      ++resource_generation_;
