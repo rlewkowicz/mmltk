@@ -7,7 +7,8 @@
 - [Build and reusable state](build.md): prerequisites, toolchains, dependencies,
   packaging, generated artifacts, cache invalidation, and build timing.
 - [Commands](commands.md): wrapper and native CLI entrypoints, process actions,
-  benchmark inspection/cache selection, desktop options, and model tooling.
+  benchmark inspection/cache selection, explicit data profiling, desktop options,
+  and model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
   preprocessing, output reservation, training history/progress, evaluation,
   export, and image/video prediction and saving.
@@ -38,16 +39,17 @@
   adaptations, and guarded native tracing.
 - [Datasets and compilation](datasets.md): source annotations, format 10 fixed
   slots, in-place compaction, prepared batch capacity, resize geometry,
-  perceptual downscaling, loading/leases, and Explore cache residency.
+  prepared CPU/perceptual resampling, loading/leases, and Explore cache residency.
 - [Compilation execution and working storage](compile-execution.md): shared
   Directory/benchmark ownership, live-class CPU floors and elastic work,
-  fixed pinned arenas, exceptional inputs, bounded image/file services and
-  retained continuations, file preparation/completion,
-  physical-growth promises, atomic filesystem publication, and bounded progress
-  delivery.
+  task-sized leases in fixed pinned arenas, selective readiness and fairness,
+  exceptional inputs, bounded image/file services and retained continuations, file
+  preparation/completion, filesystem capacity transactions, atomic publication,
+  and bounded progress delivery.
 - [Built-in benchmark datasets](benchmark-datasets.md): recipe membership,
   native import/provenance, optional mask recovery, persistent cache/repair,
-  recipe readiness, archive and Parquet continuation,
+  recipe readiness, bounded archive traversal and Parquet continuation,
+  shared encoded-image publication, batched final provenance settlement,
   source-generation reconciliation, immutable row-admission and cache custody,
   healthy subsets and incomplete provenance, row/component progress accounting,
   and capacity limits.
@@ -62,13 +64,14 @@
   test-run replacement, PCH include audits, cleanup and raw-review tooling,
   declaration formatting, symbol/address and GPU diagnostics, evidence ownership,
   rendered acceptance, numerical coverage, benchmark ownership/recovery and
-  Firefox validation records, historical fixed-storage measurements, fixtures,
-  and evidence limits.
+  Firefox validation records, opt-in CPU/data profiles, complete Coconut and
+  historical fixed-storage measurements, fixtures, and evidence limits.
 - [Headless Wayland](headless-wayland.md): private NVIDIA Weston setup, input
   seat, readiness, deadlines, shutdown, artifacts, and limitations.
 - [Logging](logging.md): automatic build/test/tidy transcripts, opt-in runtime
   diagnostics, fatal causes and process identity, acceptance evidence formats, capture/history
-  selection, queries, correlation, triage, and output limits.
+  selection, compiler cost/arena observations, partial-line windows, numeric
+  statistics, correlation, triage, and output limits.
 - [Planned work](roadmap.md): future directions, distinct from current capability.
 
 `CONTRACT.md` owns high-level architecture and handoffs; this wiki owns detailed

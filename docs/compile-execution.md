@@ -16,7 +16,7 @@ Runtime batch loading uses its existing reader pool, described in
 | --- | --- |
 | [CompileExecution](../src/backend/data/detail/compile_execution.h) | Session CPU admission, live work classes, bounded ready/parked records, dependencies, completion, cancellation, and join |
 | [CompileResources and CompileAllowance](../src/backend/data/detail/compile_resources.h) | Bytes, descriptors, dependent commitments, external CPU grants, and shared physical custody |
-| [CompileWorkspacePlan and CompileArenaBank](../src/backend/data/detail/compile_workspace.h) | Checked preparation, fixed NUMA-local pinned backing, compatible context leases, and exclusive exceptional storage |
+| [CompileWorkspacePlan and CompileArenaBank](../src/backend/data/detail/compile_workspace.h) | Checked preparation, fixed NUMA-local pinned backing, aligned task-sized leases, protected windows, and exclusive exceptional storage |
 | [CompileImageDecoder](../src/backend/data/detail/compile_image_decoder.h), [CompilePixelWorkspace](../src/backend/data/detail/compile_pixel_workspace.h), [CompiledLabelWorkspace](../src/backend/data/detail/compiled_label_workspace.h) | Checked codec/resizer plans, supplied scratch, direct pixel output, and complete label-output leases |
 | [FileWorkQueue](../src/backend/data/detail/file_work_queue.h) | Bounded borrowed file operations, class-aware service admission, and physical completion |
 | [CompiledSlotStorage](../src/backend/data/detail/compiled_slot_storage.h) | Stable block mappings, occupied slot preparation, and pixel/label write custody |
@@ -54,13 +54,17 @@ after bounded tasks. With fewer CPUs than live classes, fair sharing occurs at
 task/chunk boundaries. Feasible work can pass a blocked task, and aged byte
 demands participate in admission so fitting larger work can progress.
 
-The benchmark image pipeline keeps FIFO ready lists for Header, Workspace,
+The benchmark image pipeline keeps ready lists for Header, Workspace,
 Input, Output, and Pixels. It rotates between stages after successful admission;
 a denied probe does not consume a turn. Header admission establishes geometry
-and a checked plan. Workspace admission reserves the complete input/conversion
-envelope before retaining it, Input preloads encoded bytes, Output prepares the
-occupied destination, and Pixels converts directly into its disjoint extent.
-These stages can advance alongside source, label, and cache work.
+and a checked plan. Workspace admission atomically retains the complete
+input/conversion envelope and a successor record without taking a CPU lane.
+Input preloads encoded bytes, Output prepares the occupied destination, and
+Pixels converts directly into its disjoint extent.
+Resource-denied workspace requests rotate within a pass bounded by the initial
+ready count, allowing fitting successors to progress. A full record bank stops
+that stage until capacity returns. Admission releases the facts lock between
+bounded attempts, so completion and source publication can advance alongside it.
 
 Curl pumps and file-service calls draw CPU grants from the same owner; a service
 grant replaces a compute lane while active. External archive helpers can use
@@ -88,6 +92,31 @@ join retain physical custody until the continuation and its admitted work
 retire. This lets preloaded image input and its workspace survive asynchronous
 file preparation without requiring a second scheduler record.
 
+### Selective readiness and resource pressure
+
+The canonical [CompileChange](../src/backend/data/detail/compile_resources.h)
+causes separate Resources, Cpu, Records, Local, Pressure, Fairness, and
+Interruption. Owner subscriptions select the causes that can change their
+predicates; owner-local notifications address that subscription, and
+interruption reaches every owner. Registration checks its observed generation
+atomically, and subscription destruction joins callbacks.
+
+Resource eligibility is cached against the resource generation. CPU-only
+changes, returned scheduler records, and local product arrivals do not
+invalidate it. A failed local admission attempt suppresses retries caused only
+by its own temporary reservations; external changes retain their wake. Image
+dispatch listens for resource changes, returned records, and fairness changes,
+while file services additionally need CPU availability.
+
+An aged demand can delay fitting work for fairness without indicating exhausted
+storage. Its parked reason is `Fairness`, separate from `Bytes` and
+`Descriptors`; only actual resource waits request reclamation. Removing an aged
+demand wakes its fairness dependents without changing resource eligibility.
+Completion windows wait on their own completions and relevant pressure, so
+unrelated CPU scheduling does not discard a retained archive/Arrow cursor.
+Oversized workspace demand has an explicit drain signal. Diagnostic counters,
+addresses, and timing never control these decisions.
+
 ## Fixed pinned arenas
 
 [The checked planner](../src/backend/data/compile_workspace.cpp) combines enabled
@@ -100,13 +129,15 @@ Q = largest enabled normal context that fits below the protected ceiling
 B = min(6 GiB, max(256 MiB, R + W × Q))
 ```
 
-Arithmetic is checked. Protected windows must fit the normal ceiling. When
-CPU capacity permits, preparation first fits contexts for enabled classes,
-then adds interchangeable contexts up to the remaining budget/useful CPU count.
-Class floors guarantee CPU availability, not a separate maximum-sized workspace
-for every class. The complete budget is pinned, including protected and currently
-unused bytes. Explicit small internal plans support bounded work; the public
-compiler has no memory-budget tuning switch.
+Arithmetic is checked. Protected windows must fit the normal ceiling. The
+planner's context capacities distribute normal backing across CPU/NUMA
+placements; they are sizing inputs, not exclusive image slots. The arena bank
+pools ordinary capacity for each NUMA node into one physical allocation and
+registers the remaining budget tail as usable storage. Protected windows occupy
+separate regions on the first selected node. Class floors guarantee CPU
+availability independently of storage. The complete budget stays pinned,
+including free bytes. Explicit small internal plans support bounded work; the
+public compiler has no memory-budget tuning switch.
 
 Normal image profiles use a 2,048-pixel reference extent to choose reusable
 capacity; actual headers/rows determine each request. That reference is not an
@@ -129,7 +160,12 @@ acquiring a CUDA context. CUDA-registered runtime transfer buffers retain their
 [separate ownership](gpu-execution.md#device-and-numa-placement).
 
 Normal arenas keep their addresses, capacities, and pinning across worker
-reassignment. Leases select reusable contexts and stable slices for encoded
+reassignment. Each lease claims its actual requested bytes rounded to 64-byte
+alignment. Size-binned free extents split on admission and coalesce on last-borrower
+release within their region. Ordinary space is tried before an eligible protected
+window; coalescing never crosses NUMA allocations or protected boundaries.
+Aliases and subspans retain the complete original allocation until their last
+borrower retires. The stable slices hold encoded
 input, STB decode, RGB/CMYK output, AVIR/perceptual scratch, masks/parsing,
 Arrow payload, and label output. Completion and named source/compaction windows
 retain their admission constraints. Controllable payload allocations use the
@@ -143,10 +179,12 @@ conversion envelope, the pipeline releases that source charge and reopens the
 same admitted inode before reserving the consumer workspace. A path replacement
 cannot substitute a different input generation.
 
-A legal request that cannot fit a normal context enters one exclusive
-exceptional lineage. Unrelated transient borrowers drain while the normal bank
-stays pinned. One checked additional arena is then locked for that input and
-its admitted descendants. It cannot grow while borrowed; its last physical
+A legal request larger than every compatible normal region enters one exclusive
+exceptional lineage. Busy or fragmented normal space waits for release and
+coalescing; occupancy does not make a normal shape exceptional. Unrelated
+transient borrowers drain while the normal bank stays pinned. One page-rounded
+additional arena is then locked for that input and its admitted descendants.
+It cannot grow while borrowed; its last physical
 consumer retires it before ordinary admission resumes. Allocation or pin failure
 preserves the prior published output.
 
@@ -174,14 +212,18 @@ file/lease controls have separate accounting from data-buffer workspace.
 Slots are claimed under short metadata locks. File-service operations prepare
 occupied page ranges outside source/facts/admission locks, then publish write
 readiness. Pixel workers write directly into disjoint mapped destinations.
-Label output retains its pinned lease through the actual file write. There is
-no final serial image-copy queue.
+Label output retains its pinned lease through the actual file write. Layout
+compaction remains a separate finalization pass.
 
 Each staged inode owns its allocation, hole-punch, and truncation ordering.
-The filesystem ledger protects numeric promises while capacity and allocation
-observations run outside its lock. New physical growth, overwrites, and removed
-backing update the same reservation. This coordinates one compilation's users;
-unrelated processes can still consume disk space.
+The shared ledger keeps one capacity transaction per destination filesystem,
+identified by `st_dev`. Initial reservation and growing outstanding capacity
+sample `statvfs` once while holding that filesystem's ledger lock, check sibling
+promises, then commit together. Shrinking a promise needs no capacity sample.
+Allocation, mapped writes, and sync stay outside this transaction; allocation
+settlement updates the same ledger. Other filesystems use independent locks.
+This coordinates one compilation's users; unrelated processes can still consume
+disk space.
 
 [Format-10 finalization](datasets.md#staging-and-in-place-compaction) waits for
 borrowed writers/mappings, uses bounded pinned scratch, and preserves

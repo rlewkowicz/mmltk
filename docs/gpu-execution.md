@@ -507,9 +507,14 @@ and [ShiftLUT tooling](commands.md#shiftlut-model-tooling).
 
 This uses the existing `MMLTK_BUILD_IMAGE` (default `mmltk-build:latest`) and a
 read-only dataset mount. It does not build or pull images, read file contents,
-or run a benchmark. JSON includes GPU/driver and kernel details, filesystem
-and block devices, PCIe paths, memory-lock limits, visible cuFile/GDRCopy
-components, and `O_DIRECT` open / `STATX_DIOALIGN` observations.
+or run a benchmark. JSON includes CPU topology (`lscpu`), GPU/driver and kernel
+details, NUMA hardware, filesystem and block devices, PCIe paths, memory-lock
+limits, visible cuFile/GDRCopy components, and `O_DIRECT` open / `STATX_DIOALIGN`
+observations.
+`filesystem_capacity` reports instantaneous `statvfs` total/free/available
+bytes and fragment size. It is a read-only capacity sample, independent of the
+compiler's [capacity transactions](compile-execution.md#file-preparation-and-settlement);
+unrelated writers can consume it immediately.
 
 Unavailable tools or inaccessible metadata are reported as unavailable.
 Docker/image/GPU startup failures reach stderr before JSON can be produced.

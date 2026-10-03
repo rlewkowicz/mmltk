@@ -26,6 +26,7 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --audit-includes [--refresh] [report\|preview\|fix] [--output PREFIX] [--build-dir PATH]` | Inventory all compiler contexts and include-retention reasons; preview/apply replacements only under verified target-local PCH policy |
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, and log-query fixtures |
+| `./mmltk --test data-profile -- --help` | Prepare the opt-in data profile target and show CPU compile/resample, full Coconut, and CUDA loader modes |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
 | `./mmltk --diagnose-processes [WRAPPER_MODE]` | Inspect processes in this repository's running wrapper containers |
@@ -48,6 +49,7 @@ first when invoking that standalone operation.
 Detailed references: [CUDA/Vulkan diagnostics](validation.md#standalone-cudavulkan-diagnostic),
 [native symbols/links](validation.md#native-symbol-and-link-diagnostics),
 [test selectors](validation.md#selection-environment-deadlines-and-debugging),
+[data profiles](validation.md#data-compilation-and-resampling-profiles),
 [declaration tooling](validation.md#raw-cpd-and-declaration-formatting),
 [PCH include audits](validation.md#pch-include-audit), and
 [log queries/provenance](logging.md).
@@ -212,6 +214,12 @@ eligible CPUs; live work classes and bounded file/Curl service use that budget.
 The [compilation reference](compile-execution.md) owns scheduling, checked
 page-locked storage preparation, and exceptional inputs. Worker count is not
 a count of independent per-source controller pools or a process-memory cap.
+CPU compiler profiling uses the separate `--test data-profile` operation;
+ordinary `bench` measures compiled loading. Production-size Coconut profiling
+requires explicit `--mode Coconut` and `--cache-dir`, and can acquire missing
+sources. It is outside ordinary `all` tests; the
+[profile reference](validation.md#data-compilation-and-resampling-profiles)
+defines modes, byte-rate meaning, and bounded input options.
 
 [RF-DETR workflows](rfdetr-workflows.md) owns checkpoint, metric, and history behavior.
 Train, predict and evaluate accept `--compile-mode none|selective|full`.

@@ -156,6 +156,13 @@ warnings, and `failed.txt` preserve that distinction. A later compilation clears
 it only when authoritative source extents prove the exact release-global
 ordinals. No unrelated discovery scan delays healthy work to obtain that proof.
 
+Final Coconut selection groups required ordinal/completeness updates into
+bounded batches of at most 64 images per split. The split writer transforms
+only their used instance records through one existing file-service operation
+per batch, preserving masks, pixels, identities, and selected order. It waits
+for physical completion before the caller reuses that batch; the last partial
+batches settle before sealing. No-op provenance updates require no write.
+
 Current import admission bounds each encoded PNG to 64 MiB, each decoded image
 to 64 Mi pixels, each axis to 32,767, and each segment list to 65,535 entries.
 The canonical limits are in
@@ -283,6 +290,20 @@ inventory is needed.
 A failed body can retain useful header geometry while its image is repaired.
 Old publications cannot attach to replacement generations or attempts.
 
+[BenchmarkImagePublication](../src/backend/data/benchmark/detail/benchmark_image_publication.h)
+serves both generic archive extraction and Coconut physical membership. It
+copies each member into an admitted pinned slice sized to that member's actual
+encoded length, bounded by the 32 MiB image window. A per-publisher capacity of
+`clamp(2 × workers, 2, 8)` limits retained inputs and accepted cache writes.
+Persistent file workers own accepted bytes through physical write and callback
+completion; successful publication can transfer the same encoded-input custody
+to pixel preparation. Callbacks retain generation-qualified source tickets and
+never borrow the archive cursor. Controller settlement retains repair,
+inventory, and eligibility policy. Source completion joins accepted writes and
+image completions before sealing its physical inventory. The separate
+[image and output services](compile-execution.md#owners-and-ready-work) share
+the session CPU budget while keeping image preparation runnable behind output.
+
 [BenchmarkSplitWriter](../src/backend/data/benchmark/benchmark_writer.cpp) writes
 pixels directly into stable mapped blocks and complete labels into arithmetic
 slots. Late Large labels replace XL labels in the same physical slot without
@@ -305,6 +326,9 @@ dictionary/index while retained. Known requests are visited in physical order
 under one archive-format context. Pausing releases decoder capacity; evicted
 gzip state or context-dependent ZIP/extended/sparse tar reads may replay the
 required prefix. Control/chunk limits can fall back to bounded streaming.
+Forward replay and known-member traversal inspect at most 64 skipped headers
+per CPU grant, with cancellation checked at every header. This bounds each
+scheduling turn without batching images or delaying a ready member.
 There is no persisted seek sidecar or mandatory EOF/index-export pass.
 Gzip decoder and caller capacity participate in the shared CPU allowance;
 nonpreemptible grants last through that reader's active stream and leave
@@ -316,6 +340,10 @@ backend requires its complete fixed workspace and helper-CPU grant to be
 admitted; it is not multiplied by the number of source controllers. Suspending
 an archive retires its decoder without allocating replacement state while
 consumers retain the opened generation and their encoded bytes.
+Record-only or fairness waits retain that forward state. Actual resource
+pressure can suspend an idle decoder; an unaccepted input may be released and
+replayed from its saved position in the same opened generation. Accepted
+writers keep their independent bytes and complete during that replay.
 
 [JSON discovery](../src/backend/data/benchmark/benchmark_json.cpp) walks the
 document structure once and yields bounded record ranges. Semantic parsing
@@ -382,7 +410,7 @@ has its own authority:
 ### Memory, descriptors, and storage
 
 The [shared preparation and admission rules](compile-execution.md#fixed-pinned-arenas)
-own the checked normal budget, fixed pinned contexts, separate library charges,
+own the checked normal budget, task-sized pinned allocations, separate library charges,
 descriptor commitments, and exclusive oversized lineage. Source readers, Arrow
 batches, encoded images, and output leases retain their physical custody across
 parked work. The normal bank stays pinned while borrowers change.
@@ -774,4 +802,6 @@ zero. Exact COCONut masks are never simplified/sampled to fit. Recompiling older
 bins preserves reusable downloads,
 images, and normalized annotations. [Bounded fixtures](validation.md#benchmark-compilation-evidence)
 prove conversion/reuse, not full-release capacity at every resolution or live
-download duration/liveness.
+download duration/liveness. The explicit
+[384×384 Coconut measurement](validation.md#compiler-throughput-validation-record)
+records one complete retained-cache run separately from ordinary fixtures.

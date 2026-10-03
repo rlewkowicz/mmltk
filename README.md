@@ -111,8 +111,10 @@ omissions; both output splits still need usable data. See the
 reading the independent acquisition, labels/masks, and pixel progress.
 
 Directory and benchmark compilation share available CPU capacity and reuse
-prepared, page-locked working buffers. Progress remains responsive while the
-window resizes, and Cancel settles native work before another run starts.
+prepared, page-locked working buffers with task-sized allocations. Both compile
+and resize images on the CPU; perceptual GPU augmentation is a separate training
+option. Progress remains responsive while the window resizes, and Cancel settles
+native work before another run starts.
 The [compilation guide](docs/compile-execution.md) explains worker sharing,
 memory preparation, oversized inputs, and file settlement.
 
@@ -131,6 +133,9 @@ hardware acceptance; [logging](docs/logging.md) explains captured evidence.
 `./mmltk --test all` runs the ordinary native suites, browser JavaScript/Rust
 tests, cleanup/declaration-tool fixtures, and log-query fixtures. Packaged
 Wayland acceptance has its own command in the validation guide.
+CPU compilation/resampling profiles and full Coconut measurements are
+[explicit opt-in operations](docs/validation.md#data-compilation-and-resampling-profiles);
+ordinary tests do not launch a full benchmark-dataset download or compile.
 
 ## Codebase
 

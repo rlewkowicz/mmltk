@@ -361,6 +361,12 @@ GUI records use `kind: "benchmark_dataset"`, a top-level `name`, nested `fields`
 and `steady_ns` from the shared runtime sink. The query tool normalizes `name`
 to `@event`; fields can be queried directly. Select one capture so repeated
 artifact names and monotonic timestamps do not join different runs.
+The opt-in [data profiler](validation.md#data-compilation-and-resampling-profiles)
+uses `event`, `steady_ns`, `run_id`, and nested `fields` in its separate
+append-only JSONL file. Its repeatable `--trace-prefix` selects emitted event
+prefixes and flushes selected records, but leaves upstream clocks, counters,
+snapshots, and field construction enabled. Omit `--trace-file` for untraced
+throughput. With no observer, these diagnostic counters and clocks are inactive.
 
 | Events or fields | Observed work |
 | --- | --- |
@@ -368,16 +374,18 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.compile.paths` | Resolved `cache_root` and compiler `output_root`, with separate `*_truncated` and `*_utf8_replaced` diagnostic flags |
 | `benchmark.progress.activity` | Current `activity`, numeric `phase`, and optional numeric `source` |
 | `benchmark.progress.delivery` | Opt-in `produced`, `materialized`, `coalesced`, `delivered`, `pending`, and `high_water` counts from the bounded progress observer |
-| `compile.execution` | Shared class/CPU admission, parked/ready/running records, normal and exceptional pinned storage, active loans, descriptor promises, and completed work |
+| `compile.execution`, `.retired` | Shared class/CPU admission, parked/ready/running records, normal and exceptional pinned storage, descriptor promises, completed work, nested `arena`/`costs`, and blocked `demands`; retirement follows worker join |
+| `compile.pixel` | Shared Directory/benchmark pixel operation: codec/path, source/target extents, encoded/requested/opaque/output bytes, validation/preparation/decode/destination/resize-store wall time, thread CPU time, and failure stage |
 | `file.service.started`, `.stopped`, `file.admitted`, `.wait_records`, `.wait_cpu`, `.running`, `.physical_completed`, `.completed` | Bounded file-service records, class grants, physical calls, and callback settlement; `service` distinguishes `image` from `output` |
 | `benchmark.image.stage_started`, `.stage_completed` | `root`, `image_id`, `generation`, `stage` (`header`, `workspace`, `input`, `output`, `pixels`), `workspace_bytes`, `encoded_bytes`, `duration_ns`, and `failed` |
-| `benchmark.pipeline.ready` | Per-stage ready counts, `pending_images`, `image_head_probes`, `image_admitted`, `label_outputs`, `stage_records_blocked`, and `label_file_records_blocked` |
+| `benchmark.pipeline.ready` | Per-stage ready counts, `pending_images`, `image_head_probes`, `image_admitted`, `workspace_resource_denied`, `workspace_probe_limit`, `label_outputs`, `stage_records_blocked`, `label_file_records_blocked`, `empty_dispatch`, `lock_wait_ns`, and `body_ns` |
 | `benchmark.download.cache_hit`, `.preseeded` | Retained archive `artifact`, `bytes`, and admission `integrity` |
 | `benchmark.download.progress` | `artifact`, `completed_bytes`, `total_bytes`, `attempt`, `resumed`, `retained_bytes`, `durable_bytes`, and `redownload` |
 | `benchmark.download.segmented_resume_state`, `.partial_checkpoint` | Retained range state or ordinary-transfer checkpoint and resume eligibility |
 | `benchmark.download.attempt_failed`, `.segment_retry`, `.segmented_fallback` | HTTP/CURL failure, discarded partial state, or fallback context where available |
 | `benchmark.images.cache_scan`, `.cache_reuse`, `.progress` | `source`/`shard`, inspected/reused/resolved images, and selection counts |
 | `benchmark.images.validation_failed` | Rejected archive `member`, `image_id`, `source`/`shard`, encoded `bytes`, and `reason` |
+| `benchmark.images.buffer_wait`, `.input_wait`, `.file_wait`, `.pixel_wait`, `.input_released`, `.decoder_admission`, `.input_pressure`, `.pressure` | Encoded-publication capacity, decoder/input custody, and physical pressure context; a pressure event can carry a complete execution snapshot |
 | `benchmark.archive.scan`, `.extracted`, `.extract_cache_hit` | Archive traversal or annotation-member extraction/reuse |
 | `benchmark.archive.admission_wait` | Source admission snapshot: `bytes`, `descriptors`, `committed_descriptors`, `descriptor_capacity`, `producer_ceiling`, and `active_cpus`; `reason` is `source_admission` |
 | `benchmark.resource.wait` | First blocked reservation snapshot: requested/held bytes and descriptors, continuation commitments, limits, source location, parent chain, and live owner locations |
@@ -402,7 +410,8 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.images.archive_retry`, `benchmark.pixel_compile.cache_repair` | Bounded image/archive repair context |
 | `benchmark.download.failure_sha256`, `benchmark.images.failure_sha256` | Failure digest and cause for an artifact or image; COCONut annotation repair additionally reports `matches_expected` |
 | `benchmark.pixel_compile.throughput`, `.complete` | Completed/total images where available, `split`, elapsed seconds, images/second, and ETA observations |
-| `benchmark.storage.reserved`, `.projection` | Outstanding physical-growth reservation (`required_bytes`, aggregate `reserved_bytes`, `available_bytes`) or projected output bounds |
+| `benchmark.storage.preflight`, `.reserved`, `.capacity_failed`, `.projection` | Capacity transaction or projected output bounds; transactions carry `required_bytes`, `reserved_bytes`, `available_bytes`, `capacity_samples`, `retries`, `duration_ns`, and `failed` |
+| `benchmark.cost.started`, `.completed` | Final/control work spans: numeric `kind`, `span_id`, `duration_ns`, `failed`, and scope fields such as release, input identity, rows revisited, selected images, settlement batches, split, and bytes |
 | `benchmark.compaction.started`, `.completed`, `benchmark.split_sync.started`, `.completed` | Split compaction or physical sync boundaries with `split` and `bytes` |
 | `benchmark.directory_sync.started`, `.completed`, `benchmark.publication.started`, `.complete` | Directory sync and final atomic publication boundaries with `path` or `output` |
 | `benchmark.publication.old_generation_cleanup` | Best-effort removal of the exchanged old generation: `path`, `removed`, and `error`; cleanup failure does not revoke committed publication |
@@ -475,7 +484,7 @@ tracing does not collect this owner inventory.
 `compile.execution` uses canonical class order Acquisition, Extraction,
 Annotations, Pixels, Gather, Output for `live`, `baseline`, `ready`, and
 `running`; `parked` uses None, Dependency, Bytes, Descriptors, Cpu, Withdrawal,
-Continuation. Task-indexed arrays use Acquisition, Metadata, Header, Projection,
+Continuation, Fairness. Task-indexed arrays use Acquisition, Metadata, Header, Projection,
 Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output.
 `external` and `services` describe grants within the same CPU budget.
 `normal_locked` is fixed normal backing; `resident` adds physically materialized
@@ -483,9 +492,52 @@ exceptional backing, while `leased` counts normal slices currently borrowed.
 These are arena quantities, not measured process RSS. `exceptional_reserved`
 can precede materialization; `exceptional_peak` records the observed normal-plus-
 exceptional high-water commitment. `opaque_library` is the separate library
-charge. `protected_workspace`, `shared_workspace`, `compaction_workspace`,
-`workspace_contexts`, and `context_capacity` expose the checked preparation.
+charge. `protected_workspace`, `shared_workspace`, and `compaction_workspace`
+expose protected preparation; the compiler's separate preparation event includes
+`workspace_contexts` and `context_capacity`, which are planner quantities rather
+than a limit on live task-sized allocations.
 `workspace_reuses` and `physical_retirements` are enabled-observer counters.
+
+The nested `arena` projection comes from
+[CompileArenaObservation](../src/backend/data/detail/compile_arena_observation.h).
+It distinguishes requested and alignment-rounded occupied bytes, alignment
+loss, live allocations, ordinary capacity/free bytes/largest free extent,
+protected-window occupancy, physical backing regions, unregistered bytes, and
+allocation/occupied high-water marks. `largest_ordinary_capacity` describes
+normal shape fit; `largest_ordinary_extent` describes current contiguous room.
+A small free extent does not establish an oversized input.
+
+`costs` contains eligibility probes, notifier deliveries, submission attempts,
+record denials, resource epoch, admission-lock wait time, readiness and completion
+callback time, and worker creation/retirement. `demands` projects the canonical
+request and its denial, observed resource epoch, and largest eligible extent.
+Denial values follow
+[CompileResourceDenial](../src/backend/data/detail/compile_resources.h);
+`AgedDemand` is fairness, not a reclamation request. The
+[readiness rules](compile-execution.md#selective-readiness-and-resource-pressure)
+govern retries with diagnostics disabled too.
+
+`task_duration_ns` aggregates the physical task call through frame settlement,
+before completion callbacks; `task_body_ns` measures the work body and
+`task_cpu_ns` uses that thread's CPU clock. `ready_to_start_ns` accumulates
+queued-to-start delay. Pixel `cpu_ns` covers its validation through final
+store, while `duration_ns` and its stage fields measure wall time. CPU clock
+failure sets `cpu_incomplete` or `costs.incomplete`. Pixel
+`resize_preparations`, `resize_allocation_requests`, and
+`resize_allocation_bytes` count execution work/requests, not simultaneously live
+storage. The profiler reports separate `layout_*` preparation/allocation counts.
+Concurrent tasks, nested callbacks, and spans overlap: summed worker wall time
+or CPU time is not elapsed compile time and must not be added to it.
+
+`BenchmarkCostKind` order is PhysicalWait, RecoveryDrain, ComponentGather,
+InventorySeal, Selection, Compaction. Selection reports `settled_images` and
+`settlement_batches`; compaction reports its split and logical extent.
+`span_id` is an effect-only address that can be reused, so pair starts and ends
+within the same run and interval. Storage `capacity_samples` is one for an
+initial/growing transaction and zero for a shrinking promise; current capacity
+transactions do not retry. With no sample, `available_bytes=0` is not a
+measurement of full storage. Growth compares against sibling outstanding
+promises; successful initial/shrink observations report the committed aggregate.
 
 File records expose class-ordered `queued`, `running`, and `completing` arrays,
 plus `records`, `capacity`, `services`, `busy`, `admitted`, `completed`,
@@ -1361,6 +1413,19 @@ captured modification time, then by line. Modification time describes an
 artifact, not causality. `--tail` selects the last records of the chosen order
 and prints them ascending.
 
+`--last-lines N` instead limits parsing to the last 1–100,000 physical lines
+of each selected file. A bounded-memory byte scan locates line starts without
+decoding older payloads; parsing then seeks to that window. It reports the
+byte/line start and preserves absolute line numbers. Counts, statistics,
+context, and correlation then cover only that window; earlier failures or
+identities are excluded.
+It is useful for a large completed trace's retirement record:
+
+```bash
+./mmltk --logs build/validation/benchmark-coconut-batched.jsonl \
+  --last-lines 100 -q '@event=compile.execution.retired' --format jsonl
+```
+
 Pasted-error lookup uses `--order proximity` by default. Same-clock distances
 use recorded times. Cross-clock estimates align each source's last timestamp
 with its file modification time; untimed rows may borrow a preceding timestamp
@@ -1373,6 +1438,29 @@ requires `--error` and does not establish causal order.
 nonblank records on either side in the same file. Counts cover all selected
 records even when `--limit` bounds the displayed sample. Group/correlation
 cardinality is capped at 10,000.
+
+`--stats FIELD` aggregates all exact query matches independently of the displayed
+row limit; repeat it for up to 32 distinct fields. It reports numeric
+count/sum/min/max/mean and separate missing/null and invalid/nonfinite counts.
+Source, artifact
+run, explicit `run_id`, clock, and `--group-by` values remain separate.
+Related/context rows do not contribute. Integer arithmetic is exact;
+nonintegral results can be numerator/denominator strings. `--bucket-ms N`
+(1–86,400,000) adds clock-local half-open buckets and event rates using the full
+requested bucket width; edge buckets can be partial captures. Untimed records
+contribute only to totals. At most 10,000 aggregate rows and 8,192-bit
+accumulators are admitted; overflow fails explicitly. These options cannot
+combine with `--triage` or `--list-runs`.
+
+```bash
+./mmltk --logs build/validation/benchmark-coconut-batched.jsonl \
+  -q '@event=benchmark.cost.completed' --group-by kind,split \
+  --stats duration_ns --stats bytes --format jsonl --limit 10
+```
+
+In JSONL mode, projected records go to stdout and Statistics JSON objects to
+stderr. Statistics retain physical line/timestamp anchors; they do not align
+clocks or establish capture completeness.
 
 Malformed or oversized records remain searchable with warnings.
 `--strict` makes malformed/truncated input an error. Status 0 indicates

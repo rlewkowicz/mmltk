@@ -285,6 +285,14 @@ provide non-package development graphs. A `tsan` configure preset exists, but
 `./mmltk --test tsan` is currently rejected. Use the supported wrapper
 operations in [validation](validation.md).
 
+The data-owned `mmltk_backend_data_profile_runner` is also `EXCLUDE_FROM_ALL`.
+`./mmltk --test data-profile -- ...` explicitly builds and runs that target in
+the selected test graph (Release by default); ordinary product builds and
+`--test all` do not invoke it. It reuses the production data/resampling owners
+and test fixtures. CPU modes need no CUDA context, while Loader uses CUDA.
+Profile modes, scratch paths, retained inputs, and explicit full Coconut runs
+are documented in [validation](validation.md#data-compilation-and-resampling-profiles).
+
 ### Benchmark diagnostic builds
 
 `./mmltk --diagnose-benchmark-image` first asks its parser which native helpers

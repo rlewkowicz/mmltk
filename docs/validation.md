@@ -328,6 +328,7 @@ outside the permitted test set.
 | `core` | Core acceptance, presentation, dataset, image resampling, model catalog, system/concurrency, CLI, and tool tests |
 | `rfdetr` | Native RF-DETR contract, core, augmentation, training, inference, export, ML CUDA/layers, raster, and video suites |
 | `rfdetr-profile` | Instrumented training profile runner; selects `dev` |
+| `data-profile` | Explicit CPU Directory compile, benchmark pixels, retained-RGB resample, full Coconut, or CUDA loader profile; defaults to the Release graph |
 | `browser-app` | Rust/Iced protocol, workflow state, plots, transport, image-custody, and integration-driver tests; vendored `iced_plot` and selected `iced_aw` library tests; direct JavaScript adapter tests |
 | `workspace-wayland` | Packaged Firefox/NVIDIA hardware acceptance |
 | `cuda-vulkan` | Standalone CUDA/Vulkan allocation, FD, timeline, pixel, and exporter-exit diagnostic |
@@ -343,8 +344,9 @@ list. With no native executable or runner-argument filter, it then executes
 `browser-app`, `cleanup-tool`, and `log-query-tool`, retaining the first nonzero status while
 running the remaining groups. `all --executable TARGET` and `all -- FILTER`
 remain native selections and do not append those fixture groups. `all` does not
-execute `cuda-vulkan`, the compositor tooling suites, or the profile
-runner. `gui` and `tsan` suite names are currently unavailable even though other
+execute `cuda-vulkan`, the compositor tooling suites, or either profile
+runner. Full Coconut download/compilation is never implicit in `all`.
+`gui` and `tsan` suite names are currently unavailable even though other
 GUI/development build facilities exist.
 Product-build `--no-run` checks prove Rust test compilation only. Execution
 requires unfiltered `all` or standalone `browser-app`, including its JavaScript
@@ -354,6 +356,80 @@ Some RF-DETR tests download model checkpoints and derive normalized weights,
 ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
 tests may skip when their requirements are unavailable; a skip is not hardware
 acceptance evidence.
+
+### Data compilation and resampling profiles
+
+`./mmltk --test data-profile -- --help` prepares the selected profile target and
+its dependencies, then prints its reflected options. The
+[runner](../src/backend/data/tests/profile_runner.cpp) calls production owners;
+it does not implement another compiler. All runner arguments follow `--` and
+paths there are container-visible paths (`/workspace` is this checkout).
+Select a mode explicitly:
+
+| Mode | Timed work |
+| --- | --- |
+| `Compile` | Directory preparation, STB decode/resize, labels, and compiled-file finalization; synthetic `Png` or `Jpeg` bytes use Directory's numbered `.png` filenames |
+| `Pixels` | Shared benchmark decode/resize/store into bounded memory destinations; benchmark JPEG uses TurboJPEG, PNG uses STB |
+| `Resample` | Shared CPU resize/store from RGB decoded before timing; setup is reported separately |
+| `Coconut` | Complete Coconut recipe with Stock validation and dropped-mask recovery, Stretch, and the chosen perceptual setting, through final publication |
+| `Loader` | Directory compilation followed by sequential, shuffled, and overlapped CUDA loading; this is the default mode |
+
+For a bounded synthetic compilation profile:
+
+```bash
+./mmltk --test data-profile -- --mode Compile --encoding Jpeg \
+  --test-dir /workspace/build/validation/data-profile-compile \
+  --width 384 --height 384 --perceptual --mixed-geometry --shuffle-geometry \
+  --num-images 256 --compile-workers 4 --warmup-runs 1 --repetitions 3
+```
+
+`--mixed-geometry` cycles 384×384, 640×480, 768×768, 1024×768, 2048×2048,
+640×360, and 320×240 inputs. `--shuffle-geometry` uses seed 1729.
+`--cpu-affinity` optionally fixes an eligible Linux CPU list inherited by the
+production workers. Printed input dimensions and SHA-256 values let paired
+runs establish identical encoded inputs. Synthetic Compile/Loader working
+directories are removed afterward unless `--keep-artifacts` is set; use a
+dedicated scratch directory.
+
+Pixels/Resample can instead use `--input-manifest /workspace/PATH.txt` with one
+JPEG/PNG path per nonempty line. Relative entries resolve beside the manifest.
+Admission limits are 64 retained inputs and 256 MiB of encoded bytes;
+Resample additionally caps retained decoded RGB at 512 MiB. Per-worker output
+destinations total at most 512 MiB. `--num-images` cycles those inputs for the
+measured iteration. `cpu_profile` reports setup separately from work time,
+images/second and logical source/output bytes/second, plus retained decoded
+bytes and plan count. Those output rates are memory-store work, not disk or
+network throughput.
+
+Coconut mode requires `--cache-dir` and square target dimensions. It uses the
+complete recipe: `--num-images` does not limit its population. Each warmup or
+repetition is another complete compilation and can acquire/repair missing cache
+sources. Its output remains under `--test-dir/compiled`. An explicitly requested
+single production measurement therefore uses zero warmups and one repetition:
+
+```bash
+./mmltk --test data-profile -- --mode Coconut \
+  --cache-dir /workspace/.cache/benchmark-dataset/v1 \
+  --test-dir /workspace/build/validation/data-profile-coconut \
+  --width 384 --height 384 --perceptual --compile-workers 24 \
+  --warmup-runs 0 --repetitions 1
+```
+
+The example cache path is the default; supply the selected retained cache's
+actual container path. Coconut prints phase changes and at most one ordinary
+progress observation every five seconds, including canonical
+`phase_completed`/`phase_total`, independent tracks, and JSON-escaped activity.
+During compaction those phase quantities expose byte progress. Final
+`coconut_profile` counts come from the published manifest; output bytes are
+logical compiled lengths, not physical disk allocation or device throughput.
+
+Tracing is explicit via `--trace-file`; repeat `--trace-prefix` to retain
+selected event prefixes. A prefix requires a trace file. Filtered tracing still
+incurs upstream observation work, so omit the file option for throughput
+comparisons. [Trace fields and query statistics](logging.md#benchmark-compilation-traces)
+separate CPU time, worker wall-time sums, and elapsed time. Controlled fixtures
+remain the routine compiler checks; full-cache acquisition and production-sized
+Coconut profiles are separate opt-in work.
 
 ### Replacing an active test run
 
@@ -1099,6 +1175,23 @@ causal coverage includes:
 | Healthy subsets | Partially valid labels, true backgrounds, rejected/unlisted physical holes, unreadable annotation artifacts and pixels, bounded repair, contradictory geometry, empty required splits, and preservation of old publication on fatal failure |
 | Fixed storage | 64-slot boundaries, checked extents, 500,000-byte payload overflow, eligible-only maxima including zero, cancellation/fault preservation, unified label/pixel read preparation, bounded prefault/gather continuations, repeated logical draws, and prepared capacities through epoch changes |
 
+Additional compiler cases exercise exact slice exhaustion and non-FIFO
+coalescing, alias/alignment custody, usable pinned tails, node-pooled normal
+capacity, atomic continuation admission, resource-epoch/selective wake behavior,
+and fairness without reclamation. Publication cases hold writes while later
+members advance, preserve forward readers across ordinary backpressure, and
+drain accepted input custody on cancellation. Archive replay checks bounded
+header work across extended tar, GNU names, ZIP, and compressed tar; provenance
+settlement checks batch values while preserving masks and identities. Storage
+cases require one capacity sample through sibling settlement, independent
+filesystem ledgers, and unchanged promises on failure. Diagnostic cases prove
+disabled and throwing observers cannot change outcomes.
+
+Resampling cases check immutable algorithm selection, poisoned scratch across
+mixed geometries, stale-plan rejection, overwrite sizing, every byte transfer
+threshold and adjacent float, exact SIMD final-row output, and checked AVIR
+layout/preparation before destination writes.
+
 These fixtures establish overlap, ownership, source identity/order, and the
 specified capacity behavior. Benchmark arrival order can change physical slot
 order and file bytes. They do not measure production-release throughput,
@@ -1135,6 +1228,82 @@ proves rendering, input, cancellation/restart, and native caption agreement;
 [capacity/download limits](benchmark-datasets.md#cache-formats-and-capacity) bound
 these claims. Trace/serialization suites cover timestamps, effect-only delivery
 failure, Unicode scalars, and malformed wire-text rejection.
+
+### Compiler throughput validation record
+
+The throughput and storage implementation spans `0d4e0f7a..333032e7`.
+The local [performance ledger](../build/validation/benchmark-perceptual-performance.json)
+retains the initial cancelled GUI capture, phase evidence, commands, profile
+inputs, and validation scope. Cleanup checkpoints were `78ace8a2`
+(`pre cleanup`) and `e43b17ec` (`post cleanup`); both configured tidy stages
+and both cleanup profiles completed cleanly. Final follow-up validation used
+the explicit benchmark-only scope, retaining earlier successful checks.
+
+| Evidence | Result |
+| --- | --- |
+| [Final product build](../build/validation/benchmark-settlement-lifetime-build.log) | Exit 0; runtime `sha256:ba4609f2ffb21c5172ea5794c1b5e8e9123df3dbaca444b63518000e1539f98d` |
+| [Batch settlement and Coconut cases](../build/validation/benchmark-settlement-batch-tests.log) | Exit 0; 170 cases, 68,164 assertions, before final batch-lifetime hardening |
+| [Final affected cases](../build/validation/benchmark-final-targeted.log) | Exit 0; 3 cases, 11,217 assertions for batch settlement, dynamic slots, and fairness fixture synchronization |
+| Earlier [complete ordinary suite](../build/logs/mmltk-test-20261003-021103-3285703.log) and subsequent [Wayland acceptance](../build/logs/mmltk-test-20261003-023536-3345034.log) | Both exit 0 before later compiler follow-ups; Wayland had 88 passes, one GDR skip, and 147,989 assertions |
+| Later [broad suite](../build/validation/benchmark-final-all.log) | Stopped at user request, exit 143; resampling passed 47 cases/376,015 assertions, data reached 529 passes/one fairness-fixture failure/one skip. The fixture then passed in the final focused run above. This is not a passing full-suite result. |
+
+No current full `all`/Wayland pair is claimed after those follow-ups. The final
+compiler acceptance below was explicitly requested, separately from routine
+tests. These ignored local artifacts are absent from a fresh checkout.
+
+Untraced bounded follow-up profiles used 256 images, 24 workers, affinity 0–23,
+384×384 Stretch/perceptual, one warmup and three measured iterations. Matching
+input hashes, dimensions, settings, and affinity were verified. The preserved
+diagnostics baseline is `42c97d14`; the ledger identifies the later measured
+diff and exact commands. Median elapsed seconds were:
+
+| Production path | Baseline | Follow-up |
+| --- | ---: | ---: |
+| Directory STB JPEG, seven mixed shuffled geometries | 2.681892 | 2.578329 |
+| Directory STB PNG, seven mixed shuffled geometries | 2.529294 | 2.316668 |
+| Benchmark Pixels, 32 retained JPEGs in shuffled order | 0.265026 | 0.121570 |
+
+The retained Pixels ratio is 2.18× for decode/resize/store into memory. It
+excludes source acquisition, annotation work, disk publication, and compaction.
+Directory measurements include their small fixture's finalization. Caches were
+warm and not forcibly evicted; neither result establishes an end-to-end Coconut
+speedup. Earlier checkpoints and slower observations remain in the ledger.
+
+The final [complete Coconut run](../build/validation/benchmark-coconut-batched.log)
+used Stock validation, recovery enabled, 384×384 Stretch/perceptual, 24 workers,
+affinity 0–23, and filtered tracing. It exited 0 after **2,792.701975 seconds**,
+publishing **584,636 train + 5,000 validation images** and
+**1,190,741,014,016 logical compiled bytes**. The
+[trace](../build/validation/benchmark-coconut-batched.jsonl),
+[cost spans](../build/validation/benchmark-coconut-batched-spans.jsonl),
+[progress export](../build/validation/benchmark-coconut-batched-progress.jsonl),
+and [event summary](../build/validation/benchmark-coconut-batched-events.txt)
+retain the observation boundaries.
+
+| Wall-time boundary | Final observed seconds |
+| --- | ---: |
+| Final selection, including 239,047 provenance settlements in 3,736 batches | 23.130501498 |
+| Train compaction | 922.091084029 |
+| Validation compaction | 8.836998928 |
+
+The final execution snapshot records 24 workers created/retired,
+4,098,892 admitted/completed records, zero active/retained scheduler records,
+zero live arena allocations/occupied bytes, no exceptional peak, fixed 6 GiB
+normal locked backing, and 313 simultaneous arena allocations at high water.
+These establish retirement and observed compiler backing, not peak process RSS.
+
+The preceding [complete comparison](../build/validation/benchmark-coconut-selective.log)
+took 2,766.100522 seconds, with 69.108044390-second selection and
+965.084902918-second train compaction. The
+[manifest comparison and aggregate evidence](../build/validation/benchmark-hotspot-evidence.json)
+retain matching selection, source/annotation identities, provenance/recovery
+facts, box/run counts, and compiled lengths; the sole manifest difference is
+one image-cache hit flag. This does not prove byte-identical bins because arrival
+order can change physical placement. Source/OS cache conditions were not held
+constant: Archive calls fell from 920,527 to 103,013. Filtered tracing also keeps
+upstream observation costs. The pair supports the recorded stage observations,
+not an isolated whole-run speedup or cold-download throughput claim. Summed task
+wall/CPU times overlap and must remain separate from elapsed time.
 
 ### Benchmark ownership and recovery validation record
 
@@ -1189,7 +1358,8 @@ shrank from 58 to 39 lines; production changes from `5b0e775a` through
 `9da36b78` totaled 234 additions and 174 deletions, a net increase of 60 lines.
 Fixture counts establish removed scans and reused workers, not a production
 speedup percentage.
-No production-sized throughput or peak-memory benchmark was measured. GDR skips
+That validation measured no production-sized throughput or peak-memory
+benchmark. GDR skips
 remain unverified hardware coverage. Firefox coverage used only first-party
 suites and packaged application acceptance; no Firefox-owned tests were added
 or run.

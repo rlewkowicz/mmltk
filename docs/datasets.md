@@ -122,8 +122,13 @@ the stored resize mode as explicit provenance, alongside source and content
 extents. [Upscale preparation](gpu-execution.md#upscale-input-preparation) uses
 that provenance independently of the viewer preference.
 
-Both compilers use `RgbImageResizer::resize_to_planar` to project packed RGB8
-into the compiled planar float canvas. Perceptual shrinking writes directly
+Both compilers use the same
+[CompilePixelWorkspace](../src/backend/data/detail/compile_pixel_workspace.h)
+decode/resize operation and `RgbImageResizer::resize_to_planar` to project
+packed RGB8 into the compiled planar float canvas. Its immutable prepared plan
+binds the admitted header, decode storage, resize algorithm, geometry, and
+destination layout. Execution checks the actual encoded header against that
+plan before writing pixels. Perceptual shrinking writes directly
 to those planes while preserving RGB8 quantization followed by
 `float(byte) * (1.0F / 255.0F)`. Ordinary AVIR resizing and enlargement reuse
 the resizer's byte scratch. Identity conversion and zero Letterbox padding
@@ -421,9 +426,12 @@ Compilation and GPU augmentation have independent, default-false
 `--aug-perceptual-downscale`. Off retains ordinary resizing. The option changes
 shrinking RGB only, preserving masks, boxes, classes, geometry, and record layout.
 
-[RgbImageResizer](../src/backend/imaging/resample/image_resize.h) owns CPU execution and
-[GpuPerceptualDownscaler](../src/backend/imaging/resample/image_resize_cuda.h) owns reusable
-CUDA workspace. Both implement the SSIM local-moment method attributed in
+[RgbImageResizer](../src/backend/imaging/resample/image_resize.h) owns CPU execution
+for both Directory and benchmark compilation.
+[GpuPerceptualDownscaler](../src/backend/imaging/resample/image_resize_cuda.h)
+owns the reusable CUDA workspace used by RF-DETR augmentation. Compilation uses
+CPU image-level parallelism. Both implementations use the SSIM local-moment
+method attributed in
 [perceptual_downscale_math.h](../src/backend/imaging/resample/detail/perceptual_downscale_math.h).
 They accept checked RGB8, straight-alpha RGBA8, or planar unit-sRGB float views
 with explicit byte strides and capacities. sRGB is decoded once, the filter
@@ -439,14 +447,26 @@ same scalar method. Packed RGB reads stay within their three-byte pixels and
 never consume row padding. Checked RGB8, RGBA8, and planar float layouts share
 these rules.
 
+CPU coefficient calculation, reconstruction, transfer-table quantization, and
+compiler planar stores also operate in eight-lane blocks. Scalar and SIMD
+helpers share the same arithmetic rules, low-variance handling, and edge/tail
+behavior. Byte outputs and compiled planar projection retain exact RGB8
+quantization; continuous float output keeps scalar `powf` encoding.
+
 Ordinary CPU shrinking and enlargement use the existing
 [AVIR float4 SSE backend](../third_party/avir/avir_float4_sse.h). Its signed
 half-integer rounding follows the scalar float policy without changing the
 thread's rounding mode. Resampling fixtures compare the selected SIMD path
 against scalar AVIR output within one RGB8 level; identity copies remain exact.
-Each compiler worker retains its own resizer and scratch, and resizing creates
-no nested worker pool. These execution choices apply to both compilers without
-changing mask geometry or the compiled format.
+The checked resize plan selects Identity, PerceptualInteger,
+PerceptualFractional, or Avir once and supplies the required storage to execution.
+AVIR's sizing pass counts allocator requests without constructing filter
+coefficients; actual coefficients and queues live only inside that execution's
+allocator scope. They cannot outlive the borrowed arena. AVIR byte output is
+prepared for overwrite without first clearing those bytes. Each compiler worker
+retains its resizer controls and binds admitted scratch for the current image;
+resizing creates no nested worker pool. These choices apply to both compilers
+without changing mask geometry or the compiled format.
 
 The checked downscale operation rejects enlargement and overlapping nonidentity
 views; an identity copy is exact. The ordinary CPU resize entrypoint retains
@@ -466,7 +486,9 @@ tree; filtering, thresholds, alpha handling, and rounding are unchanged.
 
 Benchmark compilation facts record resampling policy independently of source-cache
 identity. Changed policy requires recompilation. Perceptual downscaling can
-emphasize noise; no detector-accuracy or measured performance benefit is claimed.
+emphasize noise; no detector-accuracy benefit is claimed. The
+[bounded profiles and full Coconut observation](validation.md#compiler-throughput-validation-record)
+state the measured performance and its limits.
 
 ## Loading a compiled file
 

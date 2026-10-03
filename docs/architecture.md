@@ -180,13 +180,19 @@ Directory and benchmark execution share
 pinned arena bank and allowances, and the bounded
 [FileWorkQueue](../src/backend/data/detail/file_work_queue.h). The
 [execution reference](compile-execution.md) owns class floors, elastic CPU
-admission, normal/exceptional storage, physical completion, and progress delivery.
+admission, selective readiness, task-sized normal/exceptional storage,
+physical completion, and progress delivery. Both source front ends use
+[CompilePixelWorkspace](../src/backend/data/detail/compile_pixel_workspace.h)
+for checked prepared CPU decoding/resizing, retaining their codec policies.
 [BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h)
 retains its source/image join, selected claims, withdrawal, and attempt drain.
 It owns separate bounded image and output file services using the shared CPU
 budget; retained continuations carry image preparation through to conversion.
 Recipes retain membership and recovery policy; Curl owns transport, archives
-retain opened generations, and split writers retain physical placement and
+retain opened generations,
+[BenchmarkImagePublication](../src/backend/data/benchmark/detail/benchmark_image_publication.h)
+owns bounded encoded-input/cache-write custody for generic extraction and
+Coconut, and split writers retain physical placement and
 sealing. Recipe and artifact-service owners select final publication. Pixels
 and labels advance independently through those joins.
 [CoconutRecipeInputs](../src/backend/data/benchmark/coconut/coconut_recipe.cpp)
