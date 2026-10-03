@@ -2512,7 +2512,7 @@ TEST_CASE("compile reservation traces retain complete and partial owner evidence
  snapshot.resources = {.bytes = 23, .descriptors = 2, .continuation_descriptors = 5};
  snapshot.byte_target = 29;
  snapshot.descriptor_limit = 13;
- snapshot.costs = {.eligibility_probes = maximum, .incomplete = incomplete};
+ snapshot.costs = {.eligibility_probes = maximum, .external_drain_candidates = maximum - 1, .incomplete = incomplete};
  auto& request = snapshot.reservation.emplace();
  request.location = std::source_location::current();
  request.requested = {.bytes = maximum, .descriptors = 7, .producer = true, .continuation_descriptors = 11};
@@ -2555,6 +2555,7 @@ TEST_CASE("compile reservation traces retain complete and partial owner evidence
  };
  CHECK(captured.at("costs").at("incomplete") == incomplete);
  CHECK(captured.at("costs").at("eligibility_probes").get<std::uint64_t>() == maximum);
+ CHECK(captured.at("costs").at("external_drain_candidates").get<std::uint64_t>() == maximum - 1);
  captured.erase("costs");
  CHECK(captured == expected);
 }
@@ -11140,6 +11141,199 @@ TEST_CASE("ordinary direct demands preserve age and raw eligibility across small
   CHECK(execution.resource_usage().bytes == 64);
  }
 }
+TEST_CASE("ordinary external backlog performs no exceptional candidate inspections", "[backend][data][benchmark][pipeline][resources][trace]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page * 2, .task_records = 8}, {}, {{.aggregates = true}, [](std::string_view, const CompileExecutionSnapshot&) {}});
+ auto occupied = execution.reserve({.bytes = page});
+ std::vector<std::unique_ptr<CompileResourceWait>> waiting;
+ mmltk::testsupport::TestGate running("ordinary registrations arrive during unrelated ready work");
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  running.Release();
+  waiting.clear();
+  occupied = {};
+  execution.retire_attempt();
+ });
+ auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
+ REQUIRE(running.WaitEntered(5s));
+ const CompileResources resources{.bytes = page * 2, .supplied_workspace = true};
+ for (unsigned i = 0; i < 64; ++i) {
+  waiting.push_back(execution.defer_resources(resources));
+  waiting.push_back(execution.defer_continuation(CompileTaskKind::Pixels, resources));
+ }
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK(execution.snapshot().costs.external_drain_candidates == 0);
+ running.Release();
+ active.wait();
+ unsigned completed = 0;
+ for (unsigned turn = 0; turn < 16; ++turn) {
+  for (std::size_t i = 1; i < waiting.size(); i += 2) {
+   CompileResourceDenial denial{};
+   CHECK_FALSE(execution.try_retain(*waiting[i], &denial));
+   CHECK(denial == CompileResourceDenial::Bytes);
+  }
+  execution.run(CompileTaskKind::Labels, {.bytes = 16}, [&](std::size_t) { ++completed; });
+  // Ordinary insertion and withdrawal also leave exceptional selection empty.
+  auto transient = execution.defer_resources(resources);
+ }
+ CHECK(completed == 16);
+ CHECK(execution.resource_pressure());
+ CHECK(execution.snapshot().costs.external_drain_candidates == 0);
+ waiting.clear();
+ occupied = {};
+ execution.join();
+ const auto final = execution.snapshot();
+ CHECK(final.costs.external_drain_candidates == 0);
+ CHECK(final.records == 0);
+ CHECK(final.leased == 0);
+ CHECK(final.resources.bytes == 0);
+ CHECK_FALSE(execution.resource_pressure());
+}
+TEST_CASE("external oversized membership follows registration order through promotions and demotions", "[backend][data][benchmark][pipeline][resources][trace]") {
+ using namespace mmltk::backend::data::detail;
+ const bool observed = GENERATE(false, true);
+ const bool predecessor = GENERATE(false, true);
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 4}, {}, {{.aggregates = observed}, [](std::string_view, const CompileExecutionSnapshot&) {}});
+ mmltk::testsupport::TestGate running("worker selection remains gated during membership transitions");
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] { running.Release(); execution.retire_attempt(); });
+ auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
+ REQUIRE(running.WaitEntered(5s));
+ const CompileResources ordinary{.bytes = page / 2}, first{.bytes = page * 2, .supplied_workspace = true}, second{.bytes = page * 3, .supplied_workspace = true};
+ auto older = predecessor ? execution.defer_resources({.bytes = page * 4, .supplied_workspace = true}) : nullptr;
+ auto gap = execution.defer_resources(ordinary);
+ auto early = execution.defer_resources(ordinary);
+ auto later = execution.defer_resources(second);
+ early->update(first);
+ if (older) {
+  CHECK_FALSE(execution.try_reserve(first));
+  older.reset();
+ }
+ CompileExecution::Readiness pressure(execution, CompileChange::Pressure);
+ const auto pressure_generation = pressure.generation(), resource_generation = execution.resource_generation();
+ const auto before = execution.snapshot().costs.external_drain_candidates;
+ early->update(first);
+ CHECK(pressure.generation() == pressure_generation);
+ CHECK(execution.resource_generation() == resource_generation);
+ CHECK(execution.snapshot().costs.external_drain_candidates == before);
+ for (unsigned i = 0; i < 12; ++i) {
+  CompileResourceDenial denial{};
+  CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels, second, {}, false, &denial));
+  CHECK(denial == CompileResourceDenial::ExceptionalDrain);
+ }
+ CHECK(execution.snapshot().costs.external_drain_candidates == before + (observed ? 12 : 0));
+ auto accepted = execution.try_reserve(first);
+ REQUIRE(accepted);
+ CHECK(accepted->exceptional_workspace());
+ accepted.reset();
+ early->update(ordinary);
+ CHECK(pressure.generation() != pressure_generation);
+ CHECK_FALSE(execution.try_reserve(first));
+ accepted = execution.try_reserve(second);
+ REQUIRE(accepted);
+ accepted.reset();
+ early->update(first);
+ CHECK_FALSE(execution.try_reserve(second));
+ early.reset();
+ accepted = execution.try_reserve(second);
+ REQUIRE(accepted);
+ accepted.reset();
+ later.reset();
+ gap.reset();
+ running.Release();
+ active.wait();
+ execution.join();
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK(execution.snapshot().exceptional == 0);
+ CHECK(execution.resource_usage().bytes == 0);
+}
+TEST_CASE("selected external updates replace both drain extent and parent after validation", "[backend][data][benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page, .descriptors = 8});
+ auto parent = execution.reserve(CompileResources::handles(1));
+ auto replacement = execution.reserve(CompileResources::handles(1));
+ const CompileResources original{.bytes = page * 2, .supplied_workspace = true}, updated{.bytes = page * 3, .supplied_workspace = true};
+ auto waiting = execution.defer_resources(original, parent);
+ CompileExecution::Readiness pressure(execution, CompileChange::Pressure);
+ auto generation = pressure.generation();
+ const auto resources = execution.resource_generation();
+ CHECK_THROWS_AS(waiting->update({.bytes = std::numeric_limits<std::size_t>::max(), .supplied_workspace = true}, replacement), std::bad_alloc);
+ CHECK(pressure.generation() == generation);
+ CHECK(execution.resource_generation() == resources);
+ CHECK_FALSE(execution.try_reserve(updated, parent));
+ auto accepted = execution.try_reserve(original, parent);
+ REQUIRE(accepted);
+ accepted.reset();
+ waiting->update(updated, parent);
+ CHECK(pressure.generation() != generation);
+ CHECK_FALSE(execution.try_reserve(original, parent));
+ accepted = execution.try_reserve(updated, parent);
+ REQUIRE(accepted);
+ accepted.reset();
+ parent = {};
+ generation = pressure.generation();
+ waiting->update(updated, replacement);
+ CHECK(pressure.generation() != generation);
+ CHECK(execution.resource_usage().descriptors == 1);
+ CHECK_FALSE(execution.try_reserve(updated));
+ accepted = execution.try_reserve(updated, replacement);
+ REQUIRE(accepted);
+ accepted.reset();
+ replacement = {};
+ waiting->update({.bytes = page / 2});
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK(execution.resource_usage().descriptors == 0);
+ waiting.reset();
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.snapshot().exceptional == 0);
+}
+TEST_CASE("cancellation retires mixed external memberships before final parent release", "[backend][data][benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 4});
+ mmltk::testsupport::TestGate running("physical task remains alive while demand is cancelled");
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] { running.Release(); execution.retire_attempt(); });
+ auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
+ REQUIRE(running.WaitEntered(5s));
+ auto parent = execution.reserve({.bytes = page, .descriptors = 1});
+ auto ordinary = execution.defer_resources({.bytes = page});
+ auto promoted = execution.defer_resources({.bytes = page / 2}, parent);
+ const CompileResources exceptional{.bytes = page * 3, .supplied_workspace = true};
+ auto peer = execution.defer_continuation(CompileTaskKind::Pixels, exceptional);
+ promoted->update({.bytes = page * 2, .supplied_workspace = true}, parent);
+ parent = {};
+ CHECK(execution.resource_usage().bytes == page);
+ CHECK(execution.resource_usage().descriptors == 1);
+ execution.cancel();
+ CHECK_THROWS(execution.try_retain(*peer));
+ ordinary.reset();
+ promoted.reset();
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
+ CHECK(execution.oversized_workspace_pending());
+ peer.reset();
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK_FALSE(execution.resource_pressure());
+ running.Release();
+ execution.retire_attempt();
+ CHECK(active.ready());
+ CHECK(execution.snapshot().records == 0);
+ CHECK(execution.snapshot().leased == 0);
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
+ auto next = execution.defer_continuation(CompileTaskKind::Pixels, exceptional);
+ auto accepted = execution.try_retain(*next);
+ REQUIRE(accepted);
+ next.reset();
+ accepted.reset();
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK(execution.snapshot().records == 0);
+ CHECK(execution.snapshot().exceptional == 0);
+}
 TEST_CASE("direct demands preserve the continuation work needed to return their record", "[backend][data][benchmark][pipeline][resources]") {
  const bool exceptional = GENERATE(false, true);
  const auto page = mmltk::common::system::host_page_size();
@@ -11355,20 +11549,32 @@ TEST_CASE("external drain withdrawal advances the next registration without reta
  CHECK(execution.resource_usage().descriptors == 0);
 }
 TEST_CASE("external exceptional selection bypasses a head without its protected successor record", "[backend][data][benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
  const auto page = mmltk::common::system::host_page_size();
- CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 6});
+ CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 6}, {}, {{.aggregates = true}, [](std::string_view, const CompileExecutionSnapshot&) {}});
+ mmltk::testsupport::TestGate running("candidate visits are measured while the worker holds its record");
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] { running.Release(); execution.retire_attempt(); });
+ auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
+ REQUIRE(running.WaitEntered(5s));
  auto occupied = execution.try_retain(CompileTaskKind::Pixels);
  REQUIRE(occupied);
+ std::vector<std::unique_ptr<CompileResourceWait>> ordinary;
+ for (unsigned i = 0; i < 32; ++i) ordinary.push_back(execution.defer_resources({.bytes = page / 2}));
  auto head = execution.defer_continuation(CompileTaskKind::Pixels, {.bytes = page * 2, .supplied_workspace = true});
  CHECK_FALSE(execution.oversized_workspace_pending());
+ for (unsigned i = 0; i < 32; ++i) ordinary.push_back(execution.defer_resources({.bytes = page / 2}));
  auto next = execution.defer_continuation(CompileTaskKind::Header, {.bytes = page * 3, .supplied_workspace = true});
  CHECK(execution.oversized_workspace_pending());
- detail::CompileResourceDenial denial{};
- CHECK_FALSE(execution.try_retain(*head, &denial));
- CHECK(denial == detail::CompileResourceDenial::Records);
+ const auto before = execution.snapshot().costs.external_drain_candidates;
+ for (unsigned i = 0; i < 12; ++i) {
+  CompileResourceDenial denial{};
+  CHECK_FALSE(execution.try_retain(*head, &denial));
+  CHECK(denial == CompileResourceDenial::Records);
+ }
+ CHECK(execution.snapshot().costs.external_drain_candidates == before + 24);
  auto accepted = execution.try_retain(*next);
  REQUIRE(accepted);
- CHECK(execution.snapshot().records == 2);
+ CHECK(execution.snapshot().records == 3);
  CHECK(accepted->allowance().workspace().size() == page * 3);
  accepted.reset();
  occupied.reset();
@@ -11378,6 +11584,10 @@ TEST_CASE("external exceptional selection bypasses a head without its protected 
  following.reset();
  head.reset();
  next.reset();
+ ordinary.clear();
+ running.Release();
+ active.wait();
+ execution.join();
  CHECK(execution.snapshot().records == 0);
  CHECK(execution.resource_usage().bytes == 0);
  CHECK_FALSE(execution.resource_pressure());

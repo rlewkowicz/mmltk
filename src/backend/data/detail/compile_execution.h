@@ -68,7 +68,7 @@ MMLTK_REFLECT_FIELDS(CompileAdmissionObservation)
 struct CompileExecutionCosts {
  std::uint64_t eligibility_probes = 0, notifier_deliveries = 0, resource_epoch = 0, admission_lock_ns = 0;
  std::uint64_t callback_ns = 0, completion_callback_ns = 0, workers_created = 0, workers_retired = 0;
- std::uint64_t submission_attempts = 0, record_denials = 0;
+ std::uint64_t submission_attempts = 0, record_denials = 0, external_drain_candidates = 0;
  std::uint64_t snapshots_built = 0, eventfd_writes = 0, notifier_batches = 0;
  bool incomplete = false;
 };

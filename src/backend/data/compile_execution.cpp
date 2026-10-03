@@ -80,7 +80,7 @@ struct CompileResourceWait::State {
   State* previous = nullptr;
   State* next = nullptr;
   bool linked = false;
- } external;
+ } external, oversized;
  bool registered = false, pressure = false;
  State(std::shared_ptr<CompileExecution::Impl> owner, CompileTaskKind kind, CompileResources resources, CompileAllowance parent, bool finite)
      : execution(std::move(owner)), demand{.resources = resources, .parent = std::move(parent), .finite_consumer = finite, .needs_record = kind != CompileTaskKind::Count}, successor(kind) {}
@@ -227,21 +227,27 @@ struct CompileExecution::Impl {
    value = {};
    --count;
   }
-  void append(Entry& job) noexcept {
+  void insert_before(Entry& job, Entry* next) noexcept {
    auto& value = job.*link;
    if (value.linked) return;
-   value.previous = tail;
+   value.previous = next ? (next->*link).previous : tail;
+   value.next = next;
    value.linked = true;
-   if (tail)
-    (tail->*link).next = &job;
+   if (value.previous)
+    (value.previous->*link).next = &job;
    else
     head = &job;
-   tail = &job;
+   if (next)
+    (next->*link).previous = &job;
+   else
+    tail = &job;
    ++count;
   }
+  void append(Entry& job) noexcept { insert_before(job, nullptr); }
  };
  DemandQueue<Job> exceptional{&Job::exceptional};
  DemandQueue<CompileResourceWait::State> external_demands{&CompileResourceWait::State::external};
+ DemandQueue<CompileResourceWait::State> external_oversized{&CompileResourceWait::State::oversized};
  DemandQueue<Demand> aged_demands{&Demand::aged};
  const void* draining_request = nullptr;
  bool draining_external = false;
@@ -282,15 +288,20 @@ struct CompileExecution::Impl {
   // A queued exceptional request that already owns the turn keeps it. Among
   // external requests retain order, skipping successors without record room.
   if (draining_request && !draining_external) return;
-  auto* waiting = external_demands.head;
+  auto* waiting = external_oversized.head;
   const auto records = record_capacity();
-  while (waiting && (!admission->oversized(waiting->demand.resources) || !record_eligible(waiting->demand, records))) waiting = waiting->external.next;
+  while (waiting) {
+   if (observer.demand().aggregates) ++costs.external_drain_candidates;
+   if (record_eligible(waiting->demand, records)) break;
+   waiting = waiting->oversized.next;
+  }
   drain(waiting, waiting ? waiting->demand.parent.credits_.get() : nullptr, waiting ? waiting->demand.resources.bytes : 0, waiting != nullptr);
  }
  void remove_wait(CompileResourceWait::State& waiting) noexcept {
   if (!std::exchange(waiting.registered, false)) return;
   remove_demand(waiting.demand);
   if (waiting.external.linked) {
+   external_oversized.remove(waiting);
    external_demands.remove(waiting);
    if (draining_request == &waiting) drain(nullptr, nullptr, 0);
    refresh_external_drain();
@@ -1705,7 +1716,9 @@ CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileExecution::Impl>
  // precedes intrusive publication; the remaining mutations cannot allocate.
  owner.admission->require(state.demand.resources, state.demand.needs_record);
  (void)owner.admission->reservation_bytes(state.demand.resources);
+ const bool oversized = owner.admission->oversized(state.demand.resources);
  owner.external_demands.append(state);
+ if (oversized) owner.external_oversized.append(state);
  owner.refresh_external_drain();
  if (state.demand.needs_record) owner.wait_demand(state.demand);
  // A continuation first needs a successor record. Publish resource pressure
@@ -1726,11 +1739,21 @@ void CompileResourceWait::update(CompileResources resources, const CompileAllowa
  if (state.demand.resources == resources && state.demand.parent.credits_ == parent.credits_ && state.retry == retry) return;
  owner.admission->require(resources);
  (void)owner.admission->reservation_bytes(resources);
+ const bool oversized = owner.admission->oversized(resources);
  owner.remove_demand(state.demand);
  state.demand.resources = resources;
  state.retry = retry;
  std::swap(state.demand.parent, previous_parent);
  state.demand.blocked_generation = std::numeric_limits<std::uint64_t>::max();
+ if (!oversized)
+  owner.external_oversized.remove(state);
+ else if (!state.oversized.linked) {
+  // Promotion retains the original registration order. Only this membership
+  // transition walks ordinary waits; selection uses the oversized index alone.
+  auto* previous = state.external.previous;
+  while (previous && !previous->oversized.linked) previous = previous->external.previous;
+  owner.external_oversized.insert_before(state, previous ? previous->oversized.next : owner.external_oversized.head);
+ }
  if (owner.draining_request == &state) owner.drain(nullptr, nullptr, 0);
  owner.refresh_external_drain();
  owner.notify_locked(CompileChange::Pressure);
