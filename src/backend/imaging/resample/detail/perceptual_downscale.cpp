@@ -405,20 +405,16 @@ void CpuDownscaler::execute(RgbConstImageView source, RgbMutableImageView destin
 }
 void CpuDownscaler::run_quantized_planar(RgbConstImageView source, RgbMutableImageView destination) {
  (void)validate_pair(source, destination, true);
- const auto plan = RgbImageResizer::workspace_plan(source.layout.width, source.layout.height, destination.layout.width, destination.layout.height,
-  ImageResizeMode::Stretch, true, source.layout.format);
  // Explicit quantized filtering also supports unchanged geometry; unlike the
  // compiler's identity projection this API has always applied the filter.
- run_selected(source, destination, plan.path() == RgbResizePath::Identity ? RgbResizePath::PerceptualInteger : plan.path(), true);
+ run_selected(source, destination, classify_geometry(source.layout.width, source.layout.height, destination.layout.width, destination.layout.height), true);
 }
 void CpuDownscaler::run(RgbConstImageView source, RgbMutableImageView destination) {
  if (validate_pair(source, destination)) {
   copy_identity(source, destination);
   return;
  }
- const auto plan = RgbImageResizer::workspace_plan(source.layout.width, source.layout.height, destination.layout.width, destination.layout.height,
-  ImageResizeMode::Stretch, true, source.layout.format);
- run_selected(source, destination, plan.path());
+ run_selected(source, destination, classify_geometry(source.layout.width, source.layout.height, destination.layout.width, destination.layout.height));
 }
 void CpuDownscaler::run_selected(RgbConstImageView source, RgbMutableImageView destination, RgbResizePath path, bool quantized_planar, RgbResizeWork* observed) {
  (void)validate_pair(source, destination, quantized_planar);

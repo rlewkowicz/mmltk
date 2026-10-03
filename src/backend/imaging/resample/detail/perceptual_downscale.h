@@ -19,10 +19,11 @@ public:
  [[nodiscard]] std::size_t retained_bytes() const noexcept;
  void run(RgbConstImageView source, RgbMutableImageView destination);
  void run_quantized_planar(RgbConstImageView source, RgbMutableImageView destination);
- void run_selected(RgbConstImageView, RgbMutableImageView, RgbResizePath, bool quantized_planar = false, RgbResizeWork* observed = nullptr);
 
 private:
+ friend class mmltk::backend::imaging::resample::RgbImageResizer;
  friend struct CpuDownscalerTestAccess;
+ void run_selected(RgbConstImageView, RgbMutableImageView, RgbResizePath, bool quantized_planar = false, RgbResizeWork* observed = nullptr);
  static void quantize_block(const TransferTable&, const float*, std::uint8_t*);
  // Owner-local, one-shot preparation seam; never exposed by the public
  // resizer or consulted during pixel execution.

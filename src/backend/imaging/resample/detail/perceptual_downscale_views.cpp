@@ -5,6 +5,9 @@
 #include <limits>
 #include <stdexcept>
 namespace mmltk::backend::imaging::resample::perceptual {
+RgbResizePath classify_geometry(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t destination_width, std::uint32_t destination_height) noexcept {
+ return source_width % destination_width == 0 && source_height % destination_height == 0 ? RgbResizePath::PerceptualInteger : RgbResizePath::PerceptualFractional;
+}
 IdentityCopyGeometry identity_geometry(const RgbImageLayout& layout) {
  switch (layout.format) {
   case RgbPixelFormat::RGB8: return {common::math::checked_multiply<std::size_t>(layout.width, 3, "perceptual image extent overflow"), 1};

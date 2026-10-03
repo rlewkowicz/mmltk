@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 #include <cstddef>
+#include <cstdint>
 #include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::backend::imaging::resample::perceptual {
+// Requires validated positive, non-enlarging extents. Unchanged geometry uses
+// integer filtering; each checked entrypoint owns its identity-copy policy.
+[[nodiscard]] RgbResizePath classify_geometry(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t destination_width, std::uint32_t destination_height) noexcept;
 struct IdentityCopyGeometry {
  std::size_t row_bytes;
  unsigned planes;

@@ -2,6 +2,7 @@
 #include "src/backend/imaging/resample/tests/perceptual_downscale_reference.h"
 #include "src/backend/imaging/resample/detail/perceptual_downscale_math.h"
 #include "src/backend/imaging/resample/detail/perceptual_downscale.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_views.h"
 #include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
@@ -266,7 +267,7 @@ TEST_CASE("perceptual CPU preparation retains safe recovery at each storage boun
  using Access = perceptual::CpuDownscalerTestAccess;
  using Step = Access::Step;
  constexpr std::array steps{Step::HorizontalAxis, Step::VerticalAxis, Step::FirstMoment, Step::SecondMoment, Step::FirstCoefficient, Step::SecondCoefficient, Step::FirstAlpha, Step::SecondAlpha};
- constexpr std::array<std::array<unsigned, 4>, 2> requests{{{19, 101, 7, 99}, {29, 23, 19, 17}}};
+ constexpr std::array<std::array<unsigned, 4>, 3> requests{{{19, 101, 7, 99}, {29, 23, 19, 17}, {18, 14, 9, 7}}};
  for (auto prior : test_perceptual::formats)
   for (auto requested : test_perceptual::formats)
    for (const auto& geometry : requests)
@@ -284,9 +285,10 @@ TEST_CASE("perceptual CPU first alpha preparation invalidates an unchanged geome
 }
 TEST_CASE("perceptual CPU identity copies preserve exact pixels and padding in every format", "[backend][data][image_resize][perceptual]") {
  using namespace test_perceptual;
+ using Access = perceptual::CpuDownscalerTestAccess;
  RgbImageResizer resizer;
  for (auto format : formats) {
-  Image source(17, 13, format, 3), output(17, 13, format, 5);
+  Image source(17, 13, format, 3), output(17, 13, format, 5), direct(17, 13, format, 5);
   source.fill(7);
   const auto original = source.storage;
   resizer.downscale(source.read(), source.write());
@@ -294,6 +296,15 @@ TEST_CASE("perceptual CPU identity copies preserve exact pixels and padding in e
   resizer.downscale(source.read(), output.write());
   REQUIRE(maximum_error(output, source) == 0);
   REQUIRE(padding_intact(output));
+  perceptual::CpuDownscaler owner;
+  Access::fail_before(owner, Access::Step::HorizontalAxis);
+  owner.run(source.read(), source.write());
+  REQUIRE(std::memcmp(source.storage.data(), original.data(), original.size() * sizeof(float)) == 0);
+  owner.run(source.read(), direct.write());
+  REQUIRE(std::memcmp(direct.storage.data(), output.storage.data(), output.storage.size() * sizeof(float)) == 0);
+  REQUIRE(Access::armed(owner));
+  REQUIRE_FALSE(Access::prepared(owner));
+  REQUIRE(owner.retained_bytes() == 0);
  }
 }
 TEST_CASE("optional perceptual selection preserves default AVIR and enlargement", "[backend][data][image_resize][perceptual]") {
@@ -520,26 +531,44 @@ TEST_CASE("compiler planar projection preserves every quantized RGB8 bit", "[bac
 TEST_CASE("quantized planar preparation failure leaves the complete canvas untouched and permits retry", "[backend][data][image_resize][perceptual]") {
  using Access = perceptual::CpuDownscalerTestAccess;
  using Step = Access::Step;
+ const auto dims = GENERATE((std::array<unsigned, 4>{19, 13, 9, 7}), (std::array<unsigned, 4>{18, 14, 9, 7}), (std::array<unsigned, 4>{9, 1, 9, 1}));
  for (const auto step : {Step::HorizontalAxis, Step::VerticalAxis, Step::FirstMoment, Step::SecondMoment, Step::FirstCoefficient, Step::SecondCoefficient}) {
+  INFO("geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " boundary " << static_cast<int>(step));
   perceptual::CpuDownscaler owner;
-  test_perceptual::Image source(19, 13, RgbPixelFormat::RGB8, 3), destination(9, 7, RgbPixelFormat::PlanarUnitSrgbF32, 5);
+  test_perceptual::Image source(dims[0], dims[1], RgbPixelFormat::RGB8, 3), destination(dims[2], dims[3], RgbPixelFormat::PlanarUnitSrgbF32, 5);
   source.fill(5);
   const auto untouched = destination.storage;
   Access::fail_before(owner, step);
   REQUIRE_THROWS_AS(owner.run_quantized_planar(source.read(), destination.write()), std::bad_alloc);
+  CHECK_FALSE(Access::armed(owner));
+  CHECK_FALSE(Access::prepared(owner));
   CHECK(std::memcmp(untouched.data(), destination.storage.data(), untouched.size() * sizeof(float)) == 0);
   owner.run_quantized_planar(source.read(), destination.write());
-  test_perceptual::Image bytes(9, 7, RgbPixelFormat::RGB8, 5);
-  RgbImageResizer reference;
-  reference.downscale(source.read(), bytes.write());
-  for (unsigned y = 0U; y < 7U; ++y)
-   for (unsigned x = 0U; x < 9U; ++x)
+  REQUIRE(Access::prepared(owner));
+  test_perceptual::Image bytes(dims[2], dims[3], RgbPixelFormat::RGB8, 5);
+  if (dims[0] == dims[2] && dims[1] == dims[3]) {
+   // The explicit API filters unchanged geometry. Its one-row case lets the
+   // retained scalar-row oracle check every pixel without an identity copy.
+   Access::scalar_final_row(owner, bytes.write());
+  } else {
+   RgbImageResizer reference;
+   reference.downscale(source.read(), bytes.write());
+  }
+  for (unsigned y = 0U; y < dims[3]; ++y)
+   for (unsigned x = 0U; x < dims[2]; ++x)
     for (unsigned k = 0U; k < 3U; ++k) {
      const auto code = static_cast<unsigned>(std::lround(bytes.at(x, y, k) * 255.0));
      const float expected = float(code) * (1.0F / 255.0F);
      CHECK(static_cast<float>(destination.at(x, y, k)) == expected);
     }
   CHECK(test_perceptual::padding_intact(destination));
+  const auto retained = Access::storage(owner);
+  const auto pixels = destination.storage;
+  Access::fail_before(owner, Step::HorizontalAxis);
+  owner.run_quantized_planar(source.read(), destination.write());
+  CHECK(Access::armed(owner));
+  CHECK(Access::storage(owner) == retained);
+  CHECK(std::memcmp(destination.storage.data(), pixels.data(), pixels.size() * sizeof(float)) == 0);
  }
 }
 TEST_CASE("compiler projection rejects invalid canvases before writing padding", "[backend][data][image_resize][perceptual]") {
@@ -605,14 +634,20 @@ TEST_CASE("eight-lane transfer search preserves every threshold and adjacent flo
  }
 }
 TEST_CASE("checked resize plans retain their selected algorithm independently of storage", "[backend][data][image_resize][workspace]") {
- const std::array<std::pair<std::array<unsigned, 2>, RgbResizePath>, 7> cases{{
+ const std::array<std::pair<std::array<unsigned, 2>, RgbResizePath>, 11> cases{{
   {{640, 480}, RgbResizePath::PerceptualFractional}, {{768, 768}, RgbResizePath::PerceptualInteger},
   {{384, 384}, RgbResizePath::Identity}, {{640, 360}, RgbResizePath::Avir}, {{320, 240}, RgbResizePath::Avir},
-  {{1024, 768}, RgbResizePath::PerceptualFractional}, {{2048, 2048}, RgbResizePath::PerceptualFractional}}};
+  {{1024, 768}, RgbResizePath::PerceptualFractional}, {{2048, 2048}, RgbResizePath::PerceptualFractional},
+  {{384, 768}, RgbResizePath::PerceptualInteger}, {{768, 384}, RgbResizePath::PerceptualInteger},
+  {{384, 480}, RgbResizePath::PerceptualFractional}, {{640, 384}, RgbResizePath::PerceptualFractional}}};
  for (const auto& [source, expected] : cases) {
   const auto plan = RgbImageResizer::workspace_plan(source[0], source[1], 384, 384, ImageResizeMode::Stretch, true);
   CHECK(plan.path() == expected);
   CHECK((plan.bytes() == 0) == (expected == RgbResizePath::Identity));
+  if (source[0] >= 384 && source[1] >= 384) {
+   CHECK(perceptual::classify_geometry(source[0], source[1], 384, 384) == (expected == RgbResizePath::Identity ? RgbResizePath::PerceptualInteger : expected));
+   if (expected != RgbResizePath::Identity) CHECK(plan.bytes() == perceptual::CpuDownscaler::workspace_bytes(384, 384, false));
+  }
  }
  CHECK_THROWS(RgbImageResizer::workspace_plan(0, 1, 1, 1, ImageResizeMode::Stretch, true));
  CHECK_THROWS(RgbImageResizer::workspace_plan(std::numeric_limits<unsigned>::max(), 1, 384, 384, ImageResizeMode::Stretch, false));
@@ -641,6 +676,11 @@ TEST_CASE("one supplied arena supports poisoned mixed geometry and rejects stale
  std::size_t maximum = 0;
  for (const auto& d : geometries) {
   plans.push_back(RgbImageResizer::workspace_plan(d[0], d[1], d[2], d[3], mode, perceptual));
+  const auto content = compute_image_resize_geometry(d[0], d[1], d[2], d[3], mode);
+  if (perceptual && content.resized_width <= d[0] && content.resized_height <= d[1]) {
+   const bool identity = content.resized_width == d[0] && content.resized_height == d[1];
+   CHECK(plans.back().path() == (identity ? RgbResizePath::Identity : perceptual::classify_geometry(d[0], d[1], content.resized_width, content.resized_height)));
+  }
   maximum = std::max(maximum, plans.back().bytes());
  }
  std::vector<std::byte> backing(maximum + 127, std::byte{0x53});

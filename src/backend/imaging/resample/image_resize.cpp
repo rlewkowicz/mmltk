@@ -66,7 +66,7 @@ RgbResizeWorkspacePlan RgbImageResizer::workspace_plan(std::uint32_t sw, std::ui
  const auto width = result.geometry.resized_width, height = result.geometry.resized_height;
  if (sw == width && sh == height) return result;
  if (perceptual && width <= sw && height <= sh) {
-  result.path_ = sw % width == 0 && sh % height == 0 ? RgbResizePath::PerceptualInteger : RgbResizePath::PerceptualFractional;
+  result.path_ = perceptual::classify_geometry(sw, sh, width, height);
   result.perceptual_bytes = perceptual::CpuDownscaler::workspace_bytes(width, height, result.alpha);
   return result;
  }
