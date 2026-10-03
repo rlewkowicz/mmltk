@@ -13050,6 +13050,79 @@ TEST_CASE("custom extraction retains a bounded pinned window through physical pi
   CHECK(writer.completed() == ids.size());
  }
 }
+TEST_CASE("archive cache publication overlaps held writes with bounded reusable inputs", "[backend][data][benchmark][archive][resources]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
+ mmltk::testsupport::ScopedTempDir directory("continuous-archive-publication");
+ const auto archive = directory.path() / "images.tar", images = directory.path() / "images";
+ const auto jpeg = make_jpeg(70, 110, 150);
+ std::vector<std::uint64_t> ids;
+ {
+  std::ofstream output(archive, std::ios::binary);
+  for (unsigned id = 1; id <= 24; ++id) {
+   ids.push_back(id);
+   write_jpeg_tar_entry(output, id, jpeg);
+  }
+  const std::array<char, 1024> end{};
+  output.write(end.data(), end.size());
+ }
+ mmltk::testsupport::TestGate write("first accepted cache write retains its physical input");
+ std::promise<void> peers;
+ std::atomic<unsigned> calls{0}, completed{0};
+ std::mutex observations;
+ std::vector<std::thread::id> services;
+ std::uint64_t peak_input_bytes = 0;
+ std::size_t peak_records = 0;
+ BenchmarkCompilePipeline* owner = nullptr;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& value) {
+  if (event != "file.running" || value.at("service") != "output" || value.at("bytes") != jpeg.size()) return;
+  {
+   const std::lock_guard lock(observations);
+   const auto thread = std::this_thread::get_id();
+   if (std::ranges::find(services, thread) == services.end()) services.push_back(thread);
+   peak_input_bytes = std::max(peak_input_bytes, owner->execution().snapshot().leased);
+   peak_records = std::max(peak_records, value.at("records").get<std::size_t>());
+  }
+  if (!calls.fetch_add(1)) write.receipt().ArriveAndWait();
+ };
+ BenchmarkCompilePipeline pipeline(4, {}, {.transient_bytes = 512U << 20}, {}, trace);
+ owner = &pipeline;
+ auto extracting = std::async(std::launch::async, [&] {
+  return extract_selected_archive_images(
+   {.archive_path = archive,
+    .source_identity = "continuous-input",
+    .output_root = images,
+    .source = "coco",
+    .shard = "train2017",
+    .selected_image_ids = ids,
+    .image_id_parser = benchmark_archive_image_candidate,
+    .image_ready = [&](const CachedImageReady& ready) {
+     require_condition(ready.payload && std::ranges::equal(ready.payload->encoded(), jpeg), "cache write lost its owned forward input");
+     if (completed.fetch_add(1) + 1 == ids.size() - 1) peers.set_value();
+    },
+    .execution = &pipeline});
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { write.Release(); });
+ REQUIRE(write.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(peers, "later archive members publish past a held physical write", 5s);
+ CHECK(extracting.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(fs::exists(images / ".complete.json"));
+ {
+  const std::lock_guard lock(observations);
+  CHECK(services.size() == 2);
+  CHECK(peak_input_bytes > BenchmarkEncodedImage::normal_window_bytes);
+  CHECK(peak_input_bytes <= 8 * BenchmarkEncodedImage::normal_window_bytes);
+  CHECK(peak_records <= 8);
+ }
+ write.Release();
+ const auto result = mmltk::testsupport::await_test_future(extracting, "archive generation joins all accepted publications", 5s);
+ pipeline.files().join();
+ CHECK(result.image_count == ids.size());
+ CHECK(result.image_bytes == ids.size() * jpeg.size());
+ CHECK(calls == ids.size());
+ CHECK(completed == ids.size());
+ CHECK(pipeline.execution().snapshot().leased == 0);
+ CHECK(pipeline.execution().resource_usage().descriptors == 0);
+}
 TEST_CASE("an exceptional archive pixel releases its normal input and quiesces the source cursor", "[backend][data][benchmark][archive][resources]") {
  using namespace mmltk::backend::data::detail;
  const bool below_window = GENERATE(false, true);

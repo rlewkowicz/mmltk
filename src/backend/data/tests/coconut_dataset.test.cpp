@@ -9756,8 +9756,10 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
  for (unsigned id = 1; id <= 12; ++id) members.emplace_back(coco(id).member, white_jpeg());
  tar(archive, members);
  const auto catalog = base_physical_catalog(archive, static_cast<std::uint32_t>(members.size()));
- bool warm = false, mixed = false;
+ bool warm = false, mixed = false, hold_write = false, cancel_write = false;
  SECTION("cold forward source") {}
+ SECTION("cold writes overlap later members and their pixels") { hold_write = true; }
+ SECTION("cancellation joins the held cache write before releasing its input") { hold_write = cancel_write = true; }
  SECTION("retained physical inventory") { warm = true; }
  SECTION("retained healthy peers with missing input") { warm = mixed = true; }
  if (warm) {
@@ -9765,8 +9767,6 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
   if (mixed) std::filesystem::remove(cached_image_path(cache.source_images("coco") / "train2017", 2));
  }
  auto admitted = local_physical_archives(cache, catalog);
- BenchmarkCompilePipeline pipeline(4);
- CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
  PreparedBenchmarkSplit split;
  split.name = "train";
  split.class_names = {"person"};
@@ -9775,8 +9775,24 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
   std::atomic<unsigned> completed{0};
   std::promise<void> independent;
   unsigned expected = 12;
+  bool hold_write = false;
+  std::atomic<unsigned> writes{0};
+  std::mutex mutex;
+  std::vector<std::thread::id> services;
  } observed;
- observed.expected = mixed ? 11 : 12;
+ observed.expected = mixed || hold_write ? 11 : 12;
+ observed.hold_write = hold_write;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const Json& value) {
+  if (event != "file.running" || value.at("service") != "output" || value.at("bytes") != members.front().second.size()) return;
+  {
+   const std::lock_guard lock(observed.mutex);
+   const auto thread = std::this_thread::get_id();
+   if (std::ranges::find(observed.services, thread) == observed.services.end()) observed.services.push_back(thread);
+  }
+  if (!observed.writes.fetch_add(1) && hold_write) observed.held.receipt().ArriveAndWait();
+ };
+ BenchmarkCompilePipeline pipeline(4, {}, {}, {}, trace);
+ CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
  BenchmarkWriteRequest request{
   .split = split,
   .output_path = directory.path() / "pixels.bin",
@@ -9788,7 +9804,7 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
      [](void* context) {
   auto& value = *static_cast<Observed*>(context);
   const auto count = value.completed.fetch_add(1);
-  if (!count)
+  if (!count && !value.hold_write)
    value.held.receipt().ArriveAndWait();
   else if (count + 1 == value.expected)
    value.independent.set_value();
@@ -9805,7 +9821,25 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
  mmltk::testsupport::await_test_promise(observed.independent, "same-artifact pixels refill past a held first completion", 5s);
  CHECK(consuming.wait_for(0ms) == std::future_status::timeout);
  CHECK_FALSE(physical.discovery_complete());
+ if (hold_write) {
+  CHECK(observed.writes == members.size());
+  const std::lock_guard lock(observed.mutex);
+  CHECK(observed.services.size() == 2);
+ }
+ if (cancel_write) {
+  pipeline.execution().cancel();
+  CHECK(consuming.wait_for(0ms) == std::future_status::timeout);
+  CHECK(pipeline.execution().snapshot().leased >= BenchmarkEncodedImage::normal_window_bytes);
+ }
  observed.held.Release();
+ if (cancel_write) {
+  CHECK_THROWS(mmltk::testsupport::await_test_future(consuming, "cancelled physical publication joins its writer", 5s));
+  pipeline.files().join();
+  CHECK_FALSE(physical.discovery_complete());
+  CHECK(writer.completed() == members.size() - 1);
+  CHECK(pipeline.execution().snapshot().leased == 0);
+  return;
+ }
  const auto complete = mmltk::testsupport::await_test_future(consuming, "physical publication window drain", 5s);
  if (!complete) REQUIRE(physical.consume(admitted.front()));
  CHECK(writer.completed() == members.size());
@@ -9903,6 +9937,65 @@ TEST_CASE("physical cached failures share bounded ordered repair on the retained
  CHECK(after.st_ino == before.st_ino);
  CHECK(file_bytes(peer) == jpeg);
  CHECK(physical.discovery_complete());
+}
+TEST_CASE("continuing physical repair advances beside an unrelated accepted pixel", "[benchmark][coconut][archive][cache][pipeline]") {
+ using namespace std::chrono_literals;
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
+ const bool compressed = GENERATE(false, true);
+ ScopedTempDir directory("physical-repair-continuation");
+ const auto cache = BenchmarkCacheLayout::create(directory.path() / "cache");
+ const auto archive = cache.source_downloads("coco") / (compressed ? "physical.tar.gz" : "physical.tar");
+ constexpr unsigned held_id = 18;
+ std::vector<std::pair<std::string, std::string>> members{{coco(held_id).member, white_jpeg()}};
+ for (unsigned id = 1; id < held_id; ++id) members.emplace_back(coco(id).member, white_jpeg());
+ tar(archive, members);
+ const auto catalog = base_physical_catalog(archive, static_cast<std::uint32_t>(members.size()));
+ { PhysicalMembershipFixture cached(cache, catalog); }
+ auto admitted = local_physical_archives(cache, catalog);
+ BenchmarkCompilePipeline pipeline(4);
+ CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
+ PreparedBenchmarkSplit split;
+ split.name = "train";
+ split.class_names = {"person"};
+ std::array<unsigned, held_id> opens{};
+ mmltk::testsupport::TestGate held("unrelated cached pixel stays accepted during forward repair");
+ struct Observed {
+  std::promise<void> repaired;
+  std::atomic<unsigned> completed{0};
+ } observed;
+ BenchmarkSplitWriter writer({.split = split,
+                              .output_path = directory.path() / "pixels.bin",
+                              .resolution = 3,
+                              .num_workers = 4,
+                              .progress = {.context = &observed, .image_completed = [](void* context) {
+                               auto& value = *static_cast<Observed*>(context);
+                               if (!value.completed.fetch_add(1)) value.repaired.set_value();
+                              }},
+                              .image_opened = [&](const auto&, std::uint64_t id) {
+                               const auto attempt = ++opens.at(id - 1);
+                               if (attempt == 1 || (id != held_id && attempt == 2)) throw BenchmarkImageError("cached pixel needs its forward source repair");
+                               if (id == held_id) held.receipt().ArriveAndWait();
+                              },
+                              .execution = &pipeline},
+  true);
+ BenchmarkCompilePipeline::Attempt attempt(pipeline);
+ pipeline.bind_source(physical.identity_root(CoconutImageNamespace::CocoTrain), writer, AnnotationSource::CoconutCoco);
+ physical.admitted(admitted.front(), admitted.front().download);
+ // Record the matching inventory generation, while proving its failed cached
+ // pixels need repair. The continuing pass then keeps one unrelated peer held.
+ REQUIRE_FALSE(physical.consume(admitted.front(), {}, true));
+ auto consuming = std::async(std::launch::async, [&] { return physical.consume(admitted.front()); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
+ REQUIRE(held.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(observed.repaired, "a continuing repair compiles before its unrelated peer settles", 5s);
+ CHECK(consuming.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(physical.discovery_complete());
+ held.Release();
+ REQUIRE(mmltk::testsupport::await_test_future(consuming, "forward repair reconciles its exact source generation", 5s));
+ CHECK(writer.completed() == members.size());
+ CHECK(physical.summary(admitted.front()).image_count == members.size());
+ CHECK(opens.back() == 2);
+ for (unsigned id = 1; id < held_id; ++id) CHECK(opens[id - 1] == 3);
 }
 TEST_CASE("Parquet artifact readiness bypasses a held batch borrower", "[benchmark][coconut][parquet][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;

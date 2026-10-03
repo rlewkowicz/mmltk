@@ -115,6 +115,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark/benchmark_hash.cpp
     benchmark/benchmark_archive.cpp
     benchmark/benchmark_images.cpp
+    benchmark/benchmark_image_publication.cpp
     benchmark/benchmark_image_input.cpp
     benchmark/benchmark_image_decoder.cpp
     benchmark/benchmark_sampling.cpp
@@ -177,6 +178,7 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/benchmark_download.h
     benchmark/detail/benchmark_image_facts.h
     benchmark/detail/benchmark_images.h
+    benchmark/detail/benchmark_image_publication.h
     benchmark/detail/benchmark_image_input.h
     benchmark/detail/benchmark_image_decoder.h
     benchmark/detail/benchmark_sampling.h

@@ -8,6 +8,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
+#include "src/backend/data/benchmark/detail/benchmark_image_publication.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/common/io/file_memory.h"
@@ -452,7 +453,6 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache", artifact.root.string());
  common_io::FileHandle directory(descriptor);
  BenchmarkImageDecoder decoder;
- detail::StorageReservationPool destination(artifact.root, {}, state.storage);
  const CachedImageValidator validate = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
   if (!has_complete_image_markers(encoded)) throw BenchmarkImageError("incomplete COCONut JPEG");
   return decoder.read_header(encoded);
@@ -543,57 +543,75 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  BenchmarkCompletionWindow publications(window_size, &execution.execution(), [&] {
   if (archive_reader && execution.execution().resource_pressure()) archive_reader->suspend();
  });
- const auto publish = [&](const CoconutPhysicalImage& image, BenchmarkEncodedImage::Ptr input, bool source_read = false) {
-  publications.make_room();
-  // Header admission precedes resize/output. The mapping and source ticket
-  // retain the same inode/generation through all independent consumers.
-  Impl::Change header_notification;
-  {
-   const std::lock_guard lock(state.mutex);
-   const auto found = state.images.find({image.source, image.image_id});
-   if (found != state.images.end() && found->second.image == image && !found->second.header) {
-    found->second.header = true;
-    header_notification = state.advance_locked(image.source, image.image_id);
-   }
-  }
-  state.notify(std::move(header_notification));
-  const auto bytes = input->size();
+ // Capture source/image generations and mutation custody before any file work
+ // is accepted. Only header facts and the ticket cross into file completion;
+ // publication windows, repairs and unreadable rows remain controller-owned.
+ const auto publication = [&](const CoconutPhysicalImage& image, bool source_read) {
   const auto generation = execution.image_generation(root, image.image_id);
   auto ticket = execution.source_publication(root, lease, image.image_id);
-  ticket({image.image_id, std::pair{input->header().width, input->header().height}, true, std::move(input), artifact.root});
-  publications.push(execution.image_completion(root, image.image_id), [&, image, bytes, generation, source_read, ticket](std::exception_ptr failure) {
+  CachedImageReadySink ready = [&, image, generation, ticket](const CachedImageReady& value) {
+   if (execution.image_generation(root, image.image_id) != generation) return;
+   Impl::Change header_notification;
+   {
+    const std::lock_guard lock(state.mutex);
+    const auto found = state.images.find({image.source, image.image_id});
+    if (found != state.images.end() && found->second.image == image && !found->second.header) {
+     found->second.header = true;
+     header_notification = state.advance_locked(image.source, image.image_id);
+    }
+   }
+   state.notify(std::move(header_notification));
+   ticket({value.image_id, value.dimensions, true, value.payload, artifact.root});
+  };
+  BenchmarkImagePublication::Settled settled = [&, image, generation, source_read, ticket](const CachedImageReady& value, std::exception_ptr failure) {
    if (execution.image_generation(root, image.image_id) != generation) return;
    if (failure) {
     image_failure(image, source_read, failure);
     return;
    }
-   bool conflict = false;
-   std::size_t completed = 0;
-   Impl::Change notification;
-   {
-    const std::lock_guard lock(state.mutex);
-    const auto found = state.images.find({image.source, image.image_id});
-    if (found == state.images.end() || found->second.image != image) return;
-    auto& image_fact = found->second;
-    conflict = image_fact.conflict;
-    if (!conflict && !image_fact.pixels) {
-     ++artifact.completed_images;
-     artifact.bytes = mmltk::common::math::checked_add(artifact.bytes, bytes, "COCONut image cache byte overflow");
-     image_fact.pixels = true;
-     image_fact.bytes = bytes;
+   publications.make_room();
+   const auto bytes = value.payload->size();
+   publications.push(execution.image_completion(root, image.image_id), [&, image, bytes, generation, source_read, ticket](std::exception_ptr failure) {
+    if (execution.image_generation(root, image.image_id) != generation) return;
+    if (failure) {
+     image_failure(image, source_read, failure);
+     return;
     }
-    completed = artifact.completed_images;
-    notification = state.advance_locked(image.source, image.image_id);
-   }
-   try {
-    if (conflict) execution.retire_image(root, image.image_id);
-   } catch (...) {
-    state.notify(std::move(notification), std::current_exception());
-    throw;
-   }
-   state.notify(std::move(notification));
-   if (state.progress) state.progress(CoconutEdition::Base, archive, image.image_id, completed);
-  });
+    bool conflict = false;
+    std::size_t completed = 0;
+    Impl::Change notification;
+    {
+     const std::lock_guard lock(state.mutex);
+     const auto found = state.images.find({image.source, image.image_id});
+     if (found == state.images.end() || found->second.image != image) return;
+     auto& image_fact = found->second;
+     conflict = image_fact.conflict;
+     if (!conflict && !image_fact.pixels) {
+      ++artifact.completed_images;
+      artifact.bytes = mmltk::common::math::checked_add(artifact.bytes, bytes, "COCONut image cache byte overflow");
+      image_fact.pixels = true;
+      image_fact.bytes = bytes;
+     }
+     completed = artifact.completed_images;
+     notification = state.advance_locked(image.source, image.image_id);
+    }
+    try {
+     if (conflict) execution.retire_image(root, image.image_id);
+    } catch (...) {
+     state.notify(std::move(notification), std::current_exception());
+     throw;
+    }
+    state.notify(std::move(notification));
+    if (state.progress) state.progress(CoconutEdition::Base, archive, image.image_id, completed);
+   });
+  };
+  return std::pair{std::move(ready), std::move(settled)};
+ };
+ const auto publish = [&](const CoconutPhysicalImage& image, BenchmarkEncodedImage::Ptr input, bool source_read = false) {
+  auto [ready, settled] = publication(image, source_read);
+  const CachedImageReady value{image.image_id, std::pair{input->header().width, input->header().height}, true, std::move(input)};
+  ready(value);
+  settled(value, {});
  };
  bool cache_generation_known = artifact.cache_generation_known && artifact.inspected_cache_identity == archive.download.identity;
  if (artifact.inspected_cache_identity != archive.download.identity && std::filesystem::is_regular_file(inventory_path)) {
@@ -644,35 +662,43 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   return false;
  }
  replaying_inventory = false;
- archive_reader =
-  std::make_unique<BenchmarkArchive>(archive.download.path, &execution.execution(), BenchmarkEncodedImage::normal_window_bytes, lease->allowance(), 1, true, CompileAllowance{}, 1024, 2);
+ archive_reader = std::make_unique<BenchmarkArchive>(archive.download.path, &execution.execution(), 0, lease->allowance(), 1, true);
  auto& reader = *archive_reader;
  std::vector<CoconutPhysicalImage> inventory;
  std::unordered_set<std::uint64_t> encountered;
  artifact.unreadable.clear();
+ BenchmarkImagePublication write_pool(artifact.root, cancellation, state.storage, lease->allowance(), &execution, directory.get(), true, reader, {});
  const auto read_source = [&](const CoconutPhysicalImage& image) {
   try {
-   const auto encoded = reader.read(BenchmarkEncodedImage::normal_window_bytes, cancellation);
+   reader.require_regular(BenchmarkEncodedImage::normal_window_bytes);
+   auto admitted = write_pool.acquire(mmltk::common::math::checked_cast<std::size_t>(reader.size(), "physical archive image size overflow"));
+   write_pool.read(admitted);
    BenchmarkImageHeader header;
-   reader.cpu([&] { header = validate(image.image_id, encoded); });
+   execution.execution().run(detail::CompileTaskKind::Header, {}, [&](std::size_t) { header = validate(image.image_id, admitted->encoded); }, admitted->allowance);
    BenchmarkEncodedImage::Ptr input;
-   // Compare an unknown generation's actual bytes before retaining healthy cache
-   // allocation. The borrowed archive span never escapes this synchronous copy.
+   // Unknown generations reuse healthy cache allocation only after exact byte
+   // comparison. The output descriptor grant also covers this temporary read;
+   // no archive-owned span or decoder storage escapes the forward copy.
    try {
-    input = BenchmarkEncodedImage::open(directory.get(), image.image_id, validate, cancellation, &execution.execution(), reader.allowance(), {}, BenchmarkEncodedImage::normal_window_bytes);
-    if (input && !std::ranges::equal(input->encoded(), encoded)) input.reset();
+    input = BenchmarkEncodedImage::open(directory.get(), image.image_id, validate, cancellation, &execution.execution(), admitted->allowance, {}, BenchmarkEncodedImage::normal_window_bytes);
+    if (input && !std::ranges::equal(input->encoded(), admitted->encoded)) input.reset();
    } catch (const BenchmarkImageError&) { input.reset(); } catch (const InvalidImageError&) {
     input.reset();
    }
-   if (!input) {
+   if (input) {
+    input = input->file_input();
+    admitted.reset();
+    publish(image, std::move(input), true);
+   } else {
     if (std::filesystem::exists(cached_image_path(artifact.root, image.image_id))) invalidate_cached_image_proofs(artifact.root);
-    input = BenchmarkEncodedImage::publish(directory.get(), image.image_id, encoded, header, cancellation, destination, &execution.execution(), reader.allowance(), true);
+    auto [ready, settled] = publication(image, true);
+    write_pool.submit(image.image_id, std::move(admitted), header, std::move(ready), std::move(settled));
    }
-   publish(image, std::move(input), true);
   } catch (...) { image_failure(image, true, std::current_exception()); }
  };
  const auto repair_cached = [&](bool restore_cursor) {
-  publications.drain();
+  write_pool.reap();
+  publications.reap();
   if (repairs.empty()) return;
   const auto cursor = reader.member_position();
   auto batch = std::exchange(repairs, {});
@@ -684,10 +710,12 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    publications.make_room();
    read_source(batch[index]);
   }, cancellation);
-  publications.drain();
+  // Every accepted writer owns its bytes. Cursor restoration needs no pixel
+  // or file drain; the synchronous source copy/replay has already settled.
   if (restore_cursor && !reader.seek(cursor, cancellation)) throw BenchmarkArchiveError("physical archive cursor disappeared during repair");
  };
  while (reader.next(cancellation)) {
+  write_pool.reap();
   publications.reap();
   if (repairs.size() >= window_size) repair_cached(true);
   if (!reader.regular() || !reader.member().ends_with(".jpg")) continue;
@@ -708,7 +736,9 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   BenchmarkEncodedImage::Ptr input;
   if (cache_generation_known) {
    try {
-    input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, BenchmarkEncodedImage::normal_window_bytes);
+    auto controls = execution.execution().reserve(CompileResources::handles(1, true), reader.allowance());
+    input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), controls, {}, BenchmarkEncodedImage::normal_window_bytes);
+    controls.retire_descriptors();
    } catch (const BenchmarkImageError&) {
    } catch (const InvalidImageError&) {}
   }
@@ -717,7 +747,13 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   else
    read_source(image);
  }
+ // Source completion must join every accepted publication before reconciling
+ // repairs and sealing this exact inventory generation.
+ write_pool.finish();
+ publications.drain();
  repair_cached(false);
+ write_pool.finish();
+ publications.drain();
  // An omitted ambiguous ID stays absent from the completed source inventory.
  // It must never regain eligibility merely because one spelling had pixels.
  std::erase_if(inventory, [&](const auto& image) {
