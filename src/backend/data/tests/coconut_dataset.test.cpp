@@ -6464,6 +6464,59 @@ TEST_CASE("panoptic JSON keeps decoded metadata and one unchanged inventory seal
  write_json_atomically(path.string() + ".complete.json", proof, {});
  CHECK(load_coconut_component(path, full[0].edition(), full[0].source(), full[0].input_identity()));
 }
+TEST_CASE("blocking controller local notices leave pipeline and native output owners idle", "[benchmark][coconut][pipeline][resources]") {
+ using namespace std::chrono_literals;
+ using detail::CompileExecution;
+ ScopedTempDir root("coconut-owner-local-readiness");
+ std::atomic<unsigned> dispatches{0};
+ std::atomic<bool> expect_pipeline{false};
+ std::promise<void> pipeline_ready;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const Json&) {
+  if (event != "benchmark.pipeline.ready") return;
+  ++dispatches;
+  if (expect_pipeline) mmltk::testsupport::release_test_promise(pipeline_ready);
+ };
+ BenchmarkCompilePipeline pipeline(1, {}, {}, {}, trace);
+ const std::array physical{coco(7)};
+ auto input = request(physical);
+ input.prepare_partial_staging(pipeline, root.path() / "staging");
+ mmltk::testsupport::TestGate initialized("native output registration is live before input starts");
+ input.progress = [&](std::uint64_t count) { if (!count) initialized.receipt().ArriveAndWait(); };
+ auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
+ const mmltk::testsupport::ScopedTestCleanup finish_import([&] { initialized.Release(); pipeline.execution().cancel(); });
+ REQUIRE(initialized.WaitEntered(5s));
+ mmltk::testsupport::TestGate initial("prior owner callbacks settled"), delivered("blocking controller received global Local");
+ unsigned notices = 0;
+ CompileExecution::Readiness controller(pipeline.execution(), CompileChange::Local, [&](auto changes) {
+  if (!includes(changes.causes, CompileChange::Local)) return;
+  if (++notices == 1) initial.receipt().ArriveAndWait();
+  else if (notices == 2) delivered.receipt().ArriveAndWait();
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { initial.Release(); delivered.Release(); });
+ controller.notify();
+ REQUIRE(initial.WaitEntered(5s));
+ const auto before = pipeline.execution().snapshot().costs.notifier_deliveries;
+ const auto dispatched = dispatches.load();
+ const auto generation = pipeline.execution().admission_generation();
+ pipeline.execution().notify_change(CompileChange::Local);
+ CHECK(pipeline.execution().admission_generation() == generation + 1);
+ initial.Release();
+ REQUIRE(delivered.WaitEntered(5s));
+ // The first controller callback has returned. The second is still active;
+ // no pipeline, native-output, or idle file callback joined the Local batch.
+ CHECK(pipeline.execution().snapshot().costs.notifier_deliveries == before + 1);
+ CHECK(dispatches == dispatched);
+ delivered.Release();
+ expect_pipeline = true;
+ pipeline.original_generation(root.path() / "images", 1, false);
+ mmltk::testsupport::await_test_promise(pipeline_ready, "targeted pipeline source publication still dispatches", 5s);
+ initialized.Release();
+ const auto result = mmltk::testsupport::await_test_future(importing, "targeted native output completion still settles its import", 10s);
+ REQUIRE(result.size() == 1);
+ CHECK(result.front().index().image_count() == 1);
+ CHECK(result.front().index().box_count() == 1);
+ CHECK(result.front().required_labels_valid(0));
+}
 TEST_CASE("a live Parquet normalizer lends actual workspace to pixels on one CPU", "[benchmark][coconut][parquet][pipeline]") {
  using namespace std::chrono_literals;
  ScopedTempDir root("parquet-normalizer-pixels");

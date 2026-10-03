@@ -262,7 +262,7 @@ public:
  class Readiness final {
  public:
   struct Changes {
-   bool resources = false, cpu = false, records = false, local = false, pressure = false, fairness = false, interrupted = false;
+   CompileChange causes = CompileChange::None;
    // Resource/pressure changes from outside an unsuccessful local attempt.
    // CPU, record and owner-local activity never requests a resource retry.
    bool retry = false;
@@ -290,7 +290,8 @@ public:
    static thread_local Attempt* current_;
    Readiness* owner_;
    Attempt* previous_;
-   bool resources_ = false, pressure_ = false, committed_ = false;
+   CompileChange causes_ = CompileChange::None;
+   bool committed_ = false;
   };
 
  private:

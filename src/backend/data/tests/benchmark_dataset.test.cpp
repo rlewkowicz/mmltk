@@ -6885,7 +6885,9 @@ TEST_CASE("admission readiness retains external returns across local rollback an
  SECTION("external return survives acknowledgement of the prior delivery") { returned = Return::Delivery; }
  using Changes = CompileExecution::Readiness::Changes;
  using mmltk::backend::data::detail::CompileWorkClass;
- CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8});
+ const bool observed = GENERATE(false, true);
+ CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8}, {},
+  observed ? CompileExecution::Observer{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
  auto parent = execution.reserve(CompileResources::handles(0, false, 2));
  auto external = execution.reserve(CompileResources::handles(5));
  mmltk::testsupport::TestGate initial("hold readiness before partial admission"), failed("last descriptor draw failed before rollback"), delivering("hold acknowledged readiness batch");
@@ -6932,10 +6934,10 @@ TEST_CASE("admission readiness retains external returns across local rollback an
  initial.Release();
  const auto rollback = mmltk::testsupport::await_test_promise(rolled_back, "coalesced admission changes");
  REQUIRE(delivering.WaitEntered(5s));
- CHECK(rollback.resources);
- CHECK(rollback.pressure);
+ CHECK(includes(rollback.causes, CompileChange::Resources));
+ CHECK(includes(rollback.causes, CompileChange::Pressure));
  CHECK(rollback.retry == (returned == Return::Rollback));
- CHECK_FALSE(rollback.interrupted);
+ CHECK_FALSE(includes(rollback.causes, CompileChange::Interruption));
  CHECK(execution.resource_pressure());
  // These are real scheduler grants, independent of diagnostic observations.
  // Their readiness batch has no resource retry even after acknowledgement.
@@ -6947,12 +6949,101 @@ TEST_CASE("admission readiness retains external returns across local rollback an
  delivering.Release();
  const auto next = mmltk::testsupport::await_test_promise(rearmed, "readiness rearmed during callback delivery");
  CHECK(next.retry == (returned == Return::Delivery));
- CHECK(next.resources == (returned == Return::Delivery));
- CHECK_FALSE(next.pressure);
+ CHECK(includes(next.causes, CompileChange::Resources) == (returned == Return::Delivery));
+ CHECK_FALSE(includes(next.causes, CompileChange::Pressure));
  readiness.reset();
  CHECK(execution.try_reserve(CompileResources::handles(0, false, 2), parent).has_value());
  pressure.reset();
  CHECK_FALSE(execution.resource_pressure());
+}
+TEST_CASE("accepted local readiness retries after custody commits", "[backend][data][benchmark][pipeline][resources]") {
+ using Changes = CompileExecution::Readiness::Changes;
+ const bool observed = GENERATE(false, true);
+ CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8}, {},
+  observed ? CompileExecution::Observer{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
+ mmltk::testsupport::TestGate initial("hold readiness before accepted draw"), delivering("local changes acknowledged before custody commits");
+ std::promise<Changes> drawn, committed, external;
+ unsigned deliveries = 0;
+ CompileAllowance accepted;
+ std::unique_ptr<detail::CompileResourceWait> pressure;
+ auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Pressure, [&](Changes changes) {
+  switch (++deliveries) {
+   case 1: initial.receipt().ArriveAndWait(); break;
+   case 2:
+    drawn.set_value(changes);
+    delivering.receipt().ArriveAndWait();
+    break;
+   case 3: committed.set_value(changes); break;
+   default: break;
+  }
+ });
+ bool external_delivered = false;
+ CompileExecution::Readiness peer(execution, CompileChange::Resources | CompileChange::Pressure, [&](Changes changes) {
+  if (!std::exchange(external_delivered, true)) external.set_value(changes);
+ });
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] { initial.Release(); delivering.Release(); readiness.reset(); });
+ readiness->notify();
+ REQUIRE(initial.WaitEntered(5s));
+ {
+  CompileExecution::Readiness::Attempt attempt(readiness.get());
+  accepted = execution.reserve({32, 0});
+  pressure = execution.defer_resources();
+  initial.Release();
+  const auto changes = mmltk::testsupport::await_test_promise(drawn, "uncommitted changes remain visible to readers");
+  CHECK(changes.causes == (CompileChange::Resources | CompileChange::Pressure));
+  CHECK_FALSE(changes.retry);
+  REQUIRE(delivering.WaitEntered(5s));
+  CHECK(accepted.bytes() == 32);
+  attempt.commit();
+ }
+ delivering.Release();
+ const auto retry = mmltk::testsupport::await_test_promise(committed, "accepted custody publishes its resource retry");
+ CHECK(retry.causes == (CompileChange::Resources | CompileChange::Pressure));
+ CHECK(retry.retry);
+ const auto other = mmltk::testsupport::await_test_promise(external, "the same changes are external to another owner");
+ CHECK(other.causes == (CompileChange::Resources | CompileChange::Pressure));
+ CHECK(other.retry);
+ readiness.reset();
+}
+TEST_CASE("readiness preserves pending interests and implicitly delivers interruption", "[backend][data][benchmark][pipeline][resources]") {
+ using Changes = CompileExecution::Readiness::Changes;
+ const bool observed = GENERATE(false, true);
+ CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8}, {},
+  observed ? CompileExecution::Observer{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
+ mmltk::testsupport::TestGate initial("hold notifier before changing interests"), delivering("hold prior interest batch during targeted publication");
+ std::promise<Changes> pending, targeted, interrupted;
+ unsigned deliveries = 0;
+ CompileExecution::Readiness barrier(execution, CompileChange::None, [&](Changes changes) {
+  if (includes(changes.causes, CompileChange::Local)) initial.receipt().ArriveAndWait();
+ });
+ CompileExecution::Readiness owner(execution, CompileChange::Resources | CompileChange::Cpu, [&](Changes changes) {
+  if (!deliveries++) {
+   pending.set_value(changes);
+   delivering.receipt().ArriveAndWait();
+  } else if (deliveries == 2) targeted.set_value(changes);
+ });
+ CompileExecution::Readiness peer(execution, CompileChange::None, [&](Changes changes) { interrupted.set_value(changes); });
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] { initial.Release(); delivering.Release(); });
+ barrier.notify();
+ REQUIRE(initial.WaitEntered(5s));
+ execution.notify_change(CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure | CompileChange::Fairness);
+ owner.interests(CompileChange::None);
+ initial.Release();
+ const auto prior = mmltk::testsupport::await_test_promise(pending, "already pending causes survive interest narrowing");
+ CHECK(prior.causes == (CompileChange::Resources | CompileChange::Cpu));
+ CHECK(prior.retry);
+ REQUIRE(delivering.WaitEntered(5s));
+ const auto generation = execution.admission_generation();
+ owner.notify();
+ CHECK(execution.admission_generation() == generation + 1);
+ execution.cancel();
+ delivering.Release();
+ const auto local = mmltk::testsupport::await_test_promise(targeted, "targeted local notice and implicit interruption");
+ CHECK(local.causes == (CompileChange::Local | CompileChange::Interruption));
+ CHECK_FALSE(local.retry);
+ const auto other = mmltk::testsupport::await_test_promise(interrupted, "unsubscribed peer receives only interruption");
+ CHECK(other.causes == CompileChange::Interruption);
+ CHECK_FALSE(other.retry);
 }
 TEST_CASE("compile readiness routes resource epochs records and owner publication independently", "[backend][data][benchmark][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;
@@ -6974,19 +7065,19 @@ TEST_CASE("compile readiness routes resource epochs records and owner publicatio
  std::atomic<unsigned> resource_notices{0}, local_notices{0}, cpu_turns{0};
  std::atomic<bool> unrelated{false};
  CompileExecution::Readiness resource(execution, CompileChange::Resources, [&](auto changes) {
-  if (changes.resources) ++resource_notices;
-  if (changes.cpu || changes.records) unrelated = true;
+  if (includes(changes.causes, CompileChange::Resources)) ++resource_notices;
+  if (includes(changes.causes, CompileChange::Cpu | CompileChange::Records)) unrelated = true;
  });
  CompileExecution::Readiness record(execution, CompileChange::Records, [&](auto changes) {
-  if (changes.records && blocked.ready()) mmltk::testsupport::release_test_promise(record_delivered);
-  if (changes.cpu) unrelated = true;
+  if (includes(changes.causes, CompileChange::Records) && blocked.ready()) mmltk::testsupport::release_test_promise(record_delivered);
+  if (includes(changes.causes, CompileChange::Cpu)) unrelated = true;
  });
  CompileExecution::Readiness local(execution, CompileChange::Local, [&](auto changes) {
-  if (changes.local) { ++local_notices; mmltk::testsupport::release_test_promise(local_delivered); }
+  if (includes(changes.causes, CompileChange::Local)) { ++local_notices; mmltk::testsupport::release_test_promise(local_delivered); }
  });
  CompileExecution::Readiness cpu(execution, CompileChange::Cpu, [&](auto changes) {
   if (!cpu_turns++) delivering.receipt().ArriveAndWait();
-  else if (changes.cpu) mmltk::testsupport::release_test_promise(cpu_delivered);
+  else if (includes(changes.causes, CompileChange::Cpu)) mmltk::testsupport::release_test_promise(cpu_delivered);
  });
  const mmltk::testsupport::ScopedTestCleanup cleanup([&] { delivering.Release(); held = {}; blocked.cancel(); });
  cpu.notify();
@@ -7094,7 +7185,7 @@ TEST_CASE("pending Curl admission parks through CPU notices and resumes on exter
  std::promise<Changes> cpu_notices;
  unsigned stage = 0;
  CompileExecution::Readiness delivery(execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](Changes changes) {
-  if (!stage && changes.pressure && execution.resource_pressure()) {
+  if (!stage && includes(changes.causes, CompileChange::Pressure) && execution.resource_pressure()) {
    stage = 1;
    pending.receipt().ArriveAndWait();
   } else if (stage == 1) {
@@ -7115,8 +7206,8 @@ TEST_CASE("pending Curl admission parks through CPU notices and resumes on exter
  execution.notify_change(CompileChange::Cpu);
  pending.Release();
  const auto changes = mmltk::testsupport::await_test_promise(cpu_notices, "CPU-only readiness batch for pending Curl");
- CHECK_FALSE(changes.resources);
- CHECK_FALSE(changes.pressure);
+ CHECK_FALSE(includes(changes.causes, CompileChange::Resources));
+ CHECK_FALSE(includes(changes.causes, CompileChange::Pressure));
  CHECK_FALSE(changes.retry);
  CHECK(execution.resource_pressure());
  CHECK(server.requests() == 0);
@@ -10738,6 +10829,87 @@ TEST_CASE("compile service pumps and external helpers share the configured CPU g
  CHECK(compute_cpu != external.cpus().front());
  external.retire_workspace();
  CHECK(execution.snapshot().external == 0);
+}
+TEST_CASE("external workspace retirement delivers every returned resource to queued file service", "[backend][data][benchmark][pipeline][resources]") {
+ using Changes = CompileExecution::Readiness::Changes;
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ const bool observed = GENERATE(false, true);
+ CompileExecution execution(2, {}, {.transient_bytes = 64, .descriptors = 8}, {},
+  observed ? CompileExecution::Observer{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
+ auto external = execution.reserve({.bytes = 64, .descriptors = 1, .cpu_workers = 1});
+ auto alias = external;
+ auto acquisition = execution.open_class(CompileWorkClass::Acquisition);
+ auto held = execution.service_grant(CompileWorkClass::Acquisition);
+ mmltk::testsupport::TestGate initial("hold notifier during file submission"), settled("all submission CPU causes delivered");
+ mmltk::testsupport::TestGate first_wait("queued file has no CPU"), second_wait("file rechecks after submission causes"), running("file uses returned external CPU");
+ unsigned waits = 0, barriers = 0;
+ detail::FileWorkQueue files(execution, 1, 1, [&](std::string_view event, const detail::FileWorkQueue::Observation&) {
+  if (event != "file.wait_cpu") return;
+  if (++waits == 1) first_wait.receipt().ArriveAndWait();
+  else if (waits == 2) second_wait.receipt().ArriveAndWait();
+ });
+ CompileExecution::Readiness barrier(execution, CompileChange::None, [&](Changes) {
+  if (++barriers == 1) initial.receipt().ArriveAndWait();
+  else if (barriers == 2) settled.receipt().ArriveAndWait();
+ });
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  initial.Release();
+  settled.Release();
+  first_wait.Release();
+  second_wait.Release();
+  running.Release();
+  files.cancel();
+  held = {};
+  external.retire_workspace();
+  files.join();
+ });
+ barrier.notify();
+ REQUIRE(initial.WaitEntered(5s));
+ auto work = files.submit({.work = [&] { running.receipt().ArriveAndWait(); }});
+ REQUIRE(first_wait.WaitEntered(5s));
+ // Publish after the file queue arms its CPU subscription, then drain the
+ // notice while its dispatcher cannot probe. The second failed probe parks
+ // with no older queue wake outstanding.
+ execution.notify_change(CompileChange::Cpu);
+ barrier.notify();
+ initial.Release();
+ REQUIRE(settled.WaitEntered(5s));
+ first_wait.Release();
+ REQUIRE(second_wait.WaitEntered(5s));
+ REQUIRE_FALSE(work.ready());
+ const auto epoch = execution.resource_generation();
+ constexpr std::array interests{CompileChange::Resources, CompileChange::Cpu, CompileChange::Resources | CompileChange::Cpu};
+ std::array<std::promise<Changes>, interests.size()> notices;
+ std::array<unsigned, interests.size()> deliveries{};
+ std::vector<std::unique_ptr<CompileExecution::Readiness>> readers;
+ for (std::size_t i = 0; i < interests.size(); ++i)
+  readers.push_back(std::make_unique<CompileExecution::Readiness>(execution, interests[i], [&, i](Changes changes) {
+   if (!deliveries[i]++) notices[i].set_value(changes);
+  }));
+ external.retire_workspace();
+ CHECK(execution.resource_generation() == epoch + 1);
+ CHECK(execution.snapshot().external == 0);
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(alias.descriptors() == 1);
+ second_wait.Release();
+ settled.Release();
+ for (std::size_t i = 0; i < interests.size(); ++i) {
+  const auto changes = mmltk::testsupport::await_test_promise(notices[i], "retirement delivers the exact subscribed causes");
+  CHECK(changes.causes == interests[i]);
+  CHECK(changes.retry == includes(interests[i], CompileChange::Resources));
+ }
+ REQUIRE(running.WaitEntered(5s));
+ CHECK(execution.resource_generation() == epoch + 1);
+ CHECK(execution.snapshot().services == 2);
+ // Retiring backing/CPUs leaves aliases' descriptor commitment intact.
+ external = {};
+ CHECK_FALSE(execution.try_reserve({.descriptors = 8}));
+ readers.clear();
+ alias = {};
+ CHECK(execution.try_reserve({.descriptors = 8}).has_value());
+ running.Release();
+ work.wait();
+ files.join();
 }
 TEST_CASE("compile one-core services yield their grant to an earlier ready class", "[backend][data][benchmark][pipeline]") {
  using mmltk::backend::data::detail::CompileWorkClass;

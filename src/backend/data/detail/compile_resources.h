@@ -13,8 +13,12 @@ enum class CompileChange : std::uint8_t { None = 0, Resources = 1, Cpu = 2, Reco
 [[nodiscard]] constexpr CompileChange operator|(CompileChange left, CompileChange right) noexcept {
  return static_cast<CompileChange>(static_cast<unsigned>(left) | static_cast<unsigned>(right));
 }
+[[nodiscard]] constexpr CompileChange operator&(CompileChange left, CompileChange right) noexcept {
+ return static_cast<CompileChange>(static_cast<unsigned>(left) & static_cast<unsigned>(right));
+}
+constexpr CompileChange& operator|=(CompileChange& left, CompileChange right) noexcept { return left = left | right; }
 [[nodiscard]] constexpr bool includes(CompileChange interests, CompileChange cause) noexcept {
- return (static_cast<unsigned>(interests) & static_cast<unsigned>(cause)) != 0;
+ return (interests & cause) != CompileChange::None;
 }
 enum class CompileWorkspaceWindow : std::uint8_t { Task, SharedSource, Compaction };
 enum class CompileResourceDenial : std::uint8_t {

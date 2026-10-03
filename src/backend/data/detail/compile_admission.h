@@ -329,12 +329,13 @@ struct CompileAdmission {
   credit.workspace_retirement_pending = false;
   auto& value = credit.resources;
   const bool resources_changed = value.bytes || !credit.workspace_loans.empty() || (!credit.borrowed && credit.parent);
-  external_cpus -= std::exchange(value.cpu_workers, 0);
+  const auto returned_cpus = std::exchange(value.cpu_workers, 0);
+  external_cpus -= returned_cpus;
   if (!credit.cpu_lanes.empty() && release_cpus) release_cpus(credit.cpu_lanes);
   credit.cpu_lanes.clear();
   (value.retained_handles ? handle_bytes : bytes) -= std::exchange(value.bytes, 0);
   credit.workspace_loans.retire();
-  notify(resources_changed ? Change::Resources : Change::Cpu);
+  notify((resources_changed ? Change::Resources : Change::None) | (returned_cpus ? Change::Cpu : Change::None));
   // Live descriptor draws still need their producing promise chain. Storage
   // descendants retain their own charges and loans regardless of this parent.
   return credit.borrowed ? std::shared_ptr<Credits>{} : std::move(credit.parent);

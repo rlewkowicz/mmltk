@@ -201,9 +201,10 @@ struct BenchmarkCurl::Impl {
   if (execution)
    readiness = std::make_unique<CompileExecution::Readiness>(*execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Pressure, [this](CompileExecution::Readiness::Changes changes) {
     const std::lock_guard lock(mutex);
-    if (!changes.resources && !changes.pressure && !changes.interrupted && !waiting_cpu) return;
-    if (changes.resources || changes.pressure || changes.interrupted) notify_readers_locked();
-    if (changes.retry || changes.interrupted || waiting_cpu) wake_locked();
+    const bool reader_notice = includes(changes.causes, CompileChange::Resources | CompileChange::Pressure | CompileChange::Interruption);
+    if (!reader_notice && !waiting_cpu) return;
+    if (reader_notice) notify_readers_locked();
+    if (changes.retry || includes(changes.causes, CompileChange::Interruption) || waiting_cpu) wake_locked();
    });
   worker = std::jthread([this] { run(); });
  }

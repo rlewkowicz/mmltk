@@ -82,7 +82,7 @@ public:
   buffers_->execution = execution ? &execution->execution() : nullptr;
   if (execution)
    readiness_ = std::make_unique<CompileExecution::Readiness>(execution->execution(), CompileChange::Resources | CompileChange::Pressure | CompileChange::Local, [this](CompileExecution::Readiness::Changes changes) {
-    if (!changes.retry && !changes.local && !changes.interrupted) return;
+    if (!changes.retry && !includes(changes.causes, CompileChange::Local | CompileChange::Interruption)) return;
     {
      const std::lock_guard lock(resource_mutex_);
      ++resource_generation_;

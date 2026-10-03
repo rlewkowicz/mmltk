@@ -501,7 +501,7 @@ public:
        archive_worker_(request),
        assembly_workspace_(request.limits, request.cancellation),
        normalizations_(native_window, request.execution ? &request.execution->execution() : nullptr) {
-  if (request.execution) output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::Resources | CompileChange::Records | CompileChange::Local, [this](auto changes) { if (changes.retry || changes.records || changes.local || changes.interrupted) pump_outputs(); });
+  if (request.execution) output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::Resources | CompileChange::Records, [this](auto changes) { if (changes.retry || includes(changes.causes, CompileChange::Records | CompileChange::Local | CompileChange::Interruption)) pump_outputs(); });
   if (request.input_identity.empty()) invalid("missing pinned input identity");
   if (!request.physical_membership) invalid("missing physical membership admission");
   assembly_workspace_.recovery(request.recovery);
@@ -1120,7 +1120,7 @@ private:
   std::unique_ptr<CompileExecution::Readiness> interrupted;
   if (request_.execution)
    interrupted = std::make_unique<CompileExecution::Readiness>(request_.execution->execution(), CompileChange::Interruption, [signal](auto change) {
-    if (change.interrupted) signal->notify();
+    if (includes(change.causes, CompileChange::Interruption)) signal->notify();
    });
   std::vector<std::unique_ptr<Worker>> idle_recovery;
   BenchmarkCompletionWindow ready(native_window, request_.execution ? &request_.execution->execution() : nullptr);

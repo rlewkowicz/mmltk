@@ -247,26 +247,18 @@ struct CompileExecution::Impl {
   if (includes(change, CompileChange::Interruption)) withdrawal_pending = true;
   bool wake = bool(observer) || shutdown || stopping || includes(change, CompileChange::Interruption);
   for (const auto& state : observers) {
-   if (!includes(state->interests, change)) continue;
+   const auto delivered = state->interests & change;
+   if (delivered == CompileChange::None) continue;
    state->notified = true;
    wake = true;
-   auto* local = Readiness::Attempt::current_;
-   while (local && (!local->owner_ || local->owner_->state_ != state)) local = local->previous_;
-   if (includes(change, CompileChange::Resources) && includes(state->interests, CompileChange::Resources)) {
-    state->pending.resources = true;
-    if (local) local->resources_ = true;
+   state->pending.causes |= delivered;
+   const auto retry_causes = delivered & (CompileChange::Resources | CompileChange::Pressure);
+   if (retry_causes != CompileChange::None) {
+    auto* local = Readiness::Attempt::current_;
+    while (local && (!local->owner_ || local->owner_->state_ != state)) local = local->previous_;
+    if (local) local->causes_ |= retry_causes;
     else state->pending.retry = true;
    }
-   if (includes(change, CompileChange::Pressure) && includes(state->interests, CompileChange::Pressure)) {
-    state->pending.pressure = true;
-    if (local) local->pressure_ = true;
-    else state->pending.retry = true;
-   }
-   state->pending.fairness |= includes(change, CompileChange::Fairness) && includes(state->interests, CompileChange::Fairness);
-   state->pending.cpu |= includes(change, CompileChange::Cpu) && includes(state->interests, CompileChange::Cpu);
-   state->pending.records |= includes(change, CompileChange::Records) && includes(state->interests, CompileChange::Records);
-   state->pending.local |= includes(change, CompileChange::Local) && includes(state->interests, CompileChange::Local);
-   state->pending.interrupted |= includes(change, CompileChange::Interruption);
   }
   if (wake && event.get() >= 0) signal_event(event.get());
  }
@@ -1520,7 +1512,7 @@ void CompileExecution::Readiness::notify() noexcept {
  const std::lock_guard lock(impl->admission->mutex);
  ++impl->admission->generation;
  impl->admission->changed.notify_all();
- state_->pending.local = true;
+ state_->pending.causes |= CompileChange::Local;
  state_->notified = true;
  signal_event(impl->event.get());
 }
@@ -1539,12 +1531,11 @@ thread_local CompileExecution::Readiness::Attempt* CompileExecution::Readiness::
 CompileExecution::Readiness::Attempt::Attempt(Readiness* owner) : owner_(owner), previous_(current_) { current_ = this; }
 CompileExecution::Readiness::Attempt::~Attempt() {
  current_ = previous_;
- if (!owner_ || !committed_ || (!resources_ && !pressure_)) return;
+ if (!owner_ || !committed_ || causes_ == CompileChange::None) return;
  const auto& impl = owner_->owner_.impl_;
  const std::lock_guard lock(impl->admission->mutex);
  auto& state = *owner_->state_;
- state.pending.resources |= resources_;
- state.pending.pressure |= pressure_;
+ state.pending.causes |= causes_;
  state.pending.retry = true;
  state.notified = true;
  signal_event(impl->event.get());
