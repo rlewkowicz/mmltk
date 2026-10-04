@@ -116,7 +116,7 @@ std::map<std::size_t, std::size_t> prepare_range_nodes(std::size_t count) {
  for (std::size_t i = 0; i < count; ++i) nodes.emplace(i, 0);
  return nodes;
 }
-}
+}  // namespace
 void StagedArtifact::forget_range(std::size_t begin, std::size_t end, std::map<std::size_t, std::size_t>& prepared) {
  if (begin >= end) return;
  auto& ranges = mutation_->occupied;
@@ -139,7 +139,8 @@ void StagedArtifact::forget_range(std::size_t begin, std::size_t end, std::map<s
    node.key() = end;
    ranges.insert(std::move(node));
    break;
-  } else it = ranges.erase(it);
+  } else
+   it = ranges.erase(it);
  }
 }
 void StagedArtifact::occupy_range(std::size_t begin, std::size_t end, std::map<std::size_t, std::size_t>& prepared) {
@@ -225,8 +226,12 @@ bool StagedArtifact::reclaim_ranges(std::span<const common_io::FileHandle::Range
  };
  std::size_t completed = 0;
  bool reclaimed;
- try { reclaimed = file_.punch_holes(normalized, cancellation, syscalls, &completed); }
- catch (...) { forget(normalized); throw; }
+ try {
+  reclaimed = file_.punch_holes(normalized, cancellation, syscalls, &completed);
+ } catch (...) {
+  forget(normalized);
+  throw;
+ }
  forget(std::span(normalized).first(completed));
  allocation_.resize(reconcile_locked(), "reclaimed staged allocation");
  return reclaimed;

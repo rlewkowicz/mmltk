@@ -134,10 +134,10 @@ struct BenchmarkArchive::Impl {
   observation.forward_decoded_bytes += count - replay;
   decoded_high = std::max(decoded_high, start + count);
   if (source_end >= source_start) {
-   const auto bytes = source_end - source_start;
-   const auto repeated = std::min(bytes, source_high > source_start ? source_high - source_start : 0);
+   const auto consumed = source_end - source_start;
+   const auto repeated = std::min(consumed, source_high > source_start ? source_high - source_start : 0);
    observation.replay_source_bytes += repeated;
-   observation.forward_source_bytes += bytes - repeated;
+   observation.forward_source_bytes += consumed - repeated;
    source_high = std::max(source_high, source_end);
   }
  }
@@ -176,7 +176,10 @@ struct BenchmarkArchive::Impl {
  std::optional<Suspended> suspended;
  Impl(const std::filesystem::path& path, CompileExecution* owner, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
   CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries, const BenchmarkTraceSink& sink)
-     : trace(sink), observation_enabled(sink.accepts("benchmark.archive.completed") || sink.accepts("benchmark.archive.suspended")), source(observation_enabled ? path.string() : std::string{}), execution(owner),
+     : trace(sink),
+       observation_enabled(sink.accepts("benchmark.archive.completed") || sink.accepts("benchmark.archive.suspended")),
+       source(observation_enabled ? path.string() : std::string{}),
+       execution(owner),
        producer(owner ? owner->open_class(detail::CompileWorkClass::Extraction) : CompileExecution::Producer{}),
        parent_allowance(parent),
        file_allowance(owner ? owner->reserve(CompileResources::handles(1), parent) : CompileAllowance{}),
@@ -215,7 +218,10 @@ struct BenchmarkArchive::Impl {
   file_allowance.retire_workspace();
   std::vector<std::uint8_t>().swap(bytes);
   std::vector<char>().swap(block);
-  if (owns_workspace) { credits.retire_workspace(); credits.retire_descriptors(); }
+  if (owns_workspace) {
+   credits.retire_workspace();
+   credits.retire_descriptors();
+  }
  }
  void resume(std::uint64_t workspace) {
   if (reader) return;
@@ -475,8 +481,8 @@ struct BenchmarkArchive::Impl {
  // consumption paths share extent, sparse-hole, EOF and direct-range checks.
  struct MemberRead {
   std::uint64_t written = 0, offset = 0;
-  std::span<const std::uint8_t> pending;
-  std::optional<std::uint64_t> extent;
+  std::span<const std::uint8_t> pending{};
+  std::optional<std::uint64_t> extent{};
   bool contiguous = false, eof = false;
  };
  void validate_direct() const {
@@ -486,9 +492,9 @@ struct BenchmarkArchive::Impl {
   throw_if_benchmark_cancelled(cancellation);
   const void* data = nullptr;
   std::size_t count = 0;
-  la_int64_t offset = 0;
+  la_int64_t block_member_offset = 0;
   int status = ARCHIVE_RETRY;
-  for (int retry = 0; retry < 8 && status == ARCHIVE_RETRY; ++retry) status = archive_read_data_block(reader.get(), &data, &count, &offset);
+  for (int retry = 0; retry < 8 && status == ARCHIVE_RETRY; ++retry) status = archive_read_data_block(reader.get(), &data, &count, &block_member_offset);
   throw_if_benchmark_cancelled(cancellation);
   if (observation_enabled) ++observation.read_blocks;
   if (status == ARCHIVE_EOF) {
@@ -498,16 +504,20 @@ struct BenchmarkArchive::Impl {
    return;
   }
   if (status != ARCHIVE_OK) failure(reader.get(), "cannot read archive member");
-  if (offset < 0 || static_cast<std::uint64_t>(offset) < state.written || static_cast<std::uint64_t>(offset) > current.bytes || count > current.bytes - static_cast<std::uint64_t>(offset))
+  if (block_member_offset < 0 || static_cast<std::uint64_t>(block_member_offset) < state.written || static_cast<std::uint64_t>(block_member_offset) > current.bytes ||
+      count > current.bytes - static_cast<std::uint64_t>(block_member_offset))
    throw BenchmarkArchiveError("archive data block exceeds member extent");
   const auto address = reinterpret_cast<std::uintptr_t>(data), base = reinterpret_cast<std::uintptr_t>(block.data());
   const bool borrowed = address >= base && address - base <= block_size && count <= block_size - (address - base);
-  if (state.contiguous && borrowed && static_cast<std::uint64_t>(offset) == state.written) {
+  if (state.contiguous && borrowed && static_cast<std::uint64_t>(block_member_offset) == state.written) {
    const auto physical = checked_add(block_offset, address - base, "archive extent overflow");
-   if (!state.extent) state.extent = physical;
-   else state.contiguous = physical == *state.extent + state.written;
-  } else state.contiguous = false;
-  state.offset = static_cast<std::uint64_t>(offset);
+   if (!state.extent)
+    state.extent = physical;
+   else
+    state.contiguous = physical == *state.extent + state.written;
+  } else
+   state.contiguous = false;
+  state.offset = static_cast<std::uint64_t>(block_member_offset);
   state.pending = {static_cast<const std::uint8_t*>(data), count};
  }
  template <class Consumer>
@@ -572,7 +582,12 @@ struct BenchmarkArchive::Impl {
      observation.max_turn_cpu_ns = std::max(observation.max_turn_cpu_ns, elapsed);
     }
    };
-   try { work(); } catch (...) { finish(); throw; }
+   try {
+    work();
+   } catch (...) {
+    finish();
+    throw;
+   }
    finish();
   };
   if (execution && !external_cpus)
@@ -601,7 +616,8 @@ BenchmarkArchive::InputRequirement BenchmarkArchive::input_requirement(const std
 }
 BenchmarkArchive::BenchmarkArchive(const std::filesystem::path& path, CompileExecution* execution, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
  CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t consumer_descriptors, std::size_t gzip_index_entries, const BenchmarkTraceSink& trace)
-    : impl_(std::make_unique<Impl>(path, execution, workspace, parent, workers, verify_gzip_crc, std::move(workspace_allowance), retained_gzip_windows, consumer_descriptors, gzip_index_entries, trace)) {}
+    : impl_(
+       std::make_unique<Impl>(path, execution, workspace, parent, workers, verify_gzip_crc, std::move(workspace_allowance), retained_gzip_windows, consumer_descriptors, gzip_index_entries, trace)) {}
 BenchmarkArchive::~BenchmarkArchive() = default;
 bool BenchmarkArchive::next(Cancellation cancellation) {
  restore(cancellation);
@@ -689,7 +705,10 @@ void BenchmarkArchive::read_into(std::span<std::uint8_t> output, Cancellation ca
    while (copied < turn_bytes) {
     throw_if_benchmark_cancelled(cancellation);
     if (s.direct) {
-     if (state.written == size()) { state.eof = true; break; }
+     if (state.written == size()) {
+      state.eof = true;
+      break;
+     }
      if (blocks == turn_blocks) break;
      const auto count = std::min({static_cast<std::uint64_t>(kBlock), size() - state.written, turn_bytes - copied});
      s.file.pread_all(output.data() + state.written, count, *s.current.extent + state.written);
@@ -825,12 +844,13 @@ void BenchmarkArchive::pause() noexcept {
  auto& s = *impl_;
  if (s.reader && s.observation_enabled) {
   ++s.observation.suspensions;
-  if (s.observation.suspensions <= 8) trace_benchmark_event(s.trace, "benchmark.archive.suspended", [&] {
-   auto fields = benchmark_observation_fields(s.observation);
-   fields["source"] = s.source;
-   fields["member"] = s.name;
-   return fields;
-  });
+  if (s.observation.suspensions <= 8)
+   trace_benchmark_event(s.trace, "benchmark.archive.suspended", [&] {
+    auto fields = benchmark_observation_fields(s.observation);
+    fields["source"] = s.source;
+    fields["member"] = s.name;
+    return fields;
+   });
  }
  s.reader.reset();
  s.entry = nullptr;
@@ -840,7 +860,10 @@ void BenchmarkArchive::pause() noexcept {
  s.decoder_allowance = {};
  std::vector<std::uint8_t>().swap(s.bytes);
  std::vector<char>().swap(s.block);
- if (s.owns_workspace) { s.credits.retire_workspace(); s.credits.retire_descriptors(); }
+ if (s.owns_workspace) {
+  s.credits.retire_workspace();
+  s.credits.retire_descriptors();
+ }
  s.credits = {};
  s.supplied_workspace = {};
  s.external_cpus = false;

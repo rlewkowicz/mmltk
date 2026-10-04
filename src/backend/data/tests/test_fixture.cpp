@@ -54,8 +54,8 @@ std::shared_ptr<arrow::DataType> coconut_parquet_segment_type(bool integer_area)
 std::shared_ptr<arrow::Schema> coconut_parquet_schema(bool integer_area) {
  return arrow::schema(
   {arrow::field("mask", arrow::struct_({arrow::field("bytes", arrow::binary()), arrow::field("path", arrow::utf8())})),
-   arrow::field(
-    "segments_info", arrow::struct_({arrow::field("file_name", arrow::utf8()), arrow::field("image_id", arrow::int64()), arrow::field("segments_info", arrow::list(coconut_parquet_segment_type(integer_area)))})),
+   arrow::field("segments_info",
+    arrow::struct_({arrow::field("file_name", arrow::utf8()), arrow::field("image_id", arrow::int64()), arrow::field("segments_info", arrow::list(coconut_parquet_segment_type(integer_area)))})),
    arrow::field("image_info", arrow::struct_(
                                {arrow::field("coco_url", arrow::utf8()), arrow::field("date_captured", arrow::utf8()), arrow::field("file_name", arrow::utf8()), arrow::field("height", arrow::int64()),
                                 arrow::field("id", arrow::int64()), arrow::field("license", arrow::int64()), arrow::field("width", arrow::int64())}))});
@@ -88,9 +88,8 @@ void append_value(arrow::ArrayBuilder& builder, const Json& value) {
  }
 }
 }  // namespace
-void write_coconut_parquet(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema,
- std::int64_t group_rows, std::shared_ptr<parquet::ArrowWriterProperties> arrow_properties,
- std::shared_ptr<parquet::WriterProperties> writer_properties) {
+void write_coconut_parquet(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema, std::int64_t group_rows,
+ std::shared_ptr<parquet::ArrowWriterProperties> arrow_properties, std::shared_ptr<parquet::WriterProperties> writer_properties) {
  if (!schema) schema = coconut_parquet_schema();
  if (!arrow_properties) arrow_properties = parquet::default_arrow_writer_properties();
  std::vector<std::shared_ptr<arrow::Array>> columns;
@@ -111,7 +110,6 @@ void write_coconut_parquet(const std::filesystem::path& path, const Json& rows, 
   *arrow::Table::Make(schema, columns), arrow::default_memory_pool(), output, group_rows, writer_properties ? std::move(writer_properties) : properties.build(), std::move(arrow_properties)));
  arrow_ok(output->Close());
 }
-
 ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding encoding, std::uint32_t seed, std::size_t byte_limit) {
  if (!width || !height || width > MAX_IMAGE_EXTENT || height > MAX_IMAGE_EXTENT) throw std::invalid_argument("profile fixture geometry is invalid");
  const auto pixels = mmltk::common::math::checked_multiply<std::size_t>(width, height, "profile synthetic extent overflow");
@@ -125,16 +123,22 @@ ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t hei
   seed ^= seed << 5;
   rgb[i] = static_cast<std::uint8_t>(seed);
  }
- struct Encoding { std::vector<std::uint8_t>& bytes; std::size_t limit; bool overflow = false; } output{result.encoded, byte_limit};
+ struct Encoding {
+  std::vector<std::uint8_t>& bytes;
+  std::size_t limit;
+  bool overflow = false;
+ } output{result.encoded, byte_limit};
  const auto append = +[](void* context, void* data, int count) {
-  auto& output = *static_cast<Encoding*>(context);
-  if (output.overflow || count < 0 || static_cast<std::size_t>(count) > output.limit - output.bytes.size()) { output.overflow = true; return; }
+  auto& destination = *static_cast<Encoding*>(context);
+  if (destination.overflow || count < 0 || static_cast<std::size_t>(count) > destination.limit - destination.bytes.size()) {
+   destination.overflow = true;
+   return;
+  }
   const auto* begin = static_cast<std::uint8_t*>(data);
-  output.bytes.insert(output.bytes.end(), begin, begin + count);
+  destination.bytes.insert(destination.bytes.end(), begin, begin + count);
  };
- const auto written = encoding == FixtureImageEncoding::Jpeg
-                       ? stbi_write_jpg_to_func(append, &output, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), 95)
-                       : stbi_write_png_to_func(append, &output, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), static_cast<int>(width * 3));
+ const auto written = encoding == FixtureImageEncoding::Jpeg ? stbi_write_jpg_to_func(append, &output, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), 95)
+                                                             : stbi_write_png_to_func(append, &output, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), static_cast<int>(width * 3));
  if (output.overflow) throw std::length_error("profile encoded image exceeds input cap");
  if (!written) throw std::runtime_error("cannot encode profile fixture");
  return result;
@@ -238,13 +242,20 @@ benchmark_internal::NormalizedAnnotationReadView pipeline_annotation_fixture(std
 namespace {
 // Fixture values follow the native external-row vocabulary. Only the binary
 // representation is adapted to the shared writer's external JSON input.
-template<class T>
+template <class T>
 Json parquet_fixture_value(const T& value) {
- if constexpr (std::is_arithmetic_v<T> || std::same_as<T, std::string>) return value;
- else if constexpr (std::same_as<T, std::vector<std::uint8_t>>) return std::string(value.begin(), value.end());
- else if constexpr (requires { value.has_value(); }) return value ? parquet_fixture_value(*value) : Json{};
- else if constexpr (requires { std::variant_size<T>::value; }) return std::visit([](const auto& item) { return parquet_fixture_value(item); }, value);
- else if constexpr (requires { value.begin(); value.end(); }) {
+ if constexpr (std::is_arithmetic_v<T> || std::same_as<T, std::string>)
+  return value;
+ else if constexpr (std::same_as<T, std::vector<std::uint8_t>>)
+  return std::string(value.begin(), value.end());
+ else if constexpr (requires { value.has_value(); })
+  return value ? parquet_fixture_value(*value) : Json{};
+ else if constexpr (requires { std::variant_size<T>::value; })
+  return std::visit([](const auto& item) { return parquet_fixture_value(item); }, value);
+ else if constexpr (requires {
+                     value.begin();
+                     value.end();
+                    }) {
   auto result = Json::array();
   for (const auto& item : value) result.push_back(parquet_fixture_value(item));
   return result;
@@ -254,7 +265,7 @@ Json parquet_fixture_value(const T& value) {
   return result;
  }
 }
-}
+}  // namespace
 struct PipelineNativeFixture::Impl {
  std::filesystem::path path, staging;
  std::string identity;
@@ -265,10 +276,11 @@ struct PipelineNativeFixture::Impl {
  std::uint64_t workspace = 0;
 };
 PipelineNativeFixture::PipelineNativeFixture(const std::filesystem::path& directory, std::span<const ProfileImageFixture> inputs, std::span<const std::size_t> order, bool dropped)
- : impl_(std::make_unique<Impl>()) {
+    : impl_(std::make_unique<Impl>()) {
  using namespace benchmark_internal;
  if (order.empty() || order.size() > 1024) throw std::length_error("native profile exceeds 1024 rows");
- for (const auto position : order) if (position >= inputs.size()) throw std::out_of_range("native fixture input index");
+ for (const auto position : order)
+  if (position >= inputs.size()) throw std::out_of_range("native fixture input index");
  fs::create_directories(directory);
  impl_->path = directory / "native.parquet";
  impl_->staging = directory / "native-staging";
@@ -280,13 +292,15 @@ PipelineNativeFixture::PipelineNativeFixture(const std::filesystem::path& direct
   if (pixels > (64U << 20) / 3) throw std::length_error("native fixture canvas exceeds 64 MiB");
   std::vector<std::uint8_t> rgb(pixels * 3);
   for (unsigned foreground = 0; foreground != 2; ++foreground) {
-   if (foreground) for (std::size_t pixel = 0; pixel < pixels; ++pixel) rgb[pixel * 3] = 1;
+   if (foreground)
+    for (std::size_t pixel = 0; pixel < pixels; ++pixel) rgb[pixel * 3] = 1;
    auto& encoded = masks[i][foreground];
    if (!stbi_write_png_to_func([](void* output, void* data, int count) {
-     auto& bytes = *static_cast<std::vector<std::uint8_t>*>(output);
-     const auto* first = static_cast<const std::uint8_t*>(data);
-     bytes.insert(bytes.end(), first, first + count);
-    }, &encoded, input.width, input.height, 3, rgb.data(), input.width * 3)) throw std::runtime_error("cannot encode native fixture mask");
+    auto& bytes = *static_cast<std::vector<std::uint8_t>*>(output);
+    const auto* first = static_cast<const std::uint8_t*>(data);
+    bytes.insert(bytes.end(), first, first + count);
+   }, &encoded, input.width, input.height, 3, rgb.data(), input.width * 3))
+    throw std::runtime_error("cannot encode native fixture mask");
    mask_bytes += encoded.size();
    if (mask_bytes > (64U << 20)) throw std::length_error("native fixture masks exceed 64 MiB");
   }
@@ -365,7 +379,10 @@ benchmark_internal::NormalizedAnnotationReadView PipelineNativeFixture::run(benc
   const bool available = ready.load();
   return CoconutOriginalReadiness{available ? impl_->originals : nullptr, available, 1, originals.completion()};
  };
- request.input_finished = [&] { ready = true; originals.settle(); };
+ request.input_finished = [&] {
+  ready = true;
+  originals.settle();
+ };
  auto components = import_coconut_annotations(request);
  if (components.size() != 1) throw std::runtime_error("native fixture did not produce one complete component");
  return components.front().index();

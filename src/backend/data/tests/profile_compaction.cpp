@@ -33,12 +33,12 @@ void hash_extent(io::Sha256Hasher& hash, const io::FileHandle& file, std::size_t
   bytes -= count;
  }
 }
-}
+}  // namespace
 void run_compaction_profile(const Options& opts, const benchmark_internal::BenchmarkTraceSink& trace) {
  using namespace detail;
  using namespace benchmark_internal;
  const auto setup_start = Clock::now();
- const auto staging = profile_compaction_layout(opts); // Cap before creating or acquiring anything.
+ const auto staging = profile_compaction_layout(opts);  // Cap before creating or acquiring anything.
  std::filesystem::create_directories(opts.test_dir);
  StorageReservationPool pool(opts.test_dir);
  // One private iteration is retired before another starts. keep_artifacts does
@@ -50,12 +50,17 @@ void run_compaction_profile(const Options& opts, const benchmark_internal::Bench
  CompileExecution execution(1, {}, {.workspace_plan = plan}, {}, observe_compile_execution(trace));
  auto output = execution.open_class(CompileWorkClass::Output);
  FileWorkQueue::Observer file_observer;
- if (trace) file_observer = {trace.selection(), [&](std::string_view event, const FileWorkQueue::Observation& value) {
-  trace_benchmark_event(trace, event, [&] { return benchmark_observation_fields(value); });
- }};
+ if (trace)
+  file_observer = {trace.selection(), [&](std::string_view event, const FileWorkQueue::Observation& value) {
+   trace_benchmark_event(trace, event, [&] { return benchmark_observation_fields(value); });
+  }};
  FileWorkQueue files(execution, 2, 1, std::move(file_observer));
- auto allowance = execution.reserve({.bytes = COMPILED_COMPACTION_SCRATCH_BYTES, .supplied_workspace = true, .completion_workspace = true,
-  .workspace_class = CompileWorkClass::Output, .workspace_window = CompileWorkspaceWindow::Compaction});
+ auto allowance = execution.reserve(
+  {.bytes = COMPILED_COMPACTION_SCRATCH_BYTES,
+   .supplied_workspace = true,
+   .completion_workspace = true,
+   .workspace_class = CompileWorkClass::Output,
+   .workspace_window = CompileWorkspaceWindow::Compaction});
  const auto scratch = allowance.workspace();
  std::vector<ImageEntry> entries(staging.num_slots);
  CompiledSlotStorage slots(stage, staging);
@@ -109,15 +114,16 @@ void run_compaction_profile(const Options& opts, const benchmark_internal::Bench
   stage.file().advise(0, staging.total_size, POSIX_FADV_DONTNEED);
  }
  CompiledCompactionObserver observation;
- if (trace.accepts("profile.compaction.summary")) observation = [&](const CompiledCompactionObservation& value) {
-  trace_benchmark_event(trace, "profile.compaction.summary", [&] { return benchmark_observation_fields(value); });
- };
+ if (trace.accepts("profile.compaction.summary"))
+  observation = [&](const CompiledCompactionObservation& value) { trace_benchmark_event(trace, "profile.compaction.summary", [&] { return benchmark_observation_fields(value); }); };
  FileLayout final;
  Clock::time_point start, compacted, metadata, synced;
- files.submit({.work = [&] {
+ files
+  .submit(
+   {.work =
+     [&] {
   start = Clock::now();
-  final = compact_compiled_file(stage.file(), staging, entries, {}, {},
-   CompiledStorageMutation::for_artifact(stage), scratch, observation);
+  final = compact_compiled_file(stage.file(), staging, entries, {}, {}, CompiledStorageMutation::for_artifact(stage), scratch, observation);
   compacted = Clock::now();
   const std::array<std::string, 1> classes{"profile"};
   const auto header = make_file_header({eligible, static_cast<std::uint32_t>(opts.width), static_cast<std::uint32_t>(opts.height), 3, max_instances, staging.image_stride}, classes, final);
@@ -129,7 +135,8 @@ void run_compaction_profile(const Options& opts, const benchmark_internal::Bench
   metadata = Clock::now();
   stage.file().sync_data();
   synced = Clock::now();
- }}).wait();
+ }})
+  .wait();
  const auto allocated_after = StorageReservationPool::allocated_bytes(stage.file().get());
  const auto after = io::FileSnapshot::Read(stage.file().get());
  if (initial.device != after.device || initial.inode != after.inode || after.bytes != final.total_size) throw std::runtime_error("compaction profile changed inode or final extent");
@@ -138,16 +145,20 @@ void run_compaction_profile(const Options& opts, const benchmark_internal::Bench
  stage.file().pread_all(stored.data(), final.index_size, final.index_offset);
  if (std::memcmp(stored.data(), entries.data(), final.index_size)) throw std::runtime_error("compaction profile changed slot identity");
  io::Sha256Hasher after_hash;
- for (std::uint32_t slot = 0; slot < final.num_slots; ++slot) if (entries[slot].eligible()) {
-  hash_extent(after_hash, stage.file(), final.pixel_offset(slot), final.image_stride, scratch);
-  hash_extent(after_hash, stage.file(), final.label_offset(slot), entries[slot].label_bytes, scratch);
- }
+ for (std::uint32_t slot = 0; slot < final.num_slots; ++slot)
+  if (entries[slot].eligible()) {
+   hash_extent(after_hash, stage.file(), final.pixel_offset(slot), final.image_stride, scratch);
+   hash_extent(after_hash, stage.file(), final.label_offset(slot), entries[slot].label_bytes, scratch);
+  }
  if (after_hash.Finish() != expected_hash) throw std::runtime_error("compaction profile live bytes differ");
  const auto verified = Clock::now();
- std::printf("compaction_profile slots=%u eligible=%u case=%s cold=%d staging_bytes=%zu final_bytes=%zu allocated_before=%llu allocated_after=%llu live_sha256=%s setup_sec=%.6f compaction_sec=%.6f metadata_sec=%.6f sync_sec=%.6f compaction_sync_sec=%.6f total_sec=%.6f verification_sec=%.6f\n",
+ std::printf(
+  "compaction_profile slots=%u eligible=%u case=%s cold=%d staging_bytes=%zu final_bytes=%zu allocated_before=%llu allocated_after=%llu live_sha256=%s setup_sec=%.6f compaction_sec=%.6f "
+  "metadata_sec=%.6f sync_sec=%.6f compaction_sync_sec=%.6f total_sec=%.6f verification_sec=%.6f\n",
   staging.num_slots, eligible, std::string(mmltk::frameworks::reflection::enum_name(opts.compaction_case)).c_str(), opts.compaction_cold, staging.total_size, final.total_size,
   static_cast<unsigned long long>(allocated_before), static_cast<unsigned long long>(allocated_after), io::sha256_hex(expected_hash).c_str(), seconds_since(setup_start, start),
-  seconds_since(start, compacted), seconds_since(compacted, metadata), seconds_since(metadata, synced), seconds_since(start, synced), seconds_since(setup_start, synced), seconds_since(synced, verified));
+  seconds_since(start, compacted), seconds_since(compacted, metadata), seconds_since(metadata, synced), seconds_since(start, synced), seconds_since(setup_start, synced),
+  seconds_since(synced, verified));
  record_duration_metric("compaction", "setup", setup_start, start);
  record_duration_metric("compaction", "move", start, compacted);
  record_duration_metric("compaction", "sync", metadata, synced);

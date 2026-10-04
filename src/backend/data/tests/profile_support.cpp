@@ -38,7 +38,8 @@ inline constexpr std::array profile_options{
  MMLTK_CLI_OPTION(ProfileOptions, completion_gaps, "Collect bounded completion spacing with profile.pipeline.completed selected", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, compaction_case, "Compaction fixture: Dense, Sparse, MixedLabels", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, compaction_cold, "Sync and advise only the staged fixture out of cache before compaction", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, mode, "loader, compile (Directory STB), pixels (benchmark decode), resample (retained RGB), coconut (Stock + recovery), pipeline (bounded local benchmark), compaction (bounded staged file)", "Profiling"),
+ MMLTK_CLI_OPTION(ProfileOptions, mode,
+  "loader, compile (Directory STB), pixels (benchmark decode), resample (retained RGB), coconut (Stock + recovery), pipeline (bounded local benchmark), compaction (bounded staged file)", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, encoding, "PNG or JPEG synthetic input", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, input_manifest, "Retained JPEG/PNG paths, one per line; pixels/resample only", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, cache_dir, "Retained production benchmark cache; required for coconut", "Profiling"),
@@ -86,9 +87,11 @@ Options parse_options(int argc, char** argv) {
  if (opts.annotations != PipelineAnnotations::Ready && (opts.mode != ProfileMode::Pipeline || opts.input_storage == ProfileInputStorage::Archive))
   throw std::invalid_argument("annotation variants require Pipeline mapped or pooled input");
  const bool archive_input = opts.input_storage == ProfileInputStorage::Archive;
- if (archive_input && (opts.mode != ProfileMode::Pipeline || opts.num_images < 128 || opts.num_images > 256)) throw std::invalid_argument("archive input requires Pipeline and 128-256 members within 64 MiB");
+ if (archive_input && (opts.mode != ProfileMode::Pipeline || opts.num_images < 128 || opts.num_images > 256))
+  throw std::invalid_argument("archive input requires Pipeline and 128-256 members within 64 MiB");
  if (!archive_input && opts.archive_pressure != ProfileArchivePressure::None) throw std::invalid_argument("archive pressure requires archive input");
- if (opts.mode == ProfileMode::Pipeline && (opts.num_images < (archive_input ? 128 : 256) || opts.num_images > 1024 || opts.width != opts.height || opts.output_cap_mib <= 0 || opts.output_cap_mib > 2048 || opts.task_records < 0 || opts.task_records > 1024))
+ if (opts.mode == ProfileMode::Pipeline && (opts.num_images < (archive_input ? 128 : 256) || opts.num_images > 1024 || opts.width != opts.height || opts.output_cap_mib <= 0 ||
+                                            opts.output_cap_mib > 2048 || opts.task_records < 0 || opts.task_records > 1024))
   throw std::invalid_argument("pipeline requires 256-1024 images (128-256 for archive input), square output, 0-1024 records, and 1-2048 MiB output cap");
  if (opts.mode == ProfileMode::Pipeline) {
   namespace math = mmltk::common::math;
@@ -110,8 +113,7 @@ FileLayout profile_compaction_layout(const Options& opts) {
  if (layout.total_size > (static_cast<std::uint64_t>(opts.output_cap_mib) << 20)) throw std::length_error("compaction staging/output exceeds configured cap before fixture creation");
  return layout;
 }
-ProfileTrace::ProfileTrace(const std::string& path, std::vector<std::string> prefixes)
-    : selection_(prefixes), selected_(!prefixes.empty()) {
+ProfileTrace::ProfileTrace(const std::string& path, std::vector<std::string> prefixes) : selection_(prefixes), selected_(!prefixes.empty()) {
  if (path.empty()) return;
  if (const auto parent = fs::path(path).parent_path(); !parent.empty()) fs::create_directories(parent);
  output_.open(path, std::ios::app);
@@ -167,8 +169,7 @@ std::vector<ProfileImageFixture> profile_inputs(const Options& opts) {
    inputs.push_back({header.width, header.height, {input.data(), input.data() + input.size()}});
   }
  } else if (opts.mixed_geometry) {
-  for (const auto [width, height] : std::array<std::pair<unsigned, unsigned>, 7>{{{384, 384}, {640, 480}, {768, 768}, {1024, 768}, {2048, 2048}, {640, 360}, {320, 240}}})
-   synthetic(width, height);
+  for (const auto [width, height] : std::array<std::pair<unsigned, unsigned>, 7>{{{384, 384}, {640, 480}, {768, 768}, {1024, 768}, {2048, 2048}, {640, 360}, {320, 240}}}) synthetic(width, height);
  } else
   synthetic(static_cast<unsigned>(opts.source_width), static_cast<unsigned>(opts.source_height));
  if (inputs.empty()) throw std::invalid_argument("profile input manifest is empty");

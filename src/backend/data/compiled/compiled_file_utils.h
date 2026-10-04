@@ -185,7 +185,9 @@ inline void write_compiled_annotations(
  file.pwritev_all(spans, offset + (ordinal_base ? annotations.labels.size_bytes() : 0));
 }
 inline constexpr std::size_t COMPILED_COMPACTION_SCRATCH_BYTES = 4U * 1024U * 1024U;
-namespace detail { class StagedArtifact; }
+namespace detail {
+class StagedArtifact;
+}
 struct CompiledStorageMutation {
  using Ranges = std::span<const common::io::FileHandle::Range>;
  [[nodiscard]] static CompiledStorageMutation for_artifact(detail::StagedArtifact&);

@@ -32,8 +32,7 @@ void verify_pages(void* data, std::size_t bytes, int node, NumaMemory::Lock lock
    // The non-faulting batch query sees its temporary migration entry as
    // ENOENT. Resolve that locked page through the fault-aware node query;
    // this still verifies actual placement and does not retry other failures.
-   if (status[i] == -ENOENT && lock == NumaMemory::Lock::Pages)
-    checked(::get_mempolicy(&status[i], nullptr, 0, pages[i], MPOL_F_NODE | MPOL_F_ADDR), "resolve locked host page NUMA placement");
+   if (status[i] == -ENOENT && lock == NumaMemory::Lock::Pages) checked(::get_mempolicy(&status[i], nullptr, 0, pages[i], MPOL_F_NODE | MPOL_F_ADDR), "resolve locked host page NUMA placement");
    if (status[i] == node) continue;
    const auto operation = "verify host page at byte " + std::to_string(offset + i * page) + " of " + std::to_string(bytes) + " on NUMA node " + std::to_string(node);
    if (status[i] < 0) throw std::system_error(-status[i], std::generic_category(), operation);

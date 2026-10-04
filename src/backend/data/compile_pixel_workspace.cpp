@@ -48,9 +48,9 @@ void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::sp
   observation.output_bytes = plan.destination_.capacity_bytes;
  }
  const auto report = [&](bool failed) noexcept {
-  if (resize_observed) mmltk::frameworks::reflection::visit_materialized_members<imaging::resample::RgbResizeWork>([&]<class Declaration>(const auto&) {
-   resize_observed->*Declaration::pointer += resize_work.*Declaration::pointer;
-  });
+  if (resize_observed)
+   mmltk::frameworks::reflection::visit_materialized_members<imaging::resample::RgbResizeWork>(
+    [&]<class Declaration>(const auto&) { resize_observed->*Declaration::pointer += resize_work.*Declaration::pointer; });
   if (!observer) return;
   observation.resize_preparations = resize_work.preparations;
   observation.resize_allocation_requests = resize_work.allocation_requests;

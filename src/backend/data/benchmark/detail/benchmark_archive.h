@@ -43,7 +43,8 @@ public:
  };
  [[nodiscard]] static InputRequirement input_requirement(const std::filesystem::path&, std::uint64_t consumer_workspace, std::size_t gzip_workers = 1);
  explicit BenchmarkArchive(const std::filesystem::path&, CompileExecution* = nullptr, std::uint64_t workspace = 0, const CompileAllowance& parent = {}, std::size_t gzip_workers = 1,
-  bool verify_gzip_crc = true, CompileAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768, const BenchmarkTraceSink& trace = {});
+  bool verify_gzip_crc = true, CompileAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768,
+  const BenchmarkTraceSink& trace = {});
  ~BenchmarkArchive();
  BenchmarkArchive(const BenchmarkArchive&) = delete;
  BenchmarkArchive& operator=(const BenchmarkArchive&) = delete;

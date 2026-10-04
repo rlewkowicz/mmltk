@@ -10,7 +10,8 @@ detail::CompileExecutionObserver observe_compile_execution(const BenchmarkTraceS
   .record_rejections = sink.accepts("compile.record.rejected"),
   .continuation_rejections = sink.accepts("compile.continuation.rejected"),
   .reservations = sink.accepts(reservation_event),
-  .retired = sink.accepts("compile.execution.retired")};
+  .retired = sink.accepts("compile.execution.retired")
+ };
  demand.aggregates = demand.any();
  if (!demand.any()) return {};
  return {demand, [sink, reservation_event](std::string_view event, const detail::CompileExecutionSnapshot& value) {

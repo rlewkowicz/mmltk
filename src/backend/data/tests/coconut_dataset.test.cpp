@@ -86,13 +86,13 @@ using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 namespace {
 using mmltk::backend::data::testsupport::arrow_ok;
-using mmltk::backend::data::testsupport::coconut_parquet_schema;
-using mmltk::backend::data::testsupport::coconut_parquet_segment_type;
-using mmltk::backend::data::testsupport::write_coconut_parquet;
 using mmltk::backend::data::testsupport::benchmark_entry;
 using mmltk::backend::data::testsupport::benchmark_semantics;
 using mmltk::backend::data::testsupport::bind_benchmark_slots;
+using mmltk::backend::data::testsupport::coconut_parquet_schema;
+using mmltk::backend::data::testsupport::coconut_parquet_segment_type;
 using mmltk::backend::data::testsupport::write_benchmark_fixture;
+using mmltk::backend::data::testsupport::write_coconut_parquet;
 using mmltk::testsupport::require_condition;
 std::uint32_t compiled_slot(const CompiledDataset& dataset, std::uint64_t identity, AnnotationSource source) {
  auto slots = dataset.eligible_slots();
@@ -414,7 +414,8 @@ TEST_CASE("COCONut Parquet shards preserve exact holes singleton crowd null area
  nonthing["area"] = 0;
  const std::array<std::uint32_t, 9> filled{1, 1, 1, 1, 1, 1, 1, 1, 1};
  write_coconut_parquet(root.path() / "a.parquet", Json::array({row, empty}));
- write_coconut_parquet(root.path() / "b.parquet", Json::array({hf_row(9, png(3, 3, filled), Json::array({nonthing}))}), coconut_parquet_schema(true), 1, {}, parquet::WriterProperties::Builder().compression(parquet::Compression::ZSTD)->build());
+ write_coconut_parquet(root.path() / "b.parquet", Json::array({hf_row(9, png(3, 3, filled), Json::array({nonthing}))}), coconut_parquet_schema(true), 1, {},
+  parquet::WriterProperties::Builder().compression(parquet::Compression::ZSTD)->build());
  const std::array physical{coco(7), coco(8, CoconutImageNamespace::CocoUnlabeled), coco(9)};
  auto input = request(physical);
  input.parquet_shards = {root.path() / "a.parquet", root.path() / "b.parquet"};
@@ -5105,7 +5106,8 @@ TEST_CASE("Parquet namespace hints preserve recognized routes and unknown input"
  const std::array<std::uint32_t, 1> pixels{0};
  const auto encoded = png(1, 1, pixels);
  const auto path = root.path() / "hints.parquet";
- write_coconut_parquet(path, Json::array({hf_row(1, encoded, Json::array(), 1, 1, "unlabeled2017"), hf_row(2, encoded, Json::array(), 1, 1, "unknown"), hf_row(3, encoded, Json::array(), 1, 1, "val2017")}));
+ write_coconut_parquet(
+  path, Json::array({hf_row(1, encoded, Json::array(), 1, 1, "unlabeled2017"), hf_row(2, encoded, Json::array(), 1, 1, "unknown"), hf_row(3, encoded, Json::array(), 1, 1, "val2017")}));
  std::vector<std::optional<CoconutImageNamespace>> hints;
  const std::array paths{path};
  read_coconut_parquet(paths, {}, {}, [&](std::size_t, const CoconutRecord& record, const CoconutAnnotationInput&) { hints.push_back(record.namespace_hint); }, true);
@@ -6169,8 +6171,9 @@ TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibili
   std::vector<std::pair<std::string, std::string>> members{{image.member, white_jpeg(1, 1)}};
   if (shard == 32 && conflict) members.push_back(members.front());
   tar(archive, members);
-  catalog.images.push_back({CoconutImageNamespace::Objects365V2, static_cast<std::uint16_t>(shard), "patch-" + std::to_string(shard),
-   {"physical-" + std::to_string(shard), "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kObjects365V2}});
+  catalog.images.push_back(
+   {CoconutImageNamespace::Objects365V2, static_cast<std::uint16_t>(shard), "patch-" + std::to_string(shard),
+    {"physical-" + std::to_string(shard), "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kObjects365V2}});
  }
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13});
@@ -7624,8 +7627,8 @@ TEST_CASE("a Parquet group joins native recovery before JPEG geometry", "[benchm
  input.expected_rows = 3;
  input.parquet_shards = {root.path() / "groups.parquet"};
  write_coconut_parquet(input.parquet_shards.front(),
-  Json::array({hf_row(7, png(1, 1, foreground), Json::array({segment()}), 1, 1), hf_row(10, png(1, 1, empty), Json::array(), 1, 1), hf_row(11, png(1, 1, empty), Json::array(), 1, 1)}), coconut_parquet_schema(),
-  2);
+  Json::array({hf_row(7, png(1, 1, foreground), Json::array({segment()}), 1, 1), hf_row(10, png(1, 1, empty), Json::array(), 1, 1), hf_row(11, png(1, 1, empty), Json::array(), 1, 1)}),
+  coconut_parquet_schema(), 2);
  CompileExecution::CompletionSource originals;
  std::atomic<bool> original_terminal{false};
  std::promise<void> next_group;
@@ -7751,8 +7754,8 @@ TEST_CASE("admitted Parquet rows survive physical consumers and omit reused proj
  const std::array<std::uint32_t, 1> pixel{1};
  const auto encoded = png(1, 1, pixel);
  const std::array paths{root.path() / "rows.parquet"};
- write_coconut_parquet(paths.front(), Json::array({hf_row(1, encoded, Json::array({segment()}), 1, 1), hf_row(2, encoded, Json::array(), 1, 1), hf_row(3, encoded, Json::array(), 1, 1)}), coconut_parquet_schema(),
-  2);
+ write_coconut_parquet(
+  paths.front(), Json::array({hf_row(1, encoded, Json::array({segment()}), 1, 1), hf_row(2, encoded, Json::array(), 1, 1), hf_row(3, encoded, Json::array(), 1, 1)}), coconut_parquet_schema(), 2);
  CoconutAnnotationRecords rows;
  read_coconut_parquet(paths, {}, {}, [](std::size_t, const CoconutRecord&, const CoconutAnnotationInput&) {}, true, nullptr, nullptr, {}, {}, &rows);
  REQUIRE(rows.size() == 3);
@@ -9574,7 +9577,8 @@ TEST_CASE("artifact identity settlement withdraws exact labels and preserves pix
  for (std::size_t part = 0; part < components.size(); ++part) {
   input.input_identity = "part-" + std::to_string(part);
   input.parquet_shards = {directory.path() / (input.input_identity + ".parquet")};
-  write_coconut_parquet(input.parquet_shards.front(), Json::array({hf_row(7, png(3, 3, foreground), Json::array({segment()})), hf_row(part ? 12 : 11, png(3, 3, foreground), Json::array({segment()}))}));
+  write_coconut_parquet(
+   input.parquet_shards.front(), Json::array({hf_row(7, png(3, 3, foreground), Json::array({segment()})), hf_row(part ? 12 : 11, png(3, 3, foreground), Json::array({segment()}))}));
   components[part] = import_coconut_annotations(input);
   REQUIRE(components[part].size() == 1);
   if (warm) {
@@ -11348,8 +11352,8 @@ TEST_CASE("admitted physical headers recover labels before the same image finish
  CHECK(gathered_validation.load() == 0);
  CHECK(writer.completed() == 1);
 }
-
 TEST_CASE("bounded gzip read turns preserve members and yield one CPU to a peer", "[benchmark][coconut][archive][resources]") {
+ using namespace std::chrono_literals;
  using namespace mmltk::backend::data::detail;
  using namespace mmltk::backend::data::testsupport;
  using mmltk::common::concurrency::CancellationObservation;
@@ -11369,7 +11373,10 @@ TEST_CASE("bounded gzip read turns preserve members and yield one CPU to a peer"
  struct Boundary {
   std::function<void()> entered;
   mutable std::atomic<bool> first{true};
-  bool cancelled() const noexcept { if (first.exchange(false)) entered(); return false; }
+  bool cancelled() const noexcept {
+   if (first.exchange(false)) entered();
+   return false;
+  }
  } boundary{[&] { copying.receipt().ArriveAndWait(); }};
  std::vector<std::uint8_t> bytes(inputs[0].encoded.size());
  auto reading = std::async(std::launch::async, [&] { input.read_into(bytes, CancellationObservation::Borrow(boundary)); });
@@ -11467,7 +11474,6 @@ TEST_CASE("borrowed archive workspace stays charged while explicit and exclusive
  CHECK(execution.resource_usage().bytes == 0);
  CHECK(execution.resource_usage().descriptors == 0);
 }
-
 TEST_CASE("unchanged native finalization requires a staged clean payload and rebinds its canonical lineage", "[benchmark][coconut][annotations][recovery]") {
  enum class Input { Background, Mask, Box, Dropped, Malformed, Degenerate, Unlisted, InvalidStuff };
  const auto kind = GENERATE(Input::Background, Input::Mask, Input::Box, Input::Dropped, Input::Malformed, Input::Degenerate, Input::Unlisted, Input::InvalidStuff);
@@ -11483,7 +11489,10 @@ TEST_CASE("unchanged native finalization requires a staged clean payload and reb
  if (kind == Input::Box) record.segments[0].bbox = std::array<double, 4>{0, 0, 2, 1};
  if (kind == Input::Malformed) record.segments[0].category_id = 999;
  if (kind == Input::Degenerate) record.segments[0].bbox = std::array<double, 4>{0, 0, 0, 1};
- if (kind == Input::InvalidStuff) { record.segments[0].isthing = false; record.segments[0].valid = false; }
+ if (kind == Input::InvalidStuff) {
+  record.segments[0].isthing = false;
+  record.segments[0].valid = false;
+ }
  const bool foreground = kind == Input::Mask || kind == Input::Malformed || kind == Input::Degenerate || kind == Input::InvalidStuff;
  const std::array<std::uint32_t, 3> pixels{foreground ? 1U : kind == Input::Unlisted ? 2U : 0U, 0, 0};
  const auto encoded = png(3, 1, pixels);
@@ -11541,7 +11550,6 @@ TEST_CASE("unchanged native finalization requires a staged clean payload and reb
  const auto read = CoconutNativeImage::read(final);
  REQUIRE_NOTHROW(admit_normalized_annotations(read.view.storage()));
 }
-
 TEST_CASE("bounded Pipeline native fixtures retain clean bytes across unchanged and real recovery", "[benchmark][coconut][pipeline][recovery]") {
  using namespace mmltk::backend::data::testsupport;
  ScopedTempDir root("pipeline-native-fixture");
@@ -11585,7 +11593,6 @@ TEST_CASE("bounded Pipeline native fixtures retain clean bytes across unchanged 
  CHECK(std::memcmp(clean.boxes.data(), recovered.boxes.data(), clean.boxes.size_bytes()) == 0);
  CHECK(std::memcmp(clean.mask_rle_pairs.data(), recovered.mask_rle_pairs.data(), clean.mask_rle_pairs.size_bytes()) == 0);
 }
-
 TEST_CASE("modern final caches leave held original snapshots to independent part callbacks", "[benchmark][coconut][cache][pipeline][recovery]") {
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires original inspection and independent annotation lanes");
@@ -11613,7 +11620,10 @@ TEST_CASE("modern final caches leave held original snapshots to independent part
   if (event == "benchmark.labels.placed" && fields.at("image_id") == (training ? 8 : 9)) mmltk::testsupport::release_test_promise(labels);
  };
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled = true; held.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled = true;
+  held.Release();
+ });
  REQUIRE(held.WaitEntered(5s));
  mmltk::testsupport::await_test_promise(labels, "part labels publish before their full-cache original prerequisite", 5s);
  CHECK(full_routes == 0);

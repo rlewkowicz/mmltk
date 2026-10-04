@@ -50,7 +50,6 @@ struct Options {
  std::vector<std::string> trace_prefix;
 };
 MMLTK_REFLECT_FIELDS(Options)
-
 [[nodiscard]] Options parse_options(int, char**);
 [[nodiscard]] std::vector<ProfileImageFixture> profile_inputs(const Options&);
 [[nodiscard]] std::vector<std::size_t> profile_order(const Options&, std::size_t input_count);

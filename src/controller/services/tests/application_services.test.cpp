@@ -1353,15 +1353,20 @@ TEST_CASE("artifact diagnostic selection survives the public compiler adapter", 
  using namespace mmltk::backend::data;
  using namespace mmltk::backend::data::benchmark_internal;
  std::size_t delivered = 0, constructed = 0;
- const ArtifactBenchmarkTraceObserver observer{
-  .context = &delivered,
-  .report = [](const void* context, std::string_view, std::string_view) noexcept { ++*const_cast<std::size_t*>(static_cast<const std::size_t*>(context)); },
-  .selection = CompileTraceSelection({"benchmark.selected"})};
+ const ArtifactBenchmarkTraceObserver observer{.context = &delivered, .report = [](const void* context, std::string_view, std::string_view) noexcept {
+  ++*const_cast<std::size_t*>(static_cast<const std::size_t*>(context));
+ }, .selection = CompileTraceSelection({"benchmark.selected"})};
  const auto sink = make_trace_sink({observer.selection, [observer](std::string_view event, std::string_view fields) { observer(event, fields); }});
- trace_benchmark_event(sink, "benchmark.excluded", [&] { ++constructed; return nlohmann::json::object(); });
+ trace_benchmark_event(sink, "benchmark.excluded", [&] {
+  ++constructed;
+  return nlohmann::json::object();
+ });
  CHECK(constructed == 0);
  CHECK(delivered == 0);
- trace_benchmark_event(sink, "benchmark.selected", [&] { ++constructed; return nlohmann::json::object(); });
+ trace_benchmark_event(sink, "benchmark.selected", [&] {
+  ++constructed;
+  return nlohmann::json::object();
+ });
  CHECK(constructed == 1);
  CHECK(delivered == 1);
 }

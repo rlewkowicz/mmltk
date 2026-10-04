@@ -314,7 +314,8 @@ public:
  // Capture only quiescent unaccepted draws that will be destroyed before
  // defer_resources/update. Aliases and actual arena padding count once; the
  // failed parent may be one of those returned draws. No custody is retained.
- [[nodiscard]] CompileRetryCustody retry_custody(CompileResources failed, std::span<const CompileAllowance> returning, const CompileAllowance& failed_parent = {}, const CompileAllowance& retry_parent = {}) const;
+ [[nodiscard]] CompileRetryCustody retry_custody(
+  CompileResources failed, std::span<const CompileAllowance> returning, const CompileAllowance& failed_parent = {}, const CompileAllowance& retry_parent = {}) const;
  [[nodiscard]] std::unique_ptr<CompileResourceWait> defer_resources(CompileResources = {}, const CompileAllowance& parent = {}, CompileRetryCustody = {});
  // Bind one continuation demand before classification; retries keep its age
  // and resource predicate until admission or withdrawal.

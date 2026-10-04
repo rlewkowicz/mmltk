@@ -476,8 +476,10 @@ struct BenchmarkCurl::Impl {
    // Nonblocking transport admission must advertise pressure too. Otherwise
    // an idle parser can retain the entire byte target while Curl waits for
    // a credit event that no active owner remains able to produce.
-   if (!candidate->deferred) candidate->deferred = execution->defer_resources(resources, parent, retry);
-   else candidate->deferred->update(resources, parent, retry);
+   if (!candidate->deferred)
+    candidate->deferred = execution->defer_resources(resources, parent, retry);
+   else
+    candidate->deferred->update(resources, parent, retry);
    return false;
   };
   if (execution && !candidate->work) {

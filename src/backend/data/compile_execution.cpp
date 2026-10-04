@@ -207,8 +207,15 @@ struct CompileExecution::Impl {
    Entry* value = nullptr;
    typename Entry::Link Entry::* link = nullptr;
    Entry* operator*() const noexcept { return value; }
-   Iterator& operator++() noexcept { value = (value->*link).next; return *this; }
-   Iterator operator++(int) noexcept { auto previous = *this; ++*this; return previous; }
+   Iterator& operator++() noexcept {
+    value = (value->*link).next;
+    return *this;
+   }
+   Iterator operator++(int) noexcept {
+    auto previous = *this;
+    ++*this;
+    return previous;
+   }
    bool operator==(const Iterator&) const noexcept = default;
   };
   Iterator begin() const noexcept { return {head, link}; }
@@ -709,11 +716,12 @@ struct CompileExecution::Impl {
    result.task_cpu_ns = task_cpu_ns;
    result.ready_to_start_ns = ready_to_start_ns;
    try {
-    if (demands) for (const auto& job : jobs) {
-     if (job->done || job->running || job->denial == CompileResourceDenial::None) continue;
-     const auto& demand = job->task.resources;
-     result.demands.push_back(observe_demand(job->task.kind, demand, job->denial, job->observed_epoch, job->observed_extent));
-    }
+    if (demands)
+     for (const auto& job : jobs) {
+      if (job->done || job->running || job->denial == CompileResourceDenial::None) continue;
+      const auto& demand = job->task.resources;
+      result.demands.push_back(observe_demand(job->task.kind, demand, job->denial, job->observed_epoch, job->observed_extent));
+     }
    } catch (...) {
     result.demands.clear();
     result.costs.incomplete = true;
@@ -842,9 +850,9 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
         if (!eligible || unfair) {
          // A ready older demand owns the next turn. Its peers retain their age
          // without asking source owners to discard otherwise fitting storage.
-         park(job,
-          unfair ? CompileParkReason::Fairness
-                 : task.resources.descriptors + task.resources.continuation_descriptors > admission->descriptor_room(task.resources, parent) ? CompileParkReason::Descriptors : CompileParkReason::Bytes);
+         park(job, unfair                                                                                                                      ? CompileParkReason::Fairness
+                   : task.resources.descriptors + task.resources.continuation_descriptors > admission->descriptor_room(task.resources, parent) ? CompileParkReason::Descriptors
+                                                                                                                                               : CompileParkReason::Bytes);
          if (job.reason == CompileParkReason::Bytes || job.reason == CompileParkReason::Fairness) wait_demand(job.demand);
          continue;
         }
@@ -1175,7 +1183,10 @@ CompileExecution::~CompileExecution() {
  impl_->notifier.join();
  if (impl_->observer.demand().retired) try {
    CompileExecutionSnapshot retired;
-   { const std::lock_guard lock(impl_->admission->mutex); retired = impl_->snapshot_locked(false); }
+   {
+    const std::lock_guard lock(impl_->admission->mutex);
+    retired = impl_->snapshot_locked(false);
+   }
    impl_->observer("compile.execution.retired", retired);
   } catch (...) {}
 }
@@ -1705,7 +1716,8 @@ CompileExecution::Readiness::Attempt::~Attempt() {
  state.notified = true;
  impl->arm_locked();
 }
-CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileExecution::Impl> execution, CompileTaskKind successor, CompileResources resources, CompileAllowance parent, bool finite_consumer, CompileRetryCustody retry)
+CompileResourceWait::CompileResourceWait(
+ std::shared_ptr<CompileExecution::Impl> execution, CompileTaskKind successor, CompileResources resources, CompileAllowance parent, bool finite_consumer, CompileRetryCustody retry)
     : state_(std::make_unique<State>(std::move(execution), successor, resources, std::move(parent), finite_consumer)) {
  auto& state = *state_;
  state.retry = retry;
@@ -1764,13 +1776,15 @@ CompileResourceWait::~CompileResourceWait() {
  const std::lock_guard lock(state_->execution->admission->mutex);
  state_->execution->remove_wait(*state_);
 }
-CompileRetryCustody CompileExecution::retry_custody(CompileResources failed, std::span<const CompileAllowance> returning, const CompileAllowance& failed_parent, const CompileAllowance& retry_parent) const {
+CompileRetryCustody CompileExecution::retry_custody(
+ CompileResources failed, std::span<const CompileAllowance> returning, const CompileAllowance& failed_parent, const CompileAllowance& retry_parent) const {
  const std::lock_guard lock(impl_->admission->mutex);
  CompileRetryCustody result;
  if ((failed_parent.credits_ && failed_parent.credits_->owner != impl_->admission) || (retry_parent.credits_ && retry_parent.credits_->owner != impl_->admission))
   throw std::invalid_argument("compile retry parent belongs to another session");
  const auto in_lineage = [](const Credits* credit, const Credits* parent) {
-  for (; parent; parent = parent->parent.get()) if (parent == credit) return true;
+  for (; parent; parent = parent->parent.get())
+   if (parent == credit) return true;
   return false;
  };
  for (std::size_t i = 0; i < returning.size(); ++i) {
@@ -1787,8 +1801,7 @@ CompileRetryCustody CompileExecution::retry_custody(CompileResources failed, std
   auto bytes = credit->resources.retained_handles ? 0 : credit->resources.bytes;
   if (!credit->resources.retained_handles && credit->arena_padding) {
    bool shared = false;
-   for (std::size_t previous = 0; previous < i; ++previous)
-    shared |= returning[previous].credits_ && returning[previous].credits_->arena_padding == credit->arena_padding;
+   for (std::size_t previous = 0; previous < i; ++previous) shared |= returning[previous].credits_ && returning[previous].credits_->arena_padding == credit->arena_padding;
    if (!shared) bytes += credit->arena_padding->bytes;
   }
   result.bytes_ += bytes;

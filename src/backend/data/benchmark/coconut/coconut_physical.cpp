@@ -549,20 +549,21 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  };
  std::unique_ptr<BenchmarkArchive> archive_reader;
  BenchmarkTraceSink publication_trace;
- if (state.trace) publication_trace = {state.trace.selection(), [&](std::string_view event, const nlohmann::json& value) {
-  trace_benchmark_event(state.trace, event, [&] {
-   if (value.is_null()) return value;
-   auto fields = value;
-   fields["artifact"] = archive.origin.artifact.artifact_id;
-   return fields;
-  });
- }};
+ if (state.trace)
+  publication_trace = {state.trace.selection(), [&](std::string_view event, const nlohmann::json& value) {
+   trace_benchmark_event(state.trace, event, [&] {
+    if (value.is_null()) return value;
+    auto fields = value;
+    fields["artifact"] = archive.origin.artifact.artifact_id;
+    return fields;
+   });
+  }};
  BenchmarkCompletionWindow publications(window_size, &execution.execution(), [&] {
   if (archive_reader && archive_reader->reclamation_useful()) {
-   trace_benchmark_event(publication_trace, "benchmark.images.pixel_wait", [&] {
-    return nlohmann::json{{"member", archive_reader->member()}, {"decoder_bytes", archive_reader->retained_workspace_bytes()}};
-   });
-   if (publication_trace.accepts("benchmark.images.pressure") && archive_reader->retained_workspace_bytes()) trace_compile_execution(publication_trace, "benchmark.images.pressure", execution.execution().snapshot());
+   trace_benchmark_event(
+    publication_trace, "benchmark.images.pixel_wait", [&] { return nlohmann::json{{"member", archive_reader->member()}, {"decoder_bytes", archive_reader->retained_workspace_bytes()}}; });
+   if (publication_trace.accepts("benchmark.images.pressure") && archive_reader->retained_workspace_bytes())
+    trace_compile_execution(publication_trace, "benchmark.images.pressure", execution.execution().snapshot());
    archive_reader->suspend();
   }
  });

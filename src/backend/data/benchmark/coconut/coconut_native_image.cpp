@@ -115,7 +115,7 @@ void CoconutNativeWorkspace::materialize(const std::shared_ptr<CoconutNativeImag
 std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::bind(
  std::shared_ptr<const CoconutNativeImage> source, const CoconutPhysicalImage& physical, std::shared_ptr<const CoconutNativeLineage> final_lineage) {
  if (final_lineage && (!source->can_finalize_unchanged() || final_lineage->component.annotation_input_identity != source->lineage().component.annotation_input_identity ||
-                      final_lineage->component.edition != source->lineage().component.edition || physical.image_id != source->inventory_.physical.image_id))
+                       final_lineage->component.edition != source->lineage().component.edition || physical.image_id != source->inventory_.physical.image_id))
   throw std::logic_error("COCONut: unchanged finalization requires the same admitted native input");
  if (!final_lineage && source->inventory_.physical == physical) return source;
  auto lineage = std::make_shared<CoconutNativeLineage>(final_lineage ? *final_lineage : *source->lineage_);
@@ -425,8 +425,8 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const C
  product->image_ = image;
  product->inventory_ = {physical, record.image_id, record.source_ordinal};
  product->recovery_ = std::move(recovery);
- product->unchanged_payload_ = unchanged && product->required_labels_valid_ && !product->rejected_.malformed_records && !product->rejected_.degenerate_boxes &&
-                               product->recovery_.objects.empty() && product->recovery_.omissions.empty() && !product->recovery_.unresolved;
+ product->unchanged_payload_ = unchanged && product->required_labels_valid_ && !product->rejected_.malformed_records && !product->rejected_.degenerate_boxes && product->recovery_.objects.empty() &&
+                               product->recovery_.omissions.empty() && !product->recovery_.unresolved;
  active_record_ = nullptr;
  product->input_identity_ = coconut_image_input_identity(product->lineage().component.annotation_input_identity, physical, product->lineage().component.original_annotation_identity);
  materialize(product, output);

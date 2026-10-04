@@ -20,8 +20,7 @@ const CpuTransferTable& cpu_transfer_table() {
   for (unsigned code = 1; code < 256; ++code)
    if (!(double(result.thresholds.linear[code]) - double(result.thresholds.linear[code - 1]) > 1.0 / CpuTransferTable::bucket_count))
     throw std::logic_error("CPU transfer thresholds exceed one correction per bucket");
-  for (unsigned bucket = 0; bucket <= CpuTransferTable::bucket_count; ++bucket)
-   result.base_code[bucket] = result.thresholds.quantize(float(bucket) * (1.0F / CpuTransferTable::bucket_count));
+  for (unsigned bucket = 0; bucket <= CpuTransferTable::bucket_count; ++bucket) result.base_code[bucket] = result.thresholds.quantize(float(bucket) * (1.0F / CpuTransferTable::bucket_count));
   return result;
  }();
  return table;

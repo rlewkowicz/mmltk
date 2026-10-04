@@ -115,11 +115,13 @@ BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t 
      auto output = owner.try_reserve(failed, parent_);
      if (output) {
       input->output = std::move(*output);
-      failed = {.bytes = size,
-                .continuation_descriptors = active_decoder ? 0U : 1U,
-                .supplied_workspace = true,
-                .workspace_class = detail::CompileWorkClass::Extraction,
-                .workspace_window = detail::CompileWorkspaceWindow::SharedSource};
+      failed = {
+       .bytes = size,
+       .continuation_descriptors = active_decoder ? 0U : 1U,
+       .supplied_workspace = true,
+       .workspace_class = detail::CompileWorkClass::Extraction,
+       .workspace_window = detail::CompileWorkspaceWindow::SharedSource
+      };
       auto granted = owner.try_reserve(failed, parent_);
       if (granted) {
        input->allowance = std::move(*granted);

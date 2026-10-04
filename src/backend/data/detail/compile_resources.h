@@ -60,6 +60,7 @@ class CompileRetryCustody {
  friend struct CompileAdmission;
  std::uint64_t bytes_ = 0, lineage_bytes_ = 0;
  std::size_t descriptors_ = 0, promised_ = 0;
+
 public:
  bool operator==(const CompileRetryCustody&) const = default;
 };

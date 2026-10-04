@@ -296,8 +296,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  scheduled.reserve(pending_writes);
  std::unordered_map<std::uint64_t, std::uint64_t> required_positions;
  required_positions.reserve(pending_writes);
- archive_reader =
-  std::make_unique<BenchmarkArchive>(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), 0, directory_allowance, request.decompression_workers, true, CompileAllowance{}, 1024, 0, 32768, request.trace);
+ archive_reader = std::make_unique<BenchmarkArchive>(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), 0, directory_allowance, request.decompression_workers, true,
+  CompileAllowance{}, 1024, 0, 32768, request.trace);
  auto& reader = *archive_reader;
  BenchmarkImagePublication write_pool(
   request.output_root, request.cancel_requested, request.storage, directory_allowance, request.execution, output_directory.get(), request.retain_encoded, reader, request.trace);
@@ -357,8 +357,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   if (std::filesystem::exists(cached_image_path(request.output_root, *image_id))) invalidate_cached_image_proofs(request.output_root);
   try {
    const auto generation = request.execution ? request.execution->image_generation(request.output_root, *image_id) : 0;
-   write_pool.submit(*image_id, std::move(input), header, request.image_ready,
-    [&, generation](const CachedImageReady& ready, std::exception_ptr error) { publish(ready, true, true, error, generation); });
+   write_pool.submit(
+    *image_id, std::move(input), header, request.image_ready, [&, generation](const CachedImageReady& ready, std::exception_ptr error) { publish(ready, true, true, error, generation); });
    scheduled.emplace(*image_id);
   } catch (const InvalidImageError& error) {
    if (!request.quarantine_unavailable) throw;

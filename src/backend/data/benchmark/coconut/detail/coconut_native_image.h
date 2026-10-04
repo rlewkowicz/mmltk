@@ -68,8 +68,7 @@ public:
  [[nodiscard]] std::span<const NormalizedBox> boxes() const noexcept { return mapped_boxes_.empty() ? std::span<const NormalizedBox>(boxes_) : mapped_boxes_; }
  [[nodiscard]] std::span<const RLEPair> runs() const noexcept { return mapped_runs_.empty() ? std::span<const RLEPair>(runs_) : mapped_runs_; }
  [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> stage(std::shared_ptr<const CoconutNativeImage>, CoconutStaging&);
- [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> bind(
-  std::shared_ptr<const CoconutNativeImage>, const CoconutPhysicalImage&, std::shared_ptr<const CoconutNativeLineage> = {});
+ [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> bind(std::shared_ptr<const CoconutNativeImage>, const CoconutPhysicalImage&, std::shared_ptr<const CoconutNativeLineage> = {});
  [[nodiscard]] bool can_finalize_unchanged() const noexcept { return staged_ && unchanged_payload_; }
  [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> rejected(const CoconutRecord&, const CoconutPhysicalImage&, std::shared_ptr<const CoconutNativeLineage>);
  [[nodiscard]] bool required_labels_valid() const noexcept { return required_labels_valid_; }

@@ -664,9 +664,7 @@ TEST_CASE("eight-lane transfer lookup preserves every threshold bucket and adjac
   CAPTURE(code);
   CHECK(std::bit_cast<std::uint32_t>(threshold) == std::bit_cast<std::uint32_t>(perceptual::decode(float(code) * (1.0F / 255.0F))));
   if (code) REQUIRE(double(threshold) - double(table.linear[code - 1]) > 1.0 / perceptual::CpuTransferTable::bucket_count);
-  const std::array values{
-   threshold, std::nextafter(threshold, -infinity), std::nextafter(threshold, infinity), -1.0F, 2.0F, std::numeric_limits<float>::quiet_NaN(), -infinity, infinity
-  };
+  const std::array values{threshold, std::nextafter(threshold, -infinity), std::nextafter(threshold, infinity), -1.0F, 2.0F, std::numeric_limits<float>::quiet_NaN(), -infinity, infinity};
   const auto output = check(values);
   CHECK(output[0] == code);
   CHECK(output[1] == (code ? code - 1 : 0));
@@ -685,8 +683,9 @@ TEST_CASE("eight-lane transfer lookup preserves every threshold bucket and adjac
   CHECK(table.quantize(last) - base <= 1);
   check({lower, std::nextafter(lower, -infinity), std::nextafter(lower, infinity), (lower + upper) * 0.5F, last, upper, std::nextafter(upper, infinity), -lower});
  }
- check({-0.0F, 0.0F, std::numeric_limits<float>::denorm_min(), -std::numeric_limits<float>::denorm_min(), std::numeric_limits<float>::min(), -std::numeric_limits<float>::min(),
-  std::numeric_limits<float>::lowest(), std::numeric_limits<float>::max()});
+ check(
+  {-0.0F, 0.0F, std::numeric_limits<float>::denorm_min(), -std::numeric_limits<float>::denorm_min(), std::numeric_limits<float>::min(), -std::numeric_limits<float>::min(),
+   std::numeric_limits<float>::lowest(), std::numeric_limits<float>::max()});
  CHECK(transfer.base_code.back() == 255);
 }
 TEST_CASE("checked resize plans retain their selected algorithm independently of storage", "[backend][data][image_resize][workspace]") {

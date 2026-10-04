@@ -1094,8 +1094,7 @@ private:
    const auto snapshot = request_.execution ? request_.execution->execution().snapshot() : detail::CompileExecutionSnapshot{};
    return nlohmann::json{
     {"image_id", image.inventory().physical.image_id}, {"kind", kind}, {"admitted_runs", image.admission() ? image.runs().size() : 0}, {"boxes", image.boxes().size()}, {"runs", image.runs().size()},
-    {"normal_locked", snapshot.normal_locked}, {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional},
-    {"staged_bytes", output.staged_bytes()}, {"copied_bytes", output.copied_bytes()}
+    {"normal_locked", snapshot.normal_locked}, {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}, {"staged_bytes", output.staged_bytes()}, {"copied_bytes", output.copied_bytes()}
    };
   });
  }
@@ -1245,7 +1244,8 @@ private:
      }
      target.complete = native->product;
      trace_benchmark_event(request_.trace, "benchmark.coconut.native_finalized", [&] {
-      return benchmark_observation_fields(CoconutNativeObservation{native->physical.image_id, native->product->boxes().size(), native->product->runs().size(), native->product->recovery().objects.size(), unchanged});
+      return benchmark_observation_fields(
+       CoconutNativeObservation{native->physical.image_id, native->product->boxes().size(), native->product->runs().size(), native->product->recovery().objects.size(), unchanged});
      });
     };
     const auto settle = [this, native, original](std::exception_ptr failure) {
@@ -1625,8 +1625,8 @@ private:
   // Semantic descendants own staged immutable input and reserve independently.
   constexpr std::uint64_t source_window = 0;
   if (!archive_) {
-   archive_ =
-    std::make_shared<Archive>(request_.mask_archive, request_.execution ? &request_.execution->execution() : nullptr, source_window, request_.parent_allowance, 1, true, CompileAllowance{}, 1024, 1, 32768, request_.trace);
+   archive_ = std::make_shared<Archive>(
+    request_.mask_archive, request_.execution ? &request_.execution->execution() : nullptr, source_window, request_.parent_allowance, 1, true, CompileAllowance{}, 1024, 1, 32768, request_.trace);
    records_.archive = archive_;
    admitted_ = true;
   } else if (paused_ || !admitted_) {
@@ -1903,7 +1903,8 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
  if (owned)
   owned->resume(workspace, request.parent_allowance);
  else
-  owned = std::make_shared<Archive>(request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), workspace, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0, 32768, request.trace);
+  owned = std::make_shared<Archive>(
+   request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), workspace, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0, 32768, request.trace);
  auto& archive = *owned;
  retained.archive = owned;
  std::unique_ptr<AnnotationMaskStream> masks;
@@ -2122,7 +2123,8 @@ void CoconutAnnotationRecords::discard() noexcept {
  prefixes_sealed_ = false;
 }
 std::shared_ptr<BenchmarkArchive> discover_coconut_masks(const CoconutImportRequest& request, std::stop_token stop) {
- auto archive = std::make_shared<Archive>(request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), 0, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0, 32768, request.trace);
+ auto archive = std::make_shared<Archive>(
+  request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), 0, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0, 32768, request.trace);
  // Keep only the archive owner's compact locators. The eventual annotation
  // consumer borrows this same generation and its forward compressed context.
  try {

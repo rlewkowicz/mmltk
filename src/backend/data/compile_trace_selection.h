@@ -16,8 +16,7 @@ class CompileTraceSelection final {
 
 public:
  CompileTraceSelection() = default;
- explicit CompileTraceSelection(std::vector<std::string> prefixes)
-     : prefixes_(prefixes.empty() ? nullptr : std::make_shared<const std::vector<std::string>>(std::move(prefixes))) {}
+ explicit CompileTraceSelection(std::vector<std::string> prefixes) : prefixes_(prefixes.empty() ? nullptr : std::make_shared<const std::vector<std::string>>(std::move(prefixes))) {}
  [[nodiscard]] bool accepts(std::string_view event) const noexcept {
   return !prefixes_ || std::ranges::any_of(*prefixes_, [&](const auto& prefix) { return event.starts_with(prefix); });
  }
@@ -31,9 +30,11 @@ class CompileTraceSink final {
 
 public:
  CompileTraceSink() = default;
- template <class F> requires (!std::same_as<std::remove_cvref_t<F>, CompileTraceSink> && std::is_invocable_r_v<void, F&, std::string_view, Payload>)
+ template <class F>
+  requires(!std::same_as<std::remove_cvref_t<F>, CompileTraceSink> && std::is_invocable_r_v<void, F&, std::string_view, Payload>)
  CompileTraceSink(F&& delivery) : delivery_(std::forward<F>(delivery)) {}
- template <class F> requires std::is_invocable_r_v<void, F&, std::string_view, Payload>
+ template <class F>
+  requires std::is_invocable_r_v<void, F&, std::string_view, Payload>
  CompileTraceSink(CompileTraceSelection selection, F&& delivery) : selection_(std::move(selection)), delivery_(std::forward<F>(delivery)) {}
  [[nodiscard]] explicit operator bool() const noexcept { return bool(delivery_); }
  [[nodiscard]] bool accepts(std::string_view event) const noexcept { return delivery_ && selection_.accepts(event); }

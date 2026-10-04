@@ -106,7 +106,8 @@ std::vector<FileHandle::Range> FileHandle::normalize_ranges(std::span<const Rang
   if (used && range.offset <= ranges[used - 1].end()) {
    auto& previous = ranges[used - 1];
    previous.bytes = std::max(previous.end(), range.end()) - previous.offset;
-  } else ranges[used++] = range;
+  } else
+   ranges[used++] = range;
  }
  ranges.resize(used);
  return ranges;
@@ -146,14 +147,20 @@ bool FileHandle::punch_holes(std::span<const Range> ranges, concurrency::Cancell
  if (completed) *completed = 0;
  for (const auto& range : ranges) (void)range.end();
  for (const auto& range : ranges) {
-  if (!range.bytes) { if (completed) ++*completed; continue; }
+  if (!range.bytes) {
+   if (completed) ++*completed;
+   continue;
+  }
   int result;
   do {
    if (cancellation.requested()) throw std::runtime_error("file reclamation cancelled");
    if (syscalls) ++*syscalls;
    result = ::fallocate(get(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(range.offset), static_cast<off_t>(range.bytes));
   } while (result < 0 && errno == EINTR);
-  if (!result) { if (completed) ++*completed; continue; }
+  if (!result) {
+   if (completed) ++*completed;
+   continue;
+  }
   if (errno == EOPNOTSUPP || errno == ENOSYS) return false;
   throw errno_error("file extent reclaim failed");
  }

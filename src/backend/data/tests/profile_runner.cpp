@@ -101,19 +101,19 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
   RgbMutableImageView destination{output[lane].data(), pixel_plans[i].destination()};
   if (opts.mode == ProfileMode::Resample) {
    resizers[lane]->prepare(resize_plans[i], memory);
-   resizers[lane]->resize_to_planar(
-    {decoded[i].data(), {inputs[i].width, inputs[i].height, std::size_t(inputs[i].width) * 3, 0, decoded[i].size(), RgbPixelFormat::RGB8}}, destination, policy.mode,
+   resizers[lane]->resize_to_planar({decoded[i].data(), {inputs[i].width, inputs[i].height, std::size_t(inputs[i].width) * 3, 0, decoded[i].size(), RgbPixelFormat::RGB8}}, destination, policy.mode,
     observe_resize ? &resize_work[lane] : nullptr);
   } else {
    CompilePixelObserver observed;
-   if (trace.accepts("compile.pixel")) observed = [&](const CompilePixelObservation& value) {
-    benchmark_internal::trace_benchmark_event(trace, "compile.pixel", [&] {
-     auto fields = benchmark_internal::benchmark_observation_fields(value);
-     fields["image_id"] = index;
-     fields["input_index"] = i;
-     return fields;
-    });
-   };
+   if (trace.accepts("compile.pixel"))
+    observed = [&](const CompilePixelObservation& value) {
+     benchmark_internal::trace_benchmark_event(trace, "compile.pixel", [&] {
+      auto fields = benchmark_internal::benchmark_observation_fields(value);
+      fields["image_id"] = index;
+      fields["input_index"] = i;
+      return fields;
+     });
+    };
    pixels[lane]->write(pixel_plans[i], inputs[i].encoded, pixel_plans[i].header(), memory, destination, +[] {}, observed, observe_resize ? &resize_work[lane] : nullptr);
   }
  });
@@ -129,9 +129,8 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
   RgbResizeWork work;
   for (const auto& lane : resize_work)
    mmltk::frameworks::reflection::visit_materialized_members<RgbResizeWork>([&]<class Declaration>(const auto&) { work.*Declaration::pointer += lane.*Declaration::pointer; });
-  benchmark_internal::trace_benchmark_event(trace, "profile.resize.completed", [&] {
-   return nlohmann::json{{"layout", benchmark_internal::benchmark_observation_fields(layout_work)}, {"resize", benchmark_internal::benchmark_observation_fields(work)}};
-  });
+  benchmark_internal::trace_benchmark_event(trace, "profile.resize.completed",
+   [&] { return nlohmann::json{{"layout", benchmark_internal::benchmark_observation_fields(layout_work)}, {"resize", benchmark_internal::benchmark_observation_fields(work)}}; });
   std::printf("cpu_profile resize_preparations=%llu resize_allocation_requests=%llu resize_allocation_bytes=%llu\n", static_cast<unsigned long long>(work.preparations),
    static_cast<unsigned long long>(work.allocation_requests), static_cast<unsigned long long>(work.allocation_bytes));
  }
@@ -188,19 +187,21 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts, cons
   observation.execution = +[](void* context, std::string_view event, const detail::CompileExecutionSnapshot& value) {
    benchmark_internal::trace_compile_execution(*static_cast<benchmark_internal::BenchmarkTraceSink*>(context), event, value);
   };
-  if (trace.accepts("compile.pixel")) observation.pixel = +[](void* context, std::uint32_t image, const detail::CompilePixelObservation& value) {
-   const auto& sink = *static_cast<benchmark_internal::BenchmarkTraceSink*>(context);
-   benchmark_internal::trace_benchmark_event(sink, "compile.pixel", [&] {
-    auto fields = benchmark_internal::benchmark_observation_fields(value);
-    fields["image_id"] = image;
-    fields["source"] = "directory";
-    return fields;
-   });
-  };
-  if (trace.accepts("compile.compaction.summary")) observation.compaction = +[](void* context, const CompiledCompactionObservation& value) {
-   const auto& sink = *static_cast<benchmark_internal::BenchmarkTraceSink*>(context);
-   benchmark_internal::trace_benchmark_event(sink, "compile.compaction.summary", [&] { return benchmark_internal::benchmark_observation_fields(value); });
-  };
+  if (trace.accepts("compile.pixel"))
+   observation.pixel = +[](void* context, std::uint32_t image, const detail::CompilePixelObservation& value) {
+    const auto& sink = *static_cast<benchmark_internal::BenchmarkTraceSink*>(context);
+    benchmark_internal::trace_benchmark_event(sink, "compile.pixel", [&] {
+     auto fields = benchmark_internal::benchmark_observation_fields(value);
+     fields["image_id"] = image;
+     fields["source"] = "directory";
+     return fields;
+    });
+   };
+  if (trace.accepts("compile.compaction.summary"))
+   observation.compaction = +[](void* context, const CompiledCompactionObservation& value) {
+    const auto& sink = *static_cast<benchmark_internal::BenchmarkTraceSink*>(context);
+    benchmark_internal::trace_benchmark_event(sink, "compile.compaction.summary", [&] { return benchmark_internal::benchmark_observation_fields(value); });
+   };
   ccfg.observation = &observation;
  }
  const auto compile_start = std::chrono::steady_clock::now();
@@ -296,7 +297,8 @@ int main(int argc, char** argv) {
     config.perceptual_downscale = opts.perceptual;
     config.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
     config.overwrite = true;
-    if (trace_sink) config.trace = {trace_sink.selection(), [&](std::string_view event, std::string_view fields) { trace_sink(event, fields.empty() ? nlohmann::json{} : nlohmann::json::parse(fields)); }};
+    if (trace_sink)
+     config.trace = {trace_sink.selection(), [&](std::string_view event, std::string_view fields) { trace_sink(event, fields.empty() ? nlohmann::json{} : nlohmann::json::parse(fields)); }};
     const auto started = std::chrono::steady_clock::now();
     config.progress = [started, next = started, phase = DatasetCompilePhase::Planning](const BenchmarkCompileProgress& value) mutable {
      const auto now = std::chrono::steady_clock::now();

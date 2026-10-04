@@ -2099,7 +2099,8 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
  const auto resumed_checkpoint = read_json_file(metadata_path);
  for (const auto& segment : resumed_checkpoint.at("segments")) retained_before_retry += segment.at("completed").get<std::uint64_t>();
  std::atomic<bool> traced_retry{false}, traced_complete{false}, traced_bytes{false}, traced_second_attempt{false}, invalid_byte_facts{false};
- const BenchmarkTraceSink resume_trace{completion_only ? CompileTraceSelection({"benchmark.download.segmented_complete"}) : CompileTraceSelection{}, [&](const std::string_view event, const nlohmann::json& fields) {
+ const BenchmarkTraceSink resume_trace{
+  completion_only ? CompileTraceSelection({"benchmark.download.segmented_complete"}) : CompileTraceSelection{}, [&](const std::string_view event, const nlohmann::json& fields) {
   if (event == "benchmark.download.progress") {
    traced_bytes.store(true, std::memory_order_relaxed);
    if (fields.at("attempt") == 2U) { traced_second_attempt.store(true, std::memory_order_relaxed); }
@@ -2111,8 +2112,10 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
    CHECK(fields.at("resumed") == true);
    CHECK(fields.at("retained_bytes").get<std::uint64_t>() > retained_before_retry);
    CHECK(fields.at("retained_bytes").get<std::uint64_t>() <= bytes);
-  } else if (completion_only) FAIL("completion-only selection delivered an excluded event");
- }};
+  } else if (completion_only)
+   FAIL("completion-only selection delivered an excluded event");
+ }
+ };
  const auto resumed = download_artifacts({request}, 1U, {}, {}, resume_trace);
  CHECK(traced_retry.load(std::memory_order_relaxed) == !completion_only);
  CHECK(traced_complete.load(std::memory_order_relaxed));
@@ -2325,13 +2328,22 @@ TEST_CASE("trace selection crosses serialized and enriching adapters before cons
    return copy;
   });
  }};
- trace_benchmark_event(enriched, "benchmark.test.excluded", [&] { ++builds; return nlohmann::json::object(); });
+ trace_benchmark_event(enriched, "benchmark.test.excluded", [&] {
+  ++builds;
+  return nlohmann::json::object();
+ });
  CHECK(builds == 0);
  CHECK(deliveries == 0);
- trace_benchmark_event(enriched, "benchmark.test.accepted", [&] { ++builds; return nlohmann::json::object(); });
+ trace_benchmark_event(enriched, "benchmark.test.accepted", [&] {
+  ++builds;
+  return nlohmann::json::object();
+ });
  CHECK(builds == 1);
  CHECK(deliveries == 1);
- trace_benchmark_event(enriched, "benchmark.test.accepted", [&]() -> nlohmann::json { ++builds; throw std::runtime_error("selected construction failed"); });
+ trace_benchmark_event(enriched, "benchmark.test.accepted", [&]() -> nlohmann::json {
+  ++builds;
+  throw std::runtime_error("selected construction failed");
+ });
  CHECK(builds == 2);
  CHECK(deliveries == 2);
  CHECK_FALSE(BenchmarkTraceSink{}.accepts("benchmark.test.accepted"));
@@ -2348,7 +2360,10 @@ TEST_CASE("cost spans collect independently selected endpoints", "[backend][data
   ++delivered;
  }};
  {
-  BenchmarkCostSpan span(sink, BenchmarkCostKind::Selection, [&] { ++built; return nlohmann::json::object(); });
+  BenchmarkCostSpan span(sink, BenchmarkCostKind::Selection, [&] {
+   ++built;
+   return nlohmann::json::object();
+  });
   span.finish();
   span.finish();
  }
@@ -2404,7 +2419,10 @@ TEST_CASE("selected rejection snapshots retain parked resource demand facts", "[
  CHECK(observer.demand().detailed_demands());
  CompileExecution execution(1, {}, {.transient_bytes = 4096, .task_records = 2}, {}, observer);
  auto held = execution.reserve({4096, 0});
- const mmltk::testsupport::ScopedTestCleanup cleanup([&] { held = {}; execution.cancel(); });
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  held = {};
+  execution.cancel();
+ });
  auto blocked = execution.submit({.kind = CompileTaskKind::Normalize, .resources = {1, 0}, .work = [](std::size_t, const CompileAllowance&) {}});
  // A fitting same-kind successor passes the older demand after it is probed.
  // Borrowed custody leaves its resource epoch stable through the barrier.
@@ -2426,9 +2444,7 @@ TEST_CASE("selected rejection snapshots retain parked resource demand facts", "[
  }
  REQUIRE(rejected);
  const auto& demands = rejected->at("demands");
- const auto parked = std::ranges::find_if(demands, [](const nlohmann::json& demand) {
-  return demand.at("kind") == static_cast<unsigned>(CompileTaskKind::Normalize);
- });
+ const auto parked = std::ranges::find_if(demands, [](const nlohmann::json& demand) { return demand.at("kind") == static_cast<unsigned>(CompileTaskKind::Normalize); });
  REQUIRE(parked != demands.end());
  CHECK(parked->at("requested_bytes") == 1);
  CHECK(parked->at("denial") == static_cast<unsigned>(detail::CompileResourceDenial::Bytes));
@@ -7235,8 +7251,8 @@ TEST_CASE("admission readiness retains external returns across local rollback an
  SECTION("external return survives acknowledgement of the prior delivery") { returned = Return::Delivery; }
  using Changes = CompileExecution::Readiness::Changes;
  using mmltk::backend::data::detail::CompileWorkClass;
- CompileExecution execution(
-  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
+ CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8}, {},
+  observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  auto parent = execution.reserve(CompileResources::handles(0, false, 2));
  auto external = execution.reserve(CompileResources::handles(5));
  mmltk::testsupport::TestGate initial("hold readiness before partial admission"), failed("last descriptor draw failed before rollback"), delivering("hold acknowledged readiness batch");
@@ -7318,11 +7334,19 @@ TEST_CASE("one armed event turn retains coalesced causes and callback arrivals",
   std::promise<Changes> batch, arrival;
   unsigned calls = 0;
   auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Records, [&](Changes changes) {
-   if (++calls == 1) delivering.receipt().ArriveAndWait();
-   else if (calls == 2) { batch.set_value(changes); second.receipt().ArriveAndWait(); }
-   else if (calls == 3) arrival.set_value(changes);
+   if (++calls == 1)
+    delivering.receipt().ArriveAndWait();
+   else if (calls == 2) {
+    batch.set_value(changes);
+    second.receipt().ArriveAndWait();
+   } else if (calls == 3)
+    arrival.set_value(changes);
   });
-  const mmltk::testsupport::ScopedTestCleanup cleanup([&] { delivering.Release(); second.Release(); readiness.reset(); });
+  const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+   delivering.Release();
+   second.Release();
+   readiness.reset();
+  });
   readiness->notify();
   REQUIRE(delivering.WaitEntered(5s));
   const auto before = execution.snapshot().costs.eventfd_writes;
@@ -7346,8 +7370,9 @@ TEST_CASE("bounded record turnover keeps stale physical completions independent"
  std::atomic<unsigned> bodies{0}, callbacks{0};
  for (unsigned turn = 0; turn < 24; ++turn) {
   CompileExecution::Dependency parked(execution);
-  const auto task = [&](CompileTaskKind kind) { return CompileExecution::Task{.kind = kind,
-   .work = [&](std::size_t, const CompileAllowance&) { ++bodies; }, .completed = [&](std::exception_ptr) { ++callbacks; }}; };
+  const auto task = [&](CompileTaskKind kind) {
+   return CompileExecution::Task{.kind = kind, .work = [&](std::size_t, const CompileAllowance&) { ++bodies; }, .completed = [&](std::exception_ptr) { ++callbacks; }};
+  };
   auto cancelled = execution.try_subscribe(parked, parked.generation(), task(CompileTaskKind::Normalize));
   auto ready = execution.try_submit(task(CompileTaskKind::Header));
   auto resumed = execution.try_subscribe(parked, parked.generation(), task(CompileTaskKind::Pixels));
@@ -7378,8 +7403,8 @@ TEST_CASE("accepted local readiness retries after custody commits", "[backend][d
  // CLEANUP-IGNORE: Independent readiness scenarios share only type aliases and optional-observer fixture setup; their state transitions differ.
  using Changes = CompileExecution::Readiness::Changes;
  const bool observed = GENERATE(false, true);
- CompileExecution execution(
-  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
+ CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8}, {},
+  observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  mmltk::testsupport::TestGate initial("hold readiness before accepted draw"), delivering("local changes acknowledged before custody commits");
  std::promise<Changes> drawn, committed, external;
  unsigned deliveries = 0;
@@ -7431,8 +7456,8 @@ TEST_CASE("accepted local readiness retries after custody commits", "[backend][d
 TEST_CASE("readiness preserves pending interests and implicitly delivers interruption", "[backend][data][benchmark][pipeline][resources]") {
  using Changes = CompileExecution::Readiness::Changes;
  const bool observed = GENERATE(false, true);
- CompileExecution execution(
-  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
+ CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8}, {},
+  observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  mmltk::testsupport::TestGate initial("hold notifier before changing interests"), delivering("hold prior interest batch during targeted publication");
  std::promise<Changes> pending, targeted, interrupted;
  unsigned deliveries = 0;
@@ -10472,11 +10497,9 @@ TEST_CASE("provenance settlement coalesces used record blocks while preserving m
  auto& writer = fixture.writer;
  const auto& output = fixture.output;
  const auto publication = execution.source_publication(images, {});
- std::array<BenchmarkSplitWriter::LabelSettlement, 3> settlements{{
-  {.ordinal_incomplete = true, .ordinal_base = 100},
-  {.ordinal_incomplete = false, .ordinal_base = 3},
-  {.ordinal_incomplete = false, .ordinal_base = 0}
- }};
+ std::array<BenchmarkSplitWriter::LabelSettlement, 3> settlements{
+  {{.ordinal_incomplete = true, .ordinal_base = 100}, {.ordinal_incomplete = false, .ordinal_base = 3}, {.ordinal_incomplete = false, .ordinal_base = 0}}
+ };
  std::array<std::uint32_t, settlements.size()> selected{};
  constexpr std::size_t count = 519;
  std::vector<PackedInstance> labels(count);
@@ -11196,7 +11219,10 @@ TEST_CASE("external oversized membership follows registration order through prom
  const auto page = mmltk::common::system::host_page_size();
  CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 4}, {}, {{.aggregates = observed}, [](std::string_view, const CompileExecutionSnapshot&) {}});
  mmltk::testsupport::TestGate running("worker selection remains gated during membership transitions");
- const mmltk::testsupport::ScopedTestCleanup cleanup([&] { running.Release(); execution.retire_attempt(); });
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  running.Release();
+  execution.retire_attempt();
+ });
  auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
  REQUIRE(running.WaitEntered(5s));
  const CompileResources ordinary{.bytes = page / 2}, first{.bytes = page * 2, .supplied_workspace = true}, second{.bytes = page * 3, .supplied_workspace = true};
@@ -11295,7 +11321,10 @@ TEST_CASE("cancellation retires mixed external memberships before final parent r
  const auto page = mmltk::common::system::host_page_size();
  CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 4});
  mmltk::testsupport::TestGate running("physical task remains alive while demand is cancelled");
- const mmltk::testsupport::ScopedTestCleanup cleanup([&] { running.Release(); execution.retire_attempt(); });
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  running.Release();
+  execution.retire_attempt();
+ });
  auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
  REQUIRE(running.WaitEntered(5s));
  auto parent = execution.reserve({.bytes = page, .descriptors = 1});
@@ -11553,7 +11582,10 @@ TEST_CASE("external exceptional selection bypasses a head without its protected 
  const auto page = mmltk::common::system::host_page_size();
  CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 6}, {}, {{.aggregates = true}, [](std::string_view, const CompileExecutionSnapshot&) {}});
  mmltk::testsupport::TestGate running("candidate visits are measured while the worker holds its record");
- const mmltk::testsupport::ScopedTestCleanup cleanup([&] { running.Release(); execution.retire_attempt(); });
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  running.Release();
+  execution.retire_attempt();
+ });
  auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
  REQUIRE(running.WaitEntered(5s));
  auto occupied = execution.try_retain(CompileTaskKind::Pixels);
@@ -11829,8 +11861,8 @@ TEST_CASE("external workspace retirement delivers every returned resource to que
  using Changes = CompileExecution::Readiness::Changes;
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  const bool observed = GENERATE(false, true);
- CompileExecution execution(
-  2, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
+ CompileExecution execution(2, {}, {.transient_bytes = 64, .descriptors = 8}, {},
+  observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  auto external = execution.reserve({.bytes = 64, .descriptors = 1, .cpu_workers = 1});
  auto alias = external;
  auto acquisition = execution.open_class(CompileWorkClass::Acquisition);
@@ -12233,7 +12265,8 @@ TEST_CASE("borrowed file demand observes notifying and legacy cancellation throu
 }
 TEST_CASE("file observation demand follows independently selected endpoints", "[backend][data][benchmark][pipeline][trace]") {
  using detail::FileWorkQueue;
- const std::string selected = GENERATE("", "benchmark.unrelated", "file.", "file.service.started", "file.service.stopped", "file.admitted", "file.running", "file.physical_completed", "file.completed", "file.wait_cpu", "file.wait_records");
+ const std::string selected = GENERATE("", "benchmark.unrelated", "file.", "file.service.started", "file.service.stopped", "file.admitted", "file.running", "file.physical_completed", "file.completed",
+  "file.wait_cpu", "file.wait_records");
  const bool throwing = GENERATE(false, true);
  CAPTURE(selected, throwing);
  const bool full = selected == "file.";
@@ -12243,14 +12276,15 @@ TEST_CASE("file observation demand follows independently selected endpoints", "[
  std::vector<std::pair<std::string, FileWorkQueue::Observation>> events;
  std::promise<void> waiting;
  FileWorkQueue::Observer observer;
- if (!selected.empty()) observer = {CompileTraceSelection({selected}), [&](std::string_view event, const FileWorkQueue::Observation& value) {
-  {
-   const std::lock_guard lock(mutex);
-   events.emplace_back(event, value);
-  }
-  if (event == "file.wait_cpu") mmltk::testsupport::release_test_promise(waiting);
-  if (throwing) throw std::runtime_error("file observation delivery failed after receipt");
- }};
+ if (!selected.empty())
+  observer = {CompileTraceSelection({selected}), [&](std::string_view event, const FileWorkQueue::Observation& value) {
+   {
+    const std::lock_guard lock(mutex);
+    events.emplace_back(event, value);
+   }
+   if (event == "file.wait_cpu") mmltk::testsupport::release_test_promise(waiting);
+   if (throwing) throw std::runtime_error("file observation delivery failed after receipt");
+  }};
  constexpr std::array<std::uint64_t, 2> sizes{17, 29};
  std::array<std::uint64_t, 2> output{};
  std::atomic<unsigned> callbacks{0}, failures{0};
@@ -12258,7 +12292,11 @@ TEST_CASE("file observation demand follows independently selected endpoints", "[
  auto held = execution.service_grant(CompileWorkClass::Output);
  {
   FileWorkQueue files(execution, sizes.size(), 1, observer);
-  const mmltk::testsupport::ScopedTestCleanup cleanup([&] { held = {}; files.cancel(); files.join(); });
+  const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+   held = {};
+   files.cancel();
+   files.join();
+  });
   CHECK(files.observes_operation_bytes() == bytes);
   std::array<CompileExecution::Completion, sizes.size()> work;
   for (std::size_t i = 0; i < sizes.size(); ++i) {
@@ -12310,8 +12348,10 @@ TEST_CASE("file observation demand follows independently selected endpoints", "[
    CHECK(value.bytes == sizes[value.operation - 1]);
    CHECK(value.work_class == CompileWorkClass::Output);
    if (timing && event != "file.completed") CHECK(value.total_bytes == (value.operation == 1 ? 0 : sizes[0]));
-   if (event == "file.running") CHECK(value.running[output_class] == 1);
-   else if (event == "file.physical_completed") CHECK(value.completing[output_class] == 1);
+   if (event == "file.running")
+    CHECK(value.running[output_class] == 1);
+   else if (event == "file.physical_completed")
+    CHECK(value.completing[output_class] == 1);
    else {
     CHECK(value.completed == value.operation);
     CHECK(value.total_bytes == (value.operation == 1 ? sizes[0] : sizes[0] + sizes[1]));
@@ -12336,7 +12376,7 @@ TEST_CASE("file observation demand follows independently selected endpoints", "[
  for (const auto event : {"file.service.started", "file.service.stopped", "file.admitted", "file.running", "file.physical_completed", "file.completed", "file.wait_records"}) {
   const auto count = std::string_view(event).starts_with("file.service.") || std::string_view(event) == "file.wait_records" ? 1U : sizes.size();
   const auto expected = full || selected == event ? count : 0U;
-  CHECK(std::ranges::count_if(events, [&](const auto& observation) { return observation.first == event; }) == expected);
+  CHECK(std::cmp_equal(std::ranges::count_if(events, [&](const auto& observation) { return observation.first == event; }), expected));
  }
 }
 TEST_CASE("borrowed file records retain physical completion and share compile service capacity", "[backend][data][benchmark][pipeline]") {
@@ -12854,7 +12894,7 @@ TEST_CASE("decoded RGB extent is checked independently of codec workspace", "[ba
   const auto plan = CompileImageDecoder::plan(header);
   CHECK(plan.output_bytes == (encoding == CompileImageEncoding::Jpeg ? header.rgb_bytes() : 0));
   CHECK(plan.stb_bytes == (encoding == CompileImageEncoding::Jpeg ? 0 : header.decoder_bytes));
-  for (const auto dimensions : {std::pair{0U, 1U}, std::pair{1U, 0U}, std::pair{std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()}}) {
+  for (const auto& dimensions : {std::pair{0U, 1U}, std::pair{1U, 0U}, std::pair{std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()}}) {
    header.width = dimensions.first;
    header.height = dimensions.second;
    CHECK_THROWS_AS(header.rgb_bytes(), CompileImageError);
@@ -13681,7 +13721,7 @@ TEST_CASE("staged range batches normalize coverage and preserve sibling promises
  const std::array punches{Range{8192, 4096}, Range{4096, 4096}, Range{8192, 1}};
  const auto backed = detail::StorageReservationPool::allocated_bytes(stage.file().get());
  const auto punched = stage.reclaim_ranges(punches, {}, &calls);
- CHECK(calls == 2); // Adjacent and overlapping requests share one kernel punch.
+ CHECK(calls == 2);  // Adjacent and overlapping requests share one kernel punch.
  CHECK(pool.outstanding() == 8192);
  if (punched) CHECK(detail::StorageReservationPool::allocated_bytes(stage.file().get()) < backed);
  CHECK(samples == initial_samples + 1);
@@ -14437,8 +14477,8 @@ TEST_CASE("custom archive admission retires decoder and unaccepted input through
  };
  const auto archive_bytes = BenchmarkArchive::input_requirement(archive, 0).workspace_bytes;
  const std::array<CompileWorkspaceProfile, 1> profiles{{{archive_bytes, 0}}};
- auto plan = std::make_shared<CompileWorkspacePlan>(
-  CompileWorkspacePlan::prepare(3, profiles, BenchmarkEncodedImage::normal_window_bytes, 0, BenchmarkEncodedImage::normal_window_bytes + 3 * archive_bytes));
+ auto plan =
+  std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3, profiles, BenchmarkEncodedImage::normal_window_bytes, 0, BenchmarkEncodedImage::normal_window_bytes + 3 * archive_bytes));
  BenchmarkCompilePipeline pipeline(3, {}, {.workspace_plan = plan}, {}, trace);
  std::array<CompileAllowance, 2> occupied{
   pipeline.execution().reserve({.bytes = BenchmarkEncodedImage::normal_window_bytes, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::SharedSource}),
@@ -15573,7 +15613,6 @@ TEST_CASE("immutable row admission survives identity rebinding and rejects chang
  CHECK_THROWS(assembly.gather(std::span(&slice, 1)));
  CHECK_THROWS(assembly.finish());
 }
-
 TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under selected summaries", "[backend][data][benchmark][pipeline][resources][trace]") {
  using namespace mmltk::backend::data::testsupport;
  const bool pooled = GENERATE(false, true);
@@ -15584,7 +15623,7 @@ TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under s
  const std::array<std::size_t, 8> order{0, 1, 1, 0, 1, 0, 0, 1};
  const auto annotations = pipeline_annotation_fixture(inputs, order);
  const auto images = root.path() / "images";
- PreparedBenchmarkSplit split{.name = "train", .class_names = {"object"}, .sources = {{images}}};
+ PreparedBenchmarkSplit split{.name = "train", .class_names = {"object"}, .sources = {{images}}, .images = {}};
  std::vector<BenchmarkEncodedImage::Ptr> encoded;
  for (std::size_t i = 0; i < order.size(); ++i) {
   const auto& input = inputs[order[i]];
@@ -15594,13 +15633,17 @@ TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under s
  std::optional<nlohmann::json> summary, execution_summary;
  std::mutex file_mutex;
  std::vector<nlohmann::json> file_events;
- const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.pipeline.retired", "compile.execution.retired", file_event}),
-  [&](std::string_view event, const nlohmann::json& fields) {
-   if (event == "benchmark.pipeline.retired") summary = fields;
-   else if (event == "compile.execution.retired") execution_summary = fields;
-   else if (event == file_event) { const std::lock_guard lock(file_mutex); file_events.push_back(fields); }
-   else FAIL("excluded detailed event reached selected summary");
-  }};
+ const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.pipeline.retired", "compile.execution.retired", file_event}), [&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "benchmark.pipeline.retired")
+   summary = fields;
+  else if (event == "compile.execution.retired")
+   execution_summary = fields;
+  else if (event == file_event) {
+   const std::lock_guard lock(file_mutex);
+   file_events.push_back(fields);
+  } else
+   FAIL("excluded detailed event reached selected summary");
+ }};
  {
   BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 4U << 20}, {}, trace);
   auto request = benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline);
@@ -15664,13 +15707,14 @@ TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under s
    CHECK(fields.at("bytes") == 0);
   }
  }
- if (!pooled) CHECK(observed_bytes == input_bytes);
- else CHECK(observed_bytes <= input_bytes);
+ if (!pooled)
+  CHECK(observed_bytes == input_bytes);
+ else
+  CHECK(observed_bytes <= input_bytes);
  if (input_calls == 0) CHECK(observed_bytes == 0);
  CHECK(image_events == (file_event == "file.service.stopped" ? 1 : input_calls + order.size()));
  if (file_event == "file.service.stopped") CHECK(file_events.size() == 2);
 }
-
 TEST_CASE("a finite Workspace pass yields to other owners and reaches a fitting tail", "[benchmark][pipeline][images][resources]") {
  using namespace mmltk::backend::data::detail;
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPUs");
@@ -15692,22 +15736,28 @@ TEST_CASE("a finite Workspace pass yields to other owners and reaches a fitting 
  const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.pipeline.ready"}), [&](std::string_view, const nlohmann::json& fields) {
   evidence.observe(fields);
   if (fields.at("yielded").get<bool>() && first_yield.exchange(false)) peer->notify();
-  if (fields.at("header") == 0 && fields.at("workspace") == count && !fields.at("yielded").get<bool>() && first_park.exchange(false))
-   mmltk::testsupport::release_test_promise(parked);
+  if (fields.at("header") == 0 && fields.at("workspace") == count && !fields.at("yielded").get<bool>() && first_park.exchange(false)) mmltk::testsupport::release_test_promise(parked);
  }};
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, {}, 0, 0, budget));
  BenchmarkCompilePipeline pipeline(3, {}, {.transient_bytes = budget, .workspace_plan = plan}, {}, trace);
  BoundBenchmarkWriter fixture(pipeline, benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline, true));
  peer = std::make_unique<CompileExecution::Readiness>(pipeline.execution(), CompileChange::None, [&](auto) { mmltk::testsupport::release_test_promise(other_owner); });
  auto retained = pipeline.execution().reserve({.bytes = budget - (80U << 10)});
- const mmltk::testsupport::ScopedTestCleanup release([&] { retained = {}; pipeline.retire_attempt(); peer.reset(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  retained = {};
+  pipeline.retire_attempt();
+  peer.reset();
+ });
  const auto publication = pipeline.source_publication(images, {}, {}, true);
  for (std::size_t id = 1; id <= count; ++id) publication({id});
  mmltk::testsupport::await_test_promise(parked, "the complete denied Workspace pass parks", 5s);
  mmltk::testsupport::await_test_promise(other_owner, "another owner runs between bounded Local turns", 5s);
  publication({count + 1});
  pipeline.image_completion(images, count + 1).subscribe([&](std::exception_ptr error) {
-  if (error) tail.set_exception(error); else mmltk::testsupport::release_test_promise(tail);
+  if (error)
+   tail.set_exception(error);
+  else
+   mmltk::testsupport::release_test_promise(tail);
  });
  mmltk::testsupport::await_test_promise(tail, "fitting tail advances through a bounded blocked Workspace backlog", 5s);
  CHECK_FALSE(pipeline.image_completion(images, 1).ready());
@@ -15717,7 +15767,6 @@ TEST_CASE("a finite Workspace pass yields to other owners and reaches a fitting 
  CHECK(fixture.writer.completed() == count + 1);
  CHECK(evidence.bounded);
 }
-
 TEST_CASE("synthetic profile extents obey their input budget before encoding", "[backend][data][benchmark][profile]") {
  using namespace mmltk::backend::data::testsupport;
  const auto encoding = GENERATE(FixtureImageEncoding::Png, FixtureImageEncoding::Jpeg);
@@ -15727,7 +15776,6 @@ TEST_CASE("synthetic profile extents obey their input budget before encoding", "
  CHECK_FALSE(input.encoded.empty());
  CHECK(input.encoded.size() <= 4096);
 }
-
 TEST_CASE("reclamation uses failed dimensions and live promise ancestry", "[benchmark][pipeline][archive][resources]") {
  using namespace mmltk::backend::data::detail;
  const auto page = mmltk::common::system::host_page_size();
@@ -15807,7 +15855,7 @@ TEST_CASE("archive retirement cooperates across byte and descriptor shortages", 
   REQUIRE(second.reclamation_useful());
   first.suspend();
   CHECK(first.retained_workspace_bytes() == 0);
-  CHECK(execution.resource_usage().descriptors == 3); // Two opened sources and the second decoder.
+  CHECK(execution.resource_usage().descriptors == 3);  // Two opened sources and the second decoder.
   CHECK_FALSE(execution.try_reserve(demand));
   REQUIRE(second.reclamation_useful());
   second.suspend();
@@ -15837,7 +15885,10 @@ TEST_CASE("forward publication keeps a decoder for arena pressure and wakes for 
  const std::array inputs{profile_image_fixture(41, 43, FixtureImageEncoding::Png), profile_image_fixture(39, 37, FixtureImageEncoding::Jpeg)};
  std::vector<std::size_t> order(32);
  std::vector<std::uint64_t> ids;
- for (std::size_t i = 0; i < order.size(); ++i) { order[i] = i % inputs.size(); ids.push_back(i + 1); }
+ for (std::size_t i = 0; i < order.size(); ++i) {
+  order[i] = i % inputs.size();
+  ids.push_back(i + 1);
+ }
  (void)profile_archive_fixture(path, inputs, order);
  const auto page = mmltk::common::system::host_page_size();
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, {}, 4U << 20, 0, (4U << 20) + page));
@@ -15847,7 +15898,10 @@ TEST_CASE("forward publication keeps a decoder for arena pressure and wakes for 
  std::uint64_t replays = 0, restores = 0;
  const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.archive."}), [&](std::string_view event, const nlohmann::json& value) {
   if (event == "benchmark.archive.suspended" && !suspensions.fetch_add(1)) mmltk::testsupport::release_test_promise(suspended);
-  if (event == "benchmark.archive.completed") { replays = value.at("replay_decoded_bytes"); restores = value.at("restores"); }
+  if (event == "benchmark.archive.completed") {
+   replays = value.at("replay_decoded_bytes");
+   restores = value.at("restores");
+  }
  }};
  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 32U << 20, .workspace_plan = plan}, {}, trace);
  auto& execution = pipeline.execution();
@@ -15857,17 +15911,34 @@ TEST_CASE("forward publication keeps a decoder for arena pressure and wakes for 
  auto waiting = execution.defer_resources(blocked);
  std::unique_ptr<CompileResourceWait> useful;
  auto extracting = std::async(std::launch::async, [&] {
-  return extract_selected_archive_images({.archive_path = path, .source_identity = "bounded-gzip-pressure", .output_root = images, .source = "coco", .shard = "train2017",
-   .selected_image_ids = ids, .image_id_parser = benchmark_archive_image_candidate, .cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), .trace = trace,
-   .activity = [&](std::string_view message) { if (message == "Draining selected image cache writes") mmltk::testsupport::release_test_promise(draining); },
-   .image_ready = [&](const CachedImageReady& ready) {
-    require_condition(ready.payload && std::ranges::equal(ready.payload->encoded(), inputs[order[ready.image_id - 1]].encoded), "publication changed exact member bytes");
-    if (ready.image_id == 1) held.receipt().ArriveAndWait();
-    if (published.fetch_add(1) + 1 == order.size() - 1) mmltk::testsupport::release_test_promise(peers);
-   },
-   .execution = &pipeline});
+  return extract_selected_archive_images(
+   {.archive_path = path,
+    .source_identity = "bounded-gzip-pressure",
+    .output_root = images,
+    .source = "coco",
+    .shard = "train2017",
+    .selected_image_ids = ids,
+    .image_id_parser = benchmark_archive_image_candidate,
+    .cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled),
+    .trace = trace,
+    .activity =
+     [&](std::string_view message) {
+   if (message == "Draining selected image cache writes") mmltk::testsupport::release_test_promise(draining);
+  },
+    .image_ready =
+     [&](const CachedImageReady& ready) {
+   require_condition(ready.payload && std::ranges::equal(ready.payload->encoded(), inputs[order[ready.image_id - 1]].encoded), "publication changed exact member bytes");
+   if (ready.image_id == 1) held.receipt().ArriveAndWait();
+   if (published.fetch_add(1) + 1 == order.size() - 1) mmltk::testsupport::release_test_promise(peers);
+  },
+    .execution = &pipeline});
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { useful.reset(); waiting.reset(); arena = {}; held.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  useful.reset();
+  waiting.reset();
+  arena = {};
+  held.Release();
+ });
  REQUIRE(held.WaitEntered(5s));
  mmltk::testsupport::await_test_promise(draining, "all later source members progress past unrelated arena pressure", 5s);
  mmltk::testsupport::await_test_promise(peers, "independent accepted callbacks complete while the first is held", 5s);
@@ -15899,8 +15970,15 @@ TEST_CASE("forward publication keeps a decoder for arena pressure and wakes for 
  CHECK(execution.resource_usage().bytes == 0);
  if (cancel) {
   cancelled = false;
-  const auto retry = extract_selected_archive_images({.archive_path = path, .source_identity = "bounded-gzip-pressure", .output_root = images, .source = "coco", .shard = "train2017",
-   .selected_image_ids = ids, .image_id_parser = benchmark_archive_image_candidate, .execution = &pipeline});
+  const auto retry = extract_selected_archive_images(
+   {.archive_path = path,
+    .source_identity = "bounded-gzip-pressure",
+    .output_root = images,
+    .source = "coco",
+    .shard = "train2017",
+    .selected_image_ids = ids,
+    .image_id_parser = benchmark_archive_image_candidate,
+    .execution = &pipeline});
   CHECK(retry.image_count == order.size());
   CHECK(execution.resource_usage().bytes == 0);
   CHECK(execution.resource_usage().descriptors == 0);
@@ -15945,7 +16023,6 @@ TEST_CASE("rolled-back archive input remains part of the complete retry demand",
  CHECK(execution.resource_usage().descriptors == 0);
  CHECK_FALSE(execution.resource_pressure());
 }
-
 TEST_CASE("ready normalized rows share bounded gathers across empty and oversized slices", "[benchmark][annotations][resources]") {
  const bool threaded = GENERATE(false, true);
  const bool mapped = GENERATE(false, true);
@@ -16024,11 +16101,17 @@ TEST_CASE("held gather batches leave ready independent continuations runnable an
  };
  NormalizedAnnotationAssembler assembly({}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {});
  auto gather = std::async(std::launch::async, [&] { assembly.gather(slices, &execution, nullptr, {}, trace); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); execution.cancel(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  held.Release();
+  execution.cancel();
+ });
  REQUIRE(held.WaitEntered(5s));
  mmltk::testsupport::await_test_promise(peer, "later ready batches pass their held peer", 5s);
  CHECK(gather.wait_for(0ms) == std::future_status::timeout);
- if (cancel) { cancelled = true; execution.cancel(); }
+ if (cancel) {
+  cancelled = true;
+  execution.cancel();
+ }
  held.Release();
  if (cancel) {
   CHECK_THROWS(mmltk::testsupport::await_test_future(gather, "cancelled gather joins held custody", 5s));

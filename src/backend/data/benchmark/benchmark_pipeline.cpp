@@ -33,7 +33,8 @@ enum class PipelinePixelStage { Header, Workspace, Input, Output, Pixels, Count 
 struct PipelineObservation {
  std::uint64_t dispatch_turns = 0, empty_turns = 0, yields = 0, probes = 0, max_probes = 0, admitted = 0;
  std::uint64_t lock_wait_ns = 0, dispatch_ns = 0;
- std::array<std::uint64_t, static_cast<std::size_t>(PipelinePixelStage::Count)> stage_calls{}, stage_wall_ns{}, stage_cpu_ns{}, stage_minor_faults{}, stage_major_faults{}, stage_residence_ns{}, retained_bytes{}, peak_retained_bytes{}, retained_input_bytes{}, peak_retained_input_bytes{};
+ std::array<std::uint64_t, static_cast<std::size_t>(PipelinePixelStage::Count)> stage_calls{}, stage_wall_ns{}, stage_cpu_ns{}, stage_minor_faults{}, stage_major_faults{}, stage_residence_ns{},
+  retained_bytes{}, peak_retained_bytes{}, retained_input_bytes{}, peak_retained_input_bytes{};
  bool incomplete = false;
 };
 MMLTK_REFLECT_FIELDS(PipelineObservation)
@@ -447,11 +448,12 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  bool dispatch_pass = false, pass_refresh = false;
  std::uint32_t pass_eligible = 0;
  std::size_t workspace_remaining = 0, workspace_limit = 0;
- void wake() noexcept { fresh_work.store(true, std::memory_order_release); readiness->notify(); }
+ void wake() noexcept {
+  fresh_work.store(true, std::memory_order_release);
+  readiness->notify();
+ }
  Impl(std::size_t workers, std::span<const int> cpus, detail::CompileExecutionLimits limits, mmltk::common::concurrency::CancellationObservation cancel, BenchmarkTraceSink trace_sink)
-     : execution(workers, cpus, limits, cancel,
-        observe_compile_execution(trace_sink),
-        std::make_exception_ptr(std::runtime_error("benchmark dataset compilation cancelled"))),
+     : execution(workers, cpus, limits, cancel, observe_compile_execution(trace_sink), std::make_exception_ptr(std::runtime_error("benchmark dataset compilation cancelled"))),
        files(execution, std::max(std::size_t{4}, workers * 2), std::min(std::size_t{2}, workers), observe_files(trace_sink, "output")),
        image_files(execution, std::max(std::size_t{2}, std::min(std::size_t{4}, workers * 2)), std::min(std::size_t{2}, workers), observe_files(trace_sink, "image")),
        trace(std::move(trace_sink)),
@@ -1531,7 +1533,10 @@ void BenchmarkCompilePipeline::Impl::dispatch(CompileExecution::Readiness::Chang
  };
  for (;;) {
   bool accepted = false;
-  if (remaining && !file_full && !label_outputs.empty()) { --remaining; accepted = admit_output(); }
+  if (remaining && !file_full && !label_outputs.empty()) {
+   --remaining;
+   accepted = admit_output();
+  }
   if (labels_first) accepted = labels() || accepted;
   pass_eligible &= pixels.ready_stages();
   while (remaining && pass_eligible) {
@@ -1564,7 +1569,10 @@ void BenchmarkCompilePipeline::Impl::dispatch(CompileExecution::Readiness::Chang
   if (!remaining || !accepted) break;
   lock.unlock();
   lock.lock();
-  if (stopping || failure || cancellation.requested()) { readiness->notify(); break; }
+  if (stopping || failure || cancellation.requested()) {
+   readiness->notify();
+   break;
+  }
  }
  const bool unexamined = pass_eligible || (!file_full && !label_outputs.empty()) || (!label_blocked && images.labels_unexamined());
  const bool yielded = !remaining && unexamined;
@@ -1574,8 +1582,8 @@ void BenchmarkCompilePipeline::Impl::dispatch(CompileExecution::Readiness::Chang
   dispatch_pass = false;
   // Arrivals while a finite pass was in progress get one fresh pass. A fully
   // denied, unchanged pass parks and cannot manufacture a Local wake loop.
-  const bool arrived = fresh_work.exchange(false, std::memory_order_acquire);
-  if (pass_refresh || arrived) readiness->notify();
+  const bool new_arrival = fresh_work.exchange(false, std::memory_order_acquire);
+  if (pass_refresh || new_arrival) readiness->notify();
  }
  CompileChange interests = CompileChange::None;
  if (pixels.ready_stages() & workspace_bit) interests |= CompileChange::Resources | CompileChange::Fairness;
@@ -1601,7 +1609,8 @@ void BenchmarkCompilePipeline::Impl::dispatch(CompileExecution::Readiness::Chang
    return nlohmann::json{
     {"header", queued[0]}, {"workspace", queued[1]}, {"input", queued[2]}, {"output", queued[3]}, {"pixels", queued[4]}, {"pending_images", pending_images}, {"image_head_probes", image_head_probes},
     {"image_admitted", image_admitted}, {"workspace_resource_denied", resource_denied}, {"workspace_probe_limit", workspace_limit}, {"label_outputs", outputs}, {"stage_records_blocked", blocked},
-    {"label_file_records_blocked", file_full}, {"empty_dispatch", !any_admitted}, {"lock_wait_ns", lock_ns}, {"body_ns", body_ns}, {"probes", quantum - remaining}, {"probe_quantum", quantum}, {"yielded", yielded}
+    {"label_file_records_blocked", file_full}, {"empty_dispatch", !any_admitted}, {"lock_wait_ns", lock_ns}, {"body_ns", body_ns}, {"probes", quantum - remaining}, {"probe_quantum", quantum},
+    {"yielded", yielded}
    };
   });
  }
@@ -1624,7 +1633,10 @@ bool BenchmarkCompilePipeline::Impl::ImageState::admit_labels(std::size_t& probe
    continue;
   }
   auto record = execution.execution.try_retain(CompileTaskKind::Labels);
-  if (!record) { records_blocked = true; return false; }
+  if (!record) {
+   records_blocked = true;
+   return false;
+  }
   auto work = std::make_shared<LabelWork>();
   work->label = &label;
   work->input = label.input;
@@ -1662,7 +1674,10 @@ bool BenchmarkCompilePipeline::Impl::ImageState::admit_labels(std::size_t& probe
    // including an allocation failure while appending the output continuation.
    owner->finish_label(work, error);
   }});
-  if (!task) { records_blocked = true; return false; }
+  if (!task) {
+   records_blocked = true;
+   return false;
+  }
   work->handle = std::move(*task);
   unlink_labels(label);
   label.input.reset();

@@ -908,7 +908,7 @@ TEST_CASE("compiled finalization compacts live partitions in place with bounded 
    expected = total;
    if (cancel_during && done) cancelled.store(true);
   }, {.allocate = [&](auto ranges, auto cancel, auto* calls) {
-   CHECK(calls == nullptr); // Disabled compaction observation supplies no syscall counters.
+   CHECK(calls == nullptr);  // Disabled compaction observation supplies no syscall counters.
    if (fail_storage) throw std::runtime_error("compaction storage failure");
    file.allocate_ranges(ranges, cancel, calls);
   }});
@@ -977,7 +977,10 @@ TEST_CASE("bounded compaction captures overlapping labels and full contiguous pi
   entry.status = ImageStatus::Eligible;
   entry.original_width = entry.original_height = 1;
   storage.prepare_pixels(slot);
-  { auto pixels = storage.pixels(slot); std::memset(pixels.data(), static_cast<int>(slot + 1), stride); }
+  {
+   auto pixels = storage.pixels(slot);
+   std::memset(pixels.data(), static_cast<int>(slot + 1), stride);
+  }
   if (slot % 4) {
    set_annotation_extent(entry, 1, 1, "bounded labels");
    stage.allocate_range(staging.label_offset(slot), entry.label_bytes);
@@ -1001,15 +1004,20 @@ TEST_CASE("bounded compaction captures overlapping labels and full contiguous pi
  std::size_t reports = 0, rejected = 0, reclaim_requests = 0;
  const auto compact = compact_compiled_file(stage.file(), staging, entries, {}, {},
   {[&](auto ranges, auto cancel, auto* calls) {
-    if (pressure && (ranges.size() > 1 || ranges.front().bytes > old_window + PAGE_SIZE)) {
-     ++rejected;
-     throw detail::InsufficientStorage("fixture permits one old-size allocation");
-    }
-    stage.allocate_ranges(ranges, cancel, calls);
-   },
-   [&](auto ranges, auto cancel, auto* calls) { ++reclaim_requests; return unsupported ? false : stage.reclaim_ranges(ranges, cancel, calls); },
-   [&](std::size_t bytes, auto cancel, auto* calls) { stage.resize_sparse(bytes, calls, cancel); }}, scratch,
-  [&](const CompiledCompactionObservation& value) { ++reports; observed = value; });
+  if (pressure && (ranges.size() > 1 || ranges.front().bytes > old_window + PAGE_SIZE)) {
+   ++rejected;
+   throw detail::InsufficientStorage("fixture permits one old-size allocation");
+  }
+  stage.allocate_ranges(ranges, cancel, calls);
+ },
+   [&](auto ranges, auto cancel, auto* calls) {
+  ++reclaim_requests;
+  return unsupported ? false : stage.reclaim_ranges(ranges, cancel, calls);
+ }, [&](std::size_t bytes, auto cancel, auto* calls) { stage.resize_sparse(bytes, calls, cancel); }},
+  scratch, [&](const CompiledCompactionObservation& value) {
+  ++reports;
+  observed = value;
+ });
  CHECK(reports == 1);
  CHECK_FALSE(observed.failed);
  CHECK(observed.live_bytes == live_bytes);
@@ -1023,24 +1031,28 @@ TEST_CASE("bounded compaction captures overlapping labels and full contiguous pi
  if (stride == 98304 && compact.block_bytes < staging.block_bytes) CHECK(observed.scratch_high_water == scratch.size());
  CHECK(observed.capacity_fallbacks == rejected);
  if (pressure) CHECK(rejected > 0);
- if (unsupported) { CHECK(reclaim_requests == 1); CHECK_FALSE(observed.reclaim_supported); }
+ if (unsupported) {
+  CHECK(reclaim_requests == 1);
+  CHECK_FALSE(observed.reclaim_supported);
+ }
  CHECK(compact.label_capacity == 72);
  if (capacity == 8192) CHECK(compact.block_bytes == staging.block_bytes);
  CHECK(stage.file().size() == compact.total_size);
  CHECK(pool.outstanding() == 0);
- for (std::uint32_t slot = 0; slot < count; ++slot) if (entries[slot].eligible()) {
-  std::fill(expected.begin(), expected.end(), static_cast<std::byte>(slot + 1));
-  stage.file().pread_all(actual.data(), actual.size(), compact.pixel_offset(slot));
-  CHECK(actual == expected);
-  if (entries[slot].label_bytes) {
-   std::array<std::byte, 72> payload{};
-   stage.file().pread_all(payload.data(), payload.size(), compact.label_offset(slot));
-   const auto label = label_for(slot);
-   CHECK(std::memcmp(payload.data(), &label, sizeof(label)) == 0);
-   CHECK(std::memcmp(payload.data() + annotation_layout(1, 1).run_offset, &run, sizeof(run)) == 0);
-   CHECK(std::all_of(payload.begin() + sizeof(label), payload.begin() + annotation_layout(1, 1).run_offset, [](auto byte) { return byte == std::byte{}; }));
+ for (std::uint32_t slot = 0; slot < count; ++slot)
+  if (entries[slot].eligible()) {
+   std::fill(expected.begin(), expected.end(), static_cast<std::byte>(slot + 1));
+   stage.file().pread_all(actual.data(), actual.size(), compact.pixel_offset(slot));
+   CHECK(actual == expected);
+   if (entries[slot].label_bytes) {
+    std::array<std::byte, 72> payload{};
+    stage.file().pread_all(payload.data(), payload.size(), compact.label_offset(slot));
+    const auto label = label_for(slot);
+    CHECK(std::memcmp(payload.data(), &label, sizeof(label)) == 0);
+    CHECK(std::memcmp(payload.data() + annotation_layout(1, 1).run_offset, &run, sizeof(run)) == 0);
+    CHECK(std::all_of(payload.begin() + sizeof(label), payload.begin() + annotation_layout(1, 1).run_offset, [](auto byte) { return byte == std::byte{}; }));
+   }
   }
- }
  if (observed.reclaim_supported) {
   std::array<char, 7> dead{};
   stage.file().pread_all(dead.data(), dead.size(), compact.pixel_offset(8));
@@ -1078,8 +1090,7 @@ TEST_CASE("near-capacity label prefixes split at admitted scratch without readin
  }
  std::vector<std::byte> scratch(scratch_bytes);
  CompiledCompactionObservation observed;
- const auto compact = compact_compiled_file(stage.file(), staging, entries, {}, {},
-  CompiledStorageMutation::for_artifact(stage), scratch, [&](const auto& value) { observed = value; });
+ const auto compact = compact_compiled_file(stage.file(), staging, entries, {}, {}, CompiledStorageMutation::for_artifact(stage), scratch, [&](const auto& value) { observed = value; });
  CHECK(observed.scratch_high_water <= scratch_bytes);
  CHECK(observed.read_bytes == (count - 1) * entries.front().label_bytes);
  CHECK(observed.write_bytes == observed.read_bytes);
@@ -1087,7 +1098,8 @@ TEST_CASE("near-capacity label prefixes split at admitted scratch without readin
  if (scratch_bytes == COMPILED_COMPACTION_SCRATCH_BYTES) {
   CHECK(observed.allocation_calls == 2);
   CHECK(observed.scratch_high_water == std::size_t{8} * entries.front().label_bytes);
- } else CHECK(observed.allocation_calls == count - 1);
+ } else
+  CHECK(observed.allocation_calls == count - 1);
  for (std::uint32_t slot = 0; slot < count; ++slot) {
   populate(slot);
   stage.file().pread_all(actual.data(), actual.size() * sizeof(PackedInstance), compact.label_offset(slot));
@@ -1100,7 +1112,10 @@ TEST_CASE("near-capacity label prefixes split at admitted scratch without readin
 TEST_CASE("compaction cancellation and physical errors discard only the private inode", "[backend][data][compiler][storage]") {
  const mmltk::testsupport::ScopedTempDir root("compaction-private-failures");
  const auto published = root.path() / "published";
- { auto old = FileHandle::create_output(published.string(), 3); old.pwrite_all("old", 3, 0); }
+ {
+  auto old = FileHandle::create_output(published.string(), 3);
+  old.pwrite_all("old", 3, 0);
+ }
  detail::StorageReservationPool pool(root.path());
  enum class Failure { Allocation, Write, Reclaim, CancelAllocation, CancelReclaim, CancelTruncate } failure = Failure::Allocation;
  SECTION("partial allocation error") {}
@@ -1133,26 +1148,41 @@ TEST_CASE("compaction cancellation and physical errors discard only the private 
   std::atomic<bool> cancelled{false};
   const auto cancel = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
   std::vector<std::byte> scratch(COMPILED_COMPACTION_SCRATCH_BYTES);
-  const auto run = [&] { return compact_compiled_file(stage.file(), staging, entries, cancel, {},
-   {[&](auto ranges, auto cancellation, auto* calls) {
-     if (failure == Failure::Allocation) { stage.allocate_ranges(ranges.first(1), cancellation, calls); throw std::runtime_error("partial allocation failure"); }
-     stage.allocate_ranges(ranges, cancellation, calls);
-     if (failure == Failure::CancelAllocation) cancelled.store(true);
-     if (failure == Failure::Write) {
-      stage.file().pwrite_all("partial", 7, ranges.front().offset);
-      stage.file() = FileHandle::open_readonly(stage.path().string());
-     }
-    },
-    [&](auto ranges, auto cancellation, auto* calls) {
-     if (failure == Failure::Reclaim) { (void)stage.reclaim_ranges(ranges.first(1), cancellation, calls); throw std::runtime_error("partial reclaim failure"); }
-     const auto supported = stage.reclaim_ranges(ranges, cancellation, calls);
-     if (failure == Failure::CancelReclaim) cancelled.store(true);
-     return supported;
-    },
-    [&](std::size_t bytes, auto cancel, auto* calls) {
-     if (failure == Failure::CancelTruncate) { cancelled.store(true); throw std::runtime_error("cancelled before truncate"); }
-     stage.resize_sparse(bytes, calls, cancel);
-    }}, scratch, [&](const auto& value) { ++reports; observed = value; }); };
+  const auto run = [&] {
+   return compact_compiled_file(stage.file(), staging, entries, cancel, {},
+    {[&](auto ranges, auto cancellation, auto* calls) {
+    if (failure == Failure::Allocation) {
+     stage.allocate_ranges(ranges.first(1), cancellation, calls);
+     throw std::runtime_error("partial allocation failure");
+    }
+    stage.allocate_ranges(ranges, cancellation, calls);
+    if (failure == Failure::CancelAllocation) cancelled.store(true);
+    if (failure == Failure::Write) {
+     stage.file().pwrite_all("partial", 7, ranges.front().offset);
+     stage.file() = FileHandle::open_readonly(stage.path().string());
+    }
+   },
+     [&](auto ranges, auto cancellation, auto* calls) {
+    if (failure == Failure::Reclaim) {
+     (void)stage.reclaim_ranges(ranges.first(1), cancellation, calls);
+     throw std::runtime_error("partial reclaim failure");
+    }
+    const auto supported = stage.reclaim_ranges(ranges, cancellation, calls);
+    if (failure == Failure::CancelReclaim) cancelled.store(true);
+    return supported;
+   },
+     [&](std::size_t bytes, auto cancellation, auto* calls) {
+    if (failure == Failure::CancelTruncate) {
+     cancelled.store(true);
+     throw std::runtime_error("cancelled before truncate");
+    }
+    stage.resize_sparse(bytes, calls, cancellation);
+   }},
+    scratch, [&](const auto& value) {
+    ++reports;
+    observed = value;
+   });
+  };
   CHECK_THROWS(run());
   CHECK(reports == 1);
   CHECK(observed.failed);
@@ -2354,7 +2384,6 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
  CHECK(bounds.max_y == 4096);
  CHECK(std::ranges::equal(result.instance_rle(0, label), expected, [](const auto& a, const auto& b) { return a.start == b.start && a.length == b.length; }));
 }
-
 TEST_CASE("progress tracing requires its own selected demand", "[backend][data][benchmark][progress][trace]") {
  using namespace mmltk::backend::data;
  using namespace mmltk::backend::data::benchmark_internal;
@@ -2380,7 +2409,6 @@ TEST_CASE("progress tracing requires its own selected demand", "[backend][data][
  observed.flush();
  CHECK(delivered > 0);
 }
-
 TEST_CASE("Directory forwards retired-only execution demand without live observation", "[backend][data][progress][trace]") {
  using namespace mmltk::backend::data;
  using namespace mmltk::backend::data::testsupport;
@@ -2389,15 +2417,18 @@ TEST_CASE("Directory forwards retired-only execution demand without live observa
  create_synthetic_dataset(fixture);
  auto config = compiler_config(fixture);
  config.num_workers = 1;
- struct Observation { std::size_t deliveries = 0; detail::CompileExecutionSnapshot retired; } result;
+ struct Observation {
+  std::size_t deliveries = 0;
+  detail::CompileExecutionSnapshot retired;
+ } result;
  DirectoryCompileObservation observation;
  observation.context = &result;
  observation.execution_demand = {.aggregates = true, .retired = true};
  observation.execution = +[](void* context, std::string_view event, const detail::CompileExecutionSnapshot& snapshot) {
-  auto& result = *static_cast<Observation*>(context);
+  auto& received = *static_cast<Observation*>(context);
   CHECK(event == "compile.execution.retired");
-  result.retired = snapshot;
-  ++result.deliveries;
+  received.retired = snapshot;
+  ++received.deliveries;
  };
  config.observation = &observation;
  DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0);

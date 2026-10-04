@@ -1256,9 +1256,8 @@ void NormalizedAnnotationAssembler::gather(
   observation.max_runs = std::max<std::uint64_t>(observation.max_runs, work.runs);
  };
  const auto perform = [&](const Batch& work) {
-  trace_benchmark_event(trace, "benchmark.annotations.gather_batch", [&] {
-   return nlohmann::json{{"first_image", slices[work.chunks[0].image].image.source_image_id}, {"images", work.count}, {"boxes", work.boxes}, {"runs", work.runs}};
-  });
+  trace_benchmark_event(trace, "benchmark.annotations.gather_batch",
+   [&] { return nlohmann::json{{"first_image", slices[work.chunks[0].image].image.source_image_id}, {"images", work.count}, {"boxes", work.boxes}, {"runs", work.runs}}; });
   for (const auto& item : std::span(work.chunks).first(work.count)) chunk(item);
  };
  const auto resume = [&](const Batch& work) {

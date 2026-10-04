@@ -615,15 +615,16 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
  trace_benchmark_event(request.trace, "benchmark.compaction.started", [&] { return nlohmann::json{{"split", request.split.name}, {"images", slots.size()}, {"bytes", state.layout.total_size}}; });
  BenchmarkCostSpan compaction_cost(
   request.trace, BenchmarkCostKind::Compaction, [&] { return nlohmann::json{{"split", request.split.name}, {"rows_revisited", index.size()}, {"bytes", state.layout.total_size}}; });
- state.layout = compact_compiled_file(state.staging.file(), state.layout, index, request.cancel_requested, request.compaction,
-  CompiledStorageMutation::for_artifact(state.staging), request.compaction_scratch,
-  request.trace.accepts("benchmark.compaction.summary") ? CompiledCompactionObserver{[&](const auto& value) {
-   trace_benchmark_event(request.trace, "benchmark.compaction.summary", [&] {
-    auto fields = benchmark_observation_fields(value);
-    fields["split"] = request.split.name;
-    return fields;
-   });
-  }} : CompiledCompactionObserver{});
+ state.layout =
+  compact_compiled_file(state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, CompiledStorageMutation::for_artifact(state.staging), request.compaction_scratch,
+   request.trace.accepts("benchmark.compaction.summary") ? CompiledCompactionObserver{[&](const auto& value) {
+  trace_benchmark_event(request.trace, "benchmark.compaction.summary", [&] {
+   auto fields = benchmark_observation_fields(value);
+   fields["split"] = request.split.name;
+   return fields;
+  });
+ }}
+                                                         : CompiledCompactionObserver{});
  compaction_cost.finish();
  trace_benchmark_event(request.trace, "benchmark.compaction.completed", [&] { return nlohmann::json{{"split", request.split.name}, {"images", slots.size()}, {"bytes", state.layout.total_size}}; });
  state.staging.reconcile();
@@ -639,7 +640,8 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
  trace_benchmark_event(request.trace, "benchmark.split_sync.started", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}}; });
  detail::CompileObservationClock sync_clock{request.trace.accepts("benchmark.split_sync.completed")};
  output.sync_data();
- trace_benchmark_event(request.trace, "benchmark.split_sync.completed", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}, {"duration_ns", sync_clock.elapsed()}}; });
+ trace_benchmark_event(
+  request.trace, "benchmark.split_sync.completed", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}, {"duration_ns", sync_clock.elapsed()}}; });
  const auto persisted = read_compiled_header(output);
  (void)validate_compiled_file_sections(persisted, output.size());
  if (std::memcmp(&persisted, &header, sizeof(header))) throw std::runtime_error("staged benchmark header differs");

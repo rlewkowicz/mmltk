@@ -19,12 +19,18 @@ class CompileExecutionObserver final {
 
 public:
  CompileExecutionObserver() = default;
- template <class F> requires (!std::same_as<std::remove_cvref_t<F>, CompileExecutionObserver> && std::is_invocable_r_v<void, F&, std::string_view, const CompileExecutionSnapshot&>)
+ template <class F>
+  requires(!std::same_as<std::remove_cvref_t<F>, CompileExecutionObserver> && std::is_invocable_r_v<void, F&, std::string_view, const CompileExecutionSnapshot&>)
  CompileExecutionObserver(F&& delivery) : CompileExecutionObserver(CompileExecutionObservationDemand::all(), std::forward<F>(delivery)) {}
- template <class F> requires std::is_invocable_r_v<void, F&, std::string_view, const CompileExecutionSnapshot&>
- CompileExecutionObserver(CompileExecutionObservationDemand demand, F&& delivery) : demand_(demand), delivery_(std::forward<F>(delivery)) { if (!delivery_) demand_ = {}; }
+ template <class F>
+  requires std::is_invocable_r_v<void, F&, std::string_view, const CompileExecutionSnapshot&>
+ CompileExecutionObserver(CompileExecutionObservationDemand demand, F&& delivery) : demand_(demand), delivery_(std::forward<F>(delivery)) {
+  if (!delivery_) demand_ = {};
+ }
  [[nodiscard]] explicit operator bool() const noexcept { return delivery_ && demand_.any(); }
  [[nodiscard]] const CompileExecutionObservationDemand& demand() const noexcept { return demand_; }
- void operator()(std::string_view event, const CompileExecutionSnapshot& value) const { if (delivery_) delivery_(event, value); }
+ void operator()(std::string_view event, const CompileExecutionSnapshot& value) const {
+  if (delivery_) delivery_(event, value);
+ }
 };
 }  // namespace mmltk::backend::data::detail

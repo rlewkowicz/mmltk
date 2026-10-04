@@ -256,7 +256,9 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
   {width, height, effective_config.resize_mode, effective_config.perceptual_downscale}, classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));
  detail::CompileExecutionObserver observer;
  if (effective_config.observation && effective_config.observation->execution)
-  observer = {effective_config.observation->execution_demand, [&](std::string_view event, const detail::CompileExecutionSnapshot& snapshot) { effective_config.observation->execution(effective_config.observation->context, event, snapshot); }};
+  observer = {effective_config.observation->execution_demand, [&](std::string_view event, const detail::CompileExecutionSnapshot& snapshot) {
+   effective_config.observation->execution(effective_config.observation->context, event, snapshot);
+  }};
  detail::CompileExecution execution(
   static_cast<std::size_t>(configured_workers), worker_cpus, limits, cancellation, std::move(observer), std::make_exception_ptr(std::runtime_error("dataset compilation cancelled")));
  auto output = execution.open_class(detail::CompileWorkClass::Output);
@@ -279,8 +281,10 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
      [&] {
   layout = compact_compiled_file(fd, layout, label_blocks.index, cancellation,
    telemetry ? CompiledCompactionProgress{[&](std::size_t done, std::size_t total) { telemetry->compacting(done, total); }} : CompiledCompactionProgress{},
-   CompiledStorageMutation::for_artifact(staged),
-   compaction.workspace(), effective_config.observation && effective_config.observation->compaction ? CompiledCompactionObserver{[&](const auto& value) { effective_config.observation->compaction(effective_config.observation->context, value); }} : CompiledCompactionObserver{});
+   CompiledStorageMutation::for_artifact(staged), compaction.workspace(),
+   effective_config.observation && effective_config.observation->compaction
+    ? CompiledCompactionObserver{[&](const auto& value) { effective_config.observation->compaction(effective_config.observation->context, value); }}
+    : CompiledCompactionObserver{});
   mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
   staged.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
   staged.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));

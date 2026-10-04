@@ -12,8 +12,15 @@
 #include <string>
 #include <vector>
 #include "src/frameworks/reflection/reflection_metadata.h"
-namespace arrow { class Status; class DataType; class Schema; }
-namespace parquet { class ArrowWriterProperties; class WriterProperties; }
+namespace arrow {
+class Status;
+class DataType;
+class Schema;
+}  // namespace arrow
+namespace parquet {
+class ArrowWriterProperties;
+class WriterProperties;
+}  // namespace parquet
 namespace mmltk::backend::data {
 struct ImageEntry;
 struct FileHeader;
@@ -35,8 +42,8 @@ namespace mmltk::backend::data::testsupport {
 void arrow_ok(const arrow::Status&);
 [[nodiscard]] std::shared_ptr<arrow::DataType> coconut_parquet_segment_type(bool integer_area);
 [[nodiscard]] std::shared_ptr<arrow::Schema> coconut_parquet_schema(bool integer_area = false);
-void write_coconut_parquet(const std::filesystem::path&, const nlohmann::json&, std::shared_ptr<arrow::Schema> = {}, std::int64_t group_rows = 1,
- std::shared_ptr<parquet::ArrowWriterProperties> = {}, std::shared_ptr<parquet::WriterProperties> = {});
+void write_coconut_parquet(const std::filesystem::path&, const nlohmann::json&, std::shared_ptr<arrow::Schema> = {}, std::int64_t group_rows = 1, std::shared_ptr<parquet::ArrowWriterProperties> = {},
+ std::shared_ptr<parquet::WriterProperties> = {});
 enum class FixtureImageEncoding : std::uint8_t { Png, Jpeg };
 MMLTK_REFLECT_ENUM(FixtureImageEncoding)
 struct ProfileImageFixture {
@@ -46,7 +53,8 @@ struct ProfileImageFixture {
 [[nodiscard]] ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding, std::uint32_t seed = 7, std::size_t byte_limit = 256U << 20);
 // Bounded PAX/gzip source with deterministic member names, including a long
 // first pathname. Preflight logical bytes and tar overhead before writing.
-[[nodiscard]] std::vector<std::string> profile_archive_fixture(const std::filesystem::path&, std::span<const ProfileImageFixture>, std::span<const std::size_t> order, std::uint64_t byte_limit = 16U << 20);
+[[nodiscard]] std::vector<std::string> profile_archive_fixture(
+ const std::filesystem::path&, std::span<const ProfileImageFixture>, std::span<const std::size_t> order, std::uint64_t byte_limit = 16U << 20);
 // Preflight every actual RGB extent and peak decoder workspace before retaining
 // any pixels. Limits are explicit so standard cases use small real fixtures.
 [[nodiscard]] std::vector<std::vector<std::uint8_t>> retained_profile_rgb(std::span<const ProfileImageFixture>, std::size_t retained_limit, std::size_t workspace_limit);
@@ -57,6 +65,7 @@ struct ProfileImageFixture {
 class PipelineNativeFixture final {
  struct Impl;
  std::unique_ptr<Impl> impl_;
+
 public:
  PipelineNativeFixture(const std::filesystem::path&, std::span<const ProfileImageFixture>, std::span<const std::size_t>, bool dropped);
  ~PipelineNativeFixture();

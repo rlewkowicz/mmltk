@@ -34,6 +34,7 @@ class AnnotationEvidence final {
  bool enabled_;
  std::mutex mutex_;
  AnnotationObservation observation_;
+
 public:
  explicit AnnotationEvidence(bool enabled) : enabled_(enabled) {}
  void receive(std::string_view event, const nlohmann::json& fields) {
@@ -52,10 +53,28 @@ public:
    observation_.gather_runs += fields.at("runs").get<std::uint64_t>();
   }
  }
- void projected() { if (enabled_) { const std::lock_guard lock(mutex_); ++observation_.label_attempts; } }
- void written() { if (enabled_) { const std::lock_guard lock(mutex_); ++observation_.label_writes; } }
- void settled(std::size_t count) { if (enabled_) { const std::lock_guard lock(mutex_); observation_.settlements += count; } }
- nlohmann::json report() { const std::lock_guard lock(mutex_); return benchmark_observation_fields(observation_); }
+ void projected() {
+  if (enabled_) {
+   const std::lock_guard lock(mutex_);
+   ++observation_.label_attempts;
+  }
+ }
+ void written() {
+  if (enabled_) {
+   const std::lock_guard lock(mutex_);
+   ++observation_.label_writes;
+  }
+ }
+ void settled(std::size_t count) {
+  if (enabled_) {
+   const std::lock_guard lock(mutex_);
+   observation_.settlements += count;
+  }
+ }
+ nlohmann::json report() {
+  const std::lock_guard lock(mutex_);
+  return benchmark_observation_fields(observation_);
+ }
 };
 // Optional bounded spacing evidence. No sample allocation or clock read in an
 // ordinary throughput iteration. Completion callbacks never authorize products.
@@ -66,7 +85,9 @@ class CompletionGaps final {
  std::vector<std::uint64_t> samples_;
 
 public:
- CompletionGaps(bool enabled, std::size_t count) : enabled_(enabled) { if (enabled_) samples_.reserve(count); }
+ CompletionGaps(bool enabled, std::size_t count) : enabled_(enabled) {
+  if (enabled_) samples_.reserve(count);
+ }
  void completed() {
   if (!enabled_) return;
   const std::lock_guard lock(mutex_);
@@ -79,7 +100,7 @@ public:
   return enabled_ ? nlohmann::json(samples_) : nlohmann::json{};
  }
 };
-}
+}  // namespace
 // Focused archive input variant uses the same production transport/admission
 // owners and bounded fixture inventory; it never downloads a source.
 static void run_archive_input_profile(const Options& opts, std::span<const ProfileImageFixture> inputs, const BenchmarkTraceSink& trace) {
@@ -113,15 +134,16 @@ static void run_archive_input_profile(const Options& opts, std::span<const Profi
       held = execution.reserve({.bytes = execution.transient_target() - reader.allowance().bytes()});
       demand = {.bytes = 1};
       break;
-     case ProfileArchivePressure::Exclusive:
-      demand = {.bytes = execution.workspace_capacity() + 1, .supplied_workspace = true};
-      break;
+     case ProfileArchivePressure::Exclusive: demand = {.bytes = execution.workspace_capacity() + 1, .supplied_workspace = true}; break;
      case ProfileArchivePressure::None: break;
     }
     if (execution.try_reserve(demand)) throw std::runtime_error("archive profile pressure was not blocked");
     auto wait = execution.defer_resources(demand);
     ++pressure_checks;
-    if (reader.reclamation_useful()) { reader.suspend(); ++reclaimed; }
+    if (reader.reclamation_useful()) {
+     reader.suspend();
+     ++reclaimed;
+    }
     held = {};
     auto accepted = execution.try_reserve(demand);
     if (!accepted) throw std::runtime_error("archive profile competing demand did not progress");
@@ -138,16 +160,21 @@ static void run_archive_input_profile(const Options& opts, std::span<const Profi
  const auto remaining = execution.resource_usage();
  if (remaining.bytes || remaining.descriptors || remaining.continuation_descriptors) throw std::runtime_error("archive profile retained resource custody");
  const auto ended = Clock::now();
- nlohmann::json result{{"members", order.size()}, {"compressed_bytes", fs::file_size(path)}, {"source_sha256", source_hash}, {"copied_bytes", copied}, {"pressure_checks", pressure_checks}, {"reclaimed", reclaimed},
+ nlohmann::json result{
+  {"members", order.size()}, {"compressed_bytes", fs::file_size(path)}, {"source_sha256", source_hash}, {"copied_bytes", copied}, {"pressure_checks", pressure_checks}, {"reclaimed", reclaimed},
   {"pressure", std::string(mmltk::frameworks::reflection::enum_name(opts.archive_pressure))}, {"setup_sec", seconds_since(setup, started)}, {"read_sec", seconds_since(started, ended)},
-  {"input_order", order}};
+  {"input_order", order}
+ };
  std::printf("archive_profile %s\n", result.dump().c_str());
  trace_benchmark_event(trace, "profile.archive.completed", [&] { return result; });
  record_duration_metric("archive", "setup", setup, started);
  record_duration_metric("archive", "read", started, ended);
 }
 void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixture> inputs, const BenchmarkTraceSink& trace) {
- if (opts.input_storage == ProfileInputStorage::Archive) { run_archive_input_profile(opts, inputs, trace); return; }
+ if (opts.input_storage == ProfileInputStorage::Archive) {
+  run_archive_input_profile(opts, inputs, trace);
+  return;
+ }
  using namespace benchmark_internal;
  using namespace detail;
  using namespace mmltk::backend::imaging::resample;
@@ -188,8 +215,8 @@ void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixtu
  profiles[static_cast<std::size_t>(CompileWorkClass::Annotations)] = {annotation_workspace, annotation_workspace};
  const auto protected_bytes = math::checked_add<std::uint64_t>(source_workspace, annotation_workspace + COMPILED_COMPACTION_SCRATCH_BYTES, "pipeline protected bytes overflow");
  const auto useful = math::checked_add<std::uint64_t>(protected_bytes, math::checked_multiply<std::uint64_t>(workers, largest_workspace, "pipeline arena overflow"), "pipeline arena overflow");
- auto workspace = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(workers, profiles, source_workspace, COMPILED_COMPACTION_SCRATCH_BYTES,
-  std::min<std::uint64_t>(512ULL << 20, std::max<std::uint64_t>(64ULL << 20, useful))));
+ auto workspace = std::make_shared<CompileWorkspacePlan>(
+  CompileWorkspacePlan::prepare(workers, profiles, source_workspace, COMPILED_COMPACTION_SCRATCH_BYTES, std::min<std::uint64_t>(512ULL << 20, std::max<std::uint64_t>(64ULL << 20, useful))));
  const auto retained_output = fs::path(opts.test_dir) / "pipeline-last.bin";
  // This explicit profile owns just this last-result name, never a cache tree.
  fs::remove(retained_output);
@@ -197,10 +224,9 @@ void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixtu
  fs::create_directories(images);
  std::vector<BenchmarkEncodedImage::Ptr> mapped;
  mapped.reserve(inputs.size());
- for (std::size_t i = 0; i < inputs.size(); ++i)
-  mapped.push_back(BenchmarkEncodedImage::publish(fixture.path() / ("input-" + std::to_string(i)), inputs[i].encoded, {}));
+ for (std::size_t i = 0; i < inputs.size(); ++i) mapped.push_back(BenchmarkEncodedImage::publish(fixture.path() / ("input-" + std::to_string(i)), inputs[i].encoded, {}));
  auto annotations = pipeline_annotation_fixture(inputs, order);
- PreparedBenchmarkSplit split{.name = "train", .class_names = {"object"}, .sources = {{images}}};
+ PreparedBenchmarkSplit split{.name = "train", .class_names = {"object"}, .sources = {{images}}, .images = {}};
  split.images.reserve(order.size());
  for (std::size_t i = 0; i < order.size(); ++i) {
   const auto& input = inputs[order[i]];
@@ -219,18 +245,26 @@ void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixtu
   for (const auto event : {"benchmark.coconut.native_finalized", "benchmark.coconut.native_staged", "benchmark.annotations.gathered"}) prefixes.emplace_back(event);
  }
  BenchmarkTraceSink measured;
- if (trace) measured = {CompileTraceSelection(std::move(prefixes)), [&](std::string_view event, const nlohmann::json& fields) {
-  if (event == "benchmark.split_sync.completed" && fields.is_object()) sync_ns = fields.at("duration_ns").get<std::uint64_t>();
-  evidence.receive(event, fields);
-  trace(event, fields);
- }};
+ if (trace)
+  measured = {CompileTraceSelection(std::move(prefixes)), [&](std::string_view event, const nlohmann::json& fields) {
+   if (event == "benchmark.split_sync.completed" && fields.is_object()) sync_ns = fields.at("duration_ns").get<std::uint64_t>();
+   evidence.receive(event, fields);
+   trace(event, fields);
+  }};
  std::uint64_t output_bytes = 0, produced_images = 0, selected_images = 0;
  std::string output_sha256;
  Clock::time_point production_start, production_end, final_end;
  {
   BenchmarkCompilePipeline pipeline(workers, {}, {.task_records = static_cast<std::size_t>(opts.task_records), .workspace_plan = workspace}, {}, measured);
-  BenchmarkWriteRequest request{.split = split, .output_path = fixture.path() / "train.bin", .resolution = static_cast<std::uint32_t>(opts.width), .num_workers = static_cast<int>(workers),
-   .perceptual_downscale = opts.perceptual, .execution = &pipeline, .trace = measured};
+  BenchmarkWriteRequest request{
+   .split = split,
+   .output_path = fixture.path() / "train.bin",
+   .resolution = static_cast<std::uint32_t>(opts.width),
+   .num_workers = static_cast<int>(workers),
+   .perceptual_downscale = opts.perceptual,
+   .execution = &pipeline,
+   .trace = measured
+  };
   BenchmarkSplitWriter writer(request);
   BenchmarkCompilePipeline::Attempt attempt(pipeline);
   // Accepted pooled input calls can precede image admission. Join their actual
@@ -268,21 +302,29 @@ void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixtu
    const auto publish = [&, i, completed, publication, annotations](BenchmarkEncodedImage::Ptr payload) {
     publication({i + 1, {}, true, std::move(payload)});
     if (!pipeline.labels_ready(publication, i + 1, BenchmarkLabelInput(annotations, i), "profile-labels")) throw std::runtime_error("pipeline profile label publication withdrew");
-    if (!publication.subscribe(i + 1, [&, completed](std::exception_ptr error) { if (!error) gaps.completed(); completed.settle(error); }))
+    if (!publication.subscribe(i + 1, [&, completed](std::exception_ptr error) {
+     if (!error) gaps.completed();
+     completed.settle(error);
+    }))
      throw std::runtime_error("pipeline profile image publication withdrew");
    };
    if (opts.input_storage == ProfileInputStorage::Pooled) {
     auto allowance = pipeline.execution().reserve({.bytes = inputs[order[i]].encoded.size(), .supplied_workspace = true, .workspace_class = CompileWorkClass::Extraction});
     auto payload = std::make_shared<BenchmarkEncodedImage::Ptr>();
     (void)pipeline.files().submit({.completed = [publish, payload, completed](std::exception_ptr error) {
-     if (!error) try { publish(std::move(*payload)); } catch (...) { error = std::current_exception(); }
+     if (!error) try {
+       publish(std::move(*payload));
+      } catch (...) { error = std::current_exception(); }
      if (error) completed.settle(error);
-    }, .work = [source = mapped[order[i]], payload, allowance] { *payload = source->preload(allowance, {}); }, .service_class = CompileWorkClass::Extraction,
-     .bytes = inputs[order[i]].encoded.size()});
+    }, .work = [source = mapped[order[i]], payload, allowance] {
+     *payload = source->preload(allowance, {});
+    }, .service_class = CompileWorkClass::Extraction, .bytes = inputs[order[i]].encoded.size()});
    } else {
     publish(mapped[order[i]]);
    }
-   pending.push(completed.completion(), [](std::exception_ptr error) { if (error) std::rethrow_exception(error); });
+   pending.push(completed.completion(), [](std::exception_ptr error) {
+    if (error) std::rethrow_exception(error);
+   });
   }
   pending.drain();
   pipeline.drain();
@@ -311,14 +353,21 @@ void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixtu
   if (opts.keep_artifacts) fs::rename(request.output_path, retained_output);
  }
  const auto production_seconds = seconds_since(production_start, production_end);
- nlohmann::json result{{"images", order.size()}, {"produced_images", produced_images}, {"selected_images", selected_images}, {"labels", split.labels}, {"workers", workers}, {"input_bytes", input_bytes}, {"logical_input_bytes", logical_input_bytes},
-  {"output_bytes", output_bytes}, {"output_cap_bytes", cap}, {"normal_arena_bytes", workspace->budget}, {"input_storage", std::string(mmltk::frameworks::reflection::enum_name(opts.input_storage))},
-  {"setup_sec", seconds_since(setup_start, production_start)}, {"production_sec", production_seconds}, {"finalization_including_sync_sec", seconds_since(production_end, final_end)},
-  {"images_per_sec", production_seconds > 0 ? static_cast<double>(order.size()) / production_seconds : 0}, {"sync_ns", sync_ns ? nlohmann::json(*sync_ns) : nlohmann::json{}},
-  {"input_order", order}, {"annotations", std::string(mmltk::frameworks::reflection::enum_name(opts.annotations))}, {"annotation_sha256", annotation_sha256}, {"output_sha256", output_sha256}};
+ nlohmann::json result{
+  {"images", order.size()}, {"produced_images", produced_images}, {"selected_images", selected_images}, {"labels", split.labels}, {"workers", workers}, {"input_bytes", input_bytes},
+  {"logical_input_bytes", logical_input_bytes}, {"output_bytes", output_bytes}, {"output_cap_bytes", cap}, {"normal_arena_bytes", workspace->budget},
+  {"input_storage", std::string(mmltk::frameworks::reflection::enum_name(opts.input_storage))}, {"setup_sec", seconds_since(setup_start, production_start)}, {"production_sec", production_seconds},
+  {"finalization_including_sync_sec", seconds_since(production_end, final_end)}, {"images_per_sec", production_seconds > 0 ? static_cast<double>(order.size()) / production_seconds : 0},
+  {"sync_ns", sync_ns ? nlohmann::json(*sync_ns) : nlohmann::json{}}, {"input_order", order}, {"annotations", std::string(mmltk::frameworks::reflection::enum_name(opts.annotations))},
+  {"annotation_sha256", annotation_sha256}, {"output_sha256", output_sha256}
+ };
  if (sync_ns) result["finalization_excluding_sync_sec"] = seconds_since(production_end, final_end) - static_cast<double>(*sync_ns) / 1e9;
  std::printf("pipeline_profile %s\n", result.dump().c_str());
- trace_benchmark_event(trace, "profile.pipeline.completed", [&] { result["completion_gaps_ns"] = gaps.report(); result["annotation_work"] = evidence.report(); return result; });
+ trace_benchmark_event(trace, "profile.pipeline.completed", [&] {
+  result["completion_gaps_ns"] = gaps.report();
+  result["annotation_work"] = evidence.report();
+  return result;
+ });
  record_duration_metric("pipeline", "setup", setup_start, production_start);
  record_duration_metric("pipeline", "production", production_start, production_end);
  record_duration_metric("pipeline", "finalization", production_end, final_end);
