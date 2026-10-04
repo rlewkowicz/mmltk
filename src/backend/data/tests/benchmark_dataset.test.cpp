@@ -164,6 +164,45 @@ using mmltk::backend::data::testsupport::write_benchmark_fixture;
 NormalizedAnnotationIndex fixture_index(const NormalizedAnnotationBuilder& builder) { return seal_normalized_annotation_metadata(NormalizedAnnotationBuilder(builder)); }
 const NormalizedAnnotationIndex& fixture_index(const NormalizedAnnotationIndex& index) { return index; }
 using mmltk::testsupport::require_condition;
+// Cancellation mode and its borrowed token share one stable fixture lifetime.
+class CompileTestCancellation final {
+ struct Tag;
+ using Source = mmltk::common::concurrency::EventCancellationSource<Tag, false>;
+ using Observation = mmltk::common::concurrency::CancellationObservation;
+ std::pair<Source, Source::Token> event_ = Source::Mint();
+ std::atomic<bool> legacy_{false};
+ bool notifying_;
+
+public:
+ explicit CompileTestCancellation(bool notifying) : notifying_(notifying) {}
+ [[nodiscard]] Observation observation() const noexcept { return notifying_ ? Observation::Borrow(event_.second) : Observation::Atomic(legacy_); }
+ [[nodiscard]] bool request() noexcept {
+  if (notifying_) return event_.first.RequestCancel();
+  legacy_.store(true);
+  return true;
+ }
+};
+// A physical task retains a receipt, and fixture retirement always releases its
+// gate before joining the execution. Scenario-specific custody stays local.
+class GatedCompileTask final {
+ CompileExecution& execution_;
+
+public:
+ mmltk::testsupport::TestGate gate;
+ CompileExecution::Completion completion;
+ GatedCompileTask(CompileExecution& execution, CompileTaskKind kind, std::string name)
+     : execution_(execution),
+       gate(std::move(name)),
+       completion(execution.submit({.kind = kind, .work = [receipt = gate.receipt()](std::size_t, const CompileAllowance&) { receipt.ArriveAndWait(); }})) {
+  REQUIRE(gate.WaitEntered(5s));
+ }
+ ~GatedCompileTask() {
+  gate.Release();
+  execution_.retire_attempt();
+ }
+ GatedCompileTask(const GatedCompileTask&) = delete;
+ GatedCompileTask& operator=(const GatedCompileTask&) = delete;
+};
 std::array<CompileAllowance, 2> require_protected_compile_windows(CompileExecution& execution, std::size_t bytes) {
  using enum detail::CompileWorkspaceWindow;
  std::array<CompileAllowance, 2> leases;
@@ -236,6 +275,11 @@ struct LiveBenchmarkWriter {
  LiveBenchmarkWriter(BenchmarkCompilePipeline& execution, const fs::path& directory, AnnotationSource source)
      : output(benchmark_write_request(split, directory / "train.bin", 8, {}, &execution)), writer(output, true), attempt(execution) {
   execution.bind_source(directory / "images", writer, source);
+ }
+ [[nodiscard]] CompiledDataset publish_selected(std::span<const std::uint32_t> slots) {
+  auto sealed = writer.seal_slots(output, slots);
+  sealed.artifact.publish(output.output_path, {}, detail::StagedArtifact::Publication::DurableReplace);
+  return CompiledDataset::open(output.output_path);
  }
 };
 void test_benchmark_trace_gate_is_lazy() {
@@ -7400,8 +7444,8 @@ TEST_CASE("bounded record turnover keeps stale physical completions independent"
  }
 }
 TEST_CASE("accepted local readiness retries after custody commits", "[backend][data][benchmark][pipeline][resources]") {
- // CLEANUP-IGNORE: Independent readiness scenarios share only type aliases and optional-observer fixture setup; their state transitions differ.
  using Changes = CompileExecution::Readiness::Changes;
+ // CLEANUP-IGNORE: Independent readiness scenarios share only generated observation mode and empty-observer fixture construction; their state transitions differ.
  const bool observed = GENERATE(false, true);
  CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8}, {},
   observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
@@ -10495,7 +10539,6 @@ TEST_CASE("provenance settlement coalesces used record blocks while preserving m
  BenchmarkCompilePipeline execution(1);
  LiveBenchmarkWriter fixture(execution, temporary.path(), AnnotationSource::CoconutCoco);
  auto& writer = fixture.writer;
- const auto& output = fixture.output;
  const auto publication = execution.source_publication(images, {});
  std::array<BenchmarkSplitWriter::LabelSettlement, 3> settlements{
   {{.ordinal_incomplete = true, .ordinal_base = 100}, {.ordinal_incomplete = false, .ordinal_base = 3}, {.ordinal_incomplete = false, .ordinal_base = 0}}
@@ -10534,9 +10577,7 @@ TEST_CASE("provenance settlement coalesces used record blocks while preserving m
  }
  writer.settle_labels({});
  writer.settle_labels(settlements);
- auto sealed = writer.seal_slots(output, selected);
- sealed.artifact.publish(output.output_path, {}, detail::StagedArtifact::Publication::DurableReplace);
- const auto compiled = CompiledDataset::open(output.output_path);
+ const auto compiled = fixture.publish_selected(selected);
  for (const auto& settlement : settlements) {
   const auto actual = compiled.annotations(settlement.slot);
   REQUIRE(actual.labels.size() == count);
@@ -10655,9 +10696,7 @@ TEST_CASE("dynamic benchmark slots write labels before pixels and replace one de
    const std::array settlements{BenchmarkSplitWriter::LabelSettlement{.slot = *slot, .ordinal_incomplete = incomplete, .ordinal_base = 11}};
    writer.settle_labels(settlements);
   }
-  auto sealed = writer.seal_slots(output, selected);
-  sealed.artifact.publish(output.output_path, {}, detail::StagedArtifact::Publication::DurableReplace);
-  const auto compiled = CompiledDataset::open(output.output_path);
+  const auto compiled = fixture.publish_selected(selected);
   REQUIRE(compiled.image_labels(*slot).size() == 1);
   CHECK(compiled.image_labels(*slot)[0].annotation_id == (restore ? 101 : 202));
   CHECK(compiled.image_labels(*slot)[0].source_ordinal == (restore ? 23 : 11));
@@ -11170,15 +11209,12 @@ TEST_CASE("ordinary external backlog performs no exceptional candidate inspectio
  CompileExecution execution(1, {}, {.transient_bytes = page * 2, .task_records = 8}, {}, {{.aggregates = true}, [](std::string_view, const CompileExecutionSnapshot&) {}});
  auto occupied = execution.reserve({.bytes = page});
  std::vector<std::unique_ptr<CompileResourceWait>> waiting;
- mmltk::testsupport::TestGate running("ordinary registrations arrive during unrelated ready work");
+ GatedCompileTask active(execution, CompileTaskKind::Labels, "ordinary registrations arrive during unrelated ready work");
  const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
-  running.Release();
+  active.gate.Release();
   waiting.clear();
   occupied = {};
-  execution.retire_attempt();
  });
- auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
- REQUIRE(running.WaitEntered(5s));
  const CompileResources resources{.bytes = page * 2, .supplied_workspace = true};
  for (unsigned i = 0; i < 64; ++i) {
   waiting.push_back(execution.defer_resources(resources));
@@ -11186,8 +11222,8 @@ TEST_CASE("ordinary external backlog performs no exceptional candidate inspectio
  }
  CHECK_FALSE(execution.oversized_workspace_pending());
  CHECK(execution.snapshot().costs.external_drain_candidates == 0);
- running.Release();
- active.wait();
+ active.gate.Release();
+ active.completion.wait();
  unsigned completed = 0;
  for (unsigned turn = 0; turn < 16; ++turn) {
   for (std::size_t i = 1; i < waiting.size(); i += 2) {
@@ -11218,13 +11254,7 @@ TEST_CASE("external oversized membership follows registration order through prom
  const bool predecessor = GENERATE(false, true);
  const auto page = mmltk::common::system::host_page_size();
  CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 4}, {}, {{.aggregates = observed}, [](std::string_view, const CompileExecutionSnapshot&) {}});
- mmltk::testsupport::TestGate running("worker selection remains gated during membership transitions");
- const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
-  running.Release();
-  execution.retire_attempt();
- });
- auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
- REQUIRE(running.WaitEntered(5s));
+ GatedCompileTask active(execution, CompileTaskKind::Labels, "worker selection remains gated during membership transitions");
  const CompileResources ordinary{.bytes = page / 2}, first{.bytes = page * 2, .supplied_workspace = true}, second{.bytes = page * 3, .supplied_workspace = true};
  auto older = predecessor ? execution.defer_resources({.bytes = page * 4, .supplied_workspace = true}) : nullptr;
  auto gap = execution.defer_resources(ordinary);
@@ -11266,8 +11296,8 @@ TEST_CASE("external oversized membership follows registration order through prom
  accepted.reset();
  later.reset();
  gap.reset();
- running.Release();
- active.wait();
+ active.gate.Release();
+ active.completion.wait();
  execution.join();
  CHECK_FALSE(execution.oversized_workspace_pending());
  CHECK_FALSE(execution.resource_pressure());
@@ -11320,13 +11350,7 @@ TEST_CASE("cancellation retires mixed external memberships before final parent r
  using namespace mmltk::backend::data::detail;
  const auto page = mmltk::common::system::host_page_size();
  CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 4});
- mmltk::testsupport::TestGate running("physical task remains alive while demand is cancelled");
- const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
-  running.Release();
-  execution.retire_attempt();
- });
- auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
- REQUIRE(running.WaitEntered(5s));
+ GatedCompileTask active(execution, CompileTaskKind::Labels, "physical task remains alive while demand is cancelled");
  auto parent = execution.reserve({.bytes = page, .descriptors = 1});
  auto ordinary = execution.defer_resources({.bytes = page});
  auto promoted = execution.defer_resources({.bytes = page / 2}, parent);
@@ -11346,9 +11370,9 @@ TEST_CASE("cancellation retires mixed external memberships before final parent r
  peer.reset();
  CHECK_FALSE(execution.oversized_workspace_pending());
  CHECK_FALSE(execution.resource_pressure());
- running.Release();
+ active.gate.Release();
  execution.retire_attempt();
- CHECK(active.ready());
+ CHECK(active.completion.ready());
  CHECK(execution.snapshot().records == 0);
  CHECK(execution.snapshot().leased == 0);
  CHECK(execution.resource_usage().bytes == 0);
@@ -11581,13 +11605,7 @@ TEST_CASE("external exceptional selection bypasses a head without its protected 
  using namespace mmltk::backend::data::detail;
  const auto page = mmltk::common::system::host_page_size();
  CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 6}, {}, {{.aggregates = true}, [](std::string_view, const CompileExecutionSnapshot&) {}});
- mmltk::testsupport::TestGate running("candidate visits are measured while the worker holds its record");
- const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
-  running.Release();
-  execution.retire_attempt();
- });
- auto active = execution.submit({.kind = CompileTaskKind::Labels, .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
- REQUIRE(running.WaitEntered(5s));
+ GatedCompileTask active(execution, CompileTaskKind::Labels, "candidate visits are measured while the worker holds its record");
  auto occupied = execution.try_retain(CompileTaskKind::Pixels);
  REQUIRE(occupied);
  std::vector<std::unique_ptr<CompileResourceWait>> ordinary;
@@ -11617,8 +11635,8 @@ TEST_CASE("external exceptional selection bypasses a head without its protected 
  head.reset();
  next.reset();
  ordinary.clear();
- running.Release();
- active.wait();
+ active.gate.Release();
+ active.completion.wait();
  execution.join();
  CHECK(execution.snapshot().records == 0);
  CHECK(execution.resource_usage().bytes == 0);
@@ -12224,15 +12242,11 @@ TEST_CASE("borrowed file cancellation interrupts a shared CPU grant wait locally
 }
 TEST_CASE("borrowed file demand observes notifying and legacy cancellation through a held CPU peer", "[backend][data][benchmark][pipeline]") {
  const bool notifying = GENERATE(false, true);
- struct FileCancellationTag {};
- using Source = mmltk::common::concurrency::EventCancellationSource<FileCancellationTag, false>;
- using Observation = mmltk::common::concurrency::CancellationObservation;
- auto [cancel, token] = Source::Mint();
- std::atomic<bool> legacy{false};
+ CompileTestCancellation cancellation(notifying);
  std::promise<void> waiting, settled;
  std::atomic<unsigned> calls{0};
  const auto cause = std::make_exception_ptr(std::runtime_error("file admission cancellation cause"));
- CompileExecution execution(1, {}, {}, notifying ? Observation::Borrow(token) : Observation::Atomic(legacy), [&](std::string_view, const detail::CompileExecutionSnapshot& snapshot) {
+ CompileExecution execution(1, {}, {}, cancellation.observation(), [&](std::string_view, const detail::CompileExecutionSnapshot& snapshot) {
   if (snapshot.parked[static_cast<std::size_t>(detail::CompileParkReason::Cpu)]) mmltk::testsupport::release_test_promise(waiting);
  }, cause);
  detail::FileWorkQueue files(execution, 1);
@@ -12248,10 +12262,7 @@ TEST_CASE("borrowed file demand observes notifying and legacy cancellation throu
  auto queued = files.submit({.work = [&] { ++calls; }});
  queued.subscribe([&](std::exception_ptr) { mmltk::testsupport::release_test_promise(settled); });
  mmltk::testsupport::await_test_promise(waiting, "file demand parked behind an accepted peer");
- if (notifying)
-  REQUIRE(cancel.RequestCancel());
- else
-  legacy = true;
+ REQUIRE(cancellation.request());
  mmltk::testsupport::await_test_promise(settled, "cancellation retires queued custody before peer return");
  CHECK(queued.failure() == cause);
  CHECK_THROWS(queued.wait());
@@ -13974,13 +13985,9 @@ TEST_CASE("completion windows wait for owned completion and resource pressure", 
 }
 TEST_CASE("completion windows retain physical custody through notifying and legacy cancellation", "[backend][data][benchmark][pipeline]") {
  const bool notifying = GENERATE(false, true);
- struct WindowCancellationTag {};
- using Source = mmltk::common::concurrency::EventCancellationSource<WindowCancellationTag, false>;
- using Observation = mmltk::common::concurrency::CancellationObservation;
- auto [cancel, token] = Source::Mint();
- std::atomic<bool> legacy{false};
+ CompileTestCancellation cancellation(notifying);
  const auto cause = std::make_exception_ptr(std::runtime_error("window cancellation cause"));
- CompileExecution execution(1, {}, {}, notifying ? Observation::Borrow(token) : Observation::Atomic(legacy), {}, cause);
+ CompileExecution execution(1, {}, {}, cancellation.observation(), {}, cause);
  CompileExecution::CompletionSource held(&execution);
  mmltk::testsupport::TestGate physical("sole CPU remains in accepted work");
  std::promise<void> waiting, interrupted;
@@ -14004,10 +14011,7 @@ TEST_CASE("completion windows retain physical custody through notifying and lega
   window.drain();
  });
  mmltk::testsupport::await_test_promise(waiting, "window begins its selective wait", 5s);
- if (notifying)
-  REQUIRE(cancel.RequestCancel());
- else
-  legacy = true;
+ REQUIRE(cancellation.request());
  mmltk::testsupport::await_test_promise(interrupted, "window observes cancellation while every CPU is held", 5s);
  CHECK(draining.wait_for(0ms) == std::future_status::timeout);
  CHECK(settled == 0);
@@ -16084,6 +16088,7 @@ TEST_CASE("ready normalized rows share bounded gathers across empty and oversize
  CHECK(observation.at("validated_runs") == validated);
  REQUIRE_NOTHROW(admit_normalized_annotations(result));
 }
+// CLEANUP-IGNORE: Independent gather-cancellation and archive-publication cases share only CPU eligibility and generated flags with different roles.
 TEST_CASE("held gather batches leave ready independent continuations runnable and cancellation unsealable", "[benchmark][annotations][resources]") {
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
