@@ -227,6 +227,15 @@ processing or parking rows. A fatal label conversion or independent compiler
 failure therefore settles recovery without waiting for pending originals or
 JPEG geometry, preserving the original cause.
 
+When originals settle, a staged native product with a proof that recovery
+cannot change its payload can share its existing boxes/runs in the final view.
+The proof excludes eligible dropped objects, invalid required labels, and
+suppressed malformed, degenerate, or unlisted-object reports. Finalization
+updates lineage and row admission while retaining backing and rechecking
+physical/original generations. Rows needing recovery or final rejection reports
+take the ordinary path. Final compiled-label projection and settlement still
+run; native payload reuse does not skip them.
+
 ## Overlapping acquisition, labels, and pixels
 
 The [compiler](../src/backend/data/benchmark/benchmark_compiler.cpp) constructs
@@ -329,6 +338,10 @@ required prefix. Control/chunk limits can fall back to bounded streaming.
 Forward replay and known-member traversal inspect at most 64 skipped headers
 per CPU grant, with cancellation checked at every header. This bounds each
 scheduling turn without batching images or delaying a ready member.
+Admitted member reads/copies use at most eight blocks or 1 MiB per CPU turn,
+stop at the member boundary, and check cancellation per block. Direct reads and
+streaming copies share extent validation. Arbitrary consumer callbacks retain
+their separate execution boundary because they can wait or publish output.
 There is no persisted seek sidecar or mandatory EOF/index-export pass.
 Gzip decoder and caller capacity participate in the shared CPU allowance;
 nonpreemptible grants last through that reader's active stream and leave
@@ -340,9 +353,13 @@ backend requires its complete fixed workspace and helper-CPU grant to be
 admitted; it is not multiplied by the number of source controllers. Suspending
 an archive retires its decoder without allocating replacement state while
 consumers retain the opened generation and their encoded bytes.
-Record-only or fairness waits retain that forward state. Actual resource
-pressure can suspend an idle decoder; an unaccepted input may be released and
-replayed from its saved position in the same opened generation. Accepted
+Record-only or fairness waits retain that forward state. An idle decoder
+suspends when returning its owned bytes/descriptors can help blocked demand,
+including mandatory exceptional drain. Ordinary arena-only pressure does not
+discard an unsupplied decoder whose library charge cannot relieve it. The
+[admission owner](compile-execution.md#selective-readiness-and-resource-pressure)
+decides that usefulness from current custody. An unaccepted input may be released
+and replayed from its saved position in the same opened generation. Accepted
 writers keep their independent bytes and complete during that replay.
 
 [JSON discovery](../src/backend/data/benchmark/benchmark_json.cpp) walks the
@@ -392,8 +409,13 @@ into generation-owned blocks, normally 4 MiB. A short aligned claim is separate
 from file-service preparation and payload fill. Published ranges never move;
 their block survives through its last borrower even after the append owner
 retires. Normalized component assembly plans disjoint record/run destinations
-and gathers bounded chunks on shared lanes, retaining canonical source order
-and backing through completion.
+and gathers already-ready rows on shared lanes under aggregate caps of 64
+images, 256 boxes, and 65,536 runs per task. Empty rows count toward the image
+cap; large rows resume through bounded continuations while peers progress.
+Gathering retains canonical source order, disjoint destinations, validation,
+and backing through completion, without waiting for a batch to fill. Proven
+empty mask-projection work is skipped before task admission while row and
+duplicate bookkeeping remain with the importer.
 
 Ready-input arrival determines physical slot placement. Source annotation order
 has its own authority:
@@ -495,9 +517,12 @@ admission, so replacing a path cannot substitute another generation.
 
 COCONut image consumers build physical inventories while publishing ready
 images; a completed census is not a prerequisite for the first pixel or label
-work. Annotation controllers first attempt an existing version-3 release cache
-and otherwise admit independent `.part-<shard>.normalized.bin` products, then
-merge component provenance when those inputs settle. Release and part caches
+work. Annotation controllers first attempt an existing version-3 release cache,
+including when modern part caches exist, if every cached artifact and required
+original snapshot is immediately admissible. A held or missing prerequisite
+leaves independent `.part-<shard>.normalized.bin` preparation in charge rather
+than waiting for the release-cache attempt. Controllers merge component
+provenance when those inputs settle. Release and part caches
 remain reusable across cold, warm, and repaired acquisitions. Source archives
 remain reusable on disk, and healthy reuse does not hash whole payloads.
 

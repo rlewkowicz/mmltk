@@ -222,9 +222,14 @@ Rejected or speculative slots do not influence the maximum.
 live pixel and label prefixes forward within the same staged inode, using at
 most 4 MiB of reusable pinned scratch. Within each block it visits pixels then
 labels in increasing source order, reading a complete chunk before any
-overlapping destination write. Adjacent live extents can coalesce while that
-order remains intact. It preserves physical slot IDs and sample-local
-run offsets, reclaims unused extents where hole punching is supported, and
+overlapping destination write. Adjacent live pixel extents use the full admitted
+scratch window. Label windows capture up to one block's live prefixes before
+batched page-covered allocation and consumed-source reclamation; nonadjacent
+prefixes retain separate writes. A capacity rejection falls back to smaller safe
+operations while captured source bytes remain available. A larger supplied
+window is a maximum, not a new minimum storage or scratch requirement.
+Compaction preserves physical slot IDs and sample-local run offsets, reclaims
+unused extents where hole punching is supported, and
 truncates to the computed final length. No move buffer is needed when the label
 pitch is unchanged. Header and resident-metadata records are then written and synced
 before atomic publication. Failure or cancellation preserves the prior published
@@ -453,6 +458,15 @@ helpers share the same arithmetic rules, low-variance handling, and edge/tail
 behavior. Byte outputs and compiled planar projection retain exact RGB8
 quantization; continuous float output keeps scalar `powf` encoding.
 
+CPU byte quantization uses one immutable 4,097-entry base-code lookup derived
+from the canonical Float32 transfer thresholds. Power-of-two buckets and one
+threshold correction replace the dependent eight-step SIMD search; table
+preparation verifies that each bucket needs at most one correction. The scalar
+threshold search remains the numerical authority. Full vectors use ordinary
+unaligned stores and tails retain masked stores. Fully assigned axis/state
+scratch is prepared for overwrite; mathematical accumulators still initialize
+their sums and compensation explicitly.
+
 Ordinary CPU shrinking and enlargement use the existing
 [AVIR float4 SSE backend](../third_party/avir/avir_float4_sse.h). Its signed
 half-integer rounding follows the scalar float policy without changing the
@@ -487,8 +501,8 @@ tree; filtering, thresholds, alpha handling, and rounding are unchanged.
 Benchmark compilation facts record resampling policy independently of source-cache
 identity. Changed policy requires recompilation. Perceptual downscaling can
 emphasize noise; no detector-accuracy benefit is claimed. The
-[bounded profiles and full Coconut observation](validation.md#compiler-throughput-validation-record)
-state the measured performance and its limits.
+[compiler performance report](benchmark-performance.md)
+states the measured performance and its limits.
 
 ## Loading a compiled file
 

@@ -328,7 +328,7 @@ outside the permitted test set.
 | `core` | Core acceptance, presentation, dataset, image resampling, model catalog, system/concurrency, CLI, and tool tests |
 | `rfdetr` | Native RF-DETR contract, core, augmentation, training, inference, export, ML CUDA/layers, raster, and video suites |
 | `rfdetr-profile` | Instrumented training profile runner; selects `dev` |
-| `data-profile` | Explicit CPU Directory compile, benchmark pixels, retained-RGB resample, full Coconut, or CUDA loader profile; defaults to the Release graph |
+| `data-profile` | Explicit CPU Directory compile, benchmark pipeline/archive, compaction, pixels, retained-RGB resample, full Coconut, or CUDA loader profile; defaults to the Release graph |
 | `browser-app` | Rust/Iced protocol, workflow state, plots, transport, image-custody, and integration-driver tests; vendored `iced_plot` and selected `iced_aw` library tests; direct JavaScript adapter tests |
 | `workspace-wayland` | Packaged Firefox/NVIDIA hardware acceptance |
 | `cuda-vulkan` | Standalone CUDA/Vulkan allocation, FD, timeline, pixel, and exporter-exit diagnostic |
@@ -362,7 +362,9 @@ acceptance evidence.
 `./mmltk --test data-profile -- --help` prepares the selected profile target and
 its dependencies, then prints its reflected options. The
 [runner](../src/backend/data/tests/profile_runner.cpp) calls production owners;
-it does not implement another compiler. All runner arguments follow `--` and
+its [shared reflected options](../src/backend/data/tests/profile_support.h)
+and [option admission](../src/backend/data/tests/profile_support.cpp) serve
+every mode. All runner arguments follow `--` and
 paths there are container-visible paths (`/workspace` is this checkout).
 Select a mode explicitly:
 
@@ -371,6 +373,8 @@ Select a mode explicitly:
 | `Compile` | Directory preparation, STB decode/resize, labels, and compiled-file finalization; synthetic `Png` or `Jpeg` bytes use Directory's numbered `.png` filenames |
 | `Pixels` | Shared benchmark decode/resize/store into bounded memory destinations; benchmark JPEG uses TurboJPEG, PNG uses STB |
 | `Resample` | Shared CPU resize/store from RGB decoded before timing; setup is reported separately |
+| `Pipeline` | Bounded local benchmark publication, image/label processing, file services, mapped output, and finalization; Archive input selects the focused transport variant described below |
+| `Compaction` | Shared same-inode mover, metadata writes, and sync on a bounded staged fixture; setup and verification are separate |
 | `Coconut` | Complete Coconut recipe with Stock validation and dropped-mask recovery, Stretch, and the chosen perceptual setting, through final publication |
 | `Loader` | Directory compilation followed by sequential, shuffled, and overlapped CUDA loading; this is the default mode |
 
@@ -386,20 +390,80 @@ For a bounded synthetic compilation profile:
 `--mixed-geometry` cycles 384×384, 640×480, 768×768, 1024×768, 2048×2048,
 640×360, and 320×240 inputs. `--shuffle-geometry` uses seed 1729.
 `--cpu-affinity` optionally fixes an eligible Linux CPU list inherited by the
-production workers. Printed input dimensions and SHA-256 values let paired
-runs establish identical encoded inputs. Synthetic Compile/Loader working
+production workers. A matching mixed-core mask does not guarantee matching
+core-type distribution. Use the [read-only topology diagnostic](gpu-execution.md#read-only-capability-inspection)
+to select a fixed CPU/core-type set and retain its SMT/frequency-policy facts
+alongside paired measurements. Printed input dimensions and SHA-256 values let
+paired runs establish identical encoded inputs. Synthetic Compile/Loader working
 directories are removed afterward unless `--keep-artifacts` is set; use a
 dedicated scratch directory.
 
 Pixels/Resample can instead use `--input-manifest /workspace/PATH.txt` with one
 JPEG/PNG path per nonempty line. Relative entries resolve beside the manifest.
 Admission limits are 64 retained inputs and 256 MiB of encoded bytes;
-Resample additionally caps retained decoded RGB at 512 MiB. Per-worker output
-destinations total at most 512 MiB. `--num-images` cycles those inputs for the
+Resample additionally caps retained decoded RGB at 512 MiB, checked from the
+decoder's actual RGB extent for both JPEG and PNG before decoding. Per-worker
+output destinations total at most 512 MiB. `--num-images` cycles those inputs for the
 measured iteration. `cpu_profile` reports setup separately from work time,
 images/second and logical source/output bytes/second, plus retained decoded
 bytes and plan count. Those output rates are memory-store work, not disk or
 network throughput.
+
+Pipeline accepts 256–1,024 images, square output, at most 64 MiB of unique
+synthetic encoded inputs and 1 GiB of logical cycled input, and a checked
+staging/output cap of 1–2,048 MiB (default 2,048).
+`--input-storage Mapped|Pooled` selects encoded-input custody.
+`--task-records 0` uses production record sizing; 1–1,024 explicitly bounds
+the record bank. Encoded-input hashes are printed separately; `pipeline_profile`
+JSON includes output hashes, native-fixture annotation hashes when applicable,
+setup, production, and finalization including sync. A selected sync event
+additionally separates sync duration. Output is verified after timing;
+`--keep-artifacts` retains the latest `pipeline-last.bin` under `--test-dir`.
+
+```bash
+./mmltk --test data-profile -- --mode Pipeline --encoding Jpeg \
+  --test-dir /workspace/build/validation/data-profile-pipeline \
+  --width 384 --height 384 --perceptual --mixed-geometry --shuffle-geometry \
+  --num-images 256 --compile-workers 4 --input-storage Mapped \
+  --warmup-runs 1 --repetitions 3
+./mmltk --test data-profile -- --mode Compaction --compaction-case MixedLabels \
+  --test-dir /workspace/build/validation/data-profile-compaction \
+  --width 384 --height 384 --num-images 1024 --output-cap-mib 16384 \
+  --warmup-runs 1 --repetitions 3
+```
+
+Compaction accepts 1–4,096 slots and a checked cap of at most 16,384 MiB;
+the default cap remains 2,048 MiB. `Dense`, `Sparse`, and `MixedLabels` vary live
+extents and label occupancy. Each iteration checks live-payload hashes,
+physical slot identity, staged inode identity, and the final layout.
+`compaction_profile` separates setup, movement, metadata, sync, and verification;
+`compaction_sync_sec` includes movement through sync. `--compaction-cold` syncs
+and advises only that fixture out of cache; it does not establish a cold host
+or device. The temporary staged file is retired after verification.
+
+Pipeline's focused causal variants reuse production owners:
+
+- `--input-storage Archive` accepts 128–256 members in a generated gzip archive
+  bounded to 64 MiB. It checks exact returned bytes and physical resource
+  retirement, reports `archive_profile`, and does not run image conversion or
+  publish a compiled split. `--archive-pressure None|Arena|Bytes|Exclusive`
+  selects bounded admission pressure; non-None requires Archive input.
+- `--annotations Ready|Gather|DeferredClean|DeferredRecovery` selects ordinary
+  ready labels, normalized gather, unchanged native finalization, or deferred
+  recovery. Non-Ready variants require Mapped/Pooled input and at least 256
+  images. Native/gather preparation precedes image publication, so these fixtures
+  establish work counts and custody, not full-recipe overlap.
+- `--completion-gaps` records bounded image-completion intervals only when
+  `profile.pipeline.completed` is selected. These traced intervals are not
+  UI frame times.
+
+For selected causal evidence, add `--trace-file /workspace/PATH.jsonl` and repeat
+`--trace-prefix`, for example `compile.execution.retired`,
+`benchmark.pipeline.retired`, or `profile.compaction.summary`. Other useful
+aggregates are `benchmark.archive.completed`, `profile.pipeline.completed`,
+and `profile.resize.completed`; [logging](logging.md#benchmark-compilation-traces)
+defines their fields and collection demands. Setup, warmups, measured samples,
+trace policy, hashes, affinity, and output checks all belong in a comparison.
 
 Coconut mode requires `--cache-dir` and square target dimensions. It uses the
 complete recipe: `--num-images` does not limit its population. Each warmup or
@@ -423,10 +487,10 @@ During compaction those phase quantities expose byte progress. Final
 `coconut_profile` counts come from the published manifest; output bytes are
 logical compiled lengths, not physical disk allocation or device throughput.
 
-Tracing is explicit via `--trace-file`; repeat `--trace-prefix` to retain
-selected event prefixes. A prefix requires a trace file. Filtered tracing still
-incurs upstream observation work, so omit the file option for throughput
-comparisons. [Trace fields and query statistics](logging.md#benchmark-compilation-traces)
+Tracing is explicit via `--trace-file`; repeat `--trace-prefix` to collect
+selected event prefixes. A prefix requires a trace file. Selected aggregates
+still incur their own collection and delivery costs; omit the file option for
+untraced throughput comparisons. [Trace fields and query statistics](logging.md#benchmark-compilation-traces)
 separate CPU time, worker wall-time sums, and elapsed time. Controlled fixtures
 remain the routine compiler checks; full-cache acquisition and production-sized
 Coconut profiles are separate opt-in work.
@@ -1184,13 +1248,28 @@ drain accepted input custody on cancellation. Archive replay checks bounded
 header work across extended tar, GNU names, ZIP, and compressed tar; provenance
 settlement checks batch values while preserving masks and identities. Storage
 cases require one capacity sample through sibling settlement, independent
-filesystem ledgers, and unchanged promises on failure. Diagnostic cases prove
-disabled and throwing observers cannot change outcomes.
+filesystem ledgers, and unchanged promises on failure. Range-batch cases cover
+raw-written and preallocated extents, overlapping label captures, scratch
+boundaries, partial mutation failures, and cancellation without publication loss.
+Diagnostic cases prove disabled and throwing observers cannot change outcomes,
+prefix demand crosses adapters before field construction, and selected retirement
+retains complete costs without transient snapshots. Readiness cases cover
+coalesced arrivals during callback delivery, stale completion handles after
+record reuse, finite dispatch reaching a fitting tail, and ordinary waits that
+do not enter the exceptional-drain index.
+
+Archive cases require useful byte/descriptor reclamation across multiple victims,
+retention under unrelated arena pressure, changed pressure demand delivery, and
+bounded read turns while peers progress. Annotation cases cover ready-row
+gathering across empty/oversized slices, held-peer cancellation, unchanged staged
+native payload proof/lineage, and final-cache reuse beside modern parts or held
+original snapshots.
 
 Resampling cases check immutable algorithm selection, poisoned scratch across
 mixed geometries, stale-plan rejection, overwrite sizing, every byte transfer
-threshold and adjacent float, exact SIMD final-row output, and checked AVIR
-layout/preparation before destination writes.
+threshold/bucket boundary and adjacent float, exact SIMD final-row output, and
+checked AVIR layout/preparation before destination writes. Retained-image cases
+preflight actual decoded RGB extents independently of JPEG/PNG workspace.
 
 These fixtures establish overlap, ownership, source identity/order, and the
 specified capacity behavior. Benchmark arrival order can change physical slot
@@ -1231,6 +1310,32 @@ failure, Unicode scalars, and malformed wire-text rejection.
 
 ### Compiler throughput validation record
 
+The aggregate-throughput implementation and validation finished at `cecde5c5`,
+using production baseline `333032e7` preserved at documentation commit
+`21bdcadc`. The [validation ledger](../build/validation/benchmark-throughput-validation.json)
+records both clean full tidy stages, fresh cleanup passes, initial/final product
+builds, focused remediation, retained successful checks, and bounded acceptance.
+The checkpoints are `de7d0d5f` (`pre cleanup`) and `6942a35e` (`post cleanup`).
+
+| Final gate | Result |
+| --- | --- |
+| [`./mmltk --test all`](../build/validation/benchmark-throughput-test-all-final.log) | Exit 0; the data executable passed 566 cases and 426,740 assertions, with one hardware-dependent skip |
+| [`./mmltk --test workspace-wayland --headless-compositor`](../build/validation/benchmark-throughput-wayland-final.log) | Exit 0; 88 passed cases and 148,146 assertions, with one unavailable GDR-capability skip |
+
+[Final gate results](../build/validation/benchmark-throughput-final-gates.json)
+retain exact command lines, transcripts, statuses, and times. The current suite
+pair followed the successful final build and focused fixes. Firefox coverage was first-party
+packaged acceptance; no Firefox-owned suite or new complete Coconut run ran.
+
+The [performance report](benchmark-performance.md#implemented-changes-and-bounded-measurements)
+owns the matched matrix, core-controlled repeats, operation-count evidence,
+output hashes, earlier small-image regression, and measured limits. Pipeline
+and compaction compare output/live-payload hashes; Pixels/Resample retain
+independent numerical coverage rather than claiming a profile hash check.
+All referenced `build/validation` artifacts are ignored local evidence.
+
+### Earlier compiler throughput validation record
+
 The throughput and storage implementation spans `0d4e0f7a..333032e7`.
 The local [performance ledger](../build/validation/benchmark-perceptual-performance.json)
 retains the initial cancelled GUI capture, phase evidence, commands, profile
@@ -1247,63 +1352,12 @@ the explicit benchmark-only scope, retaining earlier successful checks.
 | Earlier [complete ordinary suite](../build/logs/mmltk-test-20261003-021103-3285703.log) and subsequent [Wayland acceptance](../build/logs/mmltk-test-20261003-023536-3345034.log) | Both exit 0 before later compiler follow-ups; Wayland had 88 passes, one GDR skip, and 147,989 assertions |
 | Later [broad suite](../build/validation/benchmark-final-all.log) | Stopped at user request, exit 143; resampling passed 47 cases/376,015 assertions, data reached 529 passes/one fairness-fixture failure/one skip. The fixture then passed in the final focused run above. This is not a passing full-suite result. |
 
-No current full `all`/Wayland pair is claimed after those follow-ups. The final
-compiler acceptance below was explicitly requested, separately from routine
-tests. These ignored local artifacts are absent from a fresh checkout.
-
-Untraced bounded follow-up profiles used 256 images, 24 workers, affinity 0–23,
-384×384 Stretch/perceptual, one warmup and three measured iterations. Matching
-input hashes, dimensions, settings, and affinity were verified. The preserved
-diagnostics baseline is `42c97d14`; the ledger identifies the later measured
-diff and exact commands. Median elapsed seconds were:
-
-| Production path | Baseline | Follow-up |
-| --- | ---: | ---: |
-| Directory STB JPEG, seven mixed shuffled geometries | 2.681892 | 2.578329 |
-| Directory STB PNG, seven mixed shuffled geometries | 2.529294 | 2.316668 |
-| Benchmark Pixels, 32 retained JPEGs in shuffled order | 0.265026 | 0.121570 |
-
-The retained Pixels ratio is 2.18× for decode/resize/store into memory. It
-excludes source acquisition, annotation work, disk publication, and compaction.
-Directory measurements include their small fixture's finalization. Caches were
-warm and not forcibly evicted; neither result establishes an end-to-end Coconut
-speedup. Earlier checkpoints and slower observations remain in the ledger.
-
-The final [complete Coconut run](../build/validation/benchmark-coconut-batched.log)
-used Stock validation, recovery enabled, 384×384 Stretch/perceptual, 24 workers,
-affinity 0–23, and filtered tracing. It exited 0 after **2,792.701975 seconds**,
-publishing **584,636 train + 5,000 validation images** and
-**1,190,741,014,016 logical compiled bytes**. The
-[trace](../build/validation/benchmark-coconut-batched.jsonl),
-[cost spans](../build/validation/benchmark-coconut-batched-spans.jsonl),
-[progress export](../build/validation/benchmark-coconut-batched-progress.jsonl),
-and [event summary](../build/validation/benchmark-coconut-batched-events.txt)
-retain the observation boundaries.
-
-| Wall-time boundary | Final observed seconds |
-| --- | ---: |
-| Final selection, including 239,047 provenance settlements in 3,736 batches | 23.130501498 |
-| Train compaction | 922.091084029 |
-| Validation compaction | 8.836998928 |
-
-The final execution snapshot records 24 workers created/retired,
-4,098,892 admitted/completed records, zero active/retained scheduler records,
-zero live arena allocations/occupied bytes, no exceptional peak, fixed 6 GiB
-normal locked backing, and 313 simultaneous arena allocations at high water.
-These establish retirement and observed compiler backing, not peak process RSS.
-
-The preceding [complete comparison](../build/validation/benchmark-coconut-selective.log)
-took 2,766.100522 seconds, with 69.108044390-second selection and
-965.084902918-second train compaction. The
-[manifest comparison and aggregate evidence](../build/validation/benchmark-hotspot-evidence.json)
-retain matching selection, source/annotation identities, provenance/recovery
-facts, box/run counts, and compiled lengths; the sole manifest difference is
-one image-cache hit flag. This does not prove byte-identical bins because arrival
-order can change physical placement. Source/OS cache conditions were not held
-constant: Archive calls fell from 920,527 to 103,013. Filtered tracing also keeps
-upstream observation costs. The pair supports the recorded stage observations,
-not an isolated whole-run speedup or cold-download throughput claim. Summed task
-wall/CPU times overlap and must remain separate from elapsed time.
+Those follow-ups ended without a new passing full `all`/Wayland pair at
+`333032e7`; the later completed pair is recorded above. The explicitly requested
+complete Coconut observations and earlier `42c97d14` bounded comparisons are
+retained in the [performance report's baseline evidence](benchmark-performance.md#baseline-measurement-boundary),
+with their cache, mixed-core, and trace-cost limitations. These ignored local
+artifacts are absent from a fresh checkout.
 
 ### Benchmark ownership and recovery validation record
 

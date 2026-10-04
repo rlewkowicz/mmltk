@@ -54,17 +54,27 @@ after bounded tasks. With fewer CPUs than live classes, fair sharing occurs at
 task/chunk boundaries. Feasible work can pass a blocked task, and aged byte
 demands participate in admission so fitting larger work can progress.
 
+Compute workers persist for the session. The bounded task-record bank owns
+independent active and ready links, so enqueue/removal reuses record storage.
+Each physical step still receives fresh completion state; an older retained
+completion cannot observe a recycled record's later work. Exceptional drain
+candidates have their own ordered index, separate from ordinary resource waits.
+
 The benchmark image pipeline keeps ready lists for Header, Workspace,
-Input, Output, and Pixels. It rotates between stages after successful admission;
-a denied probe does not consume a turn. Header admission establishes geometry
+Input, Output, and Pixels. Successful admission rotates between stages;
+every candidate or admission probe, including a denial, consumes the bounded
+dispatch budget of `max(8, 4 × workers)`. Header admission establishes geometry
 and a checked plan. Workspace admission atomically retains the complete
 input/conversion envelope and a successor record without taking a CPU lane.
 Input preloads encoded bytes, Output prepares the occupied destination, and
 Pixels converts directly into its disjoint extent.
 Resource-denied workspace requests rotate within a pass bounded by the initial
-ready count, allowing fitting successors to progress. A full record bank stops
-that stage until capacity returns. Admission releases the facts lock between
-bounded attempts, so completion and source publication can advance alongside it.
+ready count, allowing fitting successors to progress. The stage, workspace,
+and label cursors survive a budget yield. Unexamined work requests a local
+follow-up; a fully denied unchanged pass parks. A full record bank stops that
+stage until capacity returns. Admission releases the facts lock between
+successful attempts, so completion and source publication can advance alongside
+it. No turn waits for a batch to fill.
 
 Curl pumps and file-service calls draw CPU grants from the same owner; a service
 grant replaces a compute lane while active. External archive helpers can use
@@ -99,7 +109,18 @@ causes separate Resources, Cpu, Records, Local, Pressure, Fairness, and
 Interruption. Owner subscriptions select the causes that can change their
 predicates; owner-local notifications address that subscription, and
 interruption reaches every owner. Registration checks its observed generation
-atomically, and subscription destruction joins callbacks.
+atomically, and subscription destruction joins callbacks. A callback borrows its
+registered subscription through return, including during owner teardown; it
+does not recover that registration through a concurrently retiring owner field.
+Pending notifier causes share one armed eventfd turn. Acknowledgement detaches
+that batch under the admission lock before delivery; arrivals during delivery
+arm another turn.
+
+Compute workers wait on a separate channel from owner-local notices. Physical
+admission changes wake compute selectors when queued work exists, pressure may
+require idle scratch retirement, or interruption/shutdown needs their attention.
+Public admission generations and physical-service subscriptions retain their
+own delivery. Idle selector wake counts are distinct from worker creation.
 
 Resource eligibility is cached against the resource generation. CPU-only
 changes, returned scheduler records, and local product arrivals do not
@@ -116,6 +137,15 @@ Completion windows wait on their own completions and relevant pressure, so
 unrelated CPU scheduling does not discard a retained archive/Arrow cursor.
 Oversized workspace demand has an explicit drain signal. Diagnostic counters,
 addresses, and timing never control these decisions.
+
+Reclamation usefulness is derived from blocked requests and the candidate's
+actual byte/descriptor custody. Returning an unsupplied library allocation
+cannot resolve ordinary pinned-arena fragmentation when aggregate bytes and
+descriptors have headroom. Several candidates may each contribute useful
+relief; no single victim has to satisfy the whole request. Changed demand
+notifies pressure subscribers even while pressure remains active. Exceptional
+drain, unknown external pressure, and physical retirement keep their admission
+rules; the archive owner decides whether to suspend its decoder.
 
 ## Fixed pinned arenas
 
@@ -224,6 +254,13 @@ Allocation, mapped writes, and sync stay outside this transaction; allocation
 settlement updates the same ledger. Other filesystems use independent locks.
 This coordinates one compilation's users; unrelated processes can still consume
 disk space.
+
+`StagedArtifact` accepts bounded range spans for allocation and reclamation,
+with one capacity admission/reconciliation for the batch. Single-range calls
+use the same path. Occupied-page accounting stays conservative through partial
+mutation failures; a missing occupied-map entry alone does not establish a hole.
+The compactor can split a rejected batch into smaller safe operations without
+requiring more free space than its prior minimum.
 
 [Format-10 finalization](datasets.md#staging-and-in-place-compaction) waits for
 borrowed writers/mappings, uses bounded pinned scratch, and preserves

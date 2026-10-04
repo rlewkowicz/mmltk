@@ -289,7 +289,12 @@ The data-owned `mmltk_backend_data_profile_runner` is also `EXCLUDE_FROM_ALL`.
 `./mmltk --test data-profile -- ...` explicitly builds and runs that target in
 the selected test graph (Release by default); ordinary product builds and
 `--test all` do not invoke it. It reuses the production data/resampling owners
-and test fixtures. CPU modes need no CUDA context, while Loader uses CUDA.
+and test fixtures. Shared options, input admission, geometry ordering, and trace
+selection live in `src/backend/data/tests/profile_support.{h,cpp}`;
+Pipeline/archive and compaction work live in `profile_pipeline.cpp` and
+`profile_compaction.cpp`.
+These sources share the same opt-in target and build graph.
+CPU modes need no CUDA context, while Loader uses CUDA.
 Profile modes, scratch paths, retained inputs, and explicit full Coconut runs
 are documented in [validation](validation.md#data-compilation-and-resampling-profiles).
 

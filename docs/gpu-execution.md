@@ -511,6 +511,12 @@ or run a benchmark. JSON includes CPU topology (`lscpu`), GPU/driver and kernel
 details, NUMA hardware, filesystem and block devices, PCIe paths, memory-lock
 limits, visible cuFile/GDRCopy components, and `O_DIRECT` open / `STATX_DIOALIGN`
 observations.
+`cpu_topology` additionally records each eligible logical CPU's package/core
+identity, SMT siblings, available core-type/capacity attributes, frequency limits,
+governor, and energy policy, plus hybrid `cpu_core`/`cpu_atom` PMU membership.
+Missing attributes remain unavailable; they do not prove homogeneous cores.
+Paired CPU profiles should retain this topology because equal mixed-core
+affinity masks alone do not establish equal core-type placement.
 `filesystem_capacity` reports instantaneous `statvfs` total/free/available
 bytes and fragment size. It is a read-only capacity sample, independent of the
 compiler's [capacity transactions](compile-execution.md#file-preparation-and-settlement);

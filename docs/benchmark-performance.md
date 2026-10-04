@@ -1,45 +1,89 @@
-# Benchmark compiler performance investigation
+# Benchmark compiler performance
 
-Baseline code: `333032e7`; documentation: `21bdcadc`.
+The five compiler changes and Final Validation are complete at `cecde5c5`.
+Bounded matched measurements show compaction and retained-JPEG gains; corrected
+small-image scheduling is within noise on the controlled P-core repeats. No new
+complete Coconut run was performed. [Implemented changes and bounded measurements](#implemented-changes-and-bounded-measurements)
+preserve every measured condition, the earlier regression, and the limits of
+those results.
 
-The largest measured remaining elapsed pass is final train compaction: **922.091 seconds, 33.0% of the latest run**. Pixel tasks account for **95.8% of measured task CPU time**. Compute-worker creation is constant at 24. Source review identifies removable scheduling and diagnostic work and unnecessary archive retirement; these measurements do not establish repeated worker creation.
+The investigation below records source baseline `333032e7`, preserved at
+documentation commit `21bdcadc`. At that baseline, final train compaction was
+the largest measured terminal pass: **922.091 seconds, 33.0% of the latest
+complete run**. Pixel tasks accounted for **95.8% of measured task CPU time**.
+Compute-worker creation was constant at 24. Source review identified removable
+scheduling/diagnostic work and unnecessary archive retirement; these
+measurements did not establish repeated worker creation.
 
-The five selected changes are below. Execution and diagnostic demand come first
-in implementation so the other owners share one inexpensive observation path.
-Each candidate received an independent Astra max source review across its
-callers, resource ownership, failure paths, and measurement alternatives.
+This table retains the original priority ranking and rationale. Each area
+received an independent source review across callers, ownership, failure paths,
+and measurement alternatives. Execution/diagnostic demand was implemented first
+so the remaining owners could share its demand-gated observation path.
 
-| Priority | Change | Aggregate evidence and expected effect |
+| Original priority | Implemented area | Baseline evidence and selected mechanism |
 | ---: | --- | --- |
-| 1 | Batch ordered compaction and staged range mutations | 922.091 s on the terminal train path. Use the complete scratch window and amortize sparse allocation/reclamation accounting. |
-| 2 | Remove excluded diagnostics and repeated scheduler work | 13.919 million probes, 2.704 million readiness deliveries, 1.735 million record denials. Gate collection upstream, coalesce wakes, reuse record links, and bound controller turns. |
-| 3 | Reduce exact CPU quantization and scratch initialization | 8,897.272 cumulative Pixel CPU s. Replace dependent transfer searches with an exact derived lookup, avoid overwrite-only clears, and use full-vector stores. |
-| 4 | Retain useful archive state and batch bounded reads/copies | Cold extraction logged repeated decoder restoration; its replay CPU is unmeasured. Retire only custody that can relieve pressure and amortize block-task handoffs. |
-| 5 | Reuse final annotation results and batch ready rows | 357,533 Gather bodies and source-proven cache/recovery rework. Reuse immediately available generation-valid caches, avoid proven-empty work, and group small ready rows. |
+| 1 | Batch ordered compaction and staged range mutations | 922.091 s on the terminal train path. Full scratch windows and amortized sparse allocation/reclamation accounting. |
+| 2 | Remove excluded diagnostics and repeated scheduler work | 13.919 million probes, 2.704 million readiness deliveries, 1.735 million record denials. Upstream demand gates, coalesced wakes, reused record links, and bounded controller turns. |
+| 3 | Reduce exact CPU quantization and scratch initialization | 8,897.272 cumulative Pixel CPU s. Exact derived lookup, overwrite sizing, and full-vector stores. |
+| 4 | Retain useful archive state and batch bounded reads/copies | Cold extraction logged repeated decoder restoration without replay-CPU attribution. Useful-custody reclamation and amortized block-task handoffs. |
+| 5 | Reuse final annotation results and batch ready rows | 357,533 Gather bodies and source-proven cache/recovery rework. Immediately available generation-valid caches, skipped proven-empty work, and grouped ready rows. |
 
-The sections below preserve the baseline investigation and decision gates.
-[Implemented changes and bounded measurements](#implemented-changes-and-bounded-measurements)
-record the subsequent work separately. Overlapping task costs cannot be added
-to the separate compaction interval.
+The baseline findings and deferred decision gates remain separate from measured
+implementation outcomes. Overlapping task costs cannot be added to the separate
+compaction interval. [Profile commands](validation.md#data-compilation-and-resampling-profiles),
+[current execution](compile-execution.md), [dataset formats/resampling](datasets.md),
+and [benchmark source policy](benchmark-datasets.md) own the operational reference.
+Evidence under `build/validation` is ignored local state and is absent from a
+fresh checkout.
 
-## Measurement boundary
+## Baseline measurement boundary
 
-Both complete runs used Coconut, Stock validation, dropped-mask recovery, 384×384 Stretch/perceptual, 24 workers on CPUs 0–23, zero warmups, and one repetition. Each published 584,636 train and 5,000 validation images. The only manifest difference is Objects365 patch-32's cache-hit flag (false then true); all source/annotation identities, provenance, box/run counts, and final lengths match. This does not prove byte-identical bin ordering.
+Both complete runs used Coconut, Stock validation, dropped-mask recovery, 384×384 Stretch/perceptual, 24 workers on CPUs 0–23, zero warmups, and one repetition. Each published 584,636 train and 5,000 validation images, totaling 1,190,741,014,016 logical compiled bytes. The only manifest difference is Objects365 patch-32's cache-hit flag (false then true); all source/annotation identities, provenance, box/run counts, and final lengths match. This does not prove byte-identical bin ordering.
 
 These are explicit production-sized profiles, separate from normal tests. Trace filtering retained upstream observation costs. Source and OS cache conditions were not controlled, so the pair does not isolate an end-to-end speedup. Source query exports and exact fields are in `build/validation/benchmark-hotspot-evidence.json`.
 
 | Elapsed boundary | Previous selective run (s) | Latest batched run (s) |
 | --- | ---: | ---: |
-| Whole compile | 2,766.101 | 2,792.702 |
+| Whole compile | 2,766.100522 | 2,792.701975 |
 | Production plus final source joining, before selection | 1,726.164 | 1,842.007 |
-| Final selection | 69.108 | 23.131 |
-| Train compaction | 965.085 | 922.091 |
-| Validation compaction (overlaps train) | 7.974 | 8.837 |
+| Final selection | 69.108044390 | 23.130501498 |
+| Train compaction | 965.084902918 | 922.091084029 |
+| Validation compaction (overlaps train) | 7.974 | 8.836998928 |
 | Train sync | 1.474 | 1.392 |
 
-Selection now settles 239,047 images in 3,736 bounded batches. The observed stage reduction is 45.978 seconds; whole-run time was 26.601 seconds longer. Neither number isolates one code change under these cache conditions.
+The later baseline selection settled 239,047 images in 3,736 bounded batches.
+The observed stage reduction was 45.978 seconds; whole-run time was 26.601
+seconds longer. Neither number isolates one code change under these cache
+conditions. Archive calls differed too: 920,527 versus 103,013.
 
-## Aggregate task costs
+The [latest complete-run transcript](../build/validation/benchmark-coconut-batched.log),
+[trace](../build/validation/benchmark-coconut-batched.jsonl),
+[cost spans](../build/validation/benchmark-coconut-batched-spans.jsonl),
+[progress export](../build/validation/benchmark-coconut-batched-progress.jsonl),
+and [event summary](../build/validation/benchmark-coconut-batched-events.txt)
+retain those boundaries. The preceding transcript is
+[benchmark-coconut-selective.log](../build/validation/benchmark-coconut-selective.log).
+
+Earlier bounded work, before this investigation, compared diagnostics baseline
+`42c97d14` with the later compiler diff recorded in
+[benchmark-perceptual-performance.json](../build/validation/benchmark-perceptual-performance.json).
+It used 256 images, 24 workers, affinity 0–23, 384×384 Stretch/perceptual, one
+warmup and three measured iterations, with matching input hashes/settings.
+
+| Earlier untraced production path | Baseline median (s) | Follow-up median (s) |
+| --- | ---: | ---: |
+| Directory STB JPEG, seven mixed shuffled geometries | 2.681892 | 2.578329 |
+| Directory STB PNG, seven mixed shuffled geometries | 2.529294 | 2.316668 |
+| Benchmark Pixels, 32 retained JPEGs in shuffled order | 0.265026 | 0.121570 |
+
+The retained Pixels ratio was 2.18× for decode/resize/store into memory, excluding
+acquisition, annotations, disk publication, and compaction. Directory included
+its small fixture's finalization. Caches were warm and not forcibly evicted;
+mixed affinity did not control core-type distribution. These earlier samples
+are distinct from the `333032e7` comparisons below and establish no end-to-end
+Coconut speedup. Their ledger retains slower observations and earlier checkpoints.
+
+## Baseline aggregate task costs
 
 The following are latest-run cumulative worker values, not elapsed phase times. Bodies, queue waits, callbacks and lock waits can overlap; do not sum them into an end-to-end budget. File-service I/O is not accounted for in the zero-valued Output task-kind row.
 
@@ -65,49 +109,41 @@ CPU are not fully attributed by this table. The pixel percentage does not
 establish saturation of the 24-worker pool or a proportional elapsed-time gain
 from a faster kernel.
 
-## Repeated control work and discarded products
+## Baseline control work and discarded products
 
-Latest totals: 5,869,294 submission attempts, 1,734,731 record denials, 13,918,999 eligibility probes, and 2,703,834 readiness callback deliveries. Recorded admission-lock wait is 291.306 cumulative seconds; readiness callback wall time is 1,669.852 seconds and completion callback wall time 2,842.254 seconds. These overlapping wall sums establish candidate work, not recoverable elapsed time or CPU attribution. Prefix filtering does not remove upstream snapshots/JSON construction.
+Latest complete-run totals: 5,869,294 submission attempts, 1,734,731 record denials, 13,918,999 eligibility probes, and 2,703,834 readiness callback deliveries. Recorded admission-lock wait is 291.306 cumulative seconds; readiness callback wall time is 1,669.852 seconds and completion callback wall time 2,842.254 seconds. These overlapping wall sums establish candidate work, not recoverable elapsed time or CPU attribution. Baseline prefix filtering did not remove upstream snapshots/JSON construction.
 
 Both runs produced 626,608 pixel images but selected 589,636. The 36,972 discarded images are 5.90% of produced images and represent 65,420,918,784 logical RGB-float bytes at 384×384. Their measured compute/physical-write contribution is not separately attributed. The latest 833,695 Labels and 483,204 Recovery calls warrant tracing whether repeated work is necessary for generation-safe early progress.
 
 Final compaction visits about 1.048 TB of live payload, then publishes 1.191 TB of logical file lengths. Logical size and visited bytes are not physical disk traffic. Sparse slots, allocation, and reclamation are relevant. Btrfs mount compression alone does not establish compressed compiled extents, because the writer preallocates used ranges.
 
-## Streaming and overlap
+## Baseline streaming and overlap
 
 During latest Indexing, no sampled roughly five-second interval had zero new pixel completions; median sampled rate was 355.98 images/s (p10 176.47, p90 462.86). These coarse samples cannot rule out short stalls or establish per-image p99 gaps. The previous run had one 5.467-second zero-pixel interval while labels advanced. Production continued through long recovery and physical-join spans.
 
 The latest four RecoveryDrain spans sum to 5,386.128 seconds and eleven PhysicalWait spans sum to 2,246.604 seconds, overlapping the same 1,842-second production interval. ComponentGather sums to only 19.879 seconds and InventorySeal to 0.350 seconds, with possible nesting. Removing a long named wait cannot recover that duration unless its producer or terminal dependency becomes earlier.
 
-## Viable work: final compaction
+## Baseline finding: final compaction
 
-The shared compactor is the first elapsed-time target. Both Directory and benchmark
-compilation already use it; extending that owner avoids a separate benchmark
-implementation.
+The shared compactor was the first elapsed-time target. Both Directory and
+benchmark compilation already used it, so the change extended that owner.
 
-At 384×384, the current mover uses 1,769,472 bytes of its admitted 4 MiB scratch.
+At 384×384, the baseline mover used 1,769,472 bytes of its admitted 4 MiB scratch.
 A full 64-slot pixel run is 108 MiB. Using the full scratch window reduces the
 derived number of pixel-copy iterations by approximately 50–58%, depending on
 inactive-slot fragmentation. It does not reduce the live pixel bytes copied.
 Labels account for less than 0.5% of live train payload but cause many separate
 gap punches, source punches, and storage-accounting transactions.
 
-Implement bounded ordered range processing:
-
-- Keep pixel-run coalescing and use the full admitted scratch. Capture every
-  chunk completely before an overlapping forward write.
-- Capture up to one block's label prefixes in a scratch-bounded window, then
-  batch page-covered destination allocation and consumed-source reclamation.
-  Retain separate writes for nonadjacent live prefixes.
-- Add shared range-span operations to `StagedArtifact`, with one capacity
-  admission and reconciliation per mutation batch. Single-range callers use
-  the same implementation. Absent occupied-map entries are not proof of holes.
-- Treat batch size as a maximum. On nonmutating capacity rejection, split down
-  to the prior safe operation size; retain source bytes and conservative promises
-  through partial failure. Cancellation remains independent of progress.
-- Emit one optional reflected aggregate per split for moved/stationary bytes,
-  read/write calls and bytes, allocation/reclamation spans and durations,
-  truncation, and scratch high-water. Disabled observation collects nothing.
+The implementation uses bounded ordered range processing: full admitted scratch
+for contiguous pixels, captured label-prefix windows, and batched allocation/
+reclamation through the staged-file owner. Rejected batches fall back to the
+prior safe operation sizes without losing source bytes or conservative promises.
+The [format reference](datasets.md#staging-and-in-place-compaction) and
+[storage reference](compile-execution.md#file-preparation-and-settlement) own
+these ordering/capacity rules. Optional reflected aggregates distinguish copy
+requests, actual syscalls, and mutation timing; disabled observation collects
+nothing.
 
 The ownership boundary is
 [the shared compactor](../src/backend/data/compiled/compiled_file_compaction.cpp),
@@ -117,12 +153,12 @@ Directory and benchmark writers retain final metadata writes, sync, failure
 joins, and atomic publication. Format 10, physical slot identity, sparse padding,
 eligible-only label maxima, and exact content remain unchanged.
 
-A bounded production-compactor profile should compare identical staged contents
-at 1,024 and 4,096 slots, with dense/sparse pixels, mixed labels, overlap, and
-tight storage admission. Include final sync in the comparison so delayed work
-cannot masquerade as a saving. This is roughly 1.8–7.3 GB of live pixels, not
-a full Coconut compile. Existing storage/publication cases provide correctness
-and failure coverage.
+The resulting [Compaction profile](validation.md#data-compilation-and-resampling-profiles)
+compares staged contents with dense/sparse pixels and mixed labels, including
+final sync. The selected measurement range was 1,024–4,096 slots, roughly
+1.8–7.3 GB of dense live pixels; the retained matrix used 1,024. Existing
+storage/publication cases cover overlap, tight admission, correctness, and
+failure without a full Coconut compile.
 
 Same-inode reflink is a separate candidate within this owner. It could avoid
 buffered copying for aligned, disjoint live pixel chunks, but requires verified
@@ -131,7 +167,7 @@ propagation, and matched-input measurements. It is not a measured improvement.
 Changing the compiled format, waiting for all labels before producing pixels,
 allocating sparse holes, or removing durability are excluded.
 
-The current Btrfs mount's compression setting does not identify compiled extent
+The captured Btrfs mount's compression setting does not identify compiled extent
 compression: preallocation affects that behavior. [Btrfs compression exceptions](https://btrfs.readthedocs.io/en/latest/Compression.html#exceptions).
 The existing stack captured one hole-punch call; it does not attribute a
 percentage of compaction time to that syscall.
@@ -143,42 +179,37 @@ percentage of compaction time to that syscall.
 | 50% | 461.0 s | 1.198× |
 | 100%, theoretical ceiling | 922.1 s | 1.493× |
 
-There is no measured positive speedup bound yet. Detailed source anchors,
-alternatives, and required cases are preserved in the local
+The table is a baseline projection, not a measured speedup bound. Subsequent
+bounded results appear below. Detailed source anchors, alternatives, and
+required cases are preserved in the local
 [compaction review](../build/validation/hotspot-compaction-review.md).
 
-## Viable work: exact CPU pixel processing
+## Baseline finding: exact CPU pixel processing
 
-The shared CPU resampler already uses AVX2/FMA, persistent worker-local controls,
-and direct perceptual planar output. The next changes target work that remains
-inside that implementation.
+The baseline CPU resampler already used AVX2/FMA, persistent worker-local
+controls, and direct perceptual planar output. The selected changes stayed
+inside that implementation:
 
-1. Derive an immutable inverse lookup from the existing Float32 transfer
-   thresholds. A 4,097-entry table for 4,096 power-of-two buckets gives an exact
-   base quantization code; one canonical-threshold comparison corrects it.
-   Prove the one-correction bound from the actual table, and retain the scalar
-   search as the authority. This replaces eight dependent SIMD gathers with two,
-   a 75% reduction in that instruction count, with unmeasured runtime benefit.
-   The straightforward table is 16,388 bytes, retained once or in bounded worker
-   controls.
-2. Use the existing overwrite-sizing operation for perceptual axes and state
-   rows that are fully assigned before use. The supplied 384² RGB scratch is
-   49,152 bytes; the current bind/resize sequence requests an unnecessary clear.
-   This does not permit removing mathematical accumulator initialization.
-3. Use ordinary unaligned vector stores for complete eight-lane blocks and
-   keep masked tails. Consider packed RGB lane construction and hoisted
-   fractional control only if exact output and matched-input profiles improve.
-   Packed RGB loads must read exactly three valid bytes; a convenient
-   four-byte gather would overread tight final pixels.
-4. Correct the profiling runner's decoded-RGB admission before PNG measurements.
-   It currently charges the JPEG-specific separate output allocation, which is
-   zero in STB PNG plans. Expose the decoder's checked actual RGB extent,
-   preflight retained bytes before allocating/decoding, and retain distinct
-   decoded-image, decoder-workspace, and compiled-destination accounting.
+1. The derived lookup replaces eight dependent SIMD gathers with two, a 75%
+   reduction in that instruction count; runtime benefit was initially unmeasured.
+   Its 4,097 base codes occupy 16,388 bytes, retained once with the canonical
+   Float32 thresholds. [CPU quantization](datasets.md#optional-perceptual-downscaling)
+   owns the bucket/correction proof and exact scalar authority.
+2. Overwrite sizing removes an unnecessary clear from fully assigned axes and
+   state rows. The supplied 384² RGB scratch is 49,152 bytes. Mathematical
+   accumulator initialization remains necessary.
+3. Complete vectors now use unaligned stores; tails stay masked. Packed RGB lane
+   construction and hoisted fractional controls remain possible follow-ups only
+   with exact output and matched-input evidence. RGB loads must read exactly
+   three valid bytes; four-byte gathers would overread tight final pixels.
+4. Retained-RGB profiling now checks the decoder's actual RGB extent before
+   allocating/decoding. The baseline charged the JPEG-specific separate output
+   allocation, which was zero for STB PNG plans. Decoded products, decoder
+   workspace, and compiled destinations retain distinct accounting.
 
-A one-image probe against the unchanged source confirms the PNG accounting
-defect: a retained 768×768 RGB image requires 1,769,472 bytes, but the runner
-reports `retained_decoded_bytes=0`. The cached profile target needed no rebuild
+A one-image probe against the baseline confirmed the PNG accounting defect:
+a retained 768×768 RGB image required 1,769,472 bytes, but the runner reported
+`retained_decoded_bytes=0`. The cached profile target needed no rebuild
 and exited successfully. The [query export](../build/validation/hotspot-png-cap-probe-query.jsonl)
 records the input and result. This establishes profiler accounting behavior;
 it is not a reproduced production allocation failure or a throughput comparison.
@@ -198,10 +229,10 @@ and image oracles remain independent of the derived lookup.
 The bounded retained-JPEG sample has 432 fractional-perceptual and 80 AVIR
 images: 1.063 cumulative seconds of decode and 4.129 seconds of resize/store.
 These overlap across workers and are sample-local. The last untraced Pixels
-profile ran 256 images in 0.121570 seconds; it excludes file output and full
-recipe control. Compare the new code against `333032e7`, at one and 24 workers,
-using matched Pixels/Resample inputs and a small Directory compile for mapped
-output. Keep setup and trace-enabled causal measurements separate.
+profile ran 256 images in 0.121570 seconds; it excluded file output and full
+recipe control. The later matrix compares `333032e7` at one and 24 workers
+using matched Pixels/Resample inputs, with a small Directory mapped-output
+control. Setup and trace-enabled causal measurements remain separate.
 
 | Other feasible mechanism | Evidence needed before selecting it |
 | --- | --- |
@@ -225,92 +256,78 @@ SIMD lanes are full; waiting for a batch or geometry match would add latency.
 Detailed alternatives, source anchors, and tests are in the local
 [pixel review](../build/validation/hotspot-pixels-review.md).
 
-## Viable work: scheduling and diagnostic demand
+## Baseline finding: scheduling and diagnostic demand
 
-The strongest control-path change is one cutover inside the existing execution
-and trace owners. A filtered trace currently builds payloads before rejection.
-For the public Coconut adapter this includes JSON construction, serialization,
-a trace mutex, parsing, and only then prefix filtering. Native execution also
-collects live snapshots and diagnostic credit ancestry when only a final
-summary was requested. Some of that work runs while callers hold their facts
-mutexes.
+The baseline filtered trace built payloads before rejection. For the public
+Coconut adapter this included JSON construction, serialization, a trace mutex,
+parsing, and only then prefix filtering. Native execution also collected live
+snapshots and diagnostic credit ancestry when only a final summary was requested.
+Some of that work ran while callers held their facts mutexes.
 
-Give trace values one immutable selection policy plus delivery, propagated
-through public, private, and enriching adapters. Gate field builders,
-source-file digests, snapshots, and clocks at their owning producer. Separate
-aggregate collection from detailed emission: selecting
-`compile.execution.retired` must retain complete cumulative counters without
+The implemented cutover gives trace values one immutable selection policy plus
+delivery through public, private, and enriching adapters. Producers gate field
+builders, source-file digests, snapshots, and clocks. Aggregate collection is
+separate from detailed emission: selecting
+`compile.execution.retired` retains complete cumulative counters without
 collecting transient ancestry or formatting every rejected admission. Completed
 span selection still requires its duration even when its start is excluded.
 Default full traces preserve their requested events and failure semantics.
 
-The scheduler itself has three concrete opportunities:
-
-- Coalesce eventfd writes for an already-pending notifier turn. Under the
-  admission mutex, detach the current causes and clear the armed state before
-  invoking callbacks. Arrivals during callback delivery must arm the next turn.
-  Interruption, withdrawal, shutdown, local retry, and subscription destruction
-  retain their existing guarantees.
-- Replace active/ready list-node allocation and linear removal with reusable
-  links in the fixed task-record bank. Preserve independent active/ready
-  membership, class ordering, bypass cursors, and physical completion custody.
-  Completion state must remain fresh for each physical step, because callers
-  can retain old handles after a record is reused.
-- Bound each pipeline dispatch turn by useful work and probes, retaining its
-  stage and denied-workspace cursors. Queue one immediate local wake for
-  genuinely unexamined work, then let other owners receive callbacks. A fully
-  denied finite pass must park; it must not restart itself indefinitely.
-  Arm resource/record interests before testing admission, so narrowing demand
-  cannot miss the only capacity return.
+The scheduler cutover coalesces eventfd turns, reuses independent active/ready
+links in the fixed record bank, and bounds dispatch while preserving cursors
+across yields. Physical completion state remains independent of record reuse.
+The [execution reference](compile-execution.md#owners-and-ready-work) owns
+admission budgets, finite denied passes, and callback/subscription lifetime;
+its [readiness section](compile-execution.md#selective-readiness-and-resource-pressure)
+describes acknowledgement races and the later idle-worker wake correction.
 
 These belong in [CompileExecution](../src/backend/data/compile_execution.cpp),
 [the benchmark trace boundary](../src/backend/data/benchmark/detail/benchmark_trace.h),
 [the public compiler adapter](../src/backend/data/benchmark/benchmark_compiler.cpp),
 and [pipeline dispatch](../src/backend/data/benchmark/benchmark_pipeline.cpp).
-The selection value should be independent of product types, JSON, and resource
+The selection value is independent of product types, JSON, and resource
 state. Existing reflected observation declarations own additional counters;
 diagnostic identities remain observational.
 
 The source review also identified ready-row gather batching and empty
-Projection admissions. Those belong in the annotation/import owners and are
-coordinated with the rework review below. They do not justify generic executor
-auto-batching across different resource or failure policies.
+Projection admissions. Their implementation stayed in the annotation/import
+owners described below; neither justified generic executor auto-batching across
+different resource or failure policies.
 
 | Further opportunity | Decision boundary |
 | --- | --- |
 | Queue-local capacity subscriptions | Returning one file queue's slot currently broadcasts global Records. A complete scoped cutover must signal after actual slot return and safely detach before the consumer retires. Removing the broadcast alone can lose progress. |
 | Record-only waits and dirty-progress wake coalescing | Use the existing readiness and progress owners; preserve predicate-before-wait races, exact terminal facts, flush sequences, and failure wakes. |
-| Worker wake targeting, class-ready masks, or fewer lock sections | Measure empty selections and lock CPU after the first cutover. Preserve class floors and keep bodies, callbacks, capture destruction, and resource retirement outside admission locks. |
+| Further worker targeting, class-ready masks, or fewer lock sections | The measured idle-broadcast correction is recorded below. Additional changes still require empty-selection/lock-CPU attribution, with class floors and physical retirement/callback boundaries preserved. |
 | Aged-credit and physical-service bookkeeping | A faster scan must preserve alias/custody changes that can occur without a resource epoch. Affinity caching must account for nested borrowed dispatch. |
 | Extra I/O workers, work stealing, or idle-floor lending | Current evidence does not justify changing these policies. Increasing retained work or delaying newly live classes can conceal the problem and weaken progress guarantees. |
 
-A bounded `Pipeline` mode in the existing profiler should exercise production
-source publication, image and label work, both file queues, and mapped output
-using 256–1,024 local synthetic images. Compare trace-off, selected-summary, and
-full-detail capture separately. Existing Compile/Pixels modes are useful
-controls but do not exercise this complete benchmark control path.
+The resulting bounded `Pipeline` mode exercises production source publication,
+image and label work, both file queues, and mapped output with 256–1,024 local
+synthetic images. Its matrix separates trace-off, selected-summary, and
+full-detail capture. Compile/Pixels remain controls with narrower scope.
 
-Record snapshots built, eventfd writes, notifier batches/deliveries, submissions,
-denials, probes per turn, empty turns, completion spacing, and retirement only
-when requested. Preserve all samples and input hashes. Explicit-gate tests must
-cover arrivals during notification acknowledgement/delivery, stale completion
-handles, cancellation, fitting work behind an oversized blocked item, and a
-continuously replenished source beside a held peer. No timing-sensitive
-throughput assertion or larger dataset is needed for those correctness cases.
+Selected observations record snapshots built, eventfd writes, notifier batches/
+deliveries, submissions, denials, probes per turn, empty turns, completion
+spacing, and retirement. The retained evidence keeps every sample and input
+hash. Explicit-gate cases cover notification acknowledgement/delivery arrivals,
+stale completion handles, cancellation, fitting work behind an oversized blocked
+item, and independent progress beside a held peer. Those correctness cases use
+bounded inputs and completion gates rather than throughput thresholds.
 
-No positive elapsed saving is yet measured. The report establishes removable
-operations and their owners; it does not convert overlapping callback or lock
-sums into wall-time gains. Full detail and exact source anchors are in the local
+The baseline review established removable operations, without a measured
+elapsed saving. The subsequent results below do not convert overlapping callback
+or lock sums into wall-time gains. Full detail and exact source anchors are in the local
 [scheduling review](../build/validation/hotspot-scheduling-review.md).
 
-## Viable work: input and archive scheduling
+## Baseline finding: input and archive scheduling
 
 The warm input path validates each encoded source, then prepares the consumer's
 decode/resample plan from the same retained mapping. Its 1,253,216 Header calls
 do not represent two full reads of 626,608 images. Full preload makes one
 mapped-to-pinned copy on persistent image services. A cold archive can instead
 transfer its existing admitted encoded buffer directly to the pixel consumer.
-Preserve both paths and the actual-byte verification before destination writes.
+Both paths retain actual-byte verification before destination writes.
 
 At 24 compute workers, the image file queue has four records and two persistent
 services; the output queue has 48 records and two services. They borrow the same
@@ -322,44 +339,38 @@ faults and dirty throttling can occur inside pixel stores.
 
 The strongest input change concerns cold archive reuse. A serial decoder retains
 a 4 MiB heap/library charge, plus a descriptor for gzip. It does not occupy a
-pinned arena slice. Current generic resource pressure can retire it for ordinary
+pinned arena slice. Baseline generic resource pressure could retire it for ordinary
 arena fragmentation even when returning that custody cannot help. Restarting a
 serial compressed archive can replay its prefix. The earlier cold patch-32
 capture has 34 pressure events and 60 decoder-admission events, but no direct
 replayed-byte or replay-CPU attribution.
 
-Make retirement usefulness an operation of the existing execution/admission
-owner, evaluated from actual blocked requests and candidate allowances:
-
-- Retain an unsupplied decoder during ordinary arena-only pressure when aggregate
-  bytes and descriptors have headroom.
-- Reclaim matching byte or descriptor custody even when multiple owners must
-  cooperate. One victim need not make the whole request fit by itself.
-- Preserve mandatory exclusive/oversized drain, aged-request priority,
-  cancellation, explicit pause, EOF, and physical retirement before release.
-- Wake pressure subscribers when a newly blocked request changes the useful
-  victims, including while the aggregate pressure flag stays true. Unknown
-  external waits remain conservative; known failures carry their actual request.
+The implemented retention decision belongs to the existing execution/admission
+owner and evaluates actual blocked requests and candidate allowances. It keeps
+an unsupplied decoder through unrelated arena pressure while permitting useful
+byte/descriptor reclamation, multiple contributing victims, and mandatory
+exceptional drain. Changed demand can notify pressure subscribers while pressure
+stays active. [Admission rules](compile-execution.md#selective-readiness-and-resource-pressure)
+retain cancellation, fairness, unknown-wait conservatism, and physical custody.
 
 The archive remains the decoder owner. No protected pool, extra eviction manager,
 or timing-based retention policy is needed. The exceptional input path's
 post-restoration decoder retirement is a separate custody guarantee and remains
 required; removing that line alone would be unsafe.
 
-The second selected change batches bounded archive block reads and copies under
-one existing CPU grant. Today each data block, including the EOF probe, submits
-and joins a task; its copy happens outside that measured body. Start with at most
-eight blocks or 1 MiB per turn, stop at the member boundary, and check cancellation
-per block. Share the current extent/bounds validator between the APIs. Arbitrary
-consumer callbacks retain their present execution boundary because they can wait
-for resources or publish files. Existing 64-header skip batching already exists.
+The baseline submitted and joined each data block, including the EOF probe;
+copying happened outside that measured body. The selected change now performs
+bounded reads/copies under one existing CPU grant, at most eight blocks or 1 MiB
+per turn, with member boundaries, per-block cancellation, and shared extent
+validation. Arbitrary consumer callbacks retain their execution boundary because
+they can wait for resources or publish files. The existing 64-header skip batch
+remains separate.
 
-Use a 32–64-member generated archive for correctness and at most 64 MiB for a
-causal profile. Exercise unrelated arena pressure, necessary byte/descriptor
-pressure, multiple victims, a useful request arriving during existing pressure,
-and exceptional drain. Observe decoder opens/restores, forward versus replayed
-bytes, copy bytes, CPU, and maximum turn work only when requested. Require fewer
-unnecessary restores or handoffs while competing work continues to progress.
+Bounded correctness cases cover unrelated arena pressure, necessary byte/
+descriptor pressure, multiple victims, a useful request arriving during existing
+pressure, and exceptional drain. The selected causal profile bound was 64 MiB;
+the implemented fixture used 128 members. Decoder opens/restores, forward/replay
+bytes, copies, CPU, and maximum turn work are collected only when requested.
 
 Other input changes need the single bounded Pipeline profile's attribution:
 
@@ -377,45 +388,38 @@ This work belongs in [BenchmarkArchive](../src/backend/data/benchmark/benchmark_
 The local [input review](../build/validation/hotspot-input-review.md) records exact
 call paths, required cases, file sets, and the deferred decision gates.
 
-## Viable work: annotation reuse and ready-row batching
+## Baseline finding: annotation reuse and ready-row batching
 
-The current recipe probes a full-release native cache only when no modern part
-cache is present. Modern runs can therefore re-enter part import even with a
-valid final component already stored. Two further miss mechanisms exist: a
-recovery-qualified part probe is skipped while originals are pending, and empty
-namespaces have no persisted component even though the part route probes both
-namespaces. These are source-proven reuse opportunities; the latest capture
-does not measure how often all prerequisites were ready at the first probe.
+The baseline recipe probed a full-release native cache only when no modern part
+cache was present, so modern runs could re-enter part import with a valid final
+component already stored. Two further miss mechanisms were identified: a
+recovery-qualified part probe was skipped while originals were pending, and
+empty namespaces had no persisted component even though the part route probed
+both namespaces. These were source-proven reuse opportunities; the complete
+capture did not measure how often all prerequisites were ready at the first probe.
 
-Extend the existing full-cache attempt to modern caches using immediately
-available artifact admissions and original snapshots. If a prerequisite is
-held, the existing independent part callbacks take over immediately. Preserve
-incremental cache validation, withdrawal after late proof failure, physical
-revalidation, optional legacy extent fields, repair, and source ordinal rules.
-Deleting the part-cache condition alone is unsafe because the current cache-only
-path can wait for originals. This change needs no new persisted empty marker.
+The implemented full-cache attempt includes modern caches when artifacts and
+original snapshots are immediately admissible; held prerequisites leave the
+independent part callbacks in charge. Incremental cache validation, withdrawal,
+physical revalidation, optional legacy extent fields, repair, and ordinal rules
+remain. Removing only the part-cache condition would have been unsafe because
+the baseline cache-only path could wait for originals. No persisted empty marker
+was added.
 
-A second opportunity is deferred native recovery. The first pass already stages
-a provisional normalized product and compact recovery support. Finalization can
-then rebuild and copy boxes/runs even where recovery cannot change them. Extract
-the applicability rule once in the recovery owner. A narrow immutable proof can
-permit a final native view to share its existing staged payload while updating
-the canonical lineage and row admission.
+A second baseline cost was deferred native recovery: finalization rebuilt and
+copied boxes/runs even where recovery could not change the staged provisional
+payload. A narrow immutable proof now permits reuse while canonical lineage,
+row admission, physical/original generations, and final label projection settle.
+The proof also excludes suppressed malformed/degenerate/unlisted reports;
+unchanged masks can still need final rejection reporting. The
+[recovery reference](benchmark-datasets.md#optional-dropped-mask-recovery)
+owns that boundary and its ordinary-path cases.
 
-The proof must also exclude rows with suppressed malformed/degenerate/unlisted
-object reports. Unchanged masks can still require final rejection reporting.
-Preserve physical/original generation rechecks, exact ordinals/provenance,
-required-label validity, final compiled-label projection, and geometry quarantine.
-Unstaged vectors and rows needing recovery take the ordinary path. The selected
-shortcut avoids its own new staging range/copy, while required native output
-continuations remain in place.
-
-Finally, group already-ready normalized rows under aggregate caps of 64 images,
-256 boxes, and 65,536 runs per task. Count empty rows; keep large-row continuations
-and independent peer progress. The same gather owner retains exact disjoint
-placement, validation, and failure-to-seal behavior. Move the existing empty
-Projection guard before admission while retaining all surrounding row and
-duplicate bookkeeping. Neither change waits for a group to fill.
+Already-ready normalized rows now share bounded gather tasks; large-row
+continuations and independent peers retain progress. Proven empty Projection
+work is skipped before admission. [Parser/gather ownership](benchmark-datasets.md#archive-and-parser-continuation)
+retains exact placement, validation, row/duplicate bookkeeping, and failure
+semantics, with no batch-fill wait.
 
 The discarded-product count has the following exact aggregate reconciliation:
 
@@ -447,7 +451,7 @@ Unknown membership must continue to make independent progress.
 | Narrow original-generation invalidation | Establish the canonical dependency for every row; generation zero alone does not distinguish pending from independent rows. |
 | Write native output directly into already-prepared staging | Measure immediate claim frequency; physical growth/wait remains outside CPU grants and the continuation remains on a miss. |
 | Tighten recovery scratch or fuse adjacent Parquet operations | Prove full temporary bounds and preserve quiesced Arrow lifetime, healthy prefixes, parse failure, and replay cursor semantics. |
-| Reduce final settlement passes | Attribute remaining work after cache reuse. Current settlement already changes bounded used-label records; it does not rewrite RGB or mask payloads. Its whole elapsed stage is only 23.131 seconds. |
+| Reduce final settlement passes | Attribute remaining work after cache reuse. Settlement changes bounded used-label records; it does not rewrite RGB or mask payloads. The baseline elapsed stage was 23.131 seconds. |
 
 The implementation stays in [Coconut recipe/import](../src/backend/data/benchmark/coconut/coconut_recipe.cpp),
 [native image ownership](../src/backend/data/benchmark/coconut/coconut_native_image.cpp),
@@ -456,7 +460,7 @@ The implementation stays in [Coconut recipe/import](../src/backend/data/benchmar
 The local [rework review](../build/validation/hotspot-rework-review.md) records
 all preservation requirements and deferred alternatives.
 
-## Measurement and implementation acceptance
+## Comparison method
 
 Use the same source baseline, encoded fixture hashes, geometry/order, worker
 affinity, and cache state for each bounded comparison. Pipeline fixtures use
@@ -473,17 +477,17 @@ for a structural optimization; a whole-run speedup requires its own measurement.
 The implementation results below distinguish measured bounded outcomes from
 these baseline projections.
 
-The executable [action plan](../actionplan.md) sequences shared execution and
-diagnostic demand, compaction, CPU pixels, archive handling, and annotation
-reuse. Bounded failure retries use the owning suites. The final completion gate
-uses `all` and packaged Wayland acceptance; neither automatically profiles the
+The completed work covers shared execution/diagnostic demand, compaction, CPU
+pixels, archives, and annotation reuse. Bounded failure retries used the owning
+suites. The [final completion gate](validation.md#compiler-throughput-validation-record)
+used `all` and packaged Wayland acceptance; neither automatically profiles the
 complete benchmark dataset or invokes Firefox-owned tests.
 
 ## Implemented changes and bounded measurements
 
 The five selected implementation areas are complete in commits
 `ff30e564`, `4db93f1`, `5098f6`, `9385d8`, `de44699b`,
-`65e2ba0c`, `9ddb6e98`, and `5bede917`. Subsequent validation corrected
+`65e2ba0c`, `9ddb6e98`, and `5bede917`. Validation through `cecde5c5` corrected
 readiness callback lifetime and reduced idle compute wakeups. The original
 complete-run measurements above remain baseline evidence; a new complete
 Coconut run has not been performed.
@@ -498,7 +502,9 @@ source remains `333032e7`, preserved at documentation commit `21bdcadc`.
 Its nine-file measurement adapter is recorded in
 `build/validation/benchmark-throughput-baseline-adapter.patch`
 (SHA-256 `b403b34ff280edda147be3c6dd0e659ac05a3dbd41ca7f935cdf2ae544640601`).
-It changes the wrapper/profile harness only.
+It changes the wrapper/profile harness only. Both harnesses pass admitted
+retained-image headers into production conversion; baseline production code
+remains unchanged.
 
 The initial untraced compaction medians include final metadata and sync:
 
@@ -663,15 +669,8 @@ established by this bounded validation.
 
 ### Final validation
 
-The final `./mmltk --test all` and
-`./mmltk --test workspace-wayland --headless-compositor` both passed. The full
-dataset executable passed 566 cases and 426,740 assertions, with one
-hardware-dependent skip. Wayland passed 88 cases and 148,146 assertions;
-its GDR-specific case was skipped because the required hardware capability was
-unavailable. Firefox was exercised through first-party packaged acceptance;
-no Firefox-owned suite or production-sized benchmark compile was run.
-
-The [validation ledger](../build/validation/benchmark-throughput-validation.json)
-records tidy/build/cleanup checkpoints, focused fixes, and retained successful
-checks. [Final gate results](../build/validation/benchmark-throughput-final-gates.json)
-identify the exact commands, transcripts, exit statuses, and run times.
+The final full build, ordinary suite, and packaged Wayland acceptance passed.
+The [validation record](validation.md#compiler-throughput-validation-record)
+owns exact commands, case/assertion counts, the unavailable hardware skip,
+checkpoints, focused fixes, and retained transcripts. No Firefox-owned suite
+or new production-sized benchmark compile was run.

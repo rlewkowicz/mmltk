@@ -26,12 +26,12 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --audit-includes [--refresh] [report\|preview\|fix] [--output PREFIX] [--build-dir PATH]` | Inventory all compiler contexts and include-retention reasons; preview/apply replacements only under verified target-local PCH policy |
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, and log-query fixtures |
-| `./mmltk --test data-profile -- --help` | Prepare the opt-in data profile target and show CPU compile/resample, full Coconut, and CUDA loader modes |
+| `./mmltk --test data-profile -- --help` | Prepare the opt-in target and show CPU compile/pipeline/archive/compaction/resample, full Coconut, and CUDA loader options |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
 | `./mmltk --diagnose-processes [WRAPPER_MODE]` | Inspect processes in this repository's running wrapper containers |
 | `./mmltk --diagnose-benchmark-image --image-id ID [OPTIONS]` | Compare retained image headers with normalized annotation geometry |
-| `./mmltk --diagnose-io FILE` | Report a compiled file's storage/GPU capabilities |
+| `./mmltk --diagnose-io FILE` | Report eligible CPU/core/SMT/frequency-policy facts and a compiled file's storage/GPU capabilities |
 | `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
 | `./mmltk --diagnose-gpu-program [--torch] SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic, optionally linked to pinned PyTorch, using existing images |
 | `./mmltk --diagnose-nvidia-payload donor\|development HEADER...` | Inspect public NVIDIA headers and payload selection |

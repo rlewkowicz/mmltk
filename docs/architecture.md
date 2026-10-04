@@ -225,6 +225,12 @@ The shell supplies its shared `RuntimeDiagnosticTarget` to the dataset runtime
 factory. `ArtifactDatasetRuntime` retains the target by value and creates its
 borrowed artifact observer only for synchronous `Compile`. The data layer
 consumes its existing benchmark trace callbacks without a controller dependency.
+[CompileTraceSelection](../src/backend/data/compile_trace_selection.h) carries
+immutable event demand across serialized and native delivery. Execution demand
+is declared independently in
+[compile_execution_observer.h](../src/backend/data/detail/compile_execution_observer.h);
+canonical reflected observations supply structural projection while ordinary
+owners retain scheduling, resources, and failures.
 [Benchmark diagnostics](logging.md#benchmark-compilation-traces) retain the
 shared service's disablement, delivery, and shutdown policy.
 
@@ -324,6 +330,9 @@ empty-read, and failure policies.
 bridges a worker's stop token to a domain's minted cancellation source/token.
 It supports borrowed or consumed tokens and destroys the stop callback before
 its owned cancellation storage, settling any in-flight callback first.
+The borrowed [CancellationObservation](../src/common/types/cancellation_observation.h)
+value belongs to shared types; it carries the caller's cancellation observation
+without owning its execution source.
 
 [file_memory.h](../src/common/io/file_memory.h) owns file handles, mappings, and
 shared destination-parent creation, treating a bare filename's parent as `.`.
