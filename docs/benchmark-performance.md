@@ -17,9 +17,10 @@ callers, resource ownership, failure paths, and measurement alternatives.
 | 4 | Retain useful archive state and batch bounded reads/copies | Cold extraction logged repeated decoder restoration; its replay CPU is unmeasured. Retire only custody that can relieve pressure and amortize block-task handoffs. |
 | 5 | Reuse final annotation results and batch ready rows | 357,533 Gather bodies and source-proven cache/recovery rework. Reuse immediately available generation-valid caches, avoid proven-empty work, and group small ready rows. |
 
-These are selected mechanisms with correctness and measurement gates. Their
-positive elapsed savings have not yet been measured, and overlapping task costs
-cannot be added to the separate compaction interval.
+The sections below preserve the baseline investigation and decision gates.
+[Implemented changes and bounded measurements](#implemented-changes-and-bounded-measurements)
+record the subsequent work separately. Overlapping task costs cannot be added
+to the separate compaction interval.
 
 ## Measurement boundary
 
@@ -469,10 +470,208 @@ causal traces. Preserve every sample, setup time, production/finalization/sync
 boundaries, exact output checks, and failure outcomes. A material reduction in
 operations or allocations with no material matched-case slowdown is evidence
 for a structural optimization; a whole-run speedup requires its own measurement.
-No projected improvements in this report are measured implementation results.
+The implementation results below distinguish measured bounded outcomes from
+these baseline projections.
 
 The executable [action plan](../actionplan.md) sequences shared execution and
 diagnostic demand, compaction, CPU pixels, archive handling, and annotation
 reuse. Bounded failure retries use the owning suites. The final completion gate
 uses `all` and packaged Wayland acceptance; neither automatically profiles the
 complete benchmark dataset or invokes Firefox-owned tests.
+
+## Implemented changes and bounded measurements
+
+The five selected implementation areas are complete in commits
+`ff30e564`, `4db93f1`, `5098f6`, `9385d8`, `de44699b`,
+`65e2ba0c`, `9ddb6e98`, and `5bede917`. Subsequent validation corrected
+readiness callback lifetime and reduced idle compute wakeups. The original
+complete-run measurements above remain baseline evidence; a new complete
+Coconut run has not been performed.
+
+The initial matrix has 37 matched cases (74 invocations), one warmup and three
+measured repetitions. It uses 256 local images, or 1,024 compaction slots below
+the 16 GiB cap, with setup and final synchronization reported separately.
+All 24 Pipeline/compaction case pairs preserve their output/live-payload hashes;
+Pixels/Resample report throughput and checked decoded extents and rely on the
+independent numerical tests for output correctness. The baseline production
+source remains `333032e7`, preserved at documentation commit `21bdcadc`.
+Its nine-file measurement adapter is recorded in
+`build/validation/benchmark-throughput-baseline-adapter.patch`
+(SHA-256 `b403b34ff280edda147be3c6dd0e659ac05a3dbd41ca7f935cdf2ae544640601`).
+It changes the wrapper/profile harness only.
+
+The initial untraced compaction medians include final metadata and sync:
+
+| Variant | Baseline (s) | Candidate (s) | Elapsed change |
+| --- | ---: | ---: | ---: |
+| Dense | 1.943623 | 1.818440 | −6.4% |
+| Sparse | 1.368839 | 1.189074 | −13.1% |
+| Mixed labels | 1.373747 | 1.232477 | −10.3% |
+
+These bounded results do not establish the same percentage saving on the
+1.19 TB complete output. Both sides used affinity 0–23; that permits mixed
+core placement. Full samples, all initial comparisons, and hash reconciliation
+are in [the primary results](../build/validation/benchmark-throughput-primary-results.json).
+
+### Core placement and the scheduling correction
+
+The captured host is an i9-12900K. Its hybrid PMUs identify P logical CPUs
+0–15 and E CPUs 16–23; P-core SMT pairs are 0–1, 2–3, and so on. All reported
+frequency policies were `performance`. Compute workers are individually
+pinned by the production worker pool. An eligible mask spanning both types
+still permits different task distributions and control-thread placement.
+The initial 0–23 results therefore do not isolate core-type effects.
+
+The read-only I/O diagnostic now records eligible CPU/core/package identities,
+SMT siblings, hybrid PMU membership, and frequency policies. Missing topology
+attributes are reported as unavailable, not interpreted as a homogeneous CPU.
+The capture is
+[benchmark-throughput-topology.json](../build/validation/benchmark-throughput-topology.json).
+
+Core-controlled follow-ups use eight distinct P cores
+(`0,2,4,6,8,10,12,14`), all eight E cores (`16-23`), or one fixed P/E CPU.
+They retain every sample, use two warmups and nine measured repetitions, and
+reverse baseline/candidate order for the disputed small-image case. No tests,
+builds, or other profile commands ran concurrently with the timed comparisons;
+unrelated host activity and frequency variation remain possible.
+
+The original candidate regressed on small images: mixed-core repeats had
+0.1371 s baseline versus 0.2029 s candidate medians. Restricting the run to
+P cores still showed 0.0670 versus 0.0855 s, so hybrid placement alone did not
+explain the regression. Gated counters then established roughly 20,000 empty
+CPU selections for 768 tasks on P8, and 87,000 on W24.
+
+Compute workers now wait separately from owner-local readiness notices.
+Physical changes wake CPU selectors when queued compute exists, resource
+pressure can require idle scratch retirement, or interruption/shutdown needs
+their attention. Physical service subscribers and public admission generations
+keep their existing delivery semantics. The existing execution owner supplies
+the shared ready-work predicate; no extra worker pool, polling loop, capacity
+budget, or batch-fill delay is introduced.
+
+The correction passed 149 focused resource/readiness cases with 22,103
+assertions. In selected-summary probes, measured median empty selections fell
+from 20,151 to 5,086 on P8 and from 87,220 to 12,921 on W24 (about 75% and 85%).
+Created/retired compute workers still equal the requested pool size, with one
+retirement snapshot per selected-summary run.
+
+Two reversed-order P8 repeats, 18 measured samples per side, have combined
+small-image medians **0.068510 s baseline / 0.068697 s candidate**, a 0.27%
+difference. The earlier 28% median regression no longer appears in those
+controlled repeats. The W24 small-image matched pair is
+**0.161200 / 0.119246 s**; its older baseline repeat was 0.137063 s.
+A first P8 post-fix pair was unusually slow on both sides
+(0.322612 / 0.180380 s) and is retained as noisy evidence, not a headline gain.
+
+The mixed-geometry pooled P8 pair is 0.901859 / 0.805657 s, with measured ranges
+0.854255–0.959473 / 0.798618–0.818794 s. An earlier P8 pair, before the idle-wake
+correction, was 0.854723 / 0.817518 s. Keep those distributions and code states
+separate. The fixture has at most eight images in flight; W24 does not imply
+24 concurrent pixel tasks.
+
+### CPU pixel processing
+
+The retained 32-JPEG sample on eight fixed P cores gives:
+
+| Boundary, 256 images | Baseline median (s) | Candidate median (s) | Elapsed change |
+| --- | ---: | ---: | ---: |
+| Decode plus resize/store | 0.184394 | 0.153668 | −16.7% |
+| Resize/store from retained RGB | 0.139750 | 0.107122 | −23.3% |
+
+Each row has two warmups and nine measured samples. Encoded inputs and order
+match; retained decoded RGB is 26,834,232 bytes on both sides of Resample.
+These timings exclude file output, dataset acquisition, and recipe control.
+Perceptual compilation remains on CPU AVX2/FMA; these results do not support a
+GPU compiler or extrapolate proportionally to whole-run elapsed time.
+
+The authoritative sample sets are
+[core-controlled initial results](../build/validation/benchmark-throughput-core-results.json),
+[post-correction comparisons](../build/validation/benchmark-throughput-idle-wake-results.json),
+[reversed-order and retained-image results](../build/validation/benchmark-throughput-core-final-results.json),
+and [wake counters](../build/validation/benchmark-throughput-idle-wake-counts.json).
+Exact commands, warmup counts, input hashes, trace selections, and all samples
+remain under `build/validation/benchmark-throughput-*`.
+
+### Compaction, archive, and annotation operation evidence
+
+The six observed compaction runs retain exact live-payload hashes and staged
+inode identity. Baseline adapter counts are single-range wrapper requests;
+candidate syscall counters are separate observations and must not be compared
+as though the baseline measured syscalls.
+
+| Variant | Allocation requests, baseline → candidate batches | Reclaim requests, baseline → candidate batches | Candidate allocation / reclaim syscalls |
+| --- | ---: | ---: | ---: |
+| Dense | 1,779 → 421 | 1,178 → 453 | 619 / 639 |
+| Sparse | 685 → 411 | 832 → 558 | 411 / 558 |
+| Mixed labels | 1,269 → 427 | 1,418 → 598 | 988 / 1,153 |
+
+All use the full 4 MiB scratch ceiling, report no capacity fallback, and retain
+required truncation and sync. Candidate reclamation accounts for about 54% of
+the measured mover interval in these observed cases; it remains a useful
+filesystem-specific follow-up target, not a proved whole-run percentage.
+
+The archive profile uses the same 128-member, 6,334,163-byte gzip input in all
+four pressure cases and checks every returned member byte. With seven unrelated
+arena-pressure episodes it retains one decoder, with zero restores or replay.
+Necessary byte pressure and exclusive drainage each retire/restore seven times,
+preserving competing admission and exact output. Those cases record 23,281,664
+replayed decoded bytes. Decoder cursor bytes are not physical disk-read bytes.
+Each variant performs 304 block reads in 128 bounded read turns; maximum turn
+work is three blocks and 49,353 copied bytes for this fixture.
+
+Mapped and pooled annotation profiles give the same results. Gathering 256
+ready rows uses four tasks for 192 boxes, with no wait for a batch to fill.
+DeferredClean reuses all 256 staged native products at finalization, while
+retaining the necessary initial 26,112-byte staging/copy work. DeferredRecovery
+recovers 192 rows and reuses 64 unchanged rows. Its final compiled hash equals
+DeferredClean, despite their deliberately different source annotation hashes.
+Every case completes 256 label projections, writes, and final settlements.
+These variants prepare native/gather input before their image-publication loop:
+they establish operation counts and custody, not full-recipe overlap or an
+annotation elapsed-time speedup.
+
+The resize observation counts 219 preparations and 9,648 allocation requests
+for 256 mixed-geometry images, identically at W1 and W24. These are requests
+inside admitted reusable workspace, not evidence of 9,648 OS allocations.
+Likewise, the 653,686,272 cumulative requested bytes are not peak memory usage.
+
+### Completion spacing and remaining limits
+
+Selected completion-gap probes record 765 intervals per side after warmup:
+
+| Input custody | Baseline p95 / p99 / max (ms) | Candidate p95 / p99 / max (ms) |
+| --- | ---: | ---: |
+| Mapped | 10.066 / 15.890 / 48.577 | 8.551 / 13.965 / 38.244 |
+| Pooled | 10.144 / 17.133 / 73.496 | 9.292 / 17.325 / 46.798 |
+
+These are traced W24 mixed-core fixtures, not UI frame timings. The pooled p99
+is essentially unchanged; the data supports reduced long gaps in this bounded
+sample, not universal smoothness. All four sides have the same compiled hash.
+[The causal results](../build/validation/benchmark-throughput-causal-results.json)
+retain operation fields, gap samples, and provenance; their command/status
+ledgers include the rejected 128-image annotation invocation and corrected
+256-image runs.
+
+The original five hotspot rankings still guide follow-up work. Reclamation
+syscalls remain substantial; tiny tasks can still incur scheduling overhead;
+resize preparation retains repeated work; required archive replay still exists
+under useful reclamation; final label projection and settlement remain necessary
+even when native payload can be reused. Each further change needs attribution
+in its owning production component and matched evidence. No new complete-run
+speedup, peak-RSS reduction, physical-I/O bandwidth gain, or GPU benefit is
+established by this bounded validation.
+
+### Final validation
+
+The final `./mmltk --test all` and
+`./mmltk --test workspace-wayland --headless-compositor` both passed. The full
+dataset executable passed 566 cases and 426,740 assertions, with one
+hardware-dependent skip. Wayland passed 88 cases and 148,146 assertions;
+its GDR-specific case was skipped because the required hardware capability was
+unavailable. Firefox was exercised through first-party packaged acceptance;
+no Firefox-owned suite or production-sized benchmark compile was run.
+
+The [validation ledger](../build/validation/benchmark-throughput-validation.json)
+records tidy/build/cleanup checkpoints, focused fixes, and retained successful
+checks. [Final gate results](../build/validation/benchmark-throughput-final-gates.json)
+identify the exact commands, transcripts, exit statuses, and run times.

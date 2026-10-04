@@ -6501,7 +6501,7 @@ TEST_CASE("blocking controller local notices leave pipeline and native output ow
  REQUIRE(initialized.WaitEntered(5s));
  mmltk::testsupport::TestGate initial("prior owner callbacks settled"), delivered("blocking controller received global Local");
  unsigned notices = 0;
- CompileExecution::Readiness controller(pipeline.execution(), CompileChange::Local, [&](auto changes) {
+ CompileExecution::Readiness controller(pipeline.execution(), CompileChange::Local, [&](CompileExecution::Readiness&, auto changes) {
   if (!includes(changes.causes, CompileChange::Local)) return;
   if (++notices == 1)
    initial.receipt().ArriveAndWait();
@@ -10648,7 +10648,7 @@ TEST_CASE("Parquet staged batches retain one forward reader and reusable source 
  CompileExecution::Completion blocked;
  std::promise<void> waiting;
  std::atomic<bool> observed{false};
- CompileExecution::Readiness readiness(pipeline.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](auto) {
+ CompileExecution::Readiness readiness(pipeline.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, auto) {
   if (pressure && pipeline.execution().resource_pressure() && !observed.exchange(true)) mmltk::testsupport::release_test_promise(waiting);
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { pipeline.execution().cancel(); });
@@ -11406,9 +11406,10 @@ TEST_CASE("bounded gzip read turns preserve members and yield one CPU to a peer"
  // generation can restore and consume the last member successfully.
  input.suspend();
  struct CancelReplay {
-  mutable unsigned checks = 0;
-  bool cancelled() const noexcept { return ++checks > 20; }
- } cancellation;
+  const BenchmarkArchive& source;
+  std::uint64_t before;
+  bool cancelled() const noexcept { return source.observation().replay_decoded_bytes > before; }
+ } cancellation{input, input.observation().replay_decoded_bytes};
  CHECK_THROWS(input.read_into(bytes, CancellationObservation::Borrow(cancellation)));
  CHECK(input.retained_workspace_bytes() == 0);
  input.read_into(bytes);
@@ -11428,7 +11429,9 @@ TEST_CASE("bounded gzip read turns preserve members and yield one CPU to a peer"
  CHECK(evidence.restores >= 2);
  CHECK(evidence.replay_decoded_bytes > 0);
  CHECK(evidence.replay_source_bytes > 0);
- CHECK(evidence.skipped_headers >= order.size() - 1);
+ // Known tar header offsets restore directly after decoder replay; they do
+ // not require a second format-level scan through earlier members.
+ CHECK(evidence.skipped_headers == 0);
  input.pause();
  CHECK(execution.resource_usage().descriptors == 1);
  CHECK(input.retained_workspace_bytes() == 0);
@@ -11521,7 +11524,9 @@ TEST_CASE("unchanged native finalization requires a staged clean payload and reb
   unsigned reports = 0;
   workspace.decode(record, bytes, {3, 1});
   const auto ordinary = workspace.finish(record, coco(7), {3, 1}, final_lineage, [&](const auto&, const auto&, const auto&, auto, auto) { ++reports; });
-  CHECK(reports == (kind == Input::InvalidStuff ? 0 : kind == Input::Unlisted ? 2 : 1));
+  // An invalid segment is absent from the admitted ID table, so its pixels
+  // still produce the ordinary unlisted-segment report.
+  CHECK(reports == (kind == Input::Unlisted ? 2 : 1));
   CHECK(ordinary->required_labels_valid() == provisional->required_labels_valid());
   CHECK(ordinary->rejected().malformed_records == provisional->rejected().malformed_records);
   CHECK(ordinary->rejected().degenerate_boxes == provisional->rejected().degenerate_boxes);
@@ -11597,11 +11602,19 @@ TEST_CASE("modern final caches leave held original snapshots to independent part
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires original inspection and independent annotation lanes");
  const bool training = GENERATE(false, true);
+ CAPTURE(training);
  ScopedTempDir root("modern-cache-held-original");
  LocalCoconutRecipe local(root.path());
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock, true}, true);
  auto catalog = local.selected(config.selection.validation);
  catalog.stock_annotations = local_custom_catalog(local).coco_annotations;
+ const auto originals = local.cache.source_downloads("coco") / catalog.stock_annotations.filename;
+ const std::array<std::pair<std::string, std::string>, 2> original_members{
+  {{"annotations/instances_train2017.json", file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json")},
+   {"annotations/instances_val2017.json", file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json")}}
+ };
+ tar(originals, original_members);
+ catalog.stock_annotations.expected_size = std::filesystem::file_size(originals);
  add_ready_parquet_part(local, catalog);
  compile_benchmark_recipe(config, &catalog);
  const auto expected_train = benchmark_semantics(local.output / "train.bin");
@@ -11612,14 +11625,20 @@ TEST_CASE("modern final caches leave held original snapshots to independent part
  std::atomic<unsigned> full_routes{0};
  std::promise<void> labels;
  const std::string original_split = training ? "train2017" : "val2017";
+ remove_normalized_annotation_index(local.cache.source_indexes("coco") / (original_split + ".normalized.bin"));
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ const auto diagnostics = mmltk::backend::data::testsupport::benchmark_trace();
  config.trace = [&](std::string_view event, std::string_view encoded) {
   const auto fields = Json::parse(encoded);
-  if (event == "benchmark.annotations.cache_hit" && fields.at("split") == original_split && !entered.exchange(true)) held.receipt().ArriveAndWait();
+  if (diagnostics) diagnostics(event, fields);
   if (event == "benchmark.annotations.release_cache_selected" && fields.at("edition") == (training ? CoconutEdition::Base : CoconutEdition::RelabeledValidation)) ++full_routes;
   if (event == "benchmark.labels.placed" && fields.at("image_id") == (training ? 8 : 9)) mmltk::testsupport::release_test_promise(labels);
  };
- auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
+ auto compiling = std::async(std::launch::async, [&] {
+  compile_benchmark_recipe(config, &catalog, nullptr, {}, {}, {}, [&](bool current_training, CocoAnnotationInputBoundary boundary) {
+   if (current_training == training && boundary == CocoAnnotationInputBoundary::Parsing && !entered.exchange(true)) held.receipt().ArriveAndWait();
+  });
+ });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   cancelled = true;
   held.Release();

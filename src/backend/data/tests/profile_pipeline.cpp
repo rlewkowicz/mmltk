@@ -192,6 +192,8 @@ void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixtu
  const auto annotation_sha256 = native ? native->input_identity() : std::string{};
  std::uint64_t input_bytes = 0, logical_input_bytes = 0;
  std::size_t largest_input = 0, largest_workspace = 0, label_workspace = 0;
+ std::vector<CompileImageHeader> headers;
+ headers.reserve(inputs.size());
  const CompilePixelPolicy policy{static_cast<std::uint32_t>(opts.width), static_cast<std::uint32_t>(opts.height), ImageResizeMode::Stretch, opts.perceptual};
  for (const auto& input : inputs) {
   if (input.encoded.size() > (64ULL << 20) - input_bytes) throw std::length_error("pipeline unique encoded inputs exceed 64 MiB");
@@ -199,6 +201,7 @@ void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixtu
   largest_input = std::max(largest_input, input.encoded.size());
   CompileImageDecoder decoder;
   const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark);
+  headers.push_back(header);
   const auto plan = compile_pixel_workspace_plan(header, policy);
   largest_workspace = std::max(largest_workspace, math::checked_add<std::size_t>(plan.bytes(), input.encoded.size(), "pipeline workspace overflow"));
   label_workspace = std::max<std::size_t>(label_workspace, BenchmarkLabelWorkspace::required_bytes(input.width));
@@ -224,7 +227,7 @@ void run_pipeline_profile(const Options& opts, std::span<const ProfileImageFixtu
  fs::create_directories(images);
  std::vector<BenchmarkEncodedImage::Ptr> mapped;
  mapped.reserve(inputs.size());
- for (std::size_t i = 0; i < inputs.size(); ++i) mapped.push_back(BenchmarkEncodedImage::publish(fixture.path() / ("input-" + std::to_string(i)), inputs[i].encoded, {}));
+ for (std::size_t i = 0; i < inputs.size(); ++i) mapped.push_back(BenchmarkEncodedImage::publish(fixture.path() / ("input-" + std::to_string(i)), inputs[i].encoded, {}, nullptr, headers[i]));
  auto annotations = pipeline_annotation_fixture(inputs, order);
  PreparedBenchmarkSplit split{.name = "train", .class_names = {"object"}, .sources = {{images}}, .images = {}};
  split.images.reserve(order.size());

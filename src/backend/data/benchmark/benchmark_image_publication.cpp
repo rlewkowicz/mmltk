@@ -39,7 +39,7 @@ BenchmarkImagePublication::BenchmarkImagePublication(std::filesystem::path outpu
   buffer_readiness_ = std::make_unique<CompileExecution::Readiness>(execution->execution(), CompileChange::Pressure);
   buffers_->readiness = buffer_readiness_.get();
   readiness_ = std::make_unique<CompileExecution::Readiness>(
-   execution->execution(), CompileChange::Resources | CompileChange::Pressure | CompileChange::Local, [this](CompileExecution::Readiness::Changes changes) {
+   execution->execution(), CompileChange::Resources | CompileChange::Pressure | CompileChange::Local, [this](CompileExecution::Readiness&, CompileExecution::Readiness::Changes changes) {
    if (!changes.retry && !includes(changes.causes, CompileChange::Local | CompileChange::Interruption)) return;
    {
     const std::lock_guard lock(resource_mutex_);

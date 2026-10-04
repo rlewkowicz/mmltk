@@ -2393,7 +2393,7 @@ TEST_CASE("progress tracing requires its own selected demand", "[backend][data][
  CHECK_FALSE(quiet.pixel_observer_enabled());
  CHECK_FALSE(quiet.transfer_observer_enabled());
  CHECK_FALSE(quiet.normalization_observer_enabled());
- quiet.pixels(10, 0, true);
+ quiet.pixels(0, 10, true);
  quiet.pixel_completed();
  quiet.flush();
  CHECK(delivered == 0);
@@ -2404,7 +2404,7 @@ TEST_CASE("progress tracing requires its own selected demand", "[backend][data][
  }};
  ProgressReporter observed({}, throughput);
  CHECK(observed.pixel_observer_enabled());
- observed.pixels(1, 0, true);
+ observed.pixels(0, 1, true);
  observed.pixel_completed();
  observed.flush();
  CHECK(delivered > 0);

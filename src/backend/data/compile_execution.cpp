@@ -107,15 +107,17 @@ struct CompileExecution::Job {
  CompileTaskKind successor = CompileTaskKind::Count;
 };
 struct CompileExecution::Readiness::State {
+ Readiness& registration;
  std::mutex mutex;
  std::condition_variable changed;
- std::function<void(Changes)> callback;
+ Callback callback;
  // Pending notices are published and acknowledged under admission->mutex.
  Changes pending;
  CompileChange interests = CompileChange::None;
  std::uint64_t generation = 0;
  bool notified = false;
  bool active = false, removed = false;
+ explicit State(Readiness& value) : registration(value) {}
 };
 struct CompileExecution::Impl {
  struct Class {
@@ -324,10 +326,17 @@ struct CompileExecution::Impl {
   }
  };
  std::array<ReadyQueue, kind_count> ready;
+ [[nodiscard]] bool has_ready_work() const noexcept {
+  return std::ranges::any_of(ready, [](const auto& queue) { return !queue.jobs.empty(); });
+ }
  DemandQueue<Job> jobs{&Job::active};
  std::vector<std::shared_ptr<Job>> record_bank;
  std::vector<std::shared_ptr<Job>> available_records;
  std::vector<std::shared_ptr<Readiness::State>> observers;
+ // Owner-local notices advance their public generations and wake their
+ // waiters, but do not change any compute selection predicate. Keep sleeping
+ // CPU lanes off that channel; physical admission changes wake them below.
+ std::condition_variable workers_changed;
  std::size_t cursor = 0, record_limit = 0, services = 0;
  std::uint64_t admitted = 0, completed = 0;
  std::array<std::uint64_t, kind_count> task_completed{}, task_duration_ns{}, task_max_duration_ns{};
@@ -350,6 +359,14 @@ struct CompileExecution::Impl {
   signal_event(event.get());
  }
  void publish_locked(CompileChange change) noexcept {
+  // Physical service/record changes still notify their subscribers below.
+  // Compute selectors have no work while all records are running, retained,
+  // or owned by file services. Pressure can independently require idle scratch
+  // retirement, and shutdown/interruption must always release parked lanes.
+  if (shutdown || stopping || includes(change, CompileChange::Interruption) || admission->pressure() || has_ready_work()) {
+   if (observer.demand().aggregates) ++costs.worker_notifications;
+   workers_changed.notify_all();
+  }
   if (includes(change, CompileChange::Interruption)) withdrawal_pending = true;
   bool wake = observer.demand().snapshots || shutdown || stopping || includes(change, CompileChange::Interruption);
   for (const auto& state : observers) {
@@ -897,9 +914,17 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
    }
    return false;
   };
+  const auto select_observed = [&] {
+   const bool selected_work = select();
+   if (observer.demand().aggregates) {
+    ++costs.selection_attempts;
+    costs.empty_selections += !selected_work;
+   }
+   return selected_work;
+  };
   if (blocking)
-   admission->changed.wait(lock, select);
-  else if (!select())
+   workers_changed.wait(lock, select_observed);
+  else if (!select_observed())
    return false;
  }
  if (retired_idle.workspace) release_idle(std::move(retired_idle), retirement_lane);
@@ -1007,6 +1032,7 @@ void CompileExecution::Impl::events() noexcept {
    const std::lock_guard lock(admission->mutex);
    failure = std::make_exception_ptr(std::system_error(errno, std::generic_category(), "compile event wait"));
    admission->changed.notify_all();
+   workers_changed.notify_all();
    return;
   }
   if (!result && !cancellation.requested()) continue;
@@ -1059,7 +1085,7 @@ void CompileExecution::Impl::events() noexcept {
    }
    CompileObservationClock callback_clock{observer.demand().aggregates};
    try {
-    value->callback(changes);
+    value->callback(value->registration, changes);
    } catch (...) {
     const std::lock_guard lock(admission->mutex);
     if (!failure) {
@@ -1652,7 +1678,7 @@ std::uint64_t CompileExecution::resource_generation() const {
  const std::lock_guard lock(impl_->admission->mutex);
  return impl_->admission->resource_generation;
 }
-CompileExecution::Readiness::Readiness(CompileExecution& owner, CompileChange interests, std::function<void(Changes)> callback) : owner_(owner), state_(std::make_shared<State>()) {
+CompileExecution::Readiness::Readiness(CompileExecution& owner, CompileChange interests, Callback callback) : owner_(owner), state_(std::make_shared<State>(*this)) {
  state_->callback = std::move(callback);
  state_->interests = interests | CompileChange::Interruption;
  const std::lock_guard lock(owner_.impl_->admission->mutex);
@@ -2194,7 +2220,7 @@ std::optional<CompileExecution::ServiceGrant> CompileExecution::ServiceDemand::t
     if (owner_->service_waiters[(owner_->cursor + earlier) % class_count]) return {};
    // Compute and services use one cursor. Earlier runnable compute receives a
    // bounded turn before handing the cursor to a waiting service class.
-   if (turn && std::ranges::any_of(owner_->ready, [](const auto& queue) { return !queue.jobs.empty(); })) return {};
+   if (turn && owner_->has_ready_work()) return {};
   }
   const auto service_class = static_cast<CompileWorkClass>(kind);
   for (bool baseline : {true, false})

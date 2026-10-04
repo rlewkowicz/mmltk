@@ -302,7 +302,7 @@ FileWorkQueue::FileWorkQueue(CompileExecution& execution, std::size_t records, s
  impl_->execution = &execution;
  impl_->service_capacity = services;
  impl_->demand = std::make_unique<CompileExecution::ServiceDemand>(execution);
- impl_->readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::None, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes) {
+ impl_->readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::None, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness&, CompileExecution::Readiness::Changes) {
   if (auto owner = weak.lock()) {
    {
     const std::lock_guard lock(owner->mutex);

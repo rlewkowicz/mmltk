@@ -383,18 +383,18 @@ class Importer final {
   }
   output_readiness_->notify();
  }
- void pump_outputs() {
+ void pump_outputs(CompileExecution::Readiness& subscription) {
   auto& execution = request_.execution->execution();
   std::array<std::shared_ptr<NativeJob>, 2 * native_window> finished;
   std::size_t count = 0;
   {
    const std::lock_guard lock(outputs_mutex_);
-   output_readiness_->interests(CompileChange::Resources | CompileChange::Records);
+   subscription.interests(CompileChange::Resources | CompileChange::Records);
    for (auto& entry : outputs_) {
     if (!entry) continue;
     const auto job = entry;
     if (job->state == NativeJob::State::Working || job->state == NativeJob::State::Preparing || job->state == NativeJob::State::Copying) continue;
-    CompileExecution::Readiness::Attempt attempt(output_readiness_.get());
+    CompileExecution::Readiness::Attempt attempt(&subscription);
     try {
      if (job->state != NativeJob::State::Done) {
       if (auto error = execution.interruption()) std::rethrow_exception(error);
@@ -447,7 +447,7 @@ class Importer final {
     // becomes Continuation; its later Records return is still indispensable.
     if (entry->state == NativeJob::State::Copy) interests |= CompileChange::Records;
    }
-   output_readiness_->interests(interests);
+   subscription.interests(interests);
   }
   for (const auto& job : std::span(finished).first(count)) {
    // No accepted operation or copy can still touch these PMR objects. Destroy
@@ -514,8 +514,8 @@ public:
        assembly_workspace_(request.limits, request.cancellation),
        normalizations_(native_window, request.execution ? &request.execution->execution() : nullptr) {
   if (request.execution)
-   output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::None, [this](auto changes) {
-    if (changes.retry || includes(changes.causes, CompileChange::Records | CompileChange::Local | CompileChange::Interruption)) pump_outputs();
+   output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::None, [this](CompileExecution::Readiness& subscription, auto changes) {
+    if (changes.retry || includes(changes.causes, CompileChange::Records | CompileChange::Local | CompileChange::Interruption)) pump_outputs(subscription);
    });
   if (request.input_identity.empty()) invalid("missing pinned input identity");
   if (!request.physical_membership) invalid("missing physical membership admission");
@@ -1135,7 +1135,7 @@ private:
   const std::stop_callback stopping(stop, [signal] { signal->notify(); });
   std::unique_ptr<CompileExecution::Readiness> interrupted;
   if (request_.execution)
-   interrupted = std::make_unique<CompileExecution::Readiness>(request_.execution->execution(), CompileChange::Interruption, [signal](auto change) {
+   interrupted = std::make_unique<CompileExecution::Readiness>(request_.execution->execution(), CompileChange::Interruption, [signal](CompileExecution::Readiness&, auto change) {
     if (includes(change.causes, CompileChange::Interruption)) signal->notify();
    });
   std::vector<std::unique_ptr<Worker>> idle_recovery;

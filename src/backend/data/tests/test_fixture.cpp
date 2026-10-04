@@ -307,12 +307,13 @@ PipelineNativeFixture::PipelineNativeFixture(const std::filesystem::path& direct
  }
  NormalizedAnnotationBuilder original;
  original.split = "train2017";
- original.annotation_sha256 = "bounded-native-profile-originals";
+ mmltk::common::io::Sha256Hasher original_identity;
  impl_->identities.reserve(order.size());
  auto rows = Json::array();
  std::uint64_t encoded_bytes = 0;
  for (std::size_t i = 0; i < order.size(); ++i) {
   const auto& input = inputs[order[i]];
+  original_identity.Update(input.encoded);
   const auto id = i + 1;
   const auto digits = std::to_string(id);
   const auto stem = std::string(12 - digits.size(), '0') + digits;
@@ -342,6 +343,7 @@ PipelineNativeFixture::PipelineNativeFixture(const std::filesystem::path& direct
    original.mask_rle_pairs.push_back({0, input.width * input.height});
   }
  }
+ original.annotation_sha256 = mmltk::common::io::sha256_hex(original_identity.Finish());
  const auto index = seal_normalized_annotations(std::move(original));
  impl_->originals = std::make_shared<CoconutRecoveryOriginals>(&index, nullptr);
  impl_->physical = std::make_unique<CoconutPhysicalMembership>(impl_->identities);

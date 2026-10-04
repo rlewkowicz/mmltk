@@ -94,7 +94,7 @@ LabelBlocks compile_directory_images(const std::filesystem::path& split, std::ui
  std::uint32_t next = 0;
  std::exception_ptr failure;
  std::vector<CompileDiagnostic> diagnostics;
- CompileExecution::Readiness readiness(execution, CompileChange::Resources | CompileChange::Records, [&](CompileExecution::Readiness::Changes) {
+ CompileExecution::Readiness readiness(execution, CompileChange::Resources | CompileChange::Records, [&](CompileExecution::Readiness&, CompileExecution::Readiness::Changes) {
   const std::lock_guard lock(mutex);
   ++revision;
   changed.notify_all();

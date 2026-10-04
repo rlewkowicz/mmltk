@@ -70,6 +70,7 @@ struct CompileExecutionCosts {
  std::uint64_t callback_ns = 0, completion_callback_ns = 0, workers_created = 0, workers_retired = 0;
  std::uint64_t submission_attempts = 0, record_denials = 0, external_drain_candidates = 0;
  std::uint64_t snapshots_built = 0, eventfd_writes = 0, notifier_batches = 0;
+ std::uint64_t worker_notifications = 0, selection_attempts = 0, empty_selections = 0;
  bool incomplete = false;
 };
 MMLTK_REFLECT_FIELDS(CompileExecutionCosts)
@@ -273,7 +274,10 @@ public:
    // CPU, record and owner-local activity never requests a resource retry.
    bool retry = false;
   };
-  Readiness(CompileExecution&, CompileChange interests, std::function<void(Changes)> = {});
+  // The callback borrows its registered owner through physical return, even
+  // before a containing handle is assigned or while that handle is reset.
+  using Callback = std::function<void(Readiness&, Changes)>;
+  Readiness(CompileExecution&, CompileChange interests, Callback = {});
   // Publish only to this owner; the common wait generation still advances.
   void notify() noexcept;
   void interests(CompileChange) noexcept;

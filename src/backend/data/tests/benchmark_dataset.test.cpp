@@ -7233,7 +7233,7 @@ TEST_CASE("shared Curl admission changes survive the check to park boundary for 
  mmltk::testsupport::TestGate notifier("admission delivery before resource mutation");
  std::atomic<bool> first_notice{true};
  CompileExecution::Readiness delivery(
-  execution.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness::Changes) {
+  execution.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, CompileExecution::Readiness::Changes) {
   if (first_notice.exchange(false)) notifier.receipt().ArriveAndWait();
  });
  const mmltk::testsupport::ScopedTestCleanup release_notifier([&] { notifier.Release(); });
@@ -7305,7 +7305,7 @@ TEST_CASE("admission readiness retains external returns across local rollback an
  std::unique_ptr<mmltk::backend::data::detail::CompileResourceWait> pressure;
  std::future<void> draw;
  auto readiness = std::make_unique<CompileExecution::Readiness>(
-  execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](Changes changes) {
+  execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, Changes changes) {
   switch (++deliveries) {
    case 1: initial.receipt().ArriveAndWait(); break;
    case 2:
@@ -7377,7 +7377,7 @@ TEST_CASE("one armed event turn retains coalesced causes and callback arrivals",
   mmltk::testsupport::TestGate delivering("acknowledged callback retains notifier"), second("coalesced callback retains notifier");
   std::promise<Changes> batch, arrival;
   unsigned calls = 0;
-  auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Records, [&](Changes changes) {
+  auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Records, [&](CompileExecution::Readiness&, Changes changes) {
    if (++calls == 1)
     delivering.receipt().ArriveAndWait();
    else if (calls == 2) {
@@ -7454,7 +7454,7 @@ TEST_CASE("accepted local readiness retries after custody commits", "[backend][d
  unsigned deliveries = 0;
  CompileAllowance accepted;
  std::unique_ptr<detail::CompileResourceWait> pressure;
- auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Pressure, [&](Changes changes) {
+ auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Pressure, [&](CompileExecution::Readiness&, Changes changes) {
   switch (++deliveries) {
    case 1: initial.receipt().ArriveAndWait(); break;
    case 2:
@@ -7466,7 +7466,7 @@ TEST_CASE("accepted local readiness retries after custody commits", "[backend][d
   }
  });
  bool external_delivered = false;
- CompileExecution::Readiness peer(execution, CompileChange::Resources | CompileChange::Pressure, [&](Changes changes) {
+ CompileExecution::Readiness peer(execution, CompileChange::Resources | CompileChange::Pressure, [&](CompileExecution::Readiness&, Changes changes) {
   if (!std::exchange(external_delivered, true)) external.set_value(changes);
  });
  const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
@@ -7505,17 +7505,17 @@ TEST_CASE("readiness preserves pending interests and implicitly delivers interru
  mmltk::testsupport::TestGate initial("hold notifier before changing interests"), delivering("hold prior interest batch during targeted publication");
  std::promise<Changes> pending, targeted, interrupted;
  unsigned deliveries = 0;
- CompileExecution::Readiness barrier(execution, CompileChange::None, [&](Changes changes) {
+ CompileExecution::Readiness barrier(execution, CompileChange::None, [&](CompileExecution::Readiness&, Changes changes) {
   if (includes(changes.causes, CompileChange::Local)) initial.receipt().ArriveAndWait();
  });
- CompileExecution::Readiness owner(execution, CompileChange::Resources | CompileChange::Cpu, [&](Changes changes) {
+ CompileExecution::Readiness owner(execution, CompileChange::Resources | CompileChange::Cpu, [&](CompileExecution::Readiness&, Changes changes) {
   if (!deliveries++) {
    pending.set_value(changes);
    delivering.receipt().ArriveAndWait();
   } else if (deliveries == 2)
    targeted.set_value(changes);
  });
- CompileExecution::Readiness peer(execution, CompileChange::None, [&](Changes changes) { interrupted.set_value(changes); });
+ CompileExecution::Readiness peer(execution, CompileChange::None, [&](CompileExecution::Readiness&, Changes changes) { interrupted.set_value(changes); });
  const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
   initial.Release();
   delivering.Release();
@@ -7562,21 +7562,21 @@ TEST_CASE("compile readiness routes resource epochs records and owner publicatio
  std::promise<void> cpu_delivered, record_delivered, local_delivered;
  std::atomic<unsigned> resource_notices{0}, local_notices{0}, cpu_turns{0};
  std::atomic<bool> unrelated{false};
- CompileExecution::Readiness resource(execution, CompileChange::Resources, [&](auto changes) {
+ CompileExecution::Readiness resource(execution, CompileChange::Resources, [&](CompileExecution::Readiness&, auto changes) {
   if (includes(changes.causes, CompileChange::Resources)) ++resource_notices;
   if (includes(changes.causes, CompileChange::Cpu | CompileChange::Records)) unrelated = true;
  });
- CompileExecution::Readiness record(execution, CompileChange::Records, [&](auto changes) {
+ CompileExecution::Readiness record(execution, CompileChange::Records, [&](CompileExecution::Readiness&, auto changes) {
   if (includes(changes.causes, CompileChange::Records) && blocked.ready()) mmltk::testsupport::release_test_promise(record_delivered);
   if (includes(changes.causes, CompileChange::Cpu)) unrelated = true;
  });
- CompileExecution::Readiness local(execution, CompileChange::Local, [&](auto changes) {
+ CompileExecution::Readiness local(execution, CompileChange::Local, [&](CompileExecution::Readiness&, auto changes) {
   if (includes(changes.causes, CompileChange::Local)) {
    ++local_notices;
    mmltk::testsupport::release_test_promise(local_delivered);
   }
  });
- CompileExecution::Readiness cpu(execution, CompileChange::Cpu, [&](auto changes) {
+ CompileExecution::Readiness cpu(execution, CompileChange::Cpu, [&](CompileExecution::Readiness&, auto changes) {
   if (!cpu_turns++)
    delivering.receipt().ArriveAndWait();
   else if (includes(changes.causes, CompileChange::Cpu))
@@ -7705,8 +7705,15 @@ TEST_CASE("direct continuation admission retains complete bounded custody withou
 TEST_CASE("readiness retirement joins an executing admission callback", "[backend][data][benchmark][pipeline]") {
  CompileExecution execution(1);
  mmltk::testsupport::TestGate callback("admission callback owns borrowed state"), retiring("readiness destruction started");
+ std::atomic<bool> updated{false};
  auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure,
-  [&](CompileExecution::Readiness::Changes) { callback.receipt().ArriveAndWait(); });
+  [&](CompileExecution::Readiness& registration, CompileExecution::Readiness::Changes) {
+   callback.receipt().ArriveAndWait();
+   registration.interests(CompileChange::None);
+   registration.notify();
+   updated.store(true);
+  });
+ std::unique_ptr<CompileExecution::Readiness> withdrawn;
  std::future<void> retirement;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
   callback.Release();
@@ -7714,15 +7721,20 @@ TEST_CASE("readiness retirement joins an executing admission callback", "[backen
  });
  execution.notify_change(CompileChange::Local);
  REQUIRE(callback.WaitEntered(5s));
+ // Withdraw the containing handle while its callback still owns a physical
+ // borrow of the registration. Retirement must preserve that direct API.
+ withdrawn = std::move(readiness);
+ CHECK_FALSE(readiness);
  retirement = std::async(std::launch::async, [&] {
   retiring.receipt().ArriveAndWait();
-  readiness.reset();
+  withdrawn.reset();
  });
  REQUIRE(retiring.WaitEntered(5s));
  retiring.Release();
  CHECK(retirement.wait_for(0ms) == std::future_status::timeout);
  callback.Release();
  mmltk::testsupport::await_test_future(retirement, "joined admission callback");
+ CHECK(updated.load());
 }
 TEST_CASE("pending Curl admission parks through CPU notices and resumes on external credit return", "[backend][data][benchmark][download][pipeline]") {
  using mmltk::backend::data::detail::CompileWorkClass;
@@ -7738,7 +7750,7 @@ TEST_CASE("pending Curl admission parks through CPU notices and resumes on exter
  mmltk::testsupport::TestGate pending("Curl registered its unsuccessful byte demand");
  std::promise<Changes> cpu_notices;
  unsigned stage = 0;
- CompileExecution::Readiness delivery(execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](Changes changes) {
+ CompileExecution::Readiness delivery(execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, Changes changes) {
   if (!stage && includes(changes.causes, CompileChange::Pressure) && execution.resource_pressure()) {
    stage = 1;
    pending.receipt().ArriveAndWait();
@@ -11431,16 +11443,14 @@ TEST_CASE("direct demands preserve the continuation work needed to return their 
  CHECK(execution.resource_usage().bytes == demand.bytes);
 }
 TEST_CASE("rejected compute publication returns sole parent custody before record reuse", "[backend][data][benchmark][pipeline][resources]") {
- // Completion storage, the owned record link, then the ready-queue link are
- // the submission's three allocations for this inline task body.
- const auto allowed = GENERATE(std::size_t{0}, std::size_t{1}, std::size_t{2});
- CAPTURE(allowed);
+ // The completion owns independent storage; active and ready membership use
+ // the reusable record's links and do not allocate during publication.
  CompileExecution execution(1, {}, {.transient_bytes = 64, .task_records = 1});
  CompileExecution::Task task{.kind = CompileTaskKind::Pixels, .work = [](std::size_t, const CompileAllowance&) {}, .parent = execution.reserve({32, 0})};
  std::exception_ptr failure;
  bool fired = false;
  {
-  const FailNextAllocation allocation(allowed);
+  const FailNextAllocation allocation(0);
   try {
    (void)execution.try_submit(std::move(task));
   } catch (...) { failure = std::current_exception(); }
@@ -11895,7 +11905,7 @@ TEST_CASE("external workspace retirement delivers every returned resource to que
   else if (waits == 2)
    second_wait.receipt().ArriveAndWait();
  });
- CompileExecution::Readiness barrier(execution, CompileChange::None, [&](Changes) {
+ CompileExecution::Readiness barrier(execution, CompileChange::None, [&](CompileExecution::Readiness&, Changes) {
   if (++barriers == 1)
    initial.receipt().ArriveAndWait();
   else if (barriers == 2)
@@ -11932,7 +11942,7 @@ TEST_CASE("external workspace retirement delivers every returned resource to que
  std::array<unsigned, interests.size()> deliveries{};
  std::vector<std::unique_ptr<CompileExecution::Readiness>> readers;
  for (std::size_t i = 0; i < interests.size(); ++i)
-  readers.push_back(std::make_unique<CompileExecution::Readiness>(execution, interests[i], [&, i](Changes changes) {
+  readers.push_back(std::make_unique<CompileExecution::Readiness>(execution, interests[i], [&, i](CompileExecution::Readiness&, Changes changes) {
    if (!deliveries[i]++) notices[i].set_value(changes);
   }));
  external.retire_workspace();
@@ -14466,12 +14476,13 @@ TEST_CASE("custom archive admission retires decoder and unaccepted input through
   pixel("oversized pixel owns its arena");
  std::atomic<unsigned> validations{0}, callbacks{0}, file_returns{0}, file_waits{0};
  std::atomic<bool> first_input_wait{false}, first_restoration{false}, testing_full_queue{false};
- std::promise<void> restoration_waiting, pixel_waiting, source_full;
+ std::promise<void> restoration_waiting, pixel_waiting, source_full, decoder_retired;
  const auto diagnostics = mmltk::backend::data::testsupport::benchmark_trace();
  const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
   if (diagnostics) diagnostics(event, fields);
   if (event == "benchmark.images.input_wait" && !first_input_wait.exchange(true)) input_wait.receipt().ArriveAndWait();
   if (event == "benchmark.images.decoder_admission" && !first_restoration.exchange(true)) restoring.receipt().ArriveAndWait();
+  if (event == "benchmark.archive.suspended") mmltk::testsupport::release_test_promise(decoder_retired);
   if (event == "benchmark.images.file_wait") {
    const auto count = ++file_waits;
    if (count == 1) mmltk::testsupport::release_test_promise(source_full);
@@ -14504,6 +14515,7 @@ TEST_CASE("custom archive admission retires decoder and unaccepted input through
     .retain_workspace = false});
  };
  CompileExecution::Completion oversized, restoring_pixel;
+ std::unique_ptr<CompileResourceWait> byte_pressure;
  std::future<CachedImageDirectory> extracting;
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   input_wait.Release();
@@ -14513,6 +14525,7 @@ TEST_CASE("custom archive admission retires decoder and unaccepted input through
   accepted.Release();
   file_peer.Release();
   pixel.Release();
+  byte_pressure.reset();
   occupied = {};
   pipeline.execution().cancel();
   pipeline.files().join();
@@ -14547,14 +14560,19 @@ TEST_CASE("custom archive admission retires decoder and unaccepted input through
  if (!waiting_for_input && extracting.wait_for(0ms) == std::future_status::ready) (void)extracting.get();
  REQUIRE(waiting_for_input);
  CHECK_FALSE(pipeline.execution().resource_pressure());
- CHECK(pipeline.execution().resource_usage().bytes == BenchmarkEncodedImage::normal_window_bytes + 2 * archive_bytes + CompileResources::handles(2).bytes);
- // This source's failed try_reserve must release decoder scratch without any
- // unrelated preexisting waiter. Independent CPU work remains selectable.
+ CHECK(pipeline.execution().resource_usage().bytes == BenchmarkEncodedImage::normal_window_bytes + 3 * archive_bytes + CompileResources::handles(2).bytes);
+ // Arena-only pressure preserves unsupplied decoder bytes. A real byte
+ // shortage then retires that decoder before restoration is admitted.
  auto independent = pipeline.execution().submit({.kind = CompileTaskKind::Metadata, .work = [](std::size_t, const CompileAllowance&) {}});
  independent.wait();
  CHECK(pipeline.execution().snapshot().normal_locked == locked);
- occupied = {};
+ const CompileResources all_bytes{.bytes = pipeline.execution().transient_target()};
+ REQUIRE_FALSE(pipeline.execution().try_reserve(all_bytes));
+ byte_pressure = pipeline.execution().defer_resources(all_bytes);
  input_wait.Release();
+ mmltk::testsupport::await_test_promise(decoder_retired, "byte pressure retires decoder custody", 5s);
+ byte_pressure.reset();
+ occupied = {};
  REQUIRE(restoring.WaitEntered(5s));
  restoring_pixel = pixel_task(restoration_peer);
  mmltk::testsupport::await_test_promise(restoration_waiting, "new oversized work closes admission before decoder restoration", 5s);
@@ -15631,7 +15649,10 @@ TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under s
  std::vector<BenchmarkEncodedImage::Ptr> encoded;
  for (std::size_t i = 0; i < order.size(); ++i) {
   const auto& input = inputs[order[i]];
-  encoded.push_back(BenchmarkEncodedImage::publish(cached_image_path(images, i + 1), input.encoded, {}));
+  const auto path = cached_image_path(images, i + 1);
+  fs::create_directories(path.parent_path());
+  encoded.push_back(BenchmarkEncodedImage::publish(path, input.encoded, {}, nullptr, BenchmarkImageDecoder{}.read_header(input.encoded)));
+  REQUIRE(encoded.back());
   split.images.push_back({i + 1, input.width, input.height, static_cast<std::uint16_t>(annotations.image(i).box_count), 0});
  }
  std::optional<nlohmann::json> summary, execution_summary;
@@ -15745,7 +15766,7 @@ TEST_CASE("a finite Workspace pass yields to other owners and reaches a fitting 
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, {}, 0, 0, budget));
  BenchmarkCompilePipeline pipeline(3, {}, {.transient_bytes = budget, .workspace_plan = plan}, {}, trace);
  BoundBenchmarkWriter fixture(pipeline, benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline, true));
- peer = std::make_unique<CompileExecution::Readiness>(pipeline.execution(), CompileChange::None, [&](auto) { mmltk::testsupport::release_test_promise(other_owner); });
+ peer = std::make_unique<CompileExecution::Readiness>(pipeline.execution(), CompileChange::None, [&](CompileExecution::Readiness&, auto) { mmltk::testsupport::release_test_promise(other_owner); });
  auto retained = pipeline.execution().reserve({.bytes = budget - (80U << 10)});
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   retained = {};
@@ -15882,6 +15903,7 @@ TEST_CASE("archive retirement cooperates across byte and descriptor shortages", 
 TEST_CASE("forward publication keeps a decoder for arena pressure and wakes for a useful changed demand", "[benchmark][archive][resources][pipeline]") {
  using namespace mmltk::backend::data::detail;
  using namespace mmltk::backend::data::testsupport;
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two independent file services");
  const bool cancel = GENERATE(false, true);
  std::atomic<bool> cancelled{false};
  mmltk::testsupport::ScopedTempDir root("archive-demand-change");
@@ -15907,7 +15929,7 @@ TEST_CASE("forward publication keeps a decoder for arena pressure and wakes for 
    restores = value.at("restores");
   }
  }};
- BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 32U << 20, .workspace_plan = plan}, {}, trace);
+ BenchmarkCompilePipeline pipeline(2, {}, {.transient_bytes = 32U << 20, .workspace_plan = plan}, {}, trace);
  auto& execution = pipeline.execution();
  const CompileResources blocked{.bytes = page, .supplied_workspace = true};
  auto arena = execution.reserve(blocked);
@@ -16041,7 +16063,8 @@ TEST_CASE("ready normalized rows share bounded gathers across empty and oversize
    box.x2 = box.y2 = 1;
    box.annotation_id = input.boxes.size() + 1;
    box.source_ordinal = input.boxes.size();
-   box.flags = kAnnotationId | kAnnotationMask;
+   box.flags = kAnnotationId | kAnnotationCategory | kAnnotationMask;
+   box.source_category_id = 1;
    box.mask_rle_offset = input.mask_rle_pairs.size();
    box.mask_rle_pairs = i == 129 ? 65537 : 1;
    for (std::size_t r = 0; r < box.mask_rle_pairs; ++r) input.mask_rle_pairs.push_back({static_cast<std::uint32_t>(r * 2), 1});

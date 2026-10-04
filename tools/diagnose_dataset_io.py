@@ -51,6 +51,30 @@ def command(*arguments):
         return unavailable(error)
 
 
+def cpu_topology():
+    """Keep CPU identity, SMT sharing, and hybrid PMU membership together."""
+    attributes = (
+        "topology/physical_package_id", "topology/core_id",
+        "topology/thread_siblings_list", "topology/core_type", "cpu_capacity",
+        "cpufreq/cpuinfo_max_freq", "cpufreq/scaling_max_freq",
+        "cpufreq/scaling_governor", "cpufreq/energy_performance_preference",
+    )
+    return {
+        "scope": "eligible logical CPUs; missing core type is not evidence of a homogeneous CPU",
+        "hybrid_pmu_cpus": {
+            name: read_text(Path("/sys/bus/event_source/devices") / name / "cpus")
+            for name in ("cpu_core", "cpu_atom")
+        },
+        "cpus": [
+            {"cpu": cpu, "attributes": {
+                name: read_text(Path(f"/sys/devices/system/cpu/cpu{cpu}") / name)
+                for name in attributes
+            }}
+            for cpu in sorted(os.sched_getaffinity(0))
+        ],
+    }
+
+
 def direct_io(path):
     result = {"read": "not attempted; open and alignment metadata do not prove a DMA route"}
     if not hasattr(os, "O_DIRECT"):
@@ -228,6 +252,7 @@ def main():
         "source_path": arguments.source_path,
         "kernel": platform.uname()._asdict(),
         "cpu": command("lscpu", "--json"),
+        "cpu_topology": cpu_topology(),
         "gpu": command("nvidia-smi", "--query-gpu=name,driver_version,pci.bus_id,memory.total", "--format=csv"),
         "gpu_topology": command("nvidia-smi", "topo", "-m"),
         "numa_hardware": command("numactl", "--hardware"),
