@@ -221,7 +221,7 @@ DirectMaskSamples sample_direct_masks(
   torch::NoGradGuard no_grad;
   labels = sample_target_masks(require_target_masks(targets, "direct mask reconstruction"), indices, coordinates, "direct mask reconstruction").to(point_logits.dtype());
  }
- return {point_logits, labels};
+ return {point_logits, labels, coordinates};
 }
 PairwiseMaskSamples sample_pairwise_masks(const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio,
  const torch::Tensor& coordinates, std::optional<std::uint64_t> sampling_key) {

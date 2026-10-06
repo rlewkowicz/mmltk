@@ -24,6 +24,8 @@ int64_t direct_mask_point_count(const torch::Tensor& masks, int64_t ratio);
 struct DirectMaskSamples {
  torch::Tensor logits;
  torch::Tensor targets;
+ // Existing selected coordinates, retained for exact numerical observation.
+ torch::Tensor coordinates;
 };
 // Seeds apply only to omitted operands; omission uses the default generator.
 struct DirectMaskRandomSeeds {

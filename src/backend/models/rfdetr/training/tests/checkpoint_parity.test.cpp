@@ -4,7 +4,8 @@
 #include <filesystem>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
-// RF-DETR training checkpoint parity coverage.
+// Native-to-native checkpoint round-trip/admission coverage. Independent
+// upstream execution is in the separate [upstream_oracle] cases.
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -171,4 +172,4 @@ void test_checkpoint_parity_matches_for_all_registered_fixtures() {
  const auto& fixtures = parity_fixture_cases();
  for (size_t index = 0; index < fixtures.size(); ++index) { run_checkpoint_parity_case(fixtures[index], index + 1, fixtures.size()); }
 }
-TEST_CASE("test_checkpoint_parity_matches_for_all_registered_fixtures", "[model][rfdetr][checkpoint_parity][integration]") { test_checkpoint_parity_matches_for_all_registered_fixtures(); }
+TEST_CASE("Native checkpoint format round-trip matches for all registered fixtures", "[model][rfdetr][checkpoint_parity][roundtrip][integration]") { test_checkpoint_parity_matches_for_all_registered_fixtures(); }

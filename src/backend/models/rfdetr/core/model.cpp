@@ -85,7 +85,7 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  void import_training_supervision_runtime(const TrainingSupervisionRuntimeState& state);
  [[nodiscard]] std::vector<detail::ClassTensorAxis> class_axes() const;
  ModelOutputs forward_impl(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising = nullptr);
- ModelOutputs forward_ordinary(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising);
+ ModelOutputs forward_ordinary(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising, std::vector<torch::Tensor>* encoder_indices = nullptr);
  ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity);
  NativeRfDetrConfig config_;
  torch::nn::ModuleList backbone_{nullptr};
@@ -99,6 +99,7 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  detail::TensorTrace full_trace_{"full_model"};
  std::array<ModelOutputs, 2> full_output_layout_;
  detail::SelectiveTensorRegion backbone_region_{"backbone"};
+ std::array<CompilationMode, 2> observation_modes_{CompilationMode::kNone, CompilationMode::kNone};
 };
 namespace {
 using namespace torch::indexing;
@@ -851,7 +852,7 @@ public:
   return torch::cat(logits, 1);
  }
  NativeTransformerOutput forward(const std::vector<torch::Tensor>& srcs, const std::vector<torch::Tensor>& masks, const std::vector<torch::Tensor>& pos_embeds, const torch::Tensor& refpoint_embed,
-  const torch::Tensor& query_feat, bool training_mode, const DenoisingQueryBatch* denoising, TrainingSupervisionImpl* supervision) {
+  const torch::Tensor& query_feat, bool training_mode, const DenoisingQueryBatch* denoising, TrainingSupervisionImpl* supervision, std::vector<torch::Tensor>* encoder_indices = nullptr) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_transformer{"rfdetr.model.transformer"};
   if (srcs.empty()) { throw std::runtime_error("RF-DETR transformer requires at least one source feature"); }
   const int64_t batch = srcs.front().size(0);
@@ -913,6 +914,7 @@ public:
     auto proposal_scores = std::get<0>(enc_outputs_class.max(-1));
     const int64_t topk = std::min<int64_t>(config_.num_queries, enc_outputs_class.size(1));
     auto topk_indices = std::get<1>(proposal_scores.topk(topk, 1));
+    if (encoder_indices) encoder_indices->push_back(topk_indices);
     auto selected_memory = output_memory_group.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, config_.hidden_dim}));
     const auto selected_proposals = output_proposals.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, 4}));
     const auto coord_delta = enc_out_bbox_embed->at<RfDetrMlpImpl>(static_cast<size_t>(group_index)).forward(selected_memory);
@@ -1164,7 +1166,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, bo
  TORCH_CHECK(index == tensors.size(), "full-trace output inventory has unexpected tensors");
  return output;
 }
-ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(const NestedTensor& batch, const bool include_masks, const bool capture_match_free_features, const DenoisingQueryBatch* denoising) {
+ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(const NestedTensor& batch, const bool include_masks, const bool capture_match_free_features, const DenoisingQueryBatch* denoising, std::vector<torch::Tensor>* encoder_indices) {
  const bool is_train = is_training();
  mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward{"rfdetr.model.forward"};
  if (!batch.tensors.defined()) { throw std::runtime_error("NativeRfDetrModel::forward requires batch.tensors"); }
@@ -1203,7 +1205,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(const NestedTensor& batch
  NativeTransformerOutput transformed;
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_transformer{"rfdetr.model.forward.transformer"};
-  transformed = transformer->forward(srcs, feature_masks, poss, ref_weights, query_weights, is_training(), denoising, training_supervision_.get());
+  transformed = transformer->forward(srcs, feature_masks, poss, ref_weights, query_weights, is_training(), denoising, training_supervision_.get(), encoder_indices);
  }
  std::vector<torch::Tensor> combined_query_features;
  std::vector<torch::Tensor> decoder_query_features;
@@ -1499,6 +1501,7 @@ void NativeRfDetrModel::Impl::optimize_for_inference(int batch_size, bool for_tr
   if (auto* head = dynamic_cast<SegmentationHeadImpl*>(module.get())) head->prepare_selective(for_training, selective, batch_size);
  }
  full_trace_.prepare(for_training, mode == CompilationMode::kFullTrace, batch_size);
+ observation_modes_[for_training] = mode;
 }
 void NativeRfDetrModel::Impl::set_force_pytorch_deformable_attn(bool value) {
  force_pytorch_deformable_attn_ = value;
@@ -1620,6 +1623,12 @@ void NativeRfDetrModel::replicate_training_supervision_runtime_from(const Native
  impl_->import_training_supervision_runtime(source.impl_->export_training_supervision_runtime());
 }
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, bool include_masks) { return impl_->forward(batch, include_masks); }
+ModelOutputs NativeRfDetrModel::forward_observed(const NestedTensor& batch, bool include_masks, std::vector<torch::Tensor>& encoder_indices) {
+ if (impl_->observation_modes_[impl_->is_training()] != CompilationMode::kNone)
+  throw std::runtime_error("encoder selection observation requires eager RF-DETR execution");
+ encoder_indices.clear();
+ return impl_->forward_ordinary(batch, include_masks, false, nullptr, &encoder_indices);
+}
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward_for_match_free(const NestedTensor& batch) { return impl_->forward_for_match_free(batch); }
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity) {
  return impl_->forward_with_denoising(batch, targets, identity);

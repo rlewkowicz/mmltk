@@ -308,16 +308,33 @@ stop_owned_process() {
 }
 
 terminate_active_builds() {
-    local container
-    for container in "${active_build_container_names[@]}"; do
-        docker rm -f "${container}" >/dev/null 2>&1 || true
-    done
-    active_build_container_names=()
-
     local pid
     for pid in "${active_build_pids[@]}"; do
         stop_owned_process "${pid}" "${active_build_start_ticks[${pid}]:-}" "${BASHPID}"
     done
+    # A child wrapper may still be waiting for the mutation lock. Shared names
+    # do not establish custody; remove only immutable IDs bearing our exact
+    # owner identity (or that of a tracked child), after stopping their clients.
+    local owner start container containers
+    for owner in "${wrapper_pid}" "${active_build_pids[@]}"; do
+        local -a custody_filters=()
+        start="${active_build_start_ticks[${owner}]:-}"
+        if [[ "${owner}" == "${wrapper_pid}" ]]; then
+            start="${wrapper_start_ticks}"
+            ((${#active_build_container_names[@]})) || continue
+            for container in "${active_build_container_names[@]}"; do
+                custody_filters+=(--filter "name=^/${container}$")
+            done
+        fi
+        [[ -n "${start}" ]] || continue
+        containers="$(timeout --signal=KILL 5s docker ps -aq \
+            --filter "label=com.mmltk.owner-pid=${owner}" \
+            --filter "label=com.mmltk.owner-start=${start}" "${custody_filters[@]}" 2>/dev/null)" || true
+        for container in ${containers}; do
+            timeout --signal=KILL 5s docker rm -f "${container}" >/dev/null 2>&1 || true
+        done
+    done
+    active_build_container_names=()
     for pid in "${active_build_pids[@]}"; do
         wait "${pid}" >/dev/null 2>&1 || true
     done
@@ -332,11 +349,12 @@ run_owned_container_command() {
     active_build_container_names=("${owned_container_name}")
     docker rm -f "${owned_container_name}" >/dev/null 2>&1 || true
     local exit_status=0
-    if "$@"; then
-        exit_status=0
-    else
-        exit_status=$?
-    fi
+    "$@" <&0 &
+    local owned_pid=$!
+    track_build_pid "${owned_pid}"
+    wait "${owned_pid}" || exit_status=$?
+    active_build_pids=()
+    active_build_start_ticks=()
     active_build_container_names=()
     return "${exit_status}"
 }
@@ -2751,6 +2769,120 @@ run_log_tool() {
     run_owned_docker_command "${log_container_name}" "${diagnostic_args[@]}"
 }
 
+run_rfdetr_upstream_diagnostic() {
+    if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+        printf '%s\n' \
+            'Usage: ./mmltk --diagnose-rfdetr-upstream --upstream PATH --output PATH' \
+            'Requires clean upstream e9a138f70cc14e3fddca029a0683055e34ab8f35 and cached official Nano weights.' \
+            'Builds a validation-only cached image from the pinned full NGC donor.' \
+            'Executes upstream Nano/SegNano FP32 and supported AMP evidence, then core/training [upstream_oracle] cases.' \
+            'Exit zero requires both stages. References, comparison JSONL and wrapper.log survive comparison failures.' \
+            'Output must be a fresh directory; retry comparisons with --test ... --env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=PATH.' \
+            'The upstream mount is read-only. Producer deadline: two hours; signals use bounded wrapper cancellation.'
+        return 0
+    fi
+    local upstream="" output="" revision=e9a138f70cc14e3fddca029a0683055e34ab8f35
+    while (($#)); do
+        case "$1" in
+            --upstream|--output)
+                (($# >= 2)) && [[ -n "$2" ]] || die "$1 requires a path"
+                if [[ "$1" == --upstream ]]; then upstream="$2"; else output="$2"; fi
+                shift 2 ;;
+            *) die "unknown RF-DETR oracle option '$1'" ;;
+        esac
+    done
+    [[ -n "${upstream}" && -n "${output}" ]] || die 'RF-DETR oracle requires --upstream and --output'
+    upstream="$(realpath -e -- "${upstream}")"
+    output="$(realpath -m -- "${output}")"
+    [[ "${upstream}" != *:* && "${output}" != *:* ]] || die 'oracle mount paths cannot contain colons'
+    [[ -f "${upstream}/src/rfdetr/models/lwdetr.py" ]] || die 'oracle source must be the RF-DETR checkout root'
+    [[ "$(git -C "${upstream}" rev-parse HEAD)" == "${revision}" ]] || die "oracle requires pinned upstream ${revision}"
+    [[ -z "$(git -C "${upstream}" status --porcelain --untracked-files=all)" ]] || die 'oracle upstream checkout must be clean, including untracked files'
+    local source_git source_common
+    source_git="$(git -C "${upstream}" rev-parse --absolute-git-dir)"
+    source_common="$(git -C "${upstream}" rev-parse --path-format=absolute --git-common-dir)"
+    [[ "${source_git}" != *:* && "${source_common}" != *:* ]] || die 'oracle Git mount paths cannot contain colons'
+    case "${output}/" in "${upstream}/"*) die 'oracle output must be outside the read-only upstream checkout' ;; esac
+    [[ ! -e "${output}/manifest.json" && ! -e "${output}/verdict.json" && ! -e "${output}/references" ]] || die 'oracle output already contains evidence; choose a fresh directory'
+    local weights="${repository_cache_root}/mmltk/weights"
+    [[ -f "${weights}/rf-detr-nano.pth" && -f "${weights}/rf-detr-seg-nano.pt" ]] || die 'oracle requires the cached official rf-detr-nano.pth and rf-detr-seg-nano.pt artifacts'
+    prepare_owned_dirs "${output}"
+    prepare_operation_logging "${output}/wrapper.log"
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    initialize_nvidia_inputs
+    local fingerprint image="${image_name}-rfdetr-oracle" diagnostic_container="${container_name}-upstream"
+    fingerprint="$(
+        {
+            printf '%s\n' "${revision}" "${nvidia_donor_image}" "$(git -C "${upstream}" rev-parse 'HEAD^{tree}')"
+            sha256sum "${repo_root}/docker/Dockerfile.rfdetr-oracle" \
+                "${repo_root}/docker/nvidia-payload.json" \
+                "${repo_root}/tools/rfdetr_oracle_requirements.txt" \
+                "${repo_root}/tools/generate_rfdetr_upstream_oracle.py"
+        } | sha256sum | cut -d' ' -f1
+    )"
+    cached_buildx_image default - "${image}" "${repo_root}/docker/Dockerfile.rfdetr-oracle" \
+        rfdetr-oracle "${fingerprint}" "${repo_root}" --platform "$(manifest_value platform)" \
+        --build-arg "MMLTK_NVIDIA_DONOR_IMAGE=${nvidia_donor_image}" &
+    local image_pid=$! image_status=0
+    track_build_pid "${image_pid}"
+    wait "${image_pid}" || image_status=$?
+    active_build_pids=()
+    active_build_start_ticks=()
+    (( image_status == 0 )) || return "${image_status}"
+    local -a producer_args=(run --rm --init --name "${diagnostic_container}"
+        --gpus all --ipc host --network none --read-only --user "${uid}:${gid}"
+        --cap-drop ALL --security-opt no-new-privileges
+        --tmpfs /tmp:rw,exec,nosuid,nodev,size=4g
+        --env HOME=/tmp --env NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        --env GIT_DIR=/upstream-git --env GIT_COMMON_DIR=/upstream-common --env GIT_WORK_TREE=/upstream --env GIT_OPTIONAL_LOCKS=0
+        --env HF_HOME=/tmp/huggingface --env TRITON_CACHE_DIR=/tmp/triton
+        --volume "${upstream}:/upstream:ro" --volume "${weights}:/weights:ro"
+        --volume "${source_git}:/upstream-git:ro" --volume "${source_common}:/upstream-common:ro"
+        --volume "${output}:/evidence:rw" --workdir /tmp --entrypoint /usr/bin/timeout)
+    append_execution_policy_args producer_args
+    append_wrapper_labels producer_args "${invocation_mode}"
+    local status=0
+    run_owned_docker_command "${diagnostic_container}" "${producer_args[@]}" "${image}" \
+        --signal=TERM --kill-after=15s 7200s python3 /opt/rfdetr-oracle/producer.py \
+        --upstream /upstream --output /evidence --weights /weights --fingerprint "${fingerprint}" || status=$?
+    release_mutation_locks
+    if (( status != 0 )); then
+        error "upstream reference production failed (exit ${status}); evidence retained in ${output}"
+        return "${status}"
+    fi
+    # Existing suites retain all their build, path, environment and process custody.
+    # Keep this wrapper active so its ordinary cancellation owns both stages.
+    local target first_failure=0
+    for target in mmltk_backend_models_rfdetr_core_tests mmltk_backend_models_rfdetr_training_tests; do
+        status=0
+        # A fresh shell retains errexit inside the existing build/test workflow.
+        # Track its exact process identity and its ordinary test containers so
+        # cancellation retires descendants through the existing wrapper owner.
+        MMLTK_TEST_LOG_FILE="${output}/${target}.log" "${repo_root}/mmltk" --test rfdetr \
+            --executable "${target}" --env "MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=$(rewrite_host_path "${output}")" \
+            -- '[upstream_oracle]' --warn UnmatchedTestSpec &
+        local test_pid=$!
+        track_build_pid "${test_pid}"
+        wait "${test_pid}" || status=$?
+        active_build_pids=()
+        active_build_start_ticks=()
+        active_build_container_names=()
+        if (( status != 0 && first_failure == 0 )); then first_failure="${status}"; fi
+    done
+    if (( first_failure != 0 )); then
+        error "native oracle comparison failed (exit ${first_failure}); reference artifacts and comparisons retained in ${output}"
+        return "${first_failure}"
+    fi
+    local manifest_hash
+    manifest_hash="$(sha256sum "${output}/manifest.json" | cut -d' ' -f1)"
+    printf '{"status":"passed","evidence":"upstream forward/VJP and stock FP32; AMP controlled FP32 matcher, stock differential retained; native Match-Free compilation","fingerprint":"%s","manifest_sha256":"%s"}\n' \
+        "${fingerprint}" "${manifest_hash}" >"${output}/.verdict.partial"
+    mv -- "${output}/.verdict.partial" "${output}/verdict.json"
+    log "upstream production and required native comparisons passed; ${output}/verdict.json"
+}
+
 run_gpu_environment_diagnostic() {
     local diagnostic_image diagnostic_image_id
     case "$1" in
@@ -4122,6 +4254,11 @@ test_debugger_commands=()
 test_environment=()
 test_headless_compositor=0
 passthrough_args=()
+if [[ "${1:-}" == "--diagnose-rfdetr-upstream" ]]; then
+    invocation_mode="diagnose-rfdetr-upstream"
+    run_rfdetr_upstream_diagnostic "${@:2}"
+    exit $?
+fi
 for arg in "$@"; do
     if [[ "${arg}" == "--gui" ]]; then
         gui_mode=1
@@ -4261,6 +4398,8 @@ for arg in "${passthrough_args[@]}"; do
         die "--diagnose-gpu-program must be the standalone operation; use './mmltk --diagnose-gpu-program --help'"
     [[ "${arg}" != "--diagnose-native-symbols" ]] ||
         die "--diagnose-native-symbols must be the standalone operation; use './mmltk --diagnose-native-symbols --help'"
+    [[ "${arg}" != "--diagnose-rfdetr-upstream" ]] ||
+        die "--diagnose-rfdetr-upstream must be first and standalone; use './mmltk --diagnose-rfdetr-upstream --help'"
     [[ "${arg}" != "--diagnose-processes" ]] ||
         die "--diagnose-processes must be the standalone operation; use './mmltk --diagnose-processes --help'"
     [[ "${arg}" != "--diagnose-benchmark-image" ]] ||

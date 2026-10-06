@@ -121,7 +121,8 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         list(APPEND sources
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint.test.cpp)
         list(APPEND ordinary_sources
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_parity.test.cpp)
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_parity.test.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/upstream_optimizer_parity.test.cpp)
     endif()
     add_executable(mmltk_backend_models_rfdetr_training_tests
         EXCLUDE_FROM_ALL)

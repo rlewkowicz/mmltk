@@ -1,0 +1,14 @@
+# Validation image: retain the complete compatible NGC Python/CUDA environment.
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+FROM ${MMLTK_NVIDIA_DONOR_IMAGE}
+ARG MMLTK_IMAGE_FINGERPRINT
+LABEL com.mmltk.input-fingerprint=${MMLTK_IMAGE_FINGERPRINT}
+COPY docker/nvidia-payload.json /opt/rfdetr-oracle/nvidia-payload.json
+COPY tools/rfdetr_oracle_requirements.txt /opt/rfdetr-oracle/requirements.txt
+COPY tools/generate_rfdetr_upstream_oracle.py /opt/rfdetr-oracle/producer.py
+# --no-deps is intentional: pip must never resolve a replacement Torch, CUDA,
+# torchvision or Triton. The producer audits versions and genuine import closure.
+RUN python3 /opt/rfdetr-oracle/producer.py --payload-snapshot /opt/rfdetr-oracle/payload.json \
+ && python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: -r /opt/rfdetr-oracle/requirements.txt \
+ && python3 /opt/rfdetr-oracle/producer.py --check-environment
+ENV PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1

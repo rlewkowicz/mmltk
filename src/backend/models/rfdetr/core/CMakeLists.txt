@@ -204,6 +204,9 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
             mmltk_backend_models_rfdetr_checkpoint_test_support
             PRIVATE_DECLARATIONS)
         mmltk_enable_python_checkpoint_loader(mmltk_backend_models_rfdetr_checkpoint_test_support PRIVATE)
+        mmltk_register_ordinary_sources(
+            mmltk_backend_models_rfdetr_checkpoint_test_support
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/upstream_oracle_fixture.cpp)
         mmltk_register_retained_module_importers(
             mmltk_backend_models_rfdetr_checkpoint_test_support
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support.cpp
@@ -212,7 +215,8 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
             mmltk_backend_models_rfdetr_checkpoint_test_support
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/asset_cache_support.h
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/checkpoint_fixture_support.h
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/parity_fixture_support.h)
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/parity_fixture_support.h
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/upstream_oracle_fixture.h)
         target_include_directories(
             mmltk_backend_models_rfdetr_checkpoint_test_support
             PUBLIC
@@ -224,6 +228,8 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
             mmltk_backend_models_rfdetr_checkpoint_test_support
             PUBLIC
                 mmltk::backend::models::rfdetr::core
+                mmltk::common::io
+                nlohmann_json
             PRIVATE
                 mmltk::backend::ml::torch_dependencies)
     endif()
@@ -239,7 +245,8 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_supervision.test.cpp)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
         list(APPEND sources
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/native_integration.test.cpp)
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/native_integration.test.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/upstream_model_parity.test.cpp)
     endif()
     add_executable(mmltk_backend_models_rfdetr_core_tests
         EXCLUDE_FROM_ALL)

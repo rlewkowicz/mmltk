@@ -45,6 +45,9 @@ public:
  void invalidate_compilation();
  void optimize_for_inference(std::int32_t batch_size = 1, bool for_training = false, CompilationMode mode = CompilationMode::kSelective);
  [[nodiscard]] ModelOutputs forward(const NestedTensor& batch, bool include_masks);
+ // Eager numerical observation only: borrows the actual encoder top-k tensors,
+ // in group order. Rejects compilation rather than claiming replay evidence.
+ [[nodiscard]] ModelOutputs forward_observed(const NestedTensor& batch, bool include_masks, std::vector<torch::Tensor>& encoder_indices);
  [[nodiscard]] ModelOutputs forward_for_match_free(const NestedTensor& batch);
  [[nodiscard]] ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity);
  void initialize_training_supervision(std::uint64_t request_seed);
