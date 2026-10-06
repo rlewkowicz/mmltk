@@ -16,12 +16,15 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 namespace mmltk::backend::models::rfdetr::testsupport {
 struct TrainingSnapshotTestAccess final {
  static torch::Tensor view(TrainingSnapshot& snapshot, std::size_t slot) { return snapshot.readback_.Stage(slot); }
@@ -42,11 +45,13 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
  r::DecodedNativeModelState checkpoint(complete);
  checkpoint.metadata.class_layout = source_layout;
  const auto before = r::testsupport::clone_normalized_model_state(destination);
- const auto unchanged = [&] {
-  const auto actual = destination.named_parameters();
-  for (const auto& entry : before) {
-   const auto* parameter = actual.find(entry.name);
-   if (parameter) CHECK(torch::equal(*parameter, entry.tensor));
+ const auto require_values = [](const r::NativeRfDetrModel& model, const std::vector<r::NormalizedModelStateEntry>& expected) {
+  const auto actual = r::collect_module_state(model);
+  REQUIRE(actual.size() == expected.size());
+  for (std::size_t index = 0; index < actual.size(); ++index) {
+   CAPTURE(expected[index].name);
+   REQUIRE(actual[index].name == expected[index].name);
+   CHECK(torch::equal(actual[index].tensor, expected[index].tensor));
   }
  };
  const r::ResolvedClassLayout semantic_source(source_layout);
@@ -70,12 +75,14 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
     REQUIRE(error.summary().incompatible_names == std::vector<std::string>{malformed == 2 ? "query_feat.weight" : "class_embed.weight"});
    }
   }
-  unchanged();
+  require_values(destination, before);
  }
  checkpoint.replace_entries(complete);
  const auto summary = r::load_training_model_weights(destination, checkpoint, r::TrainingSupervisionRoute::Hungarian);
  REQUIRE(summary.missing_names.empty());
  REQUIRE(summary.incompatible_names.empty());
+ REQUIRE(summary.initialized_names.empty());
+ REQUIRE(summary.loaded_names.size() == complete.size());
  const auto parameters = destination.named_parameters();
  for (const auto& entry : complete) {
   const auto* actual = parameters.find(entry.name);
@@ -114,56 +121,172 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
  checkpoint.metadata.preset_name = config.preset_name;
  checkpoint.metadata.num_queries = source.config().num_queries;
  checkpoint.metadata.num_select = source.config().num_select;
+ const r::FreshTransferQueryRetention retention{{source.config().group_detr, source.config().num_queries}, true};
+ const std::vector<std::string> query_names{"query_feat.weight", "refpoint_embed.weight"};
  for (const int query_count : {2, 5}) {
+  CAPTURE(query_count);
   auto resized_config = source.config();
   resized_config.num_queries = resized_config.num_select = query_count;
+  if (query_count == 5) resized_config.preset_name = "custom-query-transfer-test";
   r::NativeRfDetrModel resized(resized_config, destination_layout);
   const auto fresh = r::testsupport::clone_normalized_model_state(resized);
-  const auto require_fresh = [&] {
+  const auto retained = resized.named_parameters();
+  const std::array query_storage{retained[query_names[0]].const_data_ptr(), retained[query_names[1]].const_data_ptr()};
+  const std::array query_versions{retained[query_names[0]]._version(), retained[query_names[1]]._version()};
+  const auto require_queries = [&] {
    const auto values = resized.named_parameters();
-   for (const auto& value : fresh)
-    if (const auto* parameter = values.find(value.name)) CHECK(torch::equal(*parameter, value.tensor));
+   for (std::size_t index = 0; index < query_names.size(); ++index) {
+    const auto& name = query_names[index];
+    const auto expected = std::ranges::find(fresh, name, &r::NormalizedModelStateEntry::name);
+    CHECK(values[name].const_data_ptr() == query_storage[index]);
+    CHECK(values[name]._version() == query_versions[index]);
+    CHECK(torch::equal(values[name], expected->tensor));
+   }
   };
-  for (const int defect : {0, 1, 2}) {
-   auto incomplete = complete;
-   const auto key = defect == 0 ? "query_feat.weight" : defect == 1 ? "refpoint_embed.weight" : "backbone.0.encoder.encoder.embeddings.cls_token";
-   const auto found = std::ranges::find(incomplete, key, &r::NormalizedModelStateEntry::name);
-   REQUIRE(found != incomplete.end());
-   if (defect == 1) found->tensor = torch::zeros({1, 4});
-   else incomplete.erase(found);
-   checkpoint.replace_entries(std::move(incomplete));
+  for (const auto& name : query_names) {
+   for (const std::string_view defect : {"missing", "duplicate", "undefined", "rank", "rows", "width"}) {
+    CAPTURE(name, defect);
+    auto malformed = complete;
+    const auto found = std::ranges::find(malformed, name, &r::NormalizedModelStateEntry::name);
+    REQUIRE(found != malformed.end());
+    if (defect == "missing") malformed.erase(found);
+    else if (defect == "duplicate") malformed.push_back(*found);
+    else if (defect == "undefined") found->tensor = {};
+    else if (defect == "rank") found->tensor = found->tensor.unsqueeze(0);
+    else if (defect == "rows") found->tensor = found->tensor.narrow(0, 0, 1);
+    else found->tensor = found->tensor.narrow(1, 0, 1);
+    checkpoint.replace_entries(std::move(malformed));
+    REQUIRE_THROWS(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, retention));
+    REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
+    require_values(resized, fresh);
+    require_queries();
+   }
+  }
+  for (const bool missing : {false, true}) {
+   auto malformed = complete;
+   const std::string name = "backbone.0.encoder.encoder.embeddings.cls_token";
+   const auto found = std::ranges::find(malformed, name, &r::NormalizedModelStateEntry::name);
+   REQUIRE(found != malformed.end());
+   if (missing) malformed.erase(found);
+   else found->tensor = {};
+   checkpoint.replace_entries(std::move(malformed));
+   try {
+    static_cast<void>(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, retention));
+    FAIL("query retention must still require every compatible core tensor");
+   } catch (const r::ModelStateAdmissionError& error) {
+    CHECK(error.summary().initialized_names == query_names);
+    CHECK((missing ? error.summary().missing_names : error.summary().incompatible_names) == std::vector<std::string>{name});
+    CHECK(error.summary().loaded_names.size() + query_names.size() + 1 == complete.size());
+   }
    REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
-   require_fresh();
+   require_values(resized, fresh);
   }
   checkpoint.replace_entries(complete);
+  for (const auto& name : query_names) {
+   auto weight = retained[name];
+   const auto original = weight.detach();
+   for (const auto& malformed : {original.unsqueeze(0), original.narrow(0, 0, 1), original.narrow(1, 0, 1)}) {
+    weight.set_data(malformed);
+    REQUIRE_THROWS(resized.stage_normalized_state(complete, Admission::FreshTransfer, &semantic_source, retention));
+    REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
+    weight.set_data(original);
+    require_values(resized, fresh);
+   }
+  }
+  checkpoint.replace_entries(fresh);
+  REQUIRE_THROWS(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, retention));
+  REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
+  require_values(resized, fresh);
+  checkpoint.replace_entries(complete);
+  for (const auto admission : {Admission::Exact, Admission::RequiredCore, Admission::PartialExact, Admission::PartialFreshTransfer})
+   REQUIRE_THROWS(resized.stage_normalized_state(complete, admission, &semantic_source, retention));
+  REQUIRE_THROWS(resized.stage_normalized_state(complete, Admission::FreshTransfer, &semantic_source));
+  for (const std::int64_t source_count : {std::int64_t{0}, std::int64_t{-1}, std::int64_t{query_count}, retention.source_layout.queries_per_group + 1,
+        std::numeric_limits<std::int64_t>::max() / retention.source_layout.groups + 1, std::numeric_limits<std::int64_t>::max()}) {
+   auto conflicting = retention;
+   conflicting.source_layout.queries_per_group = source_count;
+   REQUIRE_THROWS(resized.stage_normalized_state(complete, Admission::FreshTransfer, &semantic_source, conflicting));
+   require_values(resized, fresh);
+  }
+  for (const std::int64_t source_groups : {std::int64_t{0}, std::int64_t{-1}, retention.source_layout.groups + 1}) {
+   auto conflicting = retention;
+   conflicting.source_layout.groups = source_groups;
+   REQUIRE_THROWS(resized.stage_normalized_state(complete, Admission::FreshTransfer, &semantic_source, conflicting));
+   require_values(resized, fresh);
+  }
   ++checkpoint.metadata.num_queries;
   REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
-  require_fresh();
+  require_values(resized, fresh);
   --checkpoint.metadata.num_queries;
-  REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::MatchFree));
-  require_fresh();
+  for (const auto route : {r::TrainingSupervisionRoute::MatchFree, r::TrainingSupervisionRoute::HungarianDenoising, r::TrainingSupervisionRoute::MatchFreeDenoising}) {
+   REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, route));
+   require_values(resized, fresh);
+  }
+  checkpoint.metadata.preset_name.clear();
+  if (query_count == 5) {
+   REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
+   require_values(resized, fresh);
+   checkpoint.metadata.preset_name = source.config().preset_name;
+  }
+  auto reordered = complete;
+  std::ranges::reverse(reordered);
+  auto staged = resized.stage_normalized_state(reordered, Admission::FreshTransfer, &semantic_source, retention);
+  REQUIRE(staged.summary.initialized_names == query_names);
+  REQUIRE(staged.summary.loaded_names.size() + query_names.size() == complete.size());
+  REQUIRE(staged.destinations.size() == staged.summary.loaded_names.size());
+  REQUIRE(staged.tensors.size() == staged.destinations.size());
+  REQUIRE(staged.summary.missing_names.empty());
+  REQUIRE(staged.summary.incompatible_names.empty());
+  REQUIRE(staged.summary.unexpected_names.empty());
+  REQUIRE(std::ranges::is_sorted(staged.summary.loaded_names));
+  for (const auto& value : staged.destinations)
+   for (const auto* address : query_storage) CHECK(value.const_data_ptr() != address);
+  for (const auto& name : query_names) CHECK(std::ranges::find(staged.summary.loaded_names, name) == staged.summary.loaded_names.end());
+  require_values(resized, fresh);
+  const auto staged_loaded = staged.summary.loaded_names;
+  resized.commit_normalized_state(std::move(staged));
+  require_queries();
   const auto transferred = r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian);
-  REQUIRE(transferred.initialized_names == std::vector<std::string>{"query_feat.weight", "refpoint_embed.weight"});
+  REQUIRE(transferred.initialized_names == query_names);
+  REQUIRE(transferred.loaded_names == staged_loaded);
   REQUIRE(transferred.missing_names.empty());
   REQUIRE(transferred.incompatible_names.empty());
-  const auto values = resized.named_parameters();
-  for (const auto& name : transferred.initialized_names) {
-   const auto expected = std::ranges::find(fresh, name, &r::NormalizedModelStateEntry::name);
-   CHECK(torch::equal(values[name], expected->tensor));
-   CHECK(std::ranges::find(transferred.loaded_names, name) == transferred.loaded_names.end());
+  require_queries();
+  for (std::size_t index = 0; index < complete.size(); ++index) {
+   REQUIRE(checkpoint.entries()[index].name == complete[index].name);
+   CHECK(checkpoint.entries()[index].tensor.const_data_ptr() == complete[index].tensor.const_data_ptr());
   }
+  require_values(source, complete);
   // Raw dictionaries have no count metadata. The same preset default used by
   // artifact resolution is sufficient only when the complete query pair agrees.
   auto raw = complete;
   const auto* preset = r::find_preset_catalog_entry(source.config().preset_name);
   REQUIRE(preset);
-  for (const auto name : {"query_feat.weight", "refpoint_embed.weight"}) {
+  for (const auto& name : query_names) {
    auto entry = std::ranges::find(raw, name, &r::NormalizedModelStateEntry::name);
    entry->tensor = torch::zeros({static_cast<int64_t>(preset->query_count) * preset->group_count, entry->tensor.size(1)});
   }
   checkpoint.replace_entries(std::move(raw));
   checkpoint.metadata.num_queries = 0;
+  const r::FreshTransferQueryRetention fallback{{preset->group_count, preset->query_count}, false};
+  REQUIRE(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, fallback).summary.initialized_names == query_names);
   REQUIRE(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian).initialized_names == transferred.initialized_names);
+  require_queries();
+  for (const auto& name : query_names) {
+   const auto original = std::ranges::find(checkpoint.entries(), name, &r::NormalizedModelStateEntry::name);
+   CHECK(original->tensor.size(0) == static_cast<int64_t>(preset->query_count) * preset->group_count);
+   CHECK(torch::equal(original->tensor, torch::zeros_like(original->tensor)));
+  }
+  // Matching raw rows load normally, even when the preset fallback differs.
+  checkpoint.replace_entries(fresh);
+  auto matching = resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, fallback);
+  REQUIRE(matching.summary.initialized_names.empty());
+  REQUIRE(matching.summary.loaded_names.size() == fresh.size());
+  REQUIRE(matching.destinations.size() == fresh.size());
+  // An unknown preset need not provide group evidence when no retention occurs.
+  checkpoint.metadata.preset_name.clear();
+  REQUIRE(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian).initialized_names.empty());
+  checkpoint.metadata.preset_name = source.config().preset_name;
   checkpoint.metadata.num_queries = source.config().num_queries;
  }
 }

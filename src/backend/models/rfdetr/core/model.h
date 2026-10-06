@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <utility>
@@ -19,6 +20,12 @@ struct NestedTensor {
  [[nodiscard]] std::pair<torch::Tensor, torch::Tensor> decompose() const;
 };
 NestedTensor nested_tensor_from_tensor_list(const std::vector<torch::Tensor>& tensor_list);
+struct FreshTransferQueryRetention {
+ // Zero groups means source group evidence is unavailable. It is required
+ // only when a changed query count actually retains the destination pair.
+ SupervisedQueryLayout source_layout{0, 0};
+ bool explicit_source_count = false;
+};
 class NativeRfDetrModel final {
 public:
  explicit NativeRfDetrModel(const NativeRfDetrConfig& config = {}, ModelClassLayout layout = {});
@@ -50,7 +57,8 @@ public:
  [[nodiscard]] SupervisionTimingHandoff harvest_supervision_timing();
  [[nodiscard]] ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict, const ModelClassLayout* admitted_layout = nullptr);
  [[nodiscard]] detail::NormalizedModelStateCandidate stage_normalized_state(
-  const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout = nullptr);
+  const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout = nullptr,
+  std::optional<FreshTransferQueryRetention> query_retention = std::nullopt);
  void commit_normalized_state(detail::NormalizedModelStateCandidate candidate);
  void set_force_pytorch_deformable_attn(bool value);
  void train(bool enabled = true);
