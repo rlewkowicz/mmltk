@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/ml/cuda/tensor_readback.h"
 #include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/common/system/numa_memory.h"
@@ -571,8 +572,7 @@ TEST_CASE("Math SDPA lowering preserves safe empty rows and exceptional operands
   auto graph = trace_unary_graph(input, operation);
   lower_test_graph(graph);
   const auto expected = operation(input), actual = execute_unary_onnx(graph, input);
-  REQUIRE(torch::equal(torch::isfinite(actual), torch::isfinite(expected)));
-  REQUIRE(torch::equal(torch::isnan(actual), torch::isnan(expected)));
+  mmltk::backend::ml::testsupport::require_nonfinite_pattern(actual, expected);
   CHECK(torch::allclose(actual, expected, 1e-5, 1e-6, true));
  }
 }

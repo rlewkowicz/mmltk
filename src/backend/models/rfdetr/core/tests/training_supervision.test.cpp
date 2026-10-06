@@ -39,6 +39,7 @@
 #include <torch/serialize.h>
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 namespace {
+using mmltk::backend::ml::testsupport::independent_leaf;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 using namespace torch::indexing;
 std::vector<int64_t> int64_values(const torch::Tensor& tensor) {
@@ -115,15 +116,7 @@ void install_oracle_projections(rfdetr::TrainingSupervisionImpl& supervision) {
  set_parameter(supervision, "key_projection.weight", torch::eye(2));
 }
 rfdetr::PreparedTargets one_image_targets(const torch::Tensor& boxes, const torch::Tensor& labels) {
- rfdetr::PreparedTargets targets;
- rfdetr::PreparedTarget target;
- target.boxes = boxes;
- target.labels = labels;
- targets.targets.push_back(std::move(target));
- targets.all_boxes = boxes;
- targets.all_labels = labels;
- targets.offsets = {0};
- targets.counts = {labels.size(0)};
+ auto targets = rfdetr::testsupport::one_image_targets(boxes, labels);
  const auto integer_options = torch::TensorOptions().dtype(torch::kInt64).device(labels.device());
  targets.target_offsets = torch::tensor({0}, integer_options);
  targets.target_counts = torch::tensor({labels.size(0)}, integer_options);
@@ -1352,9 +1345,7 @@ void test_dn_reference_conventions_inference_removal_and_disabled_exact_path() {
  const auto additive_reference = rfdetr::inverse_sigmoid(prepared->normalized_references);
  REQUIRE(torch::allclose(additive_reference.sigmoid(), reparameterized_reference, 1.0e-6, 1.0e-6));
  const auto zero_delta = torch::zeros_like(reparameterized_reference);
- const auto reparameterized_result = torch::cat(
-  {zero_delta.slice(-1, 0, 2) * reparameterized_reference.slice(-1, 2, 4) + reparameterized_reference.slice(-1, 0, 2), zero_delta.slice(-1, 2, 4).exp() * reparameterized_reference.slice(-1, 2, 4)},
-  -1);
+ const auto reparameterized_result = rfdetr::testsupport::reference_reparam_boxes(reparameterized_reference, zero_delta);
  REQUIRE(torch::equal(reparameterized_result, reparameterized_reference));
  auto inactive_config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  inactive_config.resolution = 64;
@@ -1599,7 +1590,7 @@ TEST_CASE("test_feature_initialization_is_reproducible_and_independent_of_dn_tog
 TEST_CASE("Pairwise mask contractions match independent dense values and gradients", "[rfdetr][training_supervision][parity]") {
  const auto targets = torch::tensor({{{1.F, 0.F, 1.F}, {0.F, 1.F, 0.F}, {0.F, 0.F, 0.F}}, {{0.F, 1.F, 1.F}, {1.F, 0.F, 0.F}, {1.F, 1.F, 1.F}}});
  auto logits = (torch::arange(12, torch::kFloat32).view({2, 2, 3}) * 0.2F - 1.F).set_requires_grad(true);
- auto reference = logits.detach().clone().set_requires_grad(true);
+ auto reference = independent_leaf(logits);
  const auto expanded = reference.unsqueeze(2), labels = targets.unsqueeze(1);
  const auto ce = (torch::softplus(-expanded) * labels + torch::softplus(expanded) * (1 - labels)).mean(-1);
  const auto probability = expanded.sigmoid();
@@ -1634,9 +1625,9 @@ TEST_CASE("Sampled mask content distinguishes probes and retains projection grad
  const auto coords = torch::tensor({{{0.25F, 0.5F}, {0.75F, 0.5F}}});
  const auto samples = rfdetr::sample_pairwise_masks(layer, targets, indices, valid, 1, coords);
  REQUIRE(torch::equal(samples.spatial, spatial.flatten(2)));
- auto dense_spatial = spatial.detach().clone().set_requires_grad(true);
- auto dense_query = mask_query.detach().clone().set_requires_grad(true);
- auto dense_bias = bias.detach().clone().set_requires_grad(true);
+ auto dense_spatial = independent_leaf(spatial);
+ auto dense_query = independent_leaf(mask_query);
+ auto dense_bias = independent_leaf(bias);
  const auto dense_logits = (torch::einsum("bchw,bqc->bqhw", {dense_spatial, dense_query}) + dense_bias).flatten(2);
  REQUIRE(torch::allclose(samples.logits, dense_logits));
  const auto sampled_gradients = torch::autograd::grad({samples.logits.square().sum()}, {spatial, mask_query, bias}, {}, true);
@@ -1650,7 +1641,7 @@ TEST_CASE("Sampled mask content distinguishes probes and retains projection grad
  const auto actual = owner.correspondence(labels, boxes, valid, query, &samples);
  REQUIRE_FALSE(torch::allclose(actual.dense.index({0, 0, 0}), actual.dense.index({0, 0, 1})));
  REQUIRE(torch::isfinite(actual.dense).all().item<bool>());
- auto expected_spatial = spatial.detach().clone().set_requires_grad(true);
+ auto expected_spatial = independent_leaf(spatial);
  auto expected_weight = torch::tensor({{0.7F, -0.2F}, {0.1F, 0.9F}}).set_requires_grad(true);
  // Independently select the two foreground pixels; empty support pools to zero.
  const auto pooled = torch::stack({expected_spatial.index({0, Slice(), 0, 0}), expected_spatial.index({0, Slice(), 0, 1}), torch::zeros({2})}, 0).unsqueeze(0);
@@ -1721,7 +1712,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
     set_parameter(owner, "query_projection.weight", torch::tensor({{0.8F, 0.3F}, {-0.2F, 1.1F}}));
     auto parameters = owner.named_parameters();
     torch::OrderedDict<std::string, torch::Tensor> reference_parameters;
-    for (const auto& parameter : parameters) reference_parameters.insert(parameter.key(), parameter.value().detach().clone().set_requires_grad(true));
+    for (const auto& parameter : parameters) reference_parameters.insert(parameter.key(), independent_leaf(parameter.value()));
     auto make_layer = [&](float content) {
      auto features = torch::tensor({{{{0.8F, 0.1F}, {0.2F, 0.9F}, {0.4F, 0.3F}}}}).repeat({1, groups, 1, 1}).set_requires_grad(true);
      auto layer = oracle_layer(features);
@@ -1754,7 +1745,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
     const auto second = owner.loss(outputs, targets, {torch::tensor(4.F)}, true);
     std::vector<std::pair<torch::Tensor, torch::Tensor>> operands;
     const auto clone = [&](const torch::Tensor& tensor) {
-     auto copy = tensor.detach().clone().set_requires_grad(true);
+     auto copy = independent_leaf(tensor);
      operands.emplace_back(tensor, copy);
      return copy;
     };
@@ -2023,14 +2014,7 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
   const auto prepared = supervision.prepare_denoising(targets, step, torch::Device(torch::kCPU), torch::kFloat32);
   REQUIRE(prepared);
   rfdetr::ModelOutputs result;
-  rfdetr::DenoisingOutputs dn;
-  dn.original_labels = prepared->original_labels;
-  dn.original_boxes = prepared->original_boxes;
-  dn.valid_slots = prepared->valid_slots;
-  dn.target_indices = prepared->target_indices;
-  dn.groups = prepared->layout.denoising_groups;
-  dn.queries_per_group = prepared->layout.denoising_queries_per_group;
-  dn.mask_sampling_seed = prepared->mask_sampling_seed;
+  auto dn = rfdetr::testsupport::denoising_output_fixture(*prepared);
   const auto make_layer = [] {
    rfdetr::DenoisingOutputLayer layer;
    layer.pred_logits = torch::full({2, 2, 2, 4}, 0.1F).set_requires_grad(true);
@@ -2249,16 +2233,15 @@ TEST_CASE("Selective mask helpers preserve dynamic samples values and gradients"
    CAPTURE(dtype, shape);
    const auto [queries, targets, points] = shape;
    auto logits = torch::linspace(-2, 2, 2 * queries * points, options).view({2, queries, points}).set_requires_grad(true);
-   auto eager_logits = logits.detach().clone().set_requires_grad(true);
+   auto eager_logits = independent_leaf(logits);
    auto labels = (torch::arange(2 * targets * points, options).view({2, targets, points}).remainder(3) == 0).to(torch::kFloat32);
    const auto pair = [&](const torch::Tensor& input, bool traced) { return 1.7 * rfdetr::batch_sigmoid_ce_loss(input, labels, traced) + 2.3 * rfdetr::batch_dice_loss(input, labels, traced); };
    const auto actual = pair(logits, true), expected = pair(eager_logits, false);
    REQUIRE(torch::allclose(actual, expected, 2e-3, 2e-3));
-   actual.square().sum().backward();
-   expected.square().sum().backward();
+   mmltk::backend::ml::testsupport::backward_squared({actual, expected});
    REQUIRE(torch::allclose(logits.grad(), eager_logits.grad(), 3e-3, 3e-3));
    auto direct = logits.detach().reshape({2 * queries, points}).clone().set_requires_grad(true);
-   auto reference = direct.detach().clone().set_requires_grad(true);
+   auto reference = independent_leaf(direct);
    const auto direct_labels = (torch::arange(direct.numel(), options).reshape(direct.sizes()).remainder(2) == 0).to(torch::kFloat32);
    const auto valid = torch::arange(2 * queries, options).remainder(2) == 0;
    const auto count = torch::tensor(3.F, options);

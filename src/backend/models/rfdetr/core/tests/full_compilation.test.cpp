@@ -11,7 +11,9 @@
 #include <cmath>
 #include <string_view>
 #include <vector>
+// CLEANUP-IGNORE: File-local namespace aliases contain no shared executable behavior.
 namespace {
+using mmltk::backend::ml::testsupport::independent_leaf;
 namespace rf = mmltk::backend::models::rfdetr;
 namespace fixture = mmltk::backend::ml::testsupport;
 using Access = rf::test_support::FullTraceTestAccess;
@@ -77,6 +79,7 @@ torch::Tensor prediction_vjp(const rf::ModelOutputs& actual, const rf::ModelOutp
 }
 TEST_CASE("Full CUDA traces preserve every prediction head and fixed-vector derivatives through replacement", "[rfdetr][compilation][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; full production-kernel parity remains unverified");
+ // CLEANUP-IGNORE: Device/precision loop headers lead to different model and matcher test bodies.
  const fixture::FullMatrixPrecision full_precision;
  for (const auto& [device, dtype] : fixture::available_amp_precisions()) {
   if (!device.is_cuda()) continue;
@@ -99,7 +102,7 @@ TEST_CASE("Full CUDA traces preserve every prediction head and fixed-vector deri
    CHECK_FALSE(Access::identity(compiled, true));
    CHECK_FALSE(Access::reference_attention(compiled));
    auto image = torch::rand({2, 3, 64, 64}, torch::TensorOptions().device(device)).set_requires_grad(true);
-   auto traced_image = image.detach().clone().set_requires_grad(true);
+   auto traced_image = independent_leaf(image);
    std::vector<torch::Tensor> eager_losses, compiled_losses;
    std::shared_ptr<torch::jit::Graph> retained_graph;
    for (int invocation = 0; invocation < 5; ++invocation) {
@@ -175,7 +178,7 @@ TEST_CASE("Full model admission retains mode tails live weights and ordinary geo
  // ordinary path while preserving the admitted FP32 training graph.
  compare_tensor(model.forward({input.to(torch::kFloat16), {}}, true).main.pred_logits, model.forward({input.to(torch::kFloat16).to(torch::kFloat32), {}}, true).main.pred_logits, torch::kFloat32);
  CHECK(Access::graph(model, true) == graph);
- auto differentiable_input = input.detach().clone().set_requires_grad(true);
+ auto differentiable_input = independent_leaf(input);
  CHECK(model.forward({differentiable_input, {}}, true).main.pred_logits.requires_grad());
  CHECK(Access::graph(model, true) == graph);
  {

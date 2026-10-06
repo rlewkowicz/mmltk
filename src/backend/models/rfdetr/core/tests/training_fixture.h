@@ -17,6 +17,46 @@ private:
 public:
  MatcherWorkspace workspace{placement_.numa_node, true};
 };
+inline void populate_target_views(PreparedTargets& result) {
+ for (std::size_t image = 0; image < result.counts.size(); ++image) {
+  auto& target = result.targets.emplace_back();
+  target.boxes = result.all_boxes.narrow(0, result.offsets[image], result.counts[image]);
+  target.labels = result.all_labels.narrow(0, result.offsets[image], result.counts[image]);
+ }
+}
+[[nodiscard]] inline PreparedTargets one_image_targets(const torch::Tensor& boxes, const torch::Tensor& labels) {
+ PreparedTargets result;
+ auto& target = result.targets.emplace_back();
+ target.boxes = boxes;
+ target.labels = labels;
+ result.all_boxes = boxes;
+ result.all_labels = labels;
+ result.offsets = {0};
+ result.counts = {labels.numel()};
+ return result;
+}
+[[nodiscard]] inline DenoisingOutputs denoising_output_fixture(const DenoisingQueryBatch& prepared) {
+ DenoisingOutputs result;
+ // CLEANUP-OFF: Independent fixture projection tests the production model's DN metadata handoff.
+ result.original_labels = prepared.original_labels;
+ result.original_boxes = prepared.original_boxes;
+ result.valid_slots = prepared.valid_slots;
+ result.target_indices = prepared.target_indices;
+ result.mask_sampling_seed = prepared.mask_sampling_seed;
+ result.groups = prepared.layout.denoising_groups;
+ result.queries_per_group = prepared.layout.denoising_queries_per_group;
+ // CLEANUP-ON
+ return result;
+}
+// Literal reference arithmetic shared only by test oracles, never production.
+[[nodiscard]] inline torch::Tensor reference_focal_elements(const torch::Tensor& logits, const torch::Tensor& labels, double alpha, int gamma) {
+ const auto probability = logits.sigmoid();
+ return (labels * torch::softplus(-logits) + (1 - labels) * torch::softplus(logits)) * torch::pow(1 - (probability * labels + (1 - probability) * (1 - labels)), gamma) *
+        (alpha * labels + (1 - alpha) * (1 - labels));
+}
+[[nodiscard]] inline torch::Tensor reference_reparam_boxes(const torch::Tensor& base, const torch::Tensor& delta) {
+ return torch::cat({delta.slice(-1, 0, 2) * base.slice(-1, 2, 4) + base.slice(-1, 0, 2), delta.slice(-1, 2, 4).exp() * base.slice(-1, 2, 4)}, -1);
+}
 // Cases retain their own class-loss policy, coefficients and mask settings.
 [[nodiscard]] inline DetectionConfig detection_fixture_base(const NativeRfDetrConfig& model) {
  DetectionConfig result;

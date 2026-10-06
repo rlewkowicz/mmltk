@@ -40,6 +40,11 @@ std::pair<torch::Tensor, torch::Tensor> generic_iou(const torch::Tensor& boxes1,
  const auto union_area = lhs_area + rhs_area - intersection;
  return {intersection / union_area.clamp_min(1e-7), union_area};
 }
+torch::Tensor generic_giou(const torch::Tensor& boxes1, const torch::Tensor& boxes2, bool pairwise) {
+ const auto [iou, union_area] = generic_iou(boxes1, boxes2, pairwise);
+ const auto enclosure = span_area(boxes1, boxes2, BoxSpan::Enclosure, pairwise);
+ return iou - (enclosure - union_area) / enclosure.clamp_min(1e-7);
+}
 void require_pairwise_prefix(const torch::Tensor& boxes1, const torch::Tensor& boxes2, const char* what) {
  require_box_tensor(boxes1, what);
  require_box_tensor(boxes2, what);
@@ -74,9 +79,7 @@ torch::Tensor pairwise_generalized_box_iou(const torch::Tensor& boxes1, const to
      !boxes2.requires_grad()) {
   return mmltk::backend::ml::ops::generalized_box_iou_cuda(boxes1, boxes2);
  }
- const auto [iou, union_area] = generic_iou(boxes1, boxes2, true);
- const auto enclosure = span_area(boxes1, boxes2, BoxSpan::Enclosure, true);
- return iou - (enclosure - union_area) / enclosure.clamp_min(1e-7);
+ return generic_giou(boxes1, boxes2, true);
 }
 torch::Tensor aligned_box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
  require_aligned_pair(boxes1, boxes2, "aligned_box_iou");
@@ -84,9 +87,7 @@ torch::Tensor aligned_box_iou(const torch::Tensor& boxes1, const torch::Tensor& 
 }
 torch::Tensor aligned_generalized_box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
  require_aligned_pair(boxes1, boxes2, "aligned_generalized_box_iou");
- const auto [iou, union_area] = generic_iou(boxes1, boxes2, false);
- const auto enclosure = span_area(boxes1, boxes2, BoxSpan::Enclosure, false);
- return iou - (enclosure - union_area) / enclosure.clamp_min(1e-7);
+ return generic_giou(boxes1, boxes2, false);
 }
 torch::Tensor batched_pairwise_generalized_box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
  if (boxes1.dim() < 3 || boxes2.dim() < 3) { throw std::runtime_error("batched_pairwise_generalized_box_iou expects [...,M,4] and [...,N,4]"); }

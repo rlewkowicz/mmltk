@@ -7,7 +7,11 @@
 #include <inplace_vector>
 #include <initializer_list>
 #include <cstdint>
+#include <cstddef>
 #include <utility>
+#include <string>
+#include <unordered_map>
+#include <torch/nn/module.h>
 namespace mmltk::backend::ml::testsupport {
 class FullMatrixPrecision final {
 public:
@@ -47,5 +51,34 @@ inline void require_zero_gradients(std::initializer_list<torch::Tensor> operands
   REQUIRE(operand.grad().defined());
   REQUIRE(operand.grad().count_nonzero().item<int64_t>() == 0);
  }
+}
+// Reference operands own storage and a fresh autograd leaf independently of
+// the implementation under test, while preserving the exact input values.
+[[nodiscard]] inline torch::Tensor independent_leaf(const torch::Tensor& source, bool requires_grad = true) { return source.detach().clone().set_requires_grad(requires_grad); }
+[[nodiscard]] inline std::unordered_map<std::string, torch::Tensor> independent_parameters(const torch::nn::Module& module) {
+ std::unordered_map<std::string, torch::Tensor> result;
+ for (const auto& parameter : module.named_parameters()) result.emplace(parameter.key(), independent_leaf(parameter.value()));
+ return result;
+}
+inline void affine_parameters(torch::nn::Module& module, double scale, double shift) {
+ torch::NoGradGuard guard;
+ for (const auto& parameter : module.named_parameters()) parameter.value().copy_((torch::arange(parameter.value().numel(), parameter.value().options()) * scale + shift).reshape_as(parameter.value()));
+}
+inline void backward_squared(std::initializer_list<torch::Tensor> outputs) {
+ for (const auto& output : outputs) output.square().sum().backward();
+}
+inline void require_gradients_close(std::initializer_list<std::pair<torch::Tensor, torch::Tensor>> operands, double relative, double absolute) {
+ std::size_t index = 0;
+ for (const auto& [actual, expected] : operands) {
+  CAPTURE(index);
+  REQUIRE(actual.grad().defined());
+  REQUIRE(expected.grad().defined());
+  REQUIRE(torch::allclose(actual.grad(), expected.grad(), relative, absolute));
+  ++index;
+ }
+}
+inline void require_nonfinite_pattern(const torch::Tensor& actual, const torch::Tensor& expected) {
+ REQUIRE(torch::equal(torch::isfinite(actual), torch::isfinite(expected)));
+ REQUIRE(torch::equal(torch::isnan(actual), torch::isnan(expected)));
 }
 }  // namespace mmltk::backend::ml::testsupport

@@ -14,7 +14,9 @@
 #include <cmath>
 #include <limits>
 #include <unordered_map>
+// CLEANUP-IGNORE: File-local namespace aliases contain no shared executable behavior.
 namespace {
+using mmltk::backend::ml::testsupport::independent_leaf;
 namespace rf = mmltk::backend::models::rfdetr;
 namespace tensor_fixture = mmltk::backend::ml::testsupport;
 using Region = rf::detail::SelectiveTensorRegion;
@@ -229,8 +231,8 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
    auto& oracle = pair.oracle;
    auto target = torch::rand({2, queries, 4}, torch::TensorOptions().device(device)).set_requires_grad(true);
    auto position = torch::zeros_like(target).set_requires_grad(true);
-   auto reference_target = target.detach().clone().set_requires_grad(true);
-   auto reference_position = position.detach().clone().set_requires_grad(true);
+   auto reference_target = independent_leaf(target);
+   auto reference_position = independent_leaf(position);
    rf::DecoderQueryLayout layout;
    layout.ordinary = {1, queries};
    torch::Tensor output, expected;
@@ -254,10 +256,8 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
     expected = dense_attention(oracle, reference_target, reference_position);
    }
    REQUIRE(torch::allclose(output, expected, 2e-2, 3e-3));
-   output.square().sum().backward();
-   expected.square().sum().backward();
-   REQUIRE(torch::allclose(target.grad(), reference_target.grad(), 2e-2, 3e-3));
-   REQUIRE(torch::allclose(position.grad(), reference_position.grad(), 2e-2, 3e-3));
+   mmltk::backend::ml::testsupport::backward_squared({output, expected});
+   tensor_fixture::require_gradients_close({{target, reference_target}, {position, reference_position}}, 2e-2, 3e-3);
    if (queries == 1) {
     // Fused AMP backward can retain rounding residue in the cancelling Q/K
     // derivatives. Use the same absolute bound as the dense gradient oracle.
@@ -295,8 +295,8 @@ TEST_CASE("Ordinary and DN grouped SDPA match masked dense equations with retain
    for (const bool equal_inputs : {false, true}) {
     auto target = torch::rand({2, layout.total_queries(), 4}, options).set_requires_grad(true);
     auto position = (equal_inputs ? target.detach().clone() : torch::zeros_like(target)).set_requires_grad(true);
-    auto reference_target = target.detach().clone().set_requires_grad(true);
-    auto reference_position = position.detach().clone().set_requires_grad(true);
+    auto reference_target = independent_leaf(target);
+    auto reference_position = independent_leaf(position);
     auto admitted = torch::zeros({2, layout.total_queries(), layout.total_queries()}, options.dtype(torch::kBool));
     for (int64_t group = 0; group < 2; ++group) admitted.narrow(1, group * 3, 3).narrow(2, group * 3, 3).fill_(true);
     auto clean_target = reference_target;
@@ -349,14 +349,8 @@ TEST_CASE("Actual decoder tail matches independent residual norm and feedforward
   const auto layer = rf::test_support::DecoderTailTestAccess::make(4, 7);
   layer->to(device);
   layer->train();
-  std::unordered_map<std::string, torch::Tensor> reference;
-  {
-   torch::NoGradGuard guard;
-   for (const auto& item : layer->named_parameters()) {
-    item.value().copy_((torch::arange(item.value().numel(), item.value().options()) * 0.017 + 0.13).reshape_as(item.value()));
-    reference.emplace(item.key(), item.value().detach().clone().set_requires_grad(true));
-   }
-  }
+  tensor_fixture::affine_parameters(*layer, 0.017, 0.13);
+  auto reference = tensor_fixture::independent_parameters(*layer);
   const auto normalization = [&](const torch::Tensor& x, const std::string& prefix) {
    const auto full = x.to(torch::kFloat32);
    const auto centered = full - full.mean(-1, true);
@@ -368,8 +362,8 @@ TEST_CASE("Actual decoder tail matches independent residual norm and feedforward
   for (const int64_t queries : {3, 7, 7, 7}) {
    auto residual = torch::rand({2, queries, 4}, torch::TensorOptions().device(device)).set_requires_grad(true);
    auto cross = torch::rand_like(residual).to(dtype).set_requires_grad(true);
-   auto expected_residual = residual.detach().clone().set_requires_grad(true);
-   auto expected_cross = cross.detach().clone().set_requires_grad(true);
+   auto expected_residual = independent_leaf(residual);
+   auto expected_cross = independent_leaf(cross);
    torch::Tensor actual, expected;
    {
     mmltk::backend::ml::cuda::TorchAutocastScope amp(device.is_cuda() && dtype != torch::kFloat32, dtype);

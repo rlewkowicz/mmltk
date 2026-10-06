@@ -1,6 +1,7 @@
 #include "src/test_support/cuda_test_gate.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "training_gradient_fixture.h"
+#include "training_continuation_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/training_ops_private.h"
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -110,16 +111,7 @@ torch::Tensor objective(const std::vector<torch::Tensor>& leaves, std::size_t mi
  return loss;
 }
 void restore_optimizer(NativeOptimizer& optimizer) {
- tc::TensorReadbackBuffers readback;
- readback.Begin();
- optimizer.reserve_checkpoint(readback, 0);
- torch::serialize::OutputArchive archive;
- optimizer.save(archive, readback, 0);
- readback.Complete();
- std::stringstream stream;
- archive.save_to(stream);
- torch::serialize::InputArchive loaded;
- loaded.load_from(stream);
+ auto loaded = optimizer_checkpoint(optimizer);
  optimizer.load(loaded);
 }
 struct BackwardGate {

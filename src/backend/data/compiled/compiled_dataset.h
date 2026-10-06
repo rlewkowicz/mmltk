@@ -104,7 +104,7 @@ public:
  [[nodiscard]] bool read_images(std::span<const CompiledImageRead> reads, std::span<std::byte> destination, const std::atomic<bool>& cancelled, bool prefault = false) const;
 
 private:
- [[nodiscard]] static CompiledDataset open_mapped(const std::filesystem::path&, mmltk::common::io::MappedFile, std::size_t image_limit, AccessPattern, const CompiledDatasetOpenOptions&);
+ [[nodiscard]] static std::expected<CompiledDataset, std::error_code> try_open(const std::filesystem::path&, std::size_t image_limit, AccessPattern, const CompiledDatasetOpenOptions&);
  std::filesystem::path path_;
  mmltk::common::io::MappedFile mapping_;
  mmltk::backend::data::FileHeader header_{};

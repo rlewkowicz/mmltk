@@ -40,6 +40,7 @@ struct NativeAdamWTestAccess {
 };
 }  // namespace mmltk::backend::models::rfdetr::testsupport
 namespace {
+using mmltk::backend::ml::testsupport::independent_leaf;
 namespace rf = mmltk::backend::models::rfdetr;
 namespace tensor_fixture = mmltk::backend::ml::testsupport;
 rf::TrainRequest optimizer_test_request(rf::TrainOptimizerKind kind) {
@@ -49,19 +50,7 @@ rf::TrainRequest optimizer_test_request(rf::TrainOptimizerKind kind) {
  request.fused_optimizer = false;
  return request;
 }
-torch::serialize::InputArchive optimizer_checkpoint(rf::NativeOptimizer& optimizer) {
- mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
- readback.Begin();
- optimizer.reserve_checkpoint(readback, 0);
- torch::serialize::OutputArchive archive;
- optimizer.save(archive, readback, 0);
- readback.Complete();
- std::stringstream bytes;
- archive.save_to(bytes);
- torch::serialize::InputArchive restored;
- restored.load_from(bytes);
- return restored;
-}
+using rf::testsupport::optimizer_checkpoint;
 // Independent equations: RF-DETR e9a138f module_model.py:607-611,1296;
 // Lightning 2.6.0 ClosureResult; PyTorch 2.9 Adam and AveragedModel.
 // Native FP32/FP64 policy, no TF32 changes, no epoch-trajectory/AP claim.
@@ -72,8 +61,8 @@ TEST_CASE("AdamW reuses batch inventories across missing gradients and activatio
    const auto options = torch::TensorOptions().dtype(torch::kFloat64).device(device);
    auto a = torch::full({4}, .7, options).set_requires_grad(true);
    auto b = torch::full({4}, -.3, options).set_requires_grad(true);
-   auto expected_a = a.detach().clone().set_requires_grad(true);
-   auto expected_b = b.detach().clone().set_requires_grad(true);
+   auto expected_a = independent_leaf(a);
+   auto expected_b = independent_leaf(b);
    const rf::NativeAdamW::Group group{{.003, .07, true}, {0, 1}};
    rf::NativeAdamW optimizer({group}, {{"a", a}, {"b", b}}, backend);
    rf::NativeAdamW reference({group}, {{"a", expected_a}, {"b", expected_b}}, rf::NativeOptimizerBackend::eager);
@@ -437,7 +426,7 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
      CAPTURE(device, count, parallel, update);
      optimizer.zero_grad(true);
      std::vector<torch::Tensor> expected_parameters;
-     for (const auto& value : optimizer.parameters()) expected_parameters.push_back(value.detach().clone().set_requires_grad(true));
+     for (const auto& value : optimizer.parameters()) expected_parameters.push_back(independent_leaf(value));
      auto expected_loss = torch::zeros({}, options);
      for (int rank = 0; rank < 2; ++rank)
       for (int micro = 0; micro < count; ++micro) {
@@ -481,13 +470,11 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
         }
        } else
         execution.backward(loss);
-       const auto logits = expected_parameters[0] + expected_parameters[1] + expected_parameters[2] + expected_parameters[3], probability = logits.sigmoid();
+       const auto logits = expected_parameters[0] + expected_parameters[1] + expected_parameters[2] + expected_parameters[3];
        auto labels = torch::zeros_like(logits);
        labels.index_put_({0, 0, 0}, 1);
        if (targets == 2) labels.index_put_({0, 1, 1}, 1);
-       const auto focal = ((labels * torch::softplus(-logits) + (1 - labels) * torch::softplus(logits)) * torch::pow(1 - (probability * labels + (1 - probability) * (1 - labels)), 2) *
-                           (0.25 * labels + 0.75 * (1 - labels)))
-                           .sum();
+       const auto focal = rf::testsupport::reference_focal_elements(logits, labels, 0.25, 2).sum();
        // Global logical count and gradient SUM, with both fixed K divisions.
        expected_loss += focal / 3 / count / count;
       }
@@ -641,7 +628,7 @@ TEST_CASE("Optimizer Resume seals group policy while restoring held schedule and
   parameter.mutable_grad() = torch::full_like(parameter, .2);
   optimizer.step();
   optimizer.zero_grad(true);
-  auto peer_parameter = parameter.detach().clone().set_requires_grad(true);
+  auto peer_parameter = independent_leaf(parameter);
   torch::OrderedDict<std::string, torch::Tensor> peer_parameters;
   peer_parameters.insert("transformer.encoder.weight", peer_parameter);
   auto peer = rf::build_optimizer(peer_parameters, request);

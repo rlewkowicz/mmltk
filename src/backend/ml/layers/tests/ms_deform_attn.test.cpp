@@ -18,17 +18,17 @@
 #include <catch2/generators/catch_generators.hpp>
 #include "src/test_support/cuda_test_utils.hpp"
 namespace {
+using mmltk::backend::ml::testsupport::independent_leaf;
 namespace layers = mmltk::backend::ml::layers;
 using AttentionInputs = std::array<torch::Tensor, 3>;
 void require_attention_values(const torch::Tensor& actual, const torch::Tensor& expected, double tolerance = 2e-4) {
  REQUIRE(actual.scalar_type() == expected.scalar_type());
- REQUIRE(torch::equal(torch::isfinite(actual), torch::isfinite(expected)));
- REQUIRE(torch::equal(torch::isnan(actual), torch::isnan(expected)));
+ mmltk::backend::ml::testsupport::require_nonfinite_pattern(actual, expected);
  REQUIRE(torch::allclose(actual, expected, tolerance, tolerance, true));
 }
 void require_attention_vjp(const torch::Tensor& actual, const AttentionInputs& operands, const torch::Tensor& shapes, const torch::Tensor& incoming) {
  AttentionInputs reference;
- for (size_t i = 0; i < operands.size(); ++i) reference[i] = operands[i].detach().clone().requires_grad_(true);
+ for (size_t i = 0; i < operands.size(); ++i) reference[i] = independent_leaf(operands[i]);
  const auto expected = layers::ms_deform_attn_reference(reference[0].to(torch::kFloat32), shapes, reference[1].to(torch::kFloat32), reference[2].to(torch::kFloat32)).to(actual.scalar_type());
  const double tolerance = actual.scalar_type() == torch::kBFloat16 ? 8e-3 : actual.scalar_type() == torch::kFloat16 ? 1e-3 : 2e-4;
  require_attention_values(actual, expected, tolerance);
@@ -46,15 +46,16 @@ void compare_attention(const AttentionInputs& operands, const torch::Tensor& sha
 void test_cuda_ms_deform_attn_matches_reference() {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  const auto device = torch::Device(torch::kCUDA, 0);
+ // CLEANUP-IGNORE: Attention shapes and level starts differ from postprocessing score/label/query literals.
  auto value = torch::randn({2, 8, 2, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(device)).requires_grad_(true);
  const auto spatial_shapes = torch::tensor({{2, 2}, {1, 4}}, torch::TensorOptions().dtype(torch::kInt64));
  const auto level_start_index = torch::tensor({0, 4}, torch::TensorOptions().dtype(torch::kInt64));
  auto sampling_locations = torch::rand({2, 3, 2, 2, 4, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(device)).requires_grad_(true);
  auto attention_weights = torch::rand({2, 3, 2, 2, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
  attention_weights = (attention_weights / attention_weights.sum({3, 4}, true)).detach().requires_grad_(true);
- auto value_ref = value.detach().clone().requires_grad_(true);
- auto sampling_ref = sampling_locations.detach().clone().requires_grad_(true);
- auto attention_ref = attention_weights.detach().clone().requires_grad_(true);
+ auto value_ref = independent_leaf(value);
+ auto sampling_ref = independent_leaf(sampling_locations);
+ auto attention_ref = independent_leaf(attention_weights);
  const auto actual = mmltk::backend::ml::layers::ms_deform_attn_cuda_autograd(value, spatial_shapes, level_start_index, sampling_locations, attention_weights, 64);
  const auto expected = mmltk::backend::ml::layers::ms_deform_attn_reference(value_ref, spatial_shapes, sampling_ref, attention_ref);
  REQUIRE((torch::allclose(actual, expected, 1.0e-4, 1.0e-4)));
@@ -139,6 +140,7 @@ TEST_CASE("Deformable attention launches bounded tail chunks on the caller strea
  const int batch = GENERATE(5, 63, 64, 65, 127, 128, 129);
  const int step = GENERATE(3, 64);
  const auto stream = c10::cuda::getStreamFromPool();
+ // CLEANUP-IGNORE: A caller-stream tail-chunk case has different level geometry and custody from supervision stream cases.
  const c10::cuda::CUDAStreamGuard guard(stream);
  const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
  const auto shapes = torch::tensor({{2, 2}, {1, 2}}, torch::kInt64), starts = torch::tensor({0, 4}, torch::kInt64);
@@ -166,7 +168,9 @@ TEST_CASE("Dispatcher attention capture preserves opaque work and mixed precisio
   };
   mmltk::backend::ml::cuda::TorchAutocastScope amp(precision != torch::kFloat32, precision);
   auto operands = make_inputs(0);
+  // CLEANUP-IGNORE: This attention trace has five positional tensors, unlike the depthwise trace's optional bias.
   auto trace = torch::jit::tracer::trace({operands[0], shapes, starts, operands[1], operands[2]}, [](torch::jit::Stack args) {
+   // CLEANUP-IGNORE: Positional tensor conversion for one attention call is unrelated to Firefox argv data pointers.
    return torch::jit::Stack{layers::ms_deform_attn_cuda_autograd(args[0].toTensor(), args[1].toTensor(), args[2].toTensor(), args[3].toTensor(), args[4].toTensor(), 64)};
   }, [](const torch::autograd::Variable&) { return std::string{}; }, false, false);
   const auto graph_text = trace.first->graph->toString();

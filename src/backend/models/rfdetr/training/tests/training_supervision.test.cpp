@@ -398,13 +398,7 @@ void test_native_optimizer_late_failure_preserves_live_state() {
  REQUIRE_THROWS(AdamW::InspectCheckpoint(malformed, tensors));
  REQUIRE_THROWS(optimizer.load(malformed));
  const auto retained_path = root / "retained.pt";
- mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
- readback.Begin();
- optimizer.reserve_checkpoint(readback, 0);
- torch::serialize::OutputArchive retained;
- optimizer.save(retained, readback, 0);
- readback.Complete();
- retained.save_to(retained_path.string());
+ rfdetr::testsupport::with_optimizer_checkpoint(optimizer, [&](auto& retained) { retained.save_to(retained_path.string()); });
  torch::serialize::InputArchive retained_input;
  retained_input.load_from(retained_path.string());
  torch::serialize::InputArchive first_parameter;
@@ -475,6 +469,7 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
  }
  rfdetr::PreparedTargets published;
  {
+  // CLEANUP-IGNORE: Producer-stream custody and float/index options are setup for target publication, unlike augmentation execution.
   c10::cuda::CUDAStreamGuard producer_guard(producer);
   const auto floating = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
   const auto integer = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);

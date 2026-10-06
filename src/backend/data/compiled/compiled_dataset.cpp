@@ -8,22 +8,21 @@
 #include <mutex>
 namespace mmltk::backend::data {
 CompiledDataset CompiledDataset::open(const std::filesystem::path& path, const AccessPattern access, const CompiledDatasetOpenOptions& options) {
- throw_if_compiled_validation_cancelled(0, options.cancellation);
- auto mapping = mmltk::common::io::MappedFile::try_open_readonly(path.string());
- if (!mapping) { throw std::system_error{mapping.error(), "compiled dataset source open failed: " + path.string()}; }
- return open_mapped(path, std::move(*mapping), std::numeric_limits<std::size_t>::max(), access, options);
+ auto store = try_open(path, std::numeric_limits<std::size_t>::max(), access, options);
+ if (!store) { throw std::system_error{store.error(), "compiled dataset source open failed: " + path.string()}; }
+ return std::move(*store);
 }
 std::expected<CompiledDataset, std::error_code> CompiledDataset::open_source(const std::filesystem::path& path, const std::size_t image_limit, const CompiledDatasetOpenOptions& options) {
+ return try_open(path, image_limit, AccessPattern::Random, options);
+}
+std::expected<CompiledDataset, std::error_code> CompiledDataset::try_open(
+ const std::filesystem::path& path, const std::size_t image_limit, const AccessPattern access, const CompiledDatasetOpenOptions& options) {
  throw_if_compiled_validation_cancelled(0, options.cancellation);
  auto mapping = mmltk::common::io::MappedFile::try_open_readonly(path.string());
  if (!mapping) { return std::unexpected{mapping.error()}; }
- return open_mapped(path, std::move(*mapping), image_limit, AccessPattern::Random, options);
-}
-CompiledDataset CompiledDataset::open_mapped(
- const std::filesystem::path& path, mmltk::common::io::MappedFile mapping, const std::size_t image_limit, const AccessPattern access, const CompiledDatasetOpenOptions& options) {
  CompiledDataset store;
  store.path_ = path;
- store.mapping_ = std::move(mapping);
+ store.mapping_ = std::move(*mapping);
  if (store.mapping_.size() < sizeof(mmltk::backend::data::FileHeader)) { throw std::runtime_error("compiled dataset is smaller than its header"); }
  std::memcpy(&store.header_, store.mapping_.data(), sizeof(store.header_));
  if (store.header_.num_images > image_limit) { throw std::runtime_error("compiled dataset exceeds the caller image limit"); }

@@ -4,6 +4,9 @@
 #include <string_view>
 #include <torch/types.h>
 #include <torch/serialize.h>
+#include <optional>
+#include <utility>
+#include "src/backend/ml/cuda/tensor_readback.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
 inline detail::TrainingContinuationValues continuation_values(const TrainRequest& request, detail::TrainingContinuationValues values) {
  values.execution = derive_execution_facts(request, 0);
@@ -36,11 +39,27 @@ inline void copy_checkpoint_archive(torch::serialize::InputArchive& source, torc
   }
  }
 }
-inline torch::serialize::InputArchive checkpoint_input(torch::serialize::OutputArchive& output) {
+inline torch::serialize::InputArchive checkpoint_input(torch::serialize::OutputArchive& output, std::optional<torch::Device> device = torch::Device(torch::kCPU)) {
  std::stringstream bytes;
  output.save_to(bytes);
  torch::serialize::InputArchive input;
- input.load_from(bytes, torch::Device(torch::kCPU));
+ input.load_from(bytes, device);
  return input;
+}
+// The archive borrows staged CPU tensors. Consume it while readback still owns
+// their storage; only serialized bytes or a freshly loaded archive may escape.
+template <class Optimizer, class Consumer>
+auto with_optimizer_checkpoint(Optimizer& optimizer, Consumer&& consume) {
+ mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+ readback.Begin();
+ optimizer.reserve_checkpoint(readback, 0);
+ torch::serialize::OutputArchive output;
+ optimizer.save(output, readback, 0);
+ readback.Complete();
+ return std::forward<Consumer>(consume)(output);
+}
+template <class Optimizer>
+torch::serialize::InputArchive optimizer_checkpoint(Optimizer& optimizer, std::optional<torch::Device> device = {}) {
+ return with_optimizer_checkpoint(optimizer, [&](auto& output) { return checkpoint_input(output, device); });
 }
 }  // namespace mmltk::backend::models::rfdetr::testsupport

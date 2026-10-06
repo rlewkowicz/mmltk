@@ -8,6 +8,7 @@
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "src/backend/models/rfdetr/training/detail/training_step.h"
 #include "src/backend/models/rfdetr/training/detail/native_optimizer_private.h"
+#include "training_continuation_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <c10/cuda/CUDAGuard.h>
 #include <nlohmann/json.hpp>
@@ -101,16 +102,7 @@ void compare_gradients(support::OracleComparison& comparison, const support::Ora
 void compare_optimizer(support::OracleComparison& comparison, const support::OracleArchive& reference, rf::NativeOptimizer& optimizer, const support::OracleCase& entry, bool state) {
  // Read the owner's production checkpoint projection: no test-only optimizer or
  // duplicated AdamW equations are used to inspect groups, ages and moments.
- mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
- readback.Begin();
- optimizer.reserve_checkpoint(readback, 0);
- torch::serialize::OutputArchive output;
- optimizer.save(output, readback, 0);
- readback.Complete();
- std::stringstream bytes;
- output.save_to(bytes);
- torch::serialize::InputArchive archive;
- archive.load_from(bytes, torch::Device(torch::kCPU));
+ auto archive = support::optimizer_checkpoint(optimizer, torch::Device(torch::kCPU));
  REQUIRE(serialization::require_double(archive, "beta1") == .9);
  REQUIRE(serialization::require_double(archive, "beta2") == .999);
  REQUIRE(serialization::require_double(archive, "eps") == 1e-8);
