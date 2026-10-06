@@ -8,10 +8,14 @@
 * Copyright (c) 2018 Microsoft
 **************************************************************************
 */
+#pragma once
 #include <ATen/cuda/Atomic.cuh>
+#include <cuda_runtime.h>
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include "ms_deform_attn_cuda_launch.h"
 namespace mmltk::backend::ml::layers {
 #define MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(i, n) \
  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < static_cast<std::int64_t>(n); i += static_cast<std::int64_t>(blockDim.x) * gridDim.x)
