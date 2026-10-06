@@ -336,7 +336,8 @@ GPU-specific trace variables are covered in [GPU execution](gpu-execution.md).
 ## Native selective compilation
 
 Native application logging at `debug` enables the
-[selective region diagnostics](../src/backend/models/rfdetr/core/selective_compilation.cpp).
+[shared tensor-trace diagnostics](../src/backend/models/rfdetr/core/tensor_trace.cpp),
+used by Selective regions and FullTrace.
 These are `rfdetr compilation` messages, separate from GUI lifecycle JSONL.
 The query tool extracts their named fields from the native log:
 
@@ -348,11 +349,11 @@ The query tool extracts their named fields from the native log:
 ```
 
 Supply the actual captured native application file. `region` identifies the
-backbone, per-layer decoder tail or segmentation spatial/query region; `owner`
+backbone, per-layer decoder tail, segmentation spatial/query, or full-model region; `owner`
 distinguishes instances within the process. `preparation` reports armed,
 disabled or identical requests. Execution `reason` distinguishes recorded
 graphs, reuse with an optimized graph when available, signature/prepared-batch
-fallback and owner-device invalidation. `signature`, `training`, `grad`, `amp`
+fallback and registered-owner/attention-policy invalidation. `signature`, `training`, `grad`, `amp`
 and numeric `amp_dtype` describe actual invocation state. `torch` is the
 compiled version macro, while the [payload manifest](../docker/nvidia-payload.json)
 owns the complete pinned build identity.
@@ -371,6 +372,45 @@ ATen operators such as SDPA are not graph fusion groups. Neither these counts
 nor the native TorchScript path establish a throughput advantage over upstream
 Dynamo/Inductor. [Validation](validation.md#training-mathematics-and-compilation-evidence)
 owns the actual observed fusion boundary.
+
+## Upstream numerical comparisons
+
+The [independent upstream diagnostic](validation.md#independent-upstream-diagnostic)
+retains `wrapper.log`, one log per native comparison executable,
+`manifest.json`, checked tensor archives, and `comparisons/*.jsonl` under its
+selected evidence directory. A successful combined run additionally publishes
+`verdict.json`; reference production alone is not a comparison pass.
+
+Comparison JSONL uses `boundary` for tensor/identity/inventory scope. The
+`policy` record retains precision, backend facts, and native executable SHA-256.
+Retries append records with a new `run_unix_ns`; filter/group that field to
+avoid treating multiple runs as one sample. Important numeric fields are
+`max_absolute`, `l2_error`, `expected_l2`, `normalized_error`, and the declared
+relative/absolute tolerances. Parameter deltas additionally retain
+`parameter_quantization_max` and `unadjusted_normalized_error` beside raw errors.
+
+`passed=false` can be an intentionally retained per-tensor or trajectory
+observation. Inspect `measurement_only`, `policy_difference`, and
+`first_difference` with the [required numerical gates](validation.md#numerical-gates-and-trajectory-observations).
+Inventory, dtype, shape, definedness, and nonfinite failures still fail
+measurement-only trajectories. A complete-vector derivative gate does not erase
+the individual tensor records or imply trajectory equality.
+
+```bash
+./mmltk --logs 'build/validation/rfdetr-math/upstream-final/comparisons/core-*.jsonl' \
+  -q 'boundary="vjp/complete-vector"' \
+  --fields @file,run_unix_ns,boundary,max_absolute,l2_error,expected_l2,passed \
+  --format jsonl --limit 100
+./mmltk --logs 'build/validation/rfdetr-math/upstream-final/comparisons/*.jsonl' \
+  -q 'first_difference=true' \
+  --fields @file,run_unix_ns,boundary,measurement_only,policy_difference,normalized_error \
+  --format jsonl --limit 40
+```
+
+Use `:` for substring and `~` for regex matching, for example
+`boundary:"held/loss"`; `contains` is not a query operator. The
+[results page](reviews/rfdetr-math/current-results.md) identifies final projections
+and the chronological ledger without conflating older failed runs with closure.
 
 ## Benchmark compilation traces
 
@@ -565,6 +605,9 @@ failure sets `cpu_incomplete` or `costs.incomplete`. Pixel
 `resize_preparations`, `resize_allocation_requests`, and
 `resize_allocation_bytes` count execution work/requests, not simultaneously live
 storage. The profiler reports separate `layout_*` preparation/allocation counts.
+Pixel observations distinguish requested RGB `method` from the selected
+execution `path`; `opaque_bytes` is the admitted library-storage charge,
+including Torch resize temporaries, rather than a measured allocator event.
 Concurrent tasks, nested callbacks, and spans overlap: summed worker wall time
 or CPU time is not elapsed compile time and must not be added to it.
 
@@ -839,6 +882,7 @@ record UI interaction and pixels separately from physical resource custody:
 
 | Records | Evidence |
 | --- | --- |
+| `integration.rgb_resampling` | Rendered Dataset/Predict resampling selections and settled native settings; pixel equations are covered by the independent resize fixtures |
 | Dataset selection, draw, caption, pixel, and cancellation records | [Dataset presentation evidence](#dataset-presentation-evidence) below |
 | `integration.status.notice`, `integration.status.stage` | Stable notice add/remove identity, bounded population, and completed fixture stages |
 | `integration.status.hover`, `integration.status.interaction`, `integration.status.latch` | Rendered hover boundary, explicit activation, and Escape/reentry behavior |

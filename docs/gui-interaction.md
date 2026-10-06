@@ -68,7 +68,7 @@ artifact-kind or Class layout controls. Page-specific composition is:
 | --- | --- |
 | Train | Center [dashboard](#training-dashboard), shared aspect selector, separate live progress card; no native image workspace. Dataset exposes manual split fields when inference is off, keeping optional test independent. Weights adds Transfer/Resume; Output loads saved charts. Advanced includes default-off EMA, separate augmentation/perceptual settings, and [lanes/recipes](#lane-and-recipe-controls). |
 | Validate | Open Dataset displays the explicit override or inherited Train validation split; [fixed workspace](#validation-workspace-and-shared-viewer). |
-| Predict | Compiled/image/video inputs, preview threshold, aspect selector, video Pause/Resume/Stop; batch size is always 1 with no field. Output has image Save sample, compiled Percent %/Total with count inspection, and video Samples/Full. Shared disclosures retain each source's choices when switching; [saving semantics](rfdetr-workflows.md#prediction-samples-and-full-video). |
+| Predict | Compiled/image/video inputs, an image-only RGB resampling selector, preview threshold, aspect selector, video Pause/Resume/Stop; batch size is always 1 with no field. Output has image Save sample, compiled Percent %/Total with count inspection, and video Samples/Full. Shared disclosures retain each source's choices when switching; [saving semantics](rfdetr-workflows.md#prediction-samples-and-full-video). |
 | Export | Left-column independent ONNX/TensorRT checkboxes; Run Export requires at least one. |
 
 Train, Validate, and Predict hide H2D/NUMA controls while retaining generated
@@ -164,9 +164,15 @@ graphics-device boundary.
 ### Dataset compilation controls
 
 The [Dataset component](../src/frontend/iced/src/view/train/dataset.rs) offers
-Stretch and Letterbox radios and a separate Perceptual downscaling checkbox.
-Native [resize defaults and geometry](datasets.md#resize-geometry) drive those
-choices. **Compile Benchmark Dataset Override** switches the explicit compile
+Stretch/Letterbox radios and Native, PyTorch bilinear, and PyTorch bilinear +
+antialias RGB resampling radios. **Perceptual downscaling (Native only)** retains
+its saved value while disabled for either Torch choice. Native
+[resize defaults and semantics](datasets.md#rgb-resampling-methods) drive these
+choices; controls explain that existing compiled pixels stay unchanged.
+Predict exposes the same RGB choices for **Image file** only and retains the
+selection across compiled/image/video source switches. C++ reflected settings
+own the values; the shared Rust field component owns labels and presentation.
+**Compile Benchmark Dataset Override** switches the explicit compile
 action between a source directory and a built-in recipe.
 
 With the override on, **Coco custom** and **Coconut** radios appear. Coco custom

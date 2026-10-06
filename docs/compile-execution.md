@@ -173,7 +173,9 @@ Normal image profiles use a 2,048-pixel reference extent to choose reusable
 capacity; actual headers/rows determine each request. That reference is not an
 input-size limit. Benchmark preparation includes its 32 MiB encoded-image
 window and, for COCONut, the 256 MiB Arrow payload profile. Shared source windows
-are counted once. Output geometry and perceptual filtering also affect the plan.
+are counted once. Output geometry and the selected
+[RGB resampling method](datasets.md#rgb-resampling-methods), including Native
+perceptual filtering, also affect the plan.
 
 [NumaMemory](../src/common/system/numa_memory.cpp) binds and prefaults owned pages,
 calls `mlock`, and verifies their retained placement before publishing compiler storage.
@@ -196,11 +198,14 @@ release within their region. Ordinary space is tried before an eligible protecte
 window; coalescing never crosses NUMA allocations or protected boundaries.
 Aliases and subspans retain the complete original allocation until their last
 borrower retires. The stable slices hold encoded
-input, STB decode, RGB/CMYK output, AVIR/perceptual scratch, masks/parsing,
+input, STB decode, RGB/CMYK output, AVIR/perceptual/Torch scratch, masks/parsing,
 Arrow payload, and label output. Completion and named source/compaction windows
 retain their admission constraints. Controllable payload allocations use the
 supplied storage; opaque library bookkeeping, including TurboJPEG's coefficient
-and control storage, has a separate checked charge. Directory preserves its STB
+and control storage or ATen resize temporaries, has a separate checked charge.
+Torch resize uses a restored task-local CPU-thread limit, so it does not create
+a nested image-worker pool or change process-wide Torch thread policy.
+Directory preserves its STB
 codec policy; benchmark JPEG uses TurboJPEG and benchmark PNG uses STB.
 
 Benchmark preload fills a reusable pinned input slice from the admitted file

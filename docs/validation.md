@@ -1113,18 +1113,25 @@ Annotation, Explore, and Upscale executables require `all` or explicit
 ## Training mathematics and compilation evidence
 
 The [training reference](rfdetr-training.md) owns the pinned equations and
-native adaptations. Coverage is colocated with these existing suites, selected
+native adaptations. The [review index](reviews/rfdetr-math/README.md) preserves
+the four baseline reviews, while the [current results](reviews/rfdetr-math/current-results.md)
+record the completed bounded acceptance and its limits. Coverage is colocated
+with these existing suites, selected
 by `all` and the standalone `rfdetr` route. This inventory describes source
 coverage, not a record that the current checkout passed these cases:
 
 | Source | Required evidence |
 | --- | --- |
+| [layers/tests/ms_deform_attn.test.cpp](../src/backend/ml/layers/tests/ms_deform_attn.test.cpp) | Custom CUDA attention, exact support boundaries, nonfinite propagation, chunk tails, dispatcher capture and mixed-precision replay/VJPs |
+| [core/tests/upstream_model_parity.test.cpp](../src/backend/models/rfdetr/core/tests/upstream_model_parity.test.cpp) | Actual pinned upstream model/resize artifacts, complete fixed-cotangent VJPs, discrete identities, and numerical-policy admission |
+| [training/tests/upstream_optimizer_parity.test.cpp](../src/backend/models/rfdetr/training/tests/upstream_optimizer_parity.test.cpp) | Actual upstream criterion at matched weights, complete gradients/clipping, identical-gradient production AdamW state/updates, and separately measured independent trajectories |
 | [core/tests/upstream_training_parity.test.cpp](../src/backend/models/rfdetr/core/tests/upstream_training_parity.test.cpp) | Independent geometry/epsilon/promotion equations and VJPs; categorical half-pixel sampling; representation-specific empty masks; learned encoder projection; grouped classification/box and dense/sparse mask objectives; full-domain nonfinite matcher sanitization; depthwise AMP derivatives and updates; direct DN mask equations |
 | [training/tests/stock_training_parity.test.cpp](../src/backend/models/rfdetr/training/tests/stock_training_parity.test.cpp) | Literal two-stage K-squared scaling, per-parameter AdamW ages, managed warmup, device clipping, first/later/resumed EMA, recoverable AMP overflow cadence, backward outside autocast and distributed group/update equations |
 | [core/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/core/tests/training_supervision.test.cpp) | Match-Free correspondence/probes and mask costs, background-only images, DN layout/noise/leakage protection, invalid and empty boundaries, direct mask gradients and sampling behavior |
 | [core/tests/selective_compilation.test.cpp](../src/backend/models/rfdetr/core/tests/selective_compilation.test.cpp) | First recording and retained live weights, signature/tail fallback, transactional replacement, dynamic query extents, direct grouped/DN SDPA and independent decoder-tail derivatives with outstanding backwards |
+| [core/tests/full_compilation.test.cpp](../src/backend/models/rfdetr/core/tests/full_compilation.test.cpp) | First-real-forward full tracing with custom CUDA/depthwise operators, replay/VJPs, signature/mode/owner changes, output inventory and explicit supervision restrictions |
 | [training/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/training/tests/training_supervision.test.cpp) | Production Hungarian/Match-Free and optional DN, FP32/FP16/BF16, empty images, accumulated updates, eager/selective values/RNG/live state; target-ring reuse and delayed backward protection, partial DMA failure, selected donor uploads, next-batch preparation with exact continuation and parameter versions |
-| [inference/tests/prediction_session.test.cpp](../src/backend/models/rfdetr/inference/tests/prediction_session.test.cpp) | Native weights compilation-request propagation and incremental inference behavior |
+| [inference/tests/prediction_session.test.cpp](../src/backend/models/rfdetr/inference/tests/prediction_session.test.cpp) | Native weights compilation-request propagation, file-image resampling, incremental inference, and export snapshot isolation including failed publication |
 | [training/tests/execution_policy.test.cpp](../src/backend/models/rfdetr/training/tests/execution_policy.test.cpp) | Literal SGD warmup exit/round-even behavior, native schedule reference clocks, final-epoch latches, sparse membership/repeats, semantic samples, and donor identity |
 | [training/tests/training_gradient_reducer.test.cpp](../src/backend/models/rfdetr/training/tests/training_gradient_reducer.test.cpp) | Logical objective across physical capacities, early-bucket overlap, direct exclusive-gradient storage and alias isolation, exact count-wave/attempt admission, cross-stream count/metric completion, cancellation, partial failure and physical collective custody |
 | [augmentation/tests/gpu_augment.test.cpp](../src/backend/models/rfdetr/augmentation/tests/gpu_augment.test.cpp) | Deterministic prepared identities/donors, RGB/output-domain paths, high-water reuse, host staging retirement before delayed pixels, exact visible support and erasure geometry, continuous boxes with empty raster masks, failure custody |
@@ -1148,14 +1155,15 @@ and independent read failure/cancellation under both admitted transfer routes.
 They are included by `all`; their existence does not establish throughput or
 hardware coverage for an unexecuted route.
 
-The complete-model selective fixture compares four accumulated microbatches
+The small complete-model compilation fixture compares four accumulated microbatches
 using the production `TrainingStep`, including the K-squared divisor, frozen
 and trainable parameter policy, then an optimizer update. It preserves exact
 RNG state across matched eager/selective forwards and losses, and exercises
 training/evaluation mode changes, padded evaluation, `2 → 1 → 2` batches,
-explicit disable and changed-state copies. It forces the reference deformable
-attention implementation to isolate the bounded tensor regions; custom CUDA
-attention has separate ML-layer evidence.
+explicit disable and changed-state copies. It exercises Selective with reference
+and custom CUDA deformable attention, and FullTrace with custom CUDA attention
+for stock supervision. Match-Free and DN retain their explicit FullTrace
+restriction. Custom attention also has independent ML-layer evidence.
 
 For that composed fixture, logits/boxes/losses use relative and absolute
 tolerances of `0.004`; BF16 spatial features use `0.02` for both. FP32 gradients
@@ -1184,13 +1192,128 @@ and fused ATen operations do not establish training graph fusion or throughput.
 The [diagnostic fields](logging.md#native-selective-compilation) distinguish
 those facts.
 
-These are controlled functional, numerical, update and lifetime checks, not a
-full upstream Python training run or measured COCO accuracy/convergence study.
+These are controlled functional, numerical, update and lifetime checks. The
+independent producer below executes actual upstream model/criterion/optimizer
+work on bounded saved inputs; it is not a full dataset training or measured
+COCO accuracy/convergence study.
 Native data membership and TF32 policy remain as documented in the reference.
 GPU-gated cases explicitly skip when their required CUDA or physical
 capabilities are unavailable; BF16 branches require compatible hardware.
 GDRCopy mappings additionally need a usable `gdrdrv` or CUDA DMA-BUF mmap route.
 A host lacking both cannot prove GDRCopy mapping even when CUDA/Wayland pass.
+
+### Independent upstream diagnostic
+
+```bash
+./mmltk --diagnose-rfdetr-upstream --help
+./mmltk --diagnose-rfdetr-upstream --upstream ../rf-upstream \
+  --output build/validation/rfdetr-math/upstream
+./mmltk --diagnose-rfdetr-upstream --upstream ../rf-upstream \
+  --output build/validation/rfdetr-math/upstream-math --sdpa math
+```
+
+Choose a fresh output directory for each production run. Admission requires a
+clean upstream checkout, including untracked files, at
+`e9a138f70cc14e3fddca029a0683055e34ab8f35`, plus the cached official
+`rf-detr-nano.pth` and `rf-detr-seg-nano.pt` under the repository cache's
+`mmltk/weights`. Source-specific command-local Git trust and read-only Git
+metadata mounts support linked worktrees and differently owned clean checkouts
+without changing global Git configuration. The source and weights remain
+read-only; the producer runs offline with a two-hour deadline. The
+[validation-only image](build.md#upstream-reference-image) retains the pinned
+donor Torch/CUDA environment.
+
+[The producer](../tools/generate_rfdetr_upstream_oracle.py) imports the actual
+upstream model, matcher, criterion, and PyTorch optimizer. It records original
+official weight identities, normalized state, constructor facts, inputs/masks,
+outputs, operator boundaries, fixed cotangents/VJPs, stochastic samples,
+criterion terms, optimizer groups/moments/ages, and held-input outputs.
+`manifest.json` uses `mmltk.rfdetr.upstream-oracle.v1`, with source/payload/
+dependency/producer hashes, effective model and execution policy, and a checked
+tensor inventory for every archive. Unsupported precisions are explicit.
+
+The bounded stock matrix uses Nano 384 and SegNano 312, two Group-DETR groups,
+FP32/FP16/BF16 where available, batches one/two, and train/eval. Nano FP32 batch
+two training retains eight updates; the other cases retain one. The native
+comparison uses production custom CUDA attention. Default SDPA retains backend
+selection; `--sdpa math` explicitly selects upstream math SDPA and the native
+model-local math route. Both sides disable matmul/cuDNN TF32 for this controlled
+comparison; the manifest records float32 matmul precision `highest`.
+AMP main references use original upstream matcher functions with FP32 operands;
+the untouched upstream AMP matcher is also executed and saved under `stock/`.
+Its differences remain explicit policy observations.
+
+After production, the wrapper runs `[upstream_oracle]` in both existing core
+and training executables. Only both successful stages publish
+`verdict.json` with `status=passed_required_checks`. The manifest's
+`references_complete_native_comparison_pending` status describes completed
+reference production and is not rewritten into a native-pass claim.
+References, appended `comparisons/*.jsonl`, `wrapper.log`, and executable logs
+survive comparison failure; cancellation settles the producer or child test
+owner without cancelling unrelated operations. Retry comparisons against
+retained artifacts without regenerating them:
+
+```bash
+./mmltk --test rfdetr --executable mmltk_backend_models_rfdetr_core_tests \
+  --env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=/workspace/build/validation/rfdetr-math/upstream \
+  -- '[upstream_oracle]'
+./mmltk --test rfdetr --executable mmltk_backend_models_rfdetr_training_tests \
+  --env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=/workspace/build/validation/rfdetr-math/upstream \
+  -- '[upstream_oracle]'
+```
+
+Absent optional artifacts produce a skip, not independent parity evidence.
+Supplied invalid artifacts fail admission. The optional
+`MMLTK_RFDETR_UPSTREAM_REPEAT_DIR` supplies a second independently
+generated reference for upstream-versus-upstream comparisons. It is not needed
+by the ordinary public diagnostic. [Logging](logging.md#upstream-numerical-comparisons)
+explains record fields, retries, and bounded queries.
+
+### Numerical gates and trajectory observations
+
+[OracleComparison](../src/backend/models/rfdetr/core/tests/upstream_oracle_fixture.cpp)
+owns these exact bounds. Value comparisons use elementwise
+`abs(error) <= atol + rtol * abs(reference)`. Derivative comparisons require
+both the maximum error and L2 error to satisfy that formula using the
+corresponding reference maximum or L2 norm.
+
+| Comparison | FP32 rtol / atol | FP16 rtol / atol | BF16 rtol / atol |
+| --- | --- | --- | --- |
+| Forward, criterion values, full parameter values | `0.0003 / 2e-5` | `0.015 / 0.002` | `0.03 / 0.002` |
+| Complete derivative vectors and update deltas | `0.002 / 1e-7` | `0.015 / 1e-7` | `0.03 / 1e-7` |
+| Optimizer second moments | `0.002 / 1e-12` | `0.015 / 1e-12` | `0.03 / 1e-12` |
+
+Every per-tensor derivative discrepancy remains reported at its original bound,
+including near-null attention key biases. The required derivative gate joins
+the complete defined tensor inventory into one vector. At each matched training
+step, the model and criterion start from the exact saved upstream weights.
+Production `NativeOptimizer` then consumes identical saved upstream clipped
+gradients while retaining its own continuous moments and ages; full parameters,
+moments, ages, and groups have separate comparisons. Parameter deltas additionally
+allow one representable FP32 parameter interval at
+`max(abs(reference_before), abs(reference_after))` before the unchanged error
+bound. Subtracting nearby stored weights cannot resolve smaller updates. Raw
+errors, original normalized errors, and the explicit interval remain in the
+report. This allowance does not apply to arbitrary forward or gradient errors.
+
+Matched-state selection/assignment/sample identities and optimizer ages are
+exact. Hyperparameters admit eight float64 epsilons for equivalent arithmetic,
+with zero settings and group membership exact. Independent native/upstream
+trajectories and independent Match-Free AdamW updates are observations, not
+equality gates. Their measurement mode still fails invalid
+inventories, shapes, dtypes, definedness, and nonfinite values. Match-Free is a
+native objective extension: its compiled forward, objective, and complete
+derivative gates compare against native eager execution, not stock upstream
+objective parity. Representative coverage uses official pretrained Nano 384,
+a frozen encoder, 13 groups, FP16/BF16, production `TrainingStep`, and fused AdamW.
+
+Independent upstream reruns themselves exceed original strict per-tensor and
+trajectory bounds. That measured fact motivated the separation above; it does
+not identify every native discrepancy as upstream noise. PyTorch distinguishes
+[finite-precision operation order](https://docs.pytorch.org/docs/2.14/notes/numerical_accuracy.html)
+from [seeded randomness and deterministic algorithms](https://docs.pytorch.org/docs/2.14/notes/randomness.html).
+The [current results](reviews/rfdetr-math/current-results.md#measured-trajectories)
+retain the material remaining trajectory differences and the unmeasured AP limit.
 
 ### Training startup and monitoring validation record
 

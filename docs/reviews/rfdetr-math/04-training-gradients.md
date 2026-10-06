@@ -1,5 +1,8 @@
 # RF-DETR training objective, gradient, and optimizer review
 
+Historical baseline review; line anchors and findings refer to the revisions
+below. See the [review index](README.md) and [current closure/evidence](current-results.md).
+
 Review date: 2026-10-05. Native baseline: `52586e98f535205cc242dfe74ef5144eef0373bb`. Upstream baseline: `e9a138f70cc14e3fddca029a0683055e34ab8f35`; the upstream checkout was clean. This review changed only this report. No build, test, training run, profiler, or diagnostic was executed by this reviewer. Findings below are source analysis and analytical examples, supplemented by the explicitly attributed mechanism diagnostic run by the main agent. Production-path validation remains main-agent work through `./mmltk`.
 
 The authorities read were `AGENTS.md`, `CONTRACT.md`, `docs/README.md`, `docs/rfdetr-training.md`, and the relevant validation and logging documentation. In local source anchors below, `N/` means `src/backend/models/rfdetr/`, and `U/` means `../rf-upstream/src/rfdetr/`. Line numbers refer to the reviewed revisions.

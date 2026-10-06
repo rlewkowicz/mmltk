@@ -141,6 +141,46 @@ Inspect public header selection with:
 image without rebuilding it. Supply public filenames, not directory paths.
 Reports include locations, package ownership, direct includes, and selection.
 
+### Numerical compilation policy
+
+First-party Release arithmetic retains normal optimization and FMA. The
+[retained RF-DETR command inspection](reviews/rfdetr-math/current-results.md#build-wrapper-and-acceptance-limits)
+found no unsafe fast-math, flush-to-zero, imprecise-division, or
+imprecise-square-root override on the seven inspected numerical units.
+Generated compile commands describe first-party compilation; they do not reveal
+NVRTC options used later by TorchScript or certify every packaged library.
+
+NVCC and NVRTC document fast math as a collection of options, including changed
+denormal/division/square-root behavior. FMA is also enabled in the normal
+defaults and is not itself evidence of unsafe fast math. See the primary
+[NVCC options](https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#use-fast-math-use-fast-math),
+[NVRTC options](https://docs.nvidia.com/cuda/nvrtc/index.html#supported-compile-options),
+and [floating-point guide](https://docs.nvidia.com/cuda/floating-point/index.html).
+Installed-payload JIT observations and the native function-local precision
+policy have separate [evidence](reviews/rfdetr-math/current-results.md) and
+[runtime ownership](rfdetr-training.md#native-selective-compilation).
+
+### Upstream reference image
+
+`./mmltk --diagnose-rfdetr-upstream` builds/reuses the validation-only image
+defined by [Dockerfile.rfdetr-oracle](../docker/Dockerfile.rfdetr-oracle).
+Unlike the application's independently based development/runtime images, this
+diagnostic image starts from the complete pinned NGC donor so the actual
+upstream Python package can execute against its compatible Torch/CUDA payload.
+It is not a production Python training runtime.
+
+[Pinned validation requirements](../tools/rfdetr_oracle_requirements.txt)
+install as binary wheels into `/opt/rfdetr-oracle/python` using `--no-deps`.
+This private overlay preserves the donor packages; the
+[producer](../tools/generate_rfdetr_upstream_oracle.py) snapshots and verifies
+payload versions and dependency/import closure. The image fingerprint includes
+the upstream revision/tree, donor, payload manifest, Dockerfile, requirements,
+producer, and selected SDPA comparison policy. Reference generation mounts
+upstream source/Git metadata and cached weights read-only; the selected evidence
+destination is the writable host mount, with temporary storage inside the container.
+[Validation](validation.md#independent-upstream-diagnostic)
+owns admission, fresh output directories, comparison retries, and verdicts.
+
 ### Native Parquet dependency
 
 [Dockerfile.dependencies](../docker/Dockerfile.dependencies) pins Apache

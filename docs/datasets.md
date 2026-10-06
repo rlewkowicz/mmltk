@@ -103,8 +103,8 @@ Both generic and benchmark compilation default to **Stretch**. It fills the
 target canvas using independent horizontal and vertical scales. **Letterbox**
 preserves source aspect, centers the resized content, and fills padding with
 zero RGB. Select it explicitly with `--resize-mode Letterbox` or the Dataset
-card's radio. Geometry and optional perceptual resampling are independent
-choices; changing either requires recompiling the affected splits.
+card's radio. Geometry and the RGB resampling method are independent choices;
+changing either requires recompiling the affected splits.
 
 [ImageResizeMode and ImageResizeGeometry](../src/backend/imaging/resample/image_resize.h)
 are the shared authority. Letterbox fits one target axis exactly, rounds the
@@ -128,11 +128,47 @@ decode/resize operation and `RgbImageResizer::resize_to_planar` to project
 packed RGB8 into the compiled planar float canvas. Its immutable prepared plan
 binds the admitted header, decode storage, resize algorithm, geometry, and
 destination layout. Execution checks the actual encoded header against that
-plan before writing pixels. Perceptual shrinking writes directly
-to those planes while preserving RGB8 quantization followed by
+plan before writing pixels. With the default Native method, perceptual shrinking
+writes directly to those planes while preserving RGB8 quantization followed by
 `float(byte) * (1.0F / 255.0F)`. Ordinary AVIR resizing and enlargement reuse
 the resizer's byte scratch. Identity conversion and zero Letterbox padding
 retain the same pixel values.
+
+### RGB resampling methods
+
+The canonical `RgbResizeMethod` in
+[image_resize.h](../src/backend/imaging/resample/image_resize.h) supplies the
+same choices to Directory/benchmark compilation and ordinary-image prediction:
+
+| Method / `--resize-method` value | Pixel operation |
+| --- | --- |
+| `Native` (default) | AVIR RGB8 resize, or optional perceptual shrinking, followed by planar unit-sRGB float conversion |
+| `TorchBilinear` | RGB8 to planar float32 in `[0,1]`, then ATen bilinear with `align_corners=false`, without antialiasing or output-byte quantization |
+| `TorchBilinearAntialias` | The same float path with ATen antialiased bilinear |
+
+[Torch resizing](../src/backend/imaging/resample/torch_resize.cpp) runs on the
+CPU with a task-local one-thread OpenMP limit, restored on return. Its immutable
+plan charges supplied float planes and bounded opaque ATen temporaries before
+admission; all views and temporaries retire before the next image. An explicit
+Torch choice requires the pinned Torch/OpenMP payload and fails admission when
+unavailable. It never silently selects Native. Identity geometry uses the
+ordinary exact RGB-to-float conversion.
+
+The perceptual flag remains saved independently but applies only to Native.
+Torch choices retain Stretch/Letterbox geometry, zero padding, boxes, and
+nearest-sampled categorical masks. They do not change format 10 or reinterpret
+existing compiled pixels/metadata. Benchmark manifests record the selected
+resampling method separately from retained source-cache identity.
+
+These options are float-tensor resize choices, not PIL-byte equivalence. The
+pinned upstream dataset route resizes a PIL image with antialiased bilinear,
+quantizes to RGB8, and only then converts to float; upstream file prediction
+uses float bilinear without antialiasing. The
+[independent resize evidence](reviews/rfdetr-math/current-results.md#resize-and-rendered-controls)
+retains both tensor and PIL results. Changing RGB resampling does not establish
+a detector-accuracy improvement.
+
+### Categorical mask sampling
 
 Categorical mask resizing uses the
 [shared RLE sampler](../src/backend/data/mask_rle_utils.cpp). It validates sorted
@@ -388,10 +424,14 @@ Supplying width without height makes the target square. The RF-DETR-specific
 consult its own help for model-specific dimensions and options.
 
 Both compilers expose [resize geometry](#resize-geometry) through `--resize-mode`
-and [perceptual shrinking](#optional-perceptual-downscaling) through
+and [RGB resampling](#rgb-resampling-methods) through
+`--resize-method Native|TorchBilinear|TorchBilinearAntialias`, with
+[perceptual shrinking](#optional-perceptual-downscaling) through
 `--perceptual-downscale`; the [Dataset card](gui-interaction.md#dataset-compilation-controls)
-provides matching controls. `rfdetr validate --resize-mode` affects source
-compilation only; existing bins retain their stored mode.
+provides matching controls. For example, append
+`--resize-method TorchBilinearAntialias` to a compile command above.
+`rfdetr validate --resize-mode` and `--resize-method` affect source compilation
+only; existing bins retain their stored pixels and geometry.
 
 Directory and benchmark compilation use one
 [execution and pinned-workspace boundary](compile-execution.md). Directory
@@ -435,7 +475,8 @@ and [cache configuration](commands.md#benchmark-cache-selection).
 Compilation and GPU augmentation have independent, default-false
 `perceptual_downscale` settings: root/RF-DETR compile use
 `--perceptual-downscale`; enabled training augmentation uses
-`--aug-perceptual-downscale`. Off retains ordinary resizing. The option changes
+`--aug-perceptual-downscale`. With the Native compile method, off retains
+ordinary AVIR resizing. The option changes
 shrinking RGB only, preserving masks, boxes, classes, geometry, and record layout.
 
 [RgbImageResizer](../src/backend/imaging/resample/image_resize.h) owns CPU execution
@@ -479,8 +520,9 @@ Ordinary CPU shrinking and enlargement use the existing
 half-integer rounding follows the scalar float policy without changing the
 thread's rounding mode. Resampling fixtures compare the selected SIMD path
 against scalar AVIR output within one RGB8 level; identity copies remain exact.
-The checked resize plan selects Identity, PerceptualInteger,
-PerceptualFractional, or Avir once and supplies the required storage to execution.
+The checked Native resize plan selects Identity, PerceptualInteger,
+PerceptualFractional, or Avir once and supplies the required storage to execution;
+explicit [Torch methods](#rgb-resampling-methods) select the separate float path.
 AVIR's sizing pass counts allocator requests without constructing filter
 coefficients; actual coefficients and queues live only inside that execution's
 allocator scope. They cannot outlive the borrowed arena. AVIR byte output is

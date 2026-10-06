@@ -94,6 +94,23 @@ match-free class axes. Unmatched destination state keeps its initialized value.
 Resume instead requires the exact native class layout and compatible saved
 state; it does not perform transfer remapping.
 
+The [external checkpoint bridge](../src/backend/models/rfdetr/training/rfdetr_checkpoint_bridge.py)
+normalizes supported model dictionaries, bare tensor dictionaries, module
+`state_dict()` results, and Lightning `state_dict` envelopes once. In a Lightning
+envelope it selects `model.` entries and strips that prefix plus an immediate
+`_orig_mod.` prefix; it rejects empty inventories and normalized-name collisions.
+Inactive empty keypoint bookkeeping is recognized, while active unsupported
+keypoint state and incompatible topology metadata fail admission.
+
+[Model-state admission](../src/backend/models/rfdetr/core/model_state_load.h)
+distinguishes exact loading, complete required-core loading, and explicit partial
+transfer. Production prediction, export, and ordinary weight initialization
+require the compatible core inventory before publishing tensors; a damaged
+archive cannot silently become a mostly random model. Reports retain loaded,
+missing, unexpected, incompatible, and deliberately initialized names. Fresh
+transfer owns class remapping and compatible query-state adaptation; exact
+Resume retains its stricter inventory and optimizer-state contract.
+
 ## Model input and detection selection
 
 Compiled files contain planar RGB float32 in `[0,1]`, using the
@@ -107,6 +124,15 @@ raw; normalization writes reusable, separately owned model-input storage and
 settles its consumers before reuse. Native, ONNX, and TensorRT prediction
 paths share this preparation, including compiled, ordinary-image, and video
 inputs.
+
+Ordinary image files use the selected
+[RGB resampling method](datasets.md#rgb-resampling-methods), default Native,
+and Stretch to the model resolution before this GPU normalization. CLI
+`rfdetr predict --resize-method` and the GUI's image-only radios carry the same
+native selection. Compiled inputs consume their stored pixels, and video keeps
+its existing GPU preparation; switching this image-file choice does not resize
+either source. Each file-image lane retains its host/resize capacity, and its
+separate pinned upload buffer stays live through H2D completion.
 
 [Postprocessing](../src/backend/models/rfdetr/core/postprocess.cpp) applies
 sigmoid over the full physical query-by-class output, stably ranks flattened
@@ -214,6 +240,14 @@ Failure or cancellation preserves already committed requested artifacts,
 including ONNX when a later engine build fails. Format choices do not change
 the prepared model identity. Native `export-onnx` and `build-engine` remain
 separate reusable CLI operations.
+
+Export traces a private inference snapshot. It keeps the source model's mode,
+trainability, graphs, and selected attention route intact on success and failure;
+reference deformable attention and math SDPA are selected only on the snapshot.
+ONNX lowering includes the registered depthwise precision boundary and SiLU's
+Sigmoid/Mul expression. ONNX Runtime and TensorRT retain their independent
+[execution and precision policies](gpu-execution.md#model-backend-precision);
+export isolation is not a guarantee of backend-identical floating-point output.
 
 ## Training inputs and output destination
 

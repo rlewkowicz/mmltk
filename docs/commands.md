@@ -34,6 +34,7 @@ invocation owns a repository-labeled container and streams application output.
 | `./mmltk --diagnose-io FILE` | Report eligible CPU/core/SMT/frequency-policy facts and a compiled file's storage/GPU capabilities |
 | `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
 | `./mmltk --diagnose-gpu-program [--torch] SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic, optionally linked to pinned PyTorch, using existing images |
+| `./mmltk --diagnose-rfdetr-upstream --upstream PATH --output PATH [--sdpa default\|math]` | Produce pinned actual upstream references in a fresh directory, run native core/training comparisons, and publish the required-check verdict |
 | `./mmltk --diagnose-nvidia-payload donor\|development HEADER...` | Inspect public NVIDIA headers and payload selection |
 | `./mmltk --diagnose-native-symbols [OPTIONS] ARTIFACT...` | Inspect cached native `.a`/`.o` symbols or resolve `--address HEX` values in one ELF artifact with the existing development image |
 | `./mmltk --diagnose-native-link [OPTIONS] TARGET` | Repeat one generated Release link into separate diagnostic storage |
@@ -43,10 +44,12 @@ Build, test, tidy, cleanup, export, and diagnostics are separate operations.
 Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
 `--diagnose-gpu-environment`, `--diagnose-gpu-program`, `--diagnose-native-symbols`,
 `--diagnose-native-link`, `--diagnose-processes`, `--diagnose-benchmark-image`,
+`--diagnose-rfdetr-upstream`,
 `--cleanup-report`, `--raw-cpd`, `--format-declarations`, or `--audit-includes`
 first when invoking that standalone operation.
 
 Detailed references: [CUDA/Vulkan diagnostics](validation.md#standalone-cudavulkan-diagnostic),
+[upstream numerical evidence](validation.md#independent-upstream-diagnostic),
 [native symbols/links](validation.md#native-symbol-and-link-diagnostics),
 [test selectors](validation.md#selection-environment-deadlines-and-debugging),
 [data profiles](validation.md#data-compilation-and-resampling-profiles),
@@ -243,11 +246,11 @@ Key option groups (required fields and defaults remain in command help):
 
 | Commands | Options and reference |
 | --- | --- |
-| `compile`, `rfdetr compile` | `--resize-mode Stretch` (default) or `Letterbox`; independent `--perceptual-downscale`; [source/geometry rules](datasets.md#compile-and-inspect) |
-| `rfdetr validate` | `--resize-mode` affects source compilation only; existing bins retain stored geometry |
+| `compile`, `rfdetr compile` | `--resize-mode Stretch` (default) or `Letterbox`; `--resize-method Native\|TorchBilinear\|TorchBilinearAntialias`; independent `--perceptual-downscale` applies to Native; [source/geometry rules](datasets.md#compile-and-inspect) |
+| `rfdetr validate` | `--resize-mode` and `--resize-method` affect source compilation only; existing bins retain stored pixels and geometry |
 | `rfdetr train` | Independent `--aug-perceptual-downscale`, `--use-ema`/`--no-ema`, `--resume`, `--output-dir`; `--test-compiled` is optional, train/validation required |
 | Model-input commands | `--class-layout` supplies a [digest-bound descriptor](rfdetr-workflows.md#class-identity-and-model-admission) |
-| `rfdetr predict` | Repeatable `--image` or `--compiled`, CLI `--batch-size`; local video is GUI-only |
+| `rfdetr predict` | Repeatable `--image` or `--compiled`, CLI `--batch-size`; `--resize-method Native\|TorchBilinear\|TorchBilinearAntialias` applies to image files; local video is GUI-only |
 | `rfdetr evaluate`, `validate` | One backend or ordered multi-backend report, respectively; independent `--candidate-count` and `--eval-max-dets` |
 | Train / Predict counts | Train exposes `--eval-max-dets`; Predict uses `--max-dets-per-image`; [count semantics and zero defaults](rfdetr-workflows.md#model-input-and-detection-selection) |
 
@@ -265,9 +268,9 @@ defines modes, byte-rate meaning, and bounded input options.
 
 [RF-DETR workflows](rfdetr-workflows.md) owns checkpoint, metric, and history behavior.
 Train, predict and evaluate accept `--compile-mode none|selective|full`.
-The [native selective contract](rfdetr-training.md#native-selective-compilation)
-describes the default selective path, its guards and inference propagation;
-the separate full-trace route is outside that evidence. CLI `export-onnx` and
+The [native compilation contract](rfdetr-training.md#native-selective-compilation)
+describes the default selective path, shared guards, FullTrace restrictions,
+and inference propagation. CLI `export-onnx` and
 `build-engine` keep explicit destinations. GUI Export combines independent
 ONNX/TensorRT selections through one conversion and reserves its output beside
 the other [workflow runs](rfdetr-workflows.md#run-output-directories).

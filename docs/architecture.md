@@ -137,9 +137,10 @@ owns reusable raster operations, and
 [resample](../src/backend/imaging/resample) owns CPU/CUDA resizing.
 [Dataset compilation](datasets.md) owns acquisition, annotations, cache
 identity, progress, and the [compiled format](datasets.md#compiled-binary-format)
-while consuming those operations. The resample owner declares resize mode and
-geometry below the data layer; compilers apply it to pixels, continuous boxes,
-and categorical masks. Compiled readers expose stored mode, original extents,
+while consuming those operations. The resample owner declares resize mode,
+geometry, and RGB method below the data layer. Compilers apply geometry to
+pixels, continuous boxes, and categorical masks; the RGB method also serves
+file-image prediction. Compiled readers expose stored mode, original extents,
 annotation metadata, and provenance without a model-layer dependency.
 
 [FileLayout](../src/backend/data/compiled/compiled_file_layout.h) owns checked

@@ -477,6 +477,28 @@ and completion rules. TensorRT records a final completion event and consumer
 wait for each touched lane, including a lane that reached only preparation
 before cancellation; its stream orders repeated use of that lane's fixed buffers.
 
+## Model backend precision
+
+Tensor dtype, autocast, internal multiplication precision, and compiler options
+are distinct. Native RF-DETR disables cuBLAS/cuDNN TF32; its FP16 permission can
+select BF16 on capable hardware, so comparisons record actual precision rather
+than only that request flag. Default SDPA backend selection remains accelerated;
+the explicit local math route and guarded trace replay retain the
+[training precision contract](rfdetr-training.md#native-selective-compilation).
+
+The [ONNX CUDA backend](../src/backend/ml/runtime/backend_onnx.cpp) enables graph
+optimizations and leaves `use_tf32` at the provider default. The
+[CUDA EP documentation](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)
+specifies that default as enabled. The
+[TensorRT runtime](../src/backend/ml/runtime/tensorrt_runtime.cpp) permits TF32
+by default and uses TensorRT 11's model-defined precision; allowing FP16 does
+not automatically lower an FP32 graph. Its
+[precision reference](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/precision-control.html)
+describes those deployment rules. These normal backend policies are preserved;
+nominal FP32 output alone does not establish equal arithmetic across engines.
+The [independent oracle](validation.md#independent-upstream-diagnostic) explicitly
+controls its own comparison precision and reports its scope.
+
 ## ONNX capture and verification storage
 
 The packaged ONNX CUDA provider captures on its calling thread and stream.

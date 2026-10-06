@@ -88,7 +88,9 @@ manifest-selection limit. Older application checkpoints and output-directory
 history are unsupported. Upstream weights keep their own supported input
 routes. Compiled datasets use format 10; recompile older
 bins. Dataset compilation defaults to Stretch, with Letterbox available
-explicitly. Explore thumbnails preserve source proportions in padded cells.
+explicitly. Native RGB resizing remains the default; compilation and image-file
+prediction also offer explicit [PyTorch bilinear choices](docs/datasets.md#rgb-resampling-methods).
+Explore thumbnails preserve source proportions in padded cells.
 Every Upscale method prepares stretched compiled input at source aspect first.
 The shared viewer's Original option changes how retained pixels are displayed;
 it does not recover source resolution. See the
@@ -96,9 +98,10 @@ it does not recover source resolution. See the
 
 The [training reference](docs/rfdetr-training.md) explains the pinned stock
 mathematics, logical lanes, optimizer recipes and schedules, sparse data plans,
-optional Match-Free and denoising mask supervision, and native selective
-compilation. Its evidence covers controlled losses, gradients and
-updates; it does not establish AP, convergence or throughput equivalence.
+optional Match-Free and denoising mask supervision, and native compilation.
+The [numerical results](docs/reviews/rfdetr-math/current-results.md) distinguish
+matched-state upstream checks from measured training-trajectory differences;
+they do not establish AP, convergence or throughput equivalence.
 
 The Dataset card's benchmark override offers Coco custom and Coconut.
 Coconut compiles the full COCONut training recipe with a choice of validation

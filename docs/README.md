@@ -33,13 +33,13 @@
 
 ## Data and backend systems
 
-- [RF-DETR training and selective compilation](rfdetr-training.md): reference
+- [RF-DETR training and native compilation](rfdetr-training.md): reference
   equations, lanes/global batches, recipes/schedulers/EMA, sparse planning,
   target/collective lifetimes, bounded next-batch preparation, supervision
-  adaptations, and guarded native tracing.
+  adaptations, guarded Selective/FullTrace execution, precision, and compiler choices.
 - [Datasets and compilation](datasets.md): source annotations, format 10 fixed
   slots, in-place compaction, prepared batch capacity, resize geometry,
-  prepared CPU/perceptual resampling, loading/leases, and Explore cache residency.
+  prepared CPU/native/perceptual/Torch resampling, loading/leases, and Explore cache residency.
 - [Compilation execution and working storage](compile-execution.md): shared
   Directory/benchmark ownership, live-class CPU floors and elastic work,
   persistent task records, bounded dispatch, task-sized leases in fixed pinned
@@ -72,6 +72,9 @@
   Firefox validation records, opt-in CPU/data profiles, complete Coconut and
   bounded pipeline/archive/compaction profiles, historical fixed-storage
   measurements, fixtures, and evidence limits.
+- [RF-DETR numerical reviews and acceptance](reviews/rfdetr-math/README.md):
+  four historical source reviews, current repair closure, actual upstream
+  matched-state gates, measured trajectory differences, and quality limits.
 - [Headless Wayland](headless-wayland.md): private NVIDIA Weston setup, input
   seat, readiness, deadlines, shutdown, artifacts, and limitations.
 - [Logging](logging.md): automatic build/test/tidy transcripts, opt-in runtime

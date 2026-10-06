@@ -1,5 +1,8 @@
 # RF-DETR model, forward, and input/output equivalence review
 
+Historical baseline review; line anchors and findings refer to the revisions
+below. See the [review index](README.md) and [current closure/evidence](current-results.md).
+
 Review date: 2026-10-05. This is a source review, not a validation result.
 
 ## Reference and claim boundaries

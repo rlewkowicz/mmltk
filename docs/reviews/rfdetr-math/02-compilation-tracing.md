@@ -1,5 +1,8 @@
 # RF-DETR mathematics review: compilation, tracing, and export
 
+Historical baseline review; line anchors and findings refer to the revisions
+below. See the [review index](README.md) and [current closure/evidence](current-results.md).
+
 Review date: 2026-10-05. Native baseline:
 `52586e98f535205cc242dfe74ef5144eef0373bb`. Reference:
 `../rf-upstream`, clean at `e9a138f70cc14e3fddca029a0683055e34ab8f35`.
