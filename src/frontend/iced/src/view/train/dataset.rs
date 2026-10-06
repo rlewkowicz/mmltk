@@ -2,7 +2,9 @@ use crate::integration_control::{DatasetTextKind, observe_dataset_text};
 pub(crate) mod progress;
 
 use crate::fluent_theme::Element;
-use crate::generated::{BenchmarkDatasetVariant, CoconutValidation, ImageResizeMode, RgbResizeMethod};
+use crate::generated::{
+    BenchmarkDatasetVariant, CoconutValidation, ImageResizeMode, RgbResizeMethod,
+};
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use crate::view::shared::{card_section_divider, disclosure};
 use iced::Fill;
@@ -248,12 +250,15 @@ pub fn view<'a>(
         ]
         .spacing(crate::view::workflow::FIELD_SPACING),
     );
-    let fields = fields.push(
-        crate::view::workflow::fields::rgb_resize_method(
-            "train.dataset.resampling", train.compileresizemethod, enabled,
-            Message::ResizeMethodChanged, Message::Ignore,
-        ),
-    ).push(text("Applies when compiling. Existing compiled pixels stay unchanged.").size(12));
+    let fields = fields
+        .push(crate::view::workflow::fields::rgb_resize_method(
+            "train.dataset.resampling",
+            train.compileresizemethod,
+            enabled,
+            Message::ResizeMethodChanged,
+            Message::Ignore,
+        ))
+        .push(text("Applies when compiling. Existing compiled pixels stay unchanged.").size(12));
     let fields = fields.push(
         container(crate::view::workflow::fields::toggle(
             "Perceptual downscaling (Native only)",
@@ -685,9 +690,15 @@ mod tests {
             ImageResizeMode::Stretch
         );
         update(&mut model, Message::PerceptualDownscaleChanged(true)).unwrap();
-        for method in [RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias, RgbResizeMethod::Native] {
-            assert!(matches!(update(&mut model, Message::ResizeMethodChanged(method)),
-                Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))));
+        for method in [
+            RgbResizeMethod::TorchBilinear,
+            RgbResizeMethod::TorchBilinearAntialias,
+            RgbResizeMethod::Native,
+        ] {
+            assert!(matches!(
+                update(&mut model, Message::ResizeMethodChanged(method)),
+                Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))
+            ));
             let train = &model.draft.as_ref().unwrap().workflows.train;
             assert_eq!(train.compileresizemethod, method);
             assert!(train.compileperceptualdownscale);

@@ -35,8 +35,14 @@ void verify_hash(const std::filesystem::path& file, const std::string& hash) {
 at::ScalarType oracle_dtype(at::ScalarType dtype) {
  // The v1 oracle admits a strict subset of the shared scalar vocabulary.
  switch (dtype) {
-  case at::kFloat: case at::kHalf: case at::kBFloat16: case at::kDouble:
-  case at::kLong: case at::kInt: case at::kByte: case at::kBool: return dtype;
+  case at::kFloat:
+  case at::kHalf:
+  case at::kBFloat16:
+  case at::kDouble:
+  case at::kLong:
+  case at::kInt:
+  case at::kByte:
+  case at::kBool: return dtype;
   default: invalid("unsupported tensor dtype");
  }
 }
@@ -44,13 +50,9 @@ at::ScalarType oracle_dtype(std::string_view external_name) {
  if (!external_name.starts_with("torch.")) invalid("unsupported manifest tensor dtype");
  try {
   return oracle_dtype(mmltk::backend::ml::serialization::scalar_type_from_name(external_name.substr(6)));
- } catch (const std::runtime_error&) {
-  invalid("unsupported manifest tensor dtype");
- }
+ } catch (const std::runtime_error&) { invalid("unsupported manifest tensor dtype"); }
 }
-std::string dtype_name(at::ScalarType dtype) {
- return "torch." + mmltk::backend::ml::serialization::scalar_type_name(oracle_dtype(dtype));
-}
+std::string dtype_name(at::ScalarType dtype) { return "torch." + mmltk::backend::ml::serialization::scalar_type_name(oracle_dtype(dtype)); }
 std::uint64_t tensor_bytes(const OracleTensor& tensor) {
  std::uint64_t width = c10::elementSize(oracle_dtype(tensor.dtype));
  std::uint64_t product = 1;
@@ -87,7 +89,8 @@ OracleArchiveRecord archive_record(const Json& value) {
    tensor.device = item.at("device").get<std::string>();
    tensor.finite_count = item.at("finite_count").get<int64_t>();
    tensor.elements = item.at("elements").get<int64_t>();
-   if (tensor.shape.size() > 8 || tensor.stride.size() != tensor.shape.size() || tensor.elements < 0 || tensor.finite_count < 0 || tensor.finite_count > tensor.elements) invalid("invalid tensor metadata");
+   if (tensor.shape.size() > 8 || tensor.stride.size() != tensor.shape.size() || tensor.elements < 0 || tensor.finite_count < 0 || tensor.finite_count > tensor.elements)
+    invalid("invalid tensor metadata");
    if (std::ranges::any_of(tensor.stride, [](int64_t stride) { return stride < 0 || static_cast<std::uint64_t>(stride) > kArchiveLimit; })) invalid("invalid source tensor stride");
    const auto size = tensor_bytes(tensor);
    if (size > kArchiveLimit - bytes) invalid("unbounded aggregate tensor storage");
@@ -102,7 +105,7 @@ std::set<std::string> keys(const TensorMap& values) {
  for (const auto& [name, value] : values) result.insert(name);
  return result;
 }
-}
+}  // namespace
 at::ScalarType OracleCase::dtype() const {
  if (precision == "fp32") return torch::kFloat32;
  if (precision == "fp16") return torch::kFloat16;
@@ -115,11 +118,12 @@ OracleArchive::OracleArchive(const std::filesystem::path& directory, const Oracl
  verify_hash(file, record.sha256);
  caffe2::serialize::PyTorchStreamReader reader(file.string());
  std::uint64_t storage_budget = 0, storage_bytes = 0, metadata_bytes = 0;
- for (const auto& [name, spec] : record.tensors) if (spec.defined) {
-  const auto size = tensor_bytes(spec);
-  if (size > kArchiveLimit - storage_budget) invalid("unbounded aggregate tensor storage");
-  storage_budget += size;
- }
+ for (const auto& [name, spec] : record.tensors)
+  if (spec.defined) {
+   const auto size = tensor_bytes(spec);
+   if (size > kArchiveLimit - storage_budget) invalid("unbounded aggregate tensor storage");
+   storage_budget += size;
+  }
  const auto records = reader.getAllRecords();
  if (records.size() > record.tensors.size() * 2 + 16) invalid("unbounded serialized record inventory");
  for (const auto& name : records) {
@@ -138,15 +142,19 @@ OracleArchive::OracleArchive(const std::filesystem::path& directory, const Oracl
  for (const auto& item : dictionary) {
   if (!item.key().isString() || !item.value().isTensor()) invalid("ordinary tensor entries required");
   const auto tensor = item.value().toTensor();
-  if (tensor.layout() != torch::kStrided || !tensor.is_cpu() || !tensor.is_contiguous() ||
-      tensor.numel() < 0 || static_cast<std::uint64_t>(tensor.numel()) > kArchiveLimit / tensor.element_size()) invalid("unbounded or noncontiguous serialized tensor");
+  if (tensor.layout() != torch::kStrided || !tensor.is_cpu() || !tensor.is_contiguous() || tensor.numel() < 0 || static_cast<std::uint64_t>(tensor.numel()) > kArchiveLimit / tensor.element_size())
+   invalid("unbounded or noncontiguous serialized tensor");
   const auto storage_elements = tensor.storage().nbytes() / tensor.element_size();
   if (tensor.storage_offset() < 0 || static_cast<std::uint64_t>(tensor.storage_offset()) > storage_elements ||
-      static_cast<std::uint64_t>(tensor.numel()) > storage_elements - static_cast<std::uint64_t>(tensor.storage_offset())) invalid("serialized tensor exceeds its storage");
+      static_cast<std::uint64_t>(tensor.numel()) > storage_elements - static_cast<std::uint64_t>(tensor.storage_offset()))
+   invalid("serialized tensor exceeds its storage");
  }
  std::set<std::string> expected;
  for (const auto& [name, spec] : record.tensors) {
-  if (!spec.defined) { undefined_.insert(name); continue; }
+  if (!spec.defined) {
+   undefined_.insert(name);
+   continue;
+  }
   expected.insert(name);
   if (!dictionary.contains(name) || !dictionary.at(name).isTensor()) invalid("missing tensor: " + name);
   const auto tensor = dictionary.at(name).toTensor();
@@ -161,7 +169,8 @@ OracleArchive::OracleArchive(const std::filesystem::path& directory, const Oracl
   }
   tensors_.emplace(name, tensor);
  }
- for (const auto& item : dictionary) if (!item.key().isString() || !expected.erase(item.key().toStringRef())) invalid("unexpected archive entry");
+ for (const auto& item : dictionary)
+  if (!item.key().isString() || !expected.erase(item.key().toStringRef())) invalid("unexpected archive entry");
  if (!expected.empty()) invalid("missing archive entries");
 }
 torch::Tensor OracleArchive::tensor(const std::string& name, const torch::Device device) const {
@@ -173,8 +182,10 @@ torch::Tensor OracleArchive::tensor(const std::string& name, const torch::Device
 bool OracleArchive::contains(const std::string& name) const { return tensors_.contains(name) || undefined_.contains(name); }
 std::set<std::string> OracleArchive::names(const std::string_view prefix) const {
  std::set<std::string> result;
- for (const auto& [name, value] : tensors_) if (name.starts_with(prefix)) result.insert(name.substr(prefix.size()));
- for (const auto& name : undefined_) if (name.starts_with(prefix)) result.insert(name.substr(prefix.size()));
+ for (const auto& [name, value] : tensors_)
+  if (name.starts_with(prefix)) result.insert(name.substr(prefix.size()));
+ for (const auto& name : undefined_)
+  if (name.starts_with(prefix)) result.insert(name.substr(prefix.size()));
  return result;
 }
 std::optional<std::filesystem::path> UpstreamOracle::requested() {
@@ -189,14 +200,16 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
  std::ifstream stream(path);
  const auto manifest = Json::parse(stream);
  if (manifest.at("format") != "mmltk.rfdetr.upstream-oracle.v1" || manifest.at("revision") != "e9a138f70cc14e3fddca029a0683055e34ab8f35" ||
-     manifest.at("status") != "references_complete_native_comparison_pending") invalid("incompatible oracle format/revision/status");
+     manifest.at("status") != "references_complete_native_comparison_pending")
+  invalid("incompatible oracle format/revision/status");
  if (manifest.at("policy").at("matmul_tf32").get<bool>() || manifest.at("policy").at("cudnn_tf32").get<bool>() || manifest.at("policy").at("gradient_scale") != 1 ||
-     manifest.at("policy").at("accumulated_microbatches") != 1) invalid("incompatible controlled numerical policy");
+     manifest.at("policy").at("accumulated_microbatches") != 1)
+  invalid("incompatible controlled numerical policy");
  for (const auto* key : {"producer_sha256", "dependency_sha256", "payload_sha256", "fingerprint"})
   if (manifest.at(key).get<std::string>().size() != 64) invalid("missing provenance identity");
  if (manifest.at("source_hashes").empty() || manifest.at("source_hashes").size() > 5000) invalid("missing source provenance");
- if (!manifest.at("environment").at("torch").get<std::string>().starts_with(TORCH_VERSION) ||
-     manifest.at("torch_build_config").get<std::string>().empty()) invalid("incompatible Torch payload provenance");
+ if (!manifest.at("environment").at("torch").get<std::string>().starts_with(TORCH_VERSION) || manifest.at("torch_build_config").get<std::string>().empty())
+  invalid("incompatible Torch payload provenance");
  directory_ = child(root, manifest.at("directory").get<std::string>());
  if (manifest.at("presets").size() != 2) invalid("missing required preset");
  for (const auto& preset : manifest.at("presets")) {
@@ -205,7 +218,8 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   verify_hash(checkpoint, preset.at("sha256").get<std::string>());
   verify_hash(child(directory_, preset.at("original").get<std::string>()), preset.at("original_sha256").get<std::string>());
   for (const auto& [kind, facts] : preset.at("constructor").items())
-   for (const auto& [member, passed] : facts.items()) if (!passed.get<bool>()) invalid("upstream constructor invariant failed: " + member);
+   for (const auto& [member, passed] : facts.items())
+    if (!passed.get<bool>()) invalid("upstream constructor invariant failed: " + member);
   if (!checkpoints_.emplace(name, checkpoint).second) invalid("duplicate preset");
  }
  if (manifest.at("cases").size() < 16 || manifest.at("cases").size() > 24) invalid("incomplete or unbounded model matrix");
@@ -230,17 +244,22 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   entry.recipe.encoder_layer_decay = recipe.at("lr_vit_layer_decay");
   entry.recipe.weight_decay = recipe.at("weight_decay");
   if (entry.id.size() > 128 || !identities.insert(entry.id).second || !checkpoints_.contains(entry.preset) || (entry.batch != 1 && entry.batch != 2) || entry.groups != 2 || entry.classes != 91 ||
-      entry.resolution != (entry.preset == "rf-detr-nano" ? 384 : 312) || entry.trainable.empty() || entry.trainable.size() > 2000) invalid("invalid case configuration");
+      entry.resolution != (entry.preset == "rf-detr-nano" ? 384 : 312) || entry.trainable.empty() || entry.trainable.size() > 2000)
+   invalid("invalid case configuration");
   (void)entry.dtype();
   if (item.at("comparison_policy") != (entry.dtype() == torch::kFloat32 || !entry.training ? "untouched_stock" : "upstream_with_fp32_matcher_boundary") ||
       item.at("execution_policy").at("autocast_enabled").get<bool>() != (entry.dtype() != torch::kFloat32) ||
-      (entry.dtype() != torch::kFloat32 && item.at("execution_policy").at("autocast_dtype") != dtype_name(entry.dtype()))) invalid("case precision policy mismatch");
+      (entry.dtype() != torch::kFloat32 && item.at("execution_policy").at("autocast_dtype") != dtype_name(entry.dtype())))
+   invalid("case precision policy mismatch");
   for (const auto& group : item.at("parameter_groups")) {
    OracleParameterGroup value;
    value.names = group.at("names").get<std::vector<std::string>>();
-   value.lr = group.at("lr"); value.weight_decay = group.at("weight_decay");
-   value.beta1 = group.at("betas").at(0); value.beta2 = group.at("betas").at(1);
-   value.eps = group.at("eps"); value.amsgrad = group.at("amsgrad");
+   value.lr = group.at("lr");
+   value.weight_decay = group.at("weight_decay");
+   value.beta1 = group.at("betas").at(0);
+   value.beta2 = group.at("betas").at(1);
+   value.eps = group.at("eps");
+   value.amsgrad = group.at("amsgrad");
    entry.parameter_groups.push_back(std::move(value));
   }
   const std::size_t expected_steps = entry.training && entry.batch == 2 && entry.preset == "rf-detr-nano" && entry.precision == "fp32" ? 8 : 1;
@@ -257,7 +276,8 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   for (const auto& precision : {"fp32", "fp16", "bf16"})
    for (const auto batch : {1, 2})
     for (const bool training : {false, true})
-     if (std::ranges::count_if(cases_, [&](const auto& value) { return value.preset == preset && value.precision == precision && value.batch == batch && value.training == training; }) != (std::string_view(precision) == "bf16" && !bf16 ? 0 : 1))
+     if (std::ranges::count_if(cases_, [&](const auto& value) { return value.preset == preset && value.precision == precision && value.batch == batch && value.training == training; }) !=
+         (std::string_view(precision) == "bf16" && !bf16 ? 0 : 1))
       invalid("missing required model case");
  resize_ = archive_record(manifest.at("resize").at("archive"));
 }
@@ -269,13 +289,15 @@ NativeRfDetrModel UpstreamOracle::model(const OracleCase& entry) const {
  if (config.num_classes != entry.classes) invalid("checkpoint class inventory differs");
  NativeRfDetrModel model(config, admitted.artifacts.class_layout);
  auto candidate = model.stage_normalized_state(admitted.model_state.entries(), detail::NormalizedModelStateAdmission::RequiredCore);
- if (!candidate.summary.missing_names.empty() || !candidate.summary.incompatible_names.empty() || !candidate.summary.unexpected_names.empty()) invalid("upstream checkpoint admission inventory differs");
+ if (!candidate.summary.missing_names.empty() || !candidate.summary.incompatible_names.empty() || !candidate.summary.unexpected_names.empty())
+  invalid("upstream checkpoint admission inventory differs");
  model.commit_normalized_state(std::move(candidate));
  model.to(torch::Device(torch::kCUDA));
  model.train(entry.training);
  model.set_force_pytorch_deformable_attn(false);
  std::set<std::string> trainable;
- for (const auto& value : model.named_parameters(true)) if (value.value().requires_grad()) trainable.insert(value.key());
+ for (const auto& value : model.named_parameters(true))
+  if (value.value().requires_grad()) trainable.insert(value.key());
  if (trainable != std::set<std::string>(entry.trainable.begin(), entry.trainable.end())) invalid("trainable parameter inventory differs");
  return model;
 }
@@ -287,40 +309,54 @@ OracleComparison::OracleComparison(const std::filesystem::path& root, std::strin
  report_.open(child(reports, name + ".jsonl"), std::ios::app);
  if (!report_) invalid("cannot write comparison evidence");
  static const auto executable_hash = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file("/proc/self/exe"));
- record({{"boundary", "policy"}, {"run_unix_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()},
-         {"precision", dtype_name(precision)}, {"matmul_tf32", at::globalContext().allowTF32CuBLAS()}, {"cudnn_tf32", at::globalContext().allowTF32CuDNN()},
-         {"forward_autocast", precision != torch::kFloat32}, {"cudnn_benchmark", at::globalContext().benchmarkCuDNN()},
-         {"flash_sdp", at::globalContext().userEnabledFlashSDP()}, {"memory_efficient_sdp", at::globalContext().userEnabledMemEfficientSDP()}, {"math_sdp", at::globalContext().userEnabledMathSDP()},
-         {"native_torch", TORCH_VERSION}, {"native_executable_sha256", executable_hash},
-         {"attention", "native production CUDA"}, {"matcher", "native FP32"}, {"objective", std::move(objective)},
-         {"hyperparameter_tolerance_reason", "eight float64 epsilons allow upstream decay**2 versus native repeated multiplication; zero settings and group membership remain exact"},
-         {"tolerance_reason", "FP32 operation/reduction order; AMP output rounding and CUDA atomic VJP accumulation; discrete identities and finite masks always exact"}});
+ record(
+  {{"boundary", "policy"}, {"run_unix_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()}, {"precision", dtype_name(precision)},
+   {"matmul_tf32", at::globalContext().allowTF32CuBLAS()}, {"cudnn_tf32", at::globalContext().allowTF32CuDNN()}, {"forward_autocast", precision != torch::kFloat32},
+   {"cudnn_benchmark", at::globalContext().benchmarkCuDNN()}, {"flash_sdp", at::globalContext().userEnabledFlashSDP()}, {"memory_efficient_sdp", at::globalContext().userEnabledMemEfficientSDP()},
+   {"math_sdp", at::globalContext().userEnabledMathSDP()}, {"native_torch", TORCH_VERSION}, {"native_executable_sha256", executable_hash}, {"attention", "native production CUDA"},
+   {"matcher", "native FP32"}, {"objective", std::move(objective)},
+   {"hyperparameter_tolerance_reason", "eight float64 epsilons allow upstream decay**2 versus native repeated multiplication; zero settings and group membership remain exact"},
+   {"tolerance_reason", "FP32 operation/reduction order; AMP output rounding and CUDA atomic VJP accumulation; discrete identities and finite masks always exact"}});
 }
-void OracleComparison::record(Json value) { report_ << value.dump() << '\n'; report_.flush(); if (!report_) invalid("comparison evidence write failed"); }
+void OracleComparison::record(Json value) {
+ report_ << value.dump() << '\n';
+ report_.flush();
+ if (!report_) invalid("comparison evidence write failed");
+}
 void OracleComparison::fact(const std::string& boundary, const Json& value) { record({{"boundary", boundary}, {"observation", value}}); }
 void OracleComparison::inventory(const std::string& boundary, const std::set<std::string>& actual, const std::set<std::string>& expected) {
  const bool match = actual == expected;
  record({{"boundary", boundary}, {"actual", actual}, {"expected", expected}, {"passed", match}, {"first_difference", !match && !failed_}});
- if (!match) { failed_ = true; invalid("first differing inventory: " + boundary); }
+ if (!match) {
+  failed_ = true;
+  invalid("first differing inventory: " + boundary);
+ }
 }
 void OracleComparison::compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference) {
  Json result{{"boundary", boundary}, {"policy_difference", policy_difference}, {"actual_defined", actual.defined()}, {"expected_defined", expected.defined()}};
  bool passed = actual.defined() == expected.defined();
  if (actual.defined() && expected.defined()) {
-  result["actual_dtype"] = dtype_name(actual.scalar_type()); result["expected_dtype"] = dtype_name(expected.scalar_type());
-   result["actual_stride"] = actual.strides().vec();
-   result["actual_device"] = actual.device().str(); result["archive_device"] = expected.device().str();
-  result["actual_shape"] = actual.sizes().vec(); result["expected_shape"] = expected.sizes().vec();
+  result["actual_dtype"] = dtype_name(actual.scalar_type());
+  result["expected_dtype"] = dtype_name(expected.scalar_type());
+  result["actual_stride"] = actual.strides().vec();
+  result["actual_device"] = actual.device().str();
+  result["archive_device"] = expected.device().str();
+  result["actual_shape"] = actual.sizes().vec();
+  result["expected_shape"] = expected.sizes().vec();
   passed = actual.sizes() == expected.sizes() && actual.scalar_type() == expected.scalar_type();
   if (actual.sizes() == expected.sizes()) {
    const auto a = actual.detach().cpu(), b = expected.detach().cpu();
    const auto finite = torch::isfinite(a);
    bool finite_equal = torch::equal(finite, torch::isfinite(b));
-   if (a.is_floating_point() && b.is_floating_point()) finite_equal &= torch::equal(torch::isnan(a), torch::isnan(b)) && torch::equal(torch::isposinf(a), torch::isposinf(b)) && torch::equal(torch::isneginf(a), torch::isneginf(b));
+   if (a.is_floating_point() && b.is_floating_point())
+    finite_equal &= torch::equal(torch::isnan(a), torch::isnan(b)) && torch::equal(torch::isposinf(a), torch::isposinf(b)) && torch::equal(torch::isneginf(a), torch::isneginf(b));
    const bool all_finite = finite.all().item<bool>();
-   result["finite_equal"] = finite_equal; result["all_finite"] = all_finite; passed &= finite_equal && all_finite;
+   result["finite_equal"] = finite_equal;
+   result["all_finite"] = all_finite;
+   passed &= finite_equal && all_finite;
    if (!a.is_floating_point() || policy == OracleComparisonPolicy::Exact) {
-    passed &= torch::equal(a, b); result["discrete_equal"] = torch::equal(a, b);
+    passed &= torch::equal(a, b);
+    result["discrete_equal"] = torch::equal(a, b);
    } else if (a.numel() && finite_equal) {
     const auto av = a.to(torch::kFloat64).masked_select(finite), bv = b.to(torch::kFloat64).masked_select(finite);
     if (av.numel()) {
@@ -334,16 +370,24 @@ void OracleComparison::compare(const std::string& boundary, const torch::Tensor&
      const double maximum = difference.abs().max().item<double>(), norm = difference.norm().item<double>();
      const double normalized = derivative ? std::max(maximum / (absolute + relative * bv.abs().max().item<double>()), norm / (absolute + relative * bv.norm().item<double>()))
                                           : (difference.abs() / (absolute + relative * bv.abs()).clamp_min(std::numeric_limits<double>::min())).max().item<double>();
-     result["max_absolute"] = maximum; result["l2_error"] = norm; result["normalized_error"] = normalized;
-     result["absolute_tolerance"] = absolute; result["relative_tolerance"] = relative; result["derivative_norm_bound"] = derivative;
+     result["max_absolute"] = maximum;
+     result["l2_error"] = norm;
+     result["normalized_error"] = normalized;
+     result["absolute_tolerance"] = absolute;
+     result["relative_tolerance"] = relative;
+     result["derivative_norm_bound"] = derivative;
      passed &= std::isfinite(normalized) && normalized <= 1.;
     }
    }
   }
  }
- result["passed"] = passed; result["first_difference"] = !passed && !failed_ && !policy_difference;
+ result["passed"] = passed;
+ result["first_difference"] = !passed && !failed_ && !policy_difference;
  record(std::move(result));
- if (!passed && !policy_difference) { failed_ = true; invalid("first differing tensor boundary: " + boundary); }
+ if (!passed && !policy_difference) {
+  failed_ = true;
+  invalid("first differing tensor boundary: " + boundary);
+ }
 }
 TensorMap oracle_output_tensors(const ModelOutputs& outputs) {
  TensorMap result;
@@ -370,15 +414,23 @@ PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& e
  for (int image = 0; image < entry.batch; ++image) {
   const auto prefix = "target/" + std::to_string(image) + "/";
   auto b = archive.tensor(prefix + "boxes", device), l = archive.tensor(prefix + "labels", device);
-  result.targets.push_back({.boxes = b, .labels = l});
-  result.offsets.push_back(offset); result.counts.push_back(l.numel()); offset += l.numel();
-  boxes.push_back(b); labels.push_back(l);
+  auto& target = result.targets.emplace_back();
+  target.boxes = b;
+  target.labels = l;
+  result.offsets.push_back(offset);
+  result.counts.push_back(l.numel());
+  offset += l.numel();
+  boxes.push_back(b);
+  labels.push_back(l);
   if (archive.contains(prefix + "masks")) masks.push_back(archive.tensor(prefix + "masks"));
  }
- result.all_boxes = torch::cat(boxes); result.all_labels = torch::cat(labels);
+ result.all_boxes = torch::cat(boxes);
+ result.all_labels = torch::cat(labels);
  const auto integers = torch::TensorOptions().device(device).dtype(torch::kInt64);
- result.target_counts = torch::tensor(result.counts, integers); result.target_offsets = torch::tensor(result.offsets, integers);
- result.target_indices = torch::arange(offset, integers); result.resolved_query_count = entry.preset == "rf-detr-nano" ? 300 : 100;
+ result.target_counts = torch::tensor(result.counts, integers);
+ result.target_offsets = torch::tensor(result.offsets, integers);
+ result.target_indices = torch::arange(offset, integers);
+ result.resolved_query_count = entry.preset == "rf-detr-nano" ? 300 : 100;
  if (!masks.empty()) {
   const auto dense = torch::cat(masks).to(torch::kBool).contiguous();
   const auto pixels = dense.size(1) * dense.size(2), words = (pixels + 63) / 64;
@@ -386,7 +438,8 @@ PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& e
   auto* destination = reinterpret_cast<std::uint64_t*>(bits.data_ptr<int64_t>());
   const auto* source = dense.data_ptr<bool>();
   for (int64_t row = 0; row < offset; ++row)
-   for (int64_t pixel = 0; pixel < pixels; ++pixel) if (source[row * pixels + pixel]) destination[row * words + pixel / 64] |= std::uint64_t{1} << (pixel % 64);
+   for (int64_t pixel = 0; pixel < pixels; ++pixel)
+    if (source[row * pixels + pixel]) destination[row * words + pixel / 64] |= std::uint64_t{1} << (pixel % 64);
   result.packed_masks = PackedTargetMasks{bits.to(device), dense.size(1), dense.size(2)};
  }
  return result;
@@ -403,7 +456,8 @@ std::vector<LayerMaskSamples> oracle_samples(const OracleArchive& archive, std::
 DetectionConfig oracle_detection(const NativeRfDetrConfig& config) {
  auto result = detection_fixture_base(config);
  project_loss_coefficients(result, config);
- result.include_masks = config.segmentation; result.mask_point_sample_ratio = config.mask_point_sample_ratio;
+ result.include_masks = config.segmentation;
+ result.mask_point_sample_ratio = config.mask_point_sample_ratio;
  populate_default_detection_weight_dict(result);
  return result;
 }
@@ -429,7 +483,11 @@ void compare_oracle_vjp(OracleComparison& comparison, const OracleArchive& archi
  }
  std::vector<torch::Tensor> operands{input};
  std::vector<std::string> names{"input"};
- for (const auto& entry : model.named_parameters(true)) if (entry.value().requires_grad()) { names.push_back("parameter/" + entry.key()); operands.push_back(entry.value()); }
+ for (const auto& entry : model.named_parameters(true))
+  if (entry.value().requires_grad()) {
+   names.push_back("parameter/" + entry.key());
+   operands.push_back(entry.value());
+  }
  comparison.inventory("VJP inventory", {names.begin(), names.end()}, archive.names("vjp/"));
  const auto gradients = torch::autograd::grad({scalar}, operands, {}, retain_graph, false, true);
  for (std::size_t i = 0; i < names.size(); ++i) comparison.compare("vjp/" + names[i], gradients[i], archive.tensor("vjp/" + names[i]), OracleComparisonPolicy::Derivative);

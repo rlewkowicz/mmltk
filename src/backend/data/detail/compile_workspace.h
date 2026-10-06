@@ -23,8 +23,8 @@ struct CompileWorkspacePlan {
  [[nodiscard]] static CompileWorkspacePlan prepare(
   std::size_t workers, std::span<const CompileWorkspaceProfile>, std::size_t shared_windows, std::size_t compaction, std::uint64_t explicit_budget = 0);
 };
-[[nodiscard]] CompileWorkspacePlan compile_workspace_plan(
- std::size_t workers, std::uint32_t resolution, bool perceptual, std::size_t reader_window = 0, std::uint64_t explicit_budget = 0, std::size_t encoded_window = 0, imaging::resample::RgbResizeMethod method = imaging::resample::RgbResizeMethod::Native);
+[[nodiscard]] CompileWorkspacePlan compile_workspace_plan(std::size_t workers, std::uint32_t resolution, bool perceptual, std::size_t reader_window = 0, std::uint64_t explicit_budget = 0,
+ std::size_t encoded_window = 0, imaging::resample::RgbResizeMethod method = imaging::resample::RgbResizeMethod::Native);
 [[nodiscard]] CompileWorkspacePlan compile_workspace_plan(std::size_t workers, CompilePixelPolicy, std::span<const CompileWorkClass> enabled, CompileWorkspaceProfile annotations,
  std::size_t encoded_window, std::size_t pixel_input_bytes = 0, std::size_t source_window = 0);
 // Shared custody supports a moved output lease or immutable batch descendants.

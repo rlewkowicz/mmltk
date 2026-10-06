@@ -1159,8 +1159,8 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(
  if (!limits.workspace_plan)
   limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers, 1, false, 0, limits.transient_bytes, BenchmarkEncodedImage::normal_window_bytes));
  impl_ = std::make_shared<Impl>(workers, cpus, limits, cancellation, std::move(trace));
- impl_->readiness = std::make_unique<CompileExecution::Readiness>(
-  impl_->execution, CompileChange::Resources | CompileChange::Records | CompileChange::Fairness, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness& subscription, CompileExecution::Readiness::Changes changes) {
+ impl_->readiness = std::make_unique<CompileExecution::Readiness>(impl_->execution, CompileChange::Resources | CompileChange::Records | CompileChange::Fairness,
+  [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness& subscription, CompileExecution::Readiness::Changes changes) {
   if (!changes.retry && !includes(changes.causes, CompileChange::Records | CompileChange::Local | CompileChange::Fairness | CompileChange::Interruption)) return;
   if (auto owner = weak.lock()) {
    try {

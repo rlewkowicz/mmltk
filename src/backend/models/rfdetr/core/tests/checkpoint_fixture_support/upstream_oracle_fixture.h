@@ -15,7 +15,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 namespace mmltk::backend::models::rfdetr::testsupport {
 struct OracleTensor final {
  bool defined = false;
@@ -52,6 +52,7 @@ public:
  [[nodiscard]] torch::Tensor tensor(const std::string& name, torch::Device device = torch::kCPU) const;
  [[nodiscard]] std::set<std::string> names(std::string_view prefix) const;
  [[nodiscard]] bool contains(const std::string& name) const;
+
 private:
  TensorMap tensors_;
  std::set<std::string> undefined_;
@@ -68,6 +69,7 @@ public:
  [[nodiscard]] NativeRfDetrModel model(const OracleCase& entry) const;
  [[nodiscard]] OracleArchive archive(const OracleCase& entry, std::size_t step) const;
  [[nodiscard]] OracleArchive resize_archive() const;
+
 private:
  std::filesystem::path directory_;
  std::map<std::string, std::filesystem::path> checkpoints_;
@@ -80,11 +82,11 @@ enum class OracleComparisonPolicy : std::uint8_t { Value, Exact, Derivative, Sec
 // diagnostic stock-policy differential never counts as controlled parity.
 class OracleComparison final {
 public:
- OracleComparison(const std::filesystem::path& root, std::string name, at::ScalarType precision,
-  std::string objective = "stock IA-BCE with separately declared FP32 matcher policy");
+ OracleComparison(const std::filesystem::path& root, std::string name, at::ScalarType precision, std::string objective = "stock IA-BCE with separately declared FP32 matcher policy");
  void compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference = false);
  void inventory(const std::string& boundary, const std::set<std::string>& actual, const std::set<std::string>& expected);
  void fact(const std::string& boundary, const nlohmann::json& value);
+
 private:
  void record(nlohmann::json value);
  std::ofstream report_;

@@ -22,7 +22,8 @@ using common::math::checked_multiply;
 using common::system::NumaMemory;
 using common::system::page_rounded_bytes;
 }  // namespace
-CompileWorkspacePlan compile_workspace_plan(std::size_t workers, std::uint32_t resolution, bool perceptual, std::size_t reader_window, std::uint64_t explicit_budget, std::size_t encoded_window, imaging::resample::RgbResizeMethod method) {
+CompileWorkspacePlan compile_workspace_plan(
+ std::size_t workers, std::uint32_t resolution, bool perceptual, std::size_t reader_window, std::uint64_t explicit_budget, std::size_t encoded_window, imaging::resample::RgbResizeMethod method) {
  if (explicit_budget) return CompileWorkspacePlan::prepare(workers, {}, 0, 0, explicit_budget);
  constexpr std::array enabled{CompileWorkClass::Acquisition, CompileWorkClass::Extraction, CompileWorkClass::Annotations, CompileWorkClass::Pixels, CompileWorkClass::Gather, CompileWorkClass::Output};
  return compile_workspace_plan(

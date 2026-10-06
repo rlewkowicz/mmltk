@@ -38,8 +38,10 @@ Signature signature_of(std::span<const torch::Tensor> inputs, bool dynamic, std:
  Signature result;
  result.specialization = specialization;
  auto& context = at::globalContext();
- result.attention_policy = {context.userEnabledFlashSDP(), context.userEnabledMemEfficientSDP(), context.userEnabledMathSDP(), context.userEnabledCuDNNSDP(),
-  context.allowFP16BF16ReductionMathSDP(), context.allowTF32CuBLAS(), context.allowTF32CuDNN(), context.userEnabledFA3SDP(), context.userEnabledOverrideableSDP(), context.deterministicAlgorithms()};
+ result.attention_policy = {
+  context.userEnabledFlashSDP(), context.userEnabledMemEfficientSDP(), context.userEnabledMathSDP(), context.userEnabledCuDNNSDP(), context.allowFP16BF16ReductionMathSDP(), context.allowTF32CuBLAS(),
+  context.allowTF32CuDNN(), context.userEnabledFA3SDP(), context.userEnabledOverrideableSDP(), context.deterministicAlgorithms()
+ };
  result.attention_priority = context.sDPPriorityOrder();
  for (const auto& input : inputs) {
   TORCH_CHECK(input.defined() && input.dim() <= 4, "tensor trace requires defined tensors of rank at most four");
@@ -159,7 +161,7 @@ TensorTrace::Result TensorTrace::invoke(bool training, std::span<const torch::Te
   }
  }
  if (slot.state && (slot.state->signature.attention_policy != signature.attention_policy || slot.state->signature.attention_priority != signature.attention_priority ||
-     std::ranges::any_of(slot.state->members, [](const auto& member) { return state_signature(member.tensor) != member.signature; }))) {
+                    std::ranges::any_of(slot.state->members, [](const auto& member) { return state_signature(member.tensor) != member.signature; }))) {
   diagnostic("registered owner or attention policy changed; invalidated");
   slot.state.reset();
   slot.armed = true;

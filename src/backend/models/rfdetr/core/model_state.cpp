@@ -68,10 +68,11 @@ void capture_checkpoint_detection_metadata(NativeCheckpointMetadata& metadata, c
   if constexpr (model_state_detail::is_optional<std::remove_cvref_t<Target>>) target = source;
  });
 }
-void validate_checkpoint_topology(const NativeRfDetrConfig& config, const NativeCheckpointMetadata& metadata) {
- template for (constexpr auto evidence : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
+template <class Config, class Metadata>
+void validate_checkpoint_topology(const Config& config, const Metadata& metadata) {
+ template for (constexpr auto evidence : std::define_static_array(std::meta::nonstatic_data_members_of(^^Metadata, std::meta::access_context::current()))) {
   if constexpr (std::meta::identifier_of(evidence).starts_with("topology_")) {
-   template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeRfDetrConfig, std::meta::access_context::current()))) {
+   template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^Config, std::meta::access_context::current()))) {
     if constexpr (std::meta::identifier_of(evidence).substr(std::string_view("topology_").size()) == std::meta::identifier_of(field)) {
      if (metadata.[:evidence:] && *metadata.[:evidence:] != config.[:field:])
       throw std::invalid_argument("RF-DETR checkpoint topology disagrees with selected preset: " + std::string(std::meta::identifier_of(field)));

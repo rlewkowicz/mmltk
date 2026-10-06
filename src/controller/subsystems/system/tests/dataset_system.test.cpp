@@ -50,11 +50,11 @@ public:
  std::function<void(mmltk::common::concurrency::CancellationObservation)> work;
 
 private:
- void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode, mmltk::backend::imaging::resample::RgbResizeMethod,
-  mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
+ void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
+  mmltk::backend::imaging::resample::RgbResizeMethod, mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
  void compile_benchmark(mmltk::backend::data::BenchmarkDatasetSelection selected, const std::filesystem::path& output, const std::filesystem::path& publication, std::uint32_t, bool,
-  mmltk::backend::imaging::resample::ImageResizeMode, mmltk::backend::imaging::resample::RgbResizeMethod, mmltk::common::concurrency::CancellationObservation cancellation, services::ArtifactProgressObserver,
-  services::ArtifactBenchmarkTraceObserver trace) const override {
+  mmltk::backend::imaging::resample::ImageResizeMode, mmltk::backend::imaging::resample::RgbResizeMethod, mmltk::common::concurrency::CancellationObservation cancellation,
+  services::ArtifactProgressObserver, services::ArtifactBenchmarkTraceObserver trace) const override {
   selection = selected;
   physical_output = output;
   publication_output = publication;

@@ -21,7 +21,8 @@ void save_upstream_python_checkpoint(const std::filesystem::path& path, const st
 }
 void write_minimal_upstream_checkpoint(const std::filesystem::path& path, const ParityFixtureCase& fixture) { save_upstream_python_checkpoint(path, make_minimal_upstream_checkpoint_state(fixture)); }
 void write_checkpoint_envelope(const std::filesystem::path& source, const std::filesystem::path& destination, CheckpointEnvelope envelope, std::string_view metadata) {
- const auto result = mmltk::testsupport::run_subprocess_capture_output({"/usr/bin/env", "-u", "LD_LIBRARY_PATH", "-u", "PYTHONPATH", MMLTK_RFDETR_PYTHON_EXECUTABLE, "-c", R"py(
+ const auto result = mmltk::testsupport::run_subprocess_capture_output(
+  {"/usr/bin/env", "-u", "LD_LIBRARY_PATH", "-u", "PYTHONPATH", MMLTK_RFDETR_PYTHON_EXECUTABLE, "-c", R"py(
 import json, sys, torch
 checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 model = checkpoint["model"]
@@ -44,7 +45,8 @@ else:
     checkpoint = {"state_dict": state, "hyper_parameters": arguments,
                   **({"class_layout": checkpoint["class_layout"]} if "class_layout" in checkpoint else {})}
 torch.save(checkpoint, sys.argv[2])
-)py", source.string(), destination.string(), std::to_string(static_cast<int>(envelope)), std::string(metadata)});
+)py",
+   source.string(), destination.string(), std::to_string(static_cast<int>(envelope)), std::string(metadata)});
  if (result.exit_code != 0) throw std::runtime_error("checkpoint envelope fixture failed: " + result.output_text);
 }
 void log_fixture_phase(const char* test_name, const std::size_t index, const std::size_t total, const char* phase, const char* preset_name) {

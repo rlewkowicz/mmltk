@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/model_fwd.h"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -16,7 +17,6 @@ class Backend;
 class Store;
 }  // namespace c10d
 namespace mmltk::backend::models::rfdetr {
-class NativeRfDetrModel;
 struct TrainRequest;
 struct TrainingFailure;
 namespace detail {

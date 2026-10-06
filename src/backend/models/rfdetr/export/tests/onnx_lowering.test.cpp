@@ -580,9 +580,8 @@ TEST_CASE("Math SDPA lowering refuses unsupported dropout and masks explicitly",
  const auto input = torch::rand({1, 2, 3, 4});
  for (const bool masked : {false, true}) {
   const auto mask = torch::zeros({3, 3});
-  auto graph = trace_unary_graph(input, [&](const torch::Tensor& value) {
-   return std::get<0>(at::_scaled_dot_product_attention_math(value, value, value, masked ? std::optional<torch::Tensor>{mask} : std::nullopt, masked ? 0.0 : .1));
-  });
+  auto graph = trace_unary_graph(input,
+   [&](const torch::Tensor& value) { return std::get<0>(at::_scaled_dot_product_attention_math(value, value, value, masked ? std::optional<torch::Tensor>{mask} : std::nullopt, masked ? 0.0 : .1)); });
   mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, masked ? "attention masks are not supported" : "dropout_p must be 0");
  }
 }

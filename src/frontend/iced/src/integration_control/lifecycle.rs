@@ -83,8 +83,12 @@ impl Default for State {
 
 impl State {
     fn compile_resize_control(&self) -> &'static str {
-        ["train.dataset.resampling.torch", "train.dataset.resampling.torch_antialias",
-         "train.dataset.resampling.native", COMPILE_LETTERBOX][self.compile_method_step]
+        [
+            "train.dataset.resampling.torch",
+            "train.dataset.resampling.torch_antialias",
+            "train.dataset.resampling.native",
+            COMPILE_LETTERBOX,
+        ][self.compile_method_step]
     }
     fn benchmark_choice(
         &self,
@@ -1116,23 +1120,40 @@ impl State {
             }
             Phase::CompileResizeMode => widgets.arm(driver, self.compile_resize_control()),
             Phase::AwaitCompileResizeMode
-                if !settings.has_local_edits() && settings.draft.as_ref().is_some_and(|draft| {
-                    use crate::generated::RgbResizeMethod;
-                    let train = &draft.workflows.train;
-                    train.compileresizemethod == [RgbResizeMethod::TorchBilinear,
-                        RgbResizeMethod::TorchBilinearAntialias, RgbResizeMethod::Native,
-                        RgbResizeMethod::Native][self.compile_method_step]
-                        && (self.compile_method_step < 3 || train.compileresizemode == crate::generated::ImageResizeMode::Letterbox)
-                }) =>
+                if !settings.has_local_edits()
+                    && settings.draft.as_ref().is_some_and(|draft| {
+                        use crate::generated::RgbResizeMethod;
+                        let train = &draft.workflows.train;
+                        train.compileresizemethod
+                            == [
+                                RgbResizeMethod::TorchBilinear,
+                                RgbResizeMethod::TorchBilinearAntialias,
+                                RgbResizeMethod::Native,
+                                RgbResizeMethod::Native,
+                            ][self.compile_method_step]
+                            && (self.compile_method_step < 3
+                                || train.compileresizemode
+                                    == crate::generated::ImageResizeMode::Letterbox)
+                    }) =>
             {
                 let train = &settings.draft.as_ref().unwrap().workflows.train;
                 if train.compileperceptualdownscale != self.perceptual_baseline[2] {
                     driver.fail("RGB method selection changed the stored perceptual choice");
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record("integration.rgb_resampling", self.compile_resize_control(),
-                    "rendered-dataset-selection", [self.compile_method_step as f64, train.compileresizemethod as u8 as f64,
-                        train.compileperceptualdownscale as u8 as f64, 1.0]));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.rgb_resampling",
+                        self.compile_resize_control(),
+                        "rendered-dataset-selection",
+                        [
+                            self.compile_method_step as f64,
+                            train.compileresizemethod as u8 as f64,
+                            train.compileperceptualdownscale as u8 as f64,
+                            1.0,
+                        ],
+                    )
+                });
                 if self.compile_method_step < 3 {
                     self.compile_method_step += 1;
                     driver.phase = Phase::CompileResizeMode;

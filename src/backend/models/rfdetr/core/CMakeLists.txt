@@ -39,6 +39,7 @@ mmltk_register_public_headers(
         evaluation.h
         evaluator.h
         model_info.h
+        model_fwd.h
         model_state.h
         model.h
         model_state_load.h

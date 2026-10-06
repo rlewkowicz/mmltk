@@ -30,7 +30,9 @@ std::vector<Json> oracle_comparison_records(const std::filesystem::path& root, c
 }
 void check_oracle_policy(at::ScalarType precision, ComparisonPolicy policy, const torch::Tensor& actual, const torch::Tensor& expected, bool passed) {
  const mmltk::testsupport::ScopedTempDir root("rfdetr-oracle-policy");
- constexpr std::array labels{"renamed/value", "parameter-group/renamed", "gradient/renamed", "optimizer/renamed/exp_avg_sq", "renamed/step", "renamed/point_coords", "optimizer/renamed/exp_avg/unused-zero"};
+ constexpr std::array labels{
+  "renamed/value", "parameter-group/renamed", "gradient/renamed", "optimizer/renamed/exp_avg_sq", "renamed/step", "renamed/point_coords", "optimizer/renamed/exp_avg/unused-zero"
+ };
  for (const bool differential : {false, true}) {
   CAPTURE(differential);
   const std::string name = differential ? "stock" : "required";
@@ -56,21 +58,23 @@ void check_oracle_policy(at::ScalarType precision, ComparisonPolicy policy, cons
    CHECK(record.at("first_difference") == (!passed && !differential && index == 0));
    record.erase("boundary");
    record.erase("first_difference");
-   if (index == 0) first = record;
-   else CHECK(record == first);
+   if (index == 0)
+    first = record;
+   else
+    CHECK(record == first);
   }
  }
 }
-}
+}  // namespace
 TEST_CASE("Oracle numerical policies retain their bounds under renamed evidence labels", "[rfdetr][parity][oracle_policy]") {
  struct PrecisionCase {
   at::ScalarType dtype;
   double value_inside, value_outside, value_absolute_inside, value_absolute_outside, derivative_inside, derivative_outside;
  };
  constexpr std::array precisions{
-  PrecisionCase{torch::kFloat32, .0002, .0004, 1e-5, 3e-5, .0015, .0025},
-  PrecisionCase{torch::kFloat16, .01, .02, .001, .003, .01, .02},
-  PrecisionCase{torch::kBFloat16, .02, .04, .001, .003, .02, .04}};
+  PrecisionCase{torch::kFloat32, .0002, .0004, 1e-5, 3e-5, .0015, .0025}, PrecisionCase{torch::kFloat16, .01, .02, .001, .003, .01, .02},
+  PrecisionCase{torch::kBFloat16, .02, .04, .001, .003, .02, .04}
+ };
  const auto scalar = [](double value) { return torch::tensor(value, torch::kFloat64); };
  const double epsilon = std::numeric_limits<double>::epsilon();
  for (const auto& precision : precisions) {
@@ -90,15 +94,12 @@ TEST_CASE("Oracle numerical policies retain their bounds under renamed evidence 
     {"value relative outside", ComparisonPolicy::Value, scalar(1. + precision.value_outside), scalar(1.), false},
     {"value absolute inside", ComparisonPolicy::Value, scalar(precision.value_absolute_inside), scalar(0.), true},
     {"value absolute outside", ComparisonPolicy::Value, scalar(precision.value_absolute_outside), scalar(0.), false},
-    {"value elementwise bound", ComparisonPolicy::Value, vector_inside, vector_expected, false},
-    {"exact equal", ComparisonPolicy::Exact, scalar(1.), scalar(1.), true},
+    {"value elementwise bound", ComparisonPolicy::Value, vector_inside, vector_expected, false}, {"exact equal", ComparisonPolicy::Exact, scalar(1.), scalar(1.), true},
     {"exact unequal", ComparisonPolicy::Exact, scalar(1. + epsilon), scalar(1.), false},
     {"derivative relative inside", ComparisonPolicy::Derivative, scalar(1. + precision.derivative_inside), scalar(1.), true},
     {"derivative relative outside", ComparisonPolicy::Derivative, scalar(1. + precision.derivative_outside), scalar(1.), false},
-    {"derivative absolute inside", ComparisonPolicy::Derivative, scalar(5e-8), scalar(0.), true},
-    {"derivative absolute outside", ComparisonPolicy::Derivative, scalar(2e-7), scalar(0.), false},
-    {"derivative global bound", ComparisonPolicy::Derivative, vector_inside, vector_expected, true},
-    {"derivative L2 bound", ComparisonPolicy::Derivative, vector_l2_failure, vector_expected, false},
+    {"derivative absolute inside", ComparisonPolicy::Derivative, scalar(5e-8), scalar(0.), true}, {"derivative absolute outside", ComparisonPolicy::Derivative, scalar(2e-7), scalar(0.), false},
+    {"derivative global bound", ComparisonPolicy::Derivative, vector_inside, vector_expected, true}, {"derivative L2 bound", ComparisonPolicy::Derivative, vector_l2_failure, vector_expected, false},
     {"derivative maximum bound", ComparisonPolicy::Derivative, vector_max_failure, torch::ones({2}, torch::kFloat64), false},
     {"second moment relative inside", ComparisonPolicy::SecondMoment, scalar(1. + precision.derivative_inside), scalar(1.), true},
     {"second moment relative outside", ComparisonPolicy::SecondMoment, scalar(1. + precision.derivative_outside), scalar(1.), false},
@@ -108,9 +109,9 @@ TEST_CASE("Oracle numerical policies retain their bounds under renamed evidence 
     {"second moment L2 bound", ComparisonPolicy::SecondMoment, vector_l2_failure, vector_expected, false},
     {"second moment maximum bound", ComparisonPolicy::SecondMoment, vector_max_failure, torch::ones({2}, torch::kFloat64), false},
     {"hyperparameter inside", ComparisonPolicy::Hyperparameter, scalar(1. + 4 * epsilon), scalar(1.), true},
-    {"hyperparameter outside", ComparisonPolicy::Hyperparameter, scalar(1. + 16 * epsilon), scalar(1.), false},
-    {"hyperparameter zero", ComparisonPolicy::Hyperparameter, scalar(0.), scalar(0.), true},
-    {"hyperparameter zero is exact", ComparisonPolicy::Hyperparameter, scalar(std::numeric_limits<double>::denorm_min()), scalar(0.), false}};
+    {"hyperparameter outside", ComparisonPolicy::Hyperparameter, scalar(1. + 16 * epsilon), scalar(1.), false}, {"hyperparameter zero", ComparisonPolicy::Hyperparameter, scalar(0.), scalar(0.), true},
+    {"hyperparameter zero is exact", ComparisonPolicy::Hyperparameter, scalar(std::numeric_limits<double>::denorm_min()), scalar(0.), false}
+   };
    for (const auto& entry : cases) {
     CAPTURE(entry.name);
     check_oracle_policy(precision.dtype, entry.policy, entry.actual, entry.expected, entry.passed);
@@ -131,22 +132,13 @@ TEST_CASE("Oracle policies retain structural and finite tensor admission", "[rfd
     bool passed;
    };
    const std::vector<TensorCase> cases{
-    {"undefined pair", {}, {}, true},
-    {"undefined actual", {}, one, false},
-    {"undefined expected", one, {}, false},
-    {"dtype mismatch", one.to(torch::kFloat64), one, false},
-    {"shape mismatch", one.reshape({1, 1}), one, false},
-    {"empty pair", one.narrow(0, 0, 0), one.narrow(0, 0, 0), true},
-    {"integer equal", age, age, true},
-    {"integer exact beyond double precision", age + 1, age, false},
-    {"boolean equal", one.to(torch::kBool), one.to(torch::kBool), true},
-    {"boolean unequal", one.to(torch::kBool), torch::zeros({1}, torch::kBool), false},
-    {"NaN pair", nan, nan, false},
-    {"NaN mask mismatch", nan, one, false},
-    {"infinity pair", infinity, infinity, false},
-    {"infinity sign mismatch", infinity, -infinity, false},
-    {"infinity finite mismatch", one, infinity, false},
-    {"nonfinite category mismatch", nan, infinity, false}};
+    {"undefined pair", {}, {}, true}, {"undefined actual", {}, one, false}, {"undefined expected", one, {}, false}, {"dtype mismatch", one.to(torch::kFloat64), one, false},
+    {"shape mismatch", one.reshape({1, 1}), one, false}, {"empty pair", one.narrow(0, 0, 0), one.narrow(0, 0, 0), true}, {"integer equal", age, age, true},
+    {"integer exact beyond double precision", age + 1, age, false}, {"boolean equal", one.to(torch::kBool), one.to(torch::kBool), true},
+    {"boolean unequal", one.to(torch::kBool), torch::zeros({1}, torch::kBool), false}, {"NaN pair", nan, nan, false}, {"NaN mask mismatch", nan, one, false},
+    {"infinity pair", infinity, infinity, false}, {"infinity sign mismatch", infinity, -infinity, false}, {"infinity finite mismatch", one, infinity, false},
+    {"nonfinite category mismatch", nan, infinity, false}
+   };
    for (const auto& entry : cases) {
     CAPTURE(entry.name);
     check_oracle_policy(torch::kFloat32, policy, entry.actual, entry.expected, entry.passed);
@@ -214,8 +206,7 @@ TEST_CASE("Explicit RGB resampling matches actual upstream tensor resize and rec
  if (!requested) SKIP("optional upstream evidence not requested; generate with --diagnose-rfdetr-upstream for independent resize acceptance");
  const rf::testsupport::UpstreamOracle oracle(*requested);
  const auto archive = oracle.resize_archive();
- rf::testsupport::OracleComparison comparison(*requested, "rgb-resampling", torch::kFloat32,
-  "actual torchvision float RGB bilinear align_corners=false; PIL RGB8 dataset path recorded separately");
+ rf::testsupport::OracleComparison comparison(*requested, "rgb-resampling", torch::kFloat32, "actual torchvision float RGB bilinear align_corners=false; PIL RGB8 dataset path recorded separately");
  for (const auto* name : {"identity", "enlarge", "shrink", "odd_aspect", "high_frequency"}) {
   const std::string key(name);
   const auto rgb = archive.tensor(key + "/rgb8").contiguous();

@@ -937,7 +937,7 @@ TEST_CASE("explicit Torch RGB methods preserve geometry float output and bounded
    for (unsigned y = 0; y < height; ++y)
     for (unsigned x = 0; x < width; ++x)
      if (x < geometry.offset_x || y < geometry.offset_y || x >= geometry.offset_x + geometry.resized_width || y >= geometry.offset_y + geometry.resized_height)
-      CHECK(actual[channel * width * height + y * width + x] == 0);
+      CHECK(actual[channel * width * height + y * width + x] == 0.F);
   if (plan.bytes()) CHECK_THROWS_AS(supplied.prepare(plan, memory.first(plan.bytes() - 1)), std::length_error);
   if (plan.path() == RgbResizePath::Identity) {
    rgb_hwc_u8_to_nchw_f32(source.data(), expected.data(), 17, 13);
@@ -951,7 +951,10 @@ TEST_CASE("Torch RGB workers retain independent local CPU limits", "[image_resiz
  const auto work = [](int threads) {
   (void)at::get_num_threads();
   const int previous = omp_get_max_threads();
-  struct Restore { int value; ~Restore() { omp_set_num_threads(value); } } restore{previous};
+  struct Restore {
+   int value;
+   ~Restore() { omp_set_num_threads(value); }
+  } restore{previous};
   omp_set_num_threads(threads);
   const auto source = make_test_image(53, 37);
   std::vector<float> result(17 * 11 * 3);

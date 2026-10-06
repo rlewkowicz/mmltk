@@ -130,10 +130,13 @@ impl Component {
                         })),
                         crate::view::shared::disclosure(
                             "predict.resampling",
-                            draft.is_some_and(|value| value.source.kind == crate::generated::SourceKind::SingleImage),
+                            draft.is_some_and(|value| value.source.kind
+                                == crate::generated::SourceKind::SingleImage),
                             crate::view::workflow::fields::rgb_resize_method(
                                 "predict.resampling",
-                                draft.map_or(crate::generated::RgbResizeMethod::Native, |value| value.request.resizemethod),
+                                draft.map_or(crate::generated::RgbResizeMethod::Native, |value| {
+                                    value.request.resizemethod
+                                }),
                                 settings_edit_available,
                                 Message::ResizeMethodChanged,
                                 Message::Ignore,
@@ -451,11 +454,34 @@ mod tests {
         use crate::generated::{RgbResizeMethod, SourceKind};
         let mut settings = crate::view::settings::installed_settings_model();
         let mut component = Component::default();
-        for method in [RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias, RgbResizeMethod::Native] {
-            component.update(&mut settings, None, Message::ResizeMethodChanged(method)).unwrap();
-            for source in [SourceKind::SingleImage, SourceKind::CompiledDataset, SourceKind::VideoFile, SourceKind::SingleImage] {
-                component.update(&mut settings, None, Message::SourceChanged(source)).unwrap();
-                assert_eq!(settings.draft.as_ref().unwrap().workflows.predict.request.resizemethod, method);
+        for method in [
+            RgbResizeMethod::TorchBilinear,
+            RgbResizeMethod::TorchBilinearAntialias,
+            RgbResizeMethod::Native,
+        ] {
+            component
+                .update(&mut settings, None, Message::ResizeMethodChanged(method))
+                .unwrap();
+            for source in [
+                SourceKind::SingleImage,
+                SourceKind::CompiledDataset,
+                SourceKind::VideoFile,
+                SourceKind::SingleImage,
+            ] {
+                component
+                    .update(&mut settings, None, Message::SourceChanged(source))
+                    .unwrap();
+                assert_eq!(
+                    settings
+                        .draft
+                        .as_ref()
+                        .unwrap()
+                        .workflows
+                        .predict
+                        .request
+                        .resizemethod,
+                    method
+                );
             }
         }
     }

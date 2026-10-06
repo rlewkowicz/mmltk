@@ -2796,11 +2796,15 @@ run_rfdetr_upstream_diagnostic() {
     output="$(realpath -m -- "${output}")"
     [[ "${upstream}" != *:* && "${output}" != *:* ]] || die 'oracle mount paths cannot contain colons'
     [[ -f "${upstream}/src/rfdetr/models/lwdetr.py" ]] || die 'oracle source must be the RF-DETR checkout root'
-    [[ "$(git -C "${upstream}" rev-parse HEAD)" == "${revision}" ]] || die "oracle requires pinned upstream ${revision}"
-    [[ -z "$(git -C "${upstream}" status --porcelain --untracked-files=all)" ]] || die 'oracle upstream checkout must be clean, including untracked files'
-    local source_git source_common
-    source_git="$(git -C "${upstream}" rev-parse --absolute-git-dir)"
-    source_common="$(git -C "${upstream}" rev-parse --path-format=absolute --git-common-dir)"
+    local -a source_git_command=(git --no-optional-locks -c "safe.directory=${upstream}" -C "${upstream}")
+    local source_revision source_status source_git source_common source_tree
+    source_revision="$("${source_git_command[@]}" rev-parse HEAD)" || die 'cannot read oracle upstream revision'
+    [[ "${source_revision}" == "${revision}" ]] || die "oracle requires pinned upstream ${revision}"
+    source_status="$("${source_git_command[@]}" status --porcelain --untracked-files=all)" || die 'cannot inspect oracle upstream worktree'
+    [[ -z "${source_status}" ]] || die 'oracle upstream checkout must be clean, including untracked files'
+    source_git="$("${source_git_command[@]}" rev-parse --absolute-git-dir)" || die 'cannot resolve oracle upstream Git directory'
+    source_common="$("${source_git_command[@]}" rev-parse --path-format=absolute --git-common-dir)" || die 'cannot resolve oracle upstream common Git directory'
+    source_tree="$("${source_git_command[@]}" rev-parse 'HEAD^{tree}')" || die 'cannot read oracle upstream tree'
     [[ "${source_git}" != *:* && "${source_common}" != *:* ]] || die 'oracle Git mount paths cannot contain colons'
     case "${output}/" in "${upstream}/"*) die 'oracle output must be outside the read-only upstream checkout' ;; esac
     [[ ! -e "${output}/manifest.json" && ! -e "${output}/verdict.json" && ! -e "${output}/references" ]] || die 'oracle output already contains evidence; choose a fresh directory'
@@ -2815,7 +2819,7 @@ run_rfdetr_upstream_diagnostic() {
     local fingerprint image="${image_name}-rfdetr-oracle" diagnostic_container="${container_name}-upstream"
     fingerprint="$(
         {
-            printf '%s\n' "${revision}" "${nvidia_donor_image}" "$(git -C "${upstream}" rev-parse 'HEAD^{tree}')"
+            printf '%s\n' "${revision}" "${nvidia_donor_image}" "${source_tree}"
             sha256sum "${repo_root}/docker/Dockerfile.rfdetr-oracle" \
                 "${repo_root}/docker/nvidia-payload.json" \
                 "${repo_root}/tools/rfdetr_oracle_requirements.txt" \

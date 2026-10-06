@@ -195,7 +195,8 @@ TEST_CASE("Projector SiLU retains the standard primitive and VJP through selecti
     torch::Tensor actual, expected, normalized;
     {
      mmltk::backend::ml::cuda::TorchAutocastScope scope(!explicit_low_dtype && amp != torch::kFloat32, amp);
-     actual = region.invoke(true, {input}, {module.get()}, [&](const auto& values) {
+     actual = region
+               .invoke(true, {input}, {module.get()}, [&](const auto& values) {
       return rf::detail::SelectiveTensorRegion::Tensors{rf::test_support::ProjectorConvTestAccess::invoke(*module, values.front())};
      }).front();
      auto convolved = F::conv2d(reference_input, weight).permute({0, 2, 3, 1});
@@ -378,7 +379,7 @@ TEST_CASE("Depthwise dispatcher replay keeps original-weight VJPs and optional g
       input = make_input(replay);
       {
        torch::NoGradGuard guard;
-       weight.add_(.00317); // Live weight values cannot become capture constants.
+       weight.add_(.00317);  // Live weight values cannot become capture constants.
       }
       mmltk::backend::ml::cuda::TorchAutocastScope scope(amp != torch::kFloat32, amp);
       auto stack = arguments(input);
@@ -395,8 +396,14 @@ TEST_CASE("Depthwise dispatcher replay keeps original-weight VJPs and optional g
      auto b = has_bias ? bias.detach().clone().set_requires_grad(true) : torch::Tensor{};
      const auto expected = reference_depthwise(x, w, b);
      std::vector<torch::Tensor> native_inputs{input}, reference_inputs{x};
-     if (train_weight) { native_inputs.push_back(weight); reference_inputs.push_back(w); }
-     if (has_bias) { native_inputs.push_back(bias); reference_inputs.push_back(b); }
+     if (train_weight) {
+      native_inputs.push_back(weight);
+      reference_inputs.push_back(w);
+     }
+     if (has_bias) {
+      native_inputs.push_back(bias);
+      reference_inputs.push_back(b);
+     }
      const auto incoming = (torch::arange(18, options).reshape_as(output) * .04113 + .037).to(output.scalar_type());
      for (const double scale : {1., .75}) {
       const auto cotangent = incoming * scale;
@@ -440,7 +447,7 @@ TEST_CASE("IA-BCE casts detached quality independently into mixed precision dest
      const auto iou = reference_giou(reference_corners(outputs.main.pred_boxes[0][0].detach().unsqueeze(0)), reference_corners(box), false).squeeze(0);
      const auto quality = (torch::pow(probability[0][0][0], config.focal_alpha) * torch::pow(iou, 1 - config.focal_alpha)).clamp_min(.01).detach();
      auto positive = torch::zeros_like(reference_logits);
-     auto negative = torch::pow(probability, 2.); // pow's autocast policy is part of this boundary.
+     auto negative = torch::pow(probability, 2.);  // pow's autocast policy is part of this boundary.
      REQUIRE(negative.scalar_type() == torch::kFloat32);
      positive.index_put_({0, 0, 0}, quality.to(positive.scalar_type()));
      const auto negative_quality = 1 - quality.to(negative.scalar_type());
@@ -539,11 +546,10 @@ TEST_CASE("Exceptional AMP matching reconstructs full-domain FP32 mask and detec
     // when selecting the exceptional replacement, just like the contract.
     const auto z = outputs.main.pred_logits.flatten(0, 1).cpu().to(torch::kFloat32), p = z.sigmoid();
     const auto b = outputs.main.pred_boxes.flatten(0, 1).cpu().to(torch::kFloat32), t = gt.all_boxes.cpu();
-    auto cost = 2 * (.25 * (1 - p).square() * torch::softplus(-z) - .75 * p.square() * torch::softplus(z)).expand({4, 2}) +
-     5 * (b.unsqueeze(1) - t.unsqueeze(0)).abs().sum(-1) - 2 * reference_giou(reference_corners(b), reference_corners(t), true, true);
+    auto cost = 2 * (.25 * (1 - p).square() * torch::softplus(-z) - .75 * p.square() * torch::softplus(z)).expand({4, 2}) + 5 * (b.unsqueeze(1) - t.unsqueeze(0)).abs().sum(-1) -
+                2 * reference_giou(reference_corners(b), reference_corners(t), true, true);
     const auto m = torch::tensor({20.F, -20.F, 12.F, -7.F}).unsqueeze(1), truth = torch::tensor({0.F, 1.F}).unsqueeze(0), probability = m.sigmoid();
-    cost += torch::softplus(-m) * truth + torch::softplus(m) * (1 - truth) + 1 -
-     (2 * 4096 * probability * truth + 1) / (4096 * probability + 4096 * truth + 1);
+    cost += torch::softplus(-m) * truth + torch::softplus(m) * (1 - truth) + 1 - (2 * 4096 * probability * truth + 1) / (4096 * probability + 4096 * truth + 1);
     const auto finite = torch::isfinite(cost), finite_values = cost.index({finite});
     const auto sentinel = finite_values.max() + finite_values.abs().max() + 1;
     cost = torch::where(finite, cost, sentinel);

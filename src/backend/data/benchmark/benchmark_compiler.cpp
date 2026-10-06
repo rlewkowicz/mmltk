@@ -1076,12 +1076,12 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
                                                       : BenchmarkWriteProgressEvent{};
   const auto empty_train = make_split("train"), empty_validation = make_split("val");
   const BenchmarkWriteRequest train_pixel_request{
-   empty_train, staging_dir / "train.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode, config.resize_method, image_opened,
-   {}, &pipeline
+   empty_train, staging_dir / "train.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode,
+   config.resize_method, image_opened, {}, &pipeline
   };
   const BenchmarkWriteRequest validation_pixel_request{
-   empty_validation, staging_dir / "val.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode, config.resize_method,
-   image_opened, {}, &pipeline
+   empty_validation, staging_dir / "val.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode,
+   config.resize_method, image_opened, {}, &pipeline
   };
   retained_train_pixels = std::make_unique<BenchmarkSplitWriter>(train_pixel_request, true);
   retained_validation_pixels = std::make_unique<BenchmarkSplitWriter>(validation_pixel_request, true);
@@ -1783,14 +1783,19 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   };
   if (progress.pixel_observer_enabled()) progress.pixels(train_writer.completed() + validation_writer.completed(), total_compile_images);
   compile_split(train_writer,
-   BenchmarkWriteRequest{train, staging_dir / "train.bin", config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode, config.resize_method});
+   BenchmarkWriteRequest{
+    train, staging_dir / "train.bin", config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode, config.resize_method
+   });
   compile_split(validation_writer,
-   BenchmarkWriteRequest{validation, staging_dir / "val.bin", config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode, config.resize_method});
+   BenchmarkWriteRequest{
+    validation, staging_dir / "val.bin", config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode, config.resize_method
+   });
   auto sealed_splits = seal_benchmark_splits(pipeline, [&](std::size_t i, std::span<std::byte> scratch) {
    auto& product = i == 0 ? train : validation;
    auto& writer = i == 0 ? train_writer : validation_writer;
    BenchmarkWriteRequest seal_request{
-    product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode, config.resize_method
+    product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode,
+    config.resize_method
    };
    if (progress.pixel_observer_enabled()) seal_request.compaction = [&, i](std::size_t done, std::size_t total) { progress.compacting(i, done, total); };
    seal_request.trace = trace;

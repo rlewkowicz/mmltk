@@ -3669,21 +3669,47 @@ impl State {
                     },
                 ))
             }
-            Step::ResizeMethod(index) => self.workflow_control(widgets, driver,
-                ["predict.resampling.torch", "predict.resampling.torch_antialias",
-                 "predict.resampling.native", "predict.resampling.torch_antialias"][usize::from(index)]),
+            Step::ResizeMethod(index) => self.workflow_control(
+                widgets,
+                driver,
+                [
+                    "predict.resampling.torch",
+                    "predict.resampling.torch_antialias",
+                    "predict.resampling.native",
+                    "predict.resampling.torch_antialias",
+                ][usize::from(index)],
+            ),
             Step::ResizeMethodReady(index) if settled => {
                 use crate::generated::RgbResizeMethod;
-                let expected = [RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias,
-                    RgbResizeMethod::Native, RgbResizeMethod::TorchBilinearAntialias][usize::from(index)];
-                if settings.draft.as_ref().is_none_or(|draft| draft.workflows.predict.request.resizemethod != expected) {
+                let expected = [
+                    RgbResizeMethod::TorchBilinear,
+                    RgbResizeMethod::TorchBilinearAntialias,
+                    RgbResizeMethod::Native,
+                    RgbResizeMethod::TorchBilinearAntialias,
+                ][usize::from(index)];
+                if settings
+                    .draft
+                    .as_ref()
+                    .is_none_or(|draft| draft.workflows.predict.request.resizemethod != expected)
+                {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record("integration.rgb_resampling", "predict.resampling",
-                    "rendered-image-selection", [index as f64, expected as u8 as f64, 1.0, 1.0]));
-                if index < 3 { return self.workflow_step(driver, Step::ResizeMethod(index + 1)); }
-                widget_ops::scroll_control_into_view("predict.card.output".into(), AnnotationReveal::Control)
-                    .chain(self.workflow_step(driver, Step::SavingControl(1)))
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.rgb_resampling",
+                        "predict.resampling",
+                        "rendered-image-selection",
+                        [index as f64, expected as u8 as f64, 1.0, 1.0],
+                    )
+                });
+                if index < 3 {
+                    return self.workflow_step(driver, Step::ResizeMethod(index + 1));
+                }
+                widget_ops::scroll_control_into_view(
+                    "predict.card.output".into(),
+                    AnnotationReveal::Control,
+                )
+                .chain(self.workflow_step(driver, Step::SavingControl(1)))
             }
             Step::InspectPrediction => {
                 self.inspection_revision = prediction.map_or(0, |value| value.revision);

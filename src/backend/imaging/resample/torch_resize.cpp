@@ -75,7 +75,8 @@ void torch_resize(const std::uint8_t* rgb, std::uint32_t sw, std::uint32_t sh, s
  // allocator events in RgbResizeWork's supplied-workspace counters.
  if (observed) ++observed->preparations;
 #else
- (void)rgb; (void)observed;
+ (void)rgb;
+ (void)observed;
 #endif
 }
 }  // namespace mmltk::backend::imaging::resample::detail

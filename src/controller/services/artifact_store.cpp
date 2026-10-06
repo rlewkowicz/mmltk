@@ -87,8 +87,8 @@ namespace {
 class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperations {
 private:
  void compile_benchmark(const mmltk::backend::data::BenchmarkDatasetSelection selection, const std::filesystem::path& output, const std::filesystem::path& publication, const std::uint32_t resolution,
-  const bool perceptual_downscale, const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const mmltk::backend::imaging::resample::RgbResizeMethod resize_method, const mmltk::common::concurrency::CancellationObservation cancellation,
-  const ArtifactProgressObserver progress, const ArtifactBenchmarkTraceObserver trace) const override {
+  const bool perceptual_downscale, const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const mmltk::backend::imaging::resample::RgbResizeMethod resize_method,
+  const mmltk::common::concurrency::CancellationObservation cancellation, const ArtifactProgressObserver progress, const ArtifactBenchmarkTraceObserver trace) const override {
   mmltk::backend::data::BenchmarkCompilerConfig configuration;
   configuration.selection = selection;
   configuration.output_dir = output;
@@ -108,8 +108,8 @@ private:
   mmltk::backend::data::compile_benchmark_dataset(std::move(configuration));
  }
  void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, const std::uint32_t resolution, const bool perceptual_downscale,
-  const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const mmltk::backend::imaging::resample::RgbResizeMethod resize_method, const mmltk::common::concurrency::CancellationObservation cancellation,
-  const ArtifactProgressObserver progress) const override {
+  const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const mmltk::backend::imaging::resample::RgbResizeMethod resize_method,
+  const mmltk::common::concurrency::CancellationObservation cancellation, const ArtifactProgressObserver progress) const override {
   std::array<std::string, contracts::kArtifactSplitCapacity> split_names{};
   std::size_t split_count = 0U;
   if (cancellation.requested()) return;
@@ -307,8 +307,8 @@ std::string md5_file(const std::filesystem::path& path, const ArtifactCancellati
 }  // namespace
 bool ArtifactCompileRequest::valid() const noexcept {
  const auto* compile_source = kind == ArtifactCompileKind::Directory ? &source : nullptr;
- return !invalid_artifact_input(preset, compile_source, &output).has_value() && resolution != 0U && mmltk::frameworks::reflection::enum_contains(resize_mode) && mmltk::frameworks::reflection::enum_contains(resize_method) &&
-        (kind == ArtifactCompileKind::Directory || mmltk::backend::data::valid_benchmark_selection(benchmark_selection));
+ return !invalid_artifact_input(preset, compile_source, &output).has_value() && resolution != 0U && mmltk::frameworks::reflection::enum_contains(resize_mode) &&
+        mmltk::frameworks::reflection::enum_contains(resize_method) && (kind == ArtifactCompileKind::Directory || mmltk::backend::data::valid_benchmark_selection(benchmark_selection));
 }
 ArtifactStore::ArtifactStore() : ArtifactStore(mmltk::common::system::runtime_paths::repository_root() / ".cache" / "mmltk" / "weights") {}
 ArtifactStore::ArtifactStore(std::filesystem::path cache_root)
@@ -350,12 +350,13 @@ ArtifactCompileResult ArtifactStore::compile(
   staging.emplace(request.output, "", ".tmp.XXXXXX", "failed to stage compiled artifact");
   switch (request.kind) {
    case ArtifactCompileKind::Directory:
-    compiler_operations_->compile_directory(request.source, staging->path(), request.resolution, request.perceptual_downscale, request.resize_mode, request.resize_method, cancellation_observation, progress);
+    compiler_operations_->compile_directory(
+     request.source, staging->path(), request.resolution, request.perceptual_downscale, request.resize_mode, request.resize_method, cancellation_observation, progress);
     break;
    case ArtifactCompileKind::Benchmark: {
     const ArtifactBenchmarkTraceObserver trace = diagnostics.benchmark;
-    compiler_operations_->compile_benchmark(
-     request.benchmark_selection, staging->path(), request.output, request.resolution, request.perceptual_downscale, request.resize_mode, request.resize_method, cancellation_observation, progress, trace);
+    compiler_operations_->compile_benchmark(request.benchmark_selection, staging->path(), request.output, request.resolution, request.perceptual_downscale, request.resize_mode, request.resize_method,
+     cancellation_observation, progress, trace);
     break;
    }
   }

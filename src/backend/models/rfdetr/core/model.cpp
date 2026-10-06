@@ -69,9 +69,8 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  void end_criterion_timing();
  SupervisionTimingHandoff harvest_supervision_timing();
  ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict = false, const ModelClassLayout* admitted_layout = nullptr);
- detail::NormalizedModelStateCandidate stage_normalized_state(
-  const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout = nullptr,
-  std::optional<FreshTransferQueryRetention> query_retention = std::nullopt);
+ detail::NormalizedModelStateCandidate stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission,
+  const ResolvedClassLayout* source_layout = nullptr, std::optional<FreshTransferQueryRetention> query_retention = std::nullopt);
  void commit_normalized_state(detail::NormalizedModelStateCandidate candidate);
  void optimize_for_inference(int batch_size, bool for_training, CompilationMode mode);
  void set_force_pytorch_deformable_attn(bool value);
@@ -85,7 +84,8 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  void import_training_supervision_runtime(const TrainingSupervisionRuntimeState& state);
  [[nodiscard]] std::vector<detail::ClassTensorAxis> class_axes() const;
  ModelOutputs forward_impl(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising = nullptr);
- ModelOutputs forward_ordinary(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising, std::vector<torch::Tensor>* encoder_indices = nullptr);
+ ModelOutputs forward_ordinary(
+  const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising, std::vector<torch::Tensor>* encoder_indices = nullptr);
  ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity);
  NativeRfDetrConfig config_;
  torch::nn::ModuleList backbone_{nullptr};
@@ -607,7 +607,6 @@ public:
   }
   return output_proj->forward(attended);
  }
-
  void reset_parameters() {
   torch::NoGradGuard no_grad;
   sampling_offsets->weight.zero_();
@@ -998,10 +997,10 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
     : config_(config.num_queries > 0 ? config : native_config_from_preset(model_presets().front())),
       backbone_(register_module("backbone", torch::nn::ModuleList())),
       class_embed(register_module(std::string(detail::kDecoderClassAxis.module_name()), torch::nn::Linear(config_.hidden_dim, std::max(1, config_.num_classes)))),
-      refpoint_embed(register_module(std::string(kReferencePointWeight.substr(0, kReferencePointWeight.find('.'))),
-       torch::nn::Embedding(std::max(1, config_.num_queries * std::max(1, config_.group_detr)), 4))),
-      query_feat(register_module(std::string(kQueryFeatureWeight.substr(0, kQueryFeatureWeight.find('.'))),
-       torch::nn::Embedding(std::max(1, config_.num_queries * std::max(1, config_.group_detr)), config_.hidden_dim))) {
+      refpoint_embed(
+       register_module(std::string(kReferencePointWeight.substr(0, kReferencePointWeight.find('.'))), torch::nn::Embedding(std::max(1, config_.num_queries * std::max(1, config_.group_detr)), 4))),
+      query_feat(register_module(
+       std::string(kQueryFeatureWeight.substr(0, kQueryFeatureWeight.find('.'))), torch::nn::Embedding(std::max(1, config_.num_queries * std::max(1, config_.group_detr)), config_.hidden_dim))) {
  if (layout.slots.empty()) layout = unresolved_class_layout(static_cast<std::size_t>(config_.num_classes));
  layout_ = std::make_shared<const ResolvedClassLayout>(std::move(layout));
  if (layout_->output_width() != static_cast<std::size_t>(config_.num_classes)) throw std::invalid_argument("model class layout disagrees with configured output width");
@@ -1120,16 +1119,20 @@ void visit_output_tensors(Value& value, Visitor&& visitor) {
   visitor(value);
  } else if constexpr (requires { value.has_value(); }) {
   if (value) visit_output_tensors(*value, visitor);
- } else if constexpr (requires { value.begin(); value.end(); }) {
+ } else if constexpr (requires {
+                       value.begin();
+                       value.end();
+                      }) {
   for (auto& element : value) visit_output_tensors(element, visitor);
  } else if constexpr (std::is_class_v<Value>) {
-  constexpr auto members = std::define_static_array(std::meta::nonstatic_data_members_of(^^Value, std::meta::access_context::current()));
-  template for (constexpr auto member : members) { visit_output_tensors(value.[:member:], visitor); }
+  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Value, std::meta::access_context::current()))) {
+   visit_output_tensors(value.[:member:], visitor);
+  }
  } else {
   static_assert(std::is_arithmetic_v<Value>);
  }
 }
-}
+}  // namespace
 ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising) {
  const bool training = is_training();
  if (!full_trace_.enabled(training)) return forward_ordinary(batch, include_masks, capture_match_free_features, denoising);
@@ -1148,7 +1151,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, bo
   visit_output_tensors(*candidate_layout, [&](torch::Tensor& tensor) {
    TORCH_CHECK(tensor.defined(), "full-trace output inventory contains an undefined tensor");
    packed.emplace_back(tensor);
-   tensor = {};
+   tensor = torch::Tensor{};
   });
   return c10::IValue(c10::ivalue::Tuple::create(std::move(packed)));
  }, include_masks ? 1U : 0U);
@@ -1166,7 +1169,8 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, bo
  TORCH_CHECK(index == tensors.size(), "full-trace output inventory has unexpected tensors");
  return output;
 }
-ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(const NestedTensor& batch, const bool include_masks, const bool capture_match_free_features, const DenoisingQueryBatch* denoising, std::vector<torch::Tensor>* encoder_indices) {
+ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
+ const NestedTensor& batch, const bool include_masks, const bool capture_match_free_features, const DenoisingQueryBatch* denoising, std::vector<torch::Tensor>* encoder_indices) {
  const bool is_train = is_training();
  mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward{"rfdetr.model.forward"};
  if (!batch.tensors.defined()) { throw std::runtime_error("NativeRfDetrModel::forward requires batch.tensors"); }
@@ -1334,9 +1338,8 @@ ModelStateLoadSummary NativeRfDetrModel::Impl::load_normalized_state(const std::
  layout_ = std::move(next_layout);
  return summary;
 }
-detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_state(
- const std::vector<NormalizedModelStateEntry>& state, const detail::NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout,
- const std::optional<FreshTransferQueryRetention> query_retention) {
+detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state, const detail::NormalizedModelStateAdmission admission,
+ const ResolvedClassLayout* source_layout, const std::optional<FreshTransferQueryRetention> query_retention) {
  if (query_retention && admission != detail::NormalizedModelStateAdmission::FreshTransfer) throw std::invalid_argument("query retention requires fresh transfer admission");
  auto parameters = named_parameters(true);
  auto buffers = named_buffers(true);
@@ -1347,15 +1350,16 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
  bool retain_queries = false;
  if (query_retention && query_retention->source_layout.queries_per_group > 0 && query_retention->source_layout.queries_per_group != config_.num_queries) {
   const auto query = std::ranges::find(state, kQueryFeatureWeight, &NormalizedModelStateEntry::name);
-  const bool changed_query_rows = query != state.end() && query->tensor.defined() && query->tensor.dim() == 2 && query_feat->weight.defined() && query_feat->weight.dim() == 2 &&
-                                  query->tensor.size(0) != query_feat->weight.size(0);
+  const bool changed_query_rows =
+   query != state.end() && query->tensor.defined() && query->tensor.dim() == 2 && query_feat->weight.defined() && query_feat->weight.dim() == 2 && query->tensor.size(0) != query_feat->weight.size(0);
   if (query_retention->explicit_source_count || changed_query_rows) {
    const auto& source = query_retention->source_layout;
    if (source.groups <= 0 || config_.group_detr <= 0 || config_.num_queries <= 0 || source.groups != config_.group_detr)
     throw std::invalid_argument("query-count transfer requires an admitted source group topology");
    const auto checked_rows = [](const SupervisedQueryLayout& layout) {
-    return mmltk::common::math::checked_cast<int64_t>(mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(layout.queries_per_group),
-     static_cast<std::uint64_t>(layout.groups), "query extent overflows"), "query extent exceeds tensor indexing");
+    return mmltk::common::math::checked_cast<int64_t>(
+     mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(layout.queries_per_group), static_cast<std::uint64_t>(layout.groups), "query extent overflows"),
+     "query extent exceeds tensor indexing");
    };
    const auto source_rows = checked_rows(source);
    const auto destination_rows = checked_rows({config_.group_detr, config_.num_queries});
@@ -1401,9 +1405,11 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
    // Upstream registers this inactive detector buffer even without keypoints.
    // Accept only its exact empty form; active keypoint state stays unexpected.
    if (admission != detail::NormalizedModelStateAdmission::Exact && entry.name == "_kp_active_mask" && entry.tensor.defined() && entry.tensor.scalar_type() == torch::kBool &&
-       entry.tensor.dim() == 2 && entry.tensor.size(0) == 0 && entry.tensor.size(1) == 0) continue;
+       entry.tensor.dim() == 2 && entry.tensor.size(0) == 0 && entry.tensor.size(1) == 0)
+    continue;
    if ((admission == detail::NormalizedModelStateAdmission::RequiredCore || (admission == detail::NormalizedModelStateAdmission::FreshTransfer && !training_supervision_)) &&
-       entry.name.starts_with("training_supervision.")) continue;
+       entry.name.starts_with("training_supervision."))
+    continue;
    candidate.summary.unexpected_names.push_back(entry.name);
    continue;
   }
@@ -1624,8 +1630,7 @@ void NativeRfDetrModel::replicate_training_supervision_runtime_from(const Native
 }
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, bool include_masks) { return impl_->forward(batch, include_masks); }
 ModelOutputs NativeRfDetrModel::forward_observed(const NestedTensor& batch, bool include_masks, std::vector<torch::Tensor>& encoder_indices) {
- if (impl_->observation_modes_[impl_->is_training()] != CompilationMode::kNone)
-  throw std::runtime_error("encoder selection observation requires eager RF-DETR execution");
+ if (impl_->observation_modes_[impl_->is_training()] != CompilationMode::kNone) throw std::runtime_error("encoder selection observation requires eager RF-DETR execution");
  encoder_indices.clear();
  return impl_->forward_ordinary(batch, include_masks, false, nullptr, &encoder_indices);
 }
@@ -1645,9 +1650,8 @@ void NativeRfDetrModel::configure_supervision_timing(const SupervisionTimingSetu
 [[nodiscard]] ModelStateLoadSummary NativeRfDetrModel::load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict, const ModelClassLayout* admitted_layout) {
  return impl_->load_normalized_state(state, strict, admitted_layout);
 }
-[[nodiscard]] detail::NormalizedModelStateCandidate NativeRfDetrModel::stage_normalized_state(
- const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout,
- std::optional<FreshTransferQueryRetention> query_retention) {
+[[nodiscard]] detail::NormalizedModelStateCandidate NativeRfDetrModel::stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission,
+ const ResolvedClassLayout* source_layout, std::optional<FreshTransferQueryRetention> query_retention) {
  return impl_->stage_normalized_state(state, admission, source_layout, query_retention);
 }
 void NativeRfDetrModel::commit_normalized_state(detail::NormalizedModelStateCandidate candidate) { impl_->commit_normalized_state(std::move(candidate)); }

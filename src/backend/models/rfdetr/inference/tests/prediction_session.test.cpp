@@ -109,7 +109,7 @@ TEST_CASE("Image prediction applies selected RGB methods while retaining origina
   constexpr std::array means{.485F, .456F, .406F}, deviations{.229F, .224F, .225F};
   double total = 0;
   for (std::size_t i = 0; i < expected.size(); ++i) total += (expected[i] - means[i / 64]) / deviations[i / 64];
-  const auto score = 1. / (1. + std::exp(-.1 * total / expected.size()));
+  const auto score = 1. / (1. + std::exp(-.1 * total / static_cast<double>(expected.size())));
   const auto result = session.Run(request, command, {.source_pixels = true, .completed = [&](const auto& record, auto pixels, const auto&) {
    REQUIRE(record.detections.size() == 2);
    for (const auto& detection : record.detections) CHECK(std::abs(detection.score - score) < 1e-5);
@@ -1961,12 +1961,15 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
  // it can deliver a result from randomly retained core parameters.
  for (const int damage : {0, 1, 2}) {
   auto candidate_entries = checkpoint.entries();
-  if (damage == 0) candidate_entries.clear();
+  if (damage == 0)
+   candidate_entries.clear();
   else {
-   const auto query = std::ranges::find(candidate_entries, "query_feat.weight", &rfdetr::NormalizedModelStateEntry::name);
+   const auto query = std::ranges::find(candidate_entries, std::string_view{"query_feat.weight"}, &rfdetr::NormalizedModelStateEntry::name);
    REQUIRE(query != candidate_entries.end());
-   if (damage == 1) candidate_entries.erase(query);
-   else query->tensor = torch::zeros({1, config.hidden_dim});
+   if (damage == 1)
+    candidate_entries.erase(query);
+   else
+    query->tensor = torch::zeros({1, config.hidden_dim});
   }
   rfdetr::DecodedNativeModelState damaged(std::move(candidate_entries));
   damaged.metadata = checkpoint.metadata;
@@ -1976,8 +1979,8 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
   invalid_request.weights_path = invalid_path;
   std::size_t delivered = 0;
   rfdetr::PredictionSession invalid_session;
-  REQUIRE_THROWS(invalid_session.Run(invalid_request, {reinterpret_cast<std::uintptr_t>(stream.get()), true},
-   {.encoded_masks = false, .completed = [&](const auto&, const auto&, const auto&) { ++delivered; }}));
+  REQUIRE_THROWS(
+   invalid_session.Run(invalid_request, {reinterpret_cast<std::uintptr_t>(stream.get()), true}, {.encoded_masks = false, .completed = [&](const auto&, const auto&, const auto&) { ++delivered; }}));
   CHECK(delivered == 0);
  }
  for (const auto source : {rfdetr::PredictSourceKind::ImageFiles, rfdetr::PredictSourceKind::CompiledDataset}) {
@@ -2191,7 +2194,6 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
   CHECK(rfdetr::read_training_selection(directory / "selected.json") == selected);
  }
 }
-
 TEST_CASE("Model-taking export isolates eager selective and full source execution even when publication fails", "[model][rfdetr][prediction][compilation][export][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; export isolation remains unverified");
  const mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
@@ -2200,8 +2202,10 @@ TEST_CASE("Model-taking export isolates eager selective and full source executio
  namespace logging = mmltk::common::logging;
  const auto backend_policy = [] {
   const auto& context = at::globalContext();
-  return std::array{context.userEnabledFlashSDP(), context.userEnabledFA3SDP(), context.userEnabledMemEfficientSDP(), context.userEnabledMathSDP(),
-   context.userEnabledCuDNNSDP(), context.userEnabledOverrideableSDP(), context.allowFP16BF16ReductionMathSDP()};
+  return std::array{
+   context.userEnabledFlashSDP(), context.userEnabledFA3SDP(), context.userEnabledMemEfficientSDP(), context.userEnabledMathSDP(), context.userEnabledCuDNNSDP(), context.userEnabledOverrideableSDP(),
+   context.allowFP16BF16ReductionMathSDP()
+  };
  };
  const auto global_policy = backend_policy();
  const auto global_priority = at::globalContext().sDPPriorityOrder();

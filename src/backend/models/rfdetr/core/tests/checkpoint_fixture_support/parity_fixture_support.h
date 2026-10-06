@@ -12,7 +12,7 @@ struct ParityFixtureCase {
  const char* preset_name;
  const char* upstream_filename;
  std::int64_t query_rows;
- std::int64_t input_size;
+ int input_size;
  float offset;
 };
 [[nodiscard]] const std::array<ParityFixtureCase, 2>& parity_fixture_cases() noexcept;

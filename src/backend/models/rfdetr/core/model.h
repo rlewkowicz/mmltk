@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/model_fwd.h"
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -12,7 +13,9 @@
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include <torch/ordered_dict.h>
 namespace mmltk::backend::models::rfdetr {
-namespace test_support { struct FullTraceTestAccess; }
+namespace test_support {
+struct FullTraceTestAccess;
+}
 struct NestedTensor {
  torch::Tensor tensors;
  torch::Tensor mask;
@@ -60,9 +63,8 @@ public:
  void end_criterion_timing();
  [[nodiscard]] SupervisionTimingHandoff harvest_supervision_timing();
  [[nodiscard]] ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict, const ModelClassLayout* admitted_layout = nullptr);
- [[nodiscard]] detail::NormalizedModelStateCandidate stage_normalized_state(
-  const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout = nullptr,
-  std::optional<FreshTransferQueryRetention> query_retention = std::nullopt);
+ [[nodiscard]] detail::NormalizedModelStateCandidate stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission,
+  const ResolvedClassLayout* source_layout = nullptr, std::optional<FreshTransferQueryRetention> query_retention = std::nullopt);
  void commit_normalized_state(detail::NormalizedModelStateCandidate candidate);
  void set_force_pytorch_deformable_attn(bool value);
  void set_force_math_attention(bool value);

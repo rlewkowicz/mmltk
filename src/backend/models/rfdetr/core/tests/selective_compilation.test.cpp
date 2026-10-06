@@ -403,12 +403,14 @@ TEST_CASE("Actual decoder tail matches independent residual norm and feedforward
  }
 }
 }  // namespace
-
 TEST_CASE("Tensor trace invalidates changed live gradient policy and retains detached slot backwards", "[rfdetr][compilation]") {
  Region region("live_policy");
  torch::nn::Linear layer(4, 4);
  int calls = 0;
- const auto ordinary = [&](const Region::Tensors& values) { ++calls; return Region::Tensors{layer->forward(values.front())}; };
+ const auto ordinary = [&](const Region::Tensors& values) {
+  ++calls;
+  return Region::Tensors{layer->forward(values.front())};
+ };
  region.prepare(true, true, 2);
  auto input = torch::randn({2, 4}).set_requires_grad(true);
  std::vector<torch::Tensor> retained;
@@ -432,11 +434,13 @@ TEST_CASE("Tensor trace invalidates changed live gradient policy and retains det
  region.invoke(true, {input}, {layer.get()}, ordinary);
  CHECK(calls == 4);
 }
-
 TEST_CASE("Tensor trace checks effective autocast device and host attention policy", "[rfdetr][compilation]") {
  Region region("policy_guard");
  int calls = 0;
- const auto ordinary = [&](const Region::Tensors& inputs) { ++calls; return Region::Tensors{inputs.front() * 2.0}; };
+ const auto ordinary = [&](const Region::Tensors& inputs) {
+  ++calls;
+  return Region::Tensors{inputs.front() * 2.0};
+ };
  region.prepare(false, true, 2);
  const auto cpu_input = torch::ones({2, 4});
  region.invoke(false, {cpu_input}, {}, ordinary);

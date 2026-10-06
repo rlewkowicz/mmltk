@@ -20,8 +20,8 @@ torch::Tensor cast_for_kernel(const torch::Tensor& tensor) {
  TORCH_CHECK(false, "deformable attention CUDA supports float32 inputs or AMP upcasts from fp16/bf16");
 }
 torch::ScalarType restore_dtype(torch::autograd::AutogradContext* ctx, const char* key) { return static_cast<torch::ScalarType>(ctx->saved_data[key].toInt()); }  // namespace
-torch::Tensor attention_cuda(const torch::Tensor& value, const torch::Tensor& spatial_shapes, const torch::Tensor& level_start_index,
- const torch::Tensor& sampling_locations, const torch::Tensor& attention_weights, int64_t im2col_step) {
+torch::Tensor attention_cuda(const torch::Tensor& value, const torch::Tensor& spatial_shapes, const torch::Tensor& level_start_index, const torch::Tensor& sampling_locations,
+ const torch::Tensor& attention_weights, int64_t im2col_step) {
  // This backend also serves InferenceMode, where the Autograd key is absent.
  return ms_deform_attn_cuda_forward(cast_for_kernel(value), spatial_shapes, level_start_index, cast_for_kernel(sampling_locations), cast_for_kernel(attention_weights), im2col_step)
   .to(value.scalar_type());
@@ -72,8 +72,8 @@ public:
   };
  }
 };
-torch::Tensor attention_autograd(const torch::Tensor& value, const torch::Tensor& spatial_shapes, const torch::Tensor& level_start_index,
- const torch::Tensor& sampling_locations, const torch::Tensor& attention_weights, int64_t im2col_step) {
+torch::Tensor attention_autograd(const torch::Tensor& value, const torch::Tensor& spatial_shapes, const torch::Tensor& level_start_index, const torch::Tensor& sampling_locations,
+ const torch::Tensor& attention_weights, int64_t im2col_step) {
  return MsDeformAttnAutograd::apply(value, spatial_shapes, level_start_index, sampling_locations, attention_weights, im2col_step).front();
 }
 }  // namespace

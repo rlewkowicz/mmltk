@@ -59,11 +59,11 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
   CAPTURE(malformed);
   auto state = complete;
   if (malformed == 0) state.clear();
-  if (malformed == 1) state.erase(std::ranges::find(state, "query_feat.weight", &r::NormalizedModelStateEntry::name));
-  if (malformed == 2) std::ranges::find(state, "query_feat.weight", &r::NormalizedModelStateEntry::name)->tensor = torch::zeros({1, config.hidden_dim});
+  if (malformed == 1) state.erase(std::ranges::find(state, std::string_view{"query_feat.weight"}, &r::NormalizedModelStateEntry::name));
+  if (malformed == 2) std::ranges::find(state, std::string_view{"query_feat.weight"}, &r::NormalizedModelStateEntry::name)->tensor = torch::zeros({1, config.hidden_dim});
   if (malformed == 3) state.push_back({"_kp_active_mask", torch::zeros({1, 1}, torch::kBool)});
   if (malformed == 4) state.push_back(state.front());
-  if (malformed == 5) std::ranges::find(state, "class_embed.weight", &r::NormalizedModelStateEntry::name)->tensor = torch::zeros({1, config.hidden_dim});
+  if (malformed == 5) std::ranges::find(state, std::string_view{"class_embed.weight"}, &r::NormalizedModelStateEntry::name)->tensor = torch::zeros({1, config.hidden_dim});
   checkpoint.replace_entries(std::move(state));
   REQUIRE_THROWS(r::load_training_model_weights(destination, checkpoint, r::TrainingSupervisionRoute::Hungarian));
   REQUIRE_THROWS(destination.stage_normalized_state(checkpoint.entries(), Admission::RequiredCore));
@@ -71,9 +71,7 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
    try {
     static_cast<void>(destination.stage_normalized_state(checkpoint.entries(), Admission::RequiredCore));
     FAIL("damaged core tensor must fail admission");
-   } catch (const r::ModelStateAdmissionError& error) {
-    REQUIRE(error.summary().incompatible_names == std::vector<std::string>{malformed == 2 ? "query_feat.weight" : "class_embed.weight"});
-   }
+   } catch (const r::ModelStateAdmissionError& error) { REQUIRE(error.summary().incompatible_names == std::vector<std::string>{malformed == 2 ? "query_feat.weight" : "class_embed.weight"}); }
   }
   require_values(destination, before);
  }
@@ -92,7 +90,8 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
    CHECK(torch::equal(actual->select(0, 0), entry.tensor.select(0, 1)));
    CHECK(torch::equal(actual->select(0, 1), original->tensor.select(0, 1)));
    CHECK(torch::equal(actual->select(0, 2), original->tensor.select(0, 2)));
-  } else CHECK(torch::equal(*actual, entry.tensor));
+  } else
+   CHECK(torch::equal(*actual, entry.tensor));
  }
  const std::vector partial{r::NormalizedModelStateEntry{"query_feat.weight", torch::full_like(parameters["query_feat.weight"], .75)}};
  for (const auto admission : {Admission::PartialExact, Admission::PartialFreshTransfer}) {
@@ -149,12 +148,18 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
     auto malformed = complete;
     const auto found = std::ranges::find(malformed, name, &r::NormalizedModelStateEntry::name);
     REQUIRE(found != malformed.end());
-    if (defect == "missing") malformed.erase(found);
-    else if (defect == "duplicate") malformed.push_back(*found);
-    else if (defect == "undefined") found->tensor = {};
-    else if (defect == "rank") found->tensor = found->tensor.unsqueeze(0);
-    else if (defect == "rows") found->tensor = found->tensor.narrow(0, 0, 1);
-    else found->tensor = found->tensor.narrow(1, 0, 1);
+    if (defect == "missing")
+     malformed.erase(found);
+    else if (defect == "duplicate")
+     malformed.push_back(*found);
+    else if (defect == "undefined")
+     found->tensor = torch::Tensor{};
+    else if (defect == "rank")
+     found->tensor = found->tensor.unsqueeze(0);
+    else if (defect == "rows")
+     found->tensor = found->tensor.narrow(0, 0, 1);
+    else
+     found->tensor = found->tensor.narrow(1, 0, 1);
     checkpoint.replace_entries(std::move(malformed));
     REQUIRE_THROWS(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, retention));
     REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
@@ -167,8 +172,10 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
    const std::string name = "backbone.0.encoder.encoder.embeddings.cls_token";
    const auto found = std::ranges::find(malformed, name, &r::NormalizedModelStateEntry::name);
    REQUIRE(found != malformed.end());
-   if (missing) malformed.erase(found);
-   else found->tensor = {};
+   if (missing)
+    malformed.erase(found);
+   else
+    found->tensor = torch::Tensor{};
    checkpoint.replace_entries(std::move(malformed));
    try {
     static_cast<void>(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, retention));
@@ -201,8 +208,9 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
   for (const auto admission : {Admission::Exact, Admission::RequiredCore, Admission::PartialExact, Admission::PartialFreshTransfer})
    REQUIRE_THROWS(resized.stage_normalized_state(complete, admission, &semantic_source, retention));
   REQUIRE_THROWS(resized.stage_normalized_state(complete, Admission::FreshTransfer, &semantic_source));
-  for (const std::int64_t source_count : {std::int64_t{0}, std::int64_t{-1}, std::int64_t{query_count}, retention.source_layout.queries_per_group + 1,
-        std::numeric_limits<std::int64_t>::max() / retention.source_layout.groups + 1, std::numeric_limits<std::int64_t>::max()}) {
+  for (const std::int64_t source_count :
+   {std::int64_t{0}, std::int64_t{-1}, std::int64_t{query_count}, retention.source_layout.queries_per_group + 1, std::numeric_limits<std::int64_t>::max() / retention.source_layout.groups + 1,
+    std::numeric_limits<std::int64_t>::max()}) {
    auto conflicting = retention;
    conflicting.source_layout.queries_per_group = source_count;
    REQUIRE_THROWS(resized.stage_normalized_state(complete, Admission::FreshTransfer, &semantic_source, conflicting));

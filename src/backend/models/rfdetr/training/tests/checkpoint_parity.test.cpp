@@ -172,4 +172,6 @@ void test_checkpoint_parity_matches_for_all_registered_fixtures() {
  const auto& fixtures = parity_fixture_cases();
  for (size_t index = 0; index < fixtures.size(); ++index) { run_checkpoint_parity_case(fixtures[index], index + 1, fixtures.size()); }
 }
-TEST_CASE("Native checkpoint format round-trip matches for all registered fixtures", "[model][rfdetr][checkpoint_parity][roundtrip][integration]") { test_checkpoint_parity_matches_for_all_registered_fixtures(); }
+TEST_CASE("Native checkpoint format round-trip matches for all registered fixtures", "[model][rfdetr][checkpoint_parity][roundtrip][integration]") {
+ test_checkpoint_parity_matches_for_all_registered_fixtures();
+}

@@ -49,9 +49,7 @@ public:
   return {dx, dw, db};
  }
 };
-torch::Tensor depthwise_autograd(const torch::Tensor& input, const torch::Tensor& weight, const std::optional<torch::Tensor>& bias) {
- return SegmentationDepthwise::apply(input, weight, bias);
-}
+torch::Tensor depthwise_autograd(const torch::Tensor& input, const torch::Tensor& weight, const std::optional<torch::Tensor>& bias) { return SegmentationDepthwise::apply(input, weight, bias); }
 }  // namespace
 // The public function and registrations share one object in the static library.
 TORCH_LIBRARY_FRAGMENT(mmltk, m) { m.def("segmentation_depthwise(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor"); }

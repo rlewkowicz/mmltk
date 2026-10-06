@@ -10648,7 +10648,8 @@ TEST_CASE("Parquet staged batches retain one forward reader and reusable source 
  CompileExecution::Completion blocked;
  std::promise<void> waiting;
  std::atomic<bool> observed{false};
- CompileExecution::Readiness readiness(pipeline.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, auto) {
+ CompileExecution::Readiness readiness(
+  pipeline.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, auto) {
   if (pressure && pipeline.execution().resource_pressure() && !observed.exchange(true)) mmltk::testsupport::release_test_promise(waiting);
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { pipeline.execution().cancel(); });

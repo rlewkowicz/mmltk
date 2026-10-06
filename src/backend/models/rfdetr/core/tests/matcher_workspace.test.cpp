@@ -376,8 +376,8 @@ TEST_CASE("Compact mask costs accumulate long low-dtype samples in FP32", "[rfde
   for (const double logit : {20., -20.})
    for (const double target : {0., 1.}) {
     const double p = 1 / (1 + std::exp(-logit));
-    const double value = ce ? std::log1p(std::exp(-std::abs(logit))) + (target == 0 ? std::max(logit, 0.) : std::max(-logit, 0.))
-                           : 1 - (2 * points * p * target + 1) / (points * p + points * target + 1);
+    const double value =
+     ce ? std::log1p(std::exp(-std::abs(logit))) + (target == 0 ? std::max(logit, 0.) : std::max(-logit, 0.)) : 1 - (2 * points * p * target + 1) / (points * p + points * target + 1);
     expected.push_back(static_cast<float>(value));
    }
   const auto actual = mmltk::backend::ml::cuda::numa_readback(cost);

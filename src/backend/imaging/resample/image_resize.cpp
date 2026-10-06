@@ -61,7 +61,9 @@ public:
 };
 }  // namespace
 std::size_t RgbResizeWorkspacePlan::bytes() const {
- return common::math::checked_add(torch_bytes, common::math::checked_add(resize_aligned(avir_bytes), common::math::checked_add(resize_aligned(byte_output_bytes), perceptual_bytes, "resize workspace overflow"), "resize workspace overflow"), "resize workspace overflow");
+ return common::math::checked_add(torch_bytes,
+  common::math::checked_add(resize_aligned(avir_bytes), common::math::checked_add(resize_aligned(byte_output_bytes), perceptual_bytes, "resize workspace overflow"), "resize workspace overflow"),
+  "resize workspace overflow");
 }
 void RgbImageResizer::require_method(RgbResizeMethod method) {
  switch (method) {
@@ -367,8 +369,7 @@ ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, 
    auto* target = pixels + plane * output.plane_stride_bytes / sizeof(float);
    clear_letterbox_padding(target, output.width, output.height, geometry.resized_width, geometry.resized_height, geometry.offset_x, geometry.offset_y);
    for (std::uint32_t row = 0; row < geometry.resized_height; ++row)
-    std::copy_n(resized + plane * plane_size + row * std::size_t(geometry.resized_width), geometry.resized_width,
-     target + (row + geometry.offset_y) * std::size_t(output.width) + geometry.offset_x);
+    std::copy_n(resized + plane * plane_size + row * std::size_t(geometry.resized_width), geometry.resized_width, target + (row + geometry.offset_y) * std::size_t(output.width) + geometry.offset_x);
   }
   return geometry;
  }

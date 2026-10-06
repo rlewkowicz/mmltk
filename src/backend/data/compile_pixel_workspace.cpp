@@ -26,7 +26,8 @@ CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& h
 CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, CompilePixelPolicy policy, imaging::resample::RgbResizeWork* observed) {
  return CompilePixelWorkspacePlan(header, policy, observed);
 }
-CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, std::uint32_t resolution, imaging::resample::ImageResizeMode mode, bool perceptual, imaging::resample::RgbResizeMethod method) {
+CompilePixelWorkspacePlan compile_pixel_workspace_plan(
+ const CompileImageHeader& header, std::uint32_t resolution, imaging::resample::ImageResizeMode mode, bool perceptual, imaging::resample::RgbResizeMethod method) {
  return compile_pixel_workspace_plan(header, {resolution, resolution, mode, perceptual, method}, nullptr);
 }
 void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::span<const std::uint8_t> encoded, const CompileImageHeader& header, std::span<std::byte> memory,

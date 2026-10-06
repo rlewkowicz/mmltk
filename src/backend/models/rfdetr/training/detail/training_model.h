@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/model_fwd.h"
 #include <memory>
 #include <cstddef>
 #include <cstdint>
@@ -18,7 +19,6 @@ class DatasetLoader;
 }
 namespace mmltk::backend::models::rfdetr {
 class RuntimeContext;
-class NativeRfDetrModel;
 class TrainingDataPlan;
 class TrainingValidationRuntime;
 class TrainingSnapshotPublication;

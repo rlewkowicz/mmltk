@@ -1891,7 +1891,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
 #define MMLTK_ONNX_LOWERING_TABLE(NODE, CTX, SYMBOL, CREATE, RESIZE) \
  NODE(kAtenTo, lower_cast_like_node)                                 \
  NODE(kAtenTypeAs, lower_cast_like_node)                             \
- CTX(kSegmentationDepthwise, lower_convolution_node)                \
+ CTX(kSegmentationDepthwise, lower_convolution_node)                 \
  CTX(kAtenConvolution, lower_convolution_node)                       \
  NODE(kAtenFlatten, lower_static_reshape_node)                       \
  NODE(kAtenView, lower_static_reshape_node)                          \

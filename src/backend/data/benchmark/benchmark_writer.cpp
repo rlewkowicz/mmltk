@@ -412,7 +412,8 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane) {
  auto input = prepare_pixel(slot, lane);
  if (!input) return;
  detail::CompileExecutionLimits limits;
- limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(1, impl_->resolution, impl_->perceptual, 0, 0, BenchmarkEncodedImage::normal_window_bytes, impl_->resize_method));
+ limits.workspace_plan =
+  std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(1, impl_->resolution, impl_->perceptual, 0, 0, BenchmarkEncodedImage::normal_window_bytes, impl_->resize_method));
  detail::CompileExecution execution(1, {}, limits, impl_->cancellation);
  detail::CompilePixelWorkspace workspace;
  detail::FileWorkQueue files(execution, 1);

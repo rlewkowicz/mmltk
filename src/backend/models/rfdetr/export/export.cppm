@@ -12,7 +12,7 @@ module;
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
-#include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/core/model_fwd.h"
 export module mmltk.backend.models.rfdetr.model_export;
 namespace mmltk::backend::models::rfdetr {
 void write_onnx_model_bytes(std::string_view serialized_model, const std::filesystem::path& output_path, const ModelClassLayout& layout);

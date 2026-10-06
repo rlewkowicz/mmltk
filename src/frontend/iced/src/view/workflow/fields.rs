@@ -17,17 +17,32 @@ pub fn rgb_resize_method<'a, Message: Clone + 'a>(
     for (suffix, label, method) in [
         ("native", "Native", RgbResizeMethod::Native),
         ("torch", "PyTorch bilinear", RgbResizeMethod::TorchBilinear),
-        ("torch_antialias", "PyTorch bilinear + antialias", RgbResizeMethod::TorchBilinearAntialias),
+        (
+            "torch_antialias",
+            "PyTorch bilinear + antialias",
+            RgbResizeMethod::TorchBilinearAntialias,
+        ),
     ] {
         let ignored = ignored.clone();
-        choices = choices.push(iced::widget::container(
-            iced::widget::radio(label, method, Some(selected), move |value| {
-                if enabled { changed(value) } else { ignored.clone() }
-            }).style(move |theme, status| {
-                if enabled { iced_fluent_theme::radio::default(theme, status) }
-                else { iced_fluent_theme::radio::disabled(theme, status) }
-            })
-        ).id(format!("{id}.{suffix}")));
+        choices = choices.push(
+            iced::widget::container(
+                iced::widget::radio(label, method, Some(selected), move |value| {
+                    if enabled {
+                        changed(value)
+                    } else {
+                        ignored.clone()
+                    }
+                })
+                .style(move |theme, status| {
+                    if enabled {
+                        iced_fluent_theme::radio::default(theme, status)
+                    } else {
+                        iced_fluent_theme::radio::disabled(theme, status)
+                    }
+                }),
+            )
+            .id(format!("{id}.{suffix}")),
+        );
     }
     choices.into()
 }

@@ -52,7 +52,7 @@ void compare_assignments(support::OracleComparison& comparison, const support::O
    if (query.numel() == 0) continue;
    const auto& value = *output_layers[index];
    selected_masks.push_back(value.sparse_pred_masks ? rf::matched_sparse_pred_masks_for_batch(*value.sparse_pred_masks, static_cast<int64_t>(image), query)
-                                                   : value.pred_masks->index({static_cast<int64_t>(image)}).index_select(0, query));
+                                                    : value.pred_masks->index({static_cast<int64_t>(image)}).index_select(0, query));
   }
   const auto sampled = rf::sample_direct_masks(torch::cat(selected_masks), targets, torch::cat(selected_targets), config.mask_point_sample_ratio, samples[index]);
   const auto key = prefix + "direct/" + std::to_string(index) + "/";
@@ -74,7 +74,8 @@ torch::Tensor compare_loss(support::OracleComparison& comparison, const support:
  const auto losses = rf::detection_loss_dict(outputs, targets, config, training, normalizer, samples);
  std::set<std::string> actual_losses, actual_statistics;
  for (const auto& [key, value] : losses) (key.starts_with("loss_") ? actual_losses : actual_statistics).insert(key);
- auto expected_losses = archive.names(prefix + "loss/"); expected_losses.erase("total");
+ auto expected_losses = archive.names(prefix + "loss/");
+ expected_losses.erase("total");
  comparison.inventory(prefix + "loss inventory", actual_losses, expected_losses);
  comparison.inventory(prefix + "statistic inventory", actual_statistics, archive.names(prefix + "statistic/"));
  for (const auto& [key, value] : losses) {
@@ -155,17 +156,21 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
  std::set<std::string> expected_names, actual_names;
  for (const auto& [name, hyperparameters] : actual) actual_names.insert(name);
  for (const auto& group : entry.parameter_groups) {
-  REQUIRE(group.beta1 == .9); REQUIRE(group.beta2 == .999); REQUIRE(group.eps == 1e-8); REQUIRE_FALSE(group.amsgrad);
+  REQUIRE(group.beta1 == .9);
+  REQUIRE(group.beta2 == .999);
+  REQUIRE(group.eps == 1e-8);
+  REQUIRE_FALSE(group.amsgrad);
   for (const auto& name : group.names) {
    REQUIRE(expected_names.insert(name).second);
    const auto found = actual.find(name);
    REQUIRE(found != actual.end());
-   comparison.compare("parameter-group/" + name, torch::tensor({found->second.first, found->second.second}, torch::kFloat64), torch::tensor({group.lr, group.weight_decay}, torch::kFloat64), ComparisonPolicy::Hyperparameter);
+   comparison.compare("parameter-group/" + name, torch::tensor({found->second.first, found->second.second}, torch::kFloat64), torch::tensor({group.lr, group.weight_decay}, torch::kFloat64),
+    ComparisonPolicy::Hyperparameter);
   }
  }
  comparison.inventory("optimizer parameter groups", actual_names, expected_names);
 }
-}
+}  // namespace
 TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded trajectory", "[rfdetr][parity][upstream_oracle][cuda]") {
  const auto requested = support::UpstreamOracle::requested();
  if (!requested) SKIP("optional independent upstream artifacts absent; default skip is not parity evidence");
@@ -195,9 +200,9 @@ TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded t
    }
    comparison.inventory("loss weight inventory", actual_weights, expected_weights);
    rf::TensorMap expected_before;
-   for (const auto& parameter : model.named_parameters(true)) if (parameter.value().requires_grad()) expected_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
-   comparison.fact("trajectory", {{"updates", entry.steps.size()}, {"optimizer_backend", built.optimizer.backend_name()},
-                                    {"interpretation", "bounded matched updates; no dataset AP measurement"}});
+   for (const auto& parameter : model.named_parameters(true))
+    if (parameter.value().requires_grad()) expected_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
+   comparison.fact("trajectory", {{"updates", entry.steps.size()}, {"optimizer_backend", built.optimizer.backend_name()}, {"interpretation", "bounded matched updates; no dataset AP measurement"}});
    for (std::size_t update = 0; update < entry.steps.size(); ++update) {
     CAPTURE(update);
     comparison.fact("step", update);
@@ -218,21 +223,25 @@ TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded t
     step.backward(total);
     compare_gradients(comparison, archive, model, "gradient/", true);
     std::vector<torch::Tensor> norms;
-    for (const auto& parameter : built.optimizer.parameters()) if (parameter.grad().defined()) norms.push_back(parameter.grad().norm());
+    for (const auto& parameter : built.optimizer.parameters())
+     if (parameter.grad().defined()) norms.push_back(parameter.grad().norm());
     comparison.compare("clip_norm", torch::stack(norms).norm(), archive.tensor("clip_norm"), ComparisonPolicy::Value);
     if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/clip_norm", torch::stack(norms).norm(), archive.tensor("stock/clip_norm"), ComparisonPolicy::Value, true);
     built.optimizer.clip_grad_norm_(entry.clip_max_norm);
     compare_gradients(comparison, archive, model, "clipped/", entry.dtype() != torch::kFloat32);
     rf::TensorMap actual_before;
-    for (const auto& parameter : model.named_parameters(true)) if (parameter.value().requires_grad()) actual_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
+    for (const auto& parameter : model.named_parameters(true))
+     if (parameter.value().requires_grad()) actual_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
     built.optimizer.step();
-    for (const auto& parameter : model.named_parameters(true)) if (parameter.value().requires_grad()) {
-     const auto key = "updated/" + parameter.key();
-     comparison.compare(key, parameter.value(), archive.tensor(key), ComparisonPolicy::Value);
-     comparison.compare("update/" + parameter.key(), parameter.value().detach().cpu() - actual_before.at(parameter.key()), archive.tensor(key) - expected_before.at(parameter.key()), ComparisonPolicy::Derivative);
-     expected_before[parameter.key()] = archive.tensor(key);
-     if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/" + key, parameter.value(), archive.tensor("stock/" + key), ComparisonPolicy::Value, true);
-    }
+    for (const auto& parameter : model.named_parameters(true))
+     if (parameter.value().requires_grad()) {
+      const auto key = "updated/" + parameter.key();
+      comparison.compare(key, parameter.value(), archive.tensor(key), ComparisonPolicy::Value);
+      comparison.compare(
+       "update/" + parameter.key(), parameter.value().detach().cpu() - actual_before.at(parameter.key()), archive.tensor(key) - expected_before.at(parameter.key()), ComparisonPolicy::Derivative);
+      expected_before[parameter.key()] = archive.tensor(key);
+      if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/" + key, parameter.value(), archive.tensor("stock/" + key), ComparisonPolicy::Value, true);
+     }
     compare_optimizer(comparison, archive, built.optimizer, entry, true);
     model.eval();
     {

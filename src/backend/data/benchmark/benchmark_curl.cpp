@@ -199,7 +199,8 @@ struct BenchmarkCurl::Impl {
   ensure_curl_global_initialized("cannot initialize benchmark Curl: ");
   require_supported_curl();
   if (execution)
-   readiness = std::make_unique<CompileExecution::Readiness>(*execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Pressure, [this](CompileExecution::Readiness&, CompileExecution::Readiness::Changes changes) {
+   readiness = std::make_unique<CompileExecution::Readiness>(
+    *execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Pressure, [this](CompileExecution::Readiness&, CompileExecution::Readiness::Changes changes) {
     const std::lock_guard lock(mutex);
     const bool reader_notice = includes(changes.causes, CompileChange::Resources | CompileChange::Pressure | CompileChange::Interruption);
     if (!reader_notice && !waiting_cpu) return;

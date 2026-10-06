@@ -29,7 +29,8 @@ rf::NativeRfDetrConfig compilation_config(bool masks = false) {
 bool contains_operation(const torch::jit::Block* block, std::string_view operation) {
  for (const auto* node : block->nodes()) {
   if (node->kind().toQualString() == operation) return true;
-  for (const auto* child : node->blocks()) if (contains_operation(child, operation)) return true;
+  for (const auto* child : node->blocks())
+   if (contains_operation(child, operation)) return true;
   if (node->hasAttribute(torch::jit::attr::Subgraph) && contains_operation(node->g(torch::jit::attr::Subgraph)->block(), operation)) return true;
  }
  return false;
@@ -172,8 +173,7 @@ TEST_CASE("Full model admission retains mode tails live weights and ordinary geo
  REQUIRE(graph);
  // Different input dtype and input/ambient gradient policy take the checked
  // ordinary path while preserving the admitted FP32 training graph.
- compare_tensor(model.forward({input.to(torch::kFloat16), {}}, true).main.pred_logits,
-  model.forward({input.to(torch::kFloat16).to(torch::kFloat32), {}}, true).main.pred_logits, torch::kFloat32);
+ compare_tensor(model.forward({input.to(torch::kFloat16), {}}, true).main.pred_logits, model.forward({input.to(torch::kFloat16).to(torch::kFloat32), {}}, true).main.pred_logits, torch::kFloat32);
  CHECK(Access::graph(model, true) == graph);
  auto differentiable_input = input.detach().clone().set_requires_grad(true);
  CHECK(model.forward({differentiable_input, {}}, true).main.pred_logits.requires_grad());
@@ -245,8 +245,10 @@ TEST_CASE("Lazy FullTrace rejects target-dependent supervision before recording"
   CHECK_FALSE(Access::graph(model, true));
   const rf::NestedTensor input{torch::zeros({1, 3, 64, 64}), {}};
   mmltk::testsupport::expect_runtime_error_contains([&] {
-   if (match_free) static_cast<void>(model.forward_for_match_free(input));
-   else static_cast<void>(model.forward_with_denoising(input, {}, {128, 0, 0, 0}));
+   if (match_free)
+    static_cast<void>(model.forward_for_match_free(input));
+   else
+    static_cast<void>(model.forward_with_denoising(input, {}, {128, 0, 0, 0}));
   }, "full-trace RF-DETR cannot");
   CHECK_FALSE(Access::graph(model, true));
  }

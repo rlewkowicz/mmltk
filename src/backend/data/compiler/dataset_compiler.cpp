@@ -253,8 +253,9 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  constexpr std::array classes{detail::CompileWorkClass::Extraction, detail::CompileWorkClass::Annotations, detail::CompileWorkClass::Pixels, detail::CompileWorkClass::Output};
  const auto label_window = compiler_internal::DirectoryLabels::resources(2048, compiler_internal::directory_line_window, effective_config.max_label_bytes).bytes;
  detail::CompileExecutionLimits limits;
- limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers),
-  {width, height, effective_config.resize_mode, effective_config.perceptual_downscale, effective_config.resize_method}, classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));
+ limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(
+  detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers), {width, height, effective_config.resize_mode, effective_config.perceptual_downscale, effective_config.resize_method},
+   classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));
  detail::CompileExecutionObserver observer;
  if (effective_config.observation && effective_config.observation->execution)
   observer = {effective_config.observation->execution_demand, [&](std::string_view event, const detail::CompileExecutionSnapshot& snapshot) {

@@ -7,7 +7,9 @@
 #include <memory>
 #include <span>
 #include <string>
-namespace torch::jit { struct Graph; }
+namespace torch::jit {
+struct Graph;
+}
 namespace mmltk::backend::models::rfdetr::detail {
 // Shared lane-local capture mechanics. Callers own output schemas and storage;
 // each mode retains one admitted graph over live registered owner tensors.
@@ -20,11 +22,15 @@ public:
  TensorTrace& operator=(const TensorTrace&) = delete;
  void prepare(bool training, bool enabled, std::int64_t batch_size);
  void invalidate();
- struct Result { c10::IValue output; bool recorded = false; };
+ struct Result {
+  c10::IValue output;
+  bool recorded = false;
+ };
  Result invoke(bool training, std::span<const torch::Tensor> inputs, std::initializer_list<torch::nn::Module*> owners, Operation ordinary, std::uint64_t specialization = 0);
  [[nodiscard]] bool enabled(bool training) const noexcept;
  [[nodiscard]] const void* identity(bool training) const noexcept;
  [[nodiscard]] std::shared_ptr<torch::jit::Graph> graph(bool training) const;
+
 private:
  struct State;
  struct Slot {

@@ -1219,9 +1219,9 @@ PredictionRunResult PredictionSession::State::RunResolved(
      lane.resizer->prepare(plan, plan.bytes() ? std::span(reinterpret_cast<std::byte*>(scratch.data_ptr<std::uint8_t>()), plan.bytes()) : std::span<std::byte>{});
      const auto target_row = static_cast<std::size_t>(input_resolution) * sizeof(float);
      const auto target_plane = target_row * input_resolution;
-     lane.resizer->resize_to_planar(
-      {pixels, {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), std::size_t(width) * 3, 0, std::size_t(width) * height * 3, RgbPixelFormat::RGB8}},
-      {lane.host[image].data_ptr<float>(), {static_cast<std::uint32_t>(input_resolution), static_cast<std::uint32_t>(input_resolution), target_row, target_plane, target_plane * 3, RgbPixelFormat::PlanarUnitSrgbF32}},
+     lane.resizer->resize_to_planar({pixels, {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), std::size_t(width) * 3, 0, std::size_t(width) * height * 3, RgbPixelFormat::RGB8}},
+      {lane.host[image].data_ptr<float>(),
+       {static_cast<std::uint32_t>(input_resolution), static_cast<std::uint32_t>(input_resolution), target_row, target_plane, target_plane * 3, RgbPixelFormat::PlanarUnitSrgbF32}},
       ImageResizeMode::Stretch);
     }
    }

@@ -103,13 +103,15 @@ TEST_CASE("Deformable attention retains selected support derivatives across redu
  const int axis = GENERATE(0, 1);
  const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
  const auto shapes = torch::tensor({{extent, extent}}, torch::kInt64), starts = torch::tensor({0}, torch::kInt64);
- const float boundary = -.5F / static_cast<float>(extent);
- const std::vector<float> coordinates{std::nextafter(boundary, -1.F), boundary, std::nextafter(boundary, 0.F), 0.F, .5F / extent, .5F, 1.F, 1.F + .5F / extent};
- auto locations = torch::full({1, static_cast<int64_t>(coordinates.size()), 1, 1, 2, 2}, .5F / extent, options);
+ const float half_pixel = .5F / static_cast<float>(extent);
+ const float boundary = -half_pixel;
+ const std::vector<float> coordinates{std::nextafter(boundary, -1.F), boundary, std::nextafter(boundary, 0.F), 0.F, half_pixel, .5F, 1.F, 1.F + half_pixel};
+ auto locations = torch::full({1, static_cast<int64_t>(coordinates.size()), 1, 1, 2, 2}, half_pixel, options);
  locations.select(-1, axis).copy_(torch::tensor(coordinates, options).view({1, -1, 1, 1, 1}).expand_as(locations.select(-1, axis)));
  AttentionInputs inputs{
-  (torch::arange(extent * extent * channels, options).reshape({1, extent * extent, 1, channels}) / (extent * extent * channels) + .125).requires_grad_(true),
-  locations.requires_grad_(true), torch::full({1, static_cast<int64_t>(coordinates.size()), 1, 1, 2}, .5, options).requires_grad_(true)};
+  (torch::arange(extent * extent * channels, options).reshape({1, extent * extent, 1, channels}) / (extent * extent * channels) + .125).requires_grad_(true), locations.requires_grad_(true),
+  torch::full({1, static_cast<int64_t>(coordinates.size()), 1, 1, 2}, .5, options).requires_grad_(true)
+ };
  compare_attention(inputs, shapes, starts, 64, torch::ones({1, static_cast<int64_t>(coordinates.size()), channels}, options));
 }
 TEST_CASE("Deformable attention preserves exceptional sampled products and VJPs", "[backend][ml][layers][parity]") {
@@ -140,8 +142,9 @@ TEST_CASE("Deformable attention launches bounded tail chunks on the caller strea
  const c10::cuda::CUDAStreamGuard guard(stream);
  const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
  const auto shapes = torch::tensor({{2, 2}, {1, 2}}, torch::kInt64), starts = torch::tensor({0, 4}, torch::kInt64);
- AttentionInputs inputs{torch::randn({batch, 6, 2, 7}, options).requires_grad_(true), torch::rand({batch, 2, 2, 2, 2, 2}, options).requires_grad_(true),
-  torch::rand({batch, 2, 2, 2, 2}, options).requires_grad_(true)};
+ AttentionInputs inputs{
+  torch::randn({batch, 6, 2, 7}, options).requires_grad_(true), torch::rand({batch, 2, 2, 2, 2, 2}, options).requires_grad_(true), torch::rand({batch, 2, 2, 2, 2}, options).requires_grad_(true)
+ };
  compare_attention(inputs, shapes, starts, step, torch::randn({batch, 2, 14}, options));
  stream.synchronize();
 }
@@ -157,9 +160,9 @@ TEST_CASE("Dispatcher attention capture preserves opaque work and mixed precisio
    locations.select(1, 0).select(-1, 0).fill_(-.25F);
    locations.select(1, 0).select(-1, 1).fill_(.25F);
    return AttentionInputs{
-    (torch::arange(56, options).reshape({1, 2, 4, 7}) * .031 + replay * .07).transpose(1, 2).to(precision).requires_grad_(true),
-    locations.requires_grad_(true),
-    torch::full({1, 3, 2, 1, 2}, .4 + replay * .01, options.dtype(precision)).requires_grad_(true)};
+    (torch::arange(56, options).reshape({1, 2, 4, 7}) * .031 + replay * .07).transpose(1, 2).to(precision).requires_grad_(true), locations.requires_grad_(true),
+    torch::full({1, 3, 2, 1, 2}, .4 + replay * .01, options.dtype(precision)).requires_grad_(true)
+   };
   };
   mmltk::backend::ml::cuda::TorchAutocastScope amp(precision != torch::kFloat32, precision);
   auto operands = make_inputs(0);

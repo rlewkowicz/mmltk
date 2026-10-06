@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/model_fwd.h"
 #include <filesystem>
 #include <stop_token>
 #include <memory>
@@ -7,7 +8,6 @@
 #include "src/common/io/file_digest.h"
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 namespace mmltk::backend::models::rfdetr {
-class NativeRfDetrModel;
 class DecodedNativeModelState;
 class TrainingSessionAdmission;
 struct ModelStateLoadSummary;

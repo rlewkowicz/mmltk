@@ -6,7 +6,9 @@
 #include <vector>
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/model.h"
-namespace torch::jit { struct Graph; }
+namespace torch::jit {
+struct Graph;
+}
 namespace mmltk::backend::models::rfdetr {
 namespace test_support {
 struct FullTraceTestAccess {

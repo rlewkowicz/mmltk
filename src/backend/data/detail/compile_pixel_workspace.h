@@ -56,7 +56,8 @@ private:
  imaging::resample::RgbImageLayout destination_;
 };
 [[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy, imaging::resample::RgbResizeWork* observed = nullptr);
-[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, std::uint32_t resolution, imaging::resample::ImageResizeMode, bool perceptual, imaging::resample::RgbResizeMethod = imaging::resample::RgbResizeMethod::Native);
+[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(
+ const CompileImageHeader&, std::uint32_t resolution, imaging::resample::ImageResizeMode, bool perceptual, imaging::resample::RgbResizeMethod = imaging::resample::RgbResizeMethod::Native);
 // Session-owned controls bind only to the current arena. Pixels go directly
 // into the prepared destination; neither controls nor borrowed scratch escape.
 // A supplied storage preparation runs after successful decoding, before stores.
