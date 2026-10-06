@@ -1,5 +1,6 @@
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include <torch/torch.h>
+#include <cmath>
 #include "src/pch_std.h"
 #include <ATen/cuda/CUDAContext.h>
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
@@ -248,7 +249,8 @@ void GradScaler::update(const bool found_inf) {
   scale_ *= backoff_factor_;
   growth_tracker_ = 0;
  } else if (++growth_tracker_ >= growth_interval_) {
-  scale_ *= growth_factor_;
+  const auto candidate = scale_ * growth_factor_;
+  if (std::isfinite(candidate)) scale_ = candidate;
   growth_tracker_ = 0;
  }
 }

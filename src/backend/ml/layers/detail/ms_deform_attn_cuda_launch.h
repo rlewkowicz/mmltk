@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdint>
 namespace mmltk::backend::ml::layers {
 namespace ms_deform_attn_launch {
@@ -20,7 +21,6 @@ struct LaunchPlan : AttentionShape {
  int batch = 0;
  int im2col_step = 0;
  int chunk_count = 0;
- int batch_n = 0;
  std::int64_t value_stride = 0;
  std::int64_t sampling_loc_stride = 0;
  std::int64_t attn_weight_stride = 0;
@@ -31,14 +31,14 @@ struct LaunchPlan : AttentionShape {
   shape,
   batch,
   im2col_step,
-  batch / im2col_step,
-  im2col_step,
+  batch / im2col_step + static_cast<int>(batch % im2col_step != 0),
   static_cast<std::int64_t>(shape.spatial_size) * shape.num_heads * shape.channels,
   static_cast<std::int64_t>(shape.num_query) * shape.num_heads * shape.num_levels * shape.num_point * 2,
   static_cast<std::int64_t>(shape.num_query) * shape.num_heads * shape.num_levels * shape.num_point,
   static_cast<std::int64_t>(shape.num_query) * shape.num_heads * shape.channels,
  };
 }
+[[nodiscard]] inline int chunk_size(const LaunchPlan& plan, const int chunk) { return std::min(plan.im2col_step, plan.batch - chunk * plan.im2col_step); }
 [[nodiscard]] inline std::int64_t batch_offset(const LaunchPlan& plan, const int batch_index, const std::int64_t stride) { return static_cast<std::int64_t>(batch_index) * plan.im2col_step * stride; }
 struct CommonLaunch : AttentionShape {
  const float* value = nullptr;

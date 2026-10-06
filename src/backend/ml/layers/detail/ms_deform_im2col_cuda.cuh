@@ -100,7 +100,7 @@ struct BilinearForwardPolicy {
  __device__ void corner(int, int, scalar_t, scalar_t, const BilinearSampleGeometry<scalar_t>&) const {}
  __device__ scalar_t finish(const scalar_t value) const { return value; }
 };
-template <typename scalar_t, typename AccumulationPolicy>
+template <typename scalar_t, typename AccumulationPolicy, bool FiniteGradient>
 struct BilinearBackwardPolicy {
  BilinearSampleGeometry<scalar_t> geometry{};
  scalar_t* grad_value = nullptr;
@@ -112,28 +112,40 @@ struct BilinearBackwardPolicy {
  scalar_t grad_w_weight = 0;
  AccumulationPolicy accumulation_policy{};
  __device__ void corner(int corner_index, int ptr, scalar_t weight, scalar_t corner_value, const BilinearSampleGeometry<scalar_t>&) {
+  scalar_t h_factor = 0, w_factor = 0;
   switch (corner_index) {
    case 0:
-    grad_h_weight -= geometry.hw * corner_value;
-    grad_w_weight -= geometry.hh * corner_value;
+    h_factor = -geometry.hw;
+    w_factor = -geometry.hh;
     break;
    case 1:
-    grad_h_weight -= geometry.lw * corner_value;
-    grad_w_weight += geometry.hh * corner_value;
+    h_factor = -geometry.lw;
+    w_factor = geometry.hh;
     break;
    case 2:
-    grad_h_weight += geometry.hw * corner_value;
-    grad_w_weight -= geometry.lh * corner_value;
+    h_factor = geometry.hw;
+    w_factor = -geometry.lh;
     break;
    default:
-    grad_h_weight += geometry.lw * corner_value;
-    grad_w_weight += geometry.lh * corner_value;
+    h_factor = geometry.lw;
+    w_factor = geometry.lh;
     break;
+  }
+  // Normally factor the incoming gradient out of the corner sum. For an
+  // exceptional cotangent, each valid corner must still evaluate 0 * Inf/NaN
+  // as grid_sample does, even if another corner has a nonzero derivative.
+  if constexpr (FiniteGradient) {
+   grad_h_weight += h_factor * corner_value;
+   grad_w_weight += w_factor * corner_value;
+  } else {
+   grad_h_weight += h_factor * corner_value * top_grad_value;
+   grad_w_weight += w_factor * corner_value * top_grad_value;
   }
   gpuAtomicAdd(grad_value + ptr, weight * top_grad_value);
  }
  __device__ scalar_t finish(const scalar_t value) {
-  accumulation_policy.template store<scalar_t>(grad_sampling_loc, grad_attn_weight, {grad_h_weight, grad_w_weight, top_grad, top_grad_value, value, geometry.height, geometry.width});
+  const auto multiplier = FiniteGradient ? top_grad_value : scalar_t{1};
+  accumulation_policy.template store<scalar_t>(grad_sampling_loc, grad_attn_weight, {grad_h_weight, grad_w_weight, top_grad, multiplier, value, geometry.height, geometry.width});
   return value;
  }
 };
@@ -170,11 +182,10 @@ struct BilinearAccumulatorPolicy {
 };
 using BilinearDirectAccumulatorPolicy = BilinearAccumulatorPolicy<BilinearDirectStoreOp>;
 using BilinearAtomicAccumulatorPolicy = BilinearAccumulatorPolicy<BilinearAtomicStoreOp>;
-template <typename scalar_t, typename AccumulationPolicy>
-__device__ void ms_deform_attn_bilinear_backward(const scalar_t* bottom_data, const BilinearSampleGeometry<scalar_t>& geometry, const scalar_t top_grad, const scalar_t attn_weight,
+template <bool FiniteGradient, typename scalar_t, typename AccumulationPolicy>
+__device__ void ms_deform_attn_bilinear_backward(const scalar_t* bottom_data, const BilinearSampleGeometry<scalar_t>& geometry, const scalar_t top_grad, const scalar_t top_grad_value,
  scalar_t* grad_value, scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight, const AccumulationPolicy& accumulation_policy) {
- const scalar_t top_grad_value = top_grad * attn_weight;
- BilinearBackwardPolicy<scalar_t, AccumulationPolicy> policy{
+ BilinearBackwardPolicy<scalar_t, AccumulationPolicy, FiniteGradient> policy{
   geometry,
   grad_value,
   grad_sampling_loc,
@@ -191,7 +202,12 @@ template <typename scalar_t, typename AccumulationPolicy>
 __device__ void ms_deform_attn_col2im_bilinear(const scalar_t* bottom_data, const int height, const int width, const int nheads, const int channels, const scalar_t h, const scalar_t w, const int m,
  const int c, const scalar_t top_grad, const scalar_t attn_weight, scalar_t* grad_value, scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight, const AccumulationPolicy& accumulation_policy) {
  const BilinearSampleGeometry<scalar_t> geometry = make_bilinear_sample_geometry(height, width, nheads, channels, h, w, m, c);
- ms_deform_attn_bilinear_backward(bottom_data, geometry, top_grad, attn_weight, grad_value, grad_sampling_loc, grad_attn_weight, accumulation_policy);
+ const scalar_t top_grad_value = top_grad * attn_weight;
+ if (isfinite(top_grad_value)) {
+  ms_deform_attn_bilinear_backward<true>(bottom_data, geometry, top_grad, top_grad_value, grad_value, grad_sampling_loc, grad_attn_weight, accumulation_policy);
+ } else {
+  ms_deform_attn_bilinear_backward<false>(bottom_data, geometry, top_grad, top_grad_value, grad_value, grad_sampling_loc, grad_attn_weight, accumulation_policy);
+ }
 }
 template <typename scalar_t>
 __device__ scalar_t ms_deform_attn_im2col_bilinear(
@@ -283,9 +299,15 @@ __device__ inline void ms_deformable_col2im_apply_point(
  const MsDeformableCol2ImPointArgs<scalar_t>& point, scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight, const AccumulationPolicy& accumulation_policy) {
  const scalar_t h_im = point.loc_h * point.spatial_h - 0.5;
  const scalar_t w_im = point.loc_w * point.spatial_w - 0.5;
- if (h_im > -1 && w_im > -1 && h_im < point.spatial_h && w_im < point.spatial_w) {
+ // At -1 the selected bilinear branch has an in-bounds, zero-weight
+ // neighbor. Its coordinate derivative and exceptional values still matter.
+ if (h_im >= -1 && w_im >= -1 && h_im < point.spatial_h && w_im < point.spatial_w) {
   ms_deform_attn_col2im_bilinear(point.data_value_ptr, point.spatial_h, point.spatial_w, point.num_heads, point.channels, h_im, w_im, point.m_col, point.c_col, point.top_grad, point.weight,
    point.grad_value_ptr, grad_sampling_loc, grad_attn_weight, accumulation_policy);
+ } else if (!isfinite(point.top_grad)) {
+  // The reference samples zero before multiplying by attention. Empty grid
+  // support has no value/location derivatives, but dAttention = g * 0.
+  accumulation_policy.template store<scalar_t>(grad_sampling_loc, grad_attn_weight, {0, 0, point.top_grad, 0, 0, point.spatial_h, point.spatial_w});
  }
 }
 template <typename scalar_t, typename ReductionFn, typename StoreFn>
@@ -392,9 +414,11 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n, MMLTK_ML_LAYERS_DEF
     const scalar_t weight = data_attn_weight[data_weight_ptr];
     const scalar_t h_im = loc_h * spatial_h - 0.5;
     const scalar_t w_im = loc_w * spatial_w - 0.5;
-    if (h_im > -1 && w_im > -1 && h_im < spatial_h && w_im < spatial_w) {
-     col += ms_deform_attn_im2col_bilinear(data_value_ptr, spatial_h, spatial_w, num_heads, channels, h_im, w_im, m_col, c_col) * weight;
+    scalar_t sampled = 0;
+    if (h_im >= -1 && w_im >= -1 && h_im < spatial_h && w_im < spatial_w) {
+     sampled = ms_deform_attn_im2col_bilinear(data_value_ptr, spatial_h, spatial_w, num_heads, channels, h_im, w_im, m_col, c_col);
     }
+    col += sampled * weight;
     data_weight_ptr += 1;
     data_loc_w_ptr += 2;
    }

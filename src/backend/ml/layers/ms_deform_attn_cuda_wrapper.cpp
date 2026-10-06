@@ -76,7 +76,6 @@ ValidatedDeformAttn validate_deform_attn_inputs(const torch::Tensor& value, cons
               sampling_loc.size(3) == attn_weight.size(3) && sampling_loc.size(4) == attn_weight.size(4),
   "sampling locations and attention weights must have compatible shapes");
  TORCH_CHECK(sampling_loc.size(2) == num_heads && sampling_loc.size(3) == num_levels, "sampling locations must match value heads and spatial levels");
- TORCH_CHECK(batch % im2col_step_ == 0, "im2col_step(%d) must divide batch(%d)", im2col_step_, batch);
  ms_deform_attn_launch::DeviceLayout layout{};
  const auto* shapes = spatial_shapes.data_ptr<int64_t>();
  const auto* starts = level_start_index.data_ptr<int64_t>();

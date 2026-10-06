@@ -13,12 +13,17 @@
 #include <torch/nn/functional/vision.h>
 #include <torch/nn/functional/conv.h>
 #include <torch/nn/functional/normalization.h>
+#include <torch/nn/functional/activation.h>
+#include <torch/csrc/jit/frontend/tracer.h>
+#include <torch/csrc/jit/runtime/graph_executor.h>
 #include "src/backend/models/rfdetr/core/detail/traced_loss_cache.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
+#include "src/backend/models/rfdetr/core/detail/detr_matcher_cuda.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/numa_topology.h"
 #include <limits>
+#include <memory>
 #include <array>
 #include <cstdint>
 #include <cstddef>
@@ -80,6 +85,28 @@ rf::PreparedTargets targets(const torch::Tensor& boxes, const torch::Tensor& lab
  result.offsets = {0};
  result.counts = {labels.numel()};
  return result;
+}
+torch::Tensor reference_depthwise(const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias) {
+ // Literal padded convolution, with its own ordinary autograd graph.
+ std::vector<torch::Tensor> channels;
+ for (int64_t channel = 0; channel < input.size(1); ++channel) {
+  std::vector<torch::Tensor> rows;
+  for (int64_t y = 0; y < input.size(2); ++y) {
+   std::vector<torch::Tensor> cells;
+   for (int64_t col = 0; col < input.size(3); ++col) {
+    auto cell = bias.defined() ? bias[channel] : torch::zeros({}, input.options());
+    for (int64_t ky = 0; ky < 3; ++ky)
+     for (int64_t kx = 0; kx < 3; ++kx) {
+      const auto iy = y + ky - 1, ix = col + kx - 1;
+      if (iy >= 0 && iy < input.size(2) && ix >= 0 && ix < input.size(3)) cell = cell + input.index({0, channel, iy, ix}) * weight.index({channel, 0, ky, kx});
+     }
+    cells.push_back(cell);
+   }
+   rows.push_back(torch::stack(cells));
+  }
+  channels.push_back(torch::stack(rows));
+ }
+ return torch::stack(channels).unsqueeze(0);
 }
 void require_stock_loss_vocabulary(const rf::TensorMap& losses, std::size_t auxiliaries, bool encoder, bool masks) {
  std::vector<std::string> suffixes{""};
@@ -205,29 +232,255 @@ TEST_CASE("Depthwise VJP uses original weight precision outside forward autocast
   // Independent literal convolution, differentiated in original FP32. This
   // bypasses native custom backward and avoids an im2col reference expansion.
   auto x = input.detach().clone().set_requires_grad(true), w = weight.detach().clone().set_requires_grad(true), b = bias.detach().clone().set_requires_grad(true);
-  std::vector<torch::Tensor> channels;
-  for (int64_t channel = 0; channel < 2; ++channel) {
-   std::vector<torch::Tensor> rows;
-   for (int64_t y = 0; y < 3; ++y) {
-    std::vector<torch::Tensor> cells;
-    for (int64_t col = 0; col < 3; ++col) {
-     auto cell = b[channel];
-     for (int64_t ky = 0; ky < 3; ++ky)
-      for (int64_t kx = 0; kx < 3; ++kx) {
-       const auto iy = y + ky - 1, ix = col + kx - 1;
-       if (iy >= 0 && iy < 3 && ix >= 0 && ix < 3) cell = cell + x.index({0, channel, iy, ix}) * w.index({channel, 0, ky, kx});
-      }
-     cells.push_back(cell);
-    }
-    rows.push_back(torch::stack(cells));
-   }
-   channels.push_back(torch::stack(rows));
-  }
-  const auto reference = torch::stack(channels).unsqueeze(0);
+  const auto reference = reference_depthwise(x, w, b);
   reference.backward(incoming.to(torch::kFloat32));
   REQUIRE(torch::allclose(input.grad(), x.grad(), 1e-5, 1e-6));
   REQUIRE(torch::allclose(weight.grad(), w.grad(), 1e-5, 1e-6));
   REQUIRE(torch::allclose(bias.grad(), b.grad(), 1e-5, 1e-6));
+ }
+}
+TEST_CASE("Depthwise dispatcher replay keeps original-weight VJPs and optional gradients", "[rfdetr][parity][compilation]") {
+ tensor_fixture::FullMatrixPrecision precision;
+ for (const auto& [device, amp] : tensor_fixture::available_amp_precisions())
+  for (const bool has_bias : {false, true})
+   for (const bool train_weight : {false, true}) {
+    CAPTURE(device, amp, has_bias, train_weight);
+    const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+    const auto make_input = [&](int replay) { return (torch::arange(18, options).reshape({1, 2, 3, 3}) * .07137 - .3 + replay * .0123).set_requires_grad(true); };
+    auto input = make_input(0);
+    auto weight = (torch::arange(18, options).reshape({2, 1, 3, 3}) * .02317 - .1).set_requires_grad(train_weight);
+    auto bias = has_bias ? torch::tensor({.03713, -.06217}, options).set_requires_grad(true) : torch::Tensor{};
+    const auto arguments = [&](const torch::Tensor& x) {
+     torch::jit::Stack args{x, weight};
+     if (has_bias) args.emplace_back(bias);
+     return args;
+    };
+    std::shared_ptr<torch::jit::Graph> graph;
+    torch::Tensor output;
+    {
+     mmltk::backend::ml::cuda::TorchAutocastScope scope(amp != torch::kFloat32, amp);
+     auto trace = torch::jit::tracer::trace(arguments(input), [](torch::jit::Stack args) {
+      return torch::jit::Stack{rf::segmentation_depthwise(args[0].toTensor(), args[1].toTensor(), args.size() == 3 ? args[2].toTensor() : torch::Tensor{})};
+     }, [](const torch::autograd::Variable&) { return std::string{}; }, false, false);
+     graph = trace.first->graph;
+     output = trace.second[0].toTensor();
+    }
+    REQUIRE(graph->toString().find("mmltk::segmentation_depthwise") != std::string::npos);
+    REQUIRE(graph->toString().find("aten::conv2d") == std::string::npos);
+    torch::jit::GraphExecutor executor(graph, "depthwise_dispatch");
+    for (int replay = 0; replay <= 4; ++replay) {
+     CAPTURE(replay);
+     if (replay) {
+      input = make_input(replay);
+      {
+       torch::NoGradGuard guard;
+       weight.add_(.00317); // Live weight values cannot become capture constants.
+      }
+      mmltk::backend::ml::cuda::TorchAutocastScope scope(amp != torch::kFloat32, amp);
+      auto stack = arguments(input);
+      executor.run(stack);
+      output = stack[0].toTensor();
+     }
+     {
+      mmltk::backend::ml::cuda::TorchAutocastScope scope(amp != torch::kFloat32, amp);
+      const auto eager = F::conv2d(input, weight, F::Conv2dFuncOptions().bias(bias).padding(1).groups(2));
+      REQUIRE(output.scalar_type() == eager.scalar_type());
+      REQUIRE(torch::allclose(output, eager, 1e-5, 1e-6));
+     }
+     auto x = input.detach().clone().set_requires_grad(true), w = weight.detach().clone().set_requires_grad(train_weight);
+     auto b = has_bias ? bias.detach().clone().set_requires_grad(true) : torch::Tensor{};
+     const auto expected = reference_depthwise(x, w, b);
+     std::vector<torch::Tensor> native_inputs{input}, reference_inputs{x};
+     if (train_weight) { native_inputs.push_back(weight); reference_inputs.push_back(w); }
+     if (has_bias) { native_inputs.push_back(bias); reference_inputs.push_back(b); }
+     const auto incoming = (torch::arange(18, options).reshape_as(output) * .04113 + .037).to(output.scalar_type());
+     for (const double scale : {1., .75}) {
+      const auto cotangent = incoming * scale;
+      const auto actual_grads = torch::autograd::grad({output}, native_inputs, {cotangent}, true);
+      const auto expected_grads = torch::autograd::grad({expected}, reference_inputs, {cotangent.to(torch::kFloat32)}, true);
+      for (size_t i = 0; i < native_inputs.size(); ++i) REQUIRE(torch::allclose(actual_grads[i], expected_grads[i], 1e-5, 1e-6));
+     }
+     REQUIRE_FALSE(weight.grad().defined());
+    }
+   }
+}
+TEST_CASE("IA-BCE casts detached quality independently into mixed precision destinations", "[rfdetr][parity][compilation]") {
+ rf::testsupport::MatcherExecutionFixture fixture;
+ rf::ScopedRuntimeContext runtime(nullptr, 0, &fixture.workspace);
+ for (const auto& [device, amp] : tensor_fixture::available_amp_precisions())
+  for (const bool traced : {false, true}) {
+   CAPTURE(device, amp, traced);
+   const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+   rf::DetectionConfig config;
+   config.num_classes = 2;
+   config.group_detr = 1;
+   config.ia_bce_loss = true;
+   config.use_jit_traced_loss_ops = traced;
+   config.set_cost_bbox = 100;
+   const auto box = torch::tensor({{.3F, .4F, .2F, .2F}}, options);
+   const auto gt = targets(box, torch::zeros({1}, options.dtype(torch::kInt64)));
+   for (int replay = 0; replay < 4; ++replay) {
+    CAPTURE(replay);
+    auto logits = (torch::tensor({{{0.F, -.7F}, {.37F, .81F}}}, options) + replay * .071).to(amp).set_requires_grad(true);
+    auto reference_logits = logits.detach().clone().set_requires_grad(true);
+    rf::ModelOutputs outputs;
+    outputs.main.pred_logits = logits;
+    outputs.main.pred_boxes = torch::tensor({{{.33F, .42F, .2F, .2F}, {.8F, .8F, .1F, .1F}}}, options).set_requires_grad(true);
+    torch::Tensor actual, expected;
+    {
+     mmltk::backend::ml::cuda::TorchAutocastScope scope(amp != torch::kFloat32, amp);
+     const auto indices = rf::matcher_indices(outputs, gt, config, true);
+     REQUIRE(indices[0].first.item<int64_t>() == 0);
+     actual = rf::detection_loss_dict(outputs, gt, config, true, 1.).at("loss_ce");
+     const auto probability = reference_logits.sigmoid();
+     const auto iou = reference_giou(reference_corners(outputs.main.pred_boxes[0][0].detach().unsqueeze(0)), reference_corners(box), false).squeeze(0);
+     const auto quality = (torch::pow(probability[0][0][0], config.focal_alpha) * torch::pow(iou, 1 - config.focal_alpha)).clamp_min(.01).detach();
+     auto positive = torch::zeros_like(reference_logits);
+     auto negative = torch::pow(probability, 2.); // pow's autocast policy is part of this boundary.
+     REQUIRE(negative.scalar_type() == torch::kFloat32);
+     positive.index_put_({0, 0, 0}, quality.to(positive.scalar_type()));
+     const auto negative_quality = 1 - quality.to(negative.scalar_type());
+     negative.index_put_({0, 0, 0}, negative_quality);
+     expected = (negative * reference_logits - F::logsigmoid(reference_logits) * (positive + negative)).sum();
+     if (amp != torch::kFloat32 && replay == 0) {
+      const auto rounded = (1 - quality.to(positive.scalar_type())).to(negative.scalar_type());
+      REQUIRE_FALSE(torch::equal(negative_quality, rounded));
+     }
+    }
+    const double tolerance = !traced || amp == torch::kFloat32 ? 1e-6 : amp == torch::kFloat16 ? 1e-3 : 8e-3;
+    REQUIRE(torch::allclose(actual, expected, tolerance, tolerance));
+    const auto expected_grad = torch::autograd::grad({expected}, {reference_logits})[0];
+    for (int retained = 0; retained < 2; ++retained) {
+     const auto actual_grad = torch::autograd::grad({actual}, {logits}, {}, true)[0];
+     REQUIRE(torch::allclose(actual_grad, expected_grad, tolerance, tolerance));
+    }
+    REQUIRE_FALSE(outputs.main.pred_boxes.grad().defined());
+   }
+  }
+}
+TEST_CASE("Compact detection terms match independent FP32 costs for low-dtype predictions", "[rfdetr][parity]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; compact FP32 detection costs remain unverified");
+ for (const auto& [device, dtype] : tensor_fixture::available_amp_precisions()) {
+  if (!device.is_cuda()) continue;
+  const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  const auto logits = torch::tensor({{{.37F, -.71F}, {8.F, -9.F}, {-1.3F, 2.1F}}}, options.dtype(dtype));
+  const auto boxes = torch::tensor({{{.31F, .42F, .21F, .19F}, {.8F, .7F, .1F, .2F}, {.55F, .33F, .25F, .15F}}}, options.dtype(dtype));
+  const auto target = torch::tensor({{.3F, .4F, .2F, .2F}, {.75F, .72F, .17F, .21F}}, options);
+  const auto labels = torch::tensor({0, 1}, options.dtype(torch::kInt64));
+  const auto zero = torch::zeros({1}, options.dtype(torch::kInt64)), count = torch::full({1}, 2, options.dtype(torch::kInt64));
+  mmltk::backend::ml::cuda::TorchAutocastScope amp(dtype != torch::kFloat32, dtype);
+  std::array<torch::Tensor, 3> expected;
+  {
+   mmltk::backend::ml::cuda::TorchAutocastScope fp32(false, torch::kFloat32);
+   const auto z = logits[0].to(torch::kFloat32), p = z.sigmoid(), b = boxes[0].to(torch::kFloat32);
+   expected[0] = .25 * (1 - p).square() * torch::softplus(-z) - .75 * p.square() * torch::softplus(z);
+   expected[1] = (b.unsqueeze(1) - target.unsqueeze(0)).abs().sum(-1);
+   expected[2] = -reference_giou(reference_corners(b), reference_corners(target), true, true);
+  }
+  for (int term = 0; term < 3; ++term) {
+   CAPTURE(dtype, term);
+   auto actual = torch::empty({6}, options);
+   rf::pairwise_detection_cost_cuda_out(actual, logits, boxes, labels, target, zero, count, zero, 3, 2, term == 0 ? 1 : 0, term == 1 ? 1 : 0, term == 2 ? 1 : 0, .25);
+   REQUIRE(torch::allclose(actual.view({3, 2}), expected[term], 1e-5, 1e-6));
+  }
+ }
+}
+TEST_CASE("Exceptional AMP matching reconstructs full-domain FP32 mask and detection costs", "[rfdetr][parity]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; FP32 exceptional matcher reconstruction remains unverified");
+ rf::testsupport::MatcherExecutionFixture fixture;
+ rf::ScopedRuntimeContext runtime(nullptr, 0, &fixture.workspace);
+ tensor_fixture::FullMatrixPrecision precision;
+ for (const auto& [device, dtype] : tensor_fixture::available_amp_precisions()) {
+  if (!device.is_cuda()) continue;
+  for (const bool sparse : {false, true})
+   for (const bool traced : {false, true}) {
+    CAPTURE(dtype, sparse, traced);
+    const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+    rf::ModelOutputs outputs;
+    outputs.main.pred_logits = torch::tensor({{{std::numeric_limits<float>::quiet_NaN()}, {8.F}}, {{0.F}, {-3.F}}}, options.dtype(dtype));
+    outputs.main.pred_boxes = torch::tensor({{{.31F, .42F, .21F, .19F}, {.8F, .7F, .1F, .2F}}, {{.55F, .33F, .25F, .15F}, {.25F, .73F, .15F, .27F}}}, options.dtype(dtype));
+    const auto mask_logits = torch::tensor({20.F, -20.F, 12.F, -7.F}, options.dtype(dtype)).view({2, 2, 1, 1}).expand({2, 2, 64, 64}).contiguous();
+    if (sparse)
+     outputs.main.sparse_pred_masks = rf::SparsePredMasks{mask_logits, torch::eye(2, options.dtype(dtype)).unsqueeze(0).expand({2, 2, 2}), torch::zeros({1}, options)};
+    else
+     outputs.main.pred_masks = mask_logits;
+    rf::PreparedTargets gt;
+    gt.all_boxes = torch::tensor({{.3F, .4F, .2F, .2F}, {.75F, .72F, .17F, .21F}}, options);
+    gt.all_labels = torch::zeros({2}, options.dtype(torch::kInt64));
+    gt.offsets = {0, 1};
+    gt.counts = {1, 1};
+    for (int image = 0; image < 2; ++image) {
+     rf::PreparedTarget target;
+     target.boxes = gt.all_boxes.narrow(0, image, 1);
+     target.labels = gt.all_labels.narrow(0, image, 1);
+     gt.targets.push_back(target);
+    }
+    auto bits = torch::full({2, 64}, int64_t{-1}, options.dtype(torch::kInt64));
+    bits[0].zero_();
+    gt.packed_masks = rf::PackedTargetMasks{bits, 64, 64};
+    rf::LayerMaskSamples samples;
+    samples.matcher = torch::full({1, 4096, 2}, .5, options);
+    rf::DetectionConfig config;
+    config.num_classes = 1;
+    config.group_detr = 1;
+    config.include_masks = true;
+    config.mask_point_sample_ratio = 1;
+    config.set_cost_class = 2;
+    config.set_cost_bbox = 5;
+    config.set_cost_giou = 2;
+    config.mask_ce_loss_coef = 1;
+    config.mask_dice_loss_coef = 1;
+    config.use_jit_traced_loss_ops = traced;
+    // An independent full BQ-by-sum(T) CPU oracle includes cross-image pairs
+    // when selecting the exceptional replacement, just like the contract.
+    const auto z = outputs.main.pred_logits.flatten(0, 1).cpu().to(torch::kFloat32), p = z.sigmoid();
+    const auto b = outputs.main.pred_boxes.flatten(0, 1).cpu().to(torch::kFloat32), t = gt.all_boxes.cpu();
+    auto cost = 2 * (.25 * (1 - p).square() * torch::softplus(-z) - .75 * p.square() * torch::softplus(z)).expand({4, 2}) +
+     5 * (b.unsqueeze(1) - t.unsqueeze(0)).abs().sum(-1) - 2 * reference_giou(reference_corners(b), reference_corners(t), true, true);
+    const auto m = torch::tensor({20.F, -20.F, 12.F, -7.F}).unsqueeze(1), truth = torch::tensor({0.F, 1.F}).unsqueeze(0), probability = m.sigmoid();
+    cost += torch::softplus(-m) * truth + torch::softplus(m) * (1 - truth) + 1 -
+     (2 * 4096 * probability * truth + 1) / (4096 * probability + 4096 * truth + 1);
+    const auto finite = torch::isfinite(cost), finite_values = cost.index({finite});
+    const auto sentinel = finite_values.max() + finite_values.abs().max() + 1;
+    cost = torch::where(finite, cost, sentinel);
+    mmltk::backend::ml::cuda::TorchAutocastScope amp(dtype != torch::kFloat32, dtype);
+    const auto pairs = rf::matcher_indices(outputs, gt, config, true, samples);
+    for (int image = 0; image < 2; ++image) {
+     const auto expected = cost.narrow(0, image * 2, 2).narrow(1, image, 1);
+     REQUIRE(torch::allclose(fixture.workspace.cpu_matrix(0, image), expected, 1e-5, 1e-5));
+     REQUIRE(pairs[image].first.item<int64_t>() == expected.argmin().item<int64_t>());
+    }
+   }
+ }
+}
+TEST_CASE("Matcher FP32 policy retains the upstream AMP assignment difference", "[rfdetr][parity]") {
+ rf::testsupport::MatcherExecutionFixture fixture;
+ rf::ScopedRuntimeContext runtime(nullptr, 0, &fixture.workspace);
+ for (const auto device : tensor_fixture::available_devices()) {
+  const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  rf::ModelOutputs outputs;
+  outputs.main.pred_logits = torch::tensor({{{0.F}, {8.F}}}, options.dtype(torch::kBFloat16));
+  outputs.main.pred_boxes = torch::tensor({{{.1F, .1F, .05F, .05F}, {.88375F, .88375F, .05F, .05F}}}, options);
+  const auto gt = targets(outputs.main.pred_boxes[0].narrow(0, 0, 1), torch::zeros({1}, options.dtype(torch::kInt64)));
+  rf::DetectionConfig config;
+  config.num_classes = 1;
+  config.group_detr = 1;
+  config.set_cost_class = 2;
+  config.set_cost_bbox = 5;
+  config.set_cost_giou = 2;
+  config.use_jit_traced_loss_ops = false;
+  mmltk::backend::ml::cuda::TorchAutocastScope amp(device.is_cuda(), torch::kBFloat16);
+  const auto assignment = rf::matcher_indices(outputs, gt, config, true);
+  REQUIRE(assignment[0].first.item<int64_t>() == 0);
+  if (!device.is_cuda()) continue;
+  const auto z = outputs.main.pred_logits[0], p = z.sigmoid();
+  // Untouched upstream arithmetic deliberately retains rounded BF16 sigmoid
+  // and log_sigmoid results, followed by autocast's FP32 pow operations.
+  const auto class_cost = .25 * torch::pow(1 - p, 2.) * -F::logsigmoid(z) - .75 * torch::pow(p, 2.) * -F::logsigmoid(-z);
+  const auto l1 = (outputs.main.pred_boxes[0] - gt.all_boxes).abs().sum(-1);
+  const auto giou = reference_giou(reference_corners(outputs.main.pred_boxes[0]), reference_corners(gt.all_boxes.expand({2, 4})));
+  const auto upstream = 2 * class_cost.squeeze(-1) + 5 * l1 - 2 * giou;
+  REQUIRE(upstream.argmin().item<int64_t>() == 1);
  }
 }
 TEST_CASE("Encoder mask projection follows learned upstream skip-block equations", "[rfdetr][parity]") {

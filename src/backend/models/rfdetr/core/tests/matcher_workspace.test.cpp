@@ -9,6 +9,9 @@
 #include <vector>
 #include <cstring>
 #include <limits>
+#include <cmath>
+#include <algorithm>
+#include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "detail/detr_matcher_cuda.h"
 #include <stdexcept>
 #include <string_view>
@@ -352,4 +355,33 @@ TEST_CASE("Compact matcher matrices preserve CUDA pair bits across independent l
  auto invalid_labels = at::full_like(labels, 2);
  pairwise_detection_cost_cuda_out(out, logits[0], predictions[0], invalid_labels, boxes, lookup, device_counts, canonical_offsets, 5, 4, 1, 5, 2, .25);
  REQUIRE(mmltk::backend::ml::cuda::numa_readback(out).eq(23).all().item<bool>());
+}
+TEST_CASE("Compact mask costs accumulate long low-dtype samples in FP32", "[rfdetr][matcher][cuda][parity]") {
+ int devices = 0;
+ if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) SKIP("CUDA unavailable; FP32 mask cost accumulation remains unverified");
+ MatcherDeviceScope scope(0);
+ const auto dtype = GENERATE(at::kFloat, at::kHalf, at::kBFloat16);
+ const auto options = at::TensorOptions().device(at::Device(at::kCUDA, scope.device_index)).dtype(at::kFloat);
+ constexpr int64_t points = 4096;
+ auto sampled = at::full({1, 2, points}, 20, options.dtype(dtype));
+ sampled.select(1, 1).fill_(-20);
+ auto masks = at::zeros({2, points}, options);
+ masks[1].fill_(1);
+ const auto zero = longs({0}).to(options.device()), count = longs({2}).to(options.device());
+ for (const bool ce : {false, true}) {
+  auto cost = at::zeros({4}, options);
+  mmltk::backend::ml::cuda::TorchAutocastScope amp(dtype != at::kFloat, dtype);
+  pairwise_mask_cost_cuda_add_(cost, sampled, masks, zero, count, zero, 2, 2, ce ? 1 : 0, ce ? 0 : 1);
+  std::vector<float> expected;
+  for (const double logit : {20., -20.})
+   for (const double target : {0., 1.}) {
+    const double p = 1 / (1 + std::exp(-logit));
+    const double value = ce ? std::log1p(std::exp(-std::abs(logit))) + (target == 0 ? std::max(logit, 0.) : std::max(-logit, 0.))
+                           : 1 - (2 * points * p * target + 1) / (points * p + points * target + 1);
+    expected.push_back(static_cast<float>(value));
+   }
+  const auto actual = mmltk::backend::ml::cuda::numa_readback(cost);
+  REQUIRE(at::isfinite(actual).all().item<bool>());
+  REQUIRE(at::allclose(actual, at::tensor(expected), 1e-6, 1e-6));
+ }
 }

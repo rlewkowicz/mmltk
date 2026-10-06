@@ -10,6 +10,7 @@
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <cmath>
+#include <algorithm>
 #include <array>
 #include <torch/csrc/autograd/custom_function.h>
 #include <numbers>
@@ -236,6 +237,78 @@ TEST_CASE("Device clipping retains global norm empty zero and nonfinite behavior
   REQUIRE(torch::allclose(a.grad(), torch::full_like(a, magnitude * coefficient), 1e-6, 1e-7));
   REQUIRE(torch::allclose(b.grad(), torch::full_like(b, -magnitude * coefficient), 1e-6, 1e-7));
  }
+}
+TEST_CASE("GradScaler retains finite growth state and recoverable backoff", "[rfdetr][training][parity]") {
+ const auto upper = std::ldexp(1.F, 127);
+ rf::GradScaler scaler(true, upper, 2.F, .5F, 2);
+ scaler.update(false);
+ REQUIRE(scaler.current_scale() == upper);
+ REQUIRE(scaler.growth_tracker() == 1);
+ scaler.update(false);
+ REQUIRE(std::isfinite(scaler.current_scale()));
+ REQUIRE(scaler.current_scale() == upper);
+ REQUIRE(scaler.growth_tracker() == 0);
+ scaler.update(true);
+ REQUIRE(scaler.current_scale() == upper * .5F);
+ REQUIRE(scaler.growth_tracker() == 0);
+ scaler.update(false);
+ scaler.update(false);
+ REQUIRE(scaler.current_scale() == upper);
+ REQUIRE(scaler.growth_tracker() == 0);
+ rf::GradScaler disabled(false, upper, 2.F, .5F, 1);
+ disabled.update(false);
+ disabled.update(true);
+ REQUIRE(disabled.current_scale() == upper);
+ REQUIRE(disabled.growth_tracker() == 0);
+ const auto loss = torch::tensor(3.F);
+ REQUIRE(disabled.scale(loss).is_same(loss));
+}
+TEST_CASE("Stock target normalization keeps the global objective at the distributed clamp boundary", "[rfdetr][training][parity]") {
+ rf::testsupport::MatcherExecutionFixture fixture;
+ rf::ScopedRuntimeContext runtime(nullptr, 0, &fixture.workspace);
+ for (const int global_targets : {0, 1, 2})
+  for (const int groups : {1, 2}) {
+   CAPTURE(global_targets, groups);
+   rf::DetectionConfig config;
+   config.num_classes = 1;
+   config.group_detr = groups;
+   config.world_size = 2;
+   config.ia_bce_loss = false;
+   config.use_jit_traced_loss_ops = false;
+   rf::PreparedTargets empty;
+   rf::PreparedTarget target;
+   target.boxes = torch::empty({0, 4});
+   target.labels = torch::empty({0}, torch::kInt64);
+   empty.targets = {target};
+   empty.all_boxes = target.boxes;
+   empty.all_labels = target.labels;
+   empty.offsets = {0};
+   empty.counts = {0};
+   auto logit = torch::tensor(.37F).set_requires_grad(true);
+   rf::ModelOutputs outputs;
+   outputs.main.pred_logits = logit.expand({1, groups, 1});
+   outputs.main.pred_boxes = torch::ones({1, groups, 4});
+   // This rank has no targets but still contributes background classification;
+   // the other rank supplies the global count through the ordinary reducer.
+   int reductions = 0;
+   const auto loss = rf::detection_loss_dict(outputs, empty, config, true, true, [&](torch::Tensor& count) {
+    ++reductions;
+    count.add_(global_targets * groups);
+   }).at("loss_ce");
+   REQUIRE(reductions == 1);
+   const double native_divisor = std::max(global_targets * groups, 1);
+   const double upstream_effective_divisor = std::max(global_targets * groups, 2);
+   const auto numerator = .75 * torch::pow(logit.sigmoid(), 2.) * torch::softplus(logit) * groups;
+   const auto native = numerator / native_divisor;
+   const auto upstream_rank_contribution = numerator / upstream_effective_divisor;
+   REQUIRE(torch::allclose(loss, native, 1e-6, 1e-6));
+   const auto actual_grad = torch::autograd::grad({loss}, {logit}, {}, true)[0];
+   const auto reference_grad = torch::autograd::grad({native}, {logit}, {}, true)[0];
+   const auto upstream_grad = torch::autograd::grad({upstream_rank_contribution}, {logit})[0];
+   REQUIRE(torch::allclose(actual_grad, reference_grad, 1e-6, 1e-6));
+   REQUIRE(torch::allclose(actual_grad, upstream_grad * (upstream_effective_divisor / native_divisor), 1e-6, 1e-6));
+   if (global_targets * groups < 2) REQUIRE_FALSE(torch::allclose(actual_grad, upstream_grad, 1e-6, 1e-6));
+  }
 }
 TEST_CASE("Recoverable AMP overflow preserves AdamW and advances EMA attempts", "[rfdetr][training][parity]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; AMP overflow evidence unverified");

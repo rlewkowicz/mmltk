@@ -27,7 +27,7 @@ void launch_ms_deform_attn_cuda_forward(const ms_deform_attn_launch::ForwardLaun
  const auto plan = make_plan_for_launch(launch);
  for (int chunk = 0; chunk < plan.chunk_count; ++chunk) {
   const auto args = ms_deform_attn_launch::make_forward_batch_args(launch, plan, chunk);
-  ms_deformable_im2col_cuda(launch.stream, args.value, args.layout, args.sampling_loc, args.attn_weight, plan.batch_n, plan, args.output);
+  ms_deformable_im2col_cuda(launch.stream, args.value, args.layout, args.sampling_loc, args.attn_weight, ms_deform_attn_launch::chunk_size(plan, chunk), plan, args.output);
   require_successful_launch("ms_deform_attn forward launch");
  }
 }
@@ -36,7 +36,7 @@ void launch_ms_deform_attn_cuda_backward(const ms_deform_attn_launch::BackwardLa
  for (int chunk = 0; chunk < plan.chunk_count; ++chunk) {
   const auto args = ms_deform_attn_launch::make_backward_batch_args(launch, plan, chunk);
   ms_deformable_col2im_cuda(
-   launch.stream, args.grad_output, args.value, args.layout, args.sampling_loc, args.attn_weight, plan.batch_n, plan, args.grad_value, args.grad_sampling_loc, args.grad_attn_weight);
+   launch.stream, args.grad_output, args.value, args.layout, args.sampling_loc, args.attn_weight, ms_deform_attn_launch::chunk_size(plan, chunk), plan, args.grad_value, args.grad_sampling_loc, args.grad_attn_weight);
   require_successful_launch("ms_deform_attn backward launch");
  }
 }

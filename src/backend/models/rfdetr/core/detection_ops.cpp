@@ -1,4 +1,5 @@
 #include "detail/semantic_sampling.h"
+#include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include <cctype>
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
@@ -267,11 +268,16 @@ torch::Tensor build_dense_matcher_cost(const OutputLayer& layer, const PreparedT
  int64_t total_targets = 0;
  for (const auto count : targets.counts) { total_targets += count; }
  if (total_targets == 0) { return torch::empty({bs, num_queries, 0}, torch::TensorOptions().dtype(torch::kFloat32).device(device)); }
+ // Preserve the compact path's sampling/autocast boundary, then calculate
+ // every cost term in FP32, including pairwise mask contractions.
+ const bool masks_present = config.include_masks && has_target_masks(targets);
+ const auto sampled = masks_present ? sample_matcher_mask_logits(layer, config, retained_coords) : MatcherMaskLogits{};
+ mmltk::backend::ml::cuda::TorchAutocastScope precision(false, torch::kFloat32);
  const double alpha = config.focal_alpha;
  const double gamma = 2.0;
- const auto flat_pred_logits = layer.pred_logits.flatten(0, 1);
+ const auto flat_pred_logits = layer.pred_logits.flatten(0, 1).to(torch::kFloat32);
  const auto out_prob = flat_pred_logits.sigmoid();
- const auto out_bbox = layer.pred_boxes.flatten(0, 1);
+ const auto out_bbox = layer.pred_boxes.flatten(0, 1).to(torch::kFloat32);
  std::vector<int64_t> logical_target_indices;
  logical_target_indices.reserve(static_cast<size_t>(total_targets));
  for (size_t image = 0; image < targets.counts.size(); ++image)
@@ -297,12 +303,10 @@ torch::Tensor build_dense_matcher_cost(const OutputLayer& layer, const PreparedT
   cost_bbox = torch::cdist(out_bbox, tgt_bbox, 1.0);
  }
  auto cost = config.set_cost_bbox * cost_bbox + config.set_cost_class * cost_class + config.set_cost_giou * cost_giou;
- const bool masks_present = config.include_masks && has_target_masks(targets);
  if (masks_present) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_cost_masks{"rfdetr.matcher.cost_masks"};
-  const auto sampled = sample_matcher_mask_logits(layer, config, retained_coords);
   const auto& point_coords = sampled.point_coords;
-  const auto pred_masks_logits = sampled.pred_logits.flatten(0, 1);
+  const auto pred_masks_logits = sampled.pred_logits.flatten(0, 1).to(torch::kFloat32);
   const auto& all_masks = require_target_masks(targets, "native RF-DETR mask matcher");
   const auto mask_indices = logical_indices;
   const auto tgt_masks_flat = sample_target_masks(all_masks, mask_indices, point_coords, "native RF-DETR mask matcher").to(pred_masks_logits.dtype());
@@ -566,9 +570,8 @@ TensorMap loss_labels(const OutputLayer& layer, const PreparedTargets& targets, 
   auto neg_weights = torch::pow(prob, gamma);
   auto t = torch::pow(prob.index({idx.first, idx.second, target_classes_o}), alpha) * torch::pow(pos_ious, 1 - alpha);
   t = torch::clamp(t, 0.01).detach();
-  const auto t_cast = t.to(pos_weights.dtype());
-  pos_weights.index_put_({idx.first, idx.second, target_classes_o}, t_cast);
-  const auto neg_update = (torch::ones_like(t_cast) - t_cast).to(neg_weights.dtype());
+  pos_weights.index_put_({idx.first, idx.second, target_classes_o}, t.to(pos_weights.dtype()));
+  const auto neg_update = 1 - t.to(neg_weights.dtype());
   neg_weights.index_put_({idx.first, idx.second, target_classes_o}, neg_update);
   loss_ce = ia_bce_loss(src_logits, pos_weights, neg_weights, num_boxes, config.use_jit_traced_loss_ops);
  } else if (config.use_position_supervised_loss) {
