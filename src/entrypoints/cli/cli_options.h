@@ -25,6 +25,7 @@ using Compile = reflection::CliScope<data::CompilerConfig>;
 using Bench = reflection::CliScope<BenchCommandRequest>;
 using Info = reflection::CliScope<InfoCommandRequest>;
 inline constexpr std::array kCompileOptions{
+ MMLTK_CLI_OPTION(Compile, resize_method, "RGB resampling: Native, TorchBilinear or TorchBilinearAntialias", "Dataset"),
  MMLTK_CLI_OPTION(Compile, resize_mode, "Image geometry: Stretch or Letterbox", "Dataset"), MMLTK_CLI_OPTION(Compile, perceptual_downscale, "Perceptual shrinking", "Dataset"),
  MMLTK_CLI_OPTION(Compile, max_label_bytes, "Per-image annotation budget in bytes (multiple of 8)", "Dataset"),
  MMLTK_CLI_OPTION(Compile, source_dir, "Source dataset directory", "Dataset", "source_dir", {}, true),

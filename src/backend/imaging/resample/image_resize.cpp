@@ -1,6 +1,7 @@
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/imaging/resample/detail/perceptual_downscale.h"
 #include "src/backend/imaging/resample/detail/perceptual_downscale_views.h"
+#include "src/backend/imaging/resample/detail/torch_resize.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/common/types/workspace_buffer.h"
 #include <immintrin.h>
@@ -21,6 +22,9 @@ struct RgbImageResizer::Impl {
   void operator()(std::byte* data) const { ::operator delete(data, std::align_val_t{64}); }
  };
  std::unique_ptr<std::byte, AlignedDelete> owned_avir;
+ std::unique_ptr<std::byte, AlignedDelete> owned_torch;
+ std::size_t owned_torch_bytes = 0;
+ std::span<std::byte> torch;
  std::size_t owned_avir_bytes = 0;
  std::optional<RgbResizeWorkspacePlan> plan;
  const RgbResizeWorkspacePlan& plan_for(std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, ImageResizeMode mode, RgbPixelFormat format = RgbPixelFormat::RGB8);
@@ -29,6 +33,7 @@ struct RgbImageResizer::Impl {
  bool supplied = false;
  std::size_t supplied_bytes = 0;
  bool perceptual_enabled = false;
+ RgbResizeMethod method = RgbResizeMethod::Native;
  mmltk::common::types::WorkspaceBuffer<std::uint8_t> byte_scratch;
  std::unique_ptr<perceptual::CpuDownscaler> perceptual;
 };
@@ -56,11 +61,21 @@ public:
 };
 }  // namespace
 std::size_t RgbResizeWorkspacePlan::bytes() const {
- return common::math::checked_add(resize_aligned(avir_bytes), common::math::checked_add(resize_aligned(byte_output_bytes), perceptual_bytes, "resize workspace overflow"), "resize workspace overflow");
+ return common::math::checked_add(torch_bytes, common::math::checked_add(resize_aligned(avir_bytes), common::math::checked_add(resize_aligned(byte_output_bytes), perceptual_bytes, "resize workspace overflow"), "resize workspace overflow"), "resize workspace overflow");
+}
+void RgbImageResizer::require_method(RgbResizeMethod method) {
+ switch (method) {
+  case RgbResizeMethod::Native: return;
+  case RgbResizeMethod::TorchBilinear:
+  case RgbResizeMethod::TorchBilinearAntialias: detail::require_torch_resize(); return;
+ }
+ throw std::invalid_argument("invalid RGB resize method");
 }
 RgbResizeWorkspacePlan RgbImageResizer::workspace_plan(
- std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, ImageResizeMode mode, bool perceptual, RgbPixelFormat format, RgbResizeWork* observed) {
+ std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, ImageResizeMode mode, bool perceptual, RgbPixelFormat format, RgbResizeWork* observed, RgbResizeMethod method) {
+ require_method(method);
  RgbResizeWorkspacePlan result;
+ result.method_ = method;
  if (observed) ++observed->preparations;
  result.geometry = compute_image_resize_geometry(sw, sh, dw, dh, mode);
  result.source_width = sw;
@@ -78,7 +93,15 @@ RgbResizeWorkspacePlan RgbImageResizer::workspace_plan(
   default: throw std::invalid_argument("invalid resize pixel format");
  }
  const auto width = result.geometry.resized_width, height = result.geometry.resized_height;
+ if (method != RgbResizeMethod::Native && format != RgbPixelFormat::RGB8) throw std::invalid_argument("Torch resize requires RGB8 input and planar float output");
  if (sw == width && sh == height) return result;
+ if (method != RgbResizeMethod::Native) {
+  const auto storage = detail::torch_resize_storage(sw, sh, width, height, method == RgbResizeMethod::TorchBilinearAntialias);
+  result.path_ = RgbResizePath::Torch;
+  result.torch_bytes = storage.supplied_bytes;
+  result.opaque_bytes_ = storage.opaque_bytes;
+  return result;
+ }
  if (perceptual && width <= sw && height <= sh) {
   result.path_ = perceptual::classify_geometry(sw, sh, width, height);
   result.perceptual_bytes = perceptual::CpuDownscaler::workspace_bytes(width, height, result.alpha);
@@ -99,7 +122,7 @@ RgbResizeWorkspacePlan RgbImageResizer::workspace_plan(
 const RgbResizeWorkspacePlan& RgbImageResizer::Impl::plan_for(std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, ImageResizeMode mode, RgbPixelFormat format) {
  if (plan && plan->source_width == sw && plan->source_height == sh && plan->target_width == dw && plan->target_height == dh && plan->mode == mode && plan->format == format) return *plan;
  if (supplied) throw std::invalid_argument("resize geometry differs from supplied workspace plan");
- plan = RgbImageResizer::workspace_plan(sw, sh, dw, dh, mode, perceptual_enabled, format);
+ plan = RgbImageResizer::workspace_plan(sw, sh, dw, dh, mode, perceptual_enabled, format, nullptr, method);
  return *plan;
 }
 void RgbImageResizer::Impl::execute_avir(const RgbResizeWorkspacePlan& selected, const std::uint8_t* source, std::uint8_t* destination, RgbResizeWork* observed) {
@@ -119,13 +142,16 @@ void RgbImageResizer::Impl::execute_avir(const RgbResizeWorkspacePlan& selected,
 }
 void RgbImageResizer::prepare(const RgbResizeWorkspacePlan& plan, std::span<std::byte> memory) {
  if (memory.size() < plan.bytes() || (memory.size() && reinterpret_cast<std::uintptr_t>(memory.data()) % 64)) throw std::length_error("resize supplied workspace capacity or alignment invalid");
- if (impl_->owned_avir || (impl_->perceptual && impl_->perceptual->retained_bytes() && !impl_->supplied) || (!impl_->supplied && impl_->byte_scratch.capacity()))
+ if (impl_->owned_avir || impl_->owned_torch || (impl_->perceptual && impl_->perceptual->retained_bytes() && !impl_->supplied) || (!impl_->supplied && impl_->byte_scratch.capacity()))
   throw std::logic_error("resize supplied workspace must bind before owned allocation");
  if (plan.perceptual_bytes && !impl_->perceptual) impl_->perceptual = std::make_unique<perceptual::CpuDownscaler>();
  impl_->plan = plan;
  impl_->supplied = true;
  impl_->supplied_bytes = plan.bytes();
  impl_->perceptual_enabled = plan.perceptual;
+ impl_->method = plan.method();
+ impl_->torch = memory.first(plan.torch_bytes);
+ memory = memory.subspan(plan.torch_bytes);
  impl_->avir = memory.first(plan.avir_bytes);
  memory = memory.subspan(resize_aligned(plan.avir_bytes));
  impl_->byte_scratch.bind({reinterpret_cast<std::uint8_t*>(memory.data()), plan.byte_output_bytes});
@@ -134,7 +160,7 @@ void RgbImageResizer::prepare(const RgbResizeWorkspacePlan& plan, std::span<std:
 }
 std::size_t RgbImageResizer::retained_bytes() const noexcept {
  if (impl_->supplied) return impl_->supplied_bytes;
- return impl_->owned_avir_bytes + impl_->byte_scratch.capacity() + (impl_->perceptual ? impl_->perceptual->retained_bytes() : 0);
+ return impl_->owned_avir_bytes + impl_->owned_torch_bytes + impl_->byte_scratch.capacity() + (impl_->perceptual ? impl_->perceptual->retained_bytes() : 0);
 }
 ImageResizeGeometry compute_image_resize_geometry(
  const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width, const std::uint32_t target_height, const ImageResizeMode mode) {
@@ -276,10 +302,12 @@ ResizeWorkerPlan plan_rgb_resize_workers(int total_workers, bool any_resize, boo
  (void)any_downscale;
  return {std::max(1, total_workers), 1};
 }
-RgbImageResizer::RgbImageResizer(int thread_count, bool perceptual_downscale) {
+RgbImageResizer::RgbImageResizer(int thread_count, bool perceptual_downscale, RgbResizeMethod method) {
  if (thread_count != 1) { throw std::runtime_error("RgbImageResizer internal threading is disabled; use image-level parallelism and pass thread_count=1"); }
+ require_method(method);
  impl_ = std::make_unique<Impl>();
  impl_->perceptual_enabled = perceptual_downscale;
+ impl_->method = method;
 }
 RgbImageResizer::~RgbImageResizer() = default;
 RgbImageResizer::RgbImageResizer(RgbImageResizer&&) noexcept = default;
@@ -308,6 +336,7 @@ void RgbImageResizer::resize(const uint8_t* src, int src_width, int src_height, 
    return;
   }
   case RgbResizePath::Avir: impl_->execute_avir(plan, src, dst, nullptr); return;
+  case RgbResizePath::Torch: throw std::invalid_argument("Torch resize writes float planes; use resize_to_planar");
  }
 }
 ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, RgbMutableImageView destination, const ImageResizeMode mode, RgbResizeWork* observed) {
@@ -323,6 +352,26 @@ ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, 
  const auto& plan = impl_->plan_for(input.width, input.height, output.width, output.height, mode);
  const auto geometry = plan.geometry;
  auto* pixels = static_cast<float*>(destination.data);
+ if (plan.path() == RgbResizePath::Torch) {
+  if (!impl_->supplied && impl_->owned_torch_bytes < plan.torch_bytes) {
+   auto* storage = static_cast<std::byte*>(::operator new(plan.torch_bytes, std::align_val_t{64}));
+   impl_->owned_torch.reset(storage);
+   impl_->owned_torch_bytes = plan.torch_bytes;
+  }
+  const auto memory = impl_->supplied ? impl_->torch : std::span<std::byte>(impl_->owned_torch.get(), impl_->owned_torch_bytes);
+  detail::torch_resize(static_cast<const std::uint8_t*>(source.data), input.width, input.height, geometry.resized_width, geometry.resized_height,
+   plan.method() == RgbResizeMethod::TorchBilinearAntialias, memory, observed);
+  const auto* resized = reinterpret_cast<const float*>(memory.data()) + std::size_t(input.width) * input.height * 3;
+  const auto plane_size = std::size_t(geometry.resized_width) * geometry.resized_height;
+  for (unsigned plane = 0; plane < 3; ++plane) {
+   auto* target = pixels + plane * output.plane_stride_bytes / sizeof(float);
+   clear_letterbox_padding(target, output.width, output.height, geometry.resized_width, geometry.resized_height, geometry.offset_x, geometry.offset_y);
+   for (std::uint32_t row = 0; row < geometry.resized_height; ++row)
+    std::copy_n(resized + plane * plane_size + row * std::size_t(geometry.resized_width), geometry.resized_width,
+     target + (row + geometry.offset_y) * std::size_t(output.width) + geometry.offset_x);
+  }
+  return geometry;
+ }
  if (plan.path() == RgbResizePath::PerceptualInteger || plan.path() == RgbResizePath::PerceptualFractional) {
   const auto offset = std::size_t(geometry.offset_y) * output.row_stride_bytes + std::size_t(geometry.offset_x) * sizeof(float);
   auto content = destination;

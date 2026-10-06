@@ -1,4 +1,5 @@
 #include "checkpoint_fixture_support/upstream_oracle_fixture.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
@@ -205,5 +206,43 @@ TEST_CASE("Actual pinned upstream Nano and SegNano forward and fixed cotangent V
    rf::testsupport::compare_oracle_outputs(comparison, archive, outputs, indices);
    rf::testsupport::compare_oracle_vjp(comparison, archive, model, outputs, input, false);
   }
+ }
+}
+TEST_CASE("Explicit RGB resampling matches actual upstream tensor resize and records PIL differences", "[rfdetr][parity][upstream_oracle][torch_resize]") {
+ namespace resize = mmltk::backend::imaging::resample;
+ const auto requested = rf::testsupport::UpstreamOracle::requested();
+ if (!requested) SKIP("optional upstream evidence not requested; generate with --diagnose-rfdetr-upstream for independent resize acceptance");
+ const rf::testsupport::UpstreamOracle oracle(*requested);
+ const auto archive = oracle.resize_archive();
+ rf::testsupport::OracleComparison comparison(*requested, "rgb-resampling", torch::kFloat32,
+  "actual torchvision float RGB bilinear align_corners=false; PIL RGB8 dataset path recorded separately");
+ for (const auto* name : {"identity", "enlarge", "shrink", "odd_aspect", "high_frequency"}) {
+  const std::string key(name);
+  const auto rgb = archive.tensor(key + "/rgb8").contiguous();
+  const auto input = archive.tensor(key + "/input");
+  REQUIRE(rgb.scalar_type() == at::kByte);
+  REQUIRE(rgb.dim() == 3);
+  REQUIRE(rgb.size(2) == 3);
+  const auto width = static_cast<std::uint32_t>(rgb.size(1)), height = static_cast<std::uint32_t>(rgb.size(0));
+  auto converted = torch::empty_like(input);
+  resize::rgb_hwc_u8_to_nchw_f32(rgb.data_ptr<std::uint8_t>(), converted.data_ptr<float>(), width, height);
+  comparison.compare(key + "/unit-srgb", converted, input, ComparisonPolicy::Value);
+  for (const auto method : {resize::RgbResizeMethod::TorchBilinear, resize::RgbResizeMethod::TorchBilinearAntialias}) {
+   const bool antialias = method == resize::RgbResizeMethod::TorchBilinearAntialias;
+   const auto output_key = key + (antialias ? "/torch_antialias" : "/torch");
+   const auto expected = archive.tensor(output_key);
+   auto actual = torch::empty_like(expected);
+   const auto out_width = static_cast<std::uint32_t>(actual.size(2)), out_height = static_cast<std::uint32_t>(actual.size(1));
+   const auto row = std::size_t(out_width) * sizeof(float), plane = row * out_height;
+   resize::RgbImageResizer resizer(1, false, method);
+   resizer.resize_to_planar({rgb.data_ptr<std::uint8_t>(), {width, height, std::size_t(width) * 3, 0, static_cast<std::size_t>(rgb.nbytes()), resize::RgbPixelFormat::RGB8}},
+    {actual.data_ptr<float>(), {out_width, out_height, row, plane, plane * 3, resize::RgbPixelFormat::PlanarUnitSrgbF32}}, resize::ImageResizeMode::Stretch);
+   comparison.compare(output_key, actual, expected, ComparisonPolicy::Value);
+   comparison.compare(output_key + "/versus-pil", actual, archive.tensor(key + "/pil"), ComparisonPolicy::Value, true);
+   const auto mean = torch::tensor({.485F, .456F, .406F}).view({3, 1, 1});
+   const auto stddev = torch::tensor({.229F, .224F, .225F}).view({3, 1, 1});
+   comparison.compare(output_key + "/normalized-versus-pil", (actual - mean) / stddev, archive.tensor(key + "/pil_normalized"), ComparisonPolicy::Value, true);
+  }
+  comparison.compare(key + "/pil-rgb8-conversion", archive.tensor(key + "/pil_rgb8").to(torch::kFloat32) / 255.F, archive.tensor(key + "/pil"), ComparisonPolicy::Value);
  }
 }

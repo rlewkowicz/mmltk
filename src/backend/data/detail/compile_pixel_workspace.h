@@ -12,6 +12,7 @@ enum class CompilePixelStage : std::uint8_t { Validation, Preparation, Decode, D
 struct CompilePixelObservation {
  CompileImageEncoding codec = CompileImageEncoding::Stb;
  imaging::resample::RgbResizePath path = imaging::resample::RgbResizePath::Identity;
+ imaging::resample::RgbResizeMethod method = imaging::resample::RgbResizeMethod::Native;
  std::uint32_t source_width = 0, source_height = 0, target_width = 0, target_height = 0;
  std::uint64_t encoded_bytes = 0, requested_bytes = 0, opaque_bytes = 0, output_bytes = 0;
  std::uint64_t validation_ns = 0, preparation_ns = 0, decode_ns = 0, destination_ns = 0, resize_store_ns = 0, duration_ns = 0;
@@ -28,6 +29,7 @@ struct CompilePixelPolicy {
  std::uint32_t width = 0, height = 0;
  imaging::resample::ImageResizeMode mode = imaging::resample::ImageResizeMode::Stretch;
  bool perceptual = false;
+ imaging::resample::RgbResizeMethod method = imaging::resample::RgbResizeMethod::Native;
  bool operator==(const CompilePixelPolicy&) const = default;
 };
 // Factory-checked immutable value: the resource demand and execution geometry
@@ -54,7 +56,7 @@ private:
  imaging::resample::RgbImageLayout destination_;
 };
 [[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy, imaging::resample::RgbResizeWork* observed = nullptr);
-[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, std::uint32_t resolution, imaging::resample::ImageResizeMode, bool perceptual);
+[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, std::uint32_t resolution, imaging::resample::ImageResizeMode, bool perceptual, imaging::resample::RgbResizeMethod = imaging::resample::RgbResizeMethod::Native);
 // Session-owned controls bind only to the current arena. Pixels go directly
 // into the prepared destination; neither controls nor borrowed scratch escape.
 // A supplied storage preparation runs after successful decoding, before stores.

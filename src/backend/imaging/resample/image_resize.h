@@ -25,9 +25,11 @@ struct RgbMutableImageView {
  RgbImageLayout layout{};
 };
 enum class ImageResizeMode : std::uint8_t { Stretch, Letterbox };
-enum class RgbResizePath : std::uint8_t { Identity, PerceptualInteger, PerceptualFractional, Avir };
+enum class RgbResizeMethod : std::uint8_t { Native, TorchBilinear, TorchBilinearAntialias };
+enum class RgbResizePath : std::uint8_t { Identity, PerceptualInteger, PerceptualFractional, Avir, Torch };
 #if !defined(__CUDACC__)
 MMLTK_REFLECT_ENUM(ImageResizeMode)
+MMLTK_REFLECT_ENUM(RgbResizeMethod)
 MMLTK_REFLECT_ENUM(RgbResizePath)
 #endif
 struct ImageResizeGeometry {
@@ -50,17 +52,21 @@ ResizeWorkerPlan plan_rgb_resize_workers(int total_workers, bool any_resize, boo
 class RgbResizeWorkspacePlan final {
 public:
  [[nodiscard]] RgbResizePath path() const noexcept { return path_; }
+ [[nodiscard]] RgbResizeMethod method() const noexcept { return method_; }
  [[nodiscard]] std::size_t bytes() const;
+ [[nodiscard]] std::size_t opaque_bytes() const noexcept { return opaque_bytes_; }
 
 private:
  friend class RgbImageResizer;
  RgbResizeWorkspacePlan() = default;
  std::size_t avir_bytes = 0, byte_output_bytes = 0, perceptual_bytes = 0;
+ std::size_t torch_bytes = 0, opaque_bytes_ = 0;
  std::uint32_t source_width = 0, source_height = 0, target_width = 0, target_height = 0;
  ImageResizeGeometry geometry{};
  ImageResizeMode mode = ImageResizeMode::Stretch;
  RgbPixelFormat format = RgbPixelFormat::RGB8;
  RgbResizePath path_ = RgbResizePath::Identity;
+ RgbResizeMethod method_ = RgbResizeMethod::Native;
  bool alpha = false, perceptual = false;
 };
 // Opt-in accumulated work. Allocation bytes count requested workspace extents,
@@ -73,19 +79,21 @@ MMLTK_REFLECT_FIELDS(RgbResizeWork)
 #endif
 class RgbImageResizer {
 public:
- explicit RgbImageResizer(int thread_count = 1, bool perceptual_downscale = false);
+ explicit RgbImageResizer(int thread_count = 1, bool perceptual_downscale = false, RgbResizeMethod method = RgbResizeMethod::Native);
  ~RgbImageResizer();
  RgbImageResizer(const RgbImageResizer&) = delete;
  RgbImageResizer& operator=(const RgbImageResizer&) = delete;
  RgbImageResizer(RgbImageResizer&&) noexcept;
  RgbImageResizer& operator=(RgbImageResizer&&) noexcept;
  [[nodiscard]] static RgbResizeWorkspacePlan workspace_plan(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode,
-  bool perceptual, RgbPixelFormat = RgbPixelFormat::RGB8, RgbResizeWork* observed = nullptr);
+  bool perceptual, RgbPixelFormat = RgbPixelFormat::RGB8, RgbResizeWork* observed = nullptr, RgbResizeMethod method = RgbResizeMethod::Native);
+ // Explicit choices fail at admission when this payload cannot execute them.
+ static void require_method(RgbResizeMethod);
  void prepare(const RgbResizeWorkspacePlan&, std::span<std::byte> supplied);
  [[nodiscard]] std::size_t retained_bytes() const noexcept;
  void resize(const uint8_t* src, int src_width, int src_height, uint8_t* dst, int dst_width, int dst_height);
- // Compiler projection: tightly packed RGB8 to a tightly packed planar
- // canvas. Perceptual output retains RGB8 quantization before conversion.
+ // Tightly packed RGB8 to a tightly packed planar float canvas. Native
+ // output retains RGB8 quantization; Torch methods write unquantized float.
  // Admission and fallible preparation finish before any canvas write.
  ImageResizeGeometry resize_to_planar(RgbConstImageView source, RgbMutableImageView destination, ImageResizeMode mode, RgbResizeWork* observed = nullptr);
  // Explicit checked perceptual operation. Same format on both sides; no

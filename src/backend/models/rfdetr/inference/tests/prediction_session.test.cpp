@@ -61,12 +61,69 @@
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/backend/models/rfdetr/inference/prediction_count.h"
 #include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
+#include "src/backend/imaging/resample/image_resize.h"
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.inference.loader;
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.common.logging.mmltk_logging;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 using rfdetr::test_support::write_prediction_model;
+TEST_CASE("Image prediction applies selected RGB methods while retaining original preview custody", "[model][rfdetr][prediction][gpu][torch_resize]") {
+ using namespace mmltk::backend::imaging::resample;
+ const mmltk::testsupport::ScopedTempDir root("prediction-rgb-resampling");
+ auto request = rfdetr::test_support::prediction_image_fixture(root.path());
+ request.include_masks = false;
+ std::vector<std::uint8_t> rgb(17 * 13 * 3);
+ for (std::size_t i = 0; i < rgb.size(); ++i) rgb[i] = static_cast<std::uint8_t>((i * 31 + i / 7) % 256);
+ {
+  std::ofstream output(request.image_inputs.front().image_path, std::ios::binary | std::ios::trunc);
+  output << "P6\n17 13\n255\n";
+  output.write(reinterpret_cast<const char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+ }
+ // The existing fixture keeps its output shapes and postprocessing, but here
+ // the logits expose the admitted normalized pixels through the model input.
+ mmltk_onnx::ModelProto model;
+ {
+  std::ifstream input(request.onnx_path, std::ios::binary);
+  REQUIRE(model.ParseFromIstream(&input));
+ }
+ for (auto& value : *model.mutable_graph()->mutable_initializer()) {
+  if (value.name() == "zero") value.set_float_data(0, .1F);
+  if (value.name() == "pred_logits_values")
+   for (int i = 0; i < value.float_data_size(); ++i) value.set_float_data(i, 0.F);
+ }
+ {
+  std::ofstream output(request.onnx_path, std::ios::binary | std::ios::trunc);
+  REQUIRE(model.SerializeToOstream(&output));
+ }
+ const mmltk::testsupport::ScopedTestStream stream;
+ const mmltk::backend::ml::runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
+ rfdetr::PredictionSession session;
+ std::vector<rfdetr::PredictionPixels> retained;
+ for (const auto method : {RgbResizeMethod::Native, RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias, RgbResizeMethod::Native}) {
+  request.resize_method = method;
+  std::vector<float> expected(3 * 8 * 8);
+  RgbImageResizer resize(1, false, method);
+  resize.resize_to_planar({rgb.data(), {17, 13, 51, 0, rgb.size(), RgbPixelFormat::RGB8}},
+   {expected.data(), {8, 8, 8 * sizeof(float), 64 * sizeof(float), expected.size() * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32}}, ImageResizeMode::Stretch);
+  constexpr std::array means{.485F, .456F, .406F}, deviations{.229F, .224F, .225F};
+  double total = 0;
+  for (std::size_t i = 0; i < expected.size(); ++i) total += (expected[i] - means[i / 64]) / deviations[i / 64];
+  const auto score = 1. / (1. + std::exp(-.1 * total / expected.size()));
+  const auto result = session.Run(request, command, {.source_pixels = true, .completed = [&](const auto& record, auto pixels, const auto&) {
+   REQUIRE(record.detections.size() == 2);
+   for (const auto& detection : record.detections) CHECK(std::abs(detection.score - score) < 1e-5);
+   CHECK(pixels.width == 17);
+   CHECK(pixels.height == 13);
+   REQUIRE(pixels.rgb8);
+   REQUIRE(pixels.custody);
+   CHECK(std::ranges::equal(std::span(pixels.rgb8, rgb.size()), rgb));
+   retained.push_back(std::move(pixels));
+  }});
+  REQUIRE(result.processed_images == 1);
+ }
+ for (const auto& pixels : retained) CHECK(std::ranges::equal(std::span(pixels.rgb8, rgb.size()), rgb));
+}
 TEST_CASE("Fixed artifact batches preserve tails ordered lane reuse and callback retirement", "[model][rfdetr][prediction][gpu]") {
  const mmltk::testsupport::ScopedTempDir root("artifact-inference-lanes");
  auto request = rfdetr::test_support::prediction_image_fixture(root.path());

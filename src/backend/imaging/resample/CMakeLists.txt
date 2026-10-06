@@ -5,17 +5,22 @@ mmltk_configure_component(mmltk_backend_imaging_resample PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(mmltk_backend_imaging_resample
     BASE_DIRS ${CMAKE_SOURCE_DIR} FILES image_resize.h image_resize_cuda.h)
 mmltk_register_private_headers(mmltk_backend_imaging_resample
+    detail/torch_resize.h
     detail/perceptual_downscale.h detail/perceptual_downscale_views.h
     detail/perceptual_downscale_math.h detail/perceptual_downscale_completion.h
     detail/perceptual_downscale_accumulation.cuh)
 mmltk_register_ordinary_sources(mmltk_backend_imaging_resample
-    image_resize.cpp detail/perceptual_downscale.cpp detail/perceptual_downscale_views.cpp)
+    image_resize.cpp torch_resize.cpp detail/perceptual_downscale.cpp detail/perceptual_downscale_views.cpp)
 target_link_libraries(mmltk_backend_imaging_resample
     PUBLIC CUDA::cudart
     PRIVATE mmltk::common::math mmltk::common::types avir mmltk::frameworks::gpu CUDA::cuda_driver)
 mmltk_link_declarations(mmltk_backend_imaging_resample PUBLIC
     mmltk::frameworks::reflection)
 if(BUILD_RFDETR_NATIVE)
+    find_package(OpenMP REQUIRED GLOBAL COMPONENTS CXX)
+    target_compile_definitions(mmltk_backend_imaging_resample PRIVATE MMLTK_TORCH_RGB_RESIZE=1)
+    target_link_libraries(mmltk_backend_imaging_resample PRIVATE
+        mmltk::backend::ml::torch_dependencies OpenMP::OpenMP_CXX)
     mmltk_register_ordinary_sources(mmltk_backend_imaging_resample image_resize_cuda.cu)
     set_target_properties(mmltk_backend_imaging_resample PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
@@ -37,6 +42,9 @@ function(mmltk_add_backend_imaging_resample_tests)
         mmltk_backend_imaging_resample_test_support
         mmltk_test_support mmltk::backend::imaging::resample mmltk::frameworks::gpu avir)
     if(BUILD_RFDETR_NATIVE)
+        target_compile_definitions(mmltk_backend_imaging_resample_tests PRIVATE MMLTK_TEST_TORCH_RGB_RESIZE=1)
+        target_link_libraries(mmltk_backend_imaging_resample_tests PRIVATE
+            mmltk::backend::ml::torch_dependencies OpenMP::OpenMP_CXX)
         mmltk_register_ordinary_sources(mmltk_backend_imaging_resample_tests
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_resize_cuda.test.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/perceptual_downscale_traversal.cu)

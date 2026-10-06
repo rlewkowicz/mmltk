@@ -41,6 +41,7 @@ pub(super) struct State {
     cancelled_generation: u64,
     compile_resize_step: u8,
     compile_resize_pending: bool,
+    compile_method_step: usize,
     fixtures_complete: bool,
     status_notice: u64,
     status_fixture: bool,
@@ -69,6 +70,7 @@ impl Default for State {
             cancelled_generation: 0,
             compile_resize_step: 0,
             compile_resize_pending: false,
+            compile_method_step: 0,
             fixtures_complete: false,
             status_notice: 0,
             status_fixture: false,
@@ -80,6 +82,10 @@ impl Default for State {
 }
 
 impl State {
+    fn compile_resize_control(&self) -> &'static str {
+        ["train.dataset.resampling.torch", "train.dataset.resampling.torch_antialias",
+         "train.dataset.resampling.native", COMPILE_LETTERBOX][self.compile_method_step]
+    }
     fn benchmark_choice(
         &self,
         index: usize,
@@ -1106,15 +1112,32 @@ impl State {
                         .is_some_and(|draft| draft.workflows.train.compiledimensions) =>
             {
                 driver.phase = Phase::CompileResizeMode;
-                widgets.arm(driver, COMPILE_LETTERBOX)
+                widgets.arm(driver, self.compile_resize_control())
             }
-            Phase::CompileResizeMode => widgets.arm(driver, COMPILE_LETTERBOX),
+            Phase::CompileResizeMode => widgets.arm(driver, self.compile_resize_control()),
             Phase::AwaitCompileResizeMode
-                if settings.draft.as_ref().is_some_and(|draft| {
-                    draft.workflows.train.compileresizemode
-                        == crate::generated::ImageResizeMode::Letterbox
+                if !settings.has_local_edits() && settings.draft.as_ref().is_some_and(|draft| {
+                    use crate::generated::RgbResizeMethod;
+                    let train = &draft.workflows.train;
+                    train.compileresizemethod == [RgbResizeMethod::TorchBilinear,
+                        RgbResizeMethod::TorchBilinearAntialias, RgbResizeMethod::Native,
+                        RgbResizeMethod::Native][self.compile_method_step]
+                        && (self.compile_method_step < 3 || train.compileresizemode == crate::generated::ImageResizeMode::Letterbox)
                 }) =>
             {
+                let train = &settings.draft.as_ref().unwrap().workflows.train;
+                if train.compileperceptualdownscale != self.perceptual_baseline[2] {
+                    driver.fail("RGB method selection changed the stored perceptual choice");
+                    return Task::none();
+                }
+                reporting::emit(|sink| sink.record("integration.rgb_resampling", self.compile_resize_control(),
+                    "rendered-dataset-selection", [self.compile_method_step as f64, train.compileresizemethod as u8 as f64,
+                        train.compileperceptualdownscale as u8 as f64, 1.0]));
+                if self.compile_method_step < 3 {
+                    self.compile_method_step += 1;
+                    driver.phase = Phase::CompileResizeMode;
+                    return widgets.arm(driver, self.compile_resize_control());
+                }
                 driver.phase = Phase::CompileResolution;
                 widgets.arm(driver, COMPILE_RESOLUTION)
             }
@@ -1724,7 +1747,7 @@ impl State {
             Phase::CompiledDirectory => COMPILED_DIRECTORY.to_owned(),
             Phase::PerceptualControl(index) => perceptual_control_id(index),
             Phase::CompileDimensions => COMPILE_DIMENSIONS.to_owned(),
-            Phase::CompileResizeMode => COMPILE_LETTERBOX.to_owned(),
+            Phase::CompileResizeMode => self.compile_resize_control().to_owned(),
             Phase::CompileResolution => COMPILE_RESOLUTION.to_owned(),
             Phase::Compile | Phase::CompileActionWithProgress => COMPILE_DATASET.to_owned(),
             Phase::CompileProgress => COMPILE_PROGRESS.to_owned(),
@@ -2052,7 +2075,7 @@ impl State {
             Phase::CompileResizeMode => {
                 driver.phase = Phase::AwaitCompileResizeMode;
                 if !click(input_bounds) {
-                    driver.fail("Firefox Letterbox radio click dispatch failed");
+                    driver.fail("Firefox dataset resize radio click dispatch failed");
                 }
                 None
             }

@@ -50,10 +50,10 @@ public:
  std::function<void(mmltk::common::concurrency::CancellationObservation)> work;
 
 private:
- void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
+ void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode, mmltk::backend::imaging::resample::RgbResizeMethod,
   mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
  void compile_benchmark(mmltk::backend::data::BenchmarkDatasetSelection selected, const std::filesystem::path& output, const std::filesystem::path& publication, std::uint32_t, bool,
-  mmltk::backend::imaging::resample::ImageResizeMode, mmltk::common::concurrency::CancellationObservation cancellation, services::ArtifactProgressObserver,
+  mmltk::backend::imaging::resample::ImageResizeMode, mmltk::backend::imaging::resample::RgbResizeMethod, mmltk::common::concurrency::CancellationObservation cancellation, services::ArtifactProgressObserver,
   services::ArtifactBenchmarkTraceObserver trace) const override {
   selection = selected;
   physical_output = output;
@@ -349,20 +349,25 @@ TEST_CASE("compilation captures its perceptual selection independently of augmen
  CHECK(settings.workflows.train.compile_resize_mode == ResizeMode::Stretch);
  settings.workflows.train.compile_resize_mode = ResizeMode::Letterbox;
  settings.workflows.train.compile_perceptual_downscale = true;
+ settings.workflows.train.compile_resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias;
  settings.workflows.train.request.gpu_augmentation.enabled = false;
  settings.workflows.train.request.gpu_augmentation.perceptual_downscale = false;
  const auto captured = services::materialize_artifact_compile(settings);
  REQUIRE(captured);
  CHECK(captured->perceptual_downscale);
+ CHECK(captured->resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias);
  CHECK(captured->resize_mode == ResizeMode::Letterbox);
  settings.workflows.train.compile_perceptual_downscale = false;
+ settings.workflows.train.compile_resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
  settings.workflows.train.compile_resize_mode = ResizeMode::Stretch;
  settings.workflows.train.request.gpu_augmentation.perceptual_downscale = true;
  const auto next = services::materialize_artifact_compile(settings);
  REQUIRE(next);
  CHECK_FALSE(next->perceptual_downscale);
+ CHECK(next->resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::Native);
  CHECK(next->resize_mode == ResizeMode::Stretch);
  CHECK(captured->perceptual_downscale);
+ CHECK(captured->resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias);
  CHECK(captured->resize_mode == ResizeMode::Letterbox);
 }
 class AcquisitionDatasetRuntime final : public DatasetRuntime {

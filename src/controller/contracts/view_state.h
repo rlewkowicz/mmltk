@@ -155,6 +155,7 @@ struct TrainViewState : TrainExecutionPaneState {
  bool overwrite_compiled_dataset = false;
  bool compile_dimensions = false;
  mmltk::backend::imaging::resample::ImageResizeMode compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ mmltk::backend::imaging::resample::RgbResizeMethod compile_resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
  bool compile_perceptual_downscale = false;
  bool compile_benchmark_dataset_override = false;
  mmltk::backend::data::BenchmarkDatasetSelection benchmark_selection{};

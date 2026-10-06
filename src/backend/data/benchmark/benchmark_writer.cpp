@@ -102,6 +102,7 @@ struct BenchmarkSplitWriter::Impl {
  std::uint32_t resolution;
  std::vector<std::string> class_names;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode;
+ mmltk::backend::imaging::resample::RgbResizeMethod resize_method;
  common_concurrency::CancellationObservation cancellation;
  BenchmarkWriteProgressEvent progress;
  BenchmarkTraceSink trace;
@@ -117,6 +118,7 @@ struct BenchmarkSplitWriter::Impl {
        resolution(request.resolution),
        class_names(request.split.class_names),
        resize_mode(request.resize_mode),
+       resize_method(request.resize_method),
        cancellation(request.cancel_requested),
        progress(request.progress),
        image_opened(request.image_opened),
@@ -352,7 +354,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
   if (state.image_opened) state.image_opened(source_root, image.source_image_id);
   if (!plan) plan = prepare_pixel_plan(slot, header);
   if (plan->header() != header) throw BenchmarkImageError("benchmark pixel input changed its prepared header");
-  if (plan->policy() != detail::CompilePixelPolicy{state.resolution, state.resolution, state.resize_mode, state.perceptual})
+  if (plan->policy() != detail::CompilePixelPolicy{state.resolution, state.resolution, state.resize_mode, state.perceptual, state.resize_method})
    throw std::logic_error("benchmark pixel preparation changed its output policy");
   input->workspace = std::move(plan);
   throw_if_benchmark_cancelled(state.cancellation);
@@ -393,7 +395,7 @@ std::shared_ptr<const detail::CompilePixelWorkspacePlan> BenchmarkSplitWriter::p
  std::uint64_t id = 0;
  {
   const std::lock_guard lock(impl_->facts_mutex);
-  policy = {impl_->resolution, impl_->resolution, impl_->resize_mode, impl_->perceptual};
+  policy = {impl_->resolution, impl_->resolution, impl_->resize_mode, impl_->perceptual, impl_->resize_method};
   if (impl_->pixel_preparing) {
    const auto& image = impl_->images.at(slot);
    id = image.source_image_id;
@@ -410,7 +412,7 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane) {
  auto input = prepare_pixel(slot, lane);
  if (!input) return;
  detail::CompileExecutionLimits limits;
- limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(1, impl_->resolution, impl_->perceptual, 0, 0, BenchmarkEncodedImage::normal_window_bytes));
+ limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(1, impl_->resolution, impl_->perceptual, 0, 0, BenchmarkEncodedImage::normal_window_bytes, impl_->resize_method));
  detail::CompileExecution execution(1, {}, limits, impl_->cancellation);
  detail::CompilePixelWorkspace workspace;
  detail::FileWorkQueue files(execution, 1);
@@ -423,7 +425,7 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  (void)lane;
  const auto& header = input->payload->header();
  const auto& plan = *input->workspace;
- if (plan.policy() != detail::CompilePixelPolicy{state.resolution, state.resolution, state.resize_mode, state.perceptual})
+ if (plan.policy() != detail::CompilePixelPolicy{state.resolution, state.resolution, state.resize_mode, state.perceptual, state.resize_method})
   throw std::logic_error("benchmark pixel output policy changed after preparation");
  auto memory = allowance.workspace();
  if (memory.size() < plan.bytes()) throw std::logic_error("benchmark pixels have no admitted arena");
@@ -535,7 +537,7 @@ void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request)
   1, std::min({request.num_workers, common_math::checked_cast<int>(cpus.size(), "benchmark CPU count overflow"), common_math::checked_cast<int>(slots.size(), "benchmark slot count overflow")}));
  detail::CompileExecutionLimits limits;
  limits.workspace_plan =
-  std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers, impl_->resolution, impl_->perceptual, 0, 0, BenchmarkEncodedImage::normal_window_bytes));
+  std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers, impl_->resolution, impl_->perceptual, 0, 0, BenchmarkEncodedImage::normal_window_bytes, impl_->resize_method));
  detail::CompileExecution execution(workers, cpus, limits, request.cancel_requested);
  detail::FileWorkQueue files(execution, execution.workers());
  std::vector<std::unique_ptr<detail::CompilePixelWorkspace>> workspaces;
@@ -589,7 +591,7 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal(const BenchmarkWriteRequest& req
 }
 BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteRequest& request, std::span<const std::uint32_t> slots) {
  auto& state = *impl_;
- if (request.resolution != state.resolution || request.resize_mode != state.resize_mode || request.split.class_names != state.class_names)
+ if (request.resolution != state.resolution || request.resize_mode != state.resize_mode || request.resize_method != state.resize_method || request.split.class_names != state.class_names)
   throw std::runtime_error("benchmark final geometry or class catalog changed");
  if (slots.empty()) throw std::runtime_error("required benchmark split contains no healthy images: " + request.split.name);
  std::vector<ImageEntry> index(state.images.size());

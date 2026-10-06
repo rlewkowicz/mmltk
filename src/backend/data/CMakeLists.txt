@@ -255,6 +255,9 @@ function(mmltk_add_backend_data_tests)
     )
 
     add_executable(mmltk_backend_data_tests EXCLUDE_FROM_ALL)
+    if(BUILD_RFDETR_NATIVE)
+        target_compile_definitions(mmltk_backend_data_tests PRIVATE MMLTK_TEST_TORCH_RGB_RESIZE=1)
+    endif()
     mmltk_register_retained_module_importers(mmltk_backend_data_tests
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/compile_progress.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/roundtrip.test.cpp

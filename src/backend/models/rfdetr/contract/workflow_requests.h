@@ -63,6 +63,7 @@ struct PredictImageInput {
 };
 struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
  PredictSourceKind source_kind = PredictSourceKind::CompiledDataset;
+ mmltk::backend::imaging::resample::RgbResizeMethod resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
  MMLTK_MAX_PATH_BYTES std::filesystem::path video_path;
  MMLTK_MAX_PATH_BYTES std::filesystem::path compiled_path;
  MMLTK_MAX_ITEMS(mmltk::backend::models::rfdetr::kMaximumCliImageInputs) std::vector<PredictImageInput> image_inputs;
@@ -97,6 +98,7 @@ struct ValidateRequest : ModelArtifactRequest, InferenceExecutionConfig {
  std::size_t alignment_images = 16U;
  MMLTK_MINIMUM(std::size_t, 1U) std::size_t prefetch_factor = 2U;
  mmltk::backend::imaging::resample::ImageResizeMode compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ mmltk::backend::imaging::resample::RgbResizeMethod compile_resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
  MMLTK_MINIMUM(int, -1) int compile_workers = -1;
  MMLTK_MINIMUM(int, 0) int compile_cuda_mask_batch_size = 0;
  MMLTK_MINIMUM(int, 0) int compile_cuda_device_id = 0;

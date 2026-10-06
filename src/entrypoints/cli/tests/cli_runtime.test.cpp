@@ -19,6 +19,7 @@
 #include <vector>
 #include <utility>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cuda_runtime_api.h>
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
@@ -850,7 +851,26 @@ TEST_CASE("RF-DETR help exposes independent augmentation and compiler resampling
   } else {
    CHECK(result.stdout_text.find("--perceptual-downscale") != std::string::npos);
    CHECK(result.stdout_text.find("--resize-mode") != std::string::npos);
+   CHECK(result.stdout_text.find("--resize-method") != std::string::npos);
   }
+ }
+}
+TEST_CASE("CLI resize method admission covers prediction recompile and both compile surfaces", "[core][cli][rfdetr][torch_resize]") {
+ for (const auto& prefix : std::vector<std::vector<std::string>>{{"compile"}, {"rfdetr", "compile"}, {"rfdetr", "predict"}, {"rfdetr", "validate"}}) {
+#if !defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+  if (prefix.front() == "rfdetr") continue;
+#endif
+  std::vector<std::string> command{mmltk_cli_path()};
+  command.insert(command.end(), prefix.begin(), prefix.end());
+  command.push_back("--help");
+  const auto help = run_subprocess_capture_output(command);
+  REQUIRE(help.exit_code == 0);
+  CHECK(help.stdout_text.find("--resize-method") != std::string::npos);
+  command.pop_back();
+  command.insert(command.end(), {"--resize-method", "not-a-resize-method"});
+  const auto invalid = run_subprocess_capture_output(command);
+  CHECK(invalid.exit_code != 0);
+  CHECK(invalid.stderr_text.find("resize-method") != std::string::npos);
  }
 }
 TEST_CASE("CLI fatal boundaries remain visible with logging off or unavailable", "[core][cli][logging]") {
@@ -879,13 +899,17 @@ TEST_CASE("RF-DETR fatal file diagnostics retain their named owner", "[core][cli
  CHECK(result.stderr_text.find("fatal: ", result.stderr_text.find("fatal: ") + 1U) == std::string::npos);
  assert_contains_substring(read_text_lines(log), "[rfdetr.cli]");
 }
-TEST_CASE("CLI compilation persists default and explicit resize geometry", "[core][cli][rfdetr][data]") {
+TEST_CASE("CLI compilation persists default and explicit resize geometry", "[core][cli][rfdetr][data][torch_resize]") {
  namespace data = mmltk::backend::data;
  using mmltk::backend::imaging::resample::ImageResizeMode;
+ const auto method = GENERATE("Native", "TorchBilinear", "TorchBilinearAntialias");
  const ScopedTempDir root{"mmltk-cli-resize"};
  data::testsupport::create_synthetic_dataset({root.path().string(), "train", 64, 32, 1, 1, 0, true});
  fs::copy(root.path() / "dataset/train", root.path() / "dataset/val", fs::copy_options::recursive);
  for (const bool rfdetr : {false, true}) {
+#if !defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+  if (rfdetr) continue;
+#endif
   for (const bool letterbox : {false, true}) {
    const auto output = root.path() / (std::string(rfdetr ? "rfdetr" : "generic") + (letterbox ? "-letterbox" : "-default"));
    std::vector<std::string> command{mmltk_cli_path()};
@@ -896,8 +920,16 @@ TEST_CASE("CLI compilation persists default and explicit resize geometry", "[cor
    else
     command.insert(command.end(), {"--split", "train", "--width", "32", "--height", "32"});
    if (letterbox) command.insert(command.end(), {"--resize-mode", "Letterbox"});
+   if (std::string_view(method) != "Native") command.insert(command.end(), {"--resize-method", method});
    const auto result = run_subprocess_capture_output(command);
    INFO(result.output_text);
+#if !defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+   if (std::string_view(method) != "Native") {
+    CHECK(result.exit_code != 0);
+    CHECK(result.stderr_text.find("Torch RGB resampling requires a build with the pinned Torch payload") != std::string::npos);
+    continue;
+   }
+#endif
    REQUIRE(result.exit_code == 0);
    for (const auto* split : {"train", "val"}) {
     if (!rfdetr && std::string_view(split) == "val") continue;

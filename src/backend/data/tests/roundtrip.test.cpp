@@ -1786,3 +1786,42 @@ TEST_CASE("runtime file readiness follows actual capacity return and retains not
  CHECK_THROWS(files.try_submit({.work = [] {}}));
  CHECK_THROWS(files.has_capacity());
 }
+TEST_CASE("Torch compiler methods preserve labels catalog and stored geometry", "[backend][data][compiler][torch_resize]") {
+ using namespace mmltk::backend::imaging::resample;
+ const auto mode = GENERATE(ImageResizeMode::Stretch, ImageResizeMode::Letterbox);
+ const mmltk::testsupport::ScopedTempDir root("torch-compiled");
+ const FixtureSpec fixture{.root_dir = root.path().string(), .width = 65, .height = 49, .num_images = 2, .background_images = 1};
+ create_synthetic_dataset(fixture);
+ auto config = compiler_config(fixture);
+ config.num_workers = 1;
+ config.target_width = config.target_height = 17;
+ config.resize_mode = mode;
+ DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0);
+ const auto native = CompiledDataset::open(compiled_bin_path(fixture));
+ for (const auto method : {RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias}) {
+  config.resize_method = method;
+  config.perceptual_downscale = true;
+  config.output_dir = (root.path() / std::string(mmltk::frameworks::reflection::enum_name(method))).string();
+#if !defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+  CHECK_THROWS_WITH(DatasetCompiler::prepare(config, {"train"}), "Torch RGB resampling requires a build with the pinned Torch payload");
+#else
+  const auto plan = DatasetCompiler::prepare(config, {"train"});
+  CHECK(plan.config.resize_method == method);
+  DatasetCompiler::compile(plan, 0);
+  const auto selected = CompiledDataset::open(fs::path(config.output_dir) / "train.bin");
+  CHECK(std::memcmp(&native.header(), &selected.header(), sizeof(FileHeader)) == 0);
+  CHECK(std::ranges::equal(native.class_names(), selected.class_names()));
+  for (const auto slot : native.eligible_slots()) {
+   const auto before = native.label_payload(slot), after = selected.label_payload(slot);
+   REQUIRE(before.size() == after.size());
+   CHECK(std::ranges::equal(before, after));
+   const auto a = native.geometry(slot), b = selected.geometry(slot);
+   CHECK(a.resized_width == b.resized_width);
+   CHECK(a.resized_height == b.resized_height);
+   CHECK(a.offset_x == b.offset_x);
+   CHECK(a.offset_y == b.offset_y);
+  }
+  CHECK(std::memcmp(native.image_pixels(1), selected.image_pixels(1), native.header().image_stride) != 0);
+#endif
+ }
+}

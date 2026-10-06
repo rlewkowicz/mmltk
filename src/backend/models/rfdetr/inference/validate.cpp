@@ -376,6 +376,7 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
   config.target_width = static_cast<std::uint32_t>(options.resolution);
   config.target_height = static_cast<std::uint32_t>(options.resolution);
   config.resize_mode = options.compile_resize_mode;
+  config.resize_method = options.compile_resize_method;
   config.num_workers = options.compile_workers;
   config.cuda_mask_batch_size = options.compile_cuda_mask_batch_size;
   config.cuda_device_id = options.compile_cuda_device_id;

@@ -18,6 +18,11 @@
 #include <cstring>
 #include <new>
 #include <utility>
+#include <future>
+#if defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+#include <ATen/Parallel.h>
+#include <omp.h>
+#endif
 #include "avir_float4_sse.h"
 namespace mmltk::backend::imaging::resample::perceptual {
 struct CpuDownscalerTestAccess {
@@ -889,3 +894,77 @@ TEST_CASE("AVIR checked layout matches all execution reservations and preparatio
   }
  }
 }
+TEST_CASE("explicit Torch RGB methods preserve geometry float output and bounded workspace", "[image_resize][torch_resize][workspace]") {
+ CHECK_THROWS_AS(RgbImageResizer::require_method(static_cast<RgbResizeMethod>(255)), std::invalid_argument);
+ const auto method = GENERATE(RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias);
+#if !defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+ CHECK_THROWS_AS(RgbImageResizer::require_method(method), std::runtime_error);
+ CHECK_NOTHROW(RgbImageResizer::require_method(RgbResizeMethod::Native));
+#else
+ const auto mode = GENERATE(ImageResizeMode::Stretch, ImageResizeMode::Letterbox);
+ const auto source = make_test_image(17, 13);
+ CHECK_THROWS(RgbImageResizer::workspace_plan(UINT32_MAX, UINT32_MAX, 1, 1, mode, false, RgbPixelFormat::RGB8, nullptr, method));
+ for (const auto size : {std::array{17U, 13U}, std::array{7U, 5U}, std::array{27U, 19U}, std::array{1U, 1U}}) {
+  const auto width = size[0], height = size[1];
+  const auto plan = RgbImageResizer::workspace_plan(17, 13, width, height, mode, true, RgbPixelFormat::RGB8, nullptr, method);
+  const auto geometry = compute_image_resize_geometry(17, 13, width, height, mode);
+  CHECK(plan.method() == method);
+  if (plan.path() != RgbResizePath::Identity) {
+   CHECK(plan.path() == RgbResizePath::Torch);
+   CHECK(plan.bytes() == (17U * 13U + geometry.resized_width * geometry.resized_height) * 3U * sizeof(float));
+   CHECK(plan.opaque_bytes() > plan.bytes());
+  } else {
+   CHECK(plan.bytes() == 0);
+   CHECK(plan.opaque_bytes() == 0);
+  }
+  std::vector<std::byte> allocation(plan.bytes() + 128, std::byte{0x7D});
+  auto* start = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(allocation.data()) + 63U) & ~std::uintptr_t{63U});
+  const std::span memory(start, plan.bytes());
+  std::vector<float> actual(width * height * 3, -1), expected(actual.size());
+  const RgbImageLayout layout{width, height, width * sizeof(float), width * height * sizeof(float), actual.size() * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32};
+  const RgbConstImageView input{source.data(), {17, 13, 17 * 3, 0, source.size(), RgbPixelFormat::RGB8}};
+  RgbImageResizer supplied, owned(1, false, method);
+  supplied.prepare(plan, memory);
+  supplied.resize_to_planar(input, {actual.data(), layout}, mode);
+  owned.resize_to_planar(input, {expected.data(), layout}, mode);
+  CHECK(actual == expected);  // Stored perceptual choice cannot alter a Torch method.
+  if (plan.path() != RgbResizePath::Identity && geometry.resized_width > 1 && geometry.resized_height > 1)
+   CHECK(std::ranges::any_of(actual, [](float value) { return std::abs(value * 255.F - std::round(value * 255.F)) > 1e-3F; }));
+  CHECK(std::ranges::all_of(actual, [](float value) { return std::isfinite(value) && value >= 0 && value <= 1; }));
+  CHECK(supplied.retained_bytes() == plan.bytes());
+  CHECK(std::ranges::all_of(std::span(start + plan.bytes(), 32), [](std::byte value) { return value == std::byte{0x7D}; }));
+  for (unsigned channel = 0; channel < 3; ++channel)
+   for (unsigned y = 0; y < height; ++y)
+    for (unsigned x = 0; x < width; ++x)
+     if (x < geometry.offset_x || y < geometry.offset_y || x >= geometry.offset_x + geometry.resized_width || y >= geometry.offset_y + geometry.resized_height)
+      CHECK(actual[channel * width * height + y * width + x] == 0);
+  if (plan.bytes()) CHECK_THROWS_AS(supplied.prepare(plan, memory.first(plan.bytes() - 1)), std::length_error);
+  if (plan.path() == RgbResizePath::Identity) {
+   rgb_hwc_u8_to_nchw_f32(source.data(), expected.data(), 17, 13);
+   CHECK(actual == expected);
+  }
+ }
+#endif
+}
+#if defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+TEST_CASE("Torch RGB workers retain independent local CPU limits", "[image_resize][torch_resize][concurrency]") {
+ const auto work = [](int threads) {
+  (void)at::get_num_threads();
+  const int previous = omp_get_max_threads();
+  struct Restore { int value; ~Restore() { omp_set_num_threads(value); } } restore{previous};
+  omp_set_num_threads(threads);
+  const auto source = make_test_image(53, 37);
+  std::vector<float> result(17 * 11 * 3);
+  RgbImageResizer resizer(1, false, RgbResizeMethod::TorchBilinearAntialias);
+  for (unsigned pass = 0; pass < 3; ++pass) {
+   resizer.resize_to_planar({source.data(), {53, 37, 159, 0, source.size(), RgbPixelFormat::RGB8}},
+    {result.data(), {17, 11, 17 * sizeof(float), 17 * 11 * sizeof(float), result.size() * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32}}, ImageResizeMode::Stretch);
+   if (at::get_num_threads() != threads) throw std::runtime_error("Torch resize changed caller CPU limit");
+  }
+  return result;
+ };
+ auto first = std::async(std::launch::async, work, 2);
+ auto second = std::async(std::launch::async, work, 3);
+ CHECK(first.get() == second.get());
+}
+#endif

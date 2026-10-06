@@ -61,6 +61,9 @@ mmltk_register_header_isolation(mmltk_entrypoints_cli_test_support)
 
 function(mmltk_add_entrypoints_cli_tests)
     add_executable(mmltk_entrypoints_cli_tests EXCLUDE_FROM_ALL)
+    if(BUILD_RFDETR_NATIVE)
+        target_compile_definitions(mmltk_entrypoints_cli_tests PRIVATE MMLTK_TEST_TORCH_RGB_RESIZE=1)
+    endif()
     mmltk_register_retained_module_importers(
         mmltk_entrypoints_cli_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/cli_runtime.test.cpp

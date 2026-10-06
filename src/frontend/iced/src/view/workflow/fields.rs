@@ -5,6 +5,33 @@ use iced::{Fill, Length};
 const NUMERIC_INPUT_PORTION: u16 = 2;
 const NUMERIC_TRAILING_PORTION: u16 = 3;
 
+pub fn rgb_resize_method<'a, Message: Clone + 'a>(
+    id: &'static str,
+    selected: crate::generated::RgbResizeMethod,
+    enabled: bool,
+    changed: impl Fn(crate::generated::RgbResizeMethod) -> Message + Copy + 'a,
+    ignored: Message,
+) -> Element<'a, Message> {
+    use crate::generated::RgbResizeMethod;
+    let mut choices = column![text("RGB resampling").size(12)].spacing(super::FIELD_SPACING);
+    for (suffix, label, method) in [
+        ("native", "Native", RgbResizeMethod::Native),
+        ("torch", "PyTorch bilinear", RgbResizeMethod::TorchBilinear),
+        ("torch_antialias", "PyTorch bilinear + antialias", RgbResizeMethod::TorchBilinearAntialias),
+    ] {
+        let ignored = ignored.clone();
+        choices = choices.push(iced::widget::container(
+            iced::widget::radio(label, method, Some(selected), move |value| {
+                if enabled { changed(value) } else { ignored.clone() }
+            }).style(move |theme, status| {
+                if enabled { iced_fluent_theme::radio::default(theme, status) }
+                else { iced_fluent_theme::radio::disabled(theme, status) }
+            })
+        ).id(format!("{id}.{suffix}")));
+    }
+    choices.into()
+}
+
 pub fn numeric_grid<'a, Message>() -> iced::widget::Grid<'a, Message, crate::fluent_theme::Theme> {
     iced::widget::Grid::new()
         .columns(4)

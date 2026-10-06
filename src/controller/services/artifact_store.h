@@ -40,6 +40,7 @@ struct ArtifactCompileRequest final {
  mmltk::backend::data::BenchmarkDatasetSelection benchmark_selection{};
  bool perceptual_downscale = false;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ mmltk::backend::imaging::resample::RgbResizeMethod resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
  [[nodiscard]] bool valid() const noexcept;
 };
 struct ArtifactCompileMaterializationError final {
@@ -75,9 +76,9 @@ public:
 private:
  friend class ArtifactStore;
  virtual void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, std::uint32_t resolution, bool perceptual_downscale,
-  mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver) const = 0;
+  mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::backend::imaging::resample::RgbResizeMethod resize_method, mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver) const = 0;
  virtual void compile_benchmark(mmltk::backend::data::BenchmarkDatasetSelection selection, const std::filesystem::path& output, const std::filesystem::path& publication, std::uint32_t resolution,
-  bool perceptual_downscale, mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver,
+  bool perceptual_downscale, mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::backend::imaging::resample::RgbResizeMethod resize_method, mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver,
   ArtifactBenchmarkTraceObserver) const = 0;
 };
 struct ArtifactCompileResult final {

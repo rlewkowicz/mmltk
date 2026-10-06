@@ -2,7 +2,7 @@ use crate::integration_control::{DatasetTextKind, observe_dataset_text};
 pub(crate) mod progress;
 
 use crate::fluent_theme::Element;
-use crate::generated::{BenchmarkDatasetVariant, CoconutValidation, ImageResizeMode};
+use crate::generated::{BenchmarkDatasetVariant, CoconutValidation, ImageResizeMode, RgbResizeMethod};
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use crate::view::shared::{card_section_divider, disclosure};
 use iced::Fill;
@@ -25,6 +25,7 @@ pub enum Message {
     CompileDimensionsChanged(bool),
     PerceptualDownscaleChanged(bool),
     ResizeModeChanged(ImageResizeMode),
+    ResizeMethodChanged(RgbResizeMethod),
     ResolutionChanged(i32),
     Browse(u64),
     Compile,
@@ -82,6 +83,9 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<Outcome, St
         })?,
         Message::ResizeModeChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraincompileresizemode(draft, value)
+        })?,
+        Message::ResizeMethodChanged(value) => model.edit(cadence, |draft| {
+            crate::generated::edit_workflowstraincompileresizemethod(draft, value)
         })?,
         Message::PerceptualDownscaleChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraincompileperceptualdownscale(draft, value)
@@ -245,10 +249,16 @@ pub fn view<'a>(
         .spacing(crate::view::workflow::FIELD_SPACING),
     );
     let fields = fields.push(
+        crate::view::workflow::fields::rgb_resize_method(
+            "train.dataset.resampling", train.compileresizemethod, enabled,
+            Message::ResizeMethodChanged, Message::Ignore,
+        ),
+    ).push(text("Applies when compiling. Existing compiled pixels stay unchanged.").size(12));
+    let fields = fields.push(
         container(crate::view::workflow::fields::toggle(
-            "Perceptual downscaling",
+            "Perceptual downscaling (Native only)",
             train.compileperceptualdownscale,
-            enabled,
+            enabled && train.compileresizemethod == RgbResizeMethod::Native,
             Message::PerceptualDownscaleChanged,
         ))
         .id(
@@ -675,6 +685,13 @@ mod tests {
             ImageResizeMode::Stretch
         );
         update(&mut model, Message::PerceptualDownscaleChanged(true)).unwrap();
+        for method in [RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias, RgbResizeMethod::Native] {
+            assert!(matches!(update(&mut model, Message::ResizeMethodChanged(method)),
+                Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))));
+            let train = &model.draft.as_ref().unwrap().workflows.train;
+            assert_eq!(train.compileresizemethod, method);
+            assert!(train.compileperceptualdownscale);
+        }
         for mode in [ImageResizeMode::Letterbox, ImageResizeMode::Stretch] {
             assert!(matches!(
                 update(&mut model, Message::ResizeModeChanged(mode)),

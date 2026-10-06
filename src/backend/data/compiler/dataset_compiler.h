@@ -131,6 +131,7 @@ struct CompileDiagnostic {
 };
 struct CompilerConfig {
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ mmltk::backend::imaging::resample::RgbResizeMethod resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
  bool perceptual_downscale = false;
  MMLTK_MAXIMUM(std::uint32_t, COMPILED_LABEL_LIMIT) std::uint32_t max_label_bytes = COMPILED_LABEL_CAPACITY;
  // CLEANUP-IGNORE: Compiler input/output paths remain backend execution facts with canonical reflected limits.

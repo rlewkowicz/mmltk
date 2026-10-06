@@ -1202,6 +1202,7 @@ void test_benchmark_cached_image_writer_and_loader() {
   BenchmarkCompilerConfig manifest_config;
   manifest_config.resolution = kNanoResolution;
   manifest_config.perceptual_downscale = perceptual;
+  manifest_config.resize_method = perceptual ? mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias : mmltk::backend::imaging::resample::RgbResizeMethod::Native;
   const auto staged = root.path() / (perceptual ? "filtered-stage" : "ordinary-stage");
   fs::create_directories(staged);
   // Acquired facts come from the real raw-cache fixture. The production
@@ -1213,6 +1214,7 @@ void test_benchmark_cached_image_writer_and_loader() {
   const auto manifest = read_json_file(staged / "benchmark_manifest.json");
   CHECK(manifest.at("resampling").at("perceptual_downscale").get<bool>() == perceptual);
   CHECK(manifest.at("resampling").at("version").get<unsigned>() == 1U);
+  CHECK(manifest.at("resampling").at("method") == (perceptual ? "TorchBilinearAntialias" : "Native"));
   CHECK(manifest.at("compiled_format_version").get<unsigned>() == FORMAT_VERSION);
   CHECK(manifest.at("normalized_annotation_version").get<unsigned>() == 3U);
   CHECK(manifest.at("resize_mode") == "stretch");
@@ -2037,15 +2039,16 @@ TEST_CASE("benchmark polygon raster bounds handle extreme and half-open coordina
   }
  }
 }
-TEST_CASE("generic and benchmark writers share complete format headers", "[backend][data][benchmark][compiler]") {
+TEST_CASE("generic and benchmark writers share complete format headers", "[backend][data][benchmark][compiler][torch_resize]") {
  namespace fixtures = mmltk::backend::data::testsupport;
  namespace resize = mmltk::backend::imaging::resample;
+ const auto method = GENERATE(resize::RgbResizeMethod::Native, resize::RgbResizeMethod::TorchBilinear, resize::RgbResizeMethod::TorchBilinearAntialias);
  const mmltk::testsupport::ScopedTempDir root("shared-compiled-header");
  const fixtures::FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 8, .num_images = 1};
  fixtures::create_synthetic_dataset(fixture);
  const auto image_root = root.path() / "cached";
  prepare_cached_image_directory(image_root);
- BenchmarkEncodedImage::publish(cached_image_path(image_root, 1U), make_jpeg(128U, 64U, 32U), {});
+ BenchmarkEncodedImage::publish(cached_image_path(image_root, 1U), mmltk::testsupport::read_binary_file(fs::path(fixtures::dataset_dir(fixture)) / "train/000001.png"), {});
  for (const auto mode : {resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox}) {
   for (const std::string& annotation :
    {std::string{}, std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
@@ -2056,6 +2059,13 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
    config.target_width = 16U;
    config.target_height = 16U;
    config.resize_mode = mode;
+   config.resize_method = method;
+#if !defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+   if (method != resize::RgbResizeMethod::Native) {
+    CHECK_THROWS_WITH(DatasetCompiler::prepare(config, {"train"}), "Torch RGB resampling requires a build with the pinned Torch payload");
+    continue;
+   }
+#endif
    DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0U);
    const auto generic = CompiledDataset::open(fixtures::compiled_bin_path(fixture));
    PreparedBenchmarkSplit split;
@@ -2070,10 +2080,12 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
    auto request = benchmark_write_request(split, output, 16U);
    request.overwrite = true;
    request.resize_mode = mode;
+   request.resize_method = method;
    write_benchmark_fixture(request, chunks);
    const auto benchmark = CompiledDataset::open(output);
    CHECK(std::memcmp(&generic.header(), &benchmark.header(), sizeof(FileHeader)) == 0);
    (void)validate_compiled_file_sections(benchmark.header(), fs::file_size(output));
+   CHECK(std::memcmp(generic.image_pixels(0), benchmark.image_pixels(0), generic.header().image_stride) == 0);
    CHECK(benchmark.label_count() == generic.image_labels(0).size());
    CHECK(benchmark.annotations(0).runs.size_bytes() == generic.annotations(0).runs.size_bytes());
   }
@@ -13289,17 +13301,24 @@ TEST_CASE("Directory supplied JPEG GIF and 16-bit PNM match the existing STB cod
     .retain_workspace = false})
   .wait();
 }
-TEST_CASE("sealed pixel plans validate custody and geometry before writing the destination", "[backend][data][writer]") {
+TEST_CASE("sealed pixel plans validate custody and geometry before writing the destination", "[backend][data][writer][torch_resize]") {
  using namespace mmltk::backend::data::detail;
  using namespace mmltk::backend::imaging::resample;
  const auto mode = GENERATE(ImageResizeMode::Stretch, ImageResizeMode::Letterbox);
  const auto perceptual = GENERATE(false, true);
+ const auto method = GENERATE(RgbResizeMethod::Native, RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias);
  const std::array<std::uint8_t, 24> rgb{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 20, 21, 40, 50, 60, 70, 80, 90, 110, 120, 130};
  std::vector<std::uint8_t> encoded;
  REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 4, 2, 3, rgb.data(), 12));
  CompileImageDecoder decoder;
  const auto header = decoder.read_header(encoded, CompileImagePolicy::Benchmark);
- const auto plan = compile_pixel_workspace_plan(header, 2, mode, perceptual);
+#if !defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+ if (method != RgbResizeMethod::Native) {
+  CHECK_THROWS_WITH(compile_pixel_workspace_plan(header, 2, mode, perceptual, method), "Torch RGB resampling requires a build with the pinned Torch payload");
+  return;
+ }
+#endif
+ const auto plan = compile_pixel_workspace_plan(header, 2, mode, perceptual, method);
  CompileExecution execution(1, {}, {.transient_bytes = plan.bytes()});
  CompilePixelWorkspace workspace;
  unsigned prepared = 0;
@@ -13332,7 +13351,11 @@ TEST_CASE("sealed pixel plans validate custody and geometry before writing the d
  },
     .retain_workspace = false})
   .wait();
- RgbImageResizer resizer(1, perceptual);
+ CHECK(plan.policy().method == method);
+ CHECK(plan.resize_plan().method() == method);
+ CHECK(plan.resources().opaque_bytes >= plan.resize_plan().opaque_bytes());
+ CHECK(plan.resources().cpu_workers == 0);  // Ordinary one-CPU task, no external worker grant.
+ RgbImageResizer resizer(1, perceptual, method);
  resizer.resize_to_planar({rgb.data(), {4, 2, 12, 0, rgb.size(), RgbPixelFormat::RGB8}}, {reference.data(), plan.destination()}, mode);
  CHECK(output == reference);
 }

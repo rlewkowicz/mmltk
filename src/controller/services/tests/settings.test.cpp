@@ -301,6 +301,9 @@ void test_ui_settings_round_trip() {
  train.overwrite_compiled_dataset = true;
  train.compile_dimensions = true;
  train.compile_perceptual_downscale = true;
+ train.compile_resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinear;
+ validate.request.compile_resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias;
+ predict.request.resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias;
  train.compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
  validate.request.compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
  train.request.gpu_augmentation.perceptual_downscale = true;
@@ -482,6 +485,9 @@ void test_ui_settings_round_trip() {
  REQUIRE((loaded_train.overwrite_compiled_dataset));
  REQUIRE((loaded_train.compile_dimensions));
  CHECK(loaded_train.compile_perceptual_downscale);
+ CHECK(loaded_train.compile_resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinear);
+ CHECK(loaded_validate.request.compile_resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias);
+ CHECK(loaded_predict.request.resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias);
  CHECK(loaded_train.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
  CHECK(loaded_validate.request.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
  CHECK(loaded_train.request.gpu_augmentation == train.request.gpu_augmentation);
@@ -568,6 +574,9 @@ void test_fresh_defaults_use_capture_only_annotate() {
  REQUIRE((!train.overwrite_compiled_dataset));
  REQUIRE((!train.compile_dimensions));
  CHECK_FALSE(train.compile_perceptual_downscale);
+ CHECK(train.compile_resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::Native);
+ CHECK(validate.request.compile_resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::Native);
+ CHECK(predict.request.resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::Native);
  CHECK(train.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
  CHECK(validate.request.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
  CHECK_FALSE(train.request.gpu_augmentation.perceptual_downscale);

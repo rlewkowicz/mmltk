@@ -268,6 +268,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(mmltk_backend_models_rfdetr_core_tests PRIVATE
+        mmltk::backend::imaging::resample
         mmltk_backend_models_rfdetr_training_fixture
         mmltk::backend::models::rfdetr::augmentation
         mmltk_common_system_test_support

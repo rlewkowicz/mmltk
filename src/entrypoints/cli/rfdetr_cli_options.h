@@ -52,6 +52,7 @@ struct CompileCliRequest final {
  bool overwrite = false;
  bool perceptual_downscale = false;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ mmltk::backend::imaging::resample::RgbResizeMethod resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
 };
 struct InfoCliRequest final {
  MMLTK_MAX_PATH_BYTES std::filesystem::path onnx_path;
@@ -92,6 +93,7 @@ using Supervision = Train::within<&TrainRequest::training_supervision>;
 using MatchFree = Supervision::within<&TrainingSupervisionConfig::match_free>;
 using Denoising = Supervision::within<&TrainingSupervisionConfig::denoising>;
 inline constexpr std::array kCompileOptions{
+ MMLTK_CLI_OPTION(Compile, resize_method, "RGB resampling: Native, TorchBilinear or TorchBilinearAntialias", "Dataset"),
  MMLTK_CLI_OPTION(Compile, resize_mode, "Image geometry: Stretch or Letterbox", "Dataset"), MMLTK_CLI_OPTION(Compile, perceptual_downscale, "Perceptual shrinking", "Dataset"),
  MMLTK_CLI_OPTION(Compile, source_dir, "Source dataset root", "Dataset"), MMLTK_CLI_OPTION(Compile, output_dir, "Compiled output directory", "Dataset"),
  MMLTK_CLI_OPTION(Compile, cache_dir, "Benchmark cache root", "Dataset"), MMLTK_CLI_NAMED(Compile, benchmark_resolution, "--compile-benchmark-dataset", "Compile benchmark dataset", "Dataset"),
@@ -140,6 +142,7 @@ inline constexpr std::array kEvaluateOptions{
  MMLTK_CLI_NAMED(Evaluate, compilation_mode, "--compile-mode", "Native compilation mode", "Execution")
 };
 inline constexpr std::array kPredictOptions{
+ MMLTK_CLI_OPTION(Predict, resize_method, "Image-file RGB resampling: Native, TorchBilinear or TorchBilinearAntialias", "Input"),
  MMLTK_CLI_NAMED(Predict, class_layout_path, "--class-layout", "Digest-bound class descriptor", "Model input"), MMLTK_CLI_OPTION(Predict, numa_node, "GPU-local NUMA node (-1 automatic)", "Execution"),
  negative_flag<PredictCliRequest, Predict::path<&PredictRequest::h2d_dataloader>>("--gdrcopy", "Use GDRCopy image loading", "Execution"),
  MMLTK_CLI_NAMED(Predict, compiled_path, "--compiled", "Compiled dataset split (.bin)", "Dataset"),
@@ -156,6 +159,7 @@ inline constexpr std::array kPredictOptions{
  MMLTK_CLI_NAMED(Predict, compilation_mode, "--compile-mode", "Native compilation mode", "Execution")
 };
 inline constexpr std::array kValidateOptions{
+ MMLTK_CLI_NAMED(Validate, compile_resize_method, "--resize-method", "Recompile RGB resampling: Native, TorchBilinear or TorchBilinearAntialias", "Dataset"),
  MMLTK_CLI_NAMED(Validate, compile_resize_mode, "--resize-mode", "Compile image geometry: Stretch or Letterbox", "Dataset"),
  MMLTK_CLI_NAMED(Validate, class_layout_path, "--class-layout", "Digest-bound class descriptor", "Model input"),
  negative_flag<ValidateRequest, &ValidateRequest::h2d_dataloader>("--gdrcopy", "Use GDRCopy image loading", "Execution"),

@@ -300,6 +300,7 @@ constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
  visit("overwrite", state.overwrite_compiled_dataset);
  visit("compile_dimensions", state.compile_dimensions);
  visit("resize_mode", state.compile_resize_mode);
+ visit("resize_method", state.compile_resize_method);
  visit("perceptual_downscale", state.compile_perceptual_downscale);
  visit("compile_benchmark_dataset_override", state.compile_benchmark_dataset_override);
  visit.nested("benchmark_selection", state.benchmark_selection, benchmark_selection_fields);
@@ -476,6 +477,7 @@ constexpr auto validation_fields = [](auto& state, const auto& visit) {
  visit("profile", state.profile);
  visit("write_report_json", state.write_report_json);
  visit("compile_resize_mode", state.compile_resize_mode);
+ visit("compile_resize_method", state.compile_resize_method);
  visit("compile_workers", state.compile_workers);
  visit("compile_cuda_mask_batch_size", state.compile_cuda_mask_batch_size);
  visit("compile_cuda_device_id", state.compile_cuda_device_id);
@@ -492,6 +494,7 @@ constexpr auto validate_flat_fields = [](auto& state, const auto& visit) {
  validation_fields(state, visit);
 };
 constexpr auto predict_fields = [](auto& state, const auto& visit) {
+ visit("resize_method", state.resize_method);
  visit("backend", state.backend);
  visit("batch_size", state.batch_size);
  visit("max_dets_per_image", state.max_dets_per_image);

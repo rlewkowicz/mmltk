@@ -187,6 +187,7 @@ void compiler_internal::ProgressCounter::add_completed(const size_t count) noexc
 }
 void compiler_internal::ProgressCounter::end_worker() noexcept { update_worker_count(false); }
 DatasetCompilePlan DatasetCompiler::prepare(CompilerConfig config, const std::vector<std::string>& splits, const mmltk::common::concurrency::CancellationObservation cancellation) {
+ mmltk::backend::imaging::resample::RgbImageResizer::require_method(config.resize_method);
  mmltk::common::logging::ScopedProfile profile{"compiler.prepare"};
  if (splits.empty()) { throw std::runtime_error("dataset compile plan requires at least one split"); }
  if (const auto valid = validate_compiler_config(config); !valid) { throw std::runtime_error(std::string(compiler_config_validation_message(valid.error()))); }
@@ -253,7 +254,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  const auto label_window = compiler_internal::DirectoryLabels::resources(2048, compiler_internal::directory_line_window, effective_config.max_label_bytes).bytes;
  detail::CompileExecutionLimits limits;
  limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers),
-  {width, height, effective_config.resize_mode, effective_config.perceptual_downscale}, classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));
+  {width, height, effective_config.resize_mode, effective_config.perceptual_downscale, effective_config.resize_method}, classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));
  detail::CompileExecutionObserver observer;
  if (effective_config.observation && effective_config.observation->execution)
   observer = {effective_config.observation->execution_demand, [&](std::string_view event, const detail::CompileExecutionSnapshot& snapshot) {

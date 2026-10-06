@@ -46,6 +46,7 @@ struct BenchmarkCompilerConfig {
  bool overwrite = false;
  bool perceptual_downscale = false;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ mmltk::backend::imaging::resample::RgbResizeMethod resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
  mmltk::common::concurrency::CancellationObservation cancel_requested;
  BenchmarkProgressCallback progress;
  BenchmarkTraceCallback trace;

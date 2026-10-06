@@ -18,6 +18,7 @@ module;
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -27,6 +28,7 @@ module;
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -723,7 +725,7 @@ struct PredictionLane final {
  torch::Tensor staging, host;
  std::unique_ptr<mmltk::backend::ml::cuda::NumaHostTensor> host_staging;
  std::unique_ptr<mmltk::backend::imaging::resample::RgbImageResizer> resizer;
- std::vector<std::uint8_t> resized;
+ std::unique_ptr<mmltk::backend::ml::cuda::NumaHostTensor> resize_workspace;
  std::vector<PredictionRecord> records;
  std::vector<PredictionPixels> pixels;
  std::vector<DecodedPredictionImage> decoded;
@@ -898,6 +900,11 @@ runtime::RuntimeStatus PredictionSession::State::Close() noexcept {
     lane->host = torch::Tensor{};
     if (lane->host_staging) {
      const auto status = lane->host_staging->ReleaseSettled();
+     if (status != CUDA_SUCCESS) return Fail(static_cast<runtime::RuntimeStatus>(status));
+    }
+    lane->resizer.reset();
+    if (lane->resize_workspace) {
+     const auto status = lane->resize_workspace->ReleaseSettled();
      if (status != CUDA_SUCCESS) return Fail(static_cast<runtime::RuntimeStatus>(status));
     }
    }
@@ -1190,7 +1197,7 @@ PredictionRunResult PredictionSession::State::RunResolved(
      }
      if (!lane.resizer) {
       lane.resizer = std::make_unique<mmltk::backend::imaging::resample::RgbImageResizer>(1);
-      lane.resized.resize(static_cast<std::size_t>(input_resolution) * input_resolution * 3);
+      lane.resize_workspace = std::make_unique<mmltk::backend::ml::cuda::NumaHostTensor>(device, std::shared_ptr<void>{}, lane.retirement, operations);
      }
      const auto& source = options.image_inputs[source_index];
      int width = 0, height = 0, channels = 0;
@@ -1203,11 +1210,19 @@ PredictionRunResult PredictionSession::State::RunResolved(
        .source_name = source.source_name.empty() ? source.image_path.string() : source.source_name});
      lane.pixels.push_back({.width = static_cast<std::uint32_t>(width), .height = static_cast<std::uint32_t>(height), .device = device, .stream = stream.native_handle});
      lane.annotations.demand[image] = prediction_demand(options, backend, delivery, lane.records.back(), width, height);
-     if (width != input_resolution || height != input_resolution) {
-      lane.resizer->resize(pixels, width, height, lane.resized.data(), input_resolution, input_resolution);
-      pixels = lane.resized.data();
-     }
-     mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(pixels, lane.host[image].data_ptr<float>(), input_resolution, input_resolution);
+     using namespace mmltk::backend::imaging::resample;
+     const auto plan = RgbImageResizer::workspace_plan(width, height, input_resolution, input_resolution, ImageResizeMode::Stretch, false, RgbPixelFormat::RGB8, nullptr, options.resize_method);
+     // Each lane retains its registered high-water scratch. CPU tensor views
+     // and opaque Torch temporaries retire synchronously before the next image;
+     // the separate host batch stays pinned until its H2D reader settles.
+     auto scratch = plan.bytes() ? lane.resize_workspace->view({mmltk::common::math::checked_cast<std::int64_t>(plan.bytes(), "prediction resize storage overflow")}, at::kByte) : torch::Tensor{};
+     lane.resizer->prepare(plan, plan.bytes() ? std::span(reinterpret_cast<std::byte*>(scratch.data_ptr<std::uint8_t>()), plan.bytes()) : std::span<std::byte>{});
+     const auto target_row = static_cast<std::size_t>(input_resolution) * sizeof(float);
+     const auto target_plane = target_row * input_resolution;
+     lane.resizer->resize_to_planar(
+      {pixels, {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), std::size_t(width) * 3, 0, std::size_t(width) * height * 3, RgbPixelFormat::RGB8}},
+      {lane.host[image].data_ptr<float>(), {static_cast<std::uint32_t>(input_resolution), static_cast<std::uint32_t>(input_resolution), target_row, target_plane, target_plane * 3, RgbPixelFormat::PlanarUnitSrgbF32}},
+      ImageResizeMode::Stretch);
     }
    }
    if (lane.records.empty()) {

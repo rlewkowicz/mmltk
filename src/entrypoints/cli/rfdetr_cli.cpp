@@ -154,6 +154,7 @@ void run_compile(const CompileCliRequest& request) {
   config.overwrite = request.overwrite;
   config.perceptual_downscale = request.perceptual_downscale;
   config.resize_mode = request.resize_mode;
+ config.resize_method = request.resize_method;
   config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Borrow(signal_scope);
   config.progress = [](const data::BenchmarkCompileProgress& progress) {
    spdmon::ProgressBar::log(data::format_dataset_compile_tracks(progress.tracks));
@@ -177,6 +178,7 @@ void run_compile(const CompileCliRequest& request) {
  data::CompilerConfig config;
  config.perceptual_downscale = request.perceptual_downscale;
  config.resize_mode = request.resize_mode;
+ config.resize_method = request.resize_method;
  config.source_dir = request.source_dir.string();
  config.output_dir = request.output_dir.string();
  config.target_width = static_cast<std::uint32_t>(request.resolution);

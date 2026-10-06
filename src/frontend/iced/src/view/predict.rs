@@ -7,6 +7,8 @@ use iced::widget::{button, column, container};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Ignore,
+    ResizeMethodChanged(crate::generated::RgbResizeMethod),
     Gpu(crate::view::workflow::gpu::Message),
     Saving(output::Message),
     Output(crate::view::workflow::output::Message),
@@ -126,6 +128,17 @@ impl Component {
                             crate::generated::SourceKind::VideoFile => "Source: local video file",
                             _ => "Select a supported prediction source",
                         })),
+                        crate::view::shared::disclosure(
+                            "predict.resampling",
+                            draft.is_some_and(|value| value.source.kind == crate::generated::SourceKind::SingleImage),
+                            crate::view::workflow::fields::rgb_resize_method(
+                                "predict.resampling",
+                                draft.map_or(crate::generated::RgbResizeMethod::Native, |value| value.request.resizemethod),
+                                settings_edit_available,
+                                Message::ResizeMethodChanged,
+                                Message::Ignore,
+                            ),
+                        ),
                         crate::view::workflow::fields::text_field(
                             "Compiled dataset",
                             crate::generated::constraint_workflowspredictsourcecompiledpath()
@@ -336,6 +349,12 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
+            Message::Ignore => return Ok(None),
+            Message::ResizeMethodChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowspredictrequestresizemethod(draft, value)
+                })?,
+            ),
             Message::Gpu(message) => Outcome::SettingsEdited(crate::view::workflow::gpu::update(
                 crate::generated::FeatureId::Predict,
                 settings,
@@ -426,6 +445,20 @@ impl Component {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_resampling_selection_survives_source_changes() {
+        use crate::generated::{RgbResizeMethod, SourceKind};
+        let mut settings = crate::view::settings::installed_settings_model();
+        let mut component = Component::default();
+        for method in [RgbResizeMethod::TorchBilinear, RgbResizeMethod::TorchBilinearAntialias, RgbResizeMethod::Native] {
+            component.update(&mut settings, None, Message::ResizeMethodChanged(method)).unwrap();
+            for source in [SourceKind::SingleImage, SourceKind::CompiledDataset, SourceKind::VideoFile, SourceKind::SingleImage] {
+                component.update(&mut settings, None, Message::SourceChanged(source)).unwrap();
+                assert_eq!(settings.draft.as_ref().unwrap().workflows.predict.request.resizemethod, method);
+            }
+        }
+    }
 
     #[test]
     fn prediction_stop_is_a_domain_outcome() {

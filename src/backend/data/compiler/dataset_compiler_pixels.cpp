@@ -48,7 +48,7 @@ bool inspect_input(ImageWork& image, const CompilerConfig& config) {
    throw std::runtime_error("failed to read image dimensions for " + image_path(std::filesystem::path(config.source_dir) / config.split, image.index).string() + ": " + error.what());
   }
   // Planning is immutable and complete before either consumer is published.
-  image.plan.emplace(detail::compile_pixel_workspace_plan(header, {config.target_width, config.target_height, config.resize_mode, config.perceptual_downscale}));
+  image.plan.emplace(detail::compile_pixel_workspace_plan(header, {config.target_width, config.target_height, config.resize_mode, config.perceptual_downscale, config.resize_method}));
   image.encoded_extent = common::math::checked_add(image.encoded.size(), std::size_t{63}, "encoded image workspace overflow") / 64 * 64;
  }
  // Only raw record extents are measured here, in bounded header continuations.

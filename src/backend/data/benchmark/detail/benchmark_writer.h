@@ -74,6 +74,7 @@ struct BenchmarkWriteRequest {
  BenchmarkWriteProgressEvent progress{};
  bool perceptual_downscale = false;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ mmltk::backend::imaging::resample::RgbResizeMethod resize_method = mmltk::backend::imaging::resample::RgbResizeMethod::Native;
  // Private effect-only boundary after opening a cached image, outside locks.
  BenchmarkImageReadObserver image_opened{};
  // Effect-only preparation observation, called once per checked plan outside locks.

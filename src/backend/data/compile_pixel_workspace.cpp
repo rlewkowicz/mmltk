@@ -8,7 +8,7 @@ CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& h
       policy_(policy),
       decoder_(CompileImageDecoder::plan(header)),
       resize_(imaging::resample::RgbImageResizer::workspace_plan(
-       header.width, header.height, policy.width, policy.height, policy.mode, policy.perceptual, imaging::resample::RgbPixelFormat::RGB8, observed)) {
+       header.width, header.height, policy.width, policy.height, policy.mode, policy.perceptual, imaging::resample::RgbPixelFormat::RGB8, observed, policy.method)) {
  using common::math::checked_add;
  using common::math::checked_multiply;
  decoder_extent_ = checked_add(decoder_.bytes(), std::size_t{63}, "decode alignment overflow") / 64 * 64;
@@ -17,7 +17,7 @@ CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& h
   .supplied_workspace = true,
   .completion_workspace = true,
   .workspace_class = CompileWorkClass::Pixels,
-  .opaque_bytes = decoder_.opaque_bytes
+  .opaque_bytes = checked_add(decoder_.opaque_bytes, resize_.opaque_bytes(), "pixel opaque storage overflow")
  };
  const auto row = checked_multiply<std::size_t>(policy.width, sizeof(float), "pixel row overflow");
  const auto plane = checked_multiply<std::size_t>(row, policy.height, "pixel plane overflow");
@@ -26,8 +26,8 @@ CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& h
 CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, CompilePixelPolicy policy, imaging::resample::RgbResizeWork* observed) {
  return CompilePixelWorkspacePlan(header, policy, observed);
 }
-CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, std::uint32_t resolution, imaging::resample::ImageResizeMode mode, bool perceptual) {
- return compile_pixel_workspace_plan(header, {resolution, resolution, mode, perceptual}, nullptr);
+CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, std::uint32_t resolution, imaging::resample::ImageResizeMode mode, bool perceptual, imaging::resample::RgbResizeMethod method) {
+ return compile_pixel_workspace_plan(header, {resolution, resolution, mode, perceptual, method}, nullptr);
 }
 void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::span<const std::uint8_t> encoded, const CompileImageHeader& header, std::span<std::byte> memory,
  imaging::resample::RgbMutableImageView destination, std::function_ref<void()> prepare_destination, const CompilePixelObserver& observer, imaging::resample::RgbResizeWork* resize_observed) {
@@ -38,6 +38,7 @@ void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::sp
  if (observer) {
   observation.codec = header.encoding;
   observation.path = plan.resize_.path();
+  observation.method = plan.resize_.method();
   observation.source_width = header.width;
   observation.source_height = header.height;
   observation.target_width = plan.policy_.width;
