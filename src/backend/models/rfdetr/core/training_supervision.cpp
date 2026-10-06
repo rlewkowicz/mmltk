@@ -1,4 +1,5 @@
 #include "detail/training_supervision.h"
+#include "detail/linear.h"
 #include "detail/training_mask_loss.h"
 #include "detail/detection_sampling.h"
 #include <ATen/Context.h>
@@ -281,13 +282,13 @@ public:
  ProbeMlpImpl(const int64_t input_width, const int64_t hidden_width)
      : linear1(register_module(std::string(detail::kProbeInputLayer), torch::nn::Linear(input_width, hidden_width))),
        linear2(register_module("linear2", torch::nn::Linear(hidden_width, hidden_width))) {}
- torch::Tensor forward(const torch::Tensor& input) { return linear2->forward(torch::relu(linear1->forward(input))); }
+ torch::Tensor forward(const torch::Tensor& input) { return detail::linear_forward(*linear2, torch::relu(detail::linear_forward(*linear1, input))); }
  torch::Tensor forward_ground_truth(const torch::Tensor& labels, const torch::Tensor& boxes, const int64_t object_classes) {
   const auto class_weights = linear1->weight.slice(1, 0, object_classes).transpose(0, 1);
   auto first = class_weights.index({labels});
   first = first + torch::matmul(boxes, linear1->weight.slice(1, object_classes, object_classes + 4).transpose(0, 1));
   if (linear1->bias.defined()) { first = first + linear1->bias; }
-  return linear2->forward(torch::relu(first));
+  return detail::linear_forward(*linear2, torch::relu(first));
  }
  torch::nn::Linear linear1{nullptr};
  torch::nn::Linear linear2{nullptr};
@@ -560,12 +561,12 @@ torch::Tensor TrainingSupervisionImpl::project_ground_truth(const torch::Tensor&
   if (!mask_projection_ || masks->spatial.size(1) != config_.hidden_dim) throw std::invalid_argument("Match-Free mask features must have the configured hidden width");
   // RF-DETR extension to the box-only paper: content-conditioned GT probes.
   const auto pooled = torch::bmm(masks->targets, masks->spatial.transpose(1, 2)) / masks->targets.sum(-1, true).clamp_min(1.0F);
-  probes = probes + mask_projection_->forward(pooled);
+  probes = probes + detail::linear_forward(*mask_projection_, pooled);
  }
- return query_projection_->forward(probes);
+ return detail::linear_forward(*query_projection_, probes);
 }
 torch::Tensor TrainingSupervisionImpl::dense_correspondence(const torch::Tensor& probes, const torch::Tensor& query_features) {
- const auto keys = key_projection_->forward(query_mlp_->forward(query_features.to(torch::kFloat32)));
+ const auto keys = detail::linear_forward(*key_projection_, query_mlp_->forward(query_features.to(torch::kFloat32)));
  return torch::softmax(torch::einsum("bmd,bgnd->bgmn", {probes, keys}) / std::sqrt(static_cast<double>(config_.hidden_dim)), -1);
 }
 MatchFreeCorrespondence TrainingSupervisionImpl::correspondence(

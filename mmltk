@@ -2772,21 +2772,28 @@ run_log_tool() {
 run_rfdetr_upstream_diagnostic() {
     if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
         printf '%s\n' \
-            'Usage: ./mmltk --diagnose-rfdetr-upstream --upstream PATH --output PATH' \
+            'Usage: ./mmltk --diagnose-rfdetr-upstream --upstream PATH --output PATH [--sdpa default|math]' \
             'Requires clean upstream e9a138f70cc14e3fddca029a0683055e34ab8f35 and cached official Nano weights.' \
             'Builds a validation-only cached image from the pinned full NGC donor.' \
             'Executes upstream Nano/SegNano FP32 and supported AMP evidence, then core/training [upstream_oracle] cases.' \
+            '--sdpa math selects ATen math attention on both sides; default retains accelerated backend selection.' \
+            'Gates matched-state forward/objectives, complete derivative vectors and identical-gradient AdamW.' \
+            'Reports per-tensor and independent-trajectory differences separately; success does not certify accuracy or identical training trajectories.' \
             'Exit zero requires both stages. References, comparison JSONL and wrapper.log survive comparison failures.' \
             'Output must be a fresh directory; retry comparisons with --test ... --env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=PATH.' \
             'The upstream mount is read-only. Producer deadline: two hours; signals use bounded wrapper cancellation.'
         return 0
     fi
-    local upstream="" output="" revision=e9a138f70cc14e3fddca029a0683055e34ab8f35
+    local upstream="" output="" sdpa=default revision=e9a138f70cc14e3fddca029a0683055e34ab8f35
     while (($#)); do
         case "$1" in
             --upstream|--output)
                 (($# >= 2)) && [[ -n "$2" ]] || die "$1 requires a path"
                 if [[ "$1" == --upstream ]]; then upstream="$2"; else output="$2"; fi
+                shift 2 ;;
+            --sdpa)
+                (($# >= 2)) && [[ "$2" == default || "$2" == math ]] || die '--sdpa requires default or math'
+                sdpa="$2"
                 shift 2 ;;
             *) die "unknown RF-DETR oracle option '$1'" ;;
         esac
@@ -2819,7 +2826,7 @@ run_rfdetr_upstream_diagnostic() {
     local fingerprint image="${image_name}-rfdetr-oracle" diagnostic_container="${container_name}-upstream"
     fingerprint="$(
         {
-            printf '%s\n' "${revision}" "${nvidia_donor_image}" "${source_tree}"
+            printf '%s\n' "${revision}" "${nvidia_donor_image}" "${source_tree}" "${sdpa}"
             sha256sum "${repo_root}/docker/Dockerfile.rfdetr-oracle" \
                 "${repo_root}/docker/nvidia-payload.json" \
                 "${repo_root}/tools/rfdetr_oracle_requirements.txt" \
@@ -2850,7 +2857,7 @@ run_rfdetr_upstream_diagnostic() {
     local status=0
     run_owned_docker_command "${diagnostic_container}" "${producer_args[@]}" "${image}" \
         --signal=TERM --kill-after=15s 7200s python3 /opt/rfdetr-oracle/producer.py \
-        --upstream /upstream --output /evidence --weights /weights --fingerprint "${fingerprint}" || status=$?
+        --upstream /upstream --output /evidence --weights /weights --fingerprint "${fingerprint}" --sdpa "${sdpa}" || status=$?
     release_mutation_locks
     if (( status != 0 )); then
         error "upstream reference production failed (exit ${status}); evidence retained in ${output}"
@@ -2881,10 +2888,10 @@ run_rfdetr_upstream_diagnostic() {
     fi
     local manifest_hash
     manifest_hash="$(sha256sum "${output}/manifest.json" | cut -d' ' -f1)"
-    printf '{"status":"passed","evidence":"upstream forward/VJP and stock FP32; AMP controlled FP32 matcher, stock differential retained; native Match-Free compilation","fingerprint":"%s","manifest_sha256":"%s"}\n' \
+    printf '{"status":"passed_required_checks","evidence":"actual upstream matched-state forward/objectives and complete derivative vectors; identical-gradient AdamW; native Match-Free compilation","measurements":"per-tensor bounds, autonomous trajectories and stock AMP matcher differences retained; no accuracy or trajectory-equality claim","fingerprint":"%s","manifest_sha256":"%s"}\n' \
         "${fingerprint}" "${manifest_hash}" >"${output}/.verdict.partial"
     mv -- "${output}/.verdict.partial" "${output}/verdict.json"
-    log "upstream production and required native comparisons passed; ${output}/verdict.json"
+    log "upstream production and required matched-state comparisons passed; trajectory differences remain measurements; ${output}/verdict.json"
 }
 
 run_gpu_environment_diagnostic() {

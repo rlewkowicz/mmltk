@@ -394,7 +394,9 @@ TEST_CASE("Depthwise dispatcher replay keeps original-weight VJPs and optional g
        torch::NoGradGuard guard;
        weight.add_(.00317);  // Live weight values cannot become capture constants.
       }
-      mmltk::backend::ml::cuda::TorchAutocastScope scope(amp != torch::kFloat32, amp);
+      // Replay precision belongs to the opaque node, independently of ambient
+      // autocast (the production recorded-graph executor excludes that key).
+      mmltk::backend::ml::cuda::TorchAutocastScope scope(false, amp);
       auto stack = arguments(input);
       executor.run(stack);
       output = stack[0].toTensor();
@@ -1180,6 +1182,31 @@ TEST_CASE("Depthwise saved operands support accumulation optional bias and versi
   weight.add_(0.1);
  }
  REQUIRE_THROWS(outstanding.sum().backward());
+ tensor_fixture::FullMatrixPrecision precision;
+ for (const auto device : tensor_fixture::available_devices())
+  for (const int selected : {0, 1, 2}) {
+   CAPTURE(device, selected);
+   const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+   auto input = torch::sin(torch::arange(18, options)).reshape({1, 2, 3, 3}).set_requires_grad(true);
+   auto kernel = torch::cos(torch::arange(18, options)).reshape({2, 1, 3, 3}).set_requires_grad(true);
+   auto incoming = (torch::arange(18, options) * .03 + .1).reshape_as(input).set_requires_grad(true);
+   auto reference_input = independent_leaf(input), reference_kernel = independent_leaf(kernel), reference_incoming = independent_leaf(incoming);
+   const auto differentiated_vjp = [&](const torch::Tensor& output, const torch::Tensor& value, const torch::Tensor& filter, const torch::Tensor& cotangent) {
+    std::vector<torch::Tensor> operands;
+    if (selected != 1) operands.push_back(value);
+    if (selected != 0) operands.push_back(filter);
+    const auto first_gradients = torch::autograd::grad({output}, operands, {cotangent}, true, true);
+    auto objective = first_gradients.front().square().sum();
+    for (std::size_t index = 1; index < first_gradients.size(); ++index) objective = objective + first_gradients[index].square().sum();
+    return torch::autograd::grad({objective}, {value, filter, cotangent}, {}, false, false, true);
+   };
+   const auto actual = differentiated_vjp(rf::segmentation_depthwise(input, kernel, {}), input, kernel, incoming);
+   const auto expected = differentiated_vjp(reference_depthwise(reference_input, reference_kernel, {}), reference_input, reference_kernel, reference_incoming);
+   for (std::size_t index = 0; index < actual.size(); ++index) {
+    REQUIRE(actual[index].defined() == expected[index].defined());
+    if (actual[index].defined()) REQUIRE(torch::allclose(actual[index], expected[index], 1e-5, 1e-5));
+   }
+  }
 }
 }  // namespace
 TEST_CASE("Packed mask admission rejects malformed extents and CPU logical indices", "[rfdetr][parity]") {

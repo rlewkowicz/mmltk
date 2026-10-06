@@ -1,7 +1,7 @@
 #pragma once
+#include "traced_graph.h"
 #include <ATen/autocast_mode.h>
 #include <torch/script.h>
-#include <torch/csrc/jit/api/function_impl.h>
 #include <torch/csrc/jit/frontend/tracer.h>
 #include <array>
 #include <cstddef>
@@ -31,10 +31,10 @@ public:
    auto trace_res = torch::jit::tracer::trace({tensors.detach().contiguous()...}, [&](torch::jit::Stack args) -> torch::jit::Stack {
     return [&]<size_t... I>(std::index_sequence<I...>) -> torch::jit::Stack { return {fn(args[I].toTensor()...)}; }(std::make_index_sequence<Arity>{});
    }, [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
-   candidate->module.type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
+   detail::install_recorded_forward(candidate->module, *cu, trace_res.first->graph);
    state_ = std::move(candidate);
   }
-  return state_->module.forward({tensors...}).toTensor();
+  return detail::run_recorded_forward(state_->module, {tensors...}, signature.device_types.front()).toTensor();
  }
  // Opaque observation only: callers cannot mutate or independently execute a module.
  [[nodiscard]] const void* identity() const noexcept { return state_.get(); }

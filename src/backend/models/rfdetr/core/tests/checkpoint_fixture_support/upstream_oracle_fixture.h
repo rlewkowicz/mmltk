@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -37,6 +38,7 @@ struct OracleParameterGroup final {
 struct OracleCase final {
  std::string id, preset, precision;
  bool training = false;
+ bool math_sdpa = false;
  int batch = 0, resolution = 0, groups = 0, classes = 0;
  std::vector<std::string> trainable;
  std::vector<OracleParameterGroup> parameter_groups;
@@ -51,11 +53,13 @@ public:
  OracleArchive(const std::filesystem::path& directory, const OracleArchiveRecord& record);
  [[nodiscard]] torch::Tensor tensor(const std::string& name, torch::Device device = torch::kCPU) const;
  [[nodiscard]] std::set<std::string> names(std::string_view prefix) const;
+ [[nodiscard]] std::vector<std::string> ordered_defined_names(std::string_view prefix) const;
  [[nodiscard]] bool contains(const std::string& name) const;
 
 private:
  TensorMap tensors_;
  std::set<std::string> undefined_;
+ std::vector<std::string> serialized_order_;
 };
 class UpstreamOracle final {
 public:
@@ -86,12 +90,31 @@ public:
  void compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference = false);
  void inventory(const std::string& boundary, const std::set<std::string>& actual, const std::set<std::string>& expected);
  void fact(const std::string& boundary, const nlohmann::json& value);
+ // Collect finite numerical discrepancies through a complete comparison,
+ // then fail. Invalid structure, identities and nonfinite tensors fail at once.
+ void compare_all(const std::function<void()>& comparisons);
+ // A trajectory with independently updated weights measures differences;
+ // tensor structure, definedness and finite values remain required.
+ void observe_values(const std::function<void()>& comparisons);
+ // Gate the complete derivative vector at the declared norm bound. Retain
+ // every per-tensor comparison, including near-null components, as evidence.
+ void derivatives(const std::string& boundary, const TensorMap& actual, const TensorMap& expected);
+ // Delta precision is limited by the stored parameter, not the much smaller
+ // update. Admit one representable parameter interval, reporting it explicitly.
+ void parameter_update(const std::string& boundary, const torch::Tensor& actual_before, const torch::Tensor& actual_after,
+  const torch::Tensor& expected_before, const torch::Tensor& expected_after);
 
 private:
+ void compare_impl(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference,
+  const torch::Tensor& rounding_scale);
  void record(nlohmann::json value);
  std::ofstream report_;
  at::ScalarType precision_;
+ std::int64_t run_unix_ns_;
  bool failed_ = false;
+ bool collecting_ = false;
+ bool observing_ = false;
+ std::string deferred_difference_;
 };
 [[nodiscard]] TensorMap oracle_output_tensors(const ModelOutputs& outputs);
 [[nodiscard]] PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& entry, torch::Device device);

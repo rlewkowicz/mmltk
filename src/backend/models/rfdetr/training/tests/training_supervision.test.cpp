@@ -2533,6 +2533,8 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
  auto admitted = rfdetr::resolve_model_state(oracle.directory() / "original-rf-detr-nano.pth", "rf-detr-nano", 384);
  for (const auto dtype : {torch::kFloat16, torch::kBFloat16}) {
   if (dtype == torch::kBFloat16 && at::cuda::getCurrentDeviceProperties()->major < 8) continue;
+  for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective}) {
+  DYNAMIC_SECTION("precision " << static_cast<int>(dtype) << " compilation " << static_cast<int>(mode)) {
   auto config = admitted.artifacts.config;
   config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
   config.training_supervision.denoising.enabled = false;
@@ -2544,10 +2546,11 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
    model->to(torch::Device(torch::kCUDA));
    model->train();
    model->set_force_pytorch_deformable_attn(false);
+   model->set_force_math_attention(found->math_sdpa);
    for (const auto& parameter : model->named_parameters(true))
     if (rfdetr::is_encoder_param(parameter.key())) parameter.value().set_requires_grad(false);
   }
-  compiled.optimize_for_inference(2, true, rfdetr::CompilationMode::kSelective);
+  compiled.optimize_for_inference(2, true, mode);
   eager.optimize_for_inference(2, true, rfdetr::CompilationMode::kNone);
   auto targets = rfdetr::testsupport::oracle_targets(archive, *found, torch::kCUDA);
   targets.sampling_keys = torch::tensor({int64_t{9001}, int64_t{9002}}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
@@ -2559,15 +2562,22 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
   auto compiled_optimizer = rfdetr::build_optimizer(compiled.named_parameters(true), request);
   const auto detection = training_detection_fixture(config);
   const rfdetr::TrainingStep step(1, 1., true, dtype);
-  rfdetr::testsupport::OracleComparison comparison(*requested, dtype == torch::kFloat16 ? "matchfree-nano384-fp16" : "matchfree-nano384-bf16", dtype,
-   "native Match-Free None/Selective compilation; independent equation/VJP coverage is separate from stock upstream");
+  const std::string comparison_name = std::string(dtype == torch::kFloat16 ? "matchfree-nano384-fp16" : "matchfree-nano384-bf16") + (mode == rfdetr::CompilationMode::kNone ? "-eager-repeat" : "");
+  rfdetr::testsupport::OracleComparison comparison(*requested, comparison_name, dtype,
+   mode == rfdetr::CompilationMode::kNone ? "independent native Match-Free eager repetitions; compilation noise baseline" : "native Match-Free None/Selective compilation; independent equation/VJP coverage is separate from stock upstream");
   comparison.fact("representative recipe",
    {{"resolution", 384}, {"groups", config.group_detr}, {"frozen_encoder", true}, {"denoising", false}, {"semantic_draws", {9001, 9002}},
     {"objective_evidence", "existing independent Match-Free pair-objective and VJP tests; this case composes imported upstream weights with production TrainingStep/CUDA/AdamW"}});
   const auto compare_gradients = [&](const std::string& boundary) {
    const auto other = compiled.named_parameters(true);
-   for (const auto& parameter : eager.named_parameters(true)) comparison.compare(boundary + parameter.key(), other[parameter.key()].grad(), parameter.value().grad(), ComparisonPolicy::Derivative);
+   rfdetr::TensorMap actual, expected;
+   for (const auto& parameter : eager.named_parameters(true)) {
+    actual.emplace(parameter.key(), other[parameter.key()].grad());
+    expected.emplace(parameter.key(), parameter.value().grad());
+   }
+   comparison.derivatives(boundary, actual, expected);
   };
+  comparison.compare_all([&] {
   // Record and exercise the retained path before the one observed update.
   for (int replay = 0; replay < 3; ++replay) {
    comparison.fact("replay", replay);
@@ -2626,12 +2636,18 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
   eager_optimizer.optimizer.step();
   compiled_optimizer.optimizer.step();
   const auto actual = compiled.named_parameters(true);
+  comparison.fact("independent AdamW updates", "measured after independent backwards; identical-gradient optimizer correctness is checked against actual PyTorch in the stock oracle case");
+  comparison.observe_values([&] {
   for (const auto& parameter : eager.named_parameters(true)) {
    comparison.compare("updated/" + parameter.key(), actual[parameter.key()], parameter.value(), ComparisonPolicy::Value);
    comparison.compare("update/" + parameter.key(), actual[parameter.key()].detach() - compiled_before.at(parameter.key()), parameter.value().detach() - ordinary_before.at(parameter.key()),
     ComparisonPolicy::Derivative);
   }
+  });
   REQUIRE_FALSE(torch::equal(ordinary_before.at("class_embed.weight"), eager.named_parameters(true)["class_embed.weight"]));
+  });
+  }
+  }
  }
 }
 #endif

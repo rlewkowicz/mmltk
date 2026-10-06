@@ -8,7 +8,10 @@ COPY tools/rfdetr_oracle_requirements.txt /opt/rfdetr-oracle/requirements.txt
 COPY tools/generate_rfdetr_upstream_oracle.py /opt/rfdetr-oracle/producer.py
 # --no-deps is intentional: pip must never resolve a replacement Torch, CUDA,
 # torchvision or Triton. The producer audits versions and genuine import closure.
+# A private overlay leaves donor packages (including distro-owned packages)
+# intact while making the pinned validation dependencies authoritative.
+ENV PYTHONPATH=/opt/rfdetr-oracle/python
 RUN python3 /opt/rfdetr-oracle/producer.py --payload-snapshot /opt/rfdetr-oracle/payload.json \
- && python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: -r /opt/rfdetr-oracle/requirements.txt \
+ && python3 -m pip install --target /opt/rfdetr-oracle/python --no-cache-dir --no-deps --only-binary=:all: -r /opt/rfdetr-oracle/requirements.txt \
  && python3 /opt/rfdetr-oracle/producer.py --check-environment
 ENV PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1

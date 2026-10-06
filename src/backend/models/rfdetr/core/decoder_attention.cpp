@@ -1,4 +1,6 @@
 #include "detail/decoder_attention.h"
+#include "detail/linear.h"
+#include <ATen/autocast_mode.h>
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <ATen/ops/_scaled_dot_product_attention_math.h>
 #include "src/pch_std.h"
@@ -10,9 +12,16 @@ torch::Tensor model_scaled_dot_product_attention(
   // The pinned math primitive consumes additive masks (the public SDPA wrapper
   // converts its bool convention before dispatch). Select it without changing
   // the process-wide backend enablement used by concurrent training lanes.
-  auto mask = admitted_mask;
-  if (mask.defined() && mask.scalar_type() == torch::kBool) mask = torch::zeros_like(mask, query.options()).masked_fill(~mask, -std::numeric_limits<double>::infinity());
-  return std::get<0>(at::_scaled_dot_product_attention_math(query, key, value, mask.defined() ? std::optional<torch::Tensor>(mask) : std::nullopt, 0.0, false, std::nullopt, scale, false));
+  const auto device = query.device().type();
+  const bool autocast = at::autocast::is_autocast_enabled(device);
+  const auto cast = [&](const torch::Tensor& input) { return autocast ? at::autocast::cached_cast(at::autocast::get_autocast_dtype(device), input, device) : input; };
+  const auto q = cast(query), k = cast(key), v = cast(value);
+  auto mask = cast(admitted_mask);
+  // Match the public SDPA autocast boundary: cast its operands once, then keep
+  // the math primitive's FP32 intermediates outside ambient autocast.
+  c10::impl::ExcludeDispatchKeyGuard precision(at::autocast::get_autocast_dispatch_key_from_device_type(device));
+  if (mask.defined() && mask.scalar_type() == torch::kBool) mask = torch::zeros_like(mask, q.options()).masked_fill(~mask, -std::numeric_limits<double>::infinity());
+  return std::get<0>(at::_scaled_dot_product_attention_math(q, k, v, mask.defined() ? std::optional<torch::Tensor>(mask) : std::nullopt, 0.0, false, std::nullopt, scale, false));
  }
  return at::scaled_dot_product_attention(query, key, value, admitted_mask.defined() ? std::optional<torch::Tensor>(admitted_mask) : std::nullopt, 0.0, false, scale);
 }
@@ -23,8 +32,7 @@ torch::Tensor grouped_attention(
  const auto split = [&](const torch::Tensor& input) { return input.reshape({batch * groups, count / groups, heads, width / heads}).transpose(1, 2); };
  // MultiheadAttention exclusion true means forbidden; SDPA true means admitted.
  const auto admitted = excluded_keys.defined() ? (~excluded_keys).unsqueeze(1).unsqueeze(1) : torch::Tensor{};
- const auto output = model_scaled_dot_product_attention(split(query), split(key), split(value), admitted, std::nullopt, force_math);
- return output.transpose(1, 2).reshape({batch, count, width});
+ return model_scaled_dot_product_attention(split(query), split(key), split(value), admitted, std::nullopt, force_math);
 }
 }  // namespace
 torch::Tensor isolated_group_self_attention(
@@ -39,6 +47,24 @@ torch::Tensor isolated_group_self_attention(
  TORCH_CHECK(heads > 0 && width == attention->options.embed_dim() && width % heads == 0 && attention->in_proj_weight.defined() && !attention->bias_k.defined() && !attention->bias_v.defined() &&
               !attention->options.add_zero_attn() && attention->options.dropout() == 0.0,
   "decoder attention requires packed equal-width zero-dropout projections");
+ const auto project = [&](const torch::Tensor& input, int64_t part) {
+  const auto bias = attention->in_proj_bias.defined() ? attention->in_proj_bias.narrow(0, part * width, width) : torch::Tensor{};
+  return torch::linear(input, attention->in_proj_weight.narrow(0, part * width, width), bias);
+ };
+ if (!layout.has_denoising()) {
+  const auto groups = layout.ordinary.groups, queries = layout.ordinary.queries_per_group;
+  // Python batch-first MHA projects transposed [queries, groups * batch, width]
+  // operands. Preserve both its group-major ordering and strides: ATen linear
+  // chooses a different rounded bias operation for noncontiguous operands.
+  const auto sequence_first = [&](const torch::Tensor& input) {
+   return input.view({batch, groups, queries, width}).transpose(0, 1).reshape({groups * batch, queries, width}).transpose(0, 1);
+  };
+  const auto positioned = sequence_first(target + query_position);
+  const auto q = project(positioned, 0), k = project(positioned, 1), v = project(sequence_first(target), 2);
+  auto output = grouped_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), heads, 1, force_math);
+  output = detail::linear_forward(*attention->out_proj, output.permute({2, 0, 1, 3}).reshape({queries * groups * batch, width}));
+  return output.view({queries, groups, batch, width}).permute({2, 1, 0, 3}).reshape({batch, ordinary_count, width});
+ }
  auto clean_target = target;
  auto clean_position = query_position;
  torch::Tensor key_padding;
@@ -57,14 +83,10 @@ torch::Tensor isolated_group_self_attention(
  // Apply each shared projection once over all queries, as in upstream MHA.
  // Splitting projections by attention block separately rounds AMP parameter
  // gradients. Only the attention matrix needs block isolation.
- const auto project = [&](const torch::Tensor& input, int64_t part) {
-  const auto bias = attention->in_proj_bias.defined() ? attention->in_proj_bias.narrow(0, part * width, width) : torch::Tensor{};
-  return torch::linear(input, attention->in_proj_weight.narrow(0, part * width, width), bias);
- };
  const auto positioned = clean_target + clean_position;
  const auto q = project(positioned, 0), k = project(positioned, 1), v = project(clean_target, 2);
  const auto attend = [&](int64_t offset, int64_t count, int64_t groups, const torch::Tensor& padding = torch::Tensor{}) {
-  return grouped_attention(q.narrow(1, offset, count), k.narrow(1, offset, count), v.narrow(1, offset, count), heads, groups, force_math, padding);
+  return grouped_attention(q.narrow(1, offset, count), k.narrow(1, offset, count), v.narrow(1, offset, count), heads, groups, force_math, padding).transpose(1, 2).reshape({batch, count, width});
  };
  // DN-DETR Equation 7 blocks matching queries from observing DN queries and
  // blocks cross-DN-group traffic. RF-DETR deliberately makes the boundary
@@ -73,6 +95,6 @@ torch::Tensor isolated_group_self_attention(
  // those blocks without a quadratic all-query mask.
  auto output = attend(0, ordinary_count, layout.ordinary.groups);
  if (layout.has_denoising()) { output = torch::cat({output, attend(ordinary_count, layout.denoising_queries(), layout.denoising_groups, key_padding)}, 1); }
- return attention->out_proj->forward(output);
+ return detail::linear_forward(*attention->out_proj, output);
 }
 }  // namespace mmltk::backend::models::rfdetr

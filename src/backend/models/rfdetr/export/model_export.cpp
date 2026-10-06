@@ -10,6 +10,7 @@ module;
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
+#include "src/backend/models/rfdetr/core/detail/traced_graph.h"
 #define ONNX_NAMESPACE onnx_torch
 #include <cuda_runtime_api.h>
 #include <torch/csrc/jit/frontend/tracer.h>
@@ -87,7 +88,7 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
    if (has_masks && outputs.main.pred_masks) { return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks}; }
    return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes};
   }, [](const torch::autograd::Variable&) { return ""; }, false, false, &export_module);
-  export_module.type()->addMethod(compilation_unit->create_function("forward", traced.first->graph, true));
+  detail::install_recorded_forward(export_module, *compilation_unit, traced.first->graph);
   std::unordered_map<std::string, at::Tensor> lowering_initializers;
   const auto collect = [&](const std::string& name, const at::Tensor& value) { lowering_initializers.emplace(name, value); };
   for (const auto& tensor : export_module.named_parameters(true)) { collect(tensor.name, tensor.value); }

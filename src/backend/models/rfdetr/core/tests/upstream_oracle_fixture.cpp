@@ -14,6 +14,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
@@ -169,8 +170,10 @@ OracleArchive::OracleArchive(const std::filesystem::path& directory, const Oracl
   }
   tensors_.emplace(name, tensor);
  }
- for (const auto& item : dictionary)
+ for (const auto& item : dictionary) {
   if (!item.key().isString() || !expected.erase(item.key().toStringRef())) invalid("unexpected archive entry");
+  if (tensors_.contains(item.key().toStringRef())) serialized_order_.push_back(item.key().toStringRef());
+ }
  if (!expected.empty()) invalid("missing archive entries");
 }
 torch::Tensor OracleArchive::tensor(const std::string& name, const torch::Device device) const {
@@ -180,6 +183,12 @@ torch::Tensor OracleArchive::tensor(const std::string& name, const torch::Device
  return found->second.to(device);
 }
 bool OracleArchive::contains(const std::string& name) const { return tensors_.contains(name) || undefined_.contains(name); }
+std::vector<std::string> OracleArchive::ordered_defined_names(const std::string_view prefix) const {
+ std::vector<std::string> result;
+ for (const auto& name : serialized_order_)
+  if (name.starts_with(prefix)) result.push_back(name.substr(prefix.size()));
+ return result;
+}
 std::set<std::string> OracleArchive::names(const std::string_view prefix) const {
  std::set<std::string> result;
  for (const auto& [name, value] : tensors_)
@@ -205,6 +214,11 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
  if (manifest.at("policy").at("matmul_tf32").get<bool>() || manifest.at("policy").at("cudnn_tf32").get<bool>() || manifest.at("policy").at("gradient_scale") != 1 ||
      manifest.at("policy").at("accumulated_microbatches") != 1)
   invalid("incompatible controlled numerical policy");
+ const auto sdpa = manifest.at("policy").value("sdpa_backend", std::string("default"));
+ if (sdpa != "default" && sdpa != "math") invalid("unknown SDPA comparison policy");
+ if (sdpa == "math" && (manifest.at("policy").at("flash_sdp").get<bool>() || manifest.at("policy").at("memory_efficient_sdp").get<bool>() ||
+                        manifest.at("policy").at("cudnn_sdp").get<bool>() || !manifest.at("policy").at("math_sdp").get<bool>()))
+  invalid("math SDPA policy disagrees with producer backends");
  for (const auto* key : {"producer_sha256", "dependency_sha256", "payload_sha256", "fingerprint"})
   if (manifest.at(key).get<std::string>().size() != 64) invalid("missing provenance identity");
  if (manifest.at("source_hashes").empty() || manifest.at("source_hashes").size() > 5000) invalid("missing source provenance");
@@ -230,6 +244,7 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   entry.preset = item.at("preset").get<std::string>();
   entry.precision = item.at("precision").get<std::string>();
   entry.training = item.at("training").get<bool>();
+  entry.math_sdpa = sdpa == "math";
   entry.batch = item.at("batch").get<int>();
   entry.resolution = item.at("resolution").get<int>();
   entry.groups = item.at("groups").get<int>();
@@ -295,6 +310,7 @@ NativeRfDetrModel UpstreamOracle::model(const OracleCase& entry) const {
  model.to(torch::Device(torch::kCUDA));
  model.train(entry.training);
  model.set_force_pytorch_deformable_attn(false);
+ model.set_force_math_attention(entry.math_sdpa);
  std::set<std::string> trainable;
  for (const auto& value : model.named_parameters(true))
   if (value.value().requires_grad()) trainable.insert(value.key());
@@ -303,27 +319,67 @@ NativeRfDetrModel UpstreamOracle::model(const OracleCase& entry) const {
 }
 OracleArchive UpstreamOracle::archive(const OracleCase& entry, std::size_t step) const { return {directory_, entry.steps.at(step)}; }
 OracleArchive UpstreamOracle::resize_archive() const { return {directory_, resize_}; }
-OracleComparison::OracleComparison(const std::filesystem::path& root, std::string name, at::ScalarType precision, std::string objective) : precision_(precision) {
+OracleComparison::OracleComparison(const std::filesystem::path& root, std::string name, at::ScalarType precision, std::string objective)
+    : precision_(precision), run_unix_ns_(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()) {
  const auto reports = root / "comparisons";
  std::filesystem::create_directories(reports);
  report_.open(child(reports, name + ".jsonl"), std::ios::app);
  if (!report_) invalid("cannot write comparison evidence");
  static const auto executable_hash = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file("/proc/self/exe"));
  record(
-  {{"boundary", "policy"}, {"run_unix_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()}, {"precision", dtype_name(precision)},
+  {{"boundary", "policy"}, {"precision", dtype_name(precision)},
    {"matmul_tf32", at::globalContext().allowTF32CuBLAS()}, {"cudnn_tf32", at::globalContext().allowTF32CuDNN()}, {"forward_autocast", precision != torch::kFloat32},
    {"cudnn_benchmark", at::globalContext().benchmarkCuDNN()}, {"flash_sdp", at::globalContext().userEnabledFlashSDP()}, {"memory_efficient_sdp", at::globalContext().userEnabledMemEfficientSDP()},
    {"math_sdp", at::globalContext().userEnabledMathSDP()}, {"native_torch", TORCH_VERSION}, {"native_executable_sha256", executable_hash}, {"attention", "native production CUDA"},
    {"matcher", "native FP32"}, {"objective", std::move(objective)},
    {"hyperparameter_tolerance_reason", "eight float64 epsilons allow upstream decay**2 versus native repeated multiplication; zero settings and group membership remain exact"},
-   {"tolerance_reason", "FP32 operation/reduction order; AMP output rounding and CUDA atomic VJP accumulation; discrete identities and finite masks always exact"}});
+   {"tolerance_reason", "FP32 operation/reduction order; AMP rounding and CUDA atomic accumulation. Derivatives gate the complete vector at the declared norm bound; per-tensor bounds remain reported. Matched-state identities are exact; independent trajectories measure values and identities. Shape/dtype/definedness/finite values remain required."}});
 }
 void OracleComparison::record(Json value) {
+ value["run_unix_ns"] = run_unix_ns_;
  report_ << value.dump() << '\n';
  report_.flush();
  if (!report_) invalid("comparison evidence write failed");
 }
 void OracleComparison::fact(const std::string& boundary, const Json& value) { record({{"boundary", boundary}, {"observation", value}}); }
+void OracleComparison::observe_values(const std::function<void()>& comparisons) {
+ const bool previous = observing_;
+ observing_ = true;
+ try {
+  comparisons();
+ } catch (...) {
+  observing_ = previous;
+  throw;
+ }
+ observing_ = previous;
+}
+void OracleComparison::derivatives(const std::string& boundary, const TensorMap& actual, const TensorMap& expected) {
+ inventory(boundary + "inventory", keys(actual), keys(expected));
+ std::vector<torch::Tensor> a, b;
+ observe_values([&] {
+  for (const auto& [name, value] : actual) {
+   const auto& reference = expected.at(name);
+   compare(boundary + name, value, reference, OracleComparisonPolicy::Derivative);
+   if (!value.defined()) continue;
+   a.push_back(value.detach().cpu().flatten());
+   b.push_back(reference.detach().cpu().flatten());
+  }
+ });
+ if (!a.empty()) compare(boundary + "complete-vector", torch::cat(a), torch::cat(b), OracleComparisonPolicy::Derivative);
+}
+void OracleComparison::compare_all(const std::function<void()>& comparisons) {
+ if (collecting_) invalid("nested comparison collection");
+ collecting_ = true;
+ deferred_difference_.clear();
+ try {
+  comparisons();
+ } catch (...) {
+  collecting_ = false;
+  throw;
+ }
+ collecting_ = false;
+ if (!deferred_difference_.empty()) invalid("first differing tensor boundary: " + deferred_difference_);
+}
 void OracleComparison::inventory(const std::string& boundary, const std::set<std::string>& actual, const std::set<std::string>& expected) {
  const bool match = actual == expected;
  record({{"boundary", boundary}, {"actual", actual}, {"expected", expected}, {"passed", match}, {"first_difference", !match && !failed_}});
@@ -333,8 +389,19 @@ void OracleComparison::inventory(const std::string& boundary, const std::set<std
  }
 }
 void OracleComparison::compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference) {
- Json result{{"boundary", boundary}, {"policy_difference", policy_difference}, {"actual_defined", actual.defined()}, {"expected_defined", expected.defined()}};
+ compare_impl(boundary, actual, expected, policy, policy_difference, {});
+}
+void OracleComparison::parameter_update(const std::string& boundary, const torch::Tensor& actual_before, const torch::Tensor& actual_after,
+ const torch::Tensor& expected_before, const torch::Tensor& expected_after) {
+ const auto before = expected_before.detach().cpu(), after = expected_after.detach().cpu();
+ compare_impl(boundary, actual_after.detach().cpu() - actual_before.detach().cpu(), after - before, OracleComparisonPolicy::Derivative, false, torch::maximum(before.abs(), after.abs()));
+}
+void OracleComparison::compare_impl(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference,
+ const torch::Tensor& rounding_scale) {
+ Json result{{"boundary", boundary}, {"policy_difference", policy_difference}, {"measurement_only", observing_}, {"actual_defined", actual.defined()}, {"expected_defined", expected.defined()}};
  bool passed = actual.defined() == expected.defined();
+ bool structurally_valid = passed;
+ bool finite_numerical_comparison = false;
  if (actual.defined() && expected.defined()) {
   result["actual_dtype"] = dtype_name(actual.scalar_type());
   result["expected_dtype"] = dtype_name(expected.scalar_type());
@@ -354,10 +421,12 @@ void OracleComparison::compare(const std::string& boundary, const torch::Tensor&
    result["finite_equal"] = finite_equal;
    result["all_finite"] = all_finite;
    passed &= finite_equal && all_finite;
+   structurally_valid = passed;
    if (!a.is_floating_point() || policy == OracleComparisonPolicy::Exact) {
     passed &= torch::equal(a, b);
     result["discrete_equal"] = torch::equal(a, b);
    } else if (a.numel() && finite_equal) {
+    finite_numerical_comparison = passed && policy != OracleComparisonPolicy::Hyperparameter;
     const auto av = a.to(torch::kFloat64).masked_select(finite), bv = b.to(torch::kFloat64).masked_select(finite);
     if (av.numel()) {
      const auto difference = av - bv;
@@ -368,10 +437,22 @@ void OracleComparison::compare(const std::string& boundary, const torch::Tensor&
      const double relative = hyperparameter ? 8 * std::numeric_limits<double>::epsilon() : precision_ == torch::kFloat32 ? (derivative ? .002 : .0003) : precision_ == torch::kFloat16 ? .015 : .03;
      const double absolute = hyperparameter ? 0. : second_moment ? 1e-12 : derivative ? 1e-7 : precision_ == torch::kFloat32 ? 2e-5 : 2e-3;
      const double maximum = difference.abs().max().item<double>(), norm = difference.norm().item<double>();
-     const double normalized = derivative ? std::max(maximum / (absolute + relative * bv.abs().max().item<double>()), norm / (absolute + relative * bv.norm().item<double>()))
+     auto bounded_error = difference.abs();
+     if (rounding_scale.defined()) {
+      const auto quantum = torch::nextafter(rounding_scale, torch::full_like(rounding_scale, std::numeric_limits<double>::infinity())) - rounding_scale;
+      result["parameter_quantization_allowance"] = "one representable interval at max(abs(before),abs(after)); raw errors are unchanged";
+      result["parameter_quantization_max"] = quantum.max().item<double>();
+      result["unadjusted_normalized_error"] = std::max(maximum / (absolute + relative * bv.abs().max().item<double>()), norm / (absolute + relative * bv.norm().item<double>()));
+      bounded_error = (bounded_error - quantum.to(torch::kFloat64).masked_select(finite)).clamp_min(0);
+     }
+     const double normalized = derivative ? std::max(bounded_error.max().item<double>() / (absolute + relative * bv.abs().max().item<double>()), bounded_error.norm().item<double>() / (absolute + relative * bv.norm().item<double>()))
                                           : (difference.abs() / (absolute + relative * bv.abs()).clamp_min(std::numeric_limits<double>::min())).max().item<double>();
      result["max_absolute"] = maximum;
      result["l2_error"] = norm;
+     result["actual_l2"] = av.norm().item<double>();
+     result["expected_l2"] = bv.norm().item<double>();
+     result["actual_max_absolute"] = av.abs().max().item<double>();
+     result["expected_max_absolute"] = bv.abs().max().item<double>();
      result["normalized_error"] = normalized;
      result["absolute_tolerance"] = absolute;
      result["relative_tolerance"] = relative;
@@ -381,11 +462,17 @@ void OracleComparison::compare(const std::string& boundary, const torch::Tensor&
    }
   }
  }
+ if (actual.defined() && expected.defined() && (actual.sizes() != expected.sizes() || actual.scalar_type() != expected.scalar_type())) structurally_valid = false;
  result["passed"] = passed;
- result["first_difference"] = !passed && !failed_ && !policy_difference;
+ result["first_difference"] = !passed && !failed_ && !policy_difference && (!observing_ || !structurally_valid);
  record(std::move(result));
+ if (observing_ && structurally_valid && policy != OracleComparisonPolicy::Hyperparameter) return;
  if (!passed && !policy_difference) {
   failed_ = true;
+  if (collecting_ && finite_numerical_comparison) {
+   if (deferred_difference_.empty()) deferred_difference_ = boundary;
+   return;
+  }
   invalid("first differing tensor boundary: " + boundary);
  }
 }
@@ -471,13 +558,26 @@ void compare_oracle_outputs(OracleComparison& comparison, const OracleArchive& a
   const auto name = prefix + "encoder/" + std::to_string(group);
   comparison.compare(name, encoder_indices[group], archive.tensor(name), OracleComparisonPolicy::Exact);
  }
- for (const auto& [name, value] : tensors) comparison.compare(prefix + "output/" + name, value, archive.tensor(prefix + "output/" + name), OracleComparisonPolicy::Value);
+ std::exception_ptr first_difference;
+ for (const auto& [name, value] : tensors) {
+  try {
+   comparison.compare(prefix + "output/" + name, value, archive.tensor(prefix + "output/" + name), OracleComparisonPolicy::Value);
+  } catch (const std::runtime_error&) {
+   if (!first_difference) first_difference = std::current_exception();
+  }
+ }
+ if (first_difference) std::rethrow_exception(first_difference);
 }
 void compare_oracle_vjp(OracleComparison& comparison, const OracleArchive& archive, NativeRfDetrModel& model, const ModelOutputs& outputs, const torch::Tensor& input, bool retain_graph) {
  const auto tensors = oracle_output_tensors(outputs);
  comparison.inventory("cotangent inventory", keys(tensors), archive.names("cotangent/"));
  torch::Tensor scalar;
- for (const auto& [name, value] : tensors) {
+ // Retain the producer's scalar reduction order from its hash-admitted tensor
+ // dictionary. Lexical map order changes low-precision backward accumulation.
+ const auto cotangents = archive.ordered_defined_names("cotangent/");
+ comparison.inventory("defined cotangent inventory", {cotangents.begin(), cotangents.end()}, keys(tensors));
+ for (const auto& name : cotangents) {
+  const auto& value = tensors.at(name);
   auto term = (value * archive.tensor("cotangent/" + name, value.device())).sum();
   scalar = scalar.defined() ? scalar + term : term;
  }
@@ -490,6 +590,11 @@ void compare_oracle_vjp(OracleComparison& comparison, const OracleArchive& archi
   }
  comparison.inventory("VJP inventory", {names.begin(), names.end()}, archive.names("vjp/"));
  const auto gradients = torch::autograd::grad({scalar}, operands, {}, retain_graph, false, true);
- for (std::size_t i = 0; i < names.size(); ++i) comparison.compare("vjp/" + names[i], gradients[i], archive.tensor("vjp/" + names[i]), OracleComparisonPolicy::Derivative);
+ TensorMap actual, expected;
+ for (std::size_t i = 0; i < names.size(); ++i) {
+  actual.emplace(names[i], gradients[i]);
+  expected.emplace(names[i], archive.tensor("vjp/" + names[i]));
+ }
+ comparison.derivatives("vjp/", actual, expected);
 }
 }  // namespace mmltk::backend::models::rfdetr::testsupport

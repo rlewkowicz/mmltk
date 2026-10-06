@@ -22,6 +22,14 @@ namespace mmltk::backend::ml::layers {
 inline constexpr int kMsDeformAttnCudaThreads = 1024;
 inline int ms_deform_attn_cuda_blocks(const int N, const int num_threads) { return N / num_threads + static_cast<int>(N % num_threads != 0); }
 template <typename scalar_t>
+__device__ scalar_t normalized_grid_pixel_coordinate(const scalar_t location, const int extent) {
+ // Retain grid_sample's normalized-grid rounding before unnormalizing. Direct
+ // location * extent - .5 skips cancellation at small coordinates and shifts
+ // the sampled value (and sometimes the selected piecewise derivative).
+ const scalar_t grid = location * 2 - 1;
+ return ((grid + 1) * extent - 1) / 2;
+}
+template <typename scalar_t>
 struct BilinearSampleGeometry {
  int height = 0;
  int width = 0;
@@ -301,8 +309,8 @@ struct MsDeformableCol2ImPointArgs {
 template <typename scalar_t, typename AccumulationPolicy>
 __device__ inline void ms_deformable_col2im_apply_point(
  const MsDeformableCol2ImPointArgs<scalar_t>& point, scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight, const AccumulationPolicy& accumulation_policy) {
- const scalar_t h_im = point.loc_h * point.spatial_h - 0.5;
- const scalar_t w_im = point.loc_w * point.spatial_w - 0.5;
+ const scalar_t h_im = normalized_grid_pixel_coordinate(point.loc_h, point.spatial_h);
+ const scalar_t w_im = normalized_grid_pixel_coordinate(point.loc_w, point.spatial_w);
  // At -1 the selected bilinear branch has an in-bounds, zero-weight
  // neighbor. Its coordinate derivative and exceptional values still matter.
  if (h_im >= -1 && w_im >= -1 && h_im < point.spatial_h && w_im < point.spatial_w) {
@@ -407,6 +415,8 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n, MMLTK_ML_LAYERS_DEF
   const int qid_stride = num_heads * channels;
   const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
   scalar_t col = 0;
+  scalar_t weighted_samples[4]{};
+  const bool short_reduction = num_levels * num_point <= 4;
   for (int l_col = 0; l_col < num_levels; ++l_col) {
    const int level_start_id = static_cast<int>(data_layout.level_start_index[l_col]);
    const int spatial_h = data_layout.spatial_shapes[l_col][0];
@@ -416,18 +426,25 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n, MMLTK_ML_LAYERS_DEF
     const scalar_t loc_w = data_sampling_loc[data_loc_w_ptr];
     const scalar_t loc_h = data_sampling_loc[data_loc_w_ptr + 1];
     const scalar_t weight = data_attn_weight[data_weight_ptr];
-    const scalar_t h_im = loc_h * spatial_h - 0.5;
-    const scalar_t w_im = loc_w * spatial_w - 0.5;
+    const scalar_t h_im = normalized_grid_pixel_coordinate(loc_h, spatial_h);
+    const scalar_t w_im = normalized_grid_pixel_coordinate(loc_w, spatial_w);
     scalar_t sampled = 0;
     if (h_im >= -1 && w_im >= -1 && h_im < spatial_h && w_im < spatial_w) {
      sampled = ms_deform_attn_im2col_bilinear(data_value_ptr, spatial_h, spatial_w, num_heads, channels, h_im, w_im, m_col, c_col);
     }
-    col += sampled * weight;
+    if (short_reduction) {
+     // The RF-DETR presets reduce two or four separately rounded FP32
+     // products. Match ATen's descending-lane sum, including a three-point
+     // tail, while retaining the general fused reduction for larger layouts.
+     weighted_samples[l_col * num_point + p_col] = __fmul_rn(sampled, weight);
+    } else {
+     col += sampled * weight;
+    }
     data_weight_ptr += 1;
     data_loc_w_ptr += 2;
    }
   }
-  *data_col_ptr = col;
+  *data_col_ptr = short_reduction ? (weighted_samples[0] + weighted_samples[2]) + (weighted_samples[1] + weighted_samples[3]) : col;
  }
 }
 #define MMLTK_ML_LAYERS_SHARED_COL2IM_KERNEL_BODY(cache_grad_sampling_loc_expr, cache_grad_attn_weight_expr, reduction_count_expr, reduction_type_expr, store_type_expr)                          \

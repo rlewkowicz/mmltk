@@ -6,20 +6,74 @@
 #include "src/test_support/cuda_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/record_function.h>
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 namespace rf = mmltk::backend::models::rfdetr;
 namespace {
 using ComparisonPolicy = rf::testsupport::OracleComparisonPolicy;
 using Json = nlohmann::json;
+class ForwardOperatorObservation final {
+ struct Event final : at::ObserverContext {
+  std::string name;
+  explicit Event(std::string value) : name(std::move(value)) {}
+ };
+ inline static thread_local ForwardOperatorObservation* active_ = nullptr;
+ at::CallbackHandle callback_ = 0;
+ std::map<std::string, std::size_t> counts_;
+ rf::TensorMap outputs_;
+ std::size_t depth_ = 0;
+ bool finished_ = false;
+
+public:
+ explicit ForwardOperatorObservation(bool enabled) {
+  if (!enabled) return;
+  TORCH_CHECK(!active_, "forward operator observation is already active");
+  callback_ = at::addThreadLocalCallback(at::RecordFunctionCallback(
+   [](const at::RecordFunction& event) -> std::unique_ptr<at::ObserverContext> {
+    const std::string_view name(event.name());
+    if (name == "aten::topk") active_->finished_ = true;
+    if (active_->finished_) return {};
+    if (name != "aten::conv2d" && name != "aten::layer_norm" && name != "aten::linear" && name != "aten::gelu" && name != "aten::scaled_dot_product_attention") return {};
+    ++active_->depth_;
+    return std::make_unique<Event>(std::string(name.substr(6)));
+   }, [](const at::RecordFunction& event, at::ObserverContext* context) {
+    if (!context) return;
+    if (--active_->depth_) return;
+    const auto& name = static_cast<Event*>(context)->name;
+    if (active_->outputs_.size() >= 256 || event.outputs().size() != 1 || !event.outputs().front().isTensor()) {
+     active_->finished_ = true;
+     return;
+    }
+    const auto index = active_->counts_[name]++;
+    active_->outputs_.emplace("forward-operator/" + name + "/" + std::to_string(index), event.outputs().front().toTensor().detach().clone());
+   }).needsOutputs(true).scopes({at::RecordScope::FUNCTION}));
+  active_ = this;
+ }
+ ~ForwardOperatorObservation() {
+  if (!callback_) return;
+  at::removeCallback(callback_);
+  active_ = nullptr;
+ }
+ void report(rf::testsupport::OracleComparison& comparison, const rf::testsupport::OracleArchive& archive) const {
+  for (const auto& [name, value] : outputs_)
+   if (archive.contains(name)) comparison.compare(name, value, archive.tensor(name), ComparisonPolicy::Value, true);
+ }
+};
 std::vector<Json> oracle_comparison_records(const std::filesystem::path& root, const std::string& name) {
  std::ifstream stream(root / "comparisons" / (name + ".jsonl"));
  REQUIRE(stream.is_open());
@@ -171,6 +225,50 @@ TEST_CASE("Oracle stock differences retain required failure and inventory report
   CHECK(inventories[index].at("first_difference") == (index == 2));
  }
 }
+TEST_CASE("Oracle comparison collection retains numerical failures and immediate structural gates", "[rfdetr][parity][oracle_policy]") {
+ const mmltk::testsupport::ScopedTempDir root("rfdetr-oracle-collection");
+ const auto zero = torch::zeros({1}, torch::kFloat32), one = torch::ones_like(zero);
+ rf::testsupport::OracleComparison comparison(root.path(), "collection", torch::kFloat32);
+ int observed = 0;
+ REQUIRE_THROWS_AS(comparison.compare_all([&] {
+  comparison.compare("first", one, zero, ComparisonPolicy::Value);
+  ++observed;
+  comparison.compare("second", one, zero, ComparisonPolicy::Derivative);
+  ++observed;
+ }), std::runtime_error);
+ CHECK(observed == 2);
+ const auto records = oracle_comparison_records(root.path(), "collection");
+ REQUIRE(records.size() == 3);
+ CHECK(records[1].at("passed") == false);
+ CHECK(records[2].at("passed") == false);
+ CHECK(records[1].at("first_difference") == true);
+ CHECK(records[2].at("first_difference") == false);
+ for (const auto& invalid : {one.reshape({1, 1}), one.to(torch::kFloat64), one * std::numeric_limits<float>::infinity()}) {
+  REQUIRE_THROWS_AS(comparison.compare_all([&] {
+   comparison.compare("structural", invalid, zero, ComparisonPolicy::Value);
+   ++observed;
+  }), std::runtime_error);
+ }
+ REQUIRE_THROWS_AS(comparison.compare_all([&] {
+  comparison.compare("discrete", one, zero, ComparisonPolicy::Exact);
+  ++observed;
+ }), std::runtime_error);
+ CHECK(observed == 2);
+ REQUIRE_NOTHROW(comparison.compare_all([&] { comparison.compare("equal", zero, zero, ComparisonPolicy::Value); }));
+ REQUIRE_NOTHROW(comparison.observe_values([&] {
+  comparison.compare("trajectory-selection", one, zero, ComparisonPolicy::Exact);
+  comparison.compare("trajectory-value", one, zero, ComparisonPolicy::Value);
+ }));
+ for (const auto& invalid : {one.reshape({1, 1}), one.to(torch::kFloat64), one * std::numeric_limits<float>::infinity(), torch::Tensor{}}) {
+  REQUIRE_THROWS_AS(comparison.observe_values([&] { comparison.compare("invalid-observation", invalid, zero, ComparisonPolicy::Value); }), std::runtime_error);
+ }
+ REQUIRE_NOTHROW(comparison.derivatives("complete-gradient/", {{"large", one}, {"near-null", one * 1e-6}}, {{"large", one}, {"near-null", zero}}));
+ REQUIRE_THROWS_AS(comparison.derivatives("incorrect-gradient/", {{"large", one * 1.1}}, {{"large", one}}), std::runtime_error);
+ REQUIRE_THROWS_AS(comparison.derivatives("missing-gradient/", {{"large", {}}}, {{"large", one}}), std::runtime_error);
+ const auto next = torch::nextafter(one, one * 2);
+ REQUIRE_NOTHROW(comparison.parameter_update("rounded-update", one, next, one, one));
+ REQUIRE_THROWS_AS(comparison.parameter_update("incorrect-update", one, one + 1e-4, one, one), std::runtime_error);
+}
 TEST_CASE("Actual pinned upstream Nano and SegNano forward and fixed cotangent VJPs", "[rfdetr][parity][upstream_oracle][cuda]") {
  const auto requested = rf::testsupport::UpstreamOracle::requested();
  if (!requested) SKIP("optional upstream evidence not requested; generate with --diagnose-rfdetr-upstream for independent acceptance");
@@ -185,18 +283,55 @@ TEST_CASE("Actual pinned upstream Nano and SegNano forward and fixed cotangent V
    auto model = oracle.model(entry);
    const auto archive = oracle.archive(entry, 0);
    rf::testsupport::OracleComparison comparison(*requested, "core-" + entry.id, entry.dtype(), "actual upstream forward and fixed cotangent VJP; eager native production CUDA");
+   comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
    auto input = archive.tensor("input", torch::kCUDA).clone().set_requires_grad(true);
    const auto mask = archive.tensor("input_mask", torch::kCUDA);
    std::vector<torch::Tensor> indices;
    rf::ModelOutputs outputs;
    {
+    ForwardOperatorObservation operators(archive.contains("forward-operator/linear/0"));
     mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
     comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
     outputs = model.forward_observed({input, mask}, model.config().segmentation, indices);
+    operators.report(comparison, archive);
    }
    comparison.fact("execution", {{"mode", "eager"}, {"input", "identical admitted normalized tensor"}, {"training", entry.training}});
-   rf::testsupport::compare_oracle_outputs(comparison, archive, outputs, indices);
-   rf::testsupport::compare_oracle_vjp(comparison, archive, model, outputs, input, false);
+   comparison.compare_all([&] {
+    rf::testsupport::compare_oracle_outputs(comparison, archive, outputs, indices);
+    rf::testsupport::compare_oracle_vjp(comparison, archive, model, outputs, input, false);
+   });
+  }
+ }
+}
+TEST_CASE("Independent upstream repetitions measure the numerical noise floor", "[rfdetr][parity][upstream_repeat]") {
+ const auto requested = rf::testsupport::UpstreamOracle::requested();
+ const auto* repeated = std::getenv("MMLTK_RFDETR_UPSTREAM_REPEAT_DIR");
+ if (!requested || !repeated) SKIP("two independent upstream artifact generations were not requested");
+ const rf::testsupport::UpstreamOracle oracle(*requested), repeat(repeated);
+ for (const auto& entry : oracle.cases()) {
+  DYNAMIC_SECTION(entry.id) {
+   const auto found = std::ranges::find_if(repeat.cases(), [&](const auto& value) { return value.id == entry.id; });
+   REQUIRE(found != repeat.cases().end());
+   rf::testsupport::OracleComparison comparison(*requested, "repeat-" + entry.id, entry.dtype(), "two independent actual upstream executions; no native model execution");
+   REQUIRE(found->steps.size() == entry.steps.size());
+   comparison.observe_values([&] {
+   for (std::size_t step = 0; step < entry.steps.size(); ++step) {
+    comparison.fact("step", step);
+    const auto actual = repeat.archive(*found, step), expected = oracle.archive(entry, step);
+    for (const auto& [prefix, policy] : std::array{
+     std::pair{"output/", ComparisonPolicy::Value}, std::pair{"vjp/", ComparisonPolicy::Derivative}, std::pair{"gradient/", ComparisonPolicy::Derivative},
+     std::pair{"clipped/", ComparisonPolicy::Derivative}, std::pair{"updated/", ComparisonPolicy::Value}, std::pair{"encoder/", ComparisonPolicy::Exact},
+     std::pair{"assignment/", ComparisonPolicy::Exact}, std::pair{"loss/", ComparisonPolicy::Value}, std::pair{"held/encoder/", ComparisonPolicy::Exact},
+     std::pair{"held/assignment/", ComparisonPolicy::Exact}, std::pair{"held/output/", ComparisonPolicy::Value}, std::pair{"held/loss/", ComparisonPolicy::Value}
+    }) {
+     comparison.inventory(std::string(prefix) + "inventory", actual.names(prefix), expected.names(prefix));
+     for (const auto& name : expected.names(prefix)) {
+      const auto key = std::string(prefix) + name;
+      comparison.compare(key, actual.tensor(key), expected.tensor(key), policy);
+     }
+    }
+   }
+   });
   }
  }
 }

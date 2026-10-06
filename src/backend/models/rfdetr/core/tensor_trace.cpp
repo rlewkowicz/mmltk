@@ -1,4 +1,5 @@
 #include "detail/tensor_trace.h"
+#include "detail/traced_graph.h"
 #include <ATen/Context.h>
 #include <ATen/autocast_mode.h>
 #include <torch/script.h>
@@ -73,7 +74,41 @@ TensorSignature state_signature(const torch::Tensor& tensor) {
  std::copy(tensor.sizes().begin(), tensor.sizes().end(), result.sizes.begin());
  return result;
 }
+bool has_low_precision_values(const torch::jit::Block& block) {
+ const auto low_precision = [](const torch::jit::Value* value) {
+  const auto type = value->type()->cast<torch::jit::TensorType>();
+  return type && (type->scalarType() == torch::kFloat16 || type->scalarType() == torch::kBFloat16);
+ };
+ if (std::ranges::any_of(block.inputs(), low_precision)) return true;
+ for (const auto* node : block.nodes()) {
+  if (std::ranges::any_of(node->outputs(), low_precision)) return true;
+  for (const auto* nested : node->blocks())
+   if (has_low_precision_values(*nested)) return true;
+ }
+ return false;
+}
 }  // namespace
+void install_recorded_forward(torch::jit::Module& module, torch::jit::CompilationUnit& compilation_unit, const std::shared_ptr<torch::jit::Graph>& graph) {
+ auto* function = compilation_unit.create_function("forward", graph, true);
+ // Eager dispatch already recorded the selected autocast conversions. A second
+ // JIT autocast pass changes that arithmetic (including CUDA GELU's dtype).
+ // Keep this function-local; runtime traces admit the recorded AMP signature.
+ auto& recorded = torch::jit::toGraphFunction(*function);
+ recorded._set_ignore_amp(true);
+ // The pinned profiling path changes low-precision rounding boundaries and
+ // its symbolic Linear backward can mix FP32 cotangents with FP16 weights.
+ // The simple executor preserves recorded ATen operations and their native
+ // autograd kernels. FP32 graphs retain the ordinary profiling executor.
+ if (has_low_precision_values(*graph->block())) recorded._set_initial_executor_execution_mode(torch::jit::SIMPLE);
+ module.type()->addMethod(function);
+}
+c10::IValue run_recorded_forward(torch::jit::Module& module, std::vector<c10::IValue> inputs, c10::DeviceType device) {
+ // Recorded conversions already encode both AMP and protected FP32 regions.
+ // Ambient dispatcher autocast would cast their FP32 intermediates again,
+ // even with the graph's separate JIT autocast rewrite disabled.
+ c10::impl::ExcludeDispatchKeyGuard precision(at::autocast::get_autocast_dispatch_key_from_device_type(device));
+ return module.forward(std::move(inputs));
+}
 struct TensorTrace::State {
  torch::jit::Module module;
  Signature signature;
@@ -173,7 +208,7 @@ TensorTrace::Result TensorTrace::invoke(bool training, std::span<const torch::Te
   }
   torch::jit::Stack arguments;
   for (const auto& input : inputs) arguments.emplace_back(input);
-  auto output = slot.state->module.forward(std::move(arguments));
+  auto output = run_recorded_forward(slot.state->module, std::move(arguments), inputs.front().device().type());
   diagnostic("reuse; optimized graph when available", {}, true);
   return {std::move(output), false};
  }
@@ -206,7 +241,7 @@ TensorTrace::Result TensorTrace::invoke(bool training, std::span<const torch::Te
     return values;
    }, [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
   }();
-  candidate->module.type()->addMethod(cu->create_function("forward", recording.first->graph, true));
+  install_recorded_forward(candidate->module, *cu, recording.first->graph);
   auto output = recording.second.front();
   diagnostic("prepared; recorded graph", recording.first->graph);
   candidate->preparation_batch = slot.batch_size;

@@ -170,9 +170,53 @@ def output_tensors(outputs):
                 yield f"{label}/{key}", layer[key]
 
 
+class ForwardOperators:
+    """Observe actual functional outputs through the first encoder selection."""
+    names = ("conv2d", "layer_norm", "linear", "gelu", "scaled_dot_product_attention")
+
+    def __init__(self):
+        self.outputs = {}
+        self.counts = {}
+        self.active = True
+        self.originals = []
+
+    def __enter__(self):
+        import torch.nn.functional as functional
+        def observe(name, original):
+            def invoke(*args, **kwargs):
+                output = original(*args, **kwargs)
+                if self.active:
+                    if len(self.outputs) >= 256:
+                        raise RuntimeError("forward operator observation exceeds its bound")
+                    index = self.counts.get(name, 0)
+                    self.counts[name] = index + 1
+                    self.outputs[f"forward-operator/{name}/{index}"] = output.detach().clone()
+                return output
+            return invoke
+        try:
+            for name in self.names:
+                original = getattr(functional, name)
+                self.originals.append((name, original))
+                setattr(functional, name, observe(name, original))
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def __exit__(self, *args):
+        import torch.nn.functional as functional
+        for name, original in reversed(self.originals):
+            setattr(functional, name, original)
+
+    def save(self, archive):
+        for name, value in self.outputs.items():
+            archive.add(name, value)
+
+
 class Observe:
     """Observe results without modifying equations, draws, or batching eligibility."""
-    def __init__(self):
+    def __init__(self, operators=None):
+        self.operators = operators
         self.indices = []
         self.encoder = []
         self.matcher = []
@@ -197,6 +241,8 @@ class Observe:
         def topk(*args, **kwargs):
             result = self.topk(*args, **kwargs)
             if sys._getframe(1).f_code.co_filename.endswith("/rfdetr/models/transformer.py"):
+                if self.operators is not None:
+                    self.operators.active = False
                 self.encoder.append(result.indices.detach().clone())
             return result
         def profile(frame, event, result):
@@ -373,10 +419,12 @@ def run_case(directory, model, initial, mc, tc, defaults, preset, dtype_name, ba
         archive.add("input", images)
         archive.add("input_mask", mask)
         optimizer.zero_grad(set_to_none=True)
-        with Observe() as forward_observation, torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
+        with (ForwardOperators() if step == 0 else nullcontext(None)) as operators, Observe(operators) as forward_observation, torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
             execution_policy = {"autocast_enabled": torch.is_autocast_enabled("cuda"), "autocast_dtype": str(torch.get_autocast_dtype("cuda"))}
             outputs = model(NestedTensor(images, mask))
         forward_observation.save(archive)
+        if operators is not None:
+            operators.save(archive)
         raw_outputs = dict(output_tensors(outputs))
         for key, value in raw_outputs.items():
             archive.add("output/" + key, value)
@@ -529,6 +577,11 @@ def generate(args):
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.benchmark = False
+    if args.sdpa == "math":
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     if (output / "manifest.json").exists():
@@ -540,10 +593,12 @@ def generate(args):
                 "payload_sha256": digest(ROOT / "nvidia-payload.json"), "environment": environment,
                 "fingerprint": args.fingerprint, "cuda_device": torch.cuda.get_device_name(),
                 "torch_build_config": build_config[:65536], "torch_build_config_truncated": len(build_config) > 65536,
-                "policy": {"matmul_tf32": torch.backends.cuda.matmul.allow_tf32, "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+                "policy": {"sdpa_backend": args.sdpa,
+                           "matmul_tf32": torch.backends.cuda.matmul.allow_tf32, "cudnn_tf32": torch.backends.cudnn.allow_tf32,
                            "matmul_precision": torch.get_float32_matmul_precision(), "cudnn_benchmark": torch.backends.cudnn.benchmark,
                            "flash_sdp": torch.backends.cuda.flash_sdp_enabled(), "math_sdp": torch.backends.cuda.math_sdp_enabled(),
                            "memory_efficient_sdp": torch.backends.cuda.mem_efficient_sdp_enabled(),
+                           "cudnn_sdp": torch.backends.cuda.cudnn_sdp_enabled(),
                            "attention": "upstream grid_sample deformable attention; native production CUDA",
                            "matcher": "FP32 cases use untouched stock; AMP main uses fp32_matcher_costs: original HungarianMatcher._focal_classification_cost, matcher.box_cxcywh_to_xyxy, matcher.batch_sigmoid_ce_loss, matcher.batch_dice_loss and matcher-origin torch.cdist receive FP32 operands with autocast disabled; original mask point_sample/einsum and matcher forward/class/batched eligibility are unchanged; stock prefix is untouched AMP",
                            "gradient_scale": 1, "accumulated_microbatches": 1},
@@ -573,6 +628,7 @@ def generate(args):
                             grad_accum_steps=1, clip_max_norm=.1, weight_decay=1e-4)
             torch.manual_seed(731)
             model = build_model_from_config(mc, tc, defaults)
+            print(f"upstream backbone attention={model.backbone[0].encoder.encoder.config._attn_implementation}", flush=True)
             invariants = constructor_evidence(model)
             load_pretrain_weights(model, mc)
             initial = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
@@ -622,6 +678,7 @@ def main():
     parser.add_argument("--output")
     parser.add_argument("--weights")
     parser.add_argument("--fingerprint")
+    parser.add_argument("--sdpa", choices=("default", "math"), default="default")
     args = parser.parse_args()
     if args.payload_snapshot:
         json_write(Path(args.payload_snapshot), payload())

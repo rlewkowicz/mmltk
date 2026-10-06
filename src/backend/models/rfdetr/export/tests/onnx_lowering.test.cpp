@@ -309,6 +309,11 @@ TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfd
   }
  }
 }
+TEST_CASE("SiLU ONNX lowering preserves activation values", "[model][rfdetr][onnx_lowering]") {
+ const auto input = torch::tensor({-80.0f, -20.0f, -5.0f, -1.0f, 0.0f, 1.0f, 5.0f, 20.0f, 80.0f});
+ const auto graph = lower_unary_graph_and_check(input, [](const torch::Tensor& value) { return at::silu(value); }, {c10::Symbol::fromQualString("aten::silu")});
+ CHECK(torch::allclose(execute_unary_onnx(graph, input), at::silu(input), 1e-5, 1e-6));
+}
 TEST_CASE("test_lower_inference_dropout_removes_dropout_node", "[model][rfdetr][onnx_lowering]") {
  lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return torch::dropout(input, 0.1, false); }, {kAtenDropout});
 }

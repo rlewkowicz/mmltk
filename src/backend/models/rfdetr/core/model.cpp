@@ -29,6 +29,7 @@
 #include "detail/selective_compilation.h"
 #include "detail/tensor_trace.h"
 #include "detail/modules_technical.h"
+#include "detail/linear.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include "detail/training_supervision.h"
@@ -117,10 +118,11 @@ torch::Tensor resize_mask_to_feature(const torch::Tensor& mask, const torch::Ten
   .to(torch::kBool);
 }
 // Reparameterized box refinement: scales the delta's center offset by the base extent and applies the delta's
-// log-space width/height factor to the base extent. Inputs are [batch, queries, 4] cxcywh tensors.
+// log-space width/height factor to the base extent. The last dimension is cxcywh;
+// leading decoder, batch and query dimensions broadcast normally.
 torch::Tensor reparam_box_refine(const torch::Tensor& base, const torch::Tensor& delta) {
- auto cxcy = delta.index({Slice(), Slice(), Slice(None, 2)}) * base.index({Slice(), Slice(), Slice(2, None)}) + base.index({Slice(), Slice(), Slice(None, 2)});
- auto wh = delta.index({Slice(), Slice(), Slice(2, None)}).exp() * base.index({Slice(), Slice(), Slice(2, None)});
+ auto cxcy = delta.index({Ellipsis, Slice(None, 2)}) * base.index({Ellipsis, Slice(2, None)}) + base.index({Ellipsis, Slice(None, 2)});
+ auto wh = delta.index({Ellipsis, Slice(2, None)}).exp() * base.index({Ellipsis, Slice(2, None)});
  return torch::cat({cxcy, wh}, -1);
 }
 // Copies source into destination when the optional metadata field carries a value.
@@ -332,9 +334,9 @@ public:
   const int64_t seq_len = hidden_states.size(1);
   const int64_t head_dim = kDinoHiddenSize / kDinoNumHeads;
   auto reshape = [&](const torch::Tensor& tensor) { return tensor.view({batch, seq_len, kDinoNumHeads, head_dim}).permute({0, 2, 1, 3}); };
-  auto query_layer = reshape(query->forward(hidden_states));
-  auto key_layer = reshape(key->forward(hidden_states));
-  auto value_layer = reshape(value->forward(hidden_states));
+  auto query_layer = reshape(detail::linear_forward(*query, hidden_states));
+  auto key_layer = reshape(detail::linear_forward(*key, hidden_states));
+  auto value_layer = reshape(detail::linear_forward(*value, hidden_states));
   const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
   auto context = model_scaled_dot_product_attention(query_layer, key_layer, value_layer, {}, scale, force_math_attention_);
   return context.permute({0, 2, 1, 3}).contiguous().view({batch, seq_len, kDinoHiddenSize});
@@ -349,7 +351,7 @@ TORCH_MODULE(Dinov2SelfAttention);
 class Dinov2SelfOutputImpl : public torch::nn::Module {
 public:
  Dinov2SelfOutputImpl() : dense(register_module("dense", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))) {}
- torch::Tensor forward(const torch::Tensor& hidden_states) { return dense->forward(hidden_states); }
+ torch::Tensor forward(const torch::Tensor& hidden_states) { return detail::linear_forward(*dense, hidden_states); }
  torch::nn::Linear dense{nullptr};
 };
 TORCH_MODULE(Dinov2SelfOutput);
@@ -373,7 +375,7 @@ TORCH_MODULE(Dinov2LayerScale);
 class Dinov2MlpImpl : public torch::nn::Module {
 public:
  Dinov2MlpImpl() : fc1(register_module("fc1", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize * 4))), fc2(register_module("fc2", torch::nn::Linear(kDinoHiddenSize * 4, kDinoHiddenSize))) {}
- torch::Tensor forward(const torch::Tensor& hidden_state) { return fc2->forward(torch::gelu(fc1->forward(hidden_state))); }
+ torch::Tensor forward(const torch::Tensor& hidden_state) { return detail::linear_forward(*fc2, torch::gelu(detail::linear_forward(*fc1, hidden_state))); }
 
 private:
  torch::nn::Linear fc1{nullptr};
@@ -585,10 +587,10 @@ public:
   const int64_t batch = query.size(0);
   const int64_t len_q = query.size(1);
   const int64_t len_in = input_flatten.size(1);
-  auto value = value_proj->forward(input_flatten);
+  auto value = detail::linear_forward(*value_proj, input_flatten);
   if (input_padding_mask.defined()) { value = value.masked_fill(input_padding_mask.unsqueeze(-1), 0.0); }
-  auto offsets = sampling_offsets->forward(query).view({batch, len_q, n_heads_, n_levels_, n_points_, 2});
-  auto attention = torch::softmax(attention_weights->forward(query).view({batch, len_q, n_heads_, n_levels_ * n_points_}), -1).view({batch, len_q, n_heads_, n_levels_, n_points_});
+  auto offsets = detail::linear_forward(*sampling_offsets, query).view({batch, len_q, n_heads_, n_levels_, n_points_, 2});
+  auto attention = torch::softmax(detail::linear_forward(*attention_weights, query).view({batch, len_q, n_heads_, n_levels_ * n_points_}), -1).view({batch, len_q, n_heads_, n_levels_, n_points_});
   torch::Tensor sampling_locations;
   if (reference_points.size(-1) == 2) {
    sampling_locations = reference_points.unsqueeze(2).unsqueeze(4) + offsets / feature_layout.offset_normalizer().view({1, 1, 1, n_levels_, 1, 2});
@@ -605,7 +607,7 @@ public:
   } else {
    attended = ms_deform_attn_reference(value, feature_layout.spatial_shapes(), sampling_locations, attention);
   }
-  return output_proj->forward(attended);
+  return detail::linear_forward(*output_proj, attended);
  }
  void reset_parameters() {
   torch::NoGradGuard no_grad;
@@ -671,7 +673,7 @@ private:
   // These RF-DETR dropout probabilities are permanently zero. Calling dropout
   // still records it, and JIT autodiff's native_dropout consumes CUDA RNG at p=0.
   auto output = norm2->forward(residual + cross);
-  auto feed_forward = linear2->forward(torch::relu(linear1->forward(output)));
+  auto feed_forward = detail::linear_forward(*linear2, torch::relu(detail::linear_forward(*linear1, output)));
   return norm3->forward(output + feed_forward);
  }
  detail::SelectiveTensorRegion tail_region_{"decoder_tail", true};
@@ -847,7 +849,7 @@ public:
   auto hs_chunks = hs_enc.chunk(groups, 1);
   std::vector<torch::Tensor> logits;
   logits.reserve(static_cast<size_t>(groups));
-  for (int64_t index = 0; index < groups; ++index) { logits.push_back(enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(index)).forward(hs_chunks[static_cast<size_t>(index)])); }
+  for (int64_t index = 0; index < groups; ++index) { logits.push_back(detail::linear_forward(enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(index)), hs_chunks[static_cast<size_t>(index)])); }
   return torch::cat(logits, 1);
  }
  NativeTransformerOutput forward(const std::vector<torch::Tensor>& srcs, const std::vector<torch::Tensor>& masks, const std::vector<torch::Tensor>& pos_embeds, const torch::Tensor& refpoint_embed,
@@ -908,8 +910,8 @@ public:
    boxes_ts.reserve(static_cast<size_t>(groups));
    for (int64_t group_index = 0; group_index < groups; ++group_index) {
     auto output_memory_group =
-     enc_output_norm->at<torch::nn::LayerNormImpl>(static_cast<size_t>(group_index)).forward(enc_output->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)).forward(output_memory));
-    auto enc_outputs_class = enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)).forward(output_memory_group);
+     enc_output_norm->at<torch::nn::LayerNormImpl>(static_cast<size_t>(group_index)).forward(detail::linear_forward(enc_output->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)), output_memory));
+    auto enc_outputs_class = detail::linear_forward(enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)), output_memory_group);
     auto proposal_scores = std::get<0>(enc_outputs_class.max(-1));
     const int64_t topk = std::min<int64_t>(config_.num_queries, enc_outputs_class.size(1));
     auto topk_indices = std::get<1>(proposal_scores.topk(topk, 1));
@@ -1213,15 +1215,12 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
  }
  std::vector<torch::Tensor> combined_query_features;
  std::vector<torch::Tensor> decoder_query_features;
- std::vector<torch::Tensor> denoising_query_features;
  if (transformed.hidden_states.defined()) {
   combined_query_features = transformed.hidden_states.unbind(0);
   const auto& states = combined_query_features;
   decoder_query_features.reserve(states.size());
-  denoising_query_features.reserve(states.size());
   for (const auto& state : states) {
    decoder_query_features.push_back(state.narrow(1, 0, active_query_count));
-   if (denoising != nullptr) { denoising_query_features.push_back(state.narrow(1, active_query_count, denoising->layout.denoising_queries())); }
   }
  }
  std::vector<torch::Tensor> dense_masks;
@@ -1250,21 +1249,18 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
  }
  if (!decoder_query_features.empty()) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_decoder_heads{"rfdetr.model.forward.decoder_heads"};
-  const int64_t ref_layers = transformed.refs_unsigmoid.size(0);
+  // Upstream projects the complete decoder-layer axis in one operation.
+  // Separate calls round shared AMP parameter gradients before summing them.
+  const auto deltas = bbox->forward(transformed.hidden_states);
+  const auto boxes = config_.bbox_reparam ? reparam_box_refine(transformed.refs_unsigmoid, deltas) : (deltas + transformed.refs_unsigmoid).sigmoid();
+  const auto logits = detail::linear_forward(*class_embed, transformed.hidden_states);
   for (size_t index = 0; index < decoder_query_features.size(); ++index) {
-   const int64_t ref_index = ref_layers == 1 ? 0 : static_cast<int64_t>(index);
    const auto& hs = decoder_query_features[index];
-   auto all_refs = transformed.refs_unsigmoid.index({ref_index});
-   auto refs = all_refs.narrow(1, 0, active_query_count);
-   torch::Tensor boxes;
-   if (config_.bbox_reparam) {
-    boxes = reparam_box_refine(refs, bbox->forward(hs));
-   } else {
-    boxes = (bbox->forward(hs) + refs).sigmoid();
-   }
+   const auto all_boxes = boxes.index({static_cast<int64_t>(index)});
+   const auto all_logits = logits.index({static_cast<int64_t>(index)});
    OutputLayer layer;
-   layer.pred_logits = class_embed->forward(hs);
-   layer.pred_boxes = boxes;
+   layer.pred_logits = all_logits.narrow(1, 0, active_query_count);
+   layer.pred_boxes = all_boxes.narrow(1, 0, active_query_count);
    const bool final_decoder_layer = index + 1 == decoder_query_features.size();
    if (capture_match_free_features && (final_decoder_layer || config_.aux_loss)) {
     const int64_t groups = is_training() ? std::max<int64_t>(1, config_.group_detr) : 1;
@@ -1286,12 +1282,11 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
     outputs.aux_outputs.push_back(std::move(layer));
    }
    if (outputs.denoising) {
-    const auto& dn_hs = denoising_query_features[index];
-    const auto dn_refs = all_refs.narrow(1, active_query_count, denoising->layout.denoising_queries());
-    auto dn_boxes = config_.bbox_reparam ? reparam_box_refine(dn_refs, bbox->forward(dn_hs)) : (bbox->forward(dn_hs) + dn_refs).sigmoid();
     DenoisingOutputLayer dn_layer;
-    dn_layer.pred_logits = class_embed->forward(dn_hs).view({dn_hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, config_.num_classes});
-    dn_layer.pred_boxes = dn_boxes.view({dn_hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, 4});
+    dn_layer.pred_logits = all_logits.narrow(1, active_query_count, denoising->layout.denoising_queries())
+                           .view({hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, config_.num_classes});
+    dn_layer.pred_boxes = all_boxes.narrow(1, active_query_count, denoising->layout.denoising_queries())
+                          .view({hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, 4});
     if (include_masks && segmentation_head_) {
      const auto& masks = sparse_masks[index];
      dn_layer.sparse_pred_masks =

@@ -77,6 +77,7 @@ const c10::Symbol kAtenExpand = c10::Symbol::fromQualString("aten::expand");
 const c10::Symbol kAtenRepeat = c10::Symbol::fromQualString("aten::repeat");
 const c10::Symbol kAtenSoftmax = c10::Symbol::fromQualString("aten::softmax");
 const c10::Symbol kAtenSigmoid = c10::Symbol::fromQualString("aten::sigmoid");
+const c10::Symbol kAtenSilu = c10::Symbol::fromQualString("aten::silu");
 const c10::Symbol kAtenRelu = c10::Symbol::fromQualString("aten::relu");
 const c10::Symbol kAtenTanh = c10::Symbol::fromQualString("aten::tanh");
 const c10::Symbol kAtenSin = c10::Symbol::fromQualString("aten::sin");
@@ -1006,7 +1007,7 @@ void lower_cast_like_node(torch::jit::Node* node) {
 }
 void lower_convolution_node(torch::jit::Node* node, const LoweringContext& context) {
  const bool depthwise = node->kind() == kSegmentationDepthwise;
- if (depthwise) require_input_count(node, 3);
+ if (depthwise) require_input_count(node, 4);
  if (!depthwise && node->inputs().size() < 9) { throw_lowering_error(node, "expected at least 9 inputs, got " + std::to_string(node->inputs().size())); }
  auto weight_sizes = value_tensor_sizes(node->input(1));
  if (!weight_sizes.has_value()) {
@@ -1055,6 +1056,19 @@ void lower_convolution_node(torch::jit::Node* node, const LoweringContext& conte
  }
  const bool bias_is_onnx_compatible = has_bias && bias_rank.has_value() && *bias_rank == 1;
  if (bias_is_onnx_compatible) { conv_inputs.push_back(node->input(2)); }
+ if (depthwise && !node->input(3)->mustBeNone()) {
+  const auto dtype = constant_int_value(node->input(3));
+  if (!dtype) throw_lowering_error(node, "depthwise autocast dtype must be constant");
+  for (auto*& input : conv_inputs) {
+   const auto scalar = value_scalar_type(input);
+   if (!scalar) throw_lowering_error(node, "depthwise autocast operand dtype must be known");
+   if (*scalar == at::kDouble || *scalar == static_cast<at::ScalarType>(*dtype)) continue;
+   auto* cast = node->owningGraph()->create(kOnnxCast, {input}, 1);
+   cast->i_(kAttrTo, native_onnx_tensor_data_type(static_cast<at::ScalarType>(*dtype)));
+   cast->insertBefore(node);
+   input = cast->output();
+  }
+ }
  auto* conv = node->owningGraph()->create(kOnnxConv, conv_inputs, 1);
  conv->copyMetadata(node);
  conv->is_(kAttrKernelShape, kernel_shape);
@@ -1255,6 +1269,12 @@ void lower_softmax_node(torch::jit::Node* node) {
 void lower_unary_node(torch::jit::Node* node, c10::Symbol onnx_kind) {
  auto* unary = node->owningGraph()->create(onnx_kind, {node->input(0)}, 1);
  replace_node_with(node, unary);
+}
+void lower_silu_node(torch::jit::Node* node) {
+ require_input_count(node, 1);
+ LoweredNodeChain chain(node);
+ auto* sigmoid = chain.append(kOnnxSigmoid, {node->input(0)});
+ replace_node_with(node, chain.append(kOnnxMul, {node->input(0), sigmoid->output()})->output());
 }
 void lower_gelu_node(torch::jit::Node* node) {
  require_input_count(node, 2);
@@ -1910,6 +1930,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
  NODE(kAtenRepeat, lower_repeat_node)                                \
  NODE(kAtenSoftmax, lower_softmax_node)                              \
  SYMBOL(kAtenSigmoid, lower_unary_node, kOnnxSigmoid)                \
+ NODE(kAtenSilu, lower_silu_node)                                  \
  SYMBOL(kAtenRelu, lower_unary_node, kOnnxRelu)                      \
  SYMBOL(kAtenTanh, lower_unary_node, kOnnxTanh)                      \
  NODE(kAtenDropout, lower_dropout_node)                              \

@@ -16,6 +16,7 @@
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "detail/modules_technical.h"
+#include "detail/linear.h"
 #include "src/frameworks/gpu/cuda/cuda_device_scope.h"
 #include "src/frameworks/gpu/cuda/cuda_error.h"
 #include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
@@ -105,7 +106,7 @@ MlpImpl::MlpImpl(int64_t input_dim, int64_t hidden_dim, int64_t output_dim, int6
 }
 torch::Tensor MlpImpl::forward(torch::Tensor x) {
  for (int64_t index = 0; index < num_layers_; ++index) {
-  x = layers[index]->as<torch::nn::Linear>()->forward(x);
+  x = detail::linear_forward(*layers[index]->as<torch::nn::Linear>(), x);
   if (index + 1 < num_layers_) { x = torch::relu(x); }
  }
  return x;
@@ -114,7 +115,7 @@ DetectionHeadImpl::DetectionHeadImpl(int64_t hidden_dim, int64_t num_classes)
     : class_embed(register_module("class_embed", torch::nn::Linear(hidden_dim, num_classes))), bbox_embed(register_module("bbox_embed", Mlp(hidden_dim, hidden_dim, 4, 3))) {}
 std::pair<torch::Tensor, torch::Tensor> DetectionHeadImpl::forward(const torch::Tensor& hs) {
  return {
-  class_embed->forward(hs),
+  detail::linear_forward(*class_embed, hs),
   bbox_embed->forward(hs).sigmoid(),
  };
 }
@@ -229,7 +230,7 @@ torch::Tensor DepthwiseConvBlockImpl::forward(torch::Tensor x) { return pointwis
 torch::Tensor DepthwiseConvBlockImpl::pointwise_tail(const torch::Tensor& residual, torch::Tensor x) {
  x = x.permute({0, 2, 3, 1});
  x = norm->forward(x);
- x = pwconv1->forward(x);
+ x = detail::linear_forward(*pwconv1, x);
  x = act->forward(x);
  if (gamma.defined()) { x = x * gamma; }
  x = x.permute({0, 3, 1, 2});
@@ -245,9 +246,9 @@ MlpBlockImpl::MlpBlockImpl(int64_t dim, double layer_scale_init_value)
 torch::Tensor MlpBlockImpl::forward(torch::Tensor x) {
  const auto residual = x;
  x = norm_in->forward(x);
- x = layers[0]->as<torch::nn::Linear>()->forward(x);
+ x = detail::linear_forward(*layers[0]->as<torch::nn::Linear>(), x);
  x = layers[1]->as<torch::nn::GELU>()->forward(x);
- x = layers[2]->as<torch::nn::Linear>()->forward(x);
+ x = detail::linear_forward(*layers[2]->as<torch::nn::Linear>(), x);
  if (gamma.defined()) { x = x * gamma; }
  return x + residual;
 }
@@ -289,7 +290,7 @@ torch::Tensor SegmentationHeadImpl::project_query_features(const torch::Tensor& 
   .invoke(is_training(), {query_features}, {query_features_block.get(), query_features_proj ? static_cast<torch::nn::Module*>(query_features_proj.get()) : nullptr},
    [this](const auto& inputs) {
   auto projected = query_features_block->forward(inputs[0]);
-  if (!use_query_identity_) projected = query_features_proj->forward(projected);
+  if (!use_query_identity_) projected = detail::linear_forward(*query_features_proj, projected);
   return detail::SelectiveTensorRegion::Tensors{projected};
  })
   .front();

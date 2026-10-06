@@ -100,6 +100,8 @@ mmltk_register_private_headers(
     detail/detection_sampling.h
     detail/training_mask_loss.h
     detail/traced_loss_cache.h
+    detail/traced_graph.h
+    detail/linear.h
     detail/detr_matcher_cuda.h
     detail/detection_geometry.h
     detail/mask_pack_cuda.h

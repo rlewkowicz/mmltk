@@ -91,13 +91,16 @@ torch::Tensor compare_loss(support::OracleComparison& comparison, const support:
 }
 void compare_gradients(support::OracleComparison& comparison, const support::OracleArchive& archive, const rf::NativeRfDetrModel& model, const std::string& prefix, bool stock) {
  std::set<std::string> names;
+ rf::TensorMap actual, expected;
  for (const auto& parameter : model.named_parameters(true)) {
   if (!parameter.value().requires_grad()) continue;
   names.insert(parameter.key());
-  comparison.compare(prefix + parameter.key(), parameter.value().grad(), archive.tensor(prefix + parameter.key()), ComparisonPolicy::Derivative);
+  actual.emplace(parameter.key(), parameter.value().grad());
+  expected.emplace(parameter.key(), archive.tensor(prefix + parameter.key()));
   if (stock) comparison.compare("stock-policy/" + prefix + parameter.key(), parameter.value().grad(), archive.tensor("stock/" + prefix + parameter.key()), ComparisonPolicy::Derivative, true);
  }
  comparison.inventory(prefix + "inventory", names, archive.names(prefix));
+ comparison.derivatives(prefix, actual, expected);
 }
 void compare_optimizer(support::OracleComparison& comparison, const support::OracleArchive& reference, rf::NativeOptimizer& optimizer, const support::OracleCase& entry, bool state) {
  // Read the owner's production checkpoint projection: no test-only optimizer or
@@ -163,7 +166,7 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
  comparison.inventory("optimizer parameter groups", actual_names, expected_names);
 }
 }  // namespace
-TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded trajectory", "[rfdetr][parity][upstream_oracle][cuda]") {
+TEST_CASE("Actual upstream matched-state criterion AdamW and measured independent trajectory", "[rfdetr][parity][upstream_oracle][cuda]") {
  const auto requested = support::UpstreamOracle::requested();
  if (!requested) SKIP("optional independent upstream artifacts absent; default skip is not parity evidence");
  const support::UpstreamOracle oracle(*requested);
@@ -174,7 +177,8 @@ TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded t
  rf::ScopedRuntimeContext runtime(nullptr, 0, &matcher.workspace);
  for (const auto& entry : oracle.cases()) {
   if (!entry.training) continue;
-  DYNAMIC_SECTION(entry.id) {
+  for (const bool matched_state : {true, false}) {
+  DYNAMIC_SECTION(entry.id << (matched_state ? " matched state" : " independent trajectory")) {
    CAPTURE(entry.id);
    auto model = oracle.model(entry);
    const auto config = support::oracle_detection(model.config());
@@ -183,7 +187,8 @@ TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded t
    request.fused_optimizer = false;
    auto built = rf::build_optimizer(model.named_parameters(true), request);
    const rf::TrainingStep step(1, 1., entry.dtype() != torch::kFloat32, entry.dtype());
-   support::OracleComparison comparison(*requested, "training-" + entry.id, entry.dtype());
+   support::OracleComparison comparison(*requested, (matched_state ? "training-" : "trajectory-") + entry.id, entry.dtype());
+   comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
    std::set<std::string> actual_weights, expected_weights;
    for (const auto& [name, weight] : entry.loss_weights) expected_weights.insert(name);
    for (const auto& [name, weight] : config.weight_dict) {
@@ -194,11 +199,18 @@ TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded t
    rf::TensorMap expected_before;
    for (const auto& parameter : model.named_parameters(true))
     if (parameter.value().requires_grad()) expected_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
-   comparison.fact("trajectory", {{"updates", entry.steps.size()}, {"optimizer_backend", built.optimizer.backend_name()}, {"interpretation", "bounded matched updates; no dataset AP measurement"}});
+   comparison.fact("trajectory", {{"updates", entry.steps.size()}, {"optimizer_backend", built.optimizer.backend_name()},
+    {"matched_state", matched_state}, {"interpretation", matched_state ? "model/criterion at upstream weights; optimizer consumes identical upstream clipped gradients" : "independent updates; measured differences, no trajectory-equality or dataset AP claim"}});
+   const auto run_updates = [&] {
    for (std::size_t update = 0; update < entry.steps.size(); ++update) {
     CAPTURE(update);
     comparison.fact("step", update);
     const auto archive = oracle.archive(entry, update);
+    if (matched_state && update) {
+     torch::NoGradGuard no_grad;
+     for (const auto& parameter : model.named_parameters(true))
+      if (parameter.value().requires_grad()) parameter.value().copy_(expected_before.at(parameter.key()));
+    }
     const auto targets = support::oracle_targets(archive, entry, torch::kCUDA);
     built.optimizer.zero_grad(true);
     auto input = archive.tensor("input", torch::kCUDA).clone().set_requires_grad(true);
@@ -224,17 +236,29 @@ TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded t
     rf::TensorMap actual_before;
     for (const auto& parameter : model.named_parameters(true))
      if (parameter.value().requires_grad()) actual_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
+    if (matched_state) {
+     // Isolate AdamW from floating backward noise. The production optimizer
+     // still owns every update, age and moment over the complete sequence.
+     for (const auto& parameter : model.named_parameters(true)) {
+      if (!parameter.value().requires_grad()) continue;
+      parameter.value().mutable_grad() = archive.tensor("clipped/" + parameter.key(), parameter.value().device());
+     }
+    }
     built.optimizer.step();
     for (const auto& parameter : model.named_parameters(true))
      if (parameter.value().requires_grad()) {
       const auto key = "updated/" + parameter.key();
       comparison.compare(key, parameter.value(), archive.tensor(key), ComparisonPolicy::Value);
-      comparison.compare(
-       "update/" + parameter.key(), parameter.value().detach().cpu() - actual_before.at(parameter.key()), archive.tensor(key) - expected_before.at(parameter.key()), ComparisonPolicy::Derivative);
+      comparison.parameter_update("update/" + parameter.key(), actual_before.at(parameter.key()), parameter.value(), expected_before.at(parameter.key()), archive.tensor(key));
       expected_before[parameter.key()] = archive.tensor(key);
       if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/" + key, parameter.value(), archive.tensor("stock/" + key), ComparisonPolicy::Value, true);
      }
     compare_optimizer(comparison, archive, built.optimizer, entry, true);
+    if (matched_state) {
+     torch::NoGradGuard no_grad;
+     for (const auto& parameter : model.named_parameters(true))
+      if (parameter.value().requires_grad()) parameter.value().copy_(expected_before.at(parameter.key()));
+    }
     model.eval();
     {
      torch::NoGradGuard no_grad;
@@ -246,6 +270,10 @@ TEST_CASE("Actual upstream stock criterion gradients AdamW updates and bounded t
     }
     model.train();
    }
+   };
+   if (matched_state) comparison.compare_all(run_updates);
+   else comparison.observe_values(run_updates);
+  }
   }
  }
 }

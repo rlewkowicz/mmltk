@@ -24,9 +24,8 @@ torch::Tensor matched_sparse_pred_masks_for_batch(const SparsePredMasks& sparse,
  const auto batch_spatial_features = sparse.spatial_features.index({batch_index});
  auto batch_query_features = sparse.query_features.index({batch_index, device_query_indices});
  if (batch_query_features.scalar_type() != batch_spatial_features.scalar_type()) { batch_query_features = batch_query_features.to(batch_spatial_features.scalar_type()); }
- const auto bias = sparse.bias.to(batch_spatial_features.dtype());
  const auto flattened_spatial = batch_spatial_features.flatten(1).contiguous();
- return torch::matmul(batch_query_features, flattened_spatial).view({batch_query_features.size(0), batch_spatial_features.size(-2), batch_spatial_features.size(-1)}) + bias;
+ return torch::matmul(batch_query_features, flattened_spatial).view({batch_query_features.size(0), batch_spatial_features.size(-2), batch_spatial_features.size(-1)}) + sparse.bias;
 }
 const PackedTargetMasks& require_target_masks(const PreparedTargets& targets, const char* context) {
  if (!targets.packed_masks.has_value() || !targets.packed_masks->bits.defined()) { throw std::runtime_error(std::string(context) + " requires target masks"); }
