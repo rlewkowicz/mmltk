@@ -186,7 +186,7 @@ public:
     postprocess_ = std::make_unique<PostprocessLane>(native_->class_layout());
     postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
     auto& technical_model = (*native_);
-    static_cast<void>(technical_model.load_normalized_state(resolved.model_state.entries(), false));
+    technical_model.commit_normalized_state(technical_model.stage_normalized_state(resolved.model_state.entries(), detail::NormalizedModelStateAdmission::RequiredCore));
     technical_model.to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
     technical_model.eval();
     technical_model.freeze_inference_weights();

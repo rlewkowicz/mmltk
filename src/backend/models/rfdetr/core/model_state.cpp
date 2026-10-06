@@ -48,10 +48,6 @@ void validate_queries(const NativeCheckpointMetadata& metadata, const std::strin
  if (!required && metadata.num_queries == 0 && metadata.num_select == 0) { return; }
  if (metadata.num_queries <= 0 || metadata.num_select <= 0 || metadata.num_select > metadata.num_queries) { throw std::runtime_error("RF-DETR native checkpoint has invalid query metadata: " + path); }
 }
-template <class T>
-inline constexpr bool is_optional = false;
-template <class T>
-inline constexpr bool is_optional<std::optional<T>> = true;
 template <class Left, class Right, class Visitor>
 void visit_matching_members(Left& left, const Right& right, Visitor&& visit) {
  template for (constexpr auto left_member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Left, std::meta::access_context::current()))) {
@@ -62,15 +58,27 @@ void visit_matching_members(Left& left, const Right& right, Visitor&& visit) {
 }
 void apply_checkpoint_detection_overrides(NativeRfDetrConfig& config, const NativeCheckpointMetadata& metadata) {
  visit_matching_members(config, metadata, []<class Target, class Source>(Target& target, const Source& source) {
-  if constexpr (is_optional<std::remove_cvref_t<Source>>) {
+  if constexpr (model_state_detail::is_optional<std::remove_cvref_t<Source>>) {
    if (source) target = *source;
   }
  });
 }
 void capture_checkpoint_detection_metadata(NativeCheckpointMetadata& metadata, const NativeRfDetrConfig& config) {
  visit_matching_members(metadata, config, []<class Target, class Source>(Target& target, const Source& source) {
-  if constexpr (is_optional<std::remove_cvref_t<Target>>) target = source;
+  if constexpr (model_state_detail::is_optional<std::remove_cvref_t<Target>>) target = source;
  });
+}
+void validate_checkpoint_topology(const NativeRfDetrConfig& config, const NativeCheckpointMetadata& metadata) {
+ template for (constexpr auto evidence : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
+  if constexpr (std::meta::identifier_of(evidence).starts_with("topology_")) {
+   template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeRfDetrConfig, std::meta::access_context::current()))) {
+    if constexpr (std::meta::identifier_of(evidence).substr(std::string_view("topology_").size()) == std::meta::identifier_of(field)) {
+     if (metadata.[:evidence:] && *metadata.[:evidence:] != config.[:field:])
+      throw std::invalid_argument("RF-DETR checkpoint topology disagrees with selected preset: " + std::string(std::meta::identifier_of(field)));
+    }
+   }
+  }
+ }
 }
 }  // namespace
 bool same_native_model_semantics(const NativeCheckpointMetadata& left, const NativeCheckpointMetadata& right) {
@@ -157,7 +165,7 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  metadata.class_layout = decode_class_layout(mmltk::backend::ml::serialization::require_string(archive, "class_layout"));
  if (metadata.num_classes < 0 || static_cast<std::size_t>(metadata.num_classes) != metadata.class_layout.slots.size())
   throw std::runtime_error("native checkpoint output width disagrees with class layout");
- metadata.for_each_detection_field(
+ metadata.for_each_optional_field(
   [&archive]<class Name, class Optional>(const Name& name, Optional& field) { field = mmltk::backend::ml::serialization::read_optional_value<typename Optional::value_type>(archive, name); });
  model_state_detail::InputArchive state_archive;
  archive.read("state", state_archive);
@@ -296,6 +304,7 @@ ResolvedModelArtifacts resolve_admitted_model_artifacts(
  result.config.num_queries = result.source_num_queries;
  result.config.num_select = result.source_num_select;
  if (resolution > 0) { result.config.resolution = resolution; }
+ validate_checkpoint_topology(result.config, state.metadata);
  apply_checkpoint_detection_overrides(result.config, state.metadata);
  return result;
 }

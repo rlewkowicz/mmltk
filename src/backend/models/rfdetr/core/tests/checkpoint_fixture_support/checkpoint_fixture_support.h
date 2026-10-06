@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include "src/backend/models/rfdetr/core/class_layout.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
 inline void set_synthetic_model_state(DecodedNativeModelState& state, std::vector<NormalizedModelStateEntry> entries) { state.replace_entries(std::move(entries)); }
@@ -31,5 +32,9 @@ struct ParityFixtureCase;
  return value;
 }
 void write_minimal_upstream_checkpoint(const std::filesystem::path& path, const ParityFixtureCase& fixture);
+enum class CheckpointEnvelope { Legacy, Raw, Lightning, CompiledLightning, Collision, RawStateDict };
+// Repackages a real complete checkpoint without generating model equations.
+// Metadata JSON is explicit external-format test evidence.
+void write_checkpoint_envelope(const std::filesystem::path& source, const std::filesystem::path& destination, CheckpointEnvelope envelope, std::string_view metadata = "{}");
 void log_fixture_phase(const char* test_name, std::size_t index, std::size_t total, const char* phase, const char* preset_name);
 }  // namespace mmltk::backend::models::rfdetr::testsupport

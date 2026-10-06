@@ -160,7 +160,7 @@ void populate_metadata_from_manifest(const json& metadata_json, NativeCheckpoint
  }
  metadata.num_queries = manifest_optional_value<int64_t>(metadata_json, "num_queries").value_or(0);
  metadata.num_select = manifest_optional_value<int64_t>(metadata_json, "num_select").value_or(0);
- metadata.for_each_detection_field(
+ metadata.for_each_optional_field(
   [&metadata_json]<class Name, class Optional>(const Name& name, Optional& field) { field = manifest_optional_value<typename Optional::value_type>(metadata_json, name); });
 }
 DecodedNativeModelState load_checkpoint_from_manifest(const fs::path& manifest_path) {
@@ -267,7 +267,7 @@ void write_upstream_model_state(const fs::path& checkpoint_path, const DecodedNa
  if (!model_state.metadata.class_layout.slots.empty()) manifest["metadata"]["class_layout"] = json::parse(encode_class_layout(model_state.metadata.class_layout));
  if (model_state.metadata.num_queries > 0) manifest["metadata"]["num_queries"] = model_state.metadata.num_queries;
  if (model_state.metadata.num_select > 0) manifest["metadata"]["num_select"] = model_state.metadata.num_select;
- model_state.metadata.for_each_detection_field([&]<class Name, class Optional>(const Name& name, const Optional& field) {
+ model_state.metadata.for_each_optional_field([&]<class Name, class Optional>(const Name& name, const Optional& field) {
   if (field) manifest["metadata"][name] = *field;
  });
  write_json_file(manifest_path, manifest);

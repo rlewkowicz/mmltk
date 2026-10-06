@@ -247,7 +247,7 @@ void ExportOnnxSession::State::Run(
   if (stop.stop_requested()) return;
   auto next_model = std::make_unique<NativeRfDetrModel>(resolved.artifacts.config, resolved.artifacts.class_layout);
   auto& technical_model = (*next_model);
-  static_cast<void>(technical_model.load_normalized_state(resolved.model_state.entries(), false));
+  technical_model.commit_normalized_state(technical_model.stage_normalized_state(resolved.model_state.entries(), detail::NormalizedModelStateAdmission::RequiredCore));
   technical_model.to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(request.device_id)));
   admission = std::move(resolved.model_state.class_artifact);
   model = std::move(next_model);

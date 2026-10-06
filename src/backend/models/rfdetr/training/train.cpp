@@ -401,7 +401,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    const auto loaded = load_training_model_weights(*common, transferred->model_state, supervision_route(options.training_supervision));
    if (main_process) {
     mmltk::common::logging::info([&](auto& logger) {
-     logger.info("rfdetr weights: loaded={} missing={} unexpected={} incompatible={} input={}", loaded.loaded_names.size(), loaded.missing_names.size(), loaded.unexpected_names.size(),
+     logger.info("rfdetr weights: loaded={} initialized={} missing={} unexpected={} incompatible={} input={}", loaded.loaded_names.size(), loaded.initialized_names.size(), loaded.missing_names.size(), loaded.unexpected_names.size(),
       loaded.incompatible_names.size(), source_checkpoint.string());
     });
     mmltk::common::logging::warn([&](auto& logger) {

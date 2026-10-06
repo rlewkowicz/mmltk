@@ -57,6 +57,9 @@ void assert_clean_summary(const ModelStateLoadSummary& summary, const std::strin
 }
 void write_module_upstream_checkpoint(const fs::path& path, const NativeRfDetrModel& module) {
  mmltk::backend::models::rfdetr::DecodedNativeModelState state;
+ state.metadata.class_layout = module.class_layout()->record();
+ state.metadata.num_queries = module.config().num_queries;
+ state.metadata.num_select = module.config().num_select;
  state.metadata.cls_loss_coef = 7.3;
  state.metadata.bbox_loss_coef = 9.1;
  state.metadata.mask_ce_loss_coef = 8.2;
@@ -120,18 +123,48 @@ void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, 
   REQUIRE(admitted.artifacts.config.mask_ce_loss_coef == (admitted.artifacts.config.segmentation ? 5.0 : 1.0));
   REQUIRE(admitted.model_state.metadata.cls_loss_coef == 7.3);
  }
- NativeRfDetrModel upstream_model(artifacts.config);
+ // Both executions are native: this is checkpoint storage/admission evidence,
+ // not an independently executed upstream forward oracle.
+ NativeRfDetrModel python_format_model(artifacts.config);
  NativeRfDetrModel native_model(artifacts.config);
  log_fixture_phase("test_rfdetr_checkpoint_parity", index, total, "load", fixture.preset_name);
- assert_clean_summary(mmltk::backend::models::rfdetr::load_model_weights(upstream_model, upstream_path, true), "upstream");
+ assert_clean_summary(mmltk::backend::models::rfdetr::load_model_weights(python_format_model, upstream_path, true), "Python format");
  assert_clean_summary(mmltk::backend::models::rfdetr::load_model_weights(native_model, native_path, true), "native");
- upstream_model.eval();
+ python_format_model.eval();
  native_model.eval();
  const auto image = make_fixture_image(fixture);
  log_fixture_phase("test_rfdetr_checkpoint_parity", index, total, "forward", fixture.preset_name);
- const auto upstream_outputs = upstream_model.forward(nested_tensor_from_tensor_list({image.clone()}), true);
+ const auto python_format_outputs = python_format_model.forward(nested_tensor_from_tensor_list({image.clone()}), true);
  const auto native_outputs = native_model.forward(nested_tensor_from_tensor_list({image.clone()}), true);
- assert_outputs_bitwise_equal(upstream_outputs, native_outputs, fixture.preset_name);
+ assert_outputs_bitwise_equal(python_format_outputs, native_outputs, fixture.preset_name);
+ namespace rf = mmltk::backend::models::rfdetr;
+ using rf::testsupport::CheckpointEnvelope;
+ for (const auto envelope : {CheckpointEnvelope::Legacy, CheckpointEnvelope::Raw, CheckpointEnvelope::Lightning, CheckpointEnvelope::CompiledLightning, CheckpointEnvelope::RawStateDict}) {
+  const auto path = temp_dir.path() / fixture.upstream_filename;
+  rf::testsupport::write_checkpoint_envelope(upstream_path, path, envelope);
+  auto admitted = rf::resolve_model_state(path, fixture.preset_name, fixture.input_size);
+  auto candidate = python_format_model.stage_normalized_state(admitted.model_state.entries(), rf::detail::NormalizedModelStateAdmission::RequiredCore);
+  assert_clean_summary(candidate.summary, "complete envelope");
+  REQUIRE(candidate.summary.loaded_names.size() == admitted.model_state.tensor_count());
+  python_format_model.commit_normalized_state(std::move(candidate));
+  assert_outputs_bitwise_equal(python_format_model.forward(nested_tensor_from_tensor_list({image.clone()}), true), native_outputs, fixture.preset_name);
+  if (envelope != CheckpointEnvelope::Raw) REQUIRE(admitted.artifacts.config.cls_loss_coef == 7.3);
+ }
+ const auto malformed = temp_dir.path() / "malformed.pth";
+ rf::testsupport::write_checkpoint_envelope(upstream_path, malformed, CheckpointEnvelope::Collision);
+ REQUIRE_THROWS(rf::decode_model_state(malformed));
+ for (const auto metadata : {R"({"use_grouppose_keypoints":true})", R"({"window_block_indexes":[2,5,8,11]})", R"({"dropout":0.1})"}) {
+  rf::testsupport::write_checkpoint_envelope(upstream_path, malformed, CheckpointEnvelope::Lightning, metadata);
+  REQUIRE_THROWS(rf::decode_model_state(malformed));
+ }
+ // Same-shaped semantic topology survives both bridge and native archives.
+ rf::testsupport::write_checkpoint_envelope(upstream_path, malformed, CheckpointEnvelope::CompiledLightning, R"({"num_windows":7})");
+ auto wrong_topology = rf::decode_model_state(malformed);
+ REQUIRE(wrong_topology.metadata.topology_num_windows == 7);
+ REQUIRE_THROWS(rf::resolve_admitted_model_artifacts(wrong_topology, malformed, fixture.preset_name, 0));
+ const auto retained = temp_dir.path() / "wrong-topology.native.pt";
+ rf::save_native_checkpoint(retained, wrong_topology);
+ REQUIRE_THROWS(rf::resolve_model_state(retained, fixture.preset_name, 0));
 }
 }  // namespace
 void test_checkpoint_parity_matches_for_all_registered_fixtures() {

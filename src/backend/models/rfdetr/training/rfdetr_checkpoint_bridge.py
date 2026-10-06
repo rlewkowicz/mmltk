@@ -50,21 +50,51 @@ def _load_checkpoint_root(checkpoint_path: Path):
         if callable(state_dict_fn):
             model = state_dict_fn()
             if isinstance(model, dict):
-                return {"model": model}
-        raise RuntimeError(
-            "RF-DETR checkpoint root is neither a dict nor a module with state_dict(): "
-            f"{checkpoint_path} ({type(checkpoint).__name__})"
-        )
+                checkpoint = {"model": model}
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(
+                "RF-DETR checkpoint root is neither a dict nor a module with state_dict(): "
+                f"{checkpoint_path} ({type(checkpoint).__name__})"
+            )
     model = checkpoint.get("model")
-    if isinstance(model, dict):
-        return checkpoint
-    state_dict = checkpoint.get("state_dict")
-    if isinstance(state_dict, dict):
-        checkpoint["model"] = state_dict
-        return checkpoint
-    if checkpoint and all(isinstance(name, str) and isinstance(tensor, torch.Tensor) for name, tensor in checkpoint.items()):
-        return {"model": checkpoint}
-    raise RuntimeError(f"RF-DETR checkpoint is missing dict['model'] or dict['state_dict']: {checkpoint_path}")
+    lightning = False
+    if not isinstance(model, dict):
+        model = checkpoint.get("state_dict")
+        if isinstance(model, dict):
+            lightning = any(isinstance(name, str) and name.startswith("model.") for name in model)
+            if "args" not in checkpoint and "hyper_parameters" in checkpoint:
+                checkpoint["args"] = checkpoint["hyper_parameters"]
+        elif all(isinstance(name, str) and isinstance(tensor, torch.Tensor) for name, tensor in checkpoint.items()):
+            model = checkpoint
+            checkpoint = {}
+        else:
+            raise RuntimeError(f"RF-DETR checkpoint is missing dict['model'] or dict['state_dict']: {checkpoint_path}")
+    normalized = OrderedDict()
+    for name, tensor in model.items():
+        if not isinstance(name, str) or not name:
+            raise RuntimeError(f"invalid RF-DETR checkpoint tensor entry: {name!r}")
+        if lightning:
+            # PTL owns non-model state too. Only its model member is imported,
+            # following the pinned upstream loader's envelope contract.
+            if not name.startswith("model."):
+                continue
+            name = name[len("model."):]
+            if name.startswith("_orig_mod."):
+                name = name[len("_orig_mod."):]
+        if not isinstance(tensor, torch.Tensor):
+            raise RuntimeError(f"RF-DETR checkpoint entry is not a tensor: {name}")
+        if not name or name in normalized:
+            raise RuntimeError(f"RF-DETR checkpoint tensor-name collision after normalization: {name!r}")
+        normalized[name] = tensor
+    if not normalized:
+        raise RuntimeError(f"RF-DETR checkpoint has no model tensors: {checkpoint_path}")
+    inactive_keypoints = normalized.get("_kp_active_mask")
+    if inactive_keypoints is not None:
+        if inactive_keypoints.dtype != torch.bool or tuple(inactive_keypoints.shape) != (0, 0):
+            raise RuntimeError("RF-DETR checkpoint has unsupported active keypoint state")
+        del normalized["_kp_active_mask"]
+    checkpoint["model"] = normalized
+    return checkpoint
 
 
 def _checkpoint_arg_value(args_obj, name: str):
@@ -105,7 +135,63 @@ def _coerce_float(value):
 
 def _extract_checkpoint_metadata(checkpoint) -> dict:
     args_obj = checkpoint.get("args")
+    # These options select behavior that the native catalog does not implement.
+    # Shape-compatible alternatives must fail before tensor publication, not
+    # quietly inherit a preset's different forward computation.
+    fixed_topology = {
+        "encoder": "dinov2_windowed_small",
+        "out_feature_indexes": [3, 6, 9, 12],
+        "projector_scale": ["P4"],
+        "vit_encoder_num_layers": 12,
+        "position_embedding": "sine",
+        "decoder_norm": "LN",
+        "decoder_norm_type": "LN",
+        "layer_norm": True,
+        "rms_norm": False,
+        "two_stage": True,
+        "encoder_only": False,
+        "backbone_only": False,
+        "num_channels": 3,
+        "num_feature_levels": 1,
+        "dropout": 0.0,
+        "drop_path": 0.0,
+        "drop_path_rate": 0.0,
+        "use_grouppose_keypoints": False,
+        "num_keypoints_per_class": [],
+        "num_decoder_registers": 0,
+        "num_registers": 0,
+        "num_register_tokens": 0,
+        "dual_projector": False,
+        "mask_downsample_ratio": 4,
+    }
+    for name, supported in fixed_topology.items():
+        value = _checkpoint_arg_value(args_obj, name)
+        if isinstance(value, tuple):
+            value = list(value)
+        if value is not None and value != supported:
+            raise RuntimeError(f"unsupported RF-DETR checkpoint topology {name}={value!r}")
+    window_blocks = _checkpoint_arg_value(args_obj, "window_block_indexes")
+    if window_blocks is not None and list(window_blocks) != [0, 1, 2, 4, 5, 7, 8, 10, 11]:
+        raise RuntimeError("unsupported RF-DETR checkpoint window attention schedule")
     metadata = {}
+    for name, coercer in {
+        "num_windows": _coerce_int,
+        "sa_nheads": _coerce_int,
+        "ca_nheads": _coerce_int,
+        "bbox_reparam": _coerce_bool,
+        "lite_refpoint_refine": _coerce_bool,
+    }.items():
+        evidence_name = f"topology_{name}"
+        raw = _checkpoint_arg_value(args_obj, name)
+        retained = _checkpoint_arg_value(args_obj, evidence_name)
+        if raw is not None and retained is not None and raw != retained:
+            raise RuntimeError(f"conflicting RF-DETR checkpoint topology evidence: {name}")
+        raw = raw if raw is not None else retained
+        if raw is not None:
+            value = coercer(raw)
+            if value is None or (coercer is _coerce_int and value <= 0):
+                raise RuntimeError(f"invalid RF-DETR checkpoint topology: {name}")
+            metadata[evidence_name] = value
     layout = checkpoint.get("class_layout")
     if layout is not None:
         if not isinstance(layout, dict):
@@ -155,6 +241,7 @@ def _extract_checkpoint_metadata(checkpoint) -> dict:
 
 def export_upstream(args: argparse.Namespace) -> None:
     checkpoint = _load_checkpoint_root(Path(args.input))
+    metadata = _extract_checkpoint_metadata(checkpoint)
     model = checkpoint["model"]
     tensor_dir = Path(args.tensor_dir)
     tensor_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +270,6 @@ def export_upstream(args: argparse.Namespace) -> None:
         raise RuntimeError(f"RF-DETR checkpoint state_dict is empty: {args.input}")
 
     manifest = {"state_dict": state_dict}
-    metadata = _extract_checkpoint_metadata(checkpoint)
     if metadata:
         manifest["metadata"] = metadata
     manifest_path = Path(args.manifest)

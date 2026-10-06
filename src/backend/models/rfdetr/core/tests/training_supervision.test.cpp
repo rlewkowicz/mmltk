@@ -716,7 +716,7 @@ void test_production_match_free_boundary_captures_layers_and_empty_gradient_anch
   config.num_queries = 3;
   config.num_select = 3;
   config.group_detr = 1;
-  config.dec_layers = include_auxiliary_and_encoder ? 2 : 1;
+  config.dec_layers = include_auxiliary_and_encoder ? 4 : 2;
   config.aux_loss = include_auxiliary_and_encoder;
   config.two_stage = include_auxiliary_and_encoder;
   config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
@@ -727,7 +727,7 @@ void test_production_match_free_boundary_captures_layers_and_empty_gradient_anch
   owner.initialize_training_supervision(0xabcdefULL);
   const auto image = torch::rand({3, 64, 64});
   auto nonempty_outputs = owner.forward_for_match_free(rfdetr::nested_tensor_from_tensor_list({image}));
-  REQUIRE(nonempty_outputs.aux_outputs.size() == (include_auxiliary_and_encoder ? 1U : 0U));
+  REQUIRE(nonempty_outputs.aux_outputs.size() == (include_auxiliary_and_encoder ? 3U : 0U));
   REQUIRE(nonempty_outputs.enc_outputs.has_value() == include_auxiliary_and_encoder);
   retain_captured_output_gradients(nonempty_outputs);
   const auto targets = one_image_targets(torch::tensor({{0.5F, 0.5F, 0.25F, 0.25F}}), torch::tensor({0}, torch::TensorOptions().dtype(torch::kInt64)));
@@ -796,6 +796,7 @@ void test_conditional_model_construction_preserves_rng_and_default_state_topolog
  inactive_config.segmentation = false;
  auto active_config = inactive_config;
  active_config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
+ active_config.training_supervision.denoising.enabled = true;
  torch::manual_seed(101);
  rfdetr::NativeRfDetrModel inactive(inactive_config, rfdetr::testsupport::synthetic_training_layout(inactive_config.num_classes - 1));
  const auto inactive_rng = at::detail::getDefaultCPUGenerator().get_state().clone();
@@ -1153,6 +1154,7 @@ void test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs() {
 void test_production_dn_forward_preserves_reference_and_output_boundaries() {
  const auto run_case = [](const rfdetr::TrainAssignmentKind assignment, const bool bbox_reparam, const bool segmentation, const std::uint64_t seed) {
   auto config = production_denoising_config(assignment, bbox_reparam, segmentation);
+  config.dec_layers = segmentation ? 4 : 2;
   torch::manual_seed(seed);
   rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
   auto& owner = (model);
@@ -1164,6 +1166,7 @@ void test_production_dn_forward_preserves_reference_and_output_boundaries() {
   const rfdetr::TrainingStepIdentity identity{seed, 7, 2, 19};
   const auto image = torch::rand({3, 64, 64});
   auto outputs = owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image}), targets, identity);
+  REQUIRE(outputs.aux_outputs.empty());
   REQUIRE(outputs.main.pred_logits.size(1) == config.num_queries);
   REQUIRE(outputs.main.pred_boxes.size(1) == config.num_queries);
   REQUIRE(outputs.denoising.has_value());
@@ -1210,6 +1213,7 @@ void test_production_dn_forward_preserves_reference_and_output_boundaries() {
   owner.eval();
   torch::NoGradGuard no_grad;
   const auto inference = owner.forward(rfdetr::nested_tensor_from_tensor_list({image.clone()}), segmentation);
+  REQUIRE(inference.aux_outputs.empty());
   REQUIRE_FALSE(inference.denoising.has_value());
   REQUIRE(inference.main.pred_logits.size(1) == config.num_queries);
   if (segmentation && assignment == rfdetr::TrainAssignmentKind::MatchFree) {

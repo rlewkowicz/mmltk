@@ -166,6 +166,110 @@ TEST_CASE("Stock categorical samples retain actual grid_sample half-pixel identi
    REQUIRE(torch::equal(actual, expected));
   }
 }
+TEST_CASE("Projector SiLU retains the standard primitive and VJP through selective recording", "[rfdetr][parity][compilation]") {
+ tensor_fixture::FullMatrixPrecision precision;
+ for (const auto& [device, amp] : tensor_fixture::available_amp_precisions())
+  for (const bool explicit_low_dtype : {false, true}) {
+   if (explicit_low_dtype && amp == torch::kFloat32) continue;
+   CAPTURE(device, amp, explicit_low_dtype);
+   constexpr int64_t width = 9;
+   const auto parameter_type = explicit_low_dtype ? amp : torch::kFloat32;
+   auto module = rf::test_support::ProjectorConvTestAccess::make(width);
+   module->to(device, parameter_type);
+   const auto parameters = module->named_parameters();
+   {
+    torch::NoGradGuard guard;
+    parameters["conv.weight"].copy_(torch::eye(width, parameters["conv.weight"].options()).view({width, width, 1, 1}));
+    parameters["bn.weight"].fill_(0.5);
+    parameters["bn.bias"].copy_(torch::tensor({-50., -12., -1., -1e-5, 0., 1e-5, 1., 12., 50.}, parameters["bn.bias"].options()));
+   }
+   rf::detail::SelectiveTensorRegion region("projector_silu_fixture");
+   region.prepare(true, true, 1);
+   for (int replay = 0; replay < 3; ++replay) {
+    for (auto parameter : module->parameters()) parameter.mutable_grad() = torch::Tensor{};
+    auto input = (torch::arange(width * 6, torch::TensorOptions().device(device).dtype(parameter_type)).reshape({1, width, 2, 3}) * .031 + replay * .013).set_requires_grad(true);
+    auto reference_input = input.detach().clone().set_requires_grad(true);
+    auto weight = parameters["conv.weight"].detach().clone().set_requires_grad(true);
+    auto norm_weight = parameters["bn.weight"].detach().clone().set_requires_grad(true);
+    auto norm_bias = parameters["bn.bias"].detach().clone().set_requires_grad(true);
+    torch::Tensor actual, expected, normalized;
+    {
+     mmltk::backend::ml::cuda::TorchAutocastScope scope(!explicit_low_dtype && amp != torch::kFloat32, amp);
+     actual = region.invoke(true, {input}, {module.get()}, [&](const auto& values) {
+      return rf::detail::SelectiveTensorRegion::Tensors{rf::test_support::ProjectorConvTestAccess::invoke(*module, values.front())};
+     }).front();
+     auto convolved = F::conv2d(reference_input, weight).permute({0, 2, 3, 1});
+     normalized = F::layer_norm(convolved, F::LayerNormFuncOptions({width}).weight(norm_weight).bias(norm_bias).eps(1e-6)).permute({0, 3, 1, 2});
+     expected = F::silu(normalized);
+    }
+    CAPTURE(actual.scalar_type(), normalized.scalar_type(), replay);
+    REQUIRE(actual.scalar_type() == normalized.scalar_type());
+    const auto incoming = torch::cos(torch::arange(actual.numel(), actual.options())).reshape_as(actual);
+    actual.backward(incoming);
+    expected.backward(incoming);
+    const double tolerance = parameter_type == torch::kBFloat16 ? .04 : amp == torch::kFloat32 ? 2e-5 : .004;
+    REQUIRE(torch::allclose(actual, expected, tolerance, tolerance));
+    REQUIRE(torch::allclose(input.grad(), reference_input.grad(), tolerance, tolerance));
+    REQUIRE(torch::allclose(parameters["conv.weight"].grad(), weight.grad(), tolerance, tolerance));
+    REQUIRE(torch::allclose(parameters["bn.weight"].grad(), norm_weight.grad(), tolerance, tolerance));
+    REQUIRE(torch::allclose(parameters["bn.bias"].grad(), norm_bias.grad(), tolerance, tolerance));
+   }
+  }
+}
+TEST_CASE("Detector construction preserves pinned zero copy and DINO distribution invariants", "[rfdetr][parity]") {
+ auto config = rf::native_config_from_preset(rf::model_presets().front());
+ config.resolution = 64;
+ config.group_detr = 2;
+ config.num_queries = config.num_select = 3;
+ config.num_classes = 4;
+ rf::NativeRfDetrModel model(config);
+ const auto parameters = model.named_parameters();
+ for (const auto& parameter : parameters) {
+  const auto& name = parameter.key();
+  const auto& value = parameter.value();
+  if (name.starts_with("bbox_embed.layers.2.") || (name.starts_with("transformer.enc_out_bbox_embed.") && name.find(".layers.2.") != std::string::npos))
+   CHECK(torch::count_nonzero(value).item<int64_t>() == 0);
+  if (name.starts_with("backbone.0.encoder.encoder.")) {
+   if (name.ends_with("bias") || name.ends_with("mask_token")) CHECK(torch::count_nonzero(value).item<int64_t>() == 0);
+   if (value.dim() > 1 && !name.ends_with("mask_token")) {
+    CAPTURE(name);
+    CHECK(value.abs().max().item<float>() <= 2.F);
+    CHECK(value.std().item<float>() > .015F);
+    CHECK(value.std().item<float>() < .025F);
+   }
+  }
+  if (name.starts_with("transformer.decoder.") && (name.ends_with("sampling_offsets.weight") || name.ends_with("attention_weights.weight") || name.ends_with("attention_weights.bias")))
+   CHECK(torch::count_nonzero(value).item<int64_t>() == 0);
+  if (name.starts_with("transformer.") && value.dim() > 1 && name.find("enc_out_") == std::string::npos) {
+   const auto bound = std::sqrt(6.0 / static_cast<double>(value.size(0) + value.size(1)));
+   CHECK(value.abs().max().item<double>() <= bound);
+  }
+ }
+ for (int group = 0; group < config.group_detr; ++group) {
+  const auto prefix = "transformer.enc_out_";
+  for (const auto& parameter : parameters)
+   if (parameter.key().starts_with("class_embed.") || parameter.key().starts_with("bbox_embed.")) {
+    const auto separator = parameter.key().find('.');
+    const auto group_name = prefix + parameter.key().substr(0, separator) + "." + std::to_string(group) + parameter.key().substr(separator);
+    REQUIRE(parameters.find(group_name) != nullptr);
+    CHECK(torch::equal(parameters[group_name], parameter.value()));
+    CHECK(parameters[group_name].data_ptr() != parameter.value().data_ptr());
+   }
+ }
+ for (int layer = 1; layer < config.dec_layers; ++layer)
+  for (const auto name : {"linear1.bias", "linear2.bias"})
+   CHECK(torch::equal(parameters["transformer.decoder.layers." + std::to_string(layer) + "." + name], parameters["transformer.decoder.layers.0." + std::string(name)]));
+ // Zero deltas preserve the selected encoder proposals, independent of top-k
+ // order or random features. Decoder zero heads preserve their seeded boxes.
+ torch::NoGradGuard guard;
+ model.eval();
+ const auto output = model.forward({torch::zeros({1, 3, 64, 64}), {}}, false);
+ REQUIRE(output.enc_outputs);
+ CHECK(torch::equal(output.main.pred_boxes, output.enc_outputs->pred_boxes));
+ CHECK(torch::equal(output.enc_outputs->pred_boxes.slice(-1, 2, 4), torch::full_like(output.enc_outputs->pred_boxes.slice(-1, 2, 4), .05)));
+ auto centers = output.enc_outputs->pred_boxes.slice(-1, 0, 2) * 4.0 - .5;
+ CHECK(torch::equal(centers, centers.round()));
+}
 TEST_CASE("Empty stock masks retain representation-specific connected expressions", "[rfdetr][parity]") {
  for (const bool sparse : {false, true})
   for (const bool nonfinite : {false, true}) {

@@ -195,7 +195,7 @@ public:
  torch::Tensor forward(const torch::Tensor& x) {
   auto out = conv->forward(x.contiguous());
   out = use_layer_norm_ ? ln->forward(out) : bn->forward(out);
-  return out * torch::sigmoid(out);
+  return torch::silu(out);
  }
  torch::nn::Conv2d conv{nullptr};
 
@@ -260,9 +260,9 @@ TORCH_MODULE(Dinov2PatchEmbeddings);
 class WindowedDinov2EmbeddingsImpl : public torch::nn::Module {
 public:
  explicit WindowedDinov2EmbeddingsImpl(const NativeRfDetrConfig& config)
-     : cls_token(register_parameter("cls_token", torch::randn({1, 1, kDinoHiddenSize}, torch::kFloat32))),
+     : cls_token(register_parameter("cls_token", torch::empty({1, 1, kDinoHiddenSize}, torch::kFloat32))),
        mask_token(register_parameter("mask_token", torch::zeros({1, kDinoHiddenSize}, torch::kFloat32))),
-       position_embeddings(register_parameter("position_embeddings", torch::randn({1, config.positional_encoding_size * config.positional_encoding_size + 1, kDinoHiddenSize}, torch::kFloat32))),
+       position_embeddings(register_parameter("position_embeddings", torch::empty({1, config.positional_encoding_size * config.positional_encoding_size + 1, kDinoHiddenSize}, torch::kFloat32))),
        patch_embeddings(register_module("patch_embeddings", Dinov2PatchEmbeddings(config.patch_size))),
        patch_size_(config.patch_size),
        num_windows_(std::max<int64_t>(1, config.num_windows)) {}
@@ -433,6 +433,12 @@ private:
  torch::nn::ModuleList layer{nullptr};
 };
 TORCH_MODULE(WindowedDinov2Encoder);
+void initialize_dino_weight(torch::Tensor tensor) {
+ // Pinned DINO uses trunc_normal_(std=.02, a=-2, b=2). These are absolute
+ // bounds, not two standard deviations. Its normal CDF endpoints round to
+ // zero and one at this scale; retain the upstream inverse-CDF construction.
+ tensor.uniform_(-1.0, 1.0).erfinv_().mul_(0.02 * std::sqrt(2.0)).clamp_(-2.0, 2.0);
+}
 class WindowedDinov2BackboneImpl : public torch::nn::Module {
 public:
  explicit WindowedDinov2BackboneImpl(const NativeRfDetrConfig& config)
@@ -440,7 +446,23 @@ public:
        num_windows_(std::max<int64_t>(1, config.num_windows)),
        embeddings(register_module("embeddings", WindowedDinov2Embeddings(config))),
        encoder(register_module("encoder", WindowedDinov2Encoder(config.num_windows))),
-       layernorm(register_module("layernorm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kDinoHiddenSize}).eps(1.0e-6)))) {}
+       layernorm(register_module("layernorm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kDinoHiddenSize}).eps(1.0e-6)))) {
+  torch::NoGradGuard no_grad;
+  for (const auto& module : modules(false)) {
+   if (auto* linear = dynamic_cast<torch::nn::LinearImpl*>(module.get())) {
+    initialize_dino_weight(linear->weight);
+    if (linear->bias.defined()) linear->bias.zero_();
+   } else if (auto* convolution = dynamic_cast<torch::nn::Conv2dImpl*>(module.get())) {
+    initialize_dino_weight(convolution->weight);
+    if (convolution->bias.defined()) convolution->bias.zero_();
+   } else if (auto* norm = dynamic_cast<torch::nn::LayerNormImpl*>(module.get())) {
+    norm->weight.fill_(1.0);
+    norm->bias.zero_();
+   }
+  }
+  initialize_dino_weight(embeddings->position_embeddings);
+  initialize_dino_weight(embeddings->cls_token);
+ }
  std::vector<torch::Tensor> forward(const torch::Tensor& pixel_values) {
   auto hidden_states = encoder->forward(embeddings->forward(pixel_values));
   const int64_t batch_size = pixel_values.size(0);
@@ -582,7 +604,6 @@ public:
   return output_proj->forward(attended);
  }
 
-private:
  void reset_parameters() {
   torch::NoGradGuard no_grad;
   sampling_offsets->weight.zero_();
@@ -598,6 +619,8 @@ private:
   torch::nn::init::xavier_uniform_(output_proj->weight);
   output_proj->bias.zero_();
  }
+
+private:
  int64_t d_model_ = 0;
  int64_t n_levels_ = 0;
  int64_t n_heads_ = 0;
@@ -670,6 +693,14 @@ public:
   for (int64_t index = 0; index < num_layers_; ++index) {
    layers->push_back(NativeDecoderLayer(config.hidden_dim, config.sa_nheads, config.ca_nheads, config.dim_feedforward, 1, config.dec_n_points));
   }
+  // Upstream clones one decoder layer before the transformer Xavier sweep.
+  // Rank-two weights will be independently reset; its untouched biases and
+  // normalization vectors retain the prototype's values across layers.
+  torch::NoGradGuard no_grad;
+  const auto prototype = layers[0]->named_parameters();
+  for (int64_t index = 1; index < num_layers_; ++index)
+   for (auto& parameter : layers[index]->named_parameters())
+    if (parameter.value().dim() <= 1) parameter.value().copy_(prototype[parameter.key()]);
  }
  void set_bbox_embed(const std::shared_ptr<RfDetrMlpImpl>& bbox_embed) { bbox_embed_ = bbox_embed; }
  std::pair<torch::Tensor, torch::Tensor> forward(const torch::Tensor& tgt, const torch::Tensor& memory, const torch::Tensor& memory_key_padding_mask, const torch::Tensor& pos,
@@ -778,15 +809,30 @@ public:
   for (int64_t index = 0; index < groups; ++index) {
    enc_output->push_back(torch::nn::Linear(config.hidden_dim, config.hidden_dim));
    enc_output_norm->push_back(torch::nn::LayerNorm(std::vector<int64_t>{config.hidden_dim}));
-   enc_out_class_embed->push_back(torch::nn::Linear(config.hidden_dim, std::max(1, config.num_classes)));
-   enc_out_bbox_embed->push_back(std::make_shared<RfDetrMlpImpl>(config.hidden_dim, config.hidden_dim, 4, 3));
   }
   torch::NoGradGuard no_grad;
-  const double prior_prob = 0.01;
-  const auto bias_value = static_cast<float>(-std::log((1.0 - prior_prob) / prior_prob));
-  for (auto& module : *enc_out_class_embed) {
-   auto linear = module->as<torch::nn::Linear>();
-   linear->bias.fill_(bias_value);
+  // Upstream resets the transformer before the detector installs its group
+  // heads. Deformable offsets and uniform attention override the Xavier sweep.
+  for (auto& parameter : parameters()) {
+   if (parameter.dim() > 1) torch::nn::init::xavier_uniform_(parameter);
+  }
+  for (const auto& module : modules(false)) {
+   if (auto* deformable = dynamic_cast<MSDeformAttnImpl*>(module.get())) deformable->reset_parameters();
+  }
+ }
+ void initialize_detector_heads(const torch::nn::Linear& classifier, const RfDetrMlpImpl& boxes) {
+  // Register independent copies only after the ordinary detector's final
+  // initialization. Names and parameter storage remain group-local.
+  torch::NoGradGuard no_grad;
+  const auto class_parameters = classifier->named_parameters();
+  const auto box_parameters = boxes.named_parameters();
+  for (int64_t index = 0; index < std::max<int64_t>(1, config_.group_detr); ++index) {
+   auto class_head = torch::nn::Linear(config_.hidden_dim, std::max(1, config_.num_classes));
+   auto box_head = std::make_shared<RfDetrMlpImpl>(config_.hidden_dim, config_.hidden_dim, 4, 3);
+   for (auto& parameter : class_head->named_parameters()) parameter.value().copy_(class_parameters[parameter.key()]);
+   for (auto& parameter : box_head->named_parameters()) parameter.value().copy_(box_parameters[parameter.key()]);
+   enc_out_class_embed->push_back(std::move(class_head));
+   enc_out_bbox_embed->push_back(std::move(box_head));
   }
  }
  void set_decoder_bbox_embed(const std::shared_ptr<RfDetrMlpImpl>& bbox_embed) { decoder->set_bbox_embed(bbox_embed); }
@@ -969,6 +1015,7 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
   auto params = bbox->named_parameters(true);
   if (auto* weight = params.find("layers.2.weight")) { weight->zero_(); }
   if (auto* bias = params.find("layers.2.bias")) { bias->zero_(); }
+  std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->initialize_detector_heads(class_embed, *bbox);
  }
  if (training_supervision_enabled(config_.training_supervision)) {
   auto generator = at::detail::getDefaultCPUGenerator();
@@ -990,6 +1037,8 @@ std::vector<detail::ClassTensorAxis> NativeRfDetrModel::Impl::class_axes() const
  return axes;
 }
 std::shared_ptr<torch::nn::Module> test_support::DecoderTailTestAccess::make(int64_t width, int64_t feedforward) { return std::make_shared<NativeDecoderLayerImpl>(width, 2, 2, feedforward, 1, 2); }
+std::shared_ptr<torch::nn::Module> test_support::ProjectorConvTestAccess::make(int64_t channels) { return std::make_shared<ConvXImpl>(channels, channels, 1, 1, 1, true); }
+torch::Tensor test_support::ProjectorConvTestAccess::invoke(torch::nn::Module& module, const torch::Tensor& input) { return dynamic_cast<ConvXImpl&>(module).forward(input); }
 torch::Tensor test_support::DecoderTailTestAccess::invoke(torch::nn::Module& module, const torch::Tensor& residual, const torch::Tensor& cross, bool selective) {
  auto& layer = dynamic_cast<NativeDecoderLayerImpl&>(module);
  layer.prepare_selective(layer.is_training(), selective, residual.size(0));
@@ -1219,7 +1268,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
    }
    if (final_decoder_layer) {
     outputs.main = std::move(layer);
-   } else {
+   } else if (config_.aux_loss) {
     outputs.aux_outputs.push_back(std::move(layer));
    }
    if (outputs.denoising) {
@@ -1280,6 +1329,7 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
  auto parameters = named_parameters(true);
  auto buffers = named_buffers(true);
  const bool transfer = admission == detail::NormalizedModelStateAdmission::FreshTransfer || admission == detail::NormalizedModelStateAdmission::PartialFreshTransfer;
+ const bool partial = admission == detail::NormalizedModelStateAdmission::PartialFreshTransfer || admission == detail::NormalizedModelStateAdmission::PartialExact;
  if (transfer && !source_layout) throw std::invalid_argument("fresh transfer requires the admitted source layout");
  if (transfer) layout_->require_execution(true);
  const auto axes = class_axes();
@@ -1312,6 +1362,12 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
   torch::Tensor* destination = parameters.find(entry.name);
   if (destination == nullptr) { destination = buffers.find(entry.name); }
   if (destination == nullptr) {
+   // Upstream registers this inactive detector buffer even without keypoints.
+   // Accept only its exact empty form; active keypoint state stays unexpected.
+   if (admission != detail::NormalizedModelStateAdmission::Exact && entry.name == "_kp_active_mask" && entry.tensor.defined() && entry.tensor.scalar_type() == torch::kBool &&
+       entry.tensor.dim() == 2 && entry.tensor.size(0) == 0 && entry.tensor.size(1) == 0) continue;
+   if ((admission == detail::NormalizedModelStateAdmission::RequiredCore || (admission == detail::NormalizedModelStateAdmission::FreshTransfer && !training_supervision_)) &&
+       entry.name.starts_with("training_supervision.")) continue;
    candidate.summary.unexpected_names.push_back(entry.name);
    continue;
   }
@@ -1326,8 +1382,11 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
     for (std::int64_t dimension = 0; compatible && dimension < source.dim(); ++dimension)
      if (dimension != axis.dimension && source.size(dimension) != destination->size(dimension)) compatible = false;
     const auto source_classes = classifier ? source_layout->output_width() : source_layout->catalog()->size();
-    if (compatible && known_axis && source.size(axis.dimension) != static_cast<std::int64_t>(source_classes + (boxes ? 4 : 0)))
-     throw std::invalid_argument("class-dependent tensor disagrees with admitted layout: " + entry.name);
+    if (compatible && known_axis && source.size(axis.dimension) != static_cast<std::int64_t>(source_classes + (boxes ? 4 : 0))) {
+     if (partial) throw std::invalid_argument("class-dependent tensor disagrees with admitted layout: " + entry.name);
+     candidate.summary.incompatible_names.push_back(entry.name);
+     continue;
+    }
     if (compatible) {
      auto adapted = destination->detach().clone();
      if (known_axis && source_layout->semantic()) {
@@ -1340,7 +1399,7 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
    }
   }
   if (!source.defined() || source.sizes() != destination->sizes()) {
-   if (axis_by_name.contains(entry.name)) throw std::invalid_argument("class-dependent tensor disagrees with model topology: " + entry.name);
+   if (partial && axis_by_name.contains(entry.name)) throw std::invalid_argument("class-dependent tensor disagrees with model topology: " + entry.name);
    candidate.summary.incompatible_names.push_back(entry.name);
    continue;
   }
@@ -1358,10 +1417,21 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
  std::ranges::sort(candidate.summary.missing_names);
  std::ranges::sort(candidate.summary.unexpected_names);
  std::ranges::sort(candidate.summary.incompatible_names);
- const bool missing_required = std::ranges::any_of(candidate.summary.missing_names, [&](const auto& name) { return !transfer || !name.starts_with("training_supervision."); });
- if (admission != detail::NormalizedModelStateAdmission::PartialFreshTransfer && admission != detail::NormalizedModelStateAdmission::PartialExact &&
-     (missing_required || !candidate.summary.unexpected_names.empty() || !candidate.summary.incompatible_names.empty())) {
-  throw std::runtime_error("normalized RF-DETR model state does not match the model");
+ const bool optional_supervision = transfer || admission == detail::NormalizedModelStateAdmission::RequiredCore;
+ const bool missing_required = std::ranges::any_of(candidate.summary.missing_names, [&](const auto& name) { return !optional_supervision || !name.starts_with("training_supervision."); });
+ if (!partial && (missing_required || !candidate.summary.unexpected_names.empty() || !candidate.summary.incompatible_names.empty())) {
+  std::string message = "normalized RF-DETR model state does not match the model (loaded " + std::to_string(candidate.summary.loaded_names.size()) + ")";
+  const auto append = [&](std::string_view kind, const std::vector<std::string>& names) {
+   if (names.empty()) return;
+   message += "; " + std::string(kind) + " " + std::to_string(names.size()) + ":";
+   constexpr std::size_t displayed_names = 3;
+   for (std::size_t index = 0; index < std::min(displayed_names, names.size()); ++index) message += " " + names[index];
+   if (names.size() > displayed_names) message += " ...";
+  };
+  append("missing", candidate.summary.missing_names);
+  append("unexpected", candidate.summary.unexpected_names);
+  append("incompatible", candidate.summary.incompatible_names);
+  throw ModelStateAdmissionError(std::move(message), std::move(candidate.summary));
  }
  return candidate;
 }

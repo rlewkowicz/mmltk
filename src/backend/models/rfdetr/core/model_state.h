@@ -32,6 +32,14 @@ struct NativeCheckpointMetadata {
  int64_t num_classes = 0;
  int64_t num_queries = 0;
  int64_t num_select = 0;
+ // Explicit external topology facts not recoverable from tensor shapes.
+ // Absent legacy evidence remains absent; resolution checks supplied facts
+ // against the catalog rather than treating them as configuration overrides.
+ std::optional<int64_t> topology_num_windows;
+ std::optional<int64_t> topology_sa_nheads;
+ std::optional<int64_t> topology_ca_nheads;
+ std::optional<bool> topology_bbox_reparam;
+ std::optional<bool> topology_lite_refpoint_refine;
  std::optional<bool> sum_group_losses;
  std::optional<bool> use_varifocal_loss;
  std::optional<bool> use_position_supervised_loss;
@@ -49,9 +57,19 @@ struct NativeCheckpointMetadata {
  std::optional<double> set_cost_giou;
  template <class Self, class Visitor>
  void for_each_detection_field(this Self&& self, Visitor&& visitor) {
+  self.template for_each_field<false>(std::forward<Visitor>(visitor));
+ }
+ template <class Self, class Visitor>
+ void for_each_optional_field(this Self&& self, Visitor&& visitor) {
+  self.template for_each_field<true>(std::forward<Visitor>(visitor));
+ }
+
+private:
+ template <bool IncludeTopology, class Self, class Visitor>
+ void for_each_field(this Self&& self, Visitor&& visitor) {
   template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
    using Field = std::remove_cvref_t<decltype(self.[:member:])>;
-   if constexpr (model_state_detail::is_optional<Field>) {
+   if constexpr (model_state_detail::is_optional<Field> && (IncludeTopology || !std::meta::identifier_of(member).starts_with("topology_"))) {
     constexpr auto name = std::define_static_string(std::meta::identifier_of(member));
     visitor(name, self.[:member:]);
    }

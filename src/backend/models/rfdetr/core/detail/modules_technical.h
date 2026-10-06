@@ -7,6 +7,12 @@
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/model.h"
 namespace mmltk::backend::models::rfdetr {
+namespace test_support {
+struct ProjectorConvTestAccess {
+ static std::shared_ptr<torch::nn::Module> make(int64_t channels);
+ static torch::Tensor invoke(torch::nn::Module& module, const torch::Tensor& input);
+};
+}  // namespace test_support
 torch::Tensor inverse_sigmoid(const torch::Tensor& x, double eps = 1e-5);
 class MlpImpl : public torch::nn::Module {
 public:

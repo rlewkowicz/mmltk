@@ -201,6 +201,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         mmltk_configure_component(
             mmltk_backend_models_rfdetr_checkpoint_test_support
             PRIVATE_DECLARATIONS)
+        mmltk_enable_python_checkpoint_loader(mmltk_backend_models_rfdetr_checkpoint_test_support PRIVATE)
         mmltk_register_retained_module_importers(
             mmltk_backend_models_rfdetr_checkpoint_test_support
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support.cpp

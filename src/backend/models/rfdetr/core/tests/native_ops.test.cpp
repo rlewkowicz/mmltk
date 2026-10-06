@@ -3,6 +3,9 @@
 #include <torch/utils.h>
 #include <torch/nn/functional/vision.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/CPUGeneratorImpl.h>
+#include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
+#include "src/backend/models/rfdetr/core/tests/training_fixture.h"
 // RF-DETR core operation coverage.
 #include <algorithm>
 #include <array>
@@ -704,6 +707,85 @@ TEST_CASE("native inference requests valid optional mask outputs", "[model][rfde
  const auto output = owner.forward(input, true);
  REQUIRE(output.main.pred_masks.has_value());
  CHECK(output.main.pred_masks->size(1) == config.num_queries);
+}
+TEST_CASE("Ordinary auxiliary publication controls criterion inventory and mask draws", "[model][rfdetr][native_ops][parity][compilation]") {
+ namespace rf = mmltk::backend::models::rfdetr;
+ rf::testsupport::MatcherExecutionFixture execution;
+ rf::ScopedRuntimeContext runtime(nullptr, 0, &execution.workspace);
+ const bool segmentation = GENERATE(false, true);
+ const int layers = GENERATE(2, 4);
+ const bool selective = GENERATE(false, true);
+ auto config = rf::native_config_from_preset(rf::model_presets().front());
+ config.resolution = 32;
+ config.segmentation = segmentation;
+ config.num_classes = 3;
+ config.num_queries = config.num_select = 3;
+ config.group_detr = 1;
+ config.dec_layers = layers;
+ rf::NativeRfDetrModel enabled(config);
+ config.aux_loss = false;
+ rf::NativeRfDetrModel disabled(config);
+ std::vector<rf::NormalizedModelStateEntry> state;
+ for (const auto& parameter : enabled.named_parameters()) state.push_back({parameter.key(), parameter.value()});
+ for (const auto& buffer : enabled.named_buffers()) state.push_back({buffer.key(), buffer.value()});
+ disabled.commit_normalized_state(disabled.stage_normalized_state(state, rf::detail::NormalizedModelStateAdmission::RequiredCore));
+ auto targets = make_targets();
+ if (segmentation) targets.packed_masks = pack_dense_masks(torch::eye(32).unsqueeze(0));
+ auto detection = make_config();
+ detection.dec_layers = layers;
+ detection.aux_loss = false;
+ detection.include_masks = segmentation;
+ detection.mask_point_sample_ratio = 4;
+ rf::populate_default_detection_weight_dict(detection);
+ const auto coords = [](int64_t count) { return torch::linspace(.01, .99, count * 2).reshape({1, count, 2}); };
+ const rf::LayerMaskSamples fixed{coords(16), coords(48), coords(4)};
+ const std::array<rf::LayerMaskSamples, 2> reduced_samples{fixed, fixed};
+ const std::vector<rf::LayerMaskSamples> all_samples(static_cast<std::size_t>(layers + 1), fixed);
+ const auto input = rf::NestedTensor{torch::sin(torch::arange(3 * 32 * 32, torch::kFloat32)).reshape({1, 3, 32, 32}), {}};
+ const auto mode = selective ? rf::CompilationMode::kSelective : rf::CompilationMode::kNone;
+ torch::NoGradGuard guard;
+ for (const bool training : {false, true}) {
+  enabled.optimize_for_inference(1, training, mode);
+  disabled.optimize_for_inference(1, training, mode);
+  auto all = enabled.forward(input, segmentation);
+  const auto actual = disabled.forward(input, segmentation);
+  REQUIRE(all.aux_outputs.size() == static_cast<std::size_t>(layers - 1));
+  REQUIRE(actual.aux_outputs.empty());
+  REQUIRE(actual.enc_outputs);
+  CHECK(torch::equal(actual.main.pred_logits, all.main.pred_logits));
+  CHECK(torch::equal(actual.main.pred_boxes, all.main.pred_boxes));
+  CHECK(actual.main.pred_masks.has_value() == (segmentation && !training));
+  CHECK(actual.main.sparse_pred_masks.has_value() == (segmentation && training));
+  CHECK(actual.enc_outputs->pred_masks.has_value() == (segmentation && !training));
+  CHECK(actual.enc_outputs->sparse_pred_masks.has_value() == (segmentation && training));
+  const auto num_boxes = torch::tensor(1.F);
+  const auto fixed_all = rf::detection_loss_dict(all, targets, detection, training, num_boxes, all_samples);
+  const auto fixed_actual = rf::detection_loss_dict(actual, targets, detection, training, num_boxes, reduced_samples);
+  CHECK_FALSE(fixed_actual.contains("loss_ce_0"));
+  CHECK(fixed_actual.contains("loss_ce_enc"));
+  CHECK(torch::equal(rf::weighted_detection_loss(fixed_all, detection, torch::kCPU), rf::weighted_detection_loss(fixed_actual, detection, torch::kCPU)));
+  auto reduced = all;
+  reduced.aux_outputs.clear();
+  for (const bool keyed : {false, true}) {
+   targets.sampling_keys = keyed ? torch::tensor({73}, torch::kInt64) : torch::Tensor{};
+   targets.microbatch_key = 19;
+   auto generator = at::detail::getDefaultCPUGenerator();
+   const auto rng = generator.get_state();
+   const auto expected_losses = rf::detection_loss_dict(reduced, targets, detection, training, num_boxes);
+   const auto expected_rng = generator.get_state();
+   generator.set_state(rng);
+   const auto actual_losses = rf::detection_loss_dict(actual, targets, detection, training, num_boxes);
+   CHECK(torch::equal(expected_rng, generator.get_state()));
+   REQUIRE(actual_losses.size() == expected_losses.size());
+   for (const auto& [name, expected] : expected_losses) CHECK(torch::equal(actual_losses.at(name), expected));
+   if (keyed || !segmentation) CHECK(torch::equal(rng, expected_rng));
+   if (keyed) {
+    const auto keyed_all = rf::detection_loss_dict(all, targets, detection, training, num_boxes);
+    CHECK(torch::equal(keyed_all.at("loss_ce"), actual_losses.at("loss_ce")));
+    if (segmentation) CHECK(torch::equal(keyed_all.at("loss_mask_ce"), actual_losses.at("loss_mask_ce")));
+   }
+  }
+ }
 }
 TEST_CASE("mask materialization follows selected query identity and bounded reusable chunks", "[model][rfdetr][native_ops]") {
  namespace rfdetr = mmltk::backend::models::rfdetr;

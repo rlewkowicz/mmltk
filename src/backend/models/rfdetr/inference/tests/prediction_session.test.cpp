@@ -1898,6 +1898,29 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
  request.progress_bar = false;
  for (int64_t index = 0; index < 7; ++index) request.image_inputs.push_back({image, "frame", index});
  const auto image_inputs = request.image_inputs;
+ // Full production admission rejects storage-only or damaged archives before
+ // it can deliver a result from randomly retained core parameters.
+ for (const int damage : {0, 1, 2}) {
+  auto candidate_entries = checkpoint.entries();
+  if (damage == 0) candidate_entries.clear();
+  else {
+   const auto query = std::ranges::find(candidate_entries, "query_feat.weight", &rfdetr::NormalizedModelStateEntry::name);
+   REQUIRE(query != candidate_entries.end());
+   if (damage == 1) candidate_entries.erase(query);
+   else query->tensor = torch::zeros({1, config.hidden_dim});
+  }
+  rfdetr::DecodedNativeModelState damaged(std::move(candidate_entries));
+  damaged.metadata = checkpoint.metadata;
+  const auto invalid_path = root.path() / ("invalid-" + std::to_string(damage) + ".pt");
+  rfdetr::save_native_checkpoint(invalid_path, damaged);
+  auto invalid_request = request;
+  invalid_request.weights_path = invalid_path;
+  std::size_t delivered = 0;
+  rfdetr::PredictionSession invalid_session;
+  REQUIRE_THROWS(invalid_session.Run(invalid_request, {reinterpret_cast<std::uintptr_t>(stream.get()), true},
+   {.encoded_masks = false, .completed = [&](const auto&, const auto&, const auto&) { ++delivered; }}));
+  CHECK(delivered == 0);
+ }
  for (const auto source : {rfdetr::PredictSourceKind::ImageFiles, rfdetr::PredictSourceKind::CompiledDataset}) {
   request.source_kind = source;
   if (source == rfdetr::PredictSourceKind::ImageFiles) {

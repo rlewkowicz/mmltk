@@ -1,8 +1,11 @@
 #include "src/backend/models/rfdetr/contract/cli.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "checkpoint.h"
 #include "detail/training_snapshot.h"
 #include "detail/checkpoint_private.h"
 #include "src/backend/ml/torch/archive.h"
+#include "src/common/math/checked_arithmetic.h"
+#include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -30,8 +33,36 @@ std::vector<NormalizedModelStateEntry> collect_module_state(const NativeRfDetrMo
 }
 ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel& model, const DecodedNativeModelState& checkpoint, const TrainingSupervisionRoute route) {
  const ResolvedClassLayout source_layout(checkpoint.metadata.class_layout);
- auto candidate = model.stage_normalized_state(
-  checkpoint.entries(), route_is_active(route) ? detail::NormalizedModelStateAdmission::FreshTransfer : detail::NormalizedModelStateAdmission::PartialFreshTransfer, &source_layout);
+ std::vector<NormalizedModelStateEntry> adapted;
+ std::vector<std::string> initialized;
+ const auto* preset = find_preset_catalog_entry(checkpoint.metadata.preset_name);
+ if (!preset) preset = find_preset_catalog_entry(model.config().preset_name);
+ const auto source_queries = checkpoint.metadata.num_queries > 0 ? checkpoint.metadata.num_queries : preset ? preset->query_count : 0;
+ const auto query = std::ranges::find(checkpoint.entries(), "query_feat.weight", &NormalizedModelStateEntry::name);
+ const bool changed_query_rows = query != checkpoint.entries().end() && query->tensor.defined() && query->tensor.dim() == 2 &&
+                                 query->tensor.size(0) != static_cast<int64_t>(model.config().num_queries) * model.config().group_detr;
+ if (!route_is_active(route) && source_queries > 0 && source_queries != model.config().num_queries && (checkpoint.metadata.num_queries > 0 || changed_query_rows)) {
+  // Ordinary transfer historically retained fresh query embeddings when a
+  // dataset/explicit limit changed their count. Preserve that outcome only
+  // after proving the complete source query pair and its group topology.
+  if (!preset || preset->group_count != model.config().group_detr) throw std::invalid_argument("query-count transfer requires an admitted source group topology");
+  const auto source_rows = mmltk::common::math::checked_cast<int64_t>(
+   mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(source_queries), static_cast<std::uint64_t>(preset->group_count), "source query extent overflows"),
+   "source query extent exceeds tensor indexing");
+  adapted = checkpoint.entries();
+  const auto parameters = model.named_parameters();
+  for (const auto name : {"query_feat.weight", "refpoint_embed.weight"}) {
+   const auto source = std::ranges::find(adapted, name, &NormalizedModelStateEntry::name);
+   const auto& destination = parameters[name];
+   if (source == adapted.end() || !source->tensor.defined() || source->tensor.dim() != 2 || source->tensor.size(0) != source_rows || source->tensor.size(1) != destination.size(1))
+    throw std::invalid_argument(std::string("query-count transfer requires complete compatible source tensor: ") + name);
+   source->tensor = destination.detach();
+   initialized.emplace_back(name);
+  }
+ }
+ auto candidate = model.stage_normalized_state(initialized.empty() ? checkpoint.entries() : adapted, detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
+ candidate.summary.initialized_names = std::move(initialized);
+ for (const auto& name : candidate.summary.initialized_names) std::erase(candidate.summary.loaded_names, name);
  auto summary = candidate.summary;
  model.commit_normalized_state(std::move(candidate));
  return summary;

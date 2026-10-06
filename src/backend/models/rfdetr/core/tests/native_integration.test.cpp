@@ -1,5 +1,6 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/models/rfdetr/core/model.h"
 // RF-DETR core integration coverage.
 #include <cstddef>
 #include <cstdint>
@@ -97,6 +98,16 @@ void test_native_rfdetr_cli_checkpoint_smoke() {
    native_path.string(),
   });
   assert_native_checkpoint(native_path, fixture.preset_name);
+  namespace rf = mmltk::backend::models::rfdetr;
+  const auto admitted = rf::resolve_model_state(native_path, fixture.preset_name, fixture.input_size);
+  rf::NativeRfDetrModel model(admitted.artifacts.config);
+  try {
+   static_cast<void>(model.stage_normalized_state(admitted.model_state.entries(), rf::detail::NormalizedModelStateAdmission::RequiredCore));
+   FAIL("the four-tensor storage fixture cannot be admitted as a complete model");
+  } catch (const rf::ModelStateAdmissionError& error) {
+   CHECK(error.summary().loaded_names.size() == 4);
+   CHECK_FALSE(error.summary().missing_names.empty());
+  }
  }
 }
 void test_native_rfdetr_cached_nano_export_pipeline() {

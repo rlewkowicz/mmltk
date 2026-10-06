@@ -73,7 +73,7 @@ void write_native_checkpoint_metadata(torch::serialize::OutputArchive& archive, 
  mmltk::backend::ml::serialization::write_int(archive, "num_classes", metadata.num_classes);
  mmltk::backend::ml::serialization::write_int(archive, "num_queries", metadata.num_queries);
  mmltk::backend::ml::serialization::write_int(archive, "num_select", metadata.num_select);
- metadata.for_each_detection_field([&]<class Optional>(const char* key, const Optional& value) {
+ metadata.for_each_optional_field([&]<class Optional>(const char* key, const Optional& value) {
   if constexpr (std::is_same_v<typename Optional::value_type, bool>)
    mmltk::backend::ml::serialization::write_optional_bool(archive, key, value);
   else if constexpr (std::is_same_v<typename Optional::value_type, int64_t>)
