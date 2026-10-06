@@ -1,7 +1,10 @@
 #pragma once
+#include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
+#include <torch/types.h>
 #include <filesystem>
 #include <cstdint>
 #include <cstddef>
@@ -17,7 +20,8 @@ namespace mmltk::backend::models::rfdetr::testsupport {
 struct OracleTensor final {
  bool defined = false;
  std::vector<int64_t> shape, stride;
- std::string dtype, device;
+ at::ScalarType dtype = at::ScalarType::Undefined;
+ std::string device;
  int64_t finite_count = 0, elements = 0;
 };
 struct OracleArchiveRecord final {
@@ -70,13 +74,15 @@ private:
  std::vector<OracleCase> cases_;
  OracleArchiveRecord resize_;
 };
+// Numerical acceptance is independent of diagnostic paths and artifact keys.
+enum class OracleComparisonPolicy : std::uint8_t { Value, Exact, Derivative, SecondMoment, Hyperparameter };
 // Comparison reports are flushed after every boundary, including failure. A
 // diagnostic stock-policy differential never counts as controlled parity.
 class OracleComparison final {
 public:
  OracleComparison(const std::filesystem::path& root, std::string name, at::ScalarType precision,
   std::string objective = "stock IA-BCE with separately declared FP32 matcher policy");
- void compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, bool policy_difference = false);
+ void compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference = false);
  void inventory(const std::string& boundary, const std::set<std::string>& actual, const std::set<std::string>& expected);
  void fact(const std::string& boundary, const nlohmann::json& value);
 private:

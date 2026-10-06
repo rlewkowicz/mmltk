@@ -2525,6 +2525,7 @@ TEST_CASE("Native compiled training retains routed objectives gradients optimize
 }
 #if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
 TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilation", "[rfdetr][training_supervision][compilation][upstream_oracle][cuda]") {
+ using ComparisonPolicy = rfdetr::testsupport::OracleComparisonPolicy;
  const auto requested = rfdetr::testsupport::UpstreamOracle::requested();
  if (!requested) SKIP("optional official pretrained oracle artifacts not requested; representative recipe remains unexecuted");
  const rfdetr::testsupport::UpstreamOracle oracle(*requested);
@@ -2569,7 +2570,7 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
    {"objective_evidence", "existing independent Match-Free pair-objective and VJP tests; this case composes imported upstream weights with production TrainingStep/CUDA/AdamW"}});
   const auto compare_gradients = [&](const std::string& boundary) {
    const auto other = compiled.named_parameters(true);
-   for (const auto& parameter : eager.named_parameters(true)) comparison.compare(boundary + parameter.key(), other[parameter.key()].grad(), parameter.value().grad());
+   for (const auto& parameter : eager.named_parameters(true)) comparison.compare(boundary + parameter.key(), other[parameter.key()].grad(), parameter.value().grad(), ComparisonPolicy::Derivative);
   };
   // Record and exercise the retained path before the one observed update.
   for (int replay = 0; replay < 3; ++replay) {
@@ -2584,13 +2585,13 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
     retained = compiled.forward_for_match_free({input, mask});
     const auto expected = rfdetr::testsupport::oracle_output_tensors(ordinary), actual = rfdetr::testsupport::oracle_output_tensors(retained);
     REQUIRE(expected.size() == actual.size());
-    for (const auto& [name, value] : expected) comparison.compare("output/" + name, actual.at(name), value);
+    for (const auto& [name, value] : expected) comparison.compare("output/" + name, actual.at(name), value, ComparisonPolicy::Value);
     const rfdetr::DeviceLossNormalizer normalizer{torch::tensor(2.F, input.options())};
     eager_loss = rfdetr::compute_routed_training_loss(eager, rfdetr::TrainingSupervisionRoute::MatchFree, ordinary, targets, normalizer, detection);
     compiled_loss = rfdetr::compute_routed_training_loss(compiled, rfdetr::TrainingSupervisionRoute::MatchFree, retained, targets, normalizer, detection);
     const auto components = [&]<class Value>(this auto&& self, const Value& actual_value, const Value& expected_value, const std::string& path) -> void {
      if constexpr (std::is_same_v<Value, torch::Tensor>) {
-      comparison.compare(path, actual_value, expected_value);
+      comparison.compare(path, actual_value, expected_value, ComparisonPolicy::Value);
      } else if constexpr (std::is_same_v<Value, rfdetr::TensorMap>) {
       REQUIRE(actual_value.size() == expected_value.size());
       for (const auto& [name, tensor] : expected_value) self(actual_value.at(name), tensor, path + "/" + name);
@@ -2603,7 +2604,7 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
       }
      }
     };
-    comparison.compare("loss/total", compiled_loss.total, eager_loss.total);
+    comparison.compare("loss/total", compiled_loss.total, eager_loss.total, ComparisonPolicy::Value);
     components(compiled_loss, eager_loss, "components");
    });
    step.backward(eager_loss.total);
@@ -2615,7 +2616,7 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
    for (const auto& parameter : optimizer.parameters()) if (parameter.grad().defined()) norms.push_back(parameter.grad().norm());
    return torch::stack(norms).norm();
   };
-  comparison.compare("clip_norm", gradient_norm(compiled_optimizer.optimizer), gradient_norm(eager_optimizer.optimizer));
+  comparison.compare("clip_norm", gradient_norm(compiled_optimizer.optimizer), gradient_norm(eager_optimizer.optimizer), ComparisonPolicy::Value);
   eager_optimizer.optimizer.clip_grad_norm_(.1);
   compiled_optimizer.optimizer.clip_grad_norm_(.1);
   compare_gradients("clipped/");
@@ -2626,8 +2627,8 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
   compiled_optimizer.optimizer.step();
   const auto actual = compiled.named_parameters(true);
   for (const auto& parameter : eager.named_parameters(true)) {
-   comparison.compare("updated/" + parameter.key(), actual[parameter.key()], parameter.value());
-   comparison.compare("update/" + parameter.key(), actual[parameter.key()].detach() - compiled_before.at(parameter.key()), parameter.value().detach() - ordinary_before.at(parameter.key()));
+   comparison.compare("updated/" + parameter.key(), actual[parameter.key()], parameter.value(), ComparisonPolicy::Value);
+   comparison.compare("update/" + parameter.key(), actual[parameter.key()].detach() - compiled_before.at(parameter.key()), parameter.value().detach() - ordinary_before.at(parameter.key()), ComparisonPolicy::Derivative);
   }
   REQUIRE_FALSE(torch::equal(ordinary_before.at("class_embed.weight"), eager.named_parameters(true)["class_embed.weight"]));
  }

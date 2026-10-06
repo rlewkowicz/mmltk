@@ -1,8 +1,10 @@
 #include "checkpoint_fixture_support/upstream_oracle_fixture.h"
+#include "src/backend/ml/torch/scalar_type.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/tests/training_fixture.h"
 #include "src/common/io/file_digest.h"
 #include <caffe2/serialize/inline_container.h>
+#include <c10/core/ScalarType.h>
 #include <torch/csrc/jit/serialization/import_read.h>
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/version.h>
@@ -30,13 +32,27 @@ std::filesystem::path child(const std::filesystem::path& parent, const std::stri
 void verify_hash(const std::filesystem::path& file, const std::string& hash) {
  if (hash.size() != 64 || mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(file)) != hash) invalid("SHA256 mismatch: " + file.string());
 }
+at::ScalarType oracle_dtype(at::ScalarType dtype) {
+ // The v1 oracle admits a strict subset of the shared scalar vocabulary.
+ switch (dtype) {
+  case at::kFloat: case at::kHalf: case at::kBFloat16: case at::kDouble:
+  case at::kLong: case at::kInt: case at::kByte: case at::kBool: return dtype;
+  default: invalid("unsupported tensor dtype");
+ }
+}
+at::ScalarType oracle_dtype(std::string_view external_name) {
+ if (!external_name.starts_with("torch.")) invalid("unsupported manifest tensor dtype");
+ try {
+  return oracle_dtype(mmltk::backend::ml::serialization::scalar_type_from_name(external_name.substr(6)));
+ } catch (const std::runtime_error&) {
+  invalid("unsupported manifest tensor dtype");
+ }
+}
+std::string dtype_name(at::ScalarType dtype) {
+ return "torch." + mmltk::backend::ml::serialization::scalar_type_name(oracle_dtype(dtype));
+}
 std::uint64_t tensor_bytes(const OracleTensor& tensor) {
- std::uint64_t width = 0;
- if (tensor.dtype == "torch.float64" || tensor.dtype == "torch.int64") width = 8;
- else if (tensor.dtype == "torch.float32" || tensor.dtype == "torch.int32") width = 4;
- else if (tensor.dtype == "torch.float16" || tensor.dtype == "torch.bfloat16") width = 2;
- else if (tensor.dtype == "torch.uint8" || tensor.dtype == "torch.bool") width = 1;
- else invalid("unsupported manifest tensor dtype");
+ std::uint64_t width = c10::elementSize(oracle_dtype(tensor.dtype));
  std::uint64_t product = 1;
  bool empty = false;
  for (const auto dimension : tensor.shape) {
@@ -49,7 +65,7 @@ std::uint64_t tensor_bytes(const OracleTensor& tensor) {
  if (empty) product = 0;
  if (product != static_cast<std::uint64_t>(tensor.elements)) invalid("tensor element count mismatch");
  // Floating archives include one boolean finite mask per value.
- if (tensor.dtype.starts_with("torch.float") || tensor.dtype == "torch.bfloat16") ++width;
+ if (c10::isFloatingType(tensor.dtype)) ++width;
  if (product > kArchiveLimit / width) invalid("unbounded tensor storage");
  return product * width;
 }
@@ -67,7 +83,7 @@ OracleArchiveRecord archive_record(const Json& value) {
   if (tensor.defined) {
    tensor.shape = item.at("shape").get<std::vector<int64_t>>();
    tensor.stride = item.at("stride").get<std::vector<int64_t>>();
-   tensor.dtype = item.at("dtype").get<std::string>();
+   tensor.dtype = oracle_dtype(item.at("dtype").get<std::string>());
    tensor.device = item.at("device").get<std::string>();
    tensor.finite_count = item.at("finite_count").get<int64_t>();
    tensor.elements = item.at("elements").get<int64_t>();
@@ -80,19 +96,6 @@ OracleArchiveRecord archive_record(const Json& value) {
   result.tensors.emplace(name, std::move(tensor));
  }
  return result;
-}
-std::string dtype_name(at::ScalarType dtype) {
- switch (dtype) {
-  case torch::kFloat32: return "torch.float32";
-  case torch::kFloat16: return "torch.float16";
-  case torch::kBFloat16: return "torch.bfloat16";
-  case torch::kFloat64: return "torch.float64";
-  case torch::kInt64: return "torch.int64";
-  case torch::kInt32: return "torch.int32";
-  case torch::kUInt8: return "torch.uint8";
-  case torch::kBool: return "torch.bool";
-  default: invalid("unsupported tensor dtype");
- }
 }
 std::set<std::string> keys(const TensorMap& values) {
  std::set<std::string> result;
@@ -147,7 +150,7 @@ OracleArchive::OracleArchive(const std::filesystem::path& directory, const Oracl
   expected.insert(name);
   if (!dictionary.contains(name) || !dictionary.at(name).isTensor()) invalid("missing tensor: " + name);
   const auto tensor = dictionary.at(name).toTensor();
-  if (tensor.sizes().vec() != spec.shape || tensor.numel() != spec.elements || dtype_name(tensor.scalar_type()) != spec.dtype || !tensor.is_cpu()) invalid("tensor metadata mismatch: " + name);
+  if (tensor.sizes().vec() != spec.shape || tensor.numel() != spec.elements || tensor.scalar_type() != spec.dtype || !tensor.is_cpu()) invalid("tensor metadata mismatch: " + name);
   const auto finite = torch::isfinite(tensor);
   if (finite.sum().item<int64_t>() != spec.finite_count) invalid("finite inventory mismatch: " + name);
   if (tensor.is_floating_point()) {
@@ -300,7 +303,7 @@ void OracleComparison::inventory(const std::string& boundary, const std::set<std
  record({{"boundary", boundary}, {"actual", actual}, {"expected", expected}, {"passed", match}, {"first_difference", !match && !failed_}});
  if (!match) { failed_ = true; invalid("first differing inventory: " + boundary); }
 }
-void OracleComparison::compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, bool policy_difference) {
+void OracleComparison::compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference) {
  Json result{{"boundary", boundary}, {"policy_difference", policy_difference}, {"actual_defined", actual.defined()}, {"expected_defined", expected.defined()}};
  bool passed = actual.defined() == expected.defined();
  if (actual.defined() && expected.defined()) {
@@ -316,16 +319,16 @@ void OracleComparison::compare(const std::string& boundary, const torch::Tensor&
    if (a.is_floating_point() && b.is_floating_point()) finite_equal &= torch::equal(torch::isnan(a), torch::isnan(b)) && torch::equal(torch::isposinf(a), torch::isposinf(b)) && torch::equal(torch::isneginf(a), torch::isneginf(b));
    const bool all_finite = finite.all().item<bool>();
    result["finite_equal"] = finite_equal; result["all_finite"] = all_finite; passed &= finite_equal && all_finite;
-   if (!a.is_floating_point() || boundary.ends_with("/step") || boundary.ends_with("/point_coords")) {
+   if (!a.is_floating_point() || policy == OracleComparisonPolicy::Exact) {
     passed &= torch::equal(a, b); result["discrete_equal"] = torch::equal(a, b);
    } else if (a.numel() && finite_equal) {
     const auto av = a.to(torch::kFloat64).masked_select(finite), bv = b.to(torch::kFloat64).masked_select(finite);
     if (av.numel()) {
      const auto difference = av - bv;
-     const bool hyperparameter = boundary.starts_with("parameter-group/");
+     const bool hyperparameter = policy == OracleComparisonPolicy::Hyperparameter;
      if (hyperparameter) passed &= torch::equal(av.masked_select(bv.eq(0)), bv.masked_select(bv.eq(0)));
-     const bool second_moment = boundary.ends_with("/exp_avg_sq");
-     const bool derivative = boundary.find("gradient/") != std::string::npos || boundary.find("vjp/") != std::string::npos || boundary.find("clipped/") != std::string::npos || boundary.find("update/") != std::string::npos || boundary.ends_with("/exp_avg") || second_moment;
+     const bool second_moment = policy == OracleComparisonPolicy::SecondMoment;
+     const bool derivative = policy == OracleComparisonPolicy::Derivative || second_moment;
      const double relative = hyperparameter ? 8 * std::numeric_limits<double>::epsilon() : precision_ == torch::kFloat32 ? (derivative ? .002 : .0003) : precision_ == torch::kFloat16 ? .015 : .03;
      const double absolute = hyperparameter ? 0. : second_moment ? 1e-12 : derivative ? 1e-7 : precision_ == torch::kFloat32 ? 2e-5 : 2e-3;
      const double maximum = difference.abs().max().item<double>(), norm = difference.norm().item<double>();
@@ -412,9 +415,9 @@ void compare_oracle_outputs(OracleComparison& comparison, const OracleArchive& a
  comparison.inventory(prefix + "encoder identity inventory", indices, archive.names(prefix + "encoder/"));
  for (std::size_t group = 0; group < encoder_indices.size(); ++group) {
   const auto name = prefix + "encoder/" + std::to_string(group);
-  comparison.compare(name, encoder_indices[group], archive.tensor(name));
+  comparison.compare(name, encoder_indices[group], archive.tensor(name), OracleComparisonPolicy::Exact);
  }
- for (const auto& [name, value] : tensors) comparison.compare(prefix + "output/" + name, value, archive.tensor(prefix + "output/" + name));
+ for (const auto& [name, value] : tensors) comparison.compare(prefix + "output/" + name, value, archive.tensor(prefix + "output/" + name), OracleComparisonPolicy::Value);
 }
 void compare_oracle_vjp(OracleComparison& comparison, const OracleArchive& archive, NativeRfDetrModel& model, const ModelOutputs& outputs, const torch::Tensor& input, bool retain_graph) {
  const auto tensors = oracle_output_tensors(outputs);
@@ -429,6 +432,6 @@ void compare_oracle_vjp(OracleComparison& comparison, const OracleArchive& archi
  for (const auto& entry : model.named_parameters(true)) if (entry.value().requires_grad()) { names.push_back("parameter/" + entry.key()); operands.push_back(entry.value()); }
  comparison.inventory("VJP inventory", {names.begin(), names.end()}, archive.names("vjp/"));
  const auto gradients = torch::autograd::grad({scalar}, operands, {}, retain_graph, false, true);
- for (std::size_t i = 0; i < names.size(); ++i) comparison.compare("vjp/" + names[i], gradients[i], archive.tensor("vjp/" + names[i]));
+ for (std::size_t i = 0; i < names.size(); ++i) comparison.compare("vjp/" + names[i], gradients[i], archive.tensor("vjp/" + names[i]), OracleComparisonPolicy::Derivative);
 }
 }  // namespace mmltk::backend::models::rfdetr::testsupport

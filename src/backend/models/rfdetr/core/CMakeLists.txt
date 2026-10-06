@@ -215,8 +215,11 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
             mmltk_backend_models_rfdetr_checkpoint_test_support
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/asset_cache_support.h
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/checkpoint_fixture_support.h
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/parity_fixture_support.h
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/upstream_oracle_fixture.h)
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/parity_fixture_support.h)
+        mmltk_register_public_headers(
+            mmltk_backend_models_rfdetr_checkpoint_test_support
+            BASE_DIRS ${CMAKE_SOURCE_DIR}
+            FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support/upstream_oracle_fixture.h)
         target_include_directories(
             mmltk_backend_models_rfdetr_checkpoint_test_support
             PUBLIC
@@ -228,10 +231,13 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
             mmltk_backend_models_rfdetr_checkpoint_test_support
             PUBLIC
                 mmltk::backend::models::rfdetr::core
+                mmltk::backend::models::rfdetr::contract
                 mmltk::common::io
                 nlohmann_json
             PRIVATE
-                mmltk::backend::ml::torch_dependencies)
+                mmltk::backend::ml::torch
+                mmltk_backend_models_rfdetr_training_fixture)
+        mmltk_register_header_isolation(mmltk_backend_models_rfdetr_checkpoint_test_support)
     endif()
 
     set(sources
