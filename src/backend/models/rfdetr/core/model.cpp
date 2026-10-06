@@ -2,11 +2,7 @@
 #include <ATen/CPUGeneratorImpl.h>
 #include <cuda_runtime_api.h>
 #include <ATen/TensorIndexing.h>
-#include <ATen/ops/scaled_dot_product_attention.h>
-#include <torch/csrc/jit/api/function_impl.h>
-#include <torch/csrc/jit/frontend/tracer.h>
 #include <torch/nn/functional.h>
-#include <torch/script.h>
 #include <torch/torch.h>
 #include <algorithm>
 #include <array>
@@ -14,6 +10,9 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <meta>
+#include <type_traits>
+#include <span>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -28,6 +27,7 @@
 #include "detail/class_tensor_axes.h"
 #include "detail/decoder_attention.h"
 #include "detail/selective_compilation.h"
+#include "detail/tensor_trace.h"
 #include "detail/modules_technical.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
@@ -54,6 +54,7 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  };
  std::shared_ptr<const ImmutableWeights> immutable_weights_;
  bool force_pytorch_deformable_attn_ = false;
+ bool force_math_attention_ = false;
  void require_mutable() const {
   if (immutable_weights_) throw std::logic_error("immutable inference weights cannot be mutated");
  }
@@ -84,6 +85,7 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  void import_training_supervision_runtime(const TrainingSupervisionRuntimeState& state);
  [[nodiscard]] std::vector<detail::ClassTensorAxis> class_axes() const;
  ModelOutputs forward_impl(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising = nullptr);
+ ModelOutputs forward_ordinary(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising);
  ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity);
  NativeRfDetrConfig config_;
  torch::nn::ModuleList backbone_{nullptr};
@@ -94,10 +96,8 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  torch::nn::Embedding query_feat{nullptr};
  std::shared_ptr<torch::nn::Module> segmentation_head_;
  std::shared_ptr<TrainingSupervisionImpl> training_supervision_;
- bool is_compiled_eval_ = false;
- bool is_compiled_train_ = false;
- torch::jit::Module traced_model_eval_;
- torch::jit::Module traced_model_train_;
+ detail::TensorTrace full_trace_{"full_model"};
+ std::array<ModelOutputs, 2> full_output_layout_;
  detail::SelectiveTensorRegion backbone_region_{"backbone"};
 };
 namespace {
@@ -321,6 +321,7 @@ private:
 TORCH_MODULE(WindowedDinov2Embeddings);
 class Dinov2SelfAttentionImpl : public torch::nn::Module {
 public:
+ bool force_math_attention_ = false;
  Dinov2SelfAttentionImpl()
      : query(register_module("query", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))),
        key(register_module("key", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))),
@@ -334,7 +335,7 @@ public:
   auto key_layer = reshape(key->forward(hidden_states));
   auto value_layer = reshape(value->forward(hidden_states));
   const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
-  auto context = at::scaled_dot_product_attention(query_layer, key_layer, value_layer, c10::nullopt, 0.0, false, scale);
+  auto context = model_scaled_dot_product_attention(query_layer, key_layer, value_layer, {}, scale, force_math_attention_);
   return context.permute({0, 2, 1, 3}).contiguous().view({batch, seq_len, kDinoHiddenSize});
  }
 
@@ -639,6 +640,7 @@ public:
 TORCH_MODULE(MSDeformAttn);
 class NativeDecoderLayerImpl : public torch::nn::Module {
 public:
+ bool force_math_attention_ = false;
  NativeDecoderLayerImpl(int64_t d_model, int64_t sa_nhead, int64_t ca_nhead, int64_t dim_feedforward, int64_t num_feature_levels, int64_t dec_n_points)
      : self_attn(register_module("self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(d_model, sa_nhead).dropout(0.0)))),
        norm1(register_module("norm1", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))),
@@ -649,7 +651,7 @@ public:
        norm3(register_module("norm3", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))) {}
  torch::Tensor forward(const torch::Tensor& tgt, const torch::Tensor& memory, const torch::Tensor& memory_key_padding_mask, const torch::Tensor& query_pos, const torch::Tensor& reference_points,
   const FeatureLayout& feature_layout, const DecoderQueryLayout& query_layout) {
-  const auto attended = isolated_group_self_attention(self_attn, tgt, query_pos, query_layout);
+  const auto attended = isolated_group_self_attention(self_attn, tgt, query_pos, query_layout, force_math_attention_);
   auto output = norm1->forward(tgt + attended);
   auto cross = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
   return post_cross_attention(output, cross);
@@ -1059,7 +1061,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_with_denoising(const NestedTensor&
  if (!is_training() || !training_supervision_ || !training_supervision_->denoising_enabled() || !training_supervision_->initialized()) {
   throw std::runtime_error("DN forward requires active initialized training supervision");
  }
- if (is_compiled_train_) { throw std::runtime_error("full-trace RF-DETR cannot consume target-dependent DN queries"); }
+ if (full_trace_.enabled(true)) { throw std::runtime_error("full-trace RF-DETR cannot consume target-dependent DN queries"); }
  auto denoising = training_supervision_->prepare_denoising(targets, identity, batch.tensors.device(), query_feat->weight.scalar_type());
  return forward_impl(batch, config_.segmentation, training_supervision_->match_free_enabled(), denoising ? &*denoising : nullptr);
 }
@@ -1106,62 +1108,64 @@ void NativeRfDetrModel::Impl::end_criterion_timing() {
  if (training_supervision_) training_supervision_->end_criterion_timing();
 }
 SupervisionTimingHandoff NativeRfDetrModel::Impl::harvest_supervision_timing() { return training_supervision_ ? training_supervision_->harvest_timing() : SupervisionTimingHandoff{}; }
-ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, const bool include_masks, const bool capture_match_free_features, const DenoisingQueryBatch* denoising) {
- const bool is_train = is_training();
- if (capture_match_free_features && ((is_train && is_compiled_train_) || (!is_train && is_compiled_eval_))) { throw std::runtime_error("full-trace RF-DETR cannot capture Match-Free query features"); }
- if ((is_train && is_compiled_train_) || (!is_train && is_compiled_eval_)) {
-  std::vector<torch::jit::IValue> inputs;
-  inputs.emplace_back(batch.tensors);
-  if (batch.mask.defined()) {
-   inputs.emplace_back(batch.mask);
-  } else {
-   inputs.emplace_back(torch::zeros({batch.tensors.size(0), batch.tensors.size(2), batch.tensors.size(3)}, torch::TensorOptions().dtype(torch::kBool).device(batch.tensors.device())));
-  }
-  auto& target_model = is_train ? traced_model_train_ : traced_model_eval_;
-  auto out_dict = target_model.forward(inputs).toGenericDict();
-  ModelOutputs outputs;
-  outputs.main.pred_logits = out_dict.at("pred_logits").toTensor();
-  outputs.main.pred_boxes = out_dict.at("pred_boxes").toTensor();
-  if (include_masks && out_dict.contains("pred_masks")) { outputs.main.pred_masks = out_dict.at("pred_masks").toTensor(); }
-  if (out_dict.contains("sparse_spatial")) {
-   SparsePredMasks sparse;
-   sparse.spatial_features = out_dict.at("sparse_spatial").toTensor();
-   sparse.query_features = out_dict.at("sparse_query").toTensor();
-   sparse.bias = out_dict.at("sparse_bias").toTensor();
-   outputs.main.sparse_pred_masks = std::move(sparse);
-  }
-  if (out_dict.contains("enc_logits")) {
-   OutputLayer enc_out;
-   enc_out.pred_logits = out_dict.at("enc_logits").toTensor();
-   enc_out.pred_boxes = out_dict.at("enc_boxes").toTensor();
-   if (include_masks && out_dict.contains("enc_masks")) { enc_out.pred_masks = out_dict.at("enc_masks").toTensor(); }
-   if (out_dict.contains("enc_sparse_spatial")) {
-    SparsePredMasks sparse;
-    sparse.spatial_features = out_dict.at("enc_sparse_spatial").toTensor();
-    sparse.query_features = out_dict.at("enc_sparse_query").toTensor();
-    sparse.bias = out_dict.at("enc_sparse_bias").toTensor();
-    enc_out.sparse_pred_masks = std::move(sparse);
-   }
-   outputs.enc_outputs = std::move(enc_out);
-  }
-  for (size_t i = 0;; ++i) {
-   std::string key_logits = "aux_logits_" + std::to_string(i);
-   if (!out_dict.contains(key_logits)) { break; }
-   OutputLayer aux_out;
-   aux_out.pred_logits = out_dict.at(key_logits).toTensor();
-   aux_out.pred_boxes = out_dict.at("aux_boxes_" + std::to_string(i)).toTensor();
-   if (include_masks && out_dict.contains("aux_masks_" + std::to_string(i))) { aux_out.pred_masks = out_dict.at("aux_masks_" + std::to_string(i)).toTensor(); }
-   if (out_dict.contains("aux_sparse_spatial_" + std::to_string(i))) {
-    SparsePredMasks sparse;
-    sparse.spatial_features = out_dict.at("aux_sparse_spatial_" + std::to_string(i)).toTensor();
-    sparse.query_features = out_dict.at("aux_sparse_query_" + std::to_string(i)).toTensor();
-    sparse.bias = out_dict.at("aux_sparse_bias_" + std::to_string(i)).toTensor();
-    aux_out.sparse_pred_masks = std::move(sparse);
-   }
-   outputs.aux_outputs.push_back(std::move(aux_out));
-  }
-  return outputs;
+namespace {
+// Structural projection of the canonical output records. Optional presence and
+// vector lengths belong to the ordinary model; no second tensor inventory or
+// string-keyed wire vocabulary is maintained by compilation.
+template <class Value, class Visitor>
+void visit_output_tensors(Value& value, Visitor&& visitor) {
+ if constexpr (std::is_same_v<Value, torch::Tensor>) {
+  visitor(value);
+ } else if constexpr (requires { value.has_value(); }) {
+  if (value) visit_output_tensors(*value, visitor);
+ } else if constexpr (requires { value.begin(); value.end(); }) {
+  for (auto& element : value) visit_output_tensors(element, visitor);
+ } else if constexpr (std::is_class_v<Value>) {
+  constexpr auto members = std::define_static_array(std::meta::nonstatic_data_members_of(^^Value, std::meta::access_context::current()));
+  template for (constexpr auto member : members) { visit_output_tensors(value.[:member:], visitor); }
+ } else {
+  static_assert(std::is_arithmetic_v<Value>);
  }
+}
+}
+ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising) {
+ const bool training = is_training();
+ if (!full_trace_.enabled(training)) return forward_ordinary(batch, include_masks, capture_match_free_features, denoising);
+ if (capture_match_free_features) throw std::runtime_error("full-trace RF-DETR cannot capture Match-Free query features");
+ if (denoising) throw std::runtime_error("full-trace RF-DETR cannot consume target-dependent DN queries");
+ // Missing masks remain missing in the signature; the ordinary path supplies
+ // its own zeros during recording, so mask-presence changes cannot reuse it.
+ detail::SelectiveTensorRegion::Tensors inputs{batch.tensors};
+ if (batch.mask.defined()) inputs.push_back(batch.mask);
+ std::optional<ModelOutputs> ordinary_outputs;
+ std::optional<ModelOutputs> candidate_layout;
+ const auto values = full_trace_.invoke(training, {inputs.data(), inputs.size()}, {this}, [&](std::span<const torch::Tensor> arguments) {
+  ordinary_outputs = forward_ordinary({arguments.front(), arguments.size() == 2 ? arguments[1] : torch::Tensor{}}, include_masks, false, nullptr);
+  candidate_layout = *ordinary_outputs;
+  std::vector<c10::IValue> packed;
+  visit_output_tensors(*candidate_layout, [&](torch::Tensor& tensor) {
+   TORCH_CHECK(tensor.defined(), "full-trace output inventory contains an undefined tensor");
+   packed.emplace_back(tensor);
+   tensor = {};
+  });
+  return c10::IValue(c10::ivalue::Tuple::create(std::move(packed)));
+ }, include_masks ? 1U : 0U);
+ if (ordinary_outputs) {
+  if (values.recorded && candidate_layout) full_output_layout_[training] = std::move(*candidate_layout);
+  return std::move(*ordinary_outputs);
+ }
+ auto output = full_output_layout_[training];
+ const auto& tensors = values.output.toTupleRef().elements();
+ std::size_t index = 0;
+ visit_output_tensors(output, [&](torch::Tensor& tensor) {
+  TORCH_CHECK(index < tensors.size(), "full-trace output inventory is incomplete");
+  tensor = tensors[index++].toTensor();
+ });
+ TORCH_CHECK(index == tensors.size(), "full-trace output inventory has unexpected tensors");
+ return output;
+}
+ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(const NestedTensor& batch, const bool include_masks, const bool capture_match_free_features, const DenoisingQueryBatch* denoising) {
+ const bool is_train = is_training();
  mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward{"rfdetr.model.forward"};
  if (!batch.tensors.defined()) { throw std::runtime_error("NativeRfDetrModel::forward requires batch.tensors"); }
  NestedTensor samples = batch;
@@ -1485,14 +1489,6 @@ void NativeRfDetrModel::Impl::commit_normalized_state(detail::NormalizedModelSta
   throw;
  }
 }
-namespace {
-// Full-model tracing and ONNX export both drive the model with a zero batch shaped like real input and bound to
-// the model's own parameter device and dtype; that probe input has one definition.
-torch::Tensor make_dummy_pixel_values(const torch::nn::Module& model, const int64_t resolution, const int64_t batch_size) {
- const torch::Tensor reference = model.parameters().front();
- return torch::zeros({batch_size, 3, resolution, resolution}, torch::TensorOptions().dtype(reference.dtype()).device(reference.device()));
-}
-}  // namespace
 void NativeRfDetrModel::Impl::optimize_for_inference(int batch_size, bool for_training, CompilationMode mode) {
  this->train(for_training);
  const bool selective = mode == CompilationMode::kSelective;
@@ -1502,75 +1498,7 @@ void NativeRfDetrModel::Impl::optimize_for_inference(int batch_size, bool for_tr
   if (auto* layer = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) layer->prepare_selective(for_training, selective, batch_size);
   if (auto* head = dynamic_cast<SegmentationHeadImpl*>(module.get())) head->prepare_selective(for_training, selective, batch_size);
  }
- auto& full_compiled = for_training ? is_compiled_train_ : is_compiled_eval_;
- if (mode != CompilationMode::kFullTrace) {
-  full_compiled = false;
-  return;
- }
- if (full_compiled) return;
- auto device = this->parameters().front().device();
- auto dummy_pixel_values = make_dummy_pixel_values(*this, config_.resolution, batch_size);
- mmltk::common::logging::info([&](auto& logger) { logger.info("rfdetr: compiling entire model {} graph via torch::jit...", for_training ? "training" : "evaluation"); });
- auto dummy_mask = torch::zeros({batch_size, config_.resolution, config_.resolution}, torch::TensorOptions().dtype(torch::kBool).device(device));
- auto cu = std::make_shared<torch::jit::CompilationUnit>();
- auto cls_name = for_training ? "__torch__.NativeRfDetrModelTrain" : "__torch__.NativeRfDetrModelEval";
- auto cls = torch::jit::ClassType::create(cls_name, cu, true);
- torch::jit::Module* target_traced_model = for_training ? &traced_model_train_ : &traced_model_eval_;
- *target_traced_model = torch::jit::Module(cu, cls);
- for (const auto& kv : this->named_parameters(true)) {
-  std::string name = kv.key();
-  std::replace(name.begin(), name.end(), '.', '_');
-  target_traced_model->register_parameter(name, kv.value(), false);
- }
- for (const auto& kv : this->named_buffers(true)) {
-  std::string name = kv.key();
-  std::replace(name.begin(), name.end(), '.', '_');
-  target_traced_model->register_buffer(name, kv.value());
- }
- std::pair<std::shared_ptr<torch::jit::tracer::TracingState>, torch::jit::Stack> trace_res;
- {
-  trace_res = torch::jit::tracer::trace({dummy_pixel_values, dummy_mask}, [&](torch::jit::Stack args) -> torch::jit::Stack {
-   auto outputs = this->forward(NestedTensor{args[0].toTensor(), args[1].toTensor()});
-   c10::Dict<std::string, torch::Tensor> dict;
-   dict.insert("pred_logits", outputs.main.pred_logits);
-   dict.insert("pred_boxes", outputs.main.pred_boxes);
-   if (outputs.main.pred_masks) { dict.insert("pred_masks", *outputs.main.pred_masks); }
-   if (outputs.main.sparse_pred_masks) {
-    dict.insert("sparse_spatial", outputs.main.sparse_pred_masks->spatial_features);
-    dict.insert("sparse_query", outputs.main.sparse_pred_masks->query_features);
-    dict.insert("sparse_bias", outputs.main.sparse_pred_masks->bias);
-   }
-   if (outputs.enc_outputs) {
-    dict.insert("enc_logits", outputs.enc_outputs->pred_logits);
-    dict.insert("enc_boxes", outputs.enc_outputs->pred_boxes);
-    if (outputs.enc_outputs->pred_masks) { dict.insert("enc_masks", *outputs.enc_outputs->pred_masks); }
-    if (outputs.enc_outputs->sparse_pred_masks) {
-     dict.insert("enc_sparse_spatial", outputs.enc_outputs->sparse_pred_masks->spatial_features);
-     dict.insert("enc_sparse_query", outputs.enc_outputs->sparse_pred_masks->query_features);
-     dict.insert("enc_sparse_bias", outputs.enc_outputs->sparse_pred_masks->bias);
-    }
-   }
-   for (size_t i = 0; i < outputs.aux_outputs.size(); ++i) {
-    dict.insert("aux_logits_" + std::to_string(i), outputs.aux_outputs[i].pred_logits);
-    dict.insert("aux_boxes_" + std::to_string(i), outputs.aux_outputs[i].pred_boxes);
-    if (outputs.aux_outputs[i].pred_masks) { dict.insert("aux_masks_" + std::to_string(i), *outputs.aux_outputs[i].pred_masks); }
-    if (outputs.aux_outputs[i].sparse_pred_masks) {
-     dict.insert("aux_sparse_spatial_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->spatial_features);
-     dict.insert("aux_sparse_query_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->query_features);
-     dict.insert("aux_sparse_bias_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->bias);
-    }
-   }
-   torch::jit::Stack result;
-   result.emplace_back(std::move(dict));
-   return result;
-  }, [](const torch::autograd::Variable&) { return ""; }, false, false, target_traced_model);
- }
- target_traced_model->type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
- if (for_training) {
-  is_compiled_train_ = true;
- } else {
-  is_compiled_eval_ = true;
- }
+ full_trace_.prepare(for_training, mode == CompilationMode::kFullTrace, batch_size);
 }
 void NativeRfDetrModel::Impl::set_force_pytorch_deformable_attn(bool value) {
  force_pytorch_deformable_attn_ = value;
@@ -1596,8 +1524,7 @@ void NativeRfDetrModel::eval() { impl_->eval(); }
 bool NativeRfDetrModel::is_training() const noexcept { return impl_->is_training(); }
 void NativeRfDetrModel::invalidate_compilation() {
  impl_->backbone_region_.invalidate();
- impl_->is_compiled_train_ = false;
- impl_->is_compiled_eval_ = false;
+ impl_->full_trace_.invalidate();
  for (const auto& module : impl_->modules(false)) {
   if (auto* layer = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) layer->invalidate_selective();
   if (auto* head = dynamic_cast<SegmentationHeadImpl*>(module.get())) head->invalidate_selective();
@@ -1633,6 +1560,7 @@ std::shared_ptr<NativeRfDetrModel> NativeRfDetrModel::make_inference_clone(std::
  } restore_generator;
  auto clone = std::make_shared<NativeRfDetrModel>(config(), class_layout()->record());
  clone->set_force_pytorch_deformable_attn(impl_->force_pytorch_deformable_attn_);
+ clone->set_force_math_attention(impl_->force_math_attention_);
  const auto source_device = impl_->parameters().front().device();
  try {
   clone->replicate_training_supervision_runtime_from(*this);
@@ -1714,7 +1642,25 @@ void NativeRfDetrModel::configure_supervision_timing(const SupervisionTimingSetu
  return impl_->stage_normalized_state(state, admission, source_layout, query_retention);
 }
 void NativeRfDetrModel::commit_normalized_state(detail::NormalizedModelStateCandidate candidate) { impl_->commit_normalized_state(std::move(candidate)); }
-void NativeRfDetrModel::set_force_pytorch_deformable_attn(bool value) { impl_->set_force_pytorch_deformable_attn(value); }
+void NativeRfDetrModel::set_force_pytorch_deformable_attn(bool value) {
+ if (impl_->force_pytorch_deformable_attn_ == value) return;
+ invalidate_compilation();
+ impl_->set_force_pytorch_deformable_attn(value);
+}
+void NativeRfDetrModel::set_force_math_attention(bool value) {
+ if (impl_->force_math_attention_ == value) return;
+ invalidate_compilation();
+ impl_->force_math_attention_ = value;
+ for (const auto& module : impl_->modules(false)) {
+  if (auto* attention = dynamic_cast<Dinov2SelfAttentionImpl*>(module.get())) attention->force_math_attention_ = value;
+  if (auto* decoder = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) decoder->force_math_attention_ = value;
+ }
+}
+const void* test_support::FullTraceTestAccess::identity(const NativeRfDetrModel& model, bool training) { return model.impl_->full_trace_.identity(training); }
+const void* test_support::FullTraceTestAccess::backbone_identity(const NativeRfDetrModel& model, bool training) { return model.impl_->backbone_region_.identity(training); }
+std::shared_ptr<torch::jit::Graph> test_support::FullTraceTestAccess::graph(const NativeRfDetrModel& model, bool training) { return model.impl_->full_trace_.graph(training); }
+bool test_support::FullTraceTestAccess::reference_attention(const NativeRfDetrModel& model) { return model.impl_->force_pytorch_deformable_attn_; }
+bool test_support::FullTraceTestAccess::math_attention(const NativeRfDetrModel& model) { return model.impl_->force_math_attention_; }
 void NativeRfDetrModel::begin_supervised_step_timing() { impl_->begin_supervised_step_timing(); }
 void NativeRfDetrModel::end_supervised_step_timing() { impl_->end_supervised_step_timing(); }
 void NativeRfDetrModel::begin_criterion_timing() { impl_->begin_criterion_timing(); }

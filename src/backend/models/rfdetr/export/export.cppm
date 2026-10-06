@@ -12,6 +12,7 @@ module;
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/model.h"
 export module mmltk.backend.models.rfdetr.model_export;
 namespace mmltk::backend::models::rfdetr {
 void write_onnx_model_bytes(std::string_view serialized_model, const std::filesystem::path& output_path, const ModelClassLayout& layout);
@@ -34,6 +35,7 @@ private:
  std::shared_ptr<State> state_;
 };
 void export_onnx(const ExportOnnxRequest& request);
+void export_onnx(NativeRfDetrModel& model, const ExportOnnxRequest& request);
 ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::span<const RfdetrNamedOutputRole> roles = {});
 void simplify_onnx_model_file(const std::filesystem::path& model_path);
 }  // namespace mmltk::backend::models::rfdetr

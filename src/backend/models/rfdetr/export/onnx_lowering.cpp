@@ -1,5 +1,6 @@
 module;
 #include <ATen/core/jit_type.h>
+#include <ATen/Context.h>
 #include <ATen/ops/scalar_tensor.h>
 #include <ATen/ops/tensor.h>
 #include <c10/core/SymInt.h>
@@ -57,6 +58,8 @@ constexpr int kOnnxTensorProtoBfloat16 = 16;
 // NOLINTBEGIN(bugprone-throwing-static-initialization)
 const c10::Symbol kAtenTo = c10::Symbol::fromQualString("aten::to");
 const c10::Symbol kAtenTypeAs = c10::Symbol::fromQualString("aten::type_as");
+const c10::Symbol kSegmentationDepthwise = c10::Symbol::fromQualString("mmltk::segmentation_depthwise");
+const c10::Symbol kMathAttention = c10::Symbol::fromQualString("aten::_scaled_dot_product_attention_math");
 const c10::Symbol kAtenConvolution = c10::Symbol::fromQualString("aten::_convolution");
 const c10::Symbol kAtenFlatten = c10::Symbol::fromQualString("aten::flatten");
 const c10::Symbol kAtenT = c10::Symbol::fromQualString("aten::t");
@@ -1002,7 +1005,9 @@ void lower_cast_like_node(torch::jit::Node* node) {
  replace_node_with(node, cast);
 }
 void lower_convolution_node(torch::jit::Node* node, const LoweringContext& context) {
- if (node->inputs().size() < 9) { throw_lowering_error(node, "expected at least 9 inputs, got " + std::to_string(node->inputs().size())); }
+ const bool depthwise = node->kind() == kSegmentationDepthwise;
+ if (depthwise) require_input_count(node, 3);
+ if (!depthwise && node->inputs().size() < 9) { throw_lowering_error(node, "expected at least 9 inputs, got " + std::to_string(node->inputs().size())); }
  auto weight_sizes = value_tensor_sizes(node->input(1));
  if (!weight_sizes.has_value()) {
   if (const auto weight_tensor = lookup_initializer_tensor(node->input(1), context)) { weight_sizes = weight_tensor->sizes().vec(); }
@@ -1013,12 +1018,16 @@ void lower_convolution_node(torch::jit::Node* node, const LoweringContext& conte
   throw_lowering_error(node,
    std::format("weight tensor shape must be statically known (value={}, producer={}, attribute={})", weight->debugName(), weight->node()->kind().toQualString(), attribute_name.value_or("<none>")));
  }
- const auto stride = constant_int_list_value(node->input(3));
- const auto padding = constant_int_list_value(node->input(4));
- const auto dilation = constant_int_list_value(node->input(5));
- const auto transposed = constant_bool_value(node->input(6));
- const auto output_padding = constant_int_list_value(node->input(7));
- const auto groups = constant_int_value(node->input(8));
+ if (depthwise && (weight_sizes->size() != 4 || weight_sizes->at(1) != 1 || weight_sizes->at(2) != 3 || weight_sizes->at(3) != 3)) {
+  throw_lowering_error(node, "segmentation depthwise requires a [channels,1,3,3] kernel");
+ }
+ const auto unit = std::optional<std::vector<int64_t>>{{1, 1}};
+ const auto stride = depthwise ? unit : constant_int_list_value(node->input(3));
+ const auto padding = depthwise ? unit : constant_int_list_value(node->input(4));
+ const auto dilation = depthwise ? unit : constant_int_list_value(node->input(5));
+ const auto transposed = depthwise ? std::optional<bool>{false} : constant_bool_value(node->input(6));
+ const auto output_padding = depthwise ? std::optional<std::vector<int64_t>>{{0, 0}} : constant_int_list_value(node->input(7));
+ const auto groups = depthwise ? std::optional<int64_t>{weight_sizes->front()} : constant_int_value(node->input(8));
  if (!stride.has_value() || !padding.has_value() || !dilation.has_value() || !transposed.has_value() || !output_padding.has_value() || !groups.has_value()) {
   std::vector<std::string> missing;
   if (!stride.has_value()) { missing.emplace_back("stride"); }
@@ -1736,51 +1745,75 @@ void lower_grid_sampler_node(torch::jit::Node* node) {
  replace_node_with(node, grid_sample->output());
 }
 void lower_scaled_dot_product_attention_node(torch::jit::Node* node) {
- require_input_count(node, 8);
- if (!is_none_value(node->input(3))) { throw_lowering_error(node, "attention masks are not supported yet"); }
+ const bool math = node->kind() == kMathAttention;
+ require_input_count(node, math ? 9 : 8);
+ if (node->outputs().size() != (math ? 2U : 1U)) throw_lowering_error(node, "unexpected attention output inventory");
+ if (!is_none_value(node->input(3))) throw_lowering_error(node, "attention masks are not supported yet");
+ if (math && !is_none_value(node->input(6))) throw_lowering_error(node, "dropout mask is not supported for export");
  const auto dropout_p = constant_double_value(node->input(4));
  const auto is_causal = constant_bool_value(node->input(5));
- const auto enable_gqa = constant_bool_value(node->input(7));
- if (!dropout_p.has_value() || !is_causal.has_value() || !enable_gqa.has_value()) { throw_lowering_error(node, "dropout, is_causal, and enable_gqa must be compile-time constants"); }
- if (*dropout_p != 0.0) { throw_lowering_error(node, "dropout_p must be 0 for export"); }
- if (*is_causal) { throw_lowering_error(node, "causal scaled dot product attention is not supported yet"); }
- if (*enable_gqa) { throw_lowering_error(node, "enable_gqa is not supported yet"); }
+ const auto enable_gqa = constant_bool_value(node->input(math ? 8 : 7));
+ if (!dropout_p.has_value() || !is_causal.has_value() || !enable_gqa.has_value()) throw_lowering_error(node, "dropout, is_causal, and enable_gqa must be compile-time constants");
+ if (*dropout_p != 0.0) throw_lowering_error(node, "dropout_p must be 0 for export");
+ if (*is_causal) throw_lowering_error(node, "causal scaled dot product attention is not supported yet");
+ if (*enable_gqa) throw_lowering_error(node, "enable_gqa is not supported yet");
  const auto query_sizes = value_tensor_sizes(node->input(0));
  const auto key_rank = value_tensor_rank(node->input(1));
- if (!query_sizes.has_value() || !key_rank.has_value() || query_sizes->size() < 2) { throw_lowering_error(node, "attention input shapes must be statically known"); }
- std::vector<int64_t> key_perm;
- key_perm.reserve(*key_rank);
- for (size_t i = 0; i < *key_rank; ++i) { key_perm.push_back(static_cast<int64_t>(i)); }
- std::swap(key_perm[key_perm.size() - 2], key_perm[key_perm.size() - 1]);
- auto* key_transpose = node->owningGraph()->create(kOnnxTranspose, {node->input(1)}, 1);
- key_transpose->copyMetadata(node);
- key_transpose->is_(kAttrPerm, key_perm);
- key_transpose->insertBefore(node);
- auto* scores = node->owningGraph()->create(kOnnxMatMul, {node->input(0), key_transpose->output()}, 1);
- scores->copyMetadata(node);
- scores->insertAfter(key_transpose);
+ if (!query_sizes || !key_rank || query_sizes->size() < 2 || *key_rank < 2) throw_lowering_error(node, "attention input shapes must be statically known");
  double scale = 0.0;
- if (!is_none_value(node->input(6))) {
-  const auto scale_value = constant_double_value(node->input(6));
-  if (!scale_value.has_value()) { throw_lowering_error(node, "attention scale must be a compile-time constant"); }
-  scale = *scale_value;
+ const auto* scale_input = node->input(math ? 7 : 6);
+ if (!is_none_value(scale_input)) {
+  const auto value = constant_double_value(scale_input);
+  if (!value) throw_lowering_error(node, "attention scale must be a compile-time constant");
+  scale = *value;
  } else {
-  const int64_t head_dim = query_sizes->back();
-  if (head_dim <= 0) { throw_lowering_error(node, "attention head dimension must be positive"); }
-  scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  if (query_sizes->back() <= 0) throw_lowering_error(node, "attention head dimension must be positive");
+  scale = 1.0 / std::sqrt(static_cast<double>(query_sizes->back()));
  }
  const auto scalar_type = value_scalar_type(node->input(0)).value_or(at::kFloat);
- auto* scaled_scores = node->owningGraph()->create(kOnnxMul, {scores->output(), create_scalar_constant(node, scale, scalar_type)}, 1);
- scaled_scores->copyMetadata(node);
- scaled_scores->insertAfter(scores);
- auto* softmax = node->owningGraph()->create(kOnnxSoftmax, {scaled_scores->output()}, 1);
- softmax->copyMetadata(node);
+ const bool promote = (scalar_type == at::kHalf || scalar_type == at::kBFloat16) && !at::globalContext().allowFP16BF16ReductionMathSDP();
+ const auto accumulator_type = promote ? at::kFloat : scalar_type;
+ LoweredNodeChain chain(node);
+ const auto cast = [&](torch::jit::Value* value, at::ScalarType type) {
+  auto* converted = chain.append(kOnnxCast, {value});
+  converted->i_(kAttrTo, native_onnx_tensor_data_type(type));
+  return converted->output();
+ };
+ auto* query = promote ? cast(node->input(0), accumulator_type) : node->input(0);
+ auto* key = promote ? cast(node->input(1), accumulator_type) : node->input(1);
+ auto* value = promote ? cast(node->input(2), accumulator_type) : node->input(2);
+ // Match pinned ATen math SDPA: split scaling before contraction prevents
+ // intermediate overflow and retains the sign of explicit negative scales.
+ const double root_scale = std::sqrt(std::abs(scale));
+ query = chain.append(kOnnxMul, {query, create_scalar_constant(node, scale < 0.0 ? -root_scale : root_scale, accumulator_type)})->output();
+ key = chain.append(kOnnxMul, {key, create_scalar_constant(node, root_scale, accumulator_type)})->output();
+ std::vector<int64_t> permutation;
+ for (std::size_t index = 0; index < *key_rank; ++index) permutation.push_back(static_cast<int64_t>(index));
+ std::swap(permutation[permutation.size() - 2], permutation.back());
+ auto* transposed = chain.append_transpose(key, std::move(permutation));
+ auto* scores = chain.append(kOnnxMatMul, {query, transposed->output()});
+ auto* softmax = chain.append(kOnnxSoftmax, {scores->output()});
  softmax->i_(kAttrAxis, -1);
- softmax->insertAfter(scaled_scores);
- auto* output = node->owningGraph()->create(kOnnxMatMul, {softmax->output(), node->input(2)}, 1);
- output->copyMetadata(node);
- output->insertAfter(softmax);
- replace_node_with(node, output->output());
+ // ATen's safe softmax maps an entirely -infinity row to zeros while
+ // preserving NaNs in all other rows. Plain ONNX Softmax alone yields NaNs.
+ auto* excluded = chain.append(kOnnxEqual, {scores->output(), create_scalar_constant(node, -std::numeric_limits<double>::infinity(), accumulator_type)})->output();
+ auto* excluded_integer = cast(excluded, at::kLong);
+ auto* all_excluded = chain.append(kOnnxReduceMin, {excluded_integer, create_int64s_constant(node, {-1})});
+ all_excluded->i_(kAttrKeepdims, 1);
+ auto* empty_row = chain.append(kOnnxEqual, {all_excluded->output(), create_scalar_constant(node, 1.0, at::kLong)})->output();
+ auto* probabilities = chain.append(kOnnxWhere, {empty_row, create_scalar_constant(node, 0.0, accumulator_type), softmax->output()})->output();
+ auto* output = chain.append(kOnnxMatMul, {probabilities, value})->output();
+ if (promote) {
+  output = cast(output, scalar_type);
+  if (math && node->output(1)->hasUses()) probabilities = cast(probabilities, scalar_type);
+ }
+ output->copyMetadata(node->output(0));
+ node->output(0)->replaceAllUsesWith(output);
+ if (math && node->output(1)->hasUses()) {
+  probabilities->copyMetadata(node->output(1));
+  node->output(1)->replaceAllUsesWith(probabilities);
+ }
+ node->destroy();
 }
 std::vector<int64_t> compute_split_sizes(torch::jit::Node* producer, size_t num_outputs, int64_t dim_size) {
  if (producer->kind() == kAtenSplit) {
@@ -1858,6 +1891,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
 #define MMLTK_ONNX_LOWERING_TABLE(NODE, CTX, SYMBOL, CREATE, RESIZE) \
  NODE(kAtenTo, lower_cast_like_node)                                 \
  NODE(kAtenTypeAs, lower_cast_like_node)                             \
+ CTX(kSegmentationDepthwise, lower_convolution_node)                \
  CTX(kAtenConvolution, lower_convolution_node)                       \
  NODE(kAtenFlatten, lower_static_reshape_node)                       \
  NODE(kAtenView, lower_static_reshape_node)                          \
@@ -1939,6 +1973,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
  RESIZE(kAtenUpsampleBilinear2d, "linear")                           \
  RESIZE(kAtenUpsampleBicubic2dAa, "cubic")                           \
  NODE(kAtenGridSampler, lower_grid_sampler_node)                     \
+ NODE(kMathAttention, lower_scaled_dot_product_attention_node)       \
  NODE(kAtenScaledDotProductAttention, lower_scaled_dot_product_attention_node)
 #define MMLTK_LOWER_NODE(key, fn) {key, [](torch::jit::Node* node, const LoweringContext&) { fn(node); }},
 #define MMLTK_LOWER_CTX(key, fn) {key, [](torch::jit::Node* node, const LoweringContext& context) { fn(node, context); }},

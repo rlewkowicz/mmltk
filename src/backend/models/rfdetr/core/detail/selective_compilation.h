@@ -1,11 +1,9 @@
 #pragma once
-#include <torch/torch.h>
-#include <array>
+#include "tensor_trace.h"
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <inplace_vector>
-#include <memory>
 #include <string>
 namespace mmltk::backend::models::rfdetr::detail {
 // Lane-local tensor execution. Each mode retains exactly one admitted signature.
@@ -24,15 +22,6 @@ public:
  [[nodiscard]] const void* identity(bool training) const noexcept;
 
 private:
- struct State;
- struct Slot {
-  bool enabled = false;
-  bool armed = false;
-  std::int64_t batch_size = 0;
-  std::unique_ptr<State> state;
- };
- std::string name_;
- bool dynamic_batch_queries_;
- std::array<Slot, 2> slots_;
+ TensorTrace trace_;
 };
 }  // namespace mmltk::backend::models::rfdetr::detail

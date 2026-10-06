@@ -2329,8 +2329,8 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
   check_parameter_update(built.optimizer, parameters, before_update, [](std::string_view) { return true; });
  }
 }
-TEST_CASE("Selective native training retains routed objectives gradients optimizer updates and RNG", "[rfdetr][training_supervision][compilation][cuda]") {
- if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; selective training remains unverified");
+TEST_CASE("Native compiled training retains routed objectives gradients optimizer updates and RNG", "[rfdetr][training_supervision][compilation][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; compiled production training remains unverified");
  // Match the production runtime's matrix and convolution precision. Otherwise
  // this standalone fixture inherits cuDNN TF32 and test-order-dependent RNG.
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
@@ -2339,12 +2339,15 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
  rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &workspace);
  const auto floats = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
  const auto integers = floats.dtype(torch::kInt64);
+ for (const bool reference_attention : {true, false})
+ for (const auto compilation : {rfdetr::CompilationMode::kSelective, rfdetr::CompilationMode::kFullTrace})
  for (const bool segmentation : {false, true})
   for (const bool match_free : {false, true})
    for (const bool denoising : {false, true})
     for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+     if (compilation == rfdetr::CompilationMode::kFullTrace && (reference_attention || match_free || denoising)) continue;
      if (dtype == torch::kBFloat16 && at::cuda::getCurrentDeviceProperties()->major < 8) continue;
-     CAPTURE(segmentation, match_free, denoising, dtype);
+     CAPTURE(segmentation, match_free, denoising, dtype, reference_attention, compilation);
      torch::manual_seed(937);
      auto config = tiny_native_training_config();
      config.segmentation = segmentation;
@@ -2359,9 +2362,9 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
      for (auto* model : {&eager, &selective}) {
       model->to(torch::Device(torch::kCUDA));
       model->train(true);
-      model->set_force_pytorch_deformable_attn(true);
+      model->set_force_pytorch_deformable_attn(reference_attention);
      }
-     selective.optimize_for_inference(2, true, rfdetr::CompilationMode::kSelective);
+     selective.optimize_for_inference(2, true, compilation);
      // Preparation precedes freeze exactly as in production; recording must observe
      // the final parameter policy, rather than a speculative dummy execution.
      const bool frozen_encoder = !denoising;
@@ -2400,7 +2403,8 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
       step.forward([&] {
        CAPTURE(micro);
        const auto forward = [&](rfdetr::NativeRfDetrModel& model, const torch::Tensor& images) {
-        const auto batch = rfdetr::nested_tensor_from_tensor_list({images[0], images[1]});
+        const auto perturbed = images + static_cast<double>(micro) * .015;
+        const auto batch = rfdetr::nested_tensor_from_tensor_list({perturbed[0], perturbed[1]});
         if (denoising) return model.forward_with_denoising(batch, targets, {937, 0, 0, micro});
         return match_free ? model.forward_for_match_free(batch) : model.forward(batch, segmentation);
        };
@@ -2493,7 +2497,7 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
       CHECK(torch::allclose(actual.main.pred_boxes, expected.main.pred_boxes, 4e-3, 4e-3));
      });
      for (auto* model : {&eager, &selective}) model->eval();
-     selective.optimize_for_inference(2, false, rfdetr::CompilationMode::kSelective);
+     selective.optimize_for_inference(2, false, compilation);
      torch::NoGradGuard no_grad;
      const auto padded = torch::cat({input.detach().narrow(0, 0, 1), torch::zeros_like(input.detach().narrow(0, 0, 1))}, 0);
      const auto padded_expected = eager.forward({padded, {}}, segmentation);

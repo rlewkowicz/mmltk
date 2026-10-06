@@ -11,7 +11,6 @@ module;
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #define ONNX_NAMESPACE onnx_torch
-#include <ATen/Context.h>
 #include <cuda_runtime_api.h>
 #include <torch/csrc/jit/frontend/tracer.h>
 #include <torch/csrc/jit/serialization/export.h>
@@ -25,7 +24,6 @@ module;
 #include <functional>
 #include <memory>
 #include <stop_token>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -39,39 +37,6 @@ namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
 namespace torch_cuda = mmltk::backend::ml::cuda;
 namespace {
-std::mutex& sdp_backend_mutex() {
- static std::mutex mutex;
- return mutex;
-}
-class ScopedSdpBackend final {
-public:
- ScopedSdpBackend()
-     : lock_(sdp_backend_mutex()),
-       flash_(at::globalContext().userEnabledFlashSDP()),
-       memory_efficient_(at::globalContext().userEnabledMemEfficientSDP()),
-       math_(at::globalContext().userEnabledMathSDP()),
-       cudnn_(at::globalContext().userEnabledCuDNNSDP()) {
-  auto& context = at::globalContext();
-  context.setSDPUseFlash(false);
-  context.setSDPUseMemEfficient(false);
-  context.setSDPUseMath(true);
-  context.setSDPUseCuDNN(false);
- }
- ~ScopedSdpBackend() {
-  auto& context = at::globalContext();
-  context.setSDPUseFlash(flash_);
-  context.setSDPUseMemEfficient(memory_efficient_);
-  context.setSDPUseMath(math_);
-  context.setSDPUseCuDNN(cudnn_);
- }
-
-private:
- std::unique_lock<std::mutex> lock_;
- bool flash_;
- bool memory_efficient_;
- bool math_;
- bool cudnn_;
-};
 void erase_unused_module_self_input(const std::shared_ptr<torch::jit::Graph>& graph) {
  if (!graph->inputs().empty() && graph->inputs().front()->type()->kind() == c10::TypeKind::ClassType) { graph->eraseInput(0); }
 }
@@ -90,10 +55,15 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
  ClassArtifactPublication publication(output_path, explicit_descriptor);
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  const auto& staged_model = publication.staged_artifact();
- auto& technical_model = (model);
- technical_model.eval();
+ // Immutable sources can share sealed tensor storage; mutable sources take a
+ // detached snapshot. Every snapshot has independent mode, caches and graphs.
+ auto snapshot = model.make_inference_clone(batch_size, CompilationMode::kNone);
+ auto& technical_model = *snapshot;
  technical_model.set_force_pytorch_deformable_attn(true);
- const auto restore_attention = [&technical_model] { technical_model.set_force_pytorch_deformable_attn(false); };
+ technical_model.set_force_math_attention(true);
+ torch::NoGradGuard no_grad;
+ mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement(1U);
+ auto terminal = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement);
  try {
   const torch::Tensor reference = technical_model.parameters().front();
   const torch::Tensor dummy_pixels = torch::zeros({batch_size, 3, model.config().resolution, model.config().resolution}, reference.options());
@@ -112,7 +82,6 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
    export_module.register_buffer(name, buffer.value());
   }
   const bool has_masks = model.config().segmentation;
-  ScopedSdpBackend sdp_scope;
   auto traced = torch::jit::tracer::trace({dummy_pixels}, [&technical_model, dummy_mask, has_masks](torch::jit::Stack args) {
    const auto outputs = technical_model.forward(NestedTensor{args[0].toTensor(), dummy_mask}, true);
    if (has_masks && outputs.main.pred_masks) { return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks}; }
@@ -148,10 +117,16 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
   if (!reopened.class_layout || *reopened.class_layout != model.class_layout()->record()) throw std::runtime_error("ONNX export lost its class layout");
   publication.Publish({}, [&] { return stop.stop_requested(); });
   if (published) published(output_path);
-  restore_attention();
   mmltk::common::logging::info([&](auto& logger) { logger.info("exported RF-DETR ONNX model to {}", output_path.string()); });
  } catch (...) {
-  restore_attention();
+  // An export may have enqueued snapshot reads before lowering/publication
+  // fails. Keep the snapshot alive if its physical CUDA settlement fails.
+  const auto device = technical_model.parameters().front().device();
+  if (device.is_cuda()) {
+   auto status = cudaSetDevice(device.index());
+   if (status == cudaSuccess) status = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(torch_cuda::current_torch_cuda_stream(device.index())));
+   if (status != cudaSuccess) std::move(terminal).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(snapshot)), status);
+  }
   throw;
  }
 }

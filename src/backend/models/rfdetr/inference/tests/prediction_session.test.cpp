@@ -6,6 +6,7 @@
 #include "src/test_support/cuda_test_utils.hpp"
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/CPUGeneratorImpl.h>
@@ -18,6 +19,7 @@
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/core/detail/modules_technical.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/training/detail/model_merging.h"
@@ -1931,7 +1933,7 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
    request.image_inputs.clear();
   }
   std::vector<rfdetr::PredictionRecord> expected;
-  for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective}) {
+  for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective, rfdetr::CompilationMode::kFullTrace}) {
    request.compilation_mode = mode;
    std::vector<rfdetr::PredictionRecord> records;
    rfdetr::PredictionSession session;
@@ -1966,7 +1968,7 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
  }
  // Evaluate -> Validate -> Predict inherits exactly one current-format policy.
  std::optional<double> reference_ap;
- for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective}) {
+ for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective, rfdetr::CompilationMode::kFullTrace}) {
   rfdetr::EvaluateRequest evaluation;
   static_cast<rfdetr::ModelArtifactRequest&>(evaluation) = request;
   evaluation.compilation_mode = mode;
@@ -2130,5 +2132,99 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
    CHECK(std::abs(actual.mask->ap - selected.validation.mask->ap) < 1e-5);
   }
   CHECK(rfdetr::read_training_selection(directory / "selected.json") == selected);
+ }
+}
+
+TEST_CASE("Model-taking export isolates eager selective and full source execution even when publication fails", "[model][rfdetr][prediction][compilation][export][gpu]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; export isolation remains unverified");
+ const mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
+ const mmltk::testsupport::ScopedTempDir root("export-source-isolation");
+ using Access = rfdetr::test_support::FullTraceTestAccess;
+ namespace logging = mmltk::common::logging;
+ const auto backend_policy = [] {
+  const auto& context = at::globalContext();
+  return std::array{context.userEnabledFlashSDP(), context.userEnabledFA3SDP(), context.userEnabledMemEfficientSDP(), context.userEnabledMathSDP(),
+   context.userEnabledCuDNNSDP(), context.userEnabledOverrideableSDP(), context.allowFP16BF16ReductionMathSDP()};
+ };
+ const auto global_policy = backend_policy();
+ const auto global_priority = at::globalContext().sDPPriorityOrder();
+ for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective, rfdetr::CompilationMode::kFullTrace}) {
+  CAPTURE(mode);
+  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
+  config.resolution = 64;
+  config.num_classes = 3;
+  config.num_queries = config.num_select = 3;
+  config.group_detr = 2;
+  config.segmentation = true;
+  rfdetr::NativeRfDetrModel source(config);
+  source.to(torch::Device(torch::kCUDA, 0));
+  const bool reference = mode == rfdetr::CompilationMode::kSelective;
+  source.set_force_pytorch_deformable_attn(reference);
+  source.optimize_for_inference(1, true, mode);
+  const auto input = torch::rand({1, 3, 64, 64}, torch::TensorOptions().device(torch::kCUDA));
+  const auto expected = source.forward({input, {}}, true).main.pred_logits.detach().clone();
+  const auto* full_identity = Access::identity(source, true);
+  const auto* selective_identity = Access::backbone_identity(source, true);
+  std::vector<torch::Tensor> weights;
+  std::vector<bool> gradients;
+  for (const auto& tensor : source.parameters()) {
+   weights.push_back(tensor.detach().clone());
+   gradients.push_back(tensor.requires_grad());
+  }
+  std::vector<torch::Tensor> buffers;
+  for (const auto& item : source.named_buffers()) buffers.push_back(item.value().detach().clone());
+  rfdetr::ExportOnnxRequest request;
+  request.weights_path = "already-admitted-source.pt";
+  request.simplify = false;
+  for (const bool fail_publication : {false, true}) {
+   CAPTURE(fail_publication);
+   request.output_path = root.path() / (std::to_string(static_cast<int>(mode)) + (fail_publication ? "-conflict.onnx" : "-ready.onnx"));
+   bool collision_injected = false;
+   bool policy_unchanged_during_export = true;
+   // The existing gated preparation diagnostic fires after publication captured
+   // the previous destination and before it publishes. This deterministic
+   // competing-writer fixture exercises the real atomic publication rejection.
+   const auto observations = std::make_shared<spdlog::sinks::callback_sink_mt>([&](const spdlog::details::log_msg& message) {
+    policy_unchanged_during_export &= backend_policy() == global_policy;
+    const std::string_view payload(message.payload.data(), message.payload.size());
+    if (fail_publication && !collision_injected && payload.find("region=full_model training=false preparation=disabled") != std::string_view::npos) {
+     mmltk::testsupport::write_text_file(request.output_path, "competing publisher");
+     collision_injected = true;
+    }
+   });
+   const auto previous_level = logging::level();
+   logging::set_level(spdlog::level::debug);
+   const mmltk::testsupport::ScopedTestCleanup restore_logging{[&] {
+    logging::debug([&](auto& logger) { std::erase(logger.sinks(), observations); });
+    logging::set_level(previous_level);
+   }};
+   logging::debug([&](auto& logger) { logger.sinks().push_back(observations); });
+   if (fail_publication) {
+    CHECK_THROWS_WITH(rfdetr::export_onnx(source, request), Catch::Matchers::ContainsSubstring("artifact appeared during publication"));
+    REQUIRE(collision_injected);
+    const auto bytes = mmltk::testsupport::read_binary_file(request.output_path);
+    CHECK(std::string(bytes.begin(), bytes.end()) == "competing publisher");
+   } else {
+    REQUIRE_NOTHROW(rfdetr::export_onnx(source, request));
+    CHECK(rfdetr::load_onnx_model_info(request.output_path).class_layout == source.class_layout()->record());
+   }
+   CHECK(policy_unchanged_during_export);
+   CHECK(backend_policy() == global_policy);
+   CHECK(at::globalContext().sDPPriorityOrder() == global_priority);
+   CHECK(source.is_training());
+   CHECK(Access::reference_attention(source) == reference);
+   CHECK_FALSE(Access::math_attention(source));
+   CHECK(Access::identity(source, true) == full_identity);
+   CHECK(Access::backbone_identity(source, true) == selective_identity);
+   const auto parameters = source.parameters();
+   REQUIRE(parameters.size() == weights.size());
+   for (std::size_t index = 0; index < weights.size(); ++index) {
+    CHECK(torch::equal(parameters[index], weights[index]));
+    CHECK(parameters[index].requires_grad() == gradients[index]);
+   }
+   std::size_t buffer_index = 0;
+   for (const auto& item : source.named_buffers()) CHECK(torch::equal(item.value(), buffers.at(buffer_index++)));
+   CHECK(torch::allclose(source.forward({input, {}}, true).main.pred_logits, expected, 4e-4, 4e-4));
+  }
  }
 }

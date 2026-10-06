@@ -6,8 +6,16 @@
 #include <vector>
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/model.h"
+namespace torch::jit { struct Graph; }
 namespace mmltk::backend::models::rfdetr {
 namespace test_support {
+struct FullTraceTestAccess {
+ static const void* identity(const NativeRfDetrModel& model, bool training);
+ static const void* backbone_identity(const NativeRfDetrModel& model, bool training);
+ static std::shared_ptr<torch::jit::Graph> graph(const NativeRfDetrModel& model, bool training);
+ static bool reference_attention(const NativeRfDetrModel& model);
+ static bool math_attention(const NativeRfDetrModel& model);
+};
 struct ProjectorConvTestAccess {
  static std::shared_ptr<torch::nn::Module> make(int64_t channels);
  static torch::Tensor invoke(torch::nn::Module& module, const torch::Tensor& input);

@@ -12,6 +12,7 @@
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include <torch/ordered_dict.h>
 namespace mmltk::backend::models::rfdetr {
+namespace test_support { struct FullTraceTestAccess; }
 struct NestedTensor {
  torch::Tensor tensors;
  torch::Tensor mask;
@@ -61,6 +62,7 @@ public:
   std::optional<FreshTransferQueryRetention> query_retention = std::nullopt);
  void commit_normalized_state(detail::NormalizedModelStateCandidate candidate);
  void set_force_pytorch_deformable_attn(bool value);
+ void set_force_math_attention(bool value);
  void train(bool enabled = true);
  void eval();
  [[nodiscard]] bool is_training() const noexcept;
@@ -70,6 +72,7 @@ public:
  [[nodiscard]] torch::OrderedDict<std::string, torch::Tensor> named_buffers(bool recurse = true) const;
 
 private:
+ friend struct test_support::FullTraceTestAccess;
  struct Impl;
  std::unique_ptr<Impl> impl_;
 };

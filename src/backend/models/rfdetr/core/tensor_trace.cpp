@@ -1,0 +1,224 @@
+#include "detail/tensor_trace.h"
+#include <ATen/Context.h>
+#include <ATen/autocast_mode.h>
+#include <torch/script.h>
+#include <torch/version.h>
+#include <torch/csrc/jit/api/function_impl.h>
+#include <torch/csrc/jit/frontend/tracer.h>
+#include <torch/csrc/jit/runtime/graph_executor.h>
+#include <torch/csrc/jit/codegen/fuser/interface.h>
+#include <sstream>
+#include <algorithm>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+import mmltk.common.logging.mmltk_logging;
+namespace mmltk::backend::models::rfdetr::detail {
+namespace {
+struct TensorSignature {
+ c10::Device device{torch::kCPU};
+ c10::ScalarType dtype = c10::ScalarType::Undefined;
+ std::array<int64_t, 4> sizes{};
+ int64_t rank = 0;
+ bool requires_grad = false;
+ bool operator==(const TensorSignature&) const = default;
+};
+struct Signature {
+ std::array<TensorSignature, 2> tensors{};
+ size_t count = 0;
+ bool grad = torch::GradMode::is_enabled();
+ bool amp = false;
+ c10::ScalarType amp_dtype = c10::ScalarType::Undefined;
+ std::uint64_t specialization = 0;
+ std::array<bool, 10> attention_policy{};
+ decltype(at::globalContext().sDPPriorityOrder()) attention_priority{};
+ bool operator==(const Signature&) const = default;
+};
+Signature signature_of(std::span<const torch::Tensor> inputs, bool dynamic, std::uint64_t specialization) {
+ Signature result;
+ result.specialization = specialization;
+ auto& context = at::globalContext();
+ result.attention_policy = {context.userEnabledFlashSDP(), context.userEnabledMemEfficientSDP(), context.userEnabledMathSDP(), context.userEnabledCuDNNSDP(),
+  context.allowFP16BF16ReductionMathSDP(), context.allowTF32CuBLAS(), context.allowTF32CuDNN(), context.userEnabledFA3SDP(), context.userEnabledOverrideableSDP(), context.deterministicAlgorithms()};
+ result.attention_priority = context.sDPPriorityOrder();
+ for (const auto& input : inputs) {
+  TORCH_CHECK(input.defined() && input.dim() <= 4, "tensor trace requires defined tensors of rank at most four");
+  std::array<int64_t, 4> sizes{};
+  std::copy(input.sizes().begin(), input.sizes().end(), sizes.begin());
+  if (dynamic) {
+   TORCH_CHECK(input.dim() == 3, "dynamic query region requires rank three");
+   sizes[0] = -1;
+   sizes[1] = -1;
+  }
+  result.tensors[result.count++] = {input.device(), input.scalar_type(), sizes, input.dim(), input.requires_grad()};
+ }
+ const auto device_type = inputs.front().device().type();
+ result.amp = at::autocast::is_autocast_enabled(device_type);
+ if (result.amp) result.amp_dtype = at::autocast::get_autocast_dtype(device_type);
+ return result;
+}
+class RecordingAutocastCache final {
+public:
+ RecordingAutocastCache() : previous_(at::autocast::is_autocast_cache_enabled()) { at::autocast::set_autocast_cache_enabled(false); }
+ ~RecordingAutocastCache() { at::autocast::set_autocast_cache_enabled(previous_); }
+
+private:
+ bool previous_;
+};
+TensorSignature state_signature(const torch::Tensor& tensor) {
+ TORCH_CHECK(tensor.dim() <= 4, "traced owner tensor rank exceeds four");
+ TensorSignature result{tensor.device(), tensor.scalar_type(), {}, tensor.dim(), tensor.requires_grad()};
+ std::copy(tensor.sizes().begin(), tensor.sizes().end(), result.sizes.begin());
+ return result;
+}
+}  // namespace
+struct TensorTrace::State {
+ torch::jit::Module module;
+ Signature signature;
+ struct LiveTensor {
+  torch::Tensor tensor;
+  TensorSignature signature;
+ };
+ std::vector<LiveTensor> members;
+ std::int64_t preparation_batch = 0;
+};
+TensorTrace::TensorTrace(std::string name, bool dynamic) : name_(std::move(name)), dynamic_batch_queries_(dynamic) {}
+TensorTrace::~TensorTrace() = default;
+void TensorTrace::prepare(bool training, bool enabled, std::int64_t batch_size) {
+ TORCH_CHECK(batch_size > 0, "tensor trace preparation requires a positive batch size");
+ auto& slot = slots_[training];
+ if (slot.enabled == enabled && slot.batch_size == batch_size) {
+  mmltk::common::logging::debug([&](auto& logger) { logger.debug("rfdetr compilation region={} training={} preparation=identical", name_, training); });
+  return;
+ }
+ mmltk::common::logging::debug([&](auto& logger) { logger.debug("rfdetr compilation region={} training={} preparation={} batch={}", name_, training, enabled ? "armed" : "disabled", batch_size); });
+ slot.enabled = enabled;
+ slot.batch_size = batch_size;
+ slot.armed = enabled;
+}
+void TensorTrace::invalidate() {
+ for (auto& slot : slots_) {
+  slot.state.reset();
+  slot.armed = slot.enabled;
+ }
+}
+const void* TensorTrace::identity(bool training) const noexcept { return slots_[training].state.get(); }
+bool TensorTrace::enabled(bool training) const noexcept { return slots_[training].enabled; }
+std::shared_ptr<torch::jit::Graph> TensorTrace::graph(bool training) const {
+ const auto& state = slots_[training].state;
+ return state ? state->module.get_method("forward").graph() : nullptr;
+}
+TensorTrace::Result TensorTrace::invoke(bool training, std::span<const torch::Tensor> inputs, std::initializer_list<torch::nn::Module*> owners, Operation ordinary, std::uint64_t specialization) {
+ auto& slot = slots_[training];
+ if (!slot.enabled) return {ordinary(inputs), false};
+ TORCH_CHECK(!inputs.empty() && inputs.size() <= 2, "tensor trace requires one or two inputs");
+ bool compatible_extents = true;
+ if (dynamic_batch_queries_) {
+  for (const auto& input : inputs) compatible_extents &= input.dim() == 3 && input.sizes() == inputs.front().sizes() && input.device() == inputs.front().device();
+ }
+ const auto signature = signature_of(inputs, dynamic_batch_queries_ && compatible_extents, specialization);
+ auto diagnostic = [&](const char* reason, std::shared_ptr<torch::jit::Graph> graph = {}, bool optimized = false) {
+  mmltk::common::logging::debug([&](auto& logger) {
+   if (optimized) graph = torch::jit::lastExecutedOptimizedGraph();
+   std::ostringstream metadata;
+   for (const auto& input : inputs) metadata << input.device() << ':' << input.scalar_type() << ':' << input.sizes() << ';';
+   std::size_t operators = 0;
+   std::size_t fusion_groups = 0;
+   std::size_t tensor_expr_groups = 0;
+   if (graph) {
+    const auto count = [&](const auto& self, const torch::jit::Block* block) -> void {
+     for (const auto* node : block->nodes()) {
+      ++operators;
+      const std::string_view kind = node->kind().toQualString();
+      if (kind == "prim::TensorExprGroup") ++tensor_expr_groups;
+      if (kind == "prim::FusionGroup" || kind == "prim::CudaFusionGroup" || kind == "prim::TensorExprGroup") ++fusion_groups;
+      for (const auto* nested : node->blocks()) self(self, nested);
+      if (node->hasAttribute(torch::jit::attr::Subgraph)) self(self, node->g(torch::jit::attr::Subgraph)->block());
+     }
+    };
+    count(count, graph->block());
+   }
+   logger.debug(
+    "rfdetr compilation region={} owner={} reason={} training={} signature={} grad={} amp={} amp_dtype={} torch={} executor_optimize={} fuse_cpu={} fuse_gpu={} tf32_matmul={} tf32_cudnn={} "
+    "graph_available={} operators={} fusion_groups={} tensor_expr_groups={}",
+    name_, static_cast<const void*>(this), reason, training, metadata.str(), signature.grad, signature.amp, static_cast<int>(signature.amp_dtype), TORCH_VERSION,
+    torch::jit::getGraphExecutorOptimize(), torch::jit::canFuseOnCPU(), torch::jit::canFuseOnGPU(), at::globalContext().allowTF32CuBLAS(), at::globalContext().allowTF32CuDNN(),
+    static_cast<bool>(graph), operators, fusion_groups, tensor_expr_groups);
+  });
+ };
+ if (!compatible_extents) {
+  diagnostic("incompatible tensor extents; ordinary fallback");
+  return {ordinary(inputs), false};
+ }
+ if (!dynamic_batch_queries_) {
+  for (const auto& input : inputs) {
+   if (input.dim() == 0 || input.size(0) != slot.batch_size) {
+    diagnostic("prepared batch mismatch; ordinary fallback");
+    return {ordinary(inputs), false};
+   }
+  }
+ }
+ if (slot.state && (slot.state->signature.attention_policy != signature.attention_policy || slot.state->signature.attention_priority != signature.attention_priority ||
+     std::ranges::any_of(slot.state->members, [](const auto& member) { return state_signature(member.tensor) != member.signature; }))) {
+  diagnostic("registered owner or attention policy changed; invalidated");
+  slot.state.reset();
+  slot.armed = true;
+ }
+ if (!slot.armed && slot.state) {
+  if (slot.state->signature != signature) {
+   diagnostic("signature mismatch; ordinary fallback");
+   return {ordinary(inputs), false};
+  }
+  torch::jit::Stack arguments;
+  for (const auto& input : inputs) arguments.emplace_back(input);
+  auto output = slot.state->module.forward(std::move(arguments));
+  diagnostic("reuse; optimized graph when available", {}, true);
+  return {std::move(output), false};
+ }
+ try {
+  auto cu = std::make_shared<torch::jit::CompilationUnit>();
+  auto type = torch::jit::ClassType::create("__torch__.TensorTrace", cu, true);
+  auto candidate = std::make_unique<State>(torch::jit::Module(cu, type), signature);
+  std::size_t member = 0;
+  for (auto* owner : owners) {
+   if (!owner) continue;
+   for (const auto& parameter : owner->named_parameters(true)) {
+    candidate->module.register_parameter("parameter_" + std::to_string(member++), parameter.value(), false);
+    candidate->members.push_back({parameter.value(), state_signature(parameter.value())});
+   }
+   for (const auto& buffer : owner->named_buffers(true)) {
+    candidate->module.register_buffer("buffer_" + std::to_string(member++), buffer.value());
+    candidate->members.push_back({buffer.value(), state_signature(buffer.value())});
+   }
+  }
+  torch::jit::Stack arguments;
+  for (const auto& input : inputs) arguments.emplace_back(input);
+  const auto recording = [&] {
+   RecordingAutocastCache cache;
+   return torch::jit::tracer::trace(std::move(arguments), [&](torch::jit::Stack values) {
+    std::array<torch::Tensor, 2> tensors;
+    for (std::size_t index = 0; index < values.size(); ++index) tensors[index] = values[index].toTensor();
+    auto output = ordinary(std::span(tensors.data(), values.size()));
+    values.clear();
+    values.emplace_back(std::move(output));
+    return values;
+   }, [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
+  }();
+  candidate->module.type()->addMethod(cu->create_function("forward", recording.first->graph, true));
+  auto output = recording.second.front();
+  diagnostic("prepared; recorded graph", recording.first->graph);
+  candidate->preparation_batch = slot.batch_size;
+  slot.state = std::move(candidate);
+  slot.armed = false;
+  return {std::move(output), true};
+ } catch (...) {
+  // A failed replacement leaves the previous admitted request and graph usable.
+  // The failing operation is never replayed as ordinary GPU work.
+  if (slot.state) {
+   slot.batch_size = slot.state->preparation_batch;
+   slot.armed = false;
+  }
+  throw;
+ }
+}
+}  // namespace mmltk::backend::models::rfdetr::detail

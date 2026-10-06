@@ -1,18 +1,32 @@
 #include "detail/decoder_attention.h"
 #include <ATen/ops/scaled_dot_product_attention.h>
+#include <ATen/ops/_scaled_dot_product_attention_math.h>
 #include "src/pch_std.h"
+#include <limits>
 namespace mmltk::backend::models::rfdetr {
+torch::Tensor model_scaled_dot_product_attention(const torch::Tensor& query, const torch::Tensor& key, const torch::Tensor& value,
+ const torch::Tensor& admitted_mask, std::optional<double> scale, bool force_math) {
+ if (force_math) {
+  // The pinned math primitive consumes additive masks (the public SDPA wrapper
+  // converts its bool convention before dispatch). Select it without changing
+  // the process-wide backend enablement used by concurrent training lanes.
+  auto mask = admitted_mask;
+  if (mask.defined() && mask.scalar_type() == torch::kBool) mask = torch::zeros_like(mask, query.options()).masked_fill(~mask, -std::numeric_limits<double>::infinity());
+  return std::get<0>(at::_scaled_dot_product_attention_math(query, key, value, mask.defined() ? std::optional<torch::Tensor>(mask) : std::nullopt, 0.0, false, std::nullopt, scale, false));
+ }
+ return at::scaled_dot_product_attention(query, key, value, admitted_mask.defined() ? std::optional<torch::Tensor>(admitted_mask) : std::nullopt, 0.0, false, scale);
+}
 namespace {
-torch::Tensor grouped_attention(const torch::Tensor& query, const torch::Tensor& key, const torch::Tensor& value, int64_t heads, int64_t groups, const torch::Tensor& excluded_keys = {}) {
+torch::Tensor grouped_attention(const torch::Tensor& query, const torch::Tensor& key, const torch::Tensor& value, int64_t heads, int64_t groups, bool force_math, const torch::Tensor& excluded_keys = {}) {
  const auto batch = value.size(0), count = value.size(1), width = value.size(2);
  const auto split = [&](const torch::Tensor& input) { return input.reshape({batch * groups, count / groups, heads, width / heads}).transpose(1, 2); };
  // MultiheadAttention exclusion true means forbidden; SDPA true means admitted.
  const auto admitted = excluded_keys.defined() ? (~excluded_keys).unsqueeze(1).unsqueeze(1) : torch::Tensor{};
- const auto output = at::scaled_dot_product_attention(split(query), split(key), split(value), admitted.defined() ? std::optional<torch::Tensor>(admitted) : std::nullopt, 0.0, false);
+ const auto output = model_scaled_dot_product_attention(split(query), split(key), split(value), admitted, std::nullopt, force_math);
  return output.transpose(1, 2).reshape({batch, count, width});
 }
 }  // namespace
-torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout) {
+torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout, bool force_math) {
  if (target.dim() != 3 || query_position.sizes() != target.sizes() || target.size(1) != layout.total_queries() || layout.ordinary.groups <= 0 || layout.ordinary.queries_per_group <= 0) {
   throw std::runtime_error("decoder query tensors do not match their typed group layout");
  }
@@ -48,7 +62,7 @@ torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& atten
  const auto positioned = clean_target + clean_position;
  const auto q = project(positioned, 0), k = project(positioned, 1), v = project(clean_target, 2);
  const auto attend = [&](int64_t offset, int64_t count, int64_t groups, const torch::Tensor& padding = torch::Tensor{}) {
-  return grouped_attention(q.narrow(1, offset, count), k.narrow(1, offset, count), v.narrow(1, offset, count), heads, groups, padding);
+  return grouped_attention(q.narrow(1, offset, count), k.narrow(1, offset, count), v.narrow(1, offset, count), heads, groups, force_math, padding);
  };
  // DN-DETR Equation 7 blocks matching queries from observing DN queries and
  // blocks cross-DN-group traffic. RF-DETR deliberately makes the boundary

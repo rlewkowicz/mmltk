@@ -4,6 +4,9 @@
 #include "src/common/system/numa_memory.h"
 #include <ATen/TensorIndexing.h>
 #include <ATen/ops/alias.h>
+#include <ATen/ops/_scaled_dot_product_attention_math.h>
+#include <ATen/ops/scaled_dot_product_attention.h>
+#include "src/backend/models/rfdetr/core/detail/segmentation_depthwise.h"
 #include <ATen/ops/arange.h>
 #include <ATen/ops/bitwise_and.h>
 #include <ATen/ops/conv2d.h>
@@ -20,6 +23,8 @@
 #include <torch/nn/functional/upsampling.h>
 #include <torch/torch.h>
 #include <functional>
+#include <cmath>
+#include <limits>
 #include <initializer_list>
 #include <iterator>
 #include <map>
@@ -263,13 +268,27 @@ TEST_CASE("test_lower_slice_and_select_emit_onnx_slice_path", "[model][rfdetr][o
 TEST_CASE("test_lower_slice_with_negative_axis_and_step_emits_onnx_slice", "[model][rfdetr][onnx_lowering]") {
  lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return input.slice(-1, 0, c10::nullopt, 2); }, {kAtenSlice}, {kOnnxSlice});
 }
-TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfdetr][onnx_lowering]") {
- namespace F = torch::nn::functional;
- mmltk::backend::ml::runtime::OnnxEnvironment environment(ORT_LOGGING_LEVEL_ERROR, "resize-lowering");
+torch::Tensor execute_unary_onnx(const std::shared_ptr<torch::jit::Graph>& graph, const torch::Tensor& input) {
+ mmltk::backend::ml::runtime::OnnxEnvironment environment(ORT_LOGGING_LEVEL_ERROR, "numerical-lowering");
  Ort::SessionOptions options;
  options.SetIntraOpNumThreads(1);
  options.SetInterOpNumThreads(1);
  const auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+ if (graph->inputs().front()->type()->kind() == c10::TypeKind::ClassType) graph->eraseInput(0);
+ graph->inputs().front()->setDebugName("input");
+ graph->outputs().front()->setDebugName("output");
+ auto exported = torch::jit::export_onnx(graph, {}, 19, {}, false, ::torch::onnx::OperatorExportTypes::ONNX, true, false, {}, true, false, "");
+ const auto bytes = torch::jit::serialize_model_proto_to_string(std::get<0>(exported));
+ Ort::Session session(environment.get(), bytes.data(), bytes.size(), options);
+ auto value = Ort::Value::CreateTensor<float>(memory, input.data_ptr<float>(), input.numel(), input.sizes().data(), input.dim());
+ const char* input_name = "input";
+ const char* output_name = "output";
+ auto output = session.Run(Ort::RunOptions{}, &input_name, &value, 1, &output_name, 1);
+ const auto shape = output.front().GetTensorTypeAndShapeInfo().GetShape();
+ return torch::from_blob(output.front().GetTensorMutableData<float>(), shape, torch::kFloat).clone();
+}
+TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfdetr][onnx_lowering]") {
+ namespace F = torch::nn::functional;
  auto input = torch::sin(torch::arange(126, torch::kFloat)).reshape({1, 2, 7, 9});
  for (const auto& size : {std::vector<int64_t>{3, 5}, std::vector<int64_t>{11, 13}, std::vector<int64_t>{1, 1}}) {
   for (const bool align_corners : {false, true}) {
@@ -282,19 +301,9 @@ TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfd
     continue;
    }
    lower_test_graph(graph);
-   if (graph->inputs().front()->type()->kind() == c10::TypeKind::ClassType) graph->eraseInput(0);
-   graph->inputs().front()->setDebugName("image");
-   graph->outputs().front()->setDebugName("resized");
-   auto exported = torch::jit::export_onnx(graph, {}, 19, {}, false, ::torch::onnx::OperatorExportTypes::ONNX, true, false, {}, true, false, "");
-   const auto bytes = torch::jit::serialize_model_proto_to_string(std::get<0>(exported));
-   Ort::Session session(environment.get(), bytes.data(), bytes.size(), options);
-   auto value = Ort::Value::CreateTensor<float>(memory, input.data_ptr<float>(), input.numel(), input.sizes().data(), input.dim());
-   const char* input_name = "image";
-   const char* output_name = "resized";
-   auto output = session.Run(Ort::RunOptions{}, &input_name, &value, 1, &output_name, 1);
+   const auto actual = execute_unary_onnx(graph, input);
    const auto expected = interpolate(input);
-   REQUIRE(output.front().GetTensorTypeAndShapeInfo().GetShape() == expected.sizes().vec());
-   const auto actual = torch::from_blob(output.front().GetTensorMutableData<float>(), expected.sizes(), torch::kFloat);
+   REQUIRE(actual.sizes() == expected.sizes());
    CHECK(torch::allclose(actual, expected, 1.0e-5, 1.0e-6));
   }
  }
@@ -502,5 +511,79 @@ TEST_CASE("ONNX lowering rejects cyclic dependencies before reordering the block
  graph->registerOutput(second->output());
  mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, "RF-DETR ONNX export produced a cyclic or unsortable lowered graph");
  CHECK(std::vector<torch::jit::Node*>(graph->nodes().begin(), graph->nodes().end()) == std::vector{first, second});
+}
+TEST_CASE("Registered segmentation depthwise lowering preserves convolution values", "[model][rfdetr][onnx_lowering]") {
+ const auto input = torch::sin(torch::arange(126, torch::kFloat)).reshape({1, 2, 7, 9});
+ const auto weight = torch::cos(torch::arange(18, torch::kFloat)).reshape({2, 1, 3, 3});
+ for (const bool biased : {false, true}) {
+  const auto bias = biased ? torch::tensor({.3F, -.2F}) : torch::Tensor{};
+  const auto operation = [&](const torch::Tensor& value) { return mmltk::backend::models::rfdetr::segmentation_depthwise(value, weight, bias); };
+  auto graph = trace_unary_graph(input, operation);
+  REQUIRE(block_contains_kind(graph->block(), c10::Symbol::fromQualString("mmltk::segmentation_depthwise")));
+  lower_test_graph(graph);
+  const auto* convolution = find_first_node_kind(graph->block(), kOnnxConv);
+  REQUIRE(convolution);
+  CHECK(convolution->i(kAttrGroup) == 2);
+  CHECK(torch::allclose(execute_unary_onnx(graph, input), operation(input), 1e-5, 1e-6));
+ }
+}
+TEST_CASE("SDPA lowering retains split scaling and both math outputs", "[model][rfdetr][onnx_lowering]") {
+ for (const bool math : {false, true}) {
+  for (const double scale : {.25, -0.25, 0.0, 1e-40, -1e-40}) {
+   if (!math && scale != 0.0 && std::abs(scale) < 1e-30) continue;
+   CAPTURE(math, scale);
+   const auto input = (torch::sin(torch::arange(24, torch::kFloat)) * (std::abs(scale) == 1e-40 ? 1e20 : 2.0)).reshape({1, 2, 3, 4});
+   const auto key = input.flip({2});
+   const auto value = torch::cos(torch::arange(24, torch::kFloat)).reshape_as(input);
+   const auto operation = [&](const torch::Tensor& query) {
+    if (!math) return at::scaled_dot_product_attention(query, key, value, std::nullopt, 0.0, false, scale).flatten();
+    const auto result = at::_scaled_dot_product_attention_math(query, key, value, std::nullopt, 0.0, false, std::nullopt, scale, false);
+    return torch::cat({std::get<0>(result).flatten(), std::get<1>(result).flatten()});
+   };
+   auto graph = trace_unary_graph(input, operation);
+   REQUIRE(block_contains_kind(graph->block(), c10::Symbol::fromQualString(math ? "aten::_scaled_dot_product_attention_math" : "aten::scaled_dot_product_attention")));
+   lower_test_graph(graph);
+   const auto expected = operation(input), actual = execute_unary_onnx(graph, input);
+   REQUIRE(torch::isfinite(expected).all().item<bool>());
+   REQUIRE(torch::equal(torch::isfinite(actual), torch::isfinite(expected)));
+   CHECK(torch::allclose(actual, expected, 1e-5, 1e-6));
+  }
+ }
+ for (const auto dtype : {torch::kFloat16, torch::kBFloat16}) {
+  CAPTURE(dtype);
+  const auto input = torch::sin(torch::arange(24, torch::kFloat)).reshape({1, 2, 3, 4});
+  const auto operation = [&](const torch::Tensor& query) {
+   const auto low = query.to(dtype);
+   return std::get<0>(at::_scaled_dot_product_attention_math(low, low, low, std::nullopt, 0.0, false, std::nullopt, std::nullopt, false)).to(torch::kFloat32);
+  };
+  auto graph = trace_unary_graph(input, operation);
+  lower_test_graph(graph);
+  const auto expected = operation(input), actual = execute_unary_onnx(graph, input);
+  CHECK(torch::allclose(actual, expected, 1e-3, dtype == torch::kBFloat16 ? .004 : .0005));
+ }
+}
+TEST_CASE("Math SDPA lowering preserves safe empty rows and exceptional operands", "[model][rfdetr][onnx_lowering]") {
+ for (const auto scalar : {-std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+  const auto input = torch::full({1, 1, 2, 4}, scalar);
+  const auto key = torch::ones_like(input);
+  const auto value = torch::arange(8, torch::kFloat).reshape_as(input);
+  const auto operation = [&](const torch::Tensor& query) { return std::get<0>(at::_scaled_dot_product_attention_math(query, key, value)); };
+  auto graph = trace_unary_graph(input, operation);
+  lower_test_graph(graph);
+  const auto expected = operation(input), actual = execute_unary_onnx(graph, input);
+  REQUIRE(torch::equal(torch::isfinite(actual), torch::isfinite(expected)));
+  REQUIRE(torch::equal(torch::isnan(actual), torch::isnan(expected)));
+  CHECK(torch::allclose(actual, expected, 1e-5, 1e-6, true));
+ }
+}
+TEST_CASE("Math SDPA lowering refuses unsupported dropout and masks explicitly", "[model][rfdetr][onnx_lowering]") {
+ const auto input = torch::rand({1, 2, 3, 4});
+ for (const bool masked : {false, true}) {
+  const auto mask = torch::zeros({3, 3});
+  auto graph = trace_unary_graph(input, [&](const torch::Tensor& value) {
+   return std::get<0>(at::_scaled_dot_product_attention_math(value, value, value, masked ? std::optional<torch::Tensor>{mask} : std::nullopt, masked ? 0.0 : .1));
+  });
+  mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, masked ? "attention masks are not supported" : "dropout_p must be 0");
+ }
 }
 }  // namespace

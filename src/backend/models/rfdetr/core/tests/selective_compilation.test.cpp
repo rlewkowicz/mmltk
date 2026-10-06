@@ -32,7 +32,7 @@ TEST_CASE("Native inference clones rebind module owners and share only immutable
  const auto cuda = torch::TensorOptions().device(torch::kCUDA);
  rf::NestedTensor input{torch::rand({1, 3, 64, 64}, cuda), torch::zeros({1, 64, 64}, cuda.dtype(torch::kBool))};
  const auto reference = master.forward(input, false).main.pred_logits.to(torch::kCPU);
- for (const auto mode : {rf::CompilationMode::kNone, rf::CompilationMode::kSelective}) {
+ for (const auto mode : {rf::CompilationMode::kNone, rf::CompilationMode::kSelective, rf::CompilationMode::kFullTrace}) {
   auto first = master.make_inference_clone(1, mode);
   auto second = first->make_inference_clone(1, mode);
   const auto original = master.named_parameters();
@@ -403,3 +403,79 @@ TEST_CASE("Actual decoder tail matches independent residual norm and feedforward
  }
 }
 }  // namespace
+
+TEST_CASE("Tensor trace invalidates changed live gradient policy and retains detached slot backwards", "[rfdetr][compilation]") {
+ Region region("live_policy");
+ torch::nn::Linear layer(4, 4);
+ int calls = 0;
+ const auto ordinary = [&](const Region::Tensors& values) { ++calls; return Region::Tensors{layer->forward(values.front())}; };
+ region.prepare(true, true, 2);
+ auto input = torch::randn({2, 4}).set_requires_grad(true);
+ std::vector<torch::Tensor> retained;
+ for (int invocation = 0; invocation < 5; ++invocation) retained.push_back(region.invoke(true, {input}, {layer.get()}, ordinary).front());
+ CHECK(calls == 1);
+ // Drop all forward graph state before traversing the recorded and optimized
+ // backward graphs. Torch's shared executor and saved tensors own their uses.
+ region.invalidate();
+ for (auto& value : retained) value.square().sum().backward();
+ REQUIRE(input.grad().defined());
+ REQUIRE(torch::isfinite(input.grad()).all().item<bool>());
+ for (auto& parameter : layer->parameters()) parameter.set_requires_grad(false);
+ region.invoke(true, {input}, {layer.get()}, ordinary);
+ CHECK(calls == 2);
+ layer->weight.set_requires_grad(true);
+ auto unfrozen = region.invoke(true, {input}, {layer.get()}, ordinary).front();
+ CHECK(calls == 3);
+ CHECK(unfrozen.requires_grad());
+ region.invoke(true, {input.detach()}, {layer.get()}, ordinary);
+ CHECK(calls == 4);
+ region.invoke(true, {input}, {layer.get()}, ordinary);
+ CHECK(calls == 4);
+}
+
+TEST_CASE("Tensor trace checks effective autocast device and host attention policy", "[rfdetr][compilation]") {
+ Region region("policy_guard");
+ int calls = 0;
+ const auto ordinary = [&](const Region::Tensors& inputs) { ++calls; return Region::Tensors{inputs.front() * 2.0}; };
+ region.prepare(false, true, 2);
+ const auto cpu_input = torch::ones({2, 4});
+ region.invoke(false, {cpu_input}, {}, ordinary);
+ REQUIRE(calls == 1);
+ {
+  struct RestoreMath final {
+   bool enabled = at::globalContext().userEnabledMathSDP();
+   ~RestoreMath() { at::globalContext().setSDPUseMath(enabled); }
+  } restore;
+  at::globalContext().setSDPUseMath(!restore.enabled);
+  region.invoke(false, {cpu_input}, {}, ordinary);
+  CHECK(calls == 2);
+ }
+ region.invoke(false, {cpu_input}, {}, ordinary);
+ CHECK(calls == 3);
+ for (const auto& device : tensor_fixture::available_devices()) {
+  if (!device.is_cuda()) continue;
+  const auto input = cpu_input.to(device);
+  const auto before = calls;
+  region.invoke(false, {input}, {}, ordinary);
+  CHECK(calls == before + 1);
+  // Reprepare explicitly to admit a CUDA signature after the CPU graph.
+  region.invalidate();
+  region.invoke(false, {input}, {}, ordinary);
+  const auto* identity = region.identity(false);
+  const auto recorded_calls = calls;
+  {
+   mmltk::backend::ml::cuda::TorchAutocastScope amp(true, torch::kFloat16);
+   CHECK(torch::equal(region.invoke(false, {input}, {}, ordinary).front(), input * 2.0));
+  }
+  CHECK(calls == recorded_calls + 1);
+  CHECK(region.identity(false) == identity);
+  region.invoke(false, {input}, {}, ordinary);
+  CHECK(calls == recorded_calls + 1);
+  if (mmltk::testsupport::checked_cuda_device_count() > 1) {
+   const auto other = input.to(torch::Device(torch::kCUDA, device.index() == 0 ? 1 : 0));
+   region.invoke(false, {other}, {}, ordinary);
+   CHECK(calls == recorded_calls + 2);
+   CHECK(region.identity(false) == identity);
+  }
+ }
+}

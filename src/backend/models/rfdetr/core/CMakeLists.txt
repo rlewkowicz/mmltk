@@ -71,6 +71,7 @@ mmltk_register_retained_module_importers(
     draw.cpp
     mask_pack_cuda_wrapper.cpp
     selective_compilation.cpp
+    tensor_trace.cpp
     modules.cpp
     postprocess.cpp
     training_supervision.cpp)
@@ -89,6 +90,7 @@ mmltk_register_ordinary_sources(
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_core
     detail/selective_compilation.h
+    detail/tensor_trace.h
     detail/decoder_attention.h
     detail/lsap_scratch.h
     detail/matcher_workspace.h
@@ -228,6 +230,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
 
     set(sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/selective_compilation.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/full_compilation.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/upstream_training_parity.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluator.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/matcher_workspace.test.cpp
