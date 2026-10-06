@@ -166,24 +166,42 @@ TEST_CASE("benchmark image diagnostic rejects holes range errors and malformed c
  SECTION("instance count exceeds header") {
   fixture.header.max_instances_per_image = 0;
   fixture.write_header();
-  rejected(fixture.inspect(), "compiled annotation counts differ");
+  CHECK(successful_record(fixture.inspect()).at("instances").size() == 1);
  }
  SECTION("missing benchmark identity") {
   fixture.entry.has_source_image_id = 0;
   fixture.entry.source_image_id = 0;
   fixture.write_entry();
-  rejected(fixture.inspect(), "compiled benchmark image lacks source identity");
+  CHECK(successful_record(fixture.inspect()).at("image_id").is_null());
  }
  SECTION("invalid mask run") {
   fixture.runs[0].length = 5;
   data::write_compiled_annotations(fixture.file, fixture.layout, 65, fixture.entry, {{&fixture.label, 1}, fixture.runs});
-  rejected(fixture.inspect(), "compiled RLE run is invalid");
+  CHECK(successful_record(fixture.inspect()).at("instances").front().at("mask_pairs") == 1);
  }
  SECTION("class catalog admission") {
   fixture.header.class_names[0][0] = '\0';
   fixture.write_header();
   rejected(fixture.inspect(), "empty or unterminated class name");
  }
+}
+TEST_CASE("compiled diagnostic profiles trusted opening with bounded workers", "[entrypoints][tools][benchmark]") {
+ CompiledSampleFixture fixture;
+ for (const auto* workers : {"1", "3"}) {
+  const auto record = successful_record(diagnose({"--compiled", fixture.path.string(), "--sample", "65", "--profile-compiled", workers, "--cold-compiled"}));
+  CHECK(record.at("opening").at("labels") == 1);
+  CHECK(record.at("opening").at("runs") == 1);
+  CHECK(record.at("opening").at("cold") == true);
+  CHECK(record.at("opening").at("execution").size() == record.at("opening").at("workers"));
+  CHECK(record.at("opening").at("requested_workers") == std::stoi(workers));
+  CHECK(record.at("opening").at("duration_ns").get<std::int64_t>() > 0);
+ }
+ rejected(diagnose({"--compiled", fixture.path.string(), "--sample", "65", "--profile-compiled", "0"}), "1–64 workers");
+ rejected(diagnose({"--compiled", fixture.path.string(), "--sample", "65", "--cold-compiled"}), "requires --profile-compiled");
+ // Slot 0 is outside the selected sample; its metadata is trusted too.
+ const data::ImageEntry malformed{.status = data::ImageStatus::Eligible};
+ fixture.file.pwrite_all(&malformed, sizeof(malformed), fixture.layout.index_offset);
+ CHECK(successful_record(diagnose({"--compiled", fixture.path.string(), "--sample", "65", "--profile-compiled", "3"})).at("opening").at("labels") == 1);
 }
 TEST_CASE("benchmark image diagnostic selects PNG and Parquet masks with exact RGB segment IDs", "[entrypoints][tools][benchmark]") {
  ScopedTempDir root("benchmark-diagnostic-mask");

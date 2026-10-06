@@ -409,6 +409,14 @@ under [exact Resume](model-merging.md#whole-session-resume).
 
 ### Augmentation preparation and transfer
 
+The canonical [augmentation defaults](../src/backend/models/rfdetr/contract/workflow_requests.h)
+give geometry, resize, color, noise, blur, and occlusion each a `0.25`
+probability and a `0.0375`–`0.375` strength range. Strength scales signed
+effects about zero and size/contrast/saturation deviations about their neutral
+factor of one. Copy-paste has probability `0.80` and scales donor objects within
+`0.625`–`1.375` of their original size. Saved settings retain the full strength
+precision; explicit saved overrides remain authoritative for subsequent runs.
+
 The [training augmenter](../src/backend/models/rfdetr/training/gpu_augment.cpp)
 resolves the immutable plan before submission. Logical donor descriptors carry
 original image/annotation meaning. Only selected copy-paste donors that differ

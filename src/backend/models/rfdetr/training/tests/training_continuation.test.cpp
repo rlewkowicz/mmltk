@@ -16,6 +16,7 @@
 #include "detail/training_continuation.h"
 #include "detail/training_data_plan.h"
 #include "src/backend/data/loading/dataset_loader.h"
+#include "src/common/concurrency/worker_pool.h"
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include "detail/training_snapshot.h"
@@ -446,7 +447,7 @@ TEST_CASE("Continuation donor admission validates every descriptor before changi
  REQUIRE_THROWS(history.restore(loader, {}));
  CHECK((history.state() == values.data.donors));
 }
-TEST_CASE("Logical donor admission preserves original RLE support and empty-mask meaning", "[model][rfdetr][training][continuation]") {
+TEST_CASE("Logical donor admission preserves original RLE support and empty-mask meaning", "[model][rfdetr][training][continuation][data_plan]") {
  namespace data = mmltk::backend::data;
  namespace fixture = data::testsupport;
  mmltk::testsupport::ScopedTempDir root("logical-donor-support");
@@ -469,6 +470,18 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
  loader_config.compiled_path = fixture::compiled_bin_path(spec);
  loader_config.batch_size = 1;
  data::DatasetLoader loader(loader_config);
+ r::TrainRequest request;
+ request.batch_size = 1;
+ mmltk::common::concurrency::WorkerPool readers(2);
+ const r::TrainingDataPlan serial_plan(loader, request);
+ const r::TrainingDataPlan parallel_plan(loader, request, &readers);
+ CHECK(parallel_plan.hash() == serial_plan.hash());
+ CHECK((parallel_plan.shards() == serial_plan.shards()));
+ const auto serial_epoch = serial_plan.epoch(0, 0);
+ const auto parallel_epoch = parallel_plan.epoch(0, 0);
+ CHECK(parallel_epoch.schedule->image_indices == serial_epoch.schedule->image_indices);
+ CHECK(parallel_epoch.schedule->draw_keys == serial_epoch.schedule->draw_keys);
+ CHECK(parallel_epoch.repeated_exposure == serial_epoch.repeated_exposure);
  const r::TrainingDonorDescriptor masked{0, 0, true}, box{1, 0, true}, empty{2, 0, true};
  const auto source = r::resolve_training_donor(loader, masked);
  const auto image_annotations = loader.annotations(0);

@@ -15,6 +15,7 @@ mmltk_register_public_headers(mmltk_frameworks_gpu
         cuda/cuda_priority.h
         cuda/device_execution.h
         cuda/device_inventory.h
+        cuda/device_telemetry.h
         cuda/resource_owner_command_authority.h
         cuda/terminal_cuda_retirement_authority.h
         cuda/terminal_cuda_retirement_owner.h
@@ -38,6 +39,7 @@ mmltk_register_ordinary_sources(
     mmltk_frameworks_gpu
     cuda/cuda_runtime.cpp
     cuda/device_execution.cpp
+    cuda/device_telemetry.cpp
     cuda/terminal_cuda_retirement_owner.cpp
     image/external_graphics_timeline.cpp
     image/image_buffer.cpp
@@ -64,6 +66,7 @@ target_link_libraries(mmltk_frameworks_gpu
         CUDA::cudart
     PRIVATE
         CUDA::cuda_driver
+        ${CMAKE_DL_LIBS}
         mmltk_gdrcopy
 )
 mmltk_register_header_isolation(mmltk_frameworks_gpu)

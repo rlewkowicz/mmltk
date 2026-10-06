@@ -205,12 +205,19 @@ recompilation does not promise the same physical order or byte-identical files.
 
 ### Staging and in-place compaction
 
-Both compilers initially allow **500,000 usable bytes per sample** for the
+Both compilers default to **121,824 usable bytes per sample** for the
 complete label payload, including instances, runs, and internal alignment.
-The page-aligned staging pitch is 503,808 bytes; its extra page padding does
+This is the largest payload in the measured 384×384 Coconut + Stock dataset.
+The default page-aligned staging pitch is 122,880 bytes; its extra page padding does
 not enlarge the usable capacity. There is no annotation sizing scan. Overflow
 is fatal and identifies the image, required bytes, and capacity; exact masks
 are never truncated or simplified to fit.
+
+The Directory compiler's `max_label_bytes` (`./mmltk compile --max-label-bytes`)
+can select a different budget, in multiples of eight, up to the persisted format
+limit of 500,000 bytes. That format limit remains independent of the compilation
+default: existing files with larger labels remain readable. Allocation,
+projection admission, and staging use the selected budget together.
 
 After writers and borrowed mappings settle, finalization measures the largest
 complete eligible `ImageEntry.label_bytes`, records that exact value as
@@ -278,7 +285,7 @@ owns that later GPU step.
 
 Each packed `ImageEntry` is 32 bytes. The array is copied into resident
 application memory when the file opens, with a 1,000,000,000-byte bound checked
-before using untrusted slot counts to allocate or read metadata:
+before using the recorded slot count to allocate or read metadata:
 
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
@@ -506,31 +513,46 @@ states the measured performance and its limits.
 
 ## Loading a compiled file
 
-[Metadata-only `info`](#compile-and-inspect) checks the header and section
-extents. Product loading through [CompiledDataset](../src/backend/data/compiled/compiled_dataset.h)
-admits the resident metadata and each eligible sample before exposing views:
+[Metadata-only `info`](#compile-and-inspect) checks the header.
+Product loading through [CompiledDataset](../src/backend/data/compiled/compiled_dataset.h)
+trusts compiler-published sample metadata and payloads for every consumer,
+including Explore, Train, validation, and diagnostics:
 
 1. map the regular file read-only with `MAP_SHARED`;
 2. copy and validate the header magic, version, dimensions, stride, and limits;
 3. compute the checked fixed layout, enforce the resident-metadata bound, and
    validate exact section offsets and end of file;
-4. copy `ImageEntry[num_slots]` into resident memory, validate slot status and
-   every eligible sample's dimensions, counts, classes, boxes, areas, flags,
-   provenance, local RLE spans, and runs, and derive mask availability;
-5. require the eligible count and observed maximum label bytes to equal the
-   header, then expose resident image facts and mapped per-image annotation
-   spans and arithmetic pixel addresses.
+4. copy `ImageEntry[num_slots]` into resident memory and sum its recorded label
+   and run counts for eligible slots;
+5. expose resident image facts, mapped per-image annotation spans, and
+   arithmetic pixel addresses without checking sample metadata, recomputing
+   header population/maxima, or walking annotation and mask payloads.
 
-Invalid or truncated files fail at open. `eligible_slots()` visits physical IDs
-directly from status metadata; it does not construct a dense-index-to-offset
+There is one trusted opening path and no payload-verification option. Format
+compatibility and mapped/read extent checks remain. An explicit
+mask-availability query reads label flags on demand, including present-empty
+masks; Train does not request that summary. Explore reads the label metadata
+needed for its class and mask filters, without validating annotation contents
+or scanning mask runs.
+
+Unsupported formats and truncated file layouts fail at open. `eligible_slots()`
+visits physical IDs directly from status metadata; it does not construct a dense-index-to-offset
 remapping. Resident metadata and the mapping belong to `CompiledDataset`, so
 borrowed views cannot outlive it.
 
+Opening accepts borrowed cancellation and an optional existing worker pool.
+The resident-index copy checks cancellation between bounded chunks; count
+aggregation checks cancellation for every physical slot. Parallel partitions
+join before publishing the source. Explore supplies its persistent gallery
+workers and registers its stop callback before opening the file. Its parallel summary pass also records
+non-crowd eligibility, so augmentation donor discovery reads resident summaries
+instead of scanning mapped labels again.
+
 [CompiledRecordChecks](../src/backend/data/compiled/compiled_file_utils.h)
-supplies the same field rules to producers during encoding/copying. Benchmark
-split writing retains its checked product through staging; a later untrusted
-file open still performs the admission above. Metadata-only `info` does not
-read every label or mask, and neither route hashes the pixel payload.
+supplies field rules to producers during encoding/copying, before publication.
+Benchmark split writing retains its checked product through staging. Readers
+consume the published facts without repeating those checks. Metadata-only
+`info` reads the header, and no opening route hashes the pixel payload.
 
 Training and inference use
 [`DatasetLoader`](../src/backend/data/loading/dataset_loader.h), which turns those

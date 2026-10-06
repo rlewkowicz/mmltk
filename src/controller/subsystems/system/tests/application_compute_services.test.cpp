@@ -1086,12 +1086,17 @@ TEST_CASE("Train preparation reaches the observer before metrics and ignores dup
  write(R"({"stage":"Dataset"})");
  const auto progress = client.consume_progress();
  REQUIRE(progress);
- CHECK(progress->progress.status == "Preparing dataset and sampling plan");
+ CHECK(progress->progress.status == "Opening compiled datasets");
  CHECK(progress->progress.completed == 0);
  CHECK(progress->progress.total == 0);
  CHECK_FALSE(progress->metrics);
  write(R"({"stage":"Dataset"})");
  CHECK_FALSE(client.consume_progress());
+ write(R"({"stage":"Sampling"})");
+ const auto sampling = client.consume_progress();
+ REQUIRE(sampling);
+ CHECK(sampling->progress.status == "Preparing sampling plan");
+ CHECK(sampling->progress.sequence > progress->progress.sequence);
  write(R"({"stage":"Optimizers"})");
  const auto ready_for_optimizer = client.consume_progress();
  REQUIRE(ready_for_optimizer);

@@ -43,7 +43,7 @@ struct ImageAnnotations {
  [[nodiscard]] std::span<const RLEPair> instance_rle(const PackedInstance& instance) const;
 };
 [[nodiscard]] size_t compiled_align_up(size_t value, size_t alignment);
-[[nodiscard]] AnnotationLayout annotation_layout(size_t labels, size_t runs);
+[[nodiscard]] AnnotationLayout annotation_layout(size_t labels, size_t runs, size_t capacity = COMPILED_LABEL_LIMIT);
 [[nodiscard]] ImageAnnotations annotation_view(const ImageEntry&, std::span<const std::byte> payload);
 [[nodiscard]] FileLayout compute_file_layout(uint32_t num_slots, size_t image_stride, size_t label_capacity = COMPILED_LABEL_CAPACITY);
 [[nodiscard]] FileHeader make_file_header(const FileHeaderInputs&, std::span<const std::string> class_names, const FileLayout&);

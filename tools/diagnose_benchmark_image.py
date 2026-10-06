@@ -23,10 +23,13 @@ def native_helper(variable):
     return executable
 
 
-def compiled_sample(path, sample):
+def compiled_sample(path, sample, opening_workers, cold):
     executable = native_helper("MMLTK_COMPILED_SAMPLE_DIAGNOSTIC")
-    completed = subprocess.run([str(executable), str(path), str(sample)],
-                               check=False, capture_output=True, text=True, timeout=120)
+    command = [str(executable), str(path), str(sample)]
+    if opening_workers is not None:
+        command.extend((str(opening_workers), str(int(cold))))
+    completed = subprocess.run(command, check=False, capture_output=True, text=True,
+                               timeout=540 if opening_workers is not None else 120)
     if completed.returncode:
         raise ValueError(completed.stderr.strip() or f"compiled diagnostic exited with status {completed.returncode}")
     record = json.loads(completed.stdout)
@@ -171,6 +174,10 @@ def main():
     parser.add_argument("--image-id", type=int)
     parser.add_argument("--compiled", type=Path)
     parser.add_argument("--sample", type=int, help="zero-based eligible physical compiled sample slot")
+    parser.add_argument("--profile-compiled", type=int, metavar="WORKERS",
+                        help="report trusted compiled opening time (1–64 workers)")
+    parser.add_argument("--cold-compiled", action="store_true",
+                        help="request file-local cache eviction before compiled opening")
     parser.add_argument("--index", type=Path, action="append", default=[])
     parser.add_argument("--objects", action="store_true", help="include normalized object records for each matching index row")
     parser.add_argument("--export-mask-runs", action="store_true", help="export bounded selected-image normalized RLEs and identities")
@@ -182,6 +189,10 @@ def main():
     args = parser.parse_args()
     if (args.compiled is None) != (args.sample is None):
         parser.error("--compiled and --sample are required together")
+    if args.profile_compiled is not None and (args.compiled is None or not 1 <= args.profile_compiled <= 64):
+        parser.error("--profile-compiled requires --compiled and 1–64 workers")
+    if args.cold_compiled and args.profile_compiled is None:
+        parser.error("--cold-compiled requires --profile-compiled")
     # The wrapper asks the same parser which native capabilities are needed
     # before preparing CMake targets. No inputs are opened during this query.
     if os.environ.get("MMLTK_BENCHMARK_NATIVE_REQUIREMENTS") == "1":
@@ -189,7 +200,7 @@ def main():
               (("compiled", args.compiled), ("mask", args.parquet or args.panoptic)) if needed))
         return
     if args.compiled:
-        identity = compiled_sample(args.compiled, args.sample)
+        identity = compiled_sample(args.compiled, args.sample, args.profile_compiled, args.cold_compiled)
         if args.image_id is not None and identity != args.image_id:
             parser.error("--image-id disagrees with the compiled sample")
         args.image_id = identity

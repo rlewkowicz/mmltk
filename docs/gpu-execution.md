@@ -44,7 +44,7 @@ reusable.
 
 Train preserves ordered device ranks and matching per-rank NUMA settings in its
 child command, including a single remaining rank. The shared selector preserves
-existing remote-provider requests and behavior. Desktop `--device-id` selects
+existing remote-provider requests and behavior. Desktop `--gpu` (`--device-id`) selects
 the native visual device; it does not overwrite these workflow choices or
 select Firefox's graphics device. Firefox follows the Wayland graphics session.
 The [shared-workspace path](#shared-workspace-interoperability) handles products
@@ -57,10 +57,10 @@ batch, and independent physical capacity.
 ## Device and NUMA placement
 
 ```bash
-./mmltk --gui --device-id 0 --numa-node -1
+./mmltk --gui --gpu 0 --numa-node -1
 ```
 
-This desktop `--device-id` uses the CUDA-visible visual device ordinal.
+This desktop `--gpu` uses the CUDA-visible visual device ordinal.
 `--numa-node -1` requests
 automatic GPU-local placement. Resolution uses the GPU's PCI identity,
 permitted local CPUs, and memory node. A single-node machine can resolve
@@ -508,7 +508,9 @@ and [ShiftLUT tooling](commands.md#shiftlut-model-tooling).
 This uses the existing `MMLTK_BUILD_IMAGE` (default `mmltk-build:latest`) and a
 read-only dataset mount. It does not build or pull images, read file contents,
 or run a benchmark. JSON includes CPU topology (`lscpu`), GPU/driver and kernel
-details, NUMA hardware, filesystem and block devices, PCIe paths, memory-lock
+details (including GPU UUID and current total/used/free VRAM), NUMA hardware,
+DRM render-node paths resolved to their sysfs PCI devices, filesystem and block
+devices, PCIe paths, memory-lock
 limits, visible cuFile/GDRCopy components, and `O_DIRECT` open / `STATX_DIOALIGN`
 observations.
 `cpu_topology` additionally records each eligible logical CPU's package/core

@@ -3349,8 +3349,8 @@ TEST_CASE("dynamic fixed slots publish labels before pixels and admit exactly th
  } catch (const std::runtime_error& error) {
   const std::string message = error.what();
   CHECK(message.find("image 1") != std::string::npos);
-  CHECK(message.find("required 500008") != std::string::npos);
-  CHECK(message.find("capacity 500000") != std::string::npos);
+  CHECK(message.find("required " + std::to_string(COMPILED_LABEL_CAPACITY + sizeof(RLEPair))) != std::string::npos);
+  CHECK(message.find("capacity " + std::to_string(COMPILED_LABEL_CAPACITY)) != std::string::npos);
  }
  runs.pop_back();
  writer.write_pixel(first_slot, 0);
@@ -7232,8 +7232,8 @@ TEST_CASE("shared Curl admission changes survive the check to park boundary for 
  // one delivery, then let both readers finish checking their actual predicate.
  mmltk::testsupport::TestGate notifier("admission delivery before resource mutation");
  std::atomic<bool> first_notice{true};
- CompileExecution::Readiness delivery(
-  execution.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, CompileExecution::Readiness::Changes) {
+ CompileExecution::Readiness delivery(execution.execution(), CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure,
+  [&](CompileExecution::Readiness&, CompileExecution::Readiness::Changes) {
   if (first_notice.exchange(false)) notifier.receipt().ArriveAndWait();
  });
  const mmltk::testsupport::ScopedTestCleanup release_notifier([&] { notifier.Release(); });
@@ -7708,11 +7708,11 @@ TEST_CASE("readiness retirement joins an executing admission callback", "[backen
  std::atomic<bool> updated{false};
  auto readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure,
   [&](CompileExecution::Readiness& registration, CompileExecution::Readiness::Changes) {
-   callback.receipt().ArriveAndWait();
-   registration.interests(CompileChange::None);
-   registration.notify();
-   updated.store(true);
-  });
+  callback.receipt().ArriveAndWait();
+  registration.interests(CompileChange::None);
+  registration.notify();
+  updated.store(true);
+ });
  std::unique_ptr<CompileExecution::Readiness> withdrawn;
  std::future<void> retirement;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
@@ -7750,7 +7750,8 @@ TEST_CASE("pending Curl admission parks through CPU notices and resumes on exter
  mmltk::testsupport::TestGate pending("Curl registered its unsuccessful byte demand");
  std::promise<Changes> cpu_notices;
  unsigned stage = 0;
- CompileExecution::Readiness delivery(execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, Changes changes) {
+ CompileExecution::Readiness delivery(
+  execution, CompileChange::Resources | CompileChange::Cpu | CompileChange::Records | CompileChange::Local | CompileChange::Pressure, [&](CompileExecution::Readiness&, Changes changes) {
   if (!stage && includes(changes.causes, CompileChange::Pressure) && execution.resource_pressure()) {
    stage = 1;
    pending.receipt().ArriveAndWait();
@@ -9914,7 +9915,7 @@ TEST_CASE("reused label output preserves immutable results and bounds complete m
   const std::string reason(error.what());
   CHECK(reason.find("image 99") != std::string::npos);
   CHECK(reason.find("required 560144 bytes") != std::string::npos);
-  CHECK(reason.find("capacity 500000") != std::string::npos);
+  CHECK(reason.find("capacity " + std::to_string(COMPILED_LABEL_CAPACITY)) != std::string::npos);
  }
  CHECK(growths == prepared_growths);
  CHECK(workspace.retained_bytes() == mmltk::common::system::page_rounded_bytes(BenchmarkLabelWorkspace::required_bytes(512)));

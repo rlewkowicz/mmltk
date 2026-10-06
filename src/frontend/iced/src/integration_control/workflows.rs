@@ -22,6 +22,7 @@ pub enum Picture {
     Progress,
     Sources,
     Train,
+    Performance,
     Validation,
     Confidence,
     Gallery,
@@ -39,6 +40,7 @@ impl Picture {
             Self::Progress => "progress",
             Self::Sources => "training-sources",
             Self::Train => "train",
+            Self::Performance => "performance",
             Self::Validation => "validation",
             Self::Confidence => "confidence",
             Self::Gallery => "validate-to-explore",
@@ -54,13 +56,15 @@ impl Picture {
     fn chart(self) -> bool {
         matches!(
             self,
-            Self::Train | Self::Sources | Self::Theme | Self::Narrow
+            Self::Train | Self::Performance | Self::Sources | Self::Theme | Self::Narrow
         )
     }
     fn control(self, _index: u8) -> String {
         match self {
             Self::Progress => "train.progress.bar".into(),
-            Self::Train | Self::Sources | Self::Theme | Self::Narrow => "train.metrics.plot".into(),
+            Self::Train | Self::Performance | Self::Sources | Self::Theme | Self::Narrow => {
+                "train.metrics.plot".into()
+            }
             Self::Validation | Self::Confidence => crate::view::validate::samples::ATLAS_ID.into(),
             Self::Detail => "validate.detail.image".into(),
             Self::Gallery => crate::view::explore::GALLERY_WORKSPACE_ID.into(),
@@ -137,6 +141,14 @@ pub(super) enum Step {
     BackToCharts,
     ChartAspect(u8),
     ChartAspectReady(u8),
+    PerformanceSelector,
+    PerformanceToggle(u8),
+    PerformanceClose,
+    PerformanceExpand(u8),
+    PerformanceBack(u8),
+    PerformanceResetSelector,
+    PerformanceReset,
+    PerformanceResetClose,
     PrepareExplore,
     OpenGallery,
     GalleryReady,
@@ -2066,6 +2078,9 @@ impl State {
                     reporting::emit(|sink| sink.record("integration.training_sources", "train.metrics.plot", "retained-pixels",
                         [f64::from(index), source.modelid as f64, sequence as f64, observation as f64]));
                 }
+                if picture == Picture::Performance {
+                    completed(&format!("performance_chart_{index}"), [index as f64, sampled as f64, visible as f64, 0.0]);
+                }
                 if picture == Picture::Validation && self.restoration_pixels {
                     reporting::emit(|sink| sink.record(
                         "integration.validation_restored_tile", &picture.control(index), "pixels",
@@ -2082,6 +2097,7 @@ impl State {
                         Step::LeaveTrain
                     },
                     Picture::Train => Step::TrainingFixture(0),
+                    Picture::Performance => Step::PerformanceBack(index),
                     Picture::Sources if index < 9 => Step::TrainingFixture(index + 1),
                     Picture::Sources => { self.source_fixture = None; Step::NoImageWorkspace },
                     Picture::Validation if index < 5 => Step::Pixels(picture, index + 1),
@@ -2434,6 +2450,16 @@ impl State {
             Step::ChartLeave => Step::ChartAway,
             Step::ChartReturn => Step::ChartSettle(Retention::Navigation),
             Step::ChartAspect(index) => Step::ChartAspectReady(index),
+            Step::PerformanceSelector => Step::PerformanceToggle(0),
+            Step::PerformanceToggle(index) if index < 3 => Step::PerformanceToggle(index + 1),
+            Step::PerformanceToggle(_) => Step::PerformanceClose,
+            Step::PerformanceClose => Step::PerformanceExpand(0),
+            Step::PerformanceExpand(index) => Step::Pixels(Picture::Performance, index),
+            Step::PerformanceBack(index) if index < 3 => Step::PerformanceExpand(index + 1),
+            Step::PerformanceBack(_) => Step::PerformanceResetSelector,
+            Step::PerformanceResetSelector => Step::PerformanceReset,
+            Step::PerformanceReset => Step::PerformanceResetClose,
+            Step::PerformanceResetClose => Step::PrepareExplore,
             Step::Train => Step::StartTrain,
             Step::StartTrain => Step::Training,
             Step::LeaveTrain => Step::HiddenTrain,
@@ -3085,11 +3111,34 @@ impl State {
                     if index as usize + 1 < crate::generated::WORKSPACE_ASPECT_RATIO_VALUES.len() {
                         Step::ChartAspect(index + 1)
                     } else {
-                        Step::PrepareExplore
+                        Step::PerformanceSelector
                     },
                 )
             }
             Step::NoImageWorkspace => widgets.arm(driver, "workflow.visual.workspace"),
+            Step::PerformanceSelector
+            | Step::PerformanceClose
+            | Step::PerformanceResetSelector
+            | Step::PerformanceResetClose => {
+                self.workflow_control(widgets, driver, "train.metrics.charts")
+            }
+            Step::PerformanceToggle(index) | Step::PerformanceExpand(index) => {
+                let chart = crate::view::metrics::Chart::ALL
+                    .into_iter()
+                    .filter(|chart| chart.performance())
+                    .nth(index as usize)
+                    .unwrap();
+                let action = if matches!(step, Step::PerformanceToggle(_)) {
+                    "visible"
+                } else {
+                    "expand"
+                };
+                self.workflow_control(widgets, driver, format!("train.metrics.{action}.{chart:?}"))
+            }
+            Step::PerformanceBack(_) => {
+                self.workflow_control(widgets, driver, "train.metrics.back")
+            }
+            Step::PerformanceReset => self.workflow_control(widgets, driver, "train.metrics.reset"),
             Step::TrainAspect | Step::NoValidationAspect => {
                 widgets.arm(driver, "workflow.workspace.aspect")
             }

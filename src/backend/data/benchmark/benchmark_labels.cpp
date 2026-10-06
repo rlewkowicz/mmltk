@@ -28,8 +28,9 @@ void project_labels(const NormalizedAnnotationReadView& index, std::size_t posit
  const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(source_width, source_height, resolution, resolution, resize_mode);
  ImageEntry extent;
  const auto identity = std::to_string(image.source_image_id);
- bool exceeded = box_count > COMPILED_LABEL_CAPACITY / sizeof(PackedInstance);
- const auto maximum_runs = exceeded ? 0 : (COMPILED_LABEL_CAPACITY - annotation_layout(box_count, 0).run_offset) / sizeof(RLEPair);
+ const auto capacity = workspace.output().capacity();
+ bool exceeded = box_count > capacity / sizeof(PackedInstance);
+ const auto maximum_runs = exceeded ? 0 : (capacity - annotation_layout(box_count, 0).run_offset) / sizeof(RLEPair);
  std::size_t required_runs = 0;
  if (!exceeded) chunk.labels.reserve(box_count);
  for (const auto& box : index.storage().boxes.subspan(common_math::checked_cast<std::size_t>(image.first_box, "box index overflow"), box_count)) {
@@ -61,7 +62,7 @@ void project_labels(const NormalizedAnnotationReadView& index, std::size_t posit
   label.mask_rle_pairs = common_math::checked_cast<std::uint16_t>(chunk.runs.size() - begin, "benchmark instance mask run count overflow");
   chunk.labels.push_back(label);
  }
- set_annotation_extent(extent, box_count, required_runs, identity);
+ set_annotation_extent(extent, box_count, required_runs, identity, capacity);
 }
 }  // namespace
 BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution,

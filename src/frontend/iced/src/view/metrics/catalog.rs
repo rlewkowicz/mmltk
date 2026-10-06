@@ -16,9 +16,13 @@ pub enum Chart {
     Errors,
     Mask,
     Area,
+    Throughput,
+    GpuUtilization,
+    GpuMemory,
+    GpuTemperature,
 }
 impl Chart {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 15] = [
         Self::Loss,
         Self::Ap50,
         Self::Ap,
@@ -30,6 +34,10 @@ impl Chart {
         Self::Errors,
         Self::Mask,
         Self::Area,
+        Self::Throughput,
+        Self::GpuUtilization,
+        Self::GpuMemory,
+        Self::GpuTemperature,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -44,6 +52,10 @@ impl Chart {
             Self::Errors => "Class / cardinality errors",
             Self::Mask => "Mask metrics",
             Self::Area => "Area breakdowns",
+            Self::Throughput => "Images / second",
+            Self::GpuUtilization => "GPU utilization",
+            Self::GpuMemory => "GPU memory",
+            Self::GpuTemperature => "GPU temperature",
         }
     }
     pub fn loss(self) -> bool {
@@ -51,6 +63,12 @@ impl Chart {
     }
     pub fn main(self) -> bool {
         Self::ALL[..6].contains(&self)
+    }
+    pub fn performance(self) -> bool {
+        matches!(
+            self,
+            Self::Throughput | Self::GpuUtilization | Self::GpuMemory | Self::GpuTemperature
+        )
     }
 }
 #[derive(Clone, Copy)]
@@ -67,31 +85,25 @@ pub(super) struct Metric {
     pub source: Source,
 }
 pub(super) fn catalog() -> Vec<Metric> {
-    use TrainingScalarsField::*;
-    let mut metrics = crate::generated::TrainingScalars::FIELDS
+    let (mut metrics, performance): (Vec<_>, Vec<_>) = crate::generated::TrainingScalars::FIELDS
         .iter()
-        .filter_map(|(field, name)| {
-            let chart = match field {
-                Total => Chart::Loss,
-                LearningRate | LearningRateMin | LearningRateMax => Chart::LearningRate,
-                ClassError | CardinalityError => Chart::Errors,
-                ImagesPerSecond => return None,
-                Classification
-                | L1
-                | Giou
-                | MaskCe
-                | MaskDice
-                | AuxiliaryWeighted
-                | DenoisingWeighted
-                | CorrespondenceWeighted => Chart::Components,
+        .map(|(field, name)| {
+            let chart = scalar_chart(*field);
+            let label = match field {
+                TrainingScalarsField::ImagesPerSecond => "Epoch average images / second".into(),
+                TrainingScalarsField::GpuUtilizationPercent => "GPU utilization (%)".into(),
+                TrainingScalarsField::GpuMemoryUsedBytes => "GPU memory used (GiB)".into(),
+                TrainingScalarsField::GpuMemoryTotalBytes => "GPU memory total (GiB)".into(),
+                TrainingScalarsField::GpuTemperatureCelsius => "GPU temperature (°C)".into(),
+                _ => name.replace('_', " "),
             };
-            Some(Metric {
+            Metric {
                 chart,
-                label: name.replace('_', " "),
+                label,
                 source: Source::Scalar(*field),
-            })
+            }
         })
-        .collect::<Vec<_>>();
+        .partition(|metric| !metric.chart.performance());
     for mask in [false, true] {
         let prefix = if mask { "Mask" } else { "Box" };
         let mut selected = MetricSummary::FIELDS
@@ -118,7 +130,29 @@ pub(super) fn catalog() -> Vec<Metric> {
         selected.sort_by_key(|(order, _)| *order);
         metrics.extend(selected.into_iter().map(|(_, metric)| metric));
     }
+    // Append new cards without changing existing curve/color identities.
+    metrics.extend(performance);
     metrics
+}
+fn scalar_chart(field: TrainingScalarsField) -> Chart {
+    use TrainingScalarsField::*;
+    match field {
+        Total => Chart::Loss,
+        LearningRate | LearningRateMin | LearningRateMax => Chart::LearningRate,
+        ClassError | CardinalityError => Chart::Errors,
+        ImagesPerSecond => Chart::Throughput,
+        GpuUtilizationPercent => Chart::GpuUtilization,
+        GpuMemoryUsedBytes | GpuMemoryTotalBytes => Chart::GpuMemory,
+        GpuTemperatureCelsius => Chart::GpuTemperature,
+        Classification
+        | L1
+        | Giou
+        | MaskCe
+        | MaskDice
+        | AuxiliaryWeighted
+        | DenoisingWeighted
+        | CorrespondenceWeighted => Chart::Components,
+    }
 }
 // Exhaustive visual policy, deliberately independent of native declaration order.
 // The interleaved order preserves existing series/color identities.
@@ -178,7 +212,11 @@ mod tests {
             (LearningRate, Some(Chart::LearningRate)),
             (LearningRateMin, Some(Chart::LearningRate)),
             (LearningRateMax, Some(Chart::LearningRate)),
-            (ImagesPerSecond, None),
+            (ImagesPerSecond, Some(Chart::Throughput)),
+            (GpuUtilizationPercent, Some(Chart::GpuUtilization)),
+            (GpuMemoryUsedBytes, Some(Chart::GpuMemory)),
+            (GpuMemoryTotalBytes, Some(Chart::GpuMemory)),
+            (GpuTemperatureCelsius, Some(Chart::GpuTemperature)),
         ];
         let metrics = catalog();
         assert_eq!(
@@ -197,8 +235,7 @@ mod tests {
             assert_eq!(selected.next().map(|metric| metric.chart), expected_chart);
             assert!(selected.next().is_none());
         }
-        // The closed visual selection has neither validation loss nor any
-        // training-progress Y chart. Optional families retain their own cards.
+        // Optional performance and evaluation families retain their own cards.
         assert_eq!(
             Chart::ALL,
             [
@@ -212,7 +249,11 @@ mod tests {
                 Chart::Ap75,
                 Chart::Errors,
                 Chart::Mask,
-                Chart::Area
+                Chart::Area,
+                Chart::Throughput,
+                Chart::GpuUtilization,
+                Chart::GpuMemory,
+                Chart::GpuTemperature,
             ]
         );
     }

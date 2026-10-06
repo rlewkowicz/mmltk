@@ -84,8 +84,9 @@ use the same pending-system admission as their typed requests, including an
 event arriving before its reply.
 Validation, Prediction, and Export keep progress inside setup; Train uses its
 live progress card. [Primary-action spacing](#shared-primary-actions) remains
-empty in every state. Training preparation reports GPU connection, dataset
-admission, model initialization, and optimizer setup before measurements exist.
+empty in every state. Training preparation reports GPU connection, compiled
+dataset opening, sampling plan construction, model initialization, and optimizer
+setup before measurements exist.
 Validation and prediction also retain the save-preview options captured at
 that accepted Start through preparation. Later viewer edits do not mutate the
 admitted save payload. Predict inspection replies enter the same revision-aware
@@ -519,7 +520,10 @@ part of the page.
 | AP50:95 | Class / cardinality errors |
 | Average recall | Mask metrics |
 | Precision / recall / F1 | Area breakdowns |
-| Learning rates | |
+| Learning rates | Images / second |
+| | GPU utilization |
+| | GPU memory |
+| | GPU temperature |
 
 **Reset to main charts** restores the six initial selections and closes an
 expanded chart. Selecting no charts leaves an explicit empty-selection state.
@@ -537,7 +541,12 @@ identity, default selection, and sparse observations.
 **Epoch axis** is on initially and uses fractional epoch positions for live
 training; turning it off selects the global optimizer-step axis.
 **Log loss scale** changes only training-loss and loss-component charts. There
-is no validation loss curve; images/second belongs to the live progress card.
+is no validation loss curve. **Images / second** plots the epoch-average
+throughput also shown in the live progress card. GPU cards show utilization in
+percent, used/total memory in GiB, and temperature in °C. Their
+[sampling and device scope](rfdetr-workflows.md#saved-history-and-plots) are
+shared by live and saved history. Unavailable sensors and older records leave
+gaps instead of zero-valued samples.
 A loss-scale change preserves non-loss cameras, legends, and prepared geometry,
 including hidden charts and explicitly selected saved history. Reapplying the
 current loss-scale value does not invalidate charts. Each chart's preparation

@@ -1,5 +1,6 @@
 #include "src/controller/services/training/train_process_client.h"
 #include "src/frameworks/serialization/reflected_json.h"
+#include "src/controller/services/diagnostics/runtime_diagnostic_span.h"
 #include "src/common/types/utf8.h"
 #include <dirent.h>
 #include "src/pch_linux.h"
@@ -393,8 +394,14 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
   update.sources.catalog = state_->source_catalog;
   return update;
  }
+ RuntimeDiagnosticSpan<RuntimeDiagnosticTarget, RuntimeDiagnosticFact> diagnostic(state_->diagnostics, [&] {
+  RuntimeDiagnosticFact begin{.owner = contracts::DiagnosticOwner::Training, .event = "training.progress.read.begin", .context = {.document_resource = state_->output_directory.native()}};
+  auto end = begin;
+  end.event = "training.progress.read.end";
+  return std::pair{begin, end};
+ });
  const auto progress = nlohmann::json::parse(bounded_file(state_->output_directory / "progress.json"), nullptr, false);
- const auto result = nlohmann::json::parse(bounded_file(state_->output_directory / "results.json"), nullptr, false);
+ const auto result = progress.is_object() ? nlohmann::json{} : nlohmann::json::parse(bounded_file(state_->output_directory / "results.json"), nullptr, false);
  namespace r = mmltk::backend::models::rfdetr;
  if (!progress.is_object() && !result.is_object() && !state_->persistence_failed) {
   const auto text = bounded_file(state_->output_directory / r::kTrainingPreparationFile, 1024);
@@ -406,7 +413,8 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
   switch (preparation.stage) {
    case r::TrainingPreparationStage::Runtime: status = "Preparing runtime"; break;
    case r::TrainingPreparationStage::Distributed: status = "Connecting training GPUs"; break;
-   case r::TrainingPreparationStage::Dataset: status = "Preparing dataset and sampling plan"; break;
+   case r::TrainingPreparationStage::Dataset: status = "Opening compiled datasets"; break;
+   case r::TrainingPreparationStage::Sampling: status = "Preparing sampling plan"; break;
    case r::TrainingPreparationStage::Model: status = "Constructing training model"; break;
    case r::TrainingPreparationStage::Optimizers: status = "Preparing optimizers and validation"; break;
    case r::TrainingPreparationStage::Checkpoint: status = "Loading model checkpoint"; break;

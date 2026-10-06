@@ -28,6 +28,7 @@ struct ExploreImageSummary {
  std::uint16_t instance_count = 0U;
  bool has_masks = false;
  bool eligible = true;
+ bool has_non_crowd = false;
 };
 struct ExploreSampleFilter {
  ExploreClassMask classes{};

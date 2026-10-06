@@ -323,7 +323,13 @@ impl History {
                     )
                 }
             };
-            let value = value.filter(|v| v.is_finite());
+            let value = value.filter(|v| v.is_finite()).map(|value| {
+                if metric.chart == super::catalog::Chart::GpuMemory {
+                    value / (1024.0 * 1024.0 * 1024.0)
+                } else {
+                    value
+                }
+            });
             if !admit {
                 if value.is_none() {
                     curve.missing = true;

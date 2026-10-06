@@ -96,7 +96,7 @@ public:
  [[nodiscard]] size_t image_stride() const;
  [[nodiscard]] size_t num_label_instances() const;
  [[nodiscard]] size_t num_rle_pairs() const;
- [[nodiscard]] bool masks_available() const noexcept;
+ [[nodiscard]] bool masks_available() const;
  [[nodiscard]] ImageAnnotations annotations(std::uint32_t slot) const;
  [[nodiscard]] const float* image_pixels(std::uint32_t slot) const;
  [[nodiscard]] auto eligible_slots() const { return compiled_source()->eligible_slots(); }

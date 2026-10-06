@@ -4,8 +4,8 @@
 
 Run commands from the repository root through `./mmltk`. The wrapper rewrites
 supported host paths into container mounts; absolute host paths become
-`/host/...`, with repository paths mapped into `/workspace`. Runtime operations
-reuse a repository-scoped container and stream the application output.
+`/host/...`, with repository paths mapped into `/workspace`. Each runtime
+invocation owns a repository-labeled container and streams application output.
 
 ## Wrapper operations
 
@@ -13,7 +13,7 @@ reuse a repository-scoped container and stream the application output.
 | --- | --- |
 | `./mmltk --build` | Build and package the Release runtime |
 | `./mmltk --build-gui` | Format/check Iced and rebuild the canonical browser bundle in the GUI graph |
-| `./mmltk --gui` | Launch the packaged browser host with the canonical bundle |
+| `./mmltk --gui` | Replace the current runtime session and launch the packaged browser host |
 | `./mmltk --prepare-gui-container` | Prepare the GUI runtime container without starting the app |
 | `./mmltk --generate-application-bindings` | Generate bindings, marker, graphics ABI, and cross-language fixtures in the dedicated generation graph |
 | `./mmltk --generate-protocol` | Generate the same artifacts in the shared Release graph |
@@ -61,6 +61,27 @@ override their destinations; relative paths use the invocation directory.
 Test help/list routes skip capture. A new `--test all` replaces earlier tests
 owned by this checkout; [replacement scope and failures](validation.md#replacing-an-active-test-run)
 also apply when `all` has filters.
+
+### GUI session replacement
+
+A new `./mmltk --gui` stops earlier GUI and raw application invocations owned
+by this checkout before starting its browser host. Runtime admission is
+serialized, and the lifetime lock remains exclusive to the active GUI. An
+older launch delayed before admission cannot replace an already admitted
+newer runtime.
+
+Owner registrations under `.cache/locks/runtime-run-*.owner` cover startup
+before a container exists. Container labels also identify sessions started
+before registrations were introduced. Replacement matches the repository,
+wrapper mode, PID, and process-start identity. It requests graceful shutdown,
+uses bounded waits and forced retirement if needed, and confirms the old
+containers and runtime lock have retired before starting the new session.
+Normal exit removes the owner's registration.
+
+Builds, tests, other repositories, and unrelated processes remain outside this
+replacement scope. Raw application invocations may run together, but a new raw
+invocation is refused while the GUI is active. `--prepare-gui-container` also
+refuses an occupied runtime instead of replacing it.
 
 ### Process snapshots
 
@@ -112,6 +133,18 @@ and objects. `N` is the displayed compiled ID, not its filtered gallery position
 or a dense ordinal among eligible images. Inactive/out-of-range slots and
 unsupported formats fail. The native record includes eligible `image_count`,
 physical `slot_count`, used `label_bytes`, and header `max_label_bytes`.
+Add `--profile-compiled WORKERS` (1–64) to time the shared trusted
+`CompiledDataset` open. The `opening` record reports elapsed nanoseconds,
+recorded label/run totals, and actual worker affinity/NUMA/nice settings.
+One worker runs serially on the calling thread. Opening copies and summarizes
+the index without verifying sample metadata or payloads.
+`--cold-compiled` requests cache eviction for
+that file before opening; it neither drops global caches nor modifies data.
+The diagnostic permits native memory-policy inspection and worker priority
+selection while retaining read-only input mounts and no network. Without this
+option, inspection reads only the selected sample. `./mmltk info --compiled
+PATH` also prints the header's maximum complete label payload in bytes.
+
 Repeat `--index PATH` to inspect version-3 normalized annotation rows; add
 `--objects` for their object records. Use `--image PATH` for a cached image or
 `--archive PATH` to find the image in a retained tar archive. JSONL output includes
@@ -123,7 +156,7 @@ count exact RGB segment IDs and report each declared segment's pixel support
 when metadata is available. The wrapper prepares only the required
 [CMake diagnostic targets](build.md#benchmark-diagnostic-builds) with the existing
 development image. The compiled-sample helper uses the Dataset system's checked
-layout and record admission; the mask helper links native Arrow/Parquet and the
+layout and trusted annotation views; the mask helper links native Arrow/Parquet and the
 vendored PNG decoder. No Python Parquet package or new dependency is installed.
 
 `--export-mask-runs` requires exactly one `--index` and writes the selected
@@ -192,10 +225,19 @@ For example, with existing input artifacts:
 
 ```bash
 ./mmltk rfdetr predict \
+  --gpu 0 \
   --compiled ./compiled/val.bin \
   --weights ./checkpoints/model.pt \
   --output ./predictions.json
 ```
+
+Use `--gpu N` on `bench` and RF-DETR device-selecting operations to select the
+CUDA-visible device index (default `0`). It accepts `--gpu=N` too, and shares
+the existing `--device-id` selection for model operations. Both `compile`
+commands accept it as an alias of `--cuda-device-id`; current image and mask
+compilation remains CPU work. Multi-GPU training retains `--device-ids 0,1`,
+which is mutually exclusive with `--gpu`. The
+[GPU guide](gpu-execution.md#workflow-device-selection) explains device numbering.
 
 Key option groups (required fields and defaults remain in command help):
 
@@ -298,11 +340,11 @@ owns cache reuse, output/cache overlap rejection, and publication behavior.
 ## Desktop options and environment
 
 ```bash
-./mmltk --gui --device-id 0 --numa-node -1
+./mmltk --gui --gpu 0 --numa-node -1
 ./mmltk --gui --gdrcopy
 ```
 
-Desktop startup accepts `--device-id`, `--numa-node`, and `--gdrcopy`.
+Desktop startup accepts `--gpu` (also `--device-id`), `--numa-node`, and `--gdrcopy`.
 Its device option selects native visual execution. The Train, Validate,
 Export, and Predict cards retain their own compute selections; Firefox's
 graphics device follows the Wayland session. The

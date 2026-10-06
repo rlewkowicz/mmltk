@@ -238,7 +238,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  FileLayout layout;
  {
   mmltk::common::logging::ScopedProfile layout_profile{"compiler.compute_file_layout"};
-  layout = compute_file_layout(num_images, image_stride);
+  layout = compute_file_layout(num_images, image_stride, effective_config.max_label_bytes);
  }
  mmltk::common::logging::debug([&](spdlog::logger& log) {
   log.debug("[compile] Pixel layout: pixel_offset={} ({:.1f} MB aligned), pixels={:.2f} GB", layout.data_offset, static_cast<double>(layout.data_offset) / (1024.0 * 1024.0),
@@ -250,7 +250,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  auto& fd = staged.file();
  detail::CompiledSlotStorage storage(staged, layout);
  constexpr std::array classes{detail::CompileWorkClass::Extraction, detail::CompileWorkClass::Annotations, detail::CompileWorkClass::Pixels, detail::CompileWorkClass::Output};
- const auto label_window = compiler_internal::DirectoryLabels::resources(2048, compiler_internal::directory_line_window).bytes;
+ const auto label_window = compiler_internal::DirectoryLabels::resources(2048, compiler_internal::directory_line_window, effective_config.max_label_bytes).bytes;
  detail::CompileExecutionLimits limits;
  limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers),
   {width, height, effective_config.resize_mode, effective_config.perceptual_downscale}, classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));

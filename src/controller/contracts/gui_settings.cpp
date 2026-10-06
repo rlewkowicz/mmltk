@@ -359,8 +359,8 @@ constexpr auto train_training_fields = [](auto& state, const auto& visit) {
 };
 constexpr auto augmentation_group_fields = [](auto& group, const auto& visit) {
  visit("probability", Hundredths{group.probability});
- visit("min_strength", Hundredths{group.min_strength});
- visit("max_strength", Hundredths{group.max_strength});
+ visit("min_strength", group.min_strength);
+ visit("max_strength", group.max_strength);
 };
 constexpr auto gpu_augmentation_fields = [](auto& config, const auto& visit) {
  visit("enabled", config.enabled);

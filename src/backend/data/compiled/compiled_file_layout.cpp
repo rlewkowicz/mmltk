@@ -10,10 +10,11 @@ size_t compiled_align_up(size_t value, size_t alignment) {
  if (!alignment || (alignment & (alignment - 1U))) throw std::invalid_argument("compiled alignment must be a power of two");
  return checked_add(value, alignment - 1U, "compiled alignment overflow") & ~(alignment - 1U);
 }
-AnnotationLayout annotation_layout(size_t labels, size_t runs) {
+AnnotationLayout annotation_layout(size_t labels, size_t runs, size_t capacity) {
+ if (capacity > COMPILED_LABEL_LIMIT || capacity % sizeof(RLEPair)) throw std::invalid_argument("invalid compiled label capacity");
  const auto offset = compiled_align_up(checked_multiply(labels, sizeof(PackedInstance), "compiled labels overflow"), sizeof(RLEPair));
  const auto bytes = checked_add(offset, checked_multiply(runs, sizeof(RLEPair), "compiled runs overflow"), "compiled label payload overflow");
- if (bytes > COMPILED_LABEL_CAPACITY) throw std::runtime_error("compiled label capacity exceeded: required " + std::to_string(bytes) + " bytes, capacity " + std::to_string(COMPILED_LABEL_CAPACITY));
+ if (bytes > capacity) throw std::runtime_error("compiled label capacity exceeded: required " + std::to_string(bytes) + " bytes, capacity " + std::to_string(capacity));
  return {offset, bytes};
 }
 std::span<const RLEPair> ImageAnnotations::instance_rle(const PackedInstance& instance) const {
@@ -33,7 +34,7 @@ FileLayout compute_file_layout(uint32_t slots, size_t stride, size_t label_capac
  layout.num_slots = slots;
  layout.image_stride = stride;
  if (!stride || stride % sizeof(float)) throw std::invalid_argument("invalid compiled pixel stride");
- if (label_capacity > COMPILED_LABEL_CAPACITY || label_capacity % sizeof(RLEPair)) throw std::invalid_argument("invalid compiled label capacity");
+ if (label_capacity > COMPILED_LABEL_LIMIT || label_capacity % sizeof(RLEPair)) throw std::invalid_argument("invalid compiled label capacity");
  layout.pixel_pitch = compiled_align_up(stride, PAGE_SIZE);
  layout.label_capacity = label_capacity;
  layout.label_pitch = compiled_align_up(label_capacity, PAGE_SIZE);

@@ -363,6 +363,14 @@ and [continuation validation](../src/backend/models/rfdetr/training/training_con
 
 ## Live training progress
 
+Startup distinguishes **Opening compiled datasets** from **Preparing sampling
+plan**. Training uses the shared
+[trusted compiled-file loader](datasets.md#loading-a-compiled-file).
+Sampling still reads the class membership needed
+for deterministic schedules and continuation, using the same persistent,
+device-local reader workers that subsequently load batches. Training and
+validation loaders share admitted mappings, including aliases of the same file.
+
 The separate progress card follows the active local run even while the dashboard
 shows saved history. It disappears when that run completes, fails, or is
 cancelled. Preparing a model remains a separate stage in the model card.
@@ -420,6 +428,21 @@ Live samples are submitted at most once per second, with immediate phase,
 epoch, and terminal updates. Scalars extend the existing loss handoff;
 learning rates come from optimizer groups and schedule state. Optional values
 remain unavailable when the relevant loss or metric was not computed.
+The existing telemetry worker also samples device-wide GPU utilization,
+used/total framebuffer memory, and temperature through a retained
+[device monitor](../src/frameworks/gpu/cuda/device_telemetry.cpp). Samples are
+cached for one second across model publications. CUDA PCI identity selects the
+physical device, rather than assuming CUDA and NVML indices agree. Collection
+uses neither CUDA stream synchronization nor subprocesses or additional workers.
+The primary training device is sampled (rank zero's device for distributed
+training); these counters include other applications on that device. A missing
+NVML library, unsupported sensor, or failed query leaves that counter absent
+without failing training. New counters are optional fields in format-3 scalar
+records, so existing format-3 histories remain readable with empty GPU charts.
+Memory is persisted in bytes and converted to GiB for display; throughput
+retains the existing epoch-average images/second meaning. CLI and GUI runs
+produce the same telemetry.
+
 Hungarian main loss components are raw, while match-free main components are
 weighted. Auxiliary and denoising groups are separate weighted values;
 correspondence is an overlapping breakdown. Only total represents the complete
@@ -448,8 +471,7 @@ summary separately from epoch curves. Native first-cause identities preserve
 per-model failures. Optional final-test results remain native; the GUI has no
 final-test chart trajectory. The
 [training dashboard](gui-interaction.md#training-dashboard) owns chart selection,
-axes, retained interaction, bounded summaries, and rendering behavior. Throughput
-belongs to live progress rather than a dashboard curve.
+axes, retained interaction, bounded summaries, and rendering behavior.
 
 ## Evaluation metrics and retained samples
 

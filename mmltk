@@ -264,6 +264,7 @@ operation_log_pids=()
 operation_stdout_fd=-1
 operation_stderr_fd=-1
 active_test_registration=""
+active_runtime_registration=""
 
 process_start_ticks() {
     local pid="$1" expected_parent="${2:-}" state
@@ -443,6 +444,9 @@ cleanup_owned_container() {
     fi
     if [[ -n "${active_test_registration}" ]]; then
         rm -f -- "${active_test_registration}"
+    fi
+    if [[ -n "${active_runtime_registration}" ]]; then
+        rm -f -- "${active_runtime_registration}"
     fi
     exit "${exit_status}"
 }
@@ -665,25 +669,34 @@ prepare_lock_file() {
         "lock file '${lock_file}' is not accessible to uid ${uid}"
 }
 
-stop_previous_test_runs() {
+stop_previous_runs() {
+    local kind="$1" mode
+    local -a modes=()
+    case "${kind}" in
+        test) modes=(test) ;;
+        runtime) modes=(gui raw) ;;
+        *) die "unknown wrapper replacement scope '${kind}'" ;;
+    esac
     command -v docker >/dev/null 2>&1 || die "docker is not installed"
     local container_records container owner_pid owner_start registration extra live_start
     local -a containers=() registrations=()
     local -A owners=()
-    container_records="$(timeout --foreground --signal=KILL 15s docker ps -a \
-        --filter label=com.mmltk.wrapper=1 --filter "label=com.mmltk.repo=${repo_root}" \
-        --filter label=com.mmltk.mode=test \
-        --format '{{.ID}} {{.Label "com.mmltk.owner-pid"}} {{.Label "com.mmltk.owner-start"}}')" ||
-        die "could not enumerate previous test containers"
-    while read -r container owner_pid owner_start; do
-        [[ -n "${container}" && "${owner_pid}" != "${wrapper_pid}" ]] || continue
-        containers+=("${container}")
-        if [[ "${owner_pid}" =~ ^[1-9][0-9]*$ && "${owner_start}" =~ ^[0-9]+$ ]]; then
-            owners["${owner_pid}"]="${owner_start}"
-        fi
-    done <<<"${container_records}"
+    for mode in "${modes[@]}"; do
+        container_records="$(timeout --foreground --signal=KILL 15s docker ps -a \
+            --filter label=com.mmltk.wrapper=1 --filter "label=com.mmltk.repo=${repo_root}" \
+            --filter "label=com.mmltk.mode=${mode}" \
+            --format '{{.ID}} {{.Label "com.mmltk.owner-pid"}} {{.Label "com.mmltk.owner-start"}}')" ||
+            die "could not enumerate previous ${kind} containers"
+        while read -r container owner_pid owner_start; do
+            [[ -n "${container}" && "${owner_pid}" != "${wrapper_pid}" ]] || continue
+            containers+=("${container}")
+            if [[ "${owner_pid}" =~ ^[1-9][0-9]*$ && "${owner_start}" =~ ^[0-9]+$ ]]; then
+                owners["${owner_pid}"]="${owner_start}"
+            fi
+        done <<<"${container_records}"
+    done
     # Registrations cover the gaps between containers and the tooling suites.
-    for registration in "${repository_cache_root}/locks"/test-run-*.owner; do
+    for registration in "${repository_cache_root}/locks/${kind}"-run-*.owner; do
         [[ -f "${registration}" ]] || continue
         registrations+=("${registration}")
         if read -r owner_pid owner_start extra <"${registration}" &&
@@ -692,13 +705,36 @@ stop_previous_test_runs() {
             owners["${owner_pid}"]="${owner_start}"
         fi
     done
+    if [[ "${kind}" == runtime ]]; then
+        # An older launch delayed before admission must not displace a newer
+        # runtime that already owns the lock.
+        for owner_pid in "${!owners[@]}"; do
+            live_start="$(process_start_ticks "${owner_pid}" || true)"
+            if [[ "${live_start}" == "${owners[${owner_pid}]}" ]] &&
+                (( live_start > wrapper_start_ticks )); then
+                die "GUI launch was superseded by a newer runtime invocation"
+            fi
+        done
+    fi
     for owner_pid in "${!owners[@]}"; do
         live_start="$(process_start_ticks "${owner_pid}" || true)"
         if [[ "${live_start}" == "${owners[${owner_pid}]}" ]]; then
-            log "stopping previous test run pid=${owner_pid}"
+            if [[ "${kind}" == test ]] || (( ! gui_diagnostics_quiet )); then
+                log "stopping previous ${kind} run pid=${owner_pid}"
+            fi
             kill -TERM "${owner_pid}" 2>/dev/null || true
         fi
     done
+    if [[ "${kind}" == runtime ]]; then
+        # Let the existing owner settle the GUI and remove its own container.
+        # A wrapper stuck in preparation is retired by the bounded fallback.
+        for owner_pid in "${!owners[@]}"; do
+            live_start="$(process_start_ticks "${owner_pid}" || true)"
+            if [[ "${live_start}" == "${owners[${owner_pid}]}" ]]; then
+                wait_for_local_pid_exit "${owner_pid}" 15000 || true
+            fi
+        done
+    fi
     # Retiring the container also releases a wrapper waiting on foreground Docker.
     for container in "${containers[@]}"; do
         timeout --foreground --signal=KILL 25s docker stop --time 22 "${container}" >/dev/null 2>&1 || true
@@ -706,18 +742,22 @@ stop_previous_test_runs() {
     for owner_pid in "${!owners[@]}"; do
         live_start="$(process_start_ticks "${owner_pid}" || true)"
         if [[ "${live_start}" == "${owners[${owner_pid}]}" ]] && ! wait_for_local_pid_exit "${owner_pid}" 5000; then
-            log "forcing previous test run to stop pid=${owner_pid}"
+            if [[ "${kind}" == test ]] || (( ! gui_diagnostics_quiet )); then
+                log "forcing previous ${kind} run to stop pid=${owner_pid}"
+            fi
             stop_owned_process "${owner_pid}" "${owners[${owner_pid}]}" ""
-            wait_for_local_pid_exit "${owner_pid}" 5000 || die "previous test wrapper did not stop"
+            wait_for_local_pid_exit "${owner_pid}" 5000 || die "previous ${kind} wrapper did not stop"
         fi
     done
     for container in "${containers[@]}"; do
         timeout --foreground --signal=KILL 15s docker rm -f "${container}" >/dev/null 2>&1 || true
     done
-    container_records="$(timeout --foreground --signal=KILL 15s docker ps -aq \
-        --filter label=com.mmltk.wrapper=1 --filter "label=com.mmltk.repo=${repo_root}" \
-        --filter label=com.mmltk.mode=test)" || die "could not verify previous test container cleanup"
-    [[ -z "${container_records}" ]] || die "previous test containers remain; new all suite did not start"
+    for mode in "${modes[@]}"; do
+        container_records="$(timeout --foreground --signal=KILL 15s docker ps -aq \
+            --filter label=com.mmltk.wrapper=1 --filter "label=com.mmltk.repo=${repo_root}" \
+            --filter "label=com.mmltk.mode=${mode}")" || die "could not verify previous ${kind} container cleanup"
+        [[ -z "${container_records}" ]] || die "previous ${kind} containers remain; replacement did not start"
+    done
     if ((${#registrations[@]})); then rm -f -- "${registrations[@]}"; fi
 }
 
@@ -727,7 +767,7 @@ begin_test_run() {
     prepare_lock_file "${admission_lock}"
     exec {admission_fd}>>"${admission_lock}"
     flock -x "${admission_fd}"
-    if [[ "${suite}" == all ]]; then stop_previous_test_runs; fi
+    if [[ "${suite}" == all ]]; then stop_previous_runs test; fi
     active_test_registration="${repository_cache_root}/locks/test-run-${wrapper_pid}.owner"
     printf '%s %s\n' "${wrapper_pid}" "${wrapper_start_ticks}" >"${active_test_registration}"
     flock -u "${admission_fd}"
@@ -764,17 +804,33 @@ release_mutation_locks() {
 acquire_runtime_lock() {
     (( runtime_lock_acquired == 0 )) || return 0
     command -v flock >/dev/null 2>&1 || die "flock is required"
-    local runtime_lock="${repository_cache_root}/locks/runtime.lock"
+    local runtime_lock="${repository_cache_root}/locks/runtime.lock" admission_fd
+    local admission_lock="${repository_cache_root}/locks/runtime-admission.lock"
+    prepare_lock_file "${admission_lock}"
+    exec {admission_fd}>>"${admission_lock}"
+    flock -x "${admission_fd}"
     prepare_lock_file "${runtime_lock}"
     exec {runtime_lock_fd}>>"${runtime_lock}"
     if (( gui_mode )); then
-        flock -n -x "${runtime_lock_fd}" || die \
-            "GUI cannot start while another GUI or raw mmltk invocation is active"
+        if ! flock -n -x "${runtime_lock_fd}"; then
+            (( ! prepare_gui_container_mode )) || die \
+                "GUI container preparation cannot start while a runtime invocation is active"
+            ensure_docker
+            ensure_image
+            resolve_gui_session
+            stop_previous_runs runtime
+            flock -w 5 -x "${runtime_lock_fd}" || die \
+                "previous runtime did not release its lock; replacement GUI did not start"
+        fi
     else
         flock -n -s "${runtime_lock_fd}" || die \
             "raw mmltk invocation cannot start while the GUI is active"
     fi
     runtime_lock_acquired=1
+    active_runtime_registration="${repository_cache_root}/locks/runtime-run-${wrapper_pid}.owner"
+    printf '%s %s\n' "${wrapper_pid}" "${wrapper_start_ticks}" >"${active_runtime_registration}"
+    flock -u "${admission_fd}"
+    exec {admission_fd}>&-
 }
 
 release_runtime_lock() {
@@ -1955,20 +2011,6 @@ ensure_container() {
     ensure_gui_runtime_dir_access
 }
 
-terminate_existing_gui_instances() {
-    if (( ! gui_mode )); then
-        return 0
-    fi
-
-    if docker exec -u 0 "${container_name}" /bin/sh -lc '
-        pgrep -f "[m]mltk-browser-host" >/dev/null 2>&1
-    ' >/dev/null 2>&1; then
-        if (( ! gui_diagnostics_quiet )); then log "terminating existing GUI runtime before starting a new one"; fi
-    fi
-
-    shutdown_gui_runtime_in_container TERM 100 || true
-}
-
 verify_gui_contract_compatibility() {
     if (( ! gui_mode )); then
         return 0
@@ -2760,6 +2802,8 @@ run_benchmark_image_diagnostic() {
     local -a diagnostic_args=(
         run --rm --init --pull never --name "${diagnostic_container}"
         --read-only --cap-drop ALL --security-opt no-new-privileges --network none
+        --security-opt seccomp=unconfined
+        --ulimit nice=40:40
         --user "${uid}:${gid}" --workdir /workspace
         --tmpfs /tmp:rw,nosuid,nodev,size=64m
         --volume "${repo_root}:/workspace:ro"
@@ -3963,7 +4007,6 @@ prepare_container_invocation() {
     ensure_container
     build_exec_env_args
     verify_gui_contract_compatibility
-    terminate_existing_gui_instances
 
     container_workdir="/host${host_workdir}"
 

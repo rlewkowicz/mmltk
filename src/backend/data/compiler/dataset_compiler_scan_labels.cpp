@@ -299,8 +299,8 @@ struct DirectoryLabels::Impl {
    projection_first = output.runs.size();
    const auto count = checked_add(labels, std::size_t{1}, "annotation count overflow");
    const auto fits_labels = count <= output.labels.capacity();
-   const auto offset = fits_labels ? annotation_layout(count, 0).run_offset : COMPILED_LABEL_CAPACITY;
-   const auto available = fits_labels && offset <= COMPILED_LABEL_CAPACITY ? (COMPILED_LABEL_CAPACITY - offset) / sizeof(RLEPair) : 0;
+   const auto offset = fits_labels ? annotation_layout(count, 0).run_offset : output.capacity();
+   const auto available = fits_labels && offset <= output.capacity() ? (output.capacity() - offset) / sizeof(RLEPair) : 0;
    if (!fits_labels || projection_first > available) exceeded = true;
    projection.emplace(std::span<const RLEPair>{source_runs.data(), source_runs.size()}, dimensions, dataset::MaskDimensions{config->target_width, config->target_height}, geometry, &output.scratch(),
     output.runs, exceeded ? projection_first : available);
@@ -378,7 +378,7 @@ struct DirectoryLabels::Impl {
 };
 DirectoryLabels::DirectoryLabels(detail::CompileExecution& execution) : parser_(std::make_unique<Parser>(execution)) {}
 DirectoryLabels::~DirectoryLabels() = default;
-detail::CompileResources DirectoryLabels::resources(std::uint32_t width, std::size_t maximum_line) {
+detail::CompileResources DirectoryLabels::resources(std::uint32_t width, std::size_t maximum_line, std::size_t label_capacity) {
  const auto input = padded_line_bytes(maximum_line);
  const auto source = aligned_bytes(checked_multiply(source_run_capacity(maximum_line), sizeof(RLEPair), "source mask workspace overflow"));
  const auto stack = aligned_bytes(checked_multiply(json_stack_capacity(maximum_line), sizeof(DatasetAnnotationFrame), "JSON traversal workspace overflow"));
@@ -387,8 +387,8 @@ detail::CompileResources DirectoryLabels::resources(std::uint32_t width, std::si
  // is separately charged for the full lifetime of this context, including yields.
  const auto opaque = maximum_line > directory_line_window ? parser_bytes(maximum_line) : 0;
  return {
-  .bytes = checked_add(detail::CompiledLabelWorkspace::required_bytes(width), checked_add(checked_add(input, source, "annotation workspace overflow"), stack, "annotation workspace overflow"),
-   "annotation workspace overflow"),
+  .bytes = checked_add(detail::CompiledLabelWorkspace::required_bytes(width, label_capacity),
+   checked_add(checked_add(input, source, "annotation workspace overflow"), stack, "annotation workspace overflow"), "annotation workspace overflow"),
   .supplied_workspace = true,
   .completion_workspace = true,
   .workspace_class = detail::CompileWorkClass::Annotations,
@@ -400,8 +400,8 @@ void DirectoryLabels::begin(std::uint32_t image_index, detail::CompileAllowance 
  impl_ = std::make_unique<Impl>();
  auto& value = *impl_;
  value.custody = allowance;
- value.output.prepare(header.width, allowance);
- auto memory = allowance.workspace().subspan(detail::CompiledLabelWorkspace::required_bytes(header.width));
+ value.output.prepare(header.width, allowance, config.max_label_bytes);
+ auto memory = allowance.workspace().subspan(detail::CompiledLabelWorkspace::required_bytes(header.width, config.max_label_bytes));
  const auto padded = padded_line_bytes(maximum_line);
  value.line_buffer = {reinterpret_cast<char*>(memory.data()), padded};
  memory = memory.subspan(padded);
@@ -435,7 +435,7 @@ bool DirectoryLabels::step(mmltk::common::concurrency::CancellationObservation c
   if (cancellation.requested()) throw std::runtime_error("dataset compilation cancelled");
   if (!value.record_active) {
    if (value.cursor == value.input.size()) {
-    set_annotation_extent(value.result, value.labels, value.required_runs, value.image.string());
+    set_annotation_extent(value.result, value.labels, value.required_runs, value.image.string(), value.output.capacity());
     FileHeader checks{};
     checks.num_classes = checked_cast<std::uint32_t>(value.catalog->size(), "class count overflow");
     checks.max_instances_per_image = UINT16_MAX;

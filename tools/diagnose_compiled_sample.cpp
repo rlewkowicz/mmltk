@@ -1,23 +1,32 @@
 // Invoked by the container-owned benchmark image diagnostic. Persisted layout
-// and annotation admission stay with the Dataset system's ordinary headers.
+// and trusted annotation views stay with the Dataset system's ordinary headers.
 #include "src/backend/data/compiled/compiled_file_utils.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/common/concurrency/worker_pool.h"
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 int main(int argc, char** argv) try {
- if (argc != 3) throw std::invalid_argument("expected compiled path and physical sample slot");
+ if (argc != 3 && argc != 5) throw std::invalid_argument("expected compiled path, physical sample slot and optional opening worker count and cold-cache flag");
  namespace data = mmltk::backend::data;
- const std::string_view sample(argv[2]);
- std::uint32_t slot = 0;
- const auto parsed = std::from_chars(sample.data(), sample.data() + sample.size(), slot);
- if (parsed.ec != std::errc{} || parsed.ptr != sample.data() + sample.size()) throw std::invalid_argument("invalid physical sample slot");
+ const auto parse_number = [](std::string_view text, const char* failure) {
+  std::uint32_t value = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) throw std::invalid_argument(failure);
+  return value;
+ };
+ const auto slot = parse_number(argv[2], "invalid physical sample slot");
  const auto file = mmltk::common::io::FileHandle::open_readonly(argv[1]);
  const auto header = data::read_compiled_header(file);
  const auto sections = data::validate_compiled_file_sections(header, file.size());
@@ -30,7 +39,6 @@ int main(int argc, char** argv) try {
  auto payload = mmltk::common::io::OwnedBuffer<std::byte>::allocate(header.max_label_bytes);
  file.pread_all(payload.data(), extent.used_bytes, sections.layout.label_offset(slot));
  const auto annotations = data::annotation_view(entry, {payload.data(), extent.used_bytes});
- (void)data::admit_compiled_annotations(entry, annotations, header, slot);
  const auto catalog = data::compiled_class_catalog(header);
  auto labels = nlohmann::json::array();
  for (const auto& label : annotations.labels) {
@@ -39,15 +47,40 @@ int main(int argc, char** argv) try {
     {"mask_pairs", +label.mask_rle_pairs}, {"annotation_id", +label.annotation_id}, {"source_category_id", +label.source_category_id}, {"original_area", +label.original_area},
     {"source_ordinal", +label.source_ordinal}});
  }
- const nlohmann::json result{
+ nlohmann::json result{
   {"kind", "compiled_sample"}, {"path", argv[1]}, {"sample", slot}, {"image_count", +header.num_images}, {"slot_count", +header.num_slots}, {"width", +header.image_width},
   {"height", +header.image_height}, {"original_width", +entry.original_width}, {"original_height", +entry.original_height}, {"source", static_cast<std::uint8_t>(entry.source)},
   {"image_id", entry.has_source_image_id ? nlohmann::json(+entry.source_image_id) : nlohmann::json(nullptr)}, {"label_bytes", +entry.label_bytes}, {"max_label_bytes", +header.max_label_bytes},
   {"instances", std::move(labels)}
  };
+ if (argc == 5) {
+  const auto count = parse_number(argv[3], "invalid opening worker count");
+  if (count < 1 || count > 64) throw std::invalid_argument("opening worker count must be 1–64");
+  std::unique_ptr<mmltk::common::concurrency::WorkerPool> workers;
+  if (count > 1) workers = std::make_unique<mmltk::common::concurrency::WorkerPool>(count, std::vector<int>{}, "compiled-open", 0, nullptr, false);
+  const bool cold = std::string_view(argv[4]) == "1";
+  if (cold) file.advise(0, file.size(), POSIX_FADV_DONTNEED);
+  const auto started = std::chrono::steady_clock::now();
+  const auto source = data::CompiledDataset::open(argv[1], data::CompiledDataset::AccessPattern::Random, {.workers = workers.get()});
+  result["opening"] = {
+   {"workers", workers ? workers->size() : 1U},
+   {"requested_workers", count},
+   {"cold", cold},
+   {"duration_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()},
+   {"labels", source.label_count()},
+   {"runs", source.run_count()},
+  };
+  auto policies = nlohmann::json::array();
+  const auto append_policy = [&](const auto& policy) { policies.push_back({{"affinity", policy.affinity}, {"numa_node", policy.numa_node}, {"nice", policy.nice_value}}); };
+  if (workers) {
+   for (std::size_t worker = 0; worker < workers->size(); ++worker) append_policy(workers->policy(worker));
+  } else
+   append_policy(mmltk::common::system::capture_execution_policy_snapshot());
+  result["opening"]["execution"] = std::move(policies);
+ }
  std::cout << result.dump() << '\n';
  return 0;
 } catch (const std::exception& error) {
- std::cerr << "compiled sample diagnostic: " << error.what() << '\n';
+ std::cerr << "compiled sample diagnostic error: " << error.what() << '\n';
  return 1;
 }

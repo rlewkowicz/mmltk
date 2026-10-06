@@ -58,7 +58,7 @@ public:
  ~DirectoryLabels();
  DirectoryLabels(const DirectoryLabels&) = delete;
  DirectoryLabels& operator=(const DirectoryLabels&) = delete;
- [[nodiscard]] static detail::CompileResources resources(std::uint32_t width, std::size_t maximum_line);
+ [[nodiscard]] static detail::CompileResources resources(std::uint32_t width, std::size_t maximum_line, std::size_t label_capacity = COMPILED_LABEL_CAPACITY);
  void begin(std::uint32_t image_index, detail::CompileAllowance, std::span<const std::uint8_t> input, std::size_t maximum_line, const detail::CompileImageHeader&, const CompilerConfig&,
   const catalog::ClassCatalog&, std::uint8_t category_base, std::filesystem::path annotation, std::filesystem::path image);
  [[nodiscard]] bool step(mmltk::common::concurrency::CancellationObservation);

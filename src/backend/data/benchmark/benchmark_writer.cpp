@@ -258,7 +258,7 @@ void BenchmarkSplitWriter::prepare_pixels(std::uint32_t slot) {
  impl_->slots_storage->prepare_pixels(slot);
 }
 void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations annotations, std::uint64_t ordinal_base) {
- set_annotation_extent(entry, annotations.labels.size(), annotations.runs.size(), std::to_string(entry.source_image_id));
+ set_annotation_extent(entry, annotations.labels.size(), annotations.runs.size(), std::to_string(entry.source_image_id), COMPILED_LABEL_CAPACITY);
  // Direct controller callers also hand physical I/O an owned pinned payload.
  auto& files = impl_->output();
  detail::CompiledLabelWorkspace workspace;
@@ -276,7 +276,7 @@ void BenchmarkSplitWriter::write_label_output(std::uint32_t slot, ImageEntry ent
  auto& state = *impl_;
  throw_if_benchmark_cancelled(state.cancellation);
  entry.status = ImageStatus::Eligible;
- set_annotation_extent(entry, output.labels.size(), output.runs.size(), std::to_string(entry.source_image_id));
+ set_annotation_extent(entry, output.labels.size(), output.runs.size(), std::to_string(entry.source_image_id), COMPILED_LABEL_CAPACITY);
  FileHeader checks{};
  checks.num_classes = common_math::checked_cast<std::uint32_t>(state.class_names.size(), "benchmark class count overflow");
  checks.max_instances_per_image = UINT16_MAX;

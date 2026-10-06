@@ -81,6 +81,9 @@ std::filesystem::path compile_explore_fixture(const std::filesystem::path& tempo
  config.target_width = dimensions.compiled_width;
  config.target_height = dimensions.compiled_height;
  config.num_workers = 1U;
+ // Explore accepts the full persisted format, including files produced with
+ // a larger compiler budget than the current default.
+ if (annotations.objects) config.max_label_bytes = backend::data::COMPILED_LABEL_LIMIT;
  const mmltk::backend::data::DatasetCompilePlan plan = mmltk::backend::data::DatasetCompiler::prepare(config, {config.split});
  mmltk::backend::data::DatasetCompiler::compile(plan, 0U);
  return backend::data::testsupport::compiled_bin_path(fixture);

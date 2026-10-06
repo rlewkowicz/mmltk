@@ -119,17 +119,18 @@ struct AugmentationGroupConfig {
  MMLTK_MINIMUM(float, kAugmentationScalarMinimum)
  MMLTK_MAXIMUM(float, kAugmentationScalarMaximum) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::UnitInterval) float max_strength = 0.0F;
 };
+inline constexpr AugmentationGroupConfig kDefaultAugmentationGroup{0.25F, 0.0375F, 0.375F};
 struct GpuAugmentationConfig {
  bool operator==(const GpuAugmentationConfig&) const = default;
  bool enabled = false;
  bool perceptual_downscale = false;
- AugmentationGroupConfig geometry{0.50F, 0.05F, 0.50F};
- AugmentationGroupConfig resize{0.50F, 0.05F, 0.50F};
- AugmentationGroupConfig color{0.50F, 0.05F, 0.50F};
- AugmentationGroupConfig noise{0.50F, 0.05F, 0.50F};
- AugmentationGroupConfig blur{0.50F, 0.05F, 0.50F};
+ AugmentationGroupConfig geometry = kDefaultAugmentationGroup;
+ AugmentationGroupConfig resize = kDefaultAugmentationGroup;
+ AugmentationGroupConfig color = kDefaultAugmentationGroup;
+ AugmentationGroupConfig noise = kDefaultAugmentationGroup;
+ AugmentationGroupConfig blur = kDefaultAugmentationGroup;
  // CLEANUP-IGNORE: Occlusion remains a named generated field rather than an opaque indexed augmentation entry.
- AugmentationGroupConfig occlusion{0.50F, 0.05F, 0.50F};
+ AugmentationGroupConfig occlusion = kDefaultAugmentationGroup;
  MMLTK_MINIMUM(float, kAugmentationScalarMinimum)
  MMLTK_MAXIMUM(float, kAugmentationScalarMaximum) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::UnitInterval) float copy_paste_probability = 0.80F;
 };

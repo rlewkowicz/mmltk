@@ -51,7 +51,7 @@ inline void validate_compiled_header(const FileHeader& header) {
  }
  if (header.num_classes == 0U || header.num_classes > MAX_CLASSES) { throw std::runtime_error("compiled file has invalid class count"); }
  if (header.max_instances_per_image > std::numeric_limits<std::uint16_t>::max()) { throw std::runtime_error("compiled file maximum instance count exceeds the index representation"); }
- if (header.max_label_bytes > COMPILED_LABEL_CAPACITY || header.max_label_bytes % sizeof(RLEPair) || annotation_layout(header.max_instances_per_image, 0).used_bytes > header.max_label_bytes)
+ if (header.max_label_bytes > COMPILED_LABEL_LIMIT || header.max_label_bytes % sizeof(RLEPair) || annotation_layout(header.max_instances_per_image, 0).used_bytes > header.max_label_bytes)
   throw std::runtime_error("compiled maximum label size is invalid");
  if (header.image_width > MAX_IMAGE_EXTENT || header.image_height > MAX_IMAGE_EXTENT || header.channels != 3U ||
      (header.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch && header.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox))
@@ -81,10 +81,14 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
   throw std::runtime_error("compiled fixed slot layout or file size is invalid");
  return {layout.index_offset, layout.index_size, layout};
 }
-// Field checks have one owner. Producers use these while copying/encoding;
-// mapped readers use the fused admission below before exposing bulk views.
+// Producers check fields while copying/encoding. Readers trust published data.
 class CompiledRecordChecks final {
 public:
+ static void metadata(const ImageEntry& entry, const FileHeader& header, std::size_t position = 0) {
+  image(entry, position);
+  if (!entry.eligible() || entry.num_instances > header.max_instances_per_image || annotation_layout(entry.num_instances, entry.num_runs).used_bytes != entry.label_bytes)
+   throw std::runtime_error("compiled annotation counts differ at slot " + std::to_string(position));
+ }
  static void image(const ImageEntry& entry, std::size_t position = 0) {
   if (!entry.original_width || !entry.original_height || entry.has_source_image_id > 1U || entry.source > AnnotationSource::CoconutObjects365V2 ||
       (!entry.has_source_image_id && entry.source_image_id) || !std::ranges::all_of(entry._reserved, [](auto value) { return value == 0; }))
@@ -114,13 +118,11 @@ public:
   return std::size_t{pair.start} + pair.length;
  }
 };
-// Producers and readers admit the same per-image payload, with local run offsets.
+// Producers check each per-image payload before publication, with local run offsets.
 [[nodiscard]] inline bool admit_compiled_annotations(
  const ImageEntry& entry, ImageAnnotations annotations, const FileHeader& header, std::size_t slot = 0, mmltk::common::concurrency::CancellationObservation cancellation = {}) {
- CompiledRecordChecks::image(entry, slot);
- if (!entry.eligible() || entry.num_instances > header.max_instances_per_image || annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs ||
-     annotation_layout(entry.num_instances, entry.num_runs).used_bytes != entry.label_bytes)
-  throw std::runtime_error("compiled annotation counts differ at slot " + std::to_string(slot));
+ CompiledRecordChecks::metadata(entry, header, slot);
+ if (annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs) throw std::runtime_error("compiled annotation counts differ at slot " + std::to_string(slot));
  const auto pixels = mmltk::common::math::checked_multiply<std::size_t>(header.image_width, header.image_height, "compiled mask size overflow");
  std::size_t consumed = 0;
  bool masks = false;
@@ -138,9 +140,9 @@ public:
  if (consumed != annotations.runs.size_bytes()) throw std::runtime_error("compiled image has unreferenced mask runs");
  return masks;
 }
-inline void set_annotation_extent(ImageEntry& entry, std::size_t labels, std::size_t runs, std::string_view identity) {
+inline void set_annotation_extent(ImageEntry& entry, std::size_t labels, std::size_t runs, std::string_view identity, std::size_t capacity = COMPILED_LABEL_LIMIT) {
  try {
-  const auto payload = annotation_layout(labels, runs);
+  const auto payload = annotation_layout(labels, runs, capacity);
   entry.num_instances = mmltk::common::math::checked_cast<std::uint16_t>(labels, "compiled instance count overflow");
   entry.num_runs = mmltk::common::math::checked_cast<std::uint32_t>(runs, "compiled run count overflow");
   entry.label_bytes = mmltk::common::math::checked_cast<std::uint32_t>(payload.used_bytes, "compiled label size overflow");

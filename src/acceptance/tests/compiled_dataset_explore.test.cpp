@@ -1021,6 +1021,9 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
   REQUIRE(labels.size() == annotations.objects);
   for (const auto& label : labels) CHECK(label.has_mask());
   if (annotations.crowd_only) CHECK(std::ranges::all_of(labels, [](const auto& label) { return label.is_crowd(); }));
+  const auto summaries = explore::build_explore_summaries(store);
+  CHECK(summaries[10U].has_non_crowd == !annotations.crowd_only);
+  CHECK_FALSE(summaries[0U].has_non_crowd);
   std::size_t runs = 0U;
   for (const auto& label : labels) runs += store.instance_rle(10U, label).size();
   REQUIRE(runs == annotations.objects * annotations.runs_per_object);

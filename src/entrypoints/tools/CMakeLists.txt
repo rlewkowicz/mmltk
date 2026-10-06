@@ -7,6 +7,8 @@ mmltk_register_ordinary_sources(mmltk_diagnose_compiled_sample
 target_link_libraries(mmltk_diagnose_compiled_sample PRIVATE
     mmltk::backend::data
     mmltk::backend::data::catalog
+    mmltk::common::concurrency
+    mmltk::common::system
     mmltk::common::io
     nlohmann_json)
 mmltk_enable_native_runtime_rpath(mmltk_diagnose_compiled_sample)

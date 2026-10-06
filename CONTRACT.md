@@ -194,6 +194,10 @@ completeness, and the relationship between source and derived geometry through
 compilation, preview, augmentation, upscaling, and editing. Clean pixels and
 semantic planes remain separate until final display composition.
 
+Compiled dataset readers trust compiler-published metadata and consume images
+and annotations on demand. Opening uses the recorded index without rescanning
+payloads or revalidating per-sample metadata.
+
 Iced applies a common view transform to completed pixels and their metadata,
 independently of native product dimensions. Annotation imports preserve the
 displayed geometry; derived products retain their source correspondence.

@@ -820,14 +820,20 @@ TEST_CASE("cached execution and semantic plans share donor identities and numeri
   CHECK(executor.plan().images[image] == plan_augmentation_image(config, keys[image], images[image], &donors[selected], selected));
  }
 }
-TEST_CASE("paste admission handles disabled zero and certain probabilities", "[backend][augmentation][donors]") {
+TEST_CASE("paste admission handles probabilities and bounded donor scaling", "[backend][augmentation][donors]") {
  CHECK(GpuAugmentationConfig{}.copy_paste_probability == .80F);
  auto config = test_support::isolated_augmentation_config();
+ const GpuAugmentationDonor donor{.label = 0, .dataset_index = 1, .area = 1.F, .box = {0.F, 0.F, 1.F, 1.F}};
  for (std::uint64_t key = 0; key < 128U; ++key) {
   config.copy_paste_probability = 0.0F;
   CHECK_FALSE(augmentation_paste_admitted(config, key));
   config.copy_paste_probability = 1.0F;
   CHECK(augmentation_paste_admitted(config, key));
+  const auto plan = plan_augmentation_image(config, key, 0, &donor, 0);
+  REQUIRE(plan.paste_donor_slot == 0);
+  const float scale = 1.0F / plan.paste_inverse[0];
+  CHECK(scale >= .625F);
+  CHECK(scale <= 1.375F);
   config.enabled = false;
   CHECK_FALSE(augmentation_paste_admitted(config, key));
   config.enabled = true;

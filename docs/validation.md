@@ -32,6 +32,9 @@ objects. Native `--file` selections skip the package-wide Rust formatting;
 `--start-at` retains it. This Rust step is formatting, not a Rust static-analysis
 suite. The [build reference](build.md#target-declarations-and-precompiled-headers)
 owns PCH and header-isolation handling in the analysis graph.
+`./mmltk --tidy --rust-only` formats just that Rust package through the same
+containerized owner, without configuring or analyzing native code. It cannot
+be combined with native file, start-at, or third-party selections.
 [.clang-format](../.clang-format) keeps the Google base, a 200-column limit,
 one-column indentation and continuation, and no tabs. Its Clang 22 braced-list
 settings use one-column indentation with opening/closing breaks for long lists;
@@ -351,6 +354,14 @@ GUI/development build facilities exist.
 Product-build `--no-run` checks prove Rust test compilation only. Execution
 requires unfiltered `all` or standalone `browser-app`, including its JavaScript
 cases.
+
+The log-query tooling suite also exercises wrapper capture and process
+ownership with isolated checkouts and a simulated Docker command. Its runtime
+cases cover [GUI replacement](commands.md#gui-session-replacement) of shared
+raw sessions, an existing GUI, and an owner still preparing its container;
+retention of other checkout/test owners; and rejection of a delayed older GUI
+after a newer invocation has started. These checks exercise wrapper admission
+and cleanup without requiring a display or stopping real application sessions.
 
 Some RF-DETR tests download model checkpoints and derive normalized weights,
 ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
@@ -1022,7 +1033,7 @@ sessions retain ordinary clipboard permissions.
 | `mmltk_controller_visual_systems_tests` | Shared visual runtime, presentation protocol/custody, native gallery cache/priority/atlas integration, acceptance gates, and cross-system workspace behavior |
 | `mmltk_frameworks_gpu_tests` | Independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, complete receiver/device transfers, sparse display coverage/coarsening/history recovery and scratch custody, acquisition/release/settlement, pressure, failure, and retirement |
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, independent prepared/released artifacts, and bounded fatal reporting with disabled/uninitialized/failed sinks and broken pipes |
-| `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | Reflected CLI names/aliases/negation, canonical member presence and width-only square compilation, scalar/item/fixed-capacity error precedence and unchanged rejected destinations; CLI/ONNX fatal stderr, logging overrides and named file identities, and command exit behavior |
+| `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | Reflected CLI names/aliases/negation, canonical member presence and width-only square compilation, GPU selection for bounded streaming and training-option exclusivity, scalar/item/fixed-capacity error precedence and unchanged rejected destinations; CLI/ONNX fatal stderr, logging overrides and named file identities, and command exit behavior |
 | `mmltk_common_concurrency_tests` | Borrowed cancellation, scoped stop-token bridging, pre-requested/concurrent cancellation, unwind, and source destruction policy |
 | `mmltk_entrypoints_desktop_tests` and `mmltk_controller_firefox_process_tests` | Desktop startup/child failure status, exact launch OS errors, unexpected signal reporting, and quiet requested shutdown |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
@@ -1181,6 +1192,60 @@ capabilities are unavailable; BF16 branches require compatible hardware.
 GDRCopy mappings additionally need a usable `gdrdrv` or CUDA DMA-BUF mmap route.
 A host lacking both cannot prove GDRCopy mapping even when CUDA/Wayland pass.
 
+### Training startup and monitoring validation record
+
+The 2026-10-04 GUI capture for `output/train/run-0021` spent 63.066 seconds
+in dataset preparation. The selected `compiled/train.bin` contains 587,017
+eligible images, 5,069,379 labels, and 546,101,044 mask runs. Full admission
+walked those payloads before sampling or training. GPU monitoring starts with
+live training records, after this preparation stage.
+
+The read-only diagnostic in
+`build/validation/training-startup-measurement.log` measured the trusted
+header/index open at **15.289 ms** and full payload validation at **115.258 s**.
+Both ran serially in one invocation without requested cache eviction, while a
+user training run was active. An earlier full validation of recently accessed
+data took **1.109 s** (`training-startup-serial.jsonl` in the same directory).
+These measurements show cache/load sensitivity and the work removed from
+training admission; they do not measure complete training startup or establish
+a controlled end-to-end speedup. Sampling still needs class membership.
+
+Focused checks after `./mmltk --build` passed:
+
+| Coverage | Result | Local artifact under `build/validation/` |
+| --- | --- | --- |
+| Compiled admission, trusted/full and serial/parallel | 3 cases, 266 assertions | `training-startup-data-tests.log` |
+| Training telemetry and deterministic sampling plans | 20 cases, 2,599 assertions | `training-startup-training-tests.log` |
+| Preparation status and fatal-cause publication | 2 cases, 48 assertions | `training-startup-process-tests.log` |
+| Compiled diagnostic boundaries | 5 cases, 139 assertions | `training-startup-diagnostic-tests.log` |
+| Rust chart projection, retention, gaps, and selection | 33 cases | `training-charts-browser-tests.log` |
+| Browser pixel evidence, including flat chart boundaries | 9 cases across focused runs | `training-charts-pixel-proof-tests.log`, `training-charts-pixel-proof-tests-retry.log` |
+| Physical GPU monitor and CUDA-context preservation | 2 cases, 22 assertions, no skips | `training-charts-gpu-tests.log` |
+| Log queries, including bounded JSON documents | 183 cases | `training-json-log-tests.log` |
+
+After the pixel-probe correction, `./mmltk --build` passed again
+(`training-charts-pixel-proof-build.log`). The focused rendered gate
+`./mmltk --test workspace-wayland --headless-compositor -- 'workspace_wayland_workflows'`
+then passed, including normal training/chart interaction and the second
+browser's injected graphics-failure recovery. Its transcript is
+`training-charts-wayland-resumed.log`; `training-charts-rendered-evidence.jsonl`
+retains all four performance-chart pixel observations. The probe includes the
+full chart height so nearly flat used/total memory lines at opposite plot edges
+remain observable. Earlier resource-limited attempts ran while the user's
+training occupied the display GPU; the successful run followed its release.
+Existing successful checks were retained through focused retries. No full
+`all` suite, production dataset compilation, or Firefox-owned tests were run
+for this change.
+
+The earlier CLI/GUI throughput captures are not matched: CLI
+`checkpoints/nano-match-free2` froze the encoder and disabled denoising; GUI
+`output/train/run-0018` trained the encoder with denoising enabled. Their reader
+and prefetch settings also differed. The comparison is retained in
+`build/validation/training-gui-cli-comparison.jsonl`; its throughput values
+cannot establish GUI overhead. GUI progress reads in the later capture averaged
+about 0.3 ms across 239 observations (`training-gui-progress-read-cost.log`).
+All these artifacts are ignored local evidence, absent from a fresh checkout.
+
 ## Benchmark compilation evidence
 
 The existing native suites exercise bounded release fixtures through the
@@ -1307,6 +1372,82 @@ proves rendering, input, cancellation/restart, and native caption agreement;
 [capacity/download limits](benchmark-datasets.md#cache-formats-and-capacity) bound
 these claims. Trace/serialization suites cover timestamps, effect-only delivery
 failure, Unicode scalars, and malformed wire-text rejection.
+
+### Compiled Explore opening measurements
+
+The measurements below describe the former payload-verifying open. Current
+[compiled loading](datasets.md#loading-a-compiled-file) trusts published
+metadata for every reader and does not perform that scan. Use
+`--diagnose-benchmark-image --profile-compiled WORKERS` to measure current
+index loading; historical annotation-admission times measure different work.
+
+The 2026-10-04 capture delayed `shutdown.explore_join` by 72.29 seconds while
+the initial discrete Explore operation was active. An isolated read-only scan
+of the selected `compiled/train.bin` reproduced the costly cold annotation
+admission. The file contains 587,017 eligible images across 621,608 slots,
+5,069,379 objects and 546,101,044 RLE pairs. Its validated maximum complete
+label payload is 121,824 bytes; the maximum object count is 688 per image.
+The current `compiled/val.bin` header reports 5,000 images, at most 63 objects
+and a maximum payload of 40,624 bytes. The compiler default therefore covers
+both existing outputs; it is not a bound inferred for other resolutions or
+future datasets.
+
+| Annotation admission | Observed wall time |
+| --- | ---: |
+| Existing serial open, cached file | 0.962 s |
+| Existing serial open, file-local cache eviction requested | 124.528 s |
+| Parallel open, same eviction request, eight persistent workers | 16.798 s |
+
+The parallel workers used CPUs 0, 2, 4, 6, 8, 10, 12 and 14, NUMA node 0,
+and nice −10. The original serial captures did not record placement, so these
+are observed end-to-end opening times, not an isolated CPU-kernel comparison.
+Both cold scans admitted identical object/run totals and exact maximum bytes.
+No images were downloaded or compiled. Local records are
+`build/validation/explore-open-baseline.jsonl`,
+`explore-open-baseline-cold.jsonl` and `explore-open-parallel-cold.jsonl` in
+that directory; the [diagnostic command](commands.md#wrapper-operations)
+records placement in subsequent captures.
+
+The focused validation built the complete product and checked changed native
+units with tidy. Dataset admission, cancellation, pool reuse, compilation and
+storage checks passed across the data suite and its focused retry: the initial
+run had 566 passes, one fixture failure and one unavailable GDR branch; the
+fixture then passed 75 assertions after explicitly selecting the persisted
+format ceiling for its deliberately wide annotation. The new diagnostic cases
+passed 137 assertions in five cases. Native Explore acceptance passed 157,085
+assertions across eight cases; four cases were marked skipped after their
+available paths completed because GDR was unavailable. Captures are
+`explore-build-final.log`, `explore-data-tests.log`, `explore-data-retry.log`,
+`explore-diagnostic-tests.log` and `explore-native-acceptance.log` under
+`build/validation/`. Packaged acceptance through
+`./mmltk --test workspace-wayland --headless-compositor` also exited zero:
+88 cases passed, one GDR-capability case was skipped, and all 155,094 assertions
+passed (`build/validation/explore-wayland-acceptance.log`). No full `all` suite
+or production dataset compilation was part of this focused follow-up.
+
+After removing reader verification, the same existing training bin opened in
+8,115,359 ns (about 8.1 ms) with eight workers and file-local cache eviction
+requested. Recorded index totals remained 5,069,379 labels and 546,101,044 runs
+across 621,608 physical slots. This measures the trusted shared open, excluding
+Explore's subsequent label-summary pass and rendering. Worker placement matched
+the earlier eight-worker capture. The read-only command was:
+
+```bash
+./mmltk --diagnose-benchmark-image --compiled compiled/train.bin --sample 0 \
+  --profile-compiled 8 --cold-compiled
+```
+
+The capture is
+[explore-open-trusted-cold.jsonl](../build/validation/explore-open-trusted-cold.jsonl).
+The product build and targeted tidy passed. Focused data checks passed 28,084
+assertions across 34 cases (33 passed, one marked skipped after H2D coverage
+because GDR was unavailable); diagnostic checks passed 137 assertions in five
+cases; native Explore acceptance passed all 157,083 assertions across eight
+cases (four passed, four marked skipped at their unavailable GDR branches).
+The respective test transcripts are
+[data](../build/logs/mmltk-test-20261004-171952-3066505.log),
+[diagnostics](../build/logs/mmltk-test-20261004-172153-3072276.log), and
+[Explore](../build/logs/mmltk-test-20261004-172213-3076038.log).
 
 ### Compiler throughput validation record
 

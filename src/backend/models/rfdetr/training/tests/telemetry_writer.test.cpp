@@ -61,6 +61,22 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
 }
 }  // namespace
 TEST_CASE("test_telemetry_persistence_failure_is_nonfatal", "[model][rfdetr][training][telemetry]") { test_telemetry_persistence_failure_is_nonfatal(); }
+TEST_CASE("Training history preserves device counters and reads older scalar records", "[rfdetr][training][telemetry]") {
+ namespace serial = mmltk::frameworks::serialization;
+ r::TrainingScalars scalars;
+ scalars.images_per_second = 107;
+ scalars.gpu_utilization_percent = 95;
+ scalars.gpu_memory_used_bytes = 20.0 * 1024 * 1024 * 1024;
+ scalars.gpu_memory_total_bytes = 24.0 * 1024 * 1024 * 1024;
+ scalars.gpu_temperature_celsius = 72;
+ std::array<std::byte, 4096> scratch{};
+ const serial::wire::Limits limits{.max_bytes = scratch.size(), .max_items = 256, .max_depth = 8};
+ auto json = serial::reflected_json(scalars, scratch, limits);
+ CHECK(serial::decode_reflected_json<r::TrainingScalars>(json.dump(), limits) == scalars);
+ mmltk::frameworks::reflection::visit_materialized_members<mmltk::frameworks::gpu::CudaDeviceTelemetry>([&]<class>(const auto& fact) { json.erase(std::string(fact.member_name)); });
+ static_cast<mmltk::frameworks::gpu::CudaDeviceTelemetry&>(scalars) = {};
+ CHECK(serial::decode_reflected_json<r::TrainingScalars>(json.dump(), limits) == scalars);
+}
 TEST_CASE("Training preparation publishes stages only from rank zero", "[rfdetr][training][telemetry]") {
  mmltk::testsupport::ScopedTempDir temp{"mmltk-training-preparation"};
  r::TrainRequest request;
@@ -80,8 +96,8 @@ TEST_CASE("Training preparation publishes stages only from rank zero", "[rfdetr]
  peer.Stage(r::TrainingPreparationStage::Model);
  CHECK(read().stage == r::TrainingPreparationStage::Dataset);
  for (const auto stage :
-  {r::TrainingPreparationStage::Checkpoint, r::TrainingPreparationStage::Model, r::TrainingPreparationStage::Weights, r::TrainingPreparationStage::Synchronization,
-   r::TrainingPreparationStage::Optimizers}) {
+  {r::TrainingPreparationStage::Sampling, r::TrainingPreparationStage::Checkpoint, r::TrainingPreparationStage::Model, r::TrainingPreparationStage::Weights,
+   r::TrainingPreparationStage::Synchronization, r::TrainingPreparationStage::Optimizers}) {
   writer.Stage(stage);
   CHECK(read().stage == stage);
  }
@@ -486,6 +502,8 @@ TEST_CASE("live projection retains every scheduled source beside current progres
   std::ifstream input(temp.path() / "progress.json");
   const auto document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(
    nlohmann::json::parse(input).dump(), {.max_bytes = r::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
+  // The writer adds device measurements independently of the submitted CPU facts.
+  static_cast<mmltk::frameworks::gpu::CudaDeviceTelemetry&>(current.scalars) = document.record.progress.scalars;
   CHECK(document.record.progress == current);
   REQUIRE(document.sources.observations.size() == (ema ? 3 : 1));
   const auto selected = std::ranges::find_if(document.sources.observations, [&](const auto& record) { return r::training_metric_source(record) == *document.sources.catalog.default_source; });

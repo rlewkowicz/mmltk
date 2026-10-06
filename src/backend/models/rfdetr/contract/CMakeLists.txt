@@ -49,6 +49,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_contract
 )
 
 mmltk_link_declarations(mmltk_backend_models_rfdetr_contract PUBLIC
+    mmltk::frameworks::gpu
     mmltk::backend::imaging::resample)
 
 mmltk_register_header_isolation(mmltk_backend_models_rfdetr_contract)

@@ -1004,6 +1004,20 @@ test('Save Annotations active perimeter evidence keeps its green save-only core'
   assert.ok(reports.every(report=>report.label === 'Save Annotations' && report.core[1]>report.core[0]+60));
 });
 
+test('workflow chart proof includes flat boundary curves and excludes neutral axes and side legends', t => {
+  const f = canvasFixture(t, true);
+  for (const curveY of [1, 78, null]) {
+    const outcomes = [];
+    f.sampling.raster = (x, y) =>
+      x < 25 || (curveY !== null && y >= curveY && y < curveY + 2)
+        ? [20, 180, 40, 255] : [128, 128, 128, 255];
+    browser.mmltkIntegrationWorkflowPixels('train.metrics.plot', [0, 0, 100, 80], true, false,
+      0, 0, -1, 0, [], (...values) => outcomes.push(values), [], [], false);
+    f.flushFrames();
+    assert.deepEqual(outcomes.at(-1), ['observed', 13 * 80, curveY === null ? 0 : 26]);
+  }
+});
+
 test('workflow gallery proof requires a ready tile, exact receipt and image pixels', t => {
   const f = canvasFixture(t, true);
   const control = 'explore.gallery.workspace';

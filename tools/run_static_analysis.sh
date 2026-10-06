@@ -12,7 +12,7 @@ die() {
 
 usage() {
     cat <<'EOF'
-Usage: tools/run_static_analysis.sh [--third_party] [--file <source>...] [--start-at <translation-unit>] [--cppcheck-only]
+Usage: tools/run_static_analysis.sh [--third_party] [--file <source>...] [--start-at <translation-unit>] [--rust-only] [--cppcheck-only]
 
 Runs the Docker-backed static-analysis pass for this repo:
 1. Formats tracked first-party C/C++/CUDA files and, on full passes, the owned Rust frontend
@@ -27,6 +27,7 @@ Options:
   --start-at <translation-unit>  Resume analysis from the given file in
                                  compile-database order
   --cppcheck-only                Unavailable while cppcheck lacks C++26 reflection support
+  --rust-only                    Format only the first-party Iced Rust package
   --help                         Show this help
 
 Environment:
@@ -46,6 +47,7 @@ start_at=""
 target_files=()
 target_files_file=""
 cppcheck_only=0
+rust_only=0
 # Cppcheck 2.21 consumes GCC's compilation database but cannot parse GCC 16's
 # C++26 reflection tokens and splices. Keep the corrected project selection in
 # place so coverage can be restored by changing this gate once its parser
@@ -128,6 +130,9 @@ while (($# > 0)); do
         --cppcheck-only)
             cppcheck_only=1
             ;;
+        --rust-only)
+            rust_only=1
+            ;;
         --third_party)
             include_third_party=1
             ;;
@@ -141,6 +146,20 @@ done
 ((${#target_files[@]} == 0)) || [[ -z "${start_at}" ]] || die "--file and --start-at cannot be combined"
 (( ! cppcheck_only || cppcheck_enabled )) ||
     die "--cppcheck-only is unavailable because cppcheck 2.21 cannot parse C++26 reflection"
+if (( rust_only )) && { ((${#target_files[@]} > 0 || include_third_party)) || [[ -n "${start_at}" ]]; }; then
+    die "--rust-only cannot be combined with native analysis selections"
+fi
+
+format_rust_sources() {
+    command -v cargo >/dev/null 2>&1 || die "cargo is unavailable; rebuild the analysis image"
+    log "running cargo fmt over the first-party Iced frontend"
+    cargo fmt --manifest-path "${repo_root}/src/frontend/iced/Cargo.toml" --package mmltk-browser-app
+}
+if (( rust_only )); then
+    format_rust_sources
+    log "Rust formatting completed cleanly"
+    exit 0
+fi
 
 repo_root_no_host="${repo_root#/host}"
 normalize_repo_path() {
@@ -249,9 +268,7 @@ format_source_files() {
 
 format_source_files
 if ((${#target_files[@]} == 0)); then
-    command -v cargo >/dev/null 2>&1 || die "cargo is unavailable; rebuild the analysis image"
-    log "running cargo fmt over the first-party Iced frontend"
-    cargo fmt --manifest-path "${repo_root}/src/frontend/iced/Cargo.toml" --package mmltk-browser-app
+    format_rust_sources
 fi
 
 mkdir -p "${build_dir}" "${cppcheck_build_dir}"

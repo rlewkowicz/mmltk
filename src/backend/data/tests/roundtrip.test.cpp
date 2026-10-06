@@ -1477,12 +1477,16 @@ TEST_CASE("empty compiled datasets retain their format admission failure", "[bac
  config.compiled_path = path.string();
  CHECK_THROWS_AS(DatasetLoader(config), std::runtime_error);
 }
-TEST_CASE("compiled owner admits all record sections in its metadata construction", "[backend][data][roundtrip][admission]") {
- mmltk::testsupport::ScopedTempDir root("compiled-fused-admission");
+TEST_CASE("compiled opening trusts recorded sample metadata and payloads", "[backend][data][roundtrip][admission]") {
+ mmltk::testsupport::ScopedTempDir root("compiled-trusted-metadata");
  const auto path = root.path() / "dataset.bin";
  const auto defect = GENERATE("none", "incomplete ordinal", "foreign incomplete ordinal", "extent", "dimensions", "source identity", "source category", "flags", "label span", "class", "zero run",
-  "overlap", "canvas", "coverage", "oversized maximum", "undersized maximum", "unaligned maximum");
+  "overlap", "canvas", "coverage", "oversized maximum", "undersized maximum", "unaligned maximum", "population", "unused maximum", "inactive metadata");
  CAPTURE(defect);
+ const bool parallel = GENERATE(false, true);
+ CAPTURE(parallel);
+ WorkerPool workers(2);
+ const CompiledDatasetOpenOptions options{.workers = parallel ? &workers : nullptr};
  std::array<ImageEntry, 2> images{};
  std::array<PackedInstance, 2> labels{};
  std::vector<RLEPair> runs{{0, 1}, {4, 2}};
@@ -1521,12 +1525,15 @@ TEST_CASE("compiled owner admits all record sections in its metadata constructio
  if (bad == "canvas") runs[1] = {15, 2};
  if (bad == "coverage") runs.push_back({8, 1});
  if (bad == "coverage") set_annotation_extent(images[0], 1, runs.size(), "0");
+ if (bad == "inactive metadata") images[1].status = ImageStatus::Inactive;
  const auto layout = compute_file_layout(images.size(), 4U * 4U * 3U * sizeof(float), annotation_layout(1, runs.size()).used_bytes);
  auto header = make_file_header({2, 4, 4, 3, 1, 4U * 4U * 3U * sizeof(float)}, names, layout);
  if (bad == "extent") ++header.total_file_size;
- if (bad == "oversized maximum") header.max_label_bytes = COMPILED_LABEL_CAPACITY + 8;
+ if (bad == "oversized maximum") header.max_label_bytes = COMPILED_LABEL_LIMIT + 8;
  if (bad == "undersized maximum") header.max_label_bytes -= 8;
  if (bad == "unaligned maximum") ++header.max_label_bytes;
+ if (bad == "population") --header.num_images;
+ if (bad == "unused maximum") header.max_label_bytes += 8;
  const auto file = mmltk::common::io::FileHandle::create_output(path.string(), layout.total_size);
  file.pwrite_all(&header, sizeof(header), 0);
  file.pwrite_all(images.data(), sizeof(images), layout.index_offset);
@@ -1534,10 +1541,20 @@ TEST_CASE("compiled owner admits all record sections in its metadata constructio
  file.pwrite_all(&labels[1], sizeof(PackedInstance), layout.label_offset(1));
  file.pwrite_all(runs.data(), runs.size() * sizeof(RLEPair), layout.label_offset(0) + annotation_layout(1, runs.size()).run_offset);
  if (bad != "none" && bad != "incomplete ordinal") {
-  CHECK_THROWS(CompiledDataset::open(path));
+  const bool invalid_layout = bad == "extent" || bad == "oversized maximum" || bad == "unaligned maximum";
+  if (invalid_layout)
+   CHECK_THROWS(CompiledDataset::open(path, CompiledDataset::AccessPattern::Random, options));
+  else {
+   const auto source = CompiledDataset::open(path, CompiledDataset::AccessPattern::Random, options);
+   CHECK(source.slot_count() == images.size());
+   CHECK(source.label_count() == (bad == "inactive metadata" ? 1 : labels.size()));
+   CHECK(source.run_count() == runs.size());
+   CHECK(source.header().num_images == header.num_images);
+   CHECK(source.header().max_label_bytes == header.max_label_bytes);
+  }
   return;
  }
- const auto source = std::make_shared<const CompiledDataset>(CompiledDataset::open(path));
+ const auto source = std::make_shared<const CompiledDataset>(CompiledDataset::open(path, CompiledDataset::AccessPattern::Random, options));
  CHECK(source->slot_count() == 2);
  CHECK(source->image_labels(0).front().has_complete_source_ordinal() == (bad != "incomplete ordinal"));
  if (bad == "incomplete ordinal") CHECK(source->image_labels(0).front().source_ordinal == 17);
@@ -1547,6 +1564,45 @@ TEST_CASE("compiled owner admits all record sections in its metadata constructio
  const auto shared = source;
  CHECK(shared->annotations(0).labels.data() == source->annotations(0).labels.data());
  CHECK(shared->annotations(0).runs.data() == source->annotations(0).runs.data());
+}
+TEST_CASE("compiled opening cancels within admission and reuses its workers", "[backend][data][roundtrip][admission]") {
+ mmltk::testsupport::ScopedTempDir root("compiled-open-cancellation");
+ const auto path = root.path() / "background.bin";
+ constexpr std::uint32_t count = 20000;
+ const auto layout = compute_file_layout(count, 12, 0);
+ const std::array<std::string, 1> names{"background"};
+ const auto header = make_file_header({count, 1, 1, 3, 0, 12}, names, layout);
+ const std::vector<ImageEntry> entries(count, {.status = ImageStatus::Eligible, .original_width = 1, .original_height = 1});
+ const auto file = mmltk::common::io::FileHandle::create_output(path.string(), layout.total_size);
+ file.pwrite_all(&header, sizeof(header), 0);
+ file.pwrite_all(entries.data(), entries.size() * sizeof(ImageEntry), layout.index_offset);
+ WorkerPool pool(3);
+ const bool parallel = GENERATE(false, true);
+ std::atomic_bool cancelled{true};
+ std::atomic_size_t observed{0};
+ CompiledDatasetOpenOptions options{.workers = parallel ? &pool : nullptr, .cancellation = CancellationObservation::Atomic(cancelled)};
+ CHECK_THROWS(CompiledDataset::open_source(path, count, options));
+ cancelled.store(false);
+ options.progress = [&](std::size_t done, std::size_t) {
+  if (done) {
+   observed.fetch_add(1);
+   cancelled.store(true);
+  }
+ };
+ CHECK_THROWS(CompiledDataset::open_source(path, count, options));
+ CHECK(observed.load() != 0);
+ cancelled.store(false);
+ // Diagnostic failures do not affect admission or poison the borrowed pool.
+ options.progress = [](std::size_t, std::size_t) { throw std::runtime_error("diagnostic unavailable"); };
+ const auto source = CompiledDataset::open_source(path, count, options);
+ REQUIRE(source.has_value());
+ CHECK(source->header().num_images == count);
+ CHECK(source->label_count() == 0);
+ CHECK(source->run_count() == 0);
+ CHECK_FALSE(source->masks_available());
+ CHECK(pool.enqueue([] { return 17; }).get() == 17);
+ CHECK_THROWS(CompiledDataset::open_source(path, count - 1, options));
+ CHECK_FALSE(CompiledDataset::open_source(root.path() / "absent.bin", count, options).has_value());
 }
 TEST_CASE("Directory metadata construction preserves empty masks offsets and publication across workers", "[backend][data][roundtrip][admission]") {
  mmltk::testsupport::ScopedTempDir root("directory-final-construction");

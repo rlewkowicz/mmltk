@@ -585,13 +585,13 @@ TEST_CASE("compiled annotations preserve continuous source meaning in both resiz
   CHECK(store.image_entry(0).source_image_id == 0U);
  }
 }
-TEST_CASE("compiled format admission rejects invalid metadata and old versions", "[backend][data][compiler]") {
+TEST_CASE("compiled opening checks the file format and trusts annotation metadata", "[backend][data][compiler]") {
  const mmltk::testsupport::ScopedTempDir root("compiled-format-admission");
  const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1, .background_images = 0};
  create_synthetic_dataset(fixture);
  compile_existing_fixture(fixture);
  const auto original = CompiledDataset::open(compiled_bin_path(fixture));
- const auto mutate = [&](auto change) {
+ const auto mutate = [&](auto change, bool invalid_format = true) {
   const auto path = root.path() / "invalid.bin";
   auto file = mutable_compiled_copy(fixture, path);
   auto header = original.header();
@@ -602,18 +602,21 @@ TEST_CASE("compiled format admission rejects invalid metadata and old versions",
   file.seekp(static_cast<std::streamoff>(compute_file_layout(original.header().num_slots, original.header().image_stride, original.header().max_label_bytes).label_offset(0)));
   file.write(reinterpret_cast<const char*>(&label), sizeof(label));
   file.close();
-  CHECK_THROWS(CompiledDataset::open(path));
+  if (invalid_format)
+   CHECK_THROWS(CompiledDataset::open(path));
+  else
+   CHECK_NOTHROW(CompiledDataset::open(path));
  };
  mutate([](auto& header, auto&) { header.version = 7U; });
  mutate([](auto& header, auto&) { header.version = 8U; });
  mutate([](auto& header, auto&) { header.version = 9U; });
  mutate([](auto& header, auto&) { header.resize_mode = static_cast<mmltk::backend::imaging::resample::ImageResizeMode>(255U); });
  mutate([](auto& header, auto&) { header.index_offset = header.total_file_size + 1U; });
- mutate([](auto&, auto& label) { label.original_area = std::numeric_limits<double>::infinity(); });
- mutate([](auto&, auto& label) { label.bbox_x1 = std::numeric_limits<float>::quiet_NaN(); });
- mutate([](auto&, auto& label) { label.flags = 128U; });
- mutate([](auto&, auto& label) { label.flags &= ~kAnnotationMask; });
- mutate([](auto&, auto& label) { label.mask_rle_offset = std::numeric_limits<decltype(label.mask_rle_offset)>::max(); });
+ mutate([](auto&, auto& label) { label.original_area = std::numeric_limits<double>::infinity(); }, false);
+ mutate([](auto&, auto& label) { label.bbox_x1 = std::numeric_limits<float>::quiet_NaN(); }, false);
+ mutate([](auto&, auto& label) { label.flags = 128U; }, false);
+ mutate([](auto&, auto& label) { label.flags &= ~kAnnotationMask; }, false);
+ mutate([](auto&, auto& label) { label.mask_rle_offset = std::numeric_limits<decltype(label.mask_rle_offset)>::max(); }, false);
 }
 TEST_CASE("known empty masks declare availability without RLE storage", "[backend][data][compiler]") {
  const mmltk::testsupport::ScopedTempDir root("empty-mask-presence");
@@ -721,7 +724,7 @@ TEST_CASE("compiler resize modes use canonical reflected admission", "[backend][
  REQUIRE_FALSE(invalid.has_value());
  CHECK(invalid.error() == CompilerConfigViolation::InvalidStorage);
 }
-TEST_CASE("compiled benchmark provenance cannot be erased while Generic identities remain optional", "[backend][data][compiler]") {
+TEST_CASE("compiled readers trust recorded benchmark and Generic provenance", "[backend][data][compiler]") {
  const mmltk::testsupport::ScopedTempDir root("compiled-provenance");
  const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1, .background_images = 0};
  create_synthetic_dataset(fixture);
@@ -748,12 +751,12 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
   REQUIRE_NOTHROW(CompiledDataset::open(path));
   image.has_source_image_id = 0U;
   write(image, label);
-  CHECK_THROWS(CompiledDataset::open(path));
+  CHECK(CompiledDataset::open(path).image_entry(0).has_source_image_id == 0U);
   image.has_source_image_id = 1U;
   label.flags &= ~kAnnotationCategory;
   label.source_category_id = 0U;
   write(image, label);
-  CHECK_THROWS(CompiledDataset::open(path));
+  CHECK_FALSE(CompiledDataset::open(path).image_labels(0).front().has_source_category());
   image.source = AnnotationSource::Generic;
   image.has_source_image_id = 0U;
   write(image, label);
@@ -762,7 +765,7 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
  auto unknown = original.image_entry(0);
  unknown.source = static_cast<AnnotationSource>(255U);
  write(unknown, original.image_labels(0)[0]);
- CHECK_THROWS(CompiledDataset::open(path));
+ CHECK(CompiledDataset::open(path).image_entry(0).source == unknown.source);
 }
 TEST_CASE("category IDs reject arithmetic identity loss before publication", "[backend][data][catalog]") {
  const mmltk::testsupport::ScopedTempDir root("exact-category-ids");
@@ -795,8 +798,9 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
  CHECK(layout.pixel_offset(64) == layout.data_offset + layout.block_bytes);
  CHECK(layout.label_offset(0) == layout.data_offset + COMPILED_BLOCK_SLOTS * PAGE_SIZE);
  CHECK(layout.label_offset(64) == layout.block_offset(1) + COMPILED_BLOCK_SLOTS * PAGE_SIZE);
- CHECK(layout.label_pitch == 503808U);
- CHECK_THROWS(compute_file_layout(1, 12, COMPILED_LABEL_CAPACITY + 8));
+ CHECK(layout.label_capacity == 121824U);
+ CHECK(layout.label_pitch == 122880U);
+ CHECK_THROWS(compute_file_layout(1, 12, COMPILED_LABEL_LIMIT + 8));
  CHECK_THROWS(compute_file_layout(1, 12, 1));
  CHECK(compute_file_layout(1, 12, 0).label_pitch == 0);
  CHECK_THROWS(layout.pixel_offset(65));
@@ -806,9 +810,11 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
  CHECK_THROWS(compute_file_layout(static_cast<std::uint32_t>(COMPILED_METADATA_CAPACITY / sizeof(ImageEntry) + 1U), 12U));
  CHECK_THROWS(annotation_layout(maximum, 0U));
  CHECK_THROWS(annotation_layout(0U, maximum));
- CHECK(annotation_layout(0U, COMPILED_LABEL_CAPACITY / sizeof(RLEPair)).used_bytes == COMPILED_LABEL_CAPACITY);
- CHECK(annotation_layout(1U, (COMPILED_LABEL_CAPACITY - 64U) / sizeof(RLEPair)).used_bytes == COMPILED_LABEL_CAPACITY);
- CHECK_THROWS(annotation_layout(1U, (COMPILED_LABEL_CAPACITY - 64U) / sizeof(RLEPair) + 1U));
+ CHECK(annotation_layout(0U, COMPILED_LABEL_LIMIT / sizeof(RLEPair)).used_bytes == COMPILED_LABEL_LIMIT);
+ CHECK(annotation_layout(1U, (COMPILED_LABEL_LIMIT - 64U) / sizeof(RLEPair)).used_bytes == COMPILED_LABEL_LIMIT);
+ CHECK_THROWS(annotation_layout(1U, (COMPILED_LABEL_LIMIT - 64U) / sizeof(RLEPair) + 1U));
+ CHECK(annotation_layout(0U, COMPILED_LABEL_CAPACITY / sizeof(RLEPair), COMPILED_LABEL_CAPACITY).used_bytes == COMPILED_LABEL_CAPACITY);
+ CHECK_THROWS(annotation_layout(0U, COMPILED_LABEL_CAPACITY / sizeof(RLEPair) + 1U, COMPILED_LABEL_CAPACITY));
  const std::vector<std::string> names{"person"};
  for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
   const auto header = make_file_header({1U, 1U, 1U, 3U, 1U, 12U, mode}, names, layout);
@@ -856,13 +862,13 @@ TEST_CASE("fixed pixel mappings retain borrowed addresses across sparse block gr
  CHECK_THROWS(storage.pixels(0));
 }
 TEST_CASE("compiled finalization compacts live partitions in place with bounded overlapping moves", "[backend][data][compiler][storage]") {
- const std::size_t maximum = GENERATE(std::size_t{0}, std::size_t{72}, std::size_t{466944}, COMPILED_LABEL_CAPACITY);
+ const std::size_t maximum = GENERATE(std::size_t{0}, std::size_t{72}, COMPILED_LABEL_CAPACITY, std::size_t{466944}, COMPILED_LABEL_LIMIT);
  CAPTURE(maximum);
  const mmltk::testsupport::ScopedTempDir root("compiled-in-place-compaction");
  const auto path = root.path() / "staged.bin";
  constexpr std::uint32_t width = 1024, height = 512, slots = 131;
  constexpr std::size_t stride = std::size_t{width} * height * 3 * sizeof(float);
- const auto staging = compute_file_layout(slots, stride);
+ const auto staging = compute_file_layout(slots, stride, COMPILED_LABEL_LIMIT);
  const auto file = FileHandle::create_output(path.string(), 0);
  file.resize_sparse(staging.total_size);
  std::vector<ImageEntry> entries(slots);
@@ -913,7 +919,7 @@ TEST_CASE("compiled finalization compacts live partitions in place with bounded 
    file.allocate_ranges(ranges, cancel, calls);
   }});
  };
- if (cancel_during || (fail_storage && maximum != COMPILED_LABEL_CAPACITY)) {
+ if (cancel_during || (fail_storage && maximum != COMPILED_LABEL_LIMIT)) {
   CHECK_THROWS(compact());
   return;
  }
@@ -922,7 +928,7 @@ TEST_CASE("compiled finalization compacts live partitions in place with bounded 
  CHECK(layout.label_capacity == maximum);
  CHECK(layout.label_pitch == compiled_align_up(maximum, PAGE_SIZE));
  CHECK(file.size() == layout.total_size);
- CHECK((layout.total_size < staging.total_size) == (maximum != COMPILED_LABEL_CAPACITY));
+ CHECK((layout.total_size < staging.total_size) == (maximum != COMPILED_LABEL_LIMIT));
  REQUIRE(::fstat(file.get(), &after) == 0);
  CHECK(after.st_ino == before.st_ino);
  CHECK(after.st_dev == before.st_dev);
@@ -1065,7 +1071,7 @@ TEST_CASE("near-capacity label prefixes split at admitted scratch without readin
  detail::StorageReservationPool pool(root.path());
  auto stage = detail::StagedArtifact::create(pool, root.path() / "labels", 0, "large label windows");
  constexpr std::uint32_t count = 16;
- const auto staging = compute_file_layout(count, 12);
+ const auto staging = compute_file_layout(count, 12, COMPILED_LABEL_LIMIT);
  stage.resize_sparse(staging.total_size);
  std::vector<ImageEntry> entries(count);
  std::vector<PackedInstance> labels(8191), actual(labels.size());

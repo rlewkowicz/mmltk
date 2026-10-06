@@ -220,7 +220,7 @@ LabelBlocks compile_directory_images(const std::filesystem::path& split, std::ui
     }
     if (image.labels == ReadyState::Complete && !image.labels_complete) image.labels = ReadyState::Ready;
     if (image.header_reported && image.labels == ReadyState::Ready) {
-     const auto demand = DirectoryLabels::resources(image.plan->header().width, image.maximum_line);
+     const auto demand = DirectoryLabels::resources(image.plan->header().width, image.maximum_line, config.max_label_bytes);
      auto task = execution.try_submit(
       {.kind = CompileTaskKind::Labels, .resources = demand, .work = [&image, &config, &catalog, category_base, &split, cancellation, label_progress](std::size_t, const CompileAllowance& allowance) {
       observe(config, CompileTaskKind::Labels, image.index, false);

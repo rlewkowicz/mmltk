@@ -1,4 +1,5 @@
 #include "src/frameworks/gpu/cuda/device_inventory.h"
+#include "src/frameworks/gpu/cuda/device_telemetry.h"
 #include "src/frameworks/gpu/cuda/device_execution.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -13,6 +14,36 @@
 #include <string_view>
 #include "src/common/system/cpu_affinity.h"
 namespace {
+TEST_CASE("GPU telemetry keeps unavailable devices absent", "[frameworks][gpu][telemetry]") {
+ mmltk::frameworks::gpu::CudaDeviceMonitor monitor(-1);
+ CHECK(monitor.Sample() == mmltk::frameworks::gpu::CudaDeviceTelemetry{});
+ CHECK(monitor.Sample() == mmltk::frameworks::gpu::CudaDeviceTelemetry{});
+}
+TEST_CASE("GPU telemetry samples CUDA-visible devices without changing context", "[frameworks][gpu][hardware][telemetry]") {
+ if (cuInit(0) != CUDA_SUCCESS) SKIP("CUDA driver unavailable; device telemetry hardware remains unverified");
+ int count = 0;
+ REQUIRE(cuDeviceGetCount(&count) == CUDA_SUCCESS);
+ if (!count) SKIP("No CUDA-visible device; device telemetry hardware remains unverified");
+ CUcontext before = nullptr;
+ REQUIRE(cuCtxGetCurrent(&before) == CUDA_SUCCESS);
+ for (int ordinal = count - 1; ordinal >= 0; --ordinal) {
+  mmltk::frameworks::gpu::CudaDeviceMonitor monitor(ordinal);
+  const auto sample = monitor.Sample();
+  if (!sample.gpu_memory_total_bytes) SKIP("NVML memory counters unavailable; device telemetry hardware remains unverified");
+  CHECK(*sample.gpu_memory_total_bytes > 0);
+  REQUIRE(sample.gpu_memory_used_bytes);
+  CHECK(*sample.gpu_memory_used_bytes >= 0);
+  CHECK(*sample.gpu_memory_used_bytes <= *sample.gpu_memory_total_bytes);
+  if (sample.gpu_utilization_percent) {
+   CHECK(*sample.gpu_utilization_percent >= 0);
+   CHECK(*sample.gpu_utilization_percent <= 100);
+  }
+  if (sample.gpu_temperature_celsius) CHECK(*sample.gpu_temperature_celsius >= 0);
+  CUcontext after = nullptr;
+  REQUIRE(cuCtxGetCurrent(&after) == CUDA_SUCCESS);
+  CHECK(after == before);
+ }
+}
 TEST_CASE("CUDA device enumeration distinguishes unavailable capability from runtime failures", "[frameworks][gpu]") {
  using mmltk::testsupport::classify_cuda_device_count;
  for (const int count : {0, 1, 2}) {

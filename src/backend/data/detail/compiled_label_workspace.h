@@ -18,6 +18,7 @@ class CompiledLabelWorkspace final {
  CompileAllowance custody_;
  std::shared_ptr<Memory> owned_;
  bool prepared_ = false;
+ std::size_t capacity_ = COMPILED_LABEL_CAPACITY;
  dataset::MaskResizeScratch scratch_;
 
 public:
@@ -34,13 +35,14 @@ public:
   OutputLease(const OutputLease&) = delete;
   OutputLease& operator=(const OutputLease&) = delete;
  };
- [[nodiscard]] static std::size_t required_bytes(std::uint32_t source_width) {
+ [[nodiscard]] static std::size_t required_bytes(std::uint32_t source_width, std::size_t capacity = COMPILED_LABEL_CAPACITY) {
+  if (capacity > COMPILED_LABEL_LIMIT || capacity % sizeof(RLEPair)) throw std::invalid_argument("invalid compiled label capacity");
   const auto intervals = common::math::checked_multiply<std::size_t>((std::uint64_t{source_width} + 1) / 2, sizeof(std::pair<std::uint32_t, std::uint32_t>), "mask interval workspace overflow");
-  return common::math::checked_add(aligned(COMPILED_LABEL_CAPACITY / sizeof(PackedInstance) * sizeof(PackedInstance)),
-   common::math::checked_add(aligned(COMPILED_LABEL_CAPACITY / sizeof(RLEPair) * sizeof(RLEPair)), aligned(intervals), "label workspace overflow"), "label workspace overflow");
+  return common::math::checked_add(aligned(capacity / sizeof(PackedInstance) * sizeof(PackedInstance)),
+   common::math::checked_add(aligned(capacity / sizeof(RLEPair) * sizeof(RLEPair)), aligned(intervals), "label workspace overflow"), "label workspace overflow");
  }
- void prepare(std::uint32_t width, CompileAllowance custody = {}) {
-  const auto bytes = required_bytes(width);
+ void prepare(std::uint32_t width, CompileAllowance custody = {}, std::size_t capacity = COMPILED_LABEL_CAPACITY) {
+  const auto bytes = required_bytes(width, capacity);
   std::span<std::byte> storage;
   if (custody) {
    storage = custody.workspace();
@@ -56,11 +58,13 @@ public:
    target.bind({reinterpret_cast<T*>(storage.data()), count});
    storage = storage.subspan(aligned(count * sizeof(T)));
   };
-  bind(labels, COMPILED_LABEL_CAPACITY / sizeof(PackedInstance));
-  bind(runs, COMPILED_LABEL_CAPACITY / sizeof(RLEPair));
+  bind(labels, capacity / sizeof(PackedInstance));
+  bind(runs, capacity / sizeof(RLEPair));
   bind(scratch_.intervals, (std::uint64_t{width} + 1) / 2);
   prepared_ = true;
+  capacity_ = capacity;
  }
+ [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
  [[nodiscard]] dataset::MaskResizeScratch& scratch() noexcept { return scratch_; }
  [[nodiscard]] std::size_t retained_bytes() const noexcept { return custody_ ? custody_.bytes() : owned_ ? owned_->capacity_bytes() : 0; }
  void release_borrow() noexcept {

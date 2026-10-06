@@ -109,6 +109,7 @@ struct TrainingTelemetryWriter::Impl final {
  const int uncaught = std::uncaught_exceptions();
  TrainingMetricProgress last_progress;
  bool finished = false;
+ std::optional<mmltk::frameworks::gpu::CudaDeviceMonitor> device_monitor;
  std::jthread worker;
  void Wake() noexcept {
   wake_generation.fetch_add(1);
@@ -187,6 +188,10 @@ struct TrainingTelemetryWriter::Impl final {
   write_file(manifest, serial::reflected_json(run, manifest_scratch, manifest_limits));
  }
  void Persist(TrainingRecord record, const std::optional<TrainingFinalFacts>& completed) {
+  if (record.role == TrainingRecordRole::Live && record.progress.phase == TrainingPhase::Train) {
+   if (!device_monitor) device_monitor.emplace(run.configuration.device_id);
+   static_cast<mmltk::frameworks::gpu::CudaDeviceTelemetry&>(record.progress.scalars) = device_monitor->Sample();
+  }
   record.run_id = run.run_id;
   record.attempt_id = run.attempt_id;
   record.evaluated_weights = record.progress.artifact ? record.progress.artifact->weights : EvaluatedWeights::Ordinary;

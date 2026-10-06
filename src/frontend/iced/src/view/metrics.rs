@@ -228,8 +228,11 @@ impl Component {
         }
     }
     pub fn controls_height(&self) -> f32 {
-        (if self.selector { 274.0 } else { 84.0 })
-            + if self.expanded.is_some() { 34.0 } else { 0.0 }
+        84.0 + if self.selector {
+            34.0 + self.charts.len().div_ceil(2) as f32 * 26.0
+        } else {
+            0.0
+        } + if self.expanded.is_some() { 34.0 } else { 0.0 }
     }
     pub fn view(&self, width: f32, height: f32) -> Element<'_, Message> {
         let controls = row![
@@ -283,8 +286,11 @@ impl Component {
         ]
         .spacing(6);
         if self.selector {
-            let mut choices =
-                column![button("Reset to main charts").on_press(Message::Reset)].spacing(4);
+            let mut choices = column![
+                container(button("Reset to main charts").on_press(Message::Reset))
+                    .id("train.metrics.reset")
+            ]
+            .spacing(4);
             for chunk in self.charts.chunks(2) {
                 let mut line = row![].spacing(8);
                 for chart in chunk {
@@ -310,57 +316,58 @@ impl Component {
             .iter()
             .filter(|c| self.expanded.map_or(c.visible, |kind| kind == c.kind))
             .collect();
-        let workspace: Element<'_, Message> =
-            if histories.selected_output() && selection.is_some() {
-                let selection = selection.unwrap();
-                let mut facts = column![
-                    text(format!(
-                        "Selected output · {:?} · {:?}",
-                        selection.method, selection.artifact.weights
-                    )),
-                    text(selection.artifact.path.clone()),
-                    text(format!(
-                        "Validation box AP: {:.4}",
-                        selection.validation.bbox.ap
-                    ))
-                ]
-                .spacing(6);
-                if let Some(mask) = &selection.validation.mask {
-                    facts = facts.push(text(format!("Validation mask AP: {:.4}", mask.ap)));
-                }
-                for ingredient in &selection.ingredients {
-                    facts = facts.push(text(format!(
-                        "Model {} · coefficient {:.4} · {}",
-                        ingredient.modelid, ingredient.coefficient, ingredient.sha256
-                    )));
-                }
-                container(facts).center(iced::Fill).into()
-            } else if selected.is_empty() {
-                container(text("No charts selected"))
-                    .center(iced::Fill)
-                    .into()
-            } else if histories.sequence.is_none() {
-                container(text("No training data yet"))
-                    .center(iced::Fill)
-                    .into()
+        let workspace: Element<'_, Message> = if histories.selected_output() && selection.is_some()
+        {
+            let selection = selection.unwrap();
+            let mut facts = column![
+                text(format!(
+                    "Selected output · {:?} · {:?}",
+                    selection.method, selection.artifact.weights
+                )),
+                text(selection.artifact.path.clone()),
+                text(format!(
+                    "Validation box AP: {:.4}",
+                    selection.validation.bbox.ap
+                ))
+            ]
+            .spacing(6);
+            if let Some(mask) = &selection.validation.mask {
+                facts = facts.push(text(format!("Validation mask AP: {:.4}", mask.ap)));
+            }
+            for ingredient in &selection.ingredients {
+                facts = facts.push(text(format!(
+                    "Model {} · coefficient {:.4} · {}",
+                    ingredient.modelid, ingredient.coefficient, ingredient.sha256
+                )));
+            }
+            container(facts).center(iced::Fill).into()
+        } else if selected.is_empty() {
+            container(text("No charts selected"))
+                .center(iced::Fill)
+                .into()
+        } else if histories.sequence.is_none() {
+            container(text("No training data yet"))
+                .center(iced::Fill)
+                .into()
+        } else {
+            let columns = if self.expanded.is_some() {
+                1
             } else {
-                let columns = if self.expanded.is_some() {
-                    1
-                } else {
-                    ((selected.len() as f32 * width / height.max(1.0) / 1.5)
-                        .sqrt()
-                        .round() as usize)
-                        .clamp(1, selected.len())
-                };
-                let rows = selected.len().div_ceil(columns);
-                let gap = 6.0_f32.min(height / (rows * 2) as f32);
-                let tile_height = (height - gap * (rows - 1) as f32) / rows as f32;
-                let mut grid = column![].spacing(gap);
-                for chunk in selected.chunks(columns) {
-                    let mut line = row![].spacing(6).height(tile_height);
-                    for chart in chunk {
-                        let kind = chart.kind;
-                        let header = container(
+                ((selected.len() as f32 * width / height.max(1.0) / 1.5)
+                    .sqrt()
+                    .round() as usize)
+                    .clamp(1, selected.len())
+            };
+            let rows = selected.len().div_ceil(columns);
+            let gap = 6.0_f32.min(height / (rows * 2) as f32);
+            let tile_height = (height - gap * (rows - 1) as f32) / rows as f32;
+            let mut grid = column![].spacing(gap);
+            for chunk in selected.chunks(columns) {
+                let mut line = row![].spacing(6).height(tile_height);
+                for chart in chunk {
+                    let kind = chart.kind;
+                    let header =
+                        container(
                             container(button(text(kind.label()).size(12)).on_press(
                                 Message::Expand(if self.expanded.is_some() {
                                     None
@@ -371,39 +378,42 @@ impl Component {
                             .id(format!("train.metrics.expand.{kind:?}")),
                         )
                         .center_x(iced::Fill);
-                        let has_data = self
-                            .history()
-                            .curves
-                            .iter()
-                            .zip(&self.metrics)
-                            .any(|(c, m)| m.chart == kind && !c.buckets.is_empty());
-                        let body: Element<'_, Message> = if has_data {
-                            chart.plot.view().map(move |m| Message::Plot(kind, m))
-                        } else {
-                            container(
-                                text(if kind.loss() || kind == Chart::LearningRate {
+                    let has_data = self
+                        .history()
+                        .curves
+                        .iter()
+                        .zip(&self.metrics)
+                        .any(|(c, m)| m.chart == kind && !c.buckets.is_empty());
+                    let body: Element<'_, Message> = if has_data {
+                        chart.plot.view().map(move |m| Message::Plot(kind, m))
+                    } else {
+                        container(
+                            text(
+                                if kind.loss() || kind == Chart::LearningRate || kind.performance()
+                                {
                                     "No recorded measurements"
                                 } else {
                                     "Waiting for validation"
-                                })
-                                .size(12),
+                                },
                             )
-                            .center(iced::Fill)
-                            .into()
-                        };
-                        line = line.push(
-                            container(column![header, body].spacing(2))
-                                .clip(true)
-                                .id(format!("train.metrics.chart.{kind:?}"))
-                                .width(iced::FillPortion(1))
-                                .height(iced::Fill)
-                                .style(crate::fluent_theme::container_workspace),
-                        );
-                    }
-                    grid = grid.push(line);
+                            .size(12),
+                        )
+                        .center(iced::Fill)
+                        .into()
+                    };
+                    line = line.push(
+                        container(column![header, body].spacing(2))
+                            .clip(true)
+                            .id(format!("train.metrics.chart.{kind:?}"))
+                            .width(iced::FillPortion(1))
+                            .height(iced::Fill)
+                            .style(crate::fluent_theme::container_workspace),
+                    );
                 }
-                grid.into()
-            };
+                grid = grid.push(line);
+            }
+            grid.into()
+        };
         if self.expanded.is_some() {
             content = content.push(
                 container(button("Back to charts").on_press(Message::Expand(None)))
@@ -509,6 +519,10 @@ pub(crate) mod tests {
                 imagespersecond: 0.0,
                 elapsedseconds: 1.0,
                 scalars: TrainingScalars {
+                    gpuutilizationpercent: None,
+                    gpumemoryusedbytes: None,
+                    gpumemorytotalbytes: None,
+                    gputemperaturecelsius: None,
                     total: Some(1.0),
                     classification: None,
                     l1: None,
@@ -885,6 +899,71 @@ pub(crate) mod tests {
             .map(|(_, c)| c.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(recalls, ["Box AR@2", "Box AR@23", "Box AR@456"]);
+    }
+    #[test]
+    fn performance_charts_retain_units_missing_samples_and_visible_geometry() {
+        let mut component = Component::default();
+        component.live = histories(&component.metrics);
+        let mut sample = record();
+        sample.progress.scalars.imagespersecond = Some(107.0);
+        sample.progress.scalars.gpuutilizationpercent = Some(95.0);
+        sample.progress.scalars.gpumemoryusedbytes = Some(20.0 * 1024.0_f64.powi(3));
+        sample.progress.scalars.gpumemorytotalbytes = Some(24.0 * 1024.0_f64.powi(3));
+        sample.progress.scalars.gputemperaturecelsius = Some(72.0);
+        component.live.ingest(&sample, true, &component.metrics);
+        component.prepare();
+        for (chart, expected) in [
+            (Chart::Throughput, 107.0),
+            (Chart::GpuUtilization, 95.0),
+            (Chart::GpuMemory, 20.0),
+            (Chart::GpuTemperature, 72.0),
+        ] {
+            assert_eq!(
+                curve(&component.live, &component.metrics, chart)
+                    .buckets
+                    .back()
+                    .unwrap()
+                    .last
+                    .value,
+                expected
+            );
+            assert!(
+                component
+                    .charts
+                    .iter()
+                    .find(|c| c.kind == chart)
+                    .unwrap()
+                    .shapes
+                    .iter()
+                    .all(Option::is_none)
+            );
+            component.update(Message::Visible(chart, true));
+            assert!(
+                component
+                    .charts
+                    .iter()
+                    .find(|c| c.kind == chart)
+                    .unwrap()
+                    .shapes
+                    .iter()
+                    .any(Option::is_some)
+            );
+        }
+        sample.sequence += 1;
+        sample.progress.elapsedseconds += 1.0;
+        sample.progress.scalars.gpuutilizationpercent = None;
+        component.live.ingest(&sample, true, &component.metrics);
+        sample.sequence += 1;
+        sample.progress.elapsedseconds += 1.0;
+        sample.progress.scalars.gpuutilizationpercent = Some(0.0);
+        component.live.ingest(&sample, true, &component.metrics);
+        let utilization = curve(&component.live, &component.metrics, Chart::GpuUtilization);
+        assert_eq!(utilization.buckets.len(), 2);
+        assert_ne!(
+            utilization.buckets[0].segment,
+            utilization.buckets[1].segment
+        );
+        assert_eq!(utilization.buckets[1].last.value, 0.0);
     }
     #[test]
     fn six_main_charts_retention_controls_and_live_epoch_coordinates() {

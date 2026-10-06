@@ -513,7 +513,7 @@ void CompiledImageStream::prepare_reads(std::size_t index, std::size_t count, st
  auto& slot = *impl_->slots.at(index);
  if (impl_->failure) std::rethrow_exception(impl_->failure);
  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled read storage is still borrowed");
- if (max_label_bytes && (*max_label_bytes > COMPILED_LABEL_CAPACITY || *max_label_bytes % sizeof(RLEPair))) throw std::invalid_argument("invalid prepared maximum label size");
+ if (max_label_bytes && (*max_label_bytes > COMPILED_LABEL_LIMIT || *max_label_bytes % sizeof(RLEPair))) throw std::invalid_argument("invalid prepared maximum label size");
  if (max_label_bytes || !slot.annotations.empty()) {
   count = std::max(count, slot.annotations.size());
   const auto pitch = std::max(slot.label_pitch, max_label_bytes.value_or(0));

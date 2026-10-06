@@ -60,7 +60,7 @@ std::vector<ExploreImageSummary> build_explore_summaries(
  std::vector<ExploreImageSummary> summaries(image_entries_.size());
  const auto summarize = [&](const std::size_t begin, const std::size_t end) {
   for (std::size_t image_index = begin; image_index < end; ++image_index) {
-   if ((image_index & 4095U) == 0U && cancellation_requested(cancel_requested)) return;
+   if (cancellation_requested(cancel_requested)) return;
    const mmltk::backend::data::ImageEntry& entry = image_entries_[image_index];
    ExploreImageSummary& summary = summaries[image_index];
    summary.eligible = entry.eligible();
@@ -73,6 +73,7 @@ std::vector<ExploreImageSummary> build_explore_summaries(
     const mmltk::backend::data::PackedInstance& instance = image_labels[instance_index];
     summary.classes[instance.class_id >> 6U] |= std::uint64_t{1} << (instance.class_id & 63U);
     summary.has_masks |= instance.has_mask();
+    summary.has_non_crowd |= !instance.is_crowd();
    }
   }
  };

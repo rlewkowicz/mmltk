@@ -97,11 +97,11 @@ inline constexpr std::array kCompileOptions{
  MMLTK_CLI_OPTION(Compile, cache_dir, "Benchmark cache root", "Dataset"), MMLTK_CLI_NAMED(Compile, benchmark_resolution, "--compile-benchmark-dataset", "Compile benchmark dataset", "Dataset"),
  MMLTK_CLI_OPTION(Compile, overwrite, "Replace benchmark output", "Dataset"), MMLTK_CLI_OPTION(Compile, resolution, "Square image resolution", "Dataset"),
  MMLTK_CLI_NAMED(Compile, num_workers, "--workers", "CPU worker budget", "Dataset"), MMLTK_CLI_OPTION(Compile, cuda_mask_batch_size, "CUDA mask batch size", "Dataset"),
- MMLTK_CLI_OPTION(Compile, cuda_device_id, "CUDA device id", "Dataset")
+ MMLTK_CLI_OPTION(Compile, cuda_device_id, "CUDA device id", "Dataset", "--gpu")
 };
 inline constexpr std::array kInfoOptions{
  MMLTK_CLI_NAMED(Info, onnx_path, "--onnx", "ONNX model path", "Model input"), MMLTK_CLI_NAMED(Info, tensorrt_path, "--tensorrt", "TensorRT engine path", "Model input"),
- MMLTK_CLI_OPTION(Info, device_id, "CUDA device id", "Execution")
+ MMLTK_CLI_OPTION(Info, device_id, "CUDA device id", "Execution", "--gpu")
 };
 inline constexpr std::array kNormalizeOptions{
  MMLTK_CLI_NAMED(Normalize, class_layout_path, "--class-layout", "Digest-bound class descriptor", "Model input"),
@@ -110,7 +110,7 @@ inline constexpr std::array kNormalizeOptions{
 inline constexpr std::array kBuildEngineOptions{
  MMLTK_CLI_NAMED(Build, class_layout_path, "--class-layout", "Digest-bound class descriptor", "Model input"), MMLTK_CLI_NAMED(Build, onnx_path, "--onnx", "ONNX model path", "Input and output"),
  MMLTK_CLI_NAMED(Build, output_path, "--output", "Output TensorRT engine path", "Input and output"), MMLTK_CLI_NAMED(Build, preset_name, "--preset", "Declared RF-DETR preset", "Input and output"),
- MMLTK_CLI_OPTION(Build, resolution, "Square model resolution", "Input and output"), MMLTK_CLI_OPTION(Build, device_id, "CUDA device id", "Execution"),
+ MMLTK_CLI_OPTION(Build, resolution, "Square model resolution", "Input and output"), MMLTK_CLI_OPTION(Build, device_id, "CUDA device id", "Execution", "--gpu"),
  MMLTK_CLI_NAMED(Build, allow_fp16, "--fp16", "Enable FP16 TensorRT kernels", "Execution", {}, "--no-fp16")
 };
 inline constexpr std::array kExportOnnxOptions{
@@ -119,7 +119,7 @@ inline constexpr std::array kExportOnnxOptions{
  // CLEANUP-IGNORE: Export and TensorRT build expose separate reflected request schemas despite shared artifact
  // fields.
  MMLTK_CLI_NAMED(Export, output_path, "--output", "Output ONNX path", "Input and output"), MMLTK_CLI_NAMED(Export, preset_name, "--preset", "Declared RF-DETR preset", "Input and output"),
- MMLTK_CLI_OPTION(Export, resolution, "Square model resolution", "Input and output"), MMLTK_CLI_OPTION(Export, device_id, "CUDA device id", "Execution"),
+ MMLTK_CLI_OPTION(Export, resolution, "Square model resolution", "Input and output"), MMLTK_CLI_OPTION(Export, device_id, "CUDA device id", "Execution", "--gpu"),
  MMLTK_CLI_OPTION(Export, opset_version, "ONNX opset version", "Execution"),
  // CLEANUP-IGNORE: Adjacent command arrays join an Export tail to separately typed Evaluate loading options.
  MMLTK_CLI_OPTION(Export, simplify, "Run ONNX validation", "Execution")
@@ -131,7 +131,7 @@ inline constexpr std::array kEvaluateOptions{
  MMLTK_CLI_NAMED(Evaluate, weights_path, "--weights", "RF-DETR checkpoint path", "Model input"), MMLTK_CLI_NAMED(Evaluate, onnx_path, "--onnx", "ONNX model path", "Model input"),
  MMLTK_CLI_NAMED(Evaluate, tensorrt_path, "--tensorrt", "TensorRT engine path", "Model input"), MMLTK_CLI_NAMED(Evaluate, preset_name, "--preset", "Declared preset", "Model input"),
  MMLTK_CLI_OPTION(Evaluate, resolution, "Square model resolution", "Model input"), MMLTK_CLI_OPTION(Evaluate, candidate_count, "Selected candidate count (0: admitted model default)", "Model input"),
- MMLTK_CLI_OPTION(Evaluate, batch_size, "Evaluation batch size", "Execution"), MMLTK_CLI_OPTION(Evaluate, device_id, "CUDA device id", "Execution"),
+ MMLTK_CLI_OPTION(Evaluate, batch_size, "Evaluation batch size", "Execution"), MMLTK_CLI_OPTION(Evaluate, device_id, "CUDA device id", "Execution", "--gpu"),
  MMLTK_CLI_OPTION(Evaluate, limit_images, "Image limit", "Execution"), MMLTK_CLI_OPTION(Evaluate, eval_max_dets, "Detection cap", "Execution"),
  MMLTK_CLI_OPTION(Evaluate, workers, "Dataset worker count", "Execution"), MMLTK_CLI_OPTION(Evaluate, lanes, "Parallel backend lanes", "Execution"),
  MMLTK_CLI_OPTION(Evaluate, cpu_affinity, "Linux CPU list", "Execution"), MMLTK_CLI_OPTION(Evaluate, backend, "Backend preference", "Execution"),
@@ -148,7 +148,7 @@ inline constexpr std::array kPredictOptions{
  MMLTK_CLI_NAMED(Predict, onnx_path, "--onnx", "ONNX model path", "Model input"), MMLTK_CLI_NAMED(Predict, tensorrt_path, "--tensorrt", "TensorRT engine path", "Model input"),
  MMLTK_CLI_NAMED(Predict, preset_name, "--preset", "Declared RF-DETR preset architecture", "Model input"), MMLTK_CLI_OPTION(Predict, resolution, "Square model input resolution", "Model input"),
  MMLTK_CLI_OPTION(Predict, batch_size, "Batch size for inference", "Execution"), MMLTK_CLI_OPTION(Predict, max_dets_per_image, "Maximum saved detections per image", "Execution"),
- MMLTK_CLI_OPTION(Predict, device_id, "CUDA device id", "Execution"), MMLTK_CLI_OPTION(Predict, threshold, "Minimum score threshold", "Execution"),
+ MMLTK_CLI_OPTION(Predict, device_id, "CUDA device id", "Execution", "--gpu"), MMLTK_CLI_OPTION(Predict, threshold, "Minimum score threshold", "Execution"),
  MMLTK_CLI_OPTION(Predict, workers, "Dataset worker count", "Execution"), MMLTK_CLI_OPTION(Predict, lanes, "Parallel backend lane count", "Execution"),
  MMLTK_CLI_OPTION(Predict, cpu_affinity, "Linux CPU list", "Execution"), MMLTK_CLI_OPTION(Predict, backend, "Backend preference", "Execution"),
  MMLTK_CLI_NAMED(Predict, allow_fp16, "--fp16", "Enable FP16", "Execution", {}, "--no-fp16"),
@@ -171,7 +171,7 @@ inline constexpr std::array kValidateOptions{
  MMLTK_CLI_OPTION(Validate, batch_size, "Evaluation batch size", "Execution"), MMLTK_CLI_OPTION(Validate, limit_images, "Image limit", "Execution"),
  MMLTK_CLI_OPTION(Validate, candidate_count, "Selected candidate count (0: admitted model default)", "Execution"), MMLTK_CLI_OPTION(Validate, eval_max_dets, "Detection cap", "Execution"),
  MMLTK_CLI_OPTION(Validate, alignment_images, "Backend alignment sample count", "Execution"), MMLTK_CLI_OPTION(Validate, prefetch_factor, "Dataset prefetch factor", "Execution"),
- MMLTK_CLI_OPTION(Validate, device_id, "CUDA device id", "Execution"), MMLTK_CLI_OPTION(Validate, workers, "Dataset worker count", "Execution"),
+ MMLTK_CLI_OPTION(Validate, device_id, "CUDA device id", "Execution", "--gpu"), MMLTK_CLI_OPTION(Validate, workers, "Dataset worker count", "Execution"),
  MMLTK_CLI_OPTION(Validate, lanes, "Parallel backend lanes", "Execution"), MMLTK_CLI_OPTION(Validate, cpu_affinity, "Linux CPU list", "Execution"),
  MMLTK_CLI_NAMED(Validate, allow_fp16, "--fp16", "Enable FP16", "Execution", {}, "--no-fp16"), MMLTK_CLI_OPTION(Validate, log_mode, "Validation logging mode", "Execution"),
  MMLTK_CLI_OPTION(Validate, profile, "Collect validation profile", "Execution"), MMLTK_CLI_OPTION(Validate, write_report_json, "Write validation report", "Output", {}, "--no-write-report-json")
@@ -250,7 +250,7 @@ inline constexpr std::array kTrainOptions{
  MMLTK_CLI_NAMED(Augmentation, perceptual_downscale, "--aug-perceptual-downscale", "Perceptual shrinking", "GPU augmentation", {}, "--no-aug-perceptual-downscale"),
  MMLTK_AUGMENTATION_OPTIONS(geometry), MMLTK_AUGMENTATION_OPTIONS(resize), MMLTK_AUGMENTATION_OPTIONS(color), MMLTK_AUGMENTATION_OPTIONS(noise), MMLTK_AUGMENTATION_OPTIONS(blur),
  MMLTK_AUGMENTATION_OPTIONS(occlusion), MMLTK_CLI_NAMED(Augmentation, copy_paste_probability, "--aug-copy-paste-prob", "Copy-paste probability", "GPU augmentation"),
- MMLTK_CLI_OPTION(Train, numa_node, "GPU-local NUMA node override (-1 selects known locality)", "Execution"), MMLTK_CLI_OPTION(Train, device_id, "Single CUDA device", "Execution"),
+ MMLTK_CLI_OPTION(Train, numa_node, "GPU-local NUMA node override (-1 selects known locality)", "Execution"), MMLTK_CLI_OPTION(Train, device_id, "Single CUDA device", "Execution", "--gpu"),
  custom_option<TrainCliRequest, Train::path<&TrainRequest::device_ids>, &assign_train_integer_list<&TrainRequest::device_ids, true>, &emit_train_integer_list<&TrainRequest::device_ids>>(
   "--device-ids", "Comma-separated CUDA device ids", "Execution"),
  MMLTK_CLI_OPTION(Train, workers, "Dataset worker count", "Execution"), MMLTK_CLI_OPTION(Train, lanes, "Parallel backend lanes", "Execution"),

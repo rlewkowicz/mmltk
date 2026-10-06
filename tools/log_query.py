@@ -955,7 +955,7 @@ def parse_record(source, line, raw, truncated=False):
             objects = None
             first = None
             malformed_jsonl = False
-            if source.endswith(".jsonl") and message.lstrip().startswith("{"):
+            if source.endswith((".jsonl", ".json")) and message.lstrip().startswith("{"):
                 try:
                     first = 0, JSON_DECODER.decode(message.strip())
                 except ValueError:
@@ -1235,6 +1235,22 @@ class LogFile:
         with self.path.open("rb") as stream:
             self.check_capture(stream, unchanged)
             stream.seek(self.start_offset)
+            # Explicit JSON documents (run/progress/preparation) retain their
+            # nested fields and physical span instead of becoming broken JSONL.
+            if self.path.suffix == ".json" and not self.start_offset:
+                raw = stream.read(min(self.size, MAX_LINE_BYTES))
+                if len(raw) != min(self.size, MAX_LINE_BYTES):
+                    raise QueryError(f"log was truncated during query: {self.source}")
+                text = raw.decode("utf-8", errors="replace")
+                row = parse_record(self.source, 1, text, self.size > MAX_LINE_BYTES)
+                row.metadata.update(metadata)
+                row.metadata["line_end"] = max(1, raw.count(b"\n") + (not raw.endswith(b"\n")))
+                if text.encode("utf-8") != raw:
+                    row.parse_error = row.parse_error or "invalid UTF-8 bytes replaced"
+                yield row
+                if unchanged:
+                    self.check_capture(stream, unchanged=True)
+                return
             remaining = self.size - self.start_offset
             line = self.first_line - 1
             while remaining:

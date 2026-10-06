@@ -258,7 +258,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     // loader's legacy shuffle switch. Preserve that policy for evaluation aliases
     // of the same admitted file; distinct evaluation sources stay sequential.
     const auto access = admitted->snapshot == training_file->snapshot ? Dataset::AccessPattern::Random : Dataset::AccessPattern::Sequential;
-    admitted->dataset = shared != admitted_files.end() ? shared->dataset : std::make_shared<const Dataset>(Dataset::open(admitted->path, access));
+    admitted->dataset = shared != admitted_files.end() ? shared->dataset : std::make_shared<const Dataset>(Dataset::open(admitted->path, access, {.workers = reader_pool.get()}));
    }
    config.source = admitted->dataset;
    config.drop_last = drop_last;
@@ -275,11 +275,13 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   auto admission_loader =
    std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.train_compiled_path, std::max<std::size_t>(1, local_batch_size), options.prefetch_factor, false, true));
   auto& train_loader = *admission_loader;
-  TrainingDataPlan data_plan(train_loader, options);
+  preparation.Stage(TrainingPreparationStage::Sampling);
+  TrainingDataPlan data_plan(train_loader, options, reader_pool.get());
   // Admit every logical model before training publishes or updates any state.
   auto epoch_draws = data_plan.epoch(0, 0);
   for (std::size_t model_index = 1; model_index < data_plan.shards().size(); ++model_index) (void)data_plan.epoch(model_index, 0);
   std::unique_ptr<mmltk::backend::data::DatasetLoader> val_loader;
+  preparation.Stage(TrainingPreparationStage::Dataset);
   if (main_process) { val_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.val_compiled_path, val_batch_size, options.prefetch_factor, false, false)); }
   const std::uint32_t val_max_instances = val_loader ? val_loader->max_instances_per_image() : mmltk::backend::data::inspect_compiled_dataset(options.val_compiled_path).max_instances_per_image;
   std::optional<mmltk::backend::data::CompiledDatasetInfo> test_info;

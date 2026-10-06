@@ -820,7 +820,9 @@ size, and publication. Incompatible or invalid cache records require rebuilding
 from admitted source inputs rather than reinterpretation.
 
 [Packed format limits](datasets.md#instances-and-masks) bound each complete
-sample label payload to 500,000 usable bytes and reject unrepresentable counts,
+persisted sample label payload to 500,000 usable bytes. The compiler uses the
+smaller [default staging budget](datasets.md#staging-and-in-place-compaction)
+and rejects unrepresentable counts,
 coordinates, and extents before publication. The final header records the
 largest eligible payload, including internal alignment; zero-label splits use
 zero. Exact COCONut masks are never simplified/sampled to fit. Recompiling older

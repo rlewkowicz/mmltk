@@ -764,13 +764,14 @@ export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progre
         return;
       }
       const [x,y,w,h] = canvasPixelBounds(canvas, cssBounds, control);
-      // The chart's middle strip excludes its legend and vertical axis. Only
-      // saturated curve pixels count; neutral axes, grid and text cannot pass.
+      // The chart's middle strip excludes its legend and vertical axis. Keep
+      // its full height: flat min/max curves can sit near either plot edge.
+      // Only saturated curve pixels count; neutral axes/grid/text cannot pass.
       // The isolated progress bar uses its full extent, including small fills.
       const left = Math.max(0, Math.ceil(x + w * (progress ? 0 : chart ? 0.43 : 0.15)));
-      const top = Math.max(0, Math.ceil(y + h * (progress ? 0 : 0.12)));
+      const top = Math.max(0, Math.ceil(y + h * (widget ? 0 : 0.12)));
       const right = Math.min(canvas.width, Math.floor(x + w * (progress ? 1 : chart ? 0.57 : 0.85)));
-      const bottom = Math.min(canvas.height, Math.floor(y + h * (progress ? 1 : 0.88)));
+      const bottom = Math.min(canvas.height, Math.floor(y + h * (widget ? 1 : 0.88)));
       if (right <= left || bottom <= top) throw new Error('workflow canvas region is not visible');
       const snapshot = canvasSnapshot(canvas);
       if (confidence.length) {

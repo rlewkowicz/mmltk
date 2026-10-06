@@ -19,6 +19,7 @@
 #include <vector>
 #include <utility>
 #include <catch2/catch_test_macros.hpp>
+#include <cuda_runtime_api.h>
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 #include "src/frameworks/reflection/cli_declarations.h"
@@ -889,7 +890,7 @@ TEST_CASE("CLI compilation persists default and explicit resize geometry", "[cor
    const auto output = root.path() / (std::string(rfdetr ? "rfdetr" : "generic") + (letterbox ? "-letterbox" : "-default"));
    std::vector<std::string> command{mmltk_cli_path()};
    if (rfdetr) command.emplace_back("rfdetr");
-   command.insert(command.end(), {"compile", "--source-dir", (root.path() / "dataset").string(), "--output-dir", output.string(), "--workers", "1"});
+   command.insert(command.end(), {"compile", "--source-dir", (root.path() / "dataset").string(), "--output-dir", output.string(), "--workers", "1", "--gpu=0"});
    if (rfdetr)
     command.insert(command.end(), {"--resolution", "32"});
    else
@@ -928,6 +929,37 @@ TEST_CASE("generic compile uses square width fallback and preserves explicit hei
   CHECK(compiled.header().image_height == (explicit_height ? 16U : 32U));
   CHECK(compiled.geometry(0U).resized_width == 32U);
   CHECK(compiled.geometry(0U).resized_height == (explicit_height ? 16U : 32U));
+ }
+}
+TEST_CASE("CLI benchmark uses the selected GPU and rejects unavailable devices", "[core][cli][data][gpu]") {
+ namespace fixtures = mmltk::backend::data::testsupport;
+ const ScopedTempDir root{"mmltk-cli-gpu"};
+ const fixtures::FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1, .background_images = 0};
+ fixtures::create_synthetic_dataset(fixture);
+ fixtures::compile_existing_fixture(fixture);
+ int count = 0;
+ REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
+ REQUIRE(count > 0);
+ for (int device = 0; device <= count; ++device) {
+  const auto result =
+   run_subprocess_capture_output({mmltk_cli_path(), "bench", "--compiled", fixtures::compiled_bin_path(fixture), "--batch-size", "1", "--epochs", "1", "--gpu", std::to_string(device)});
+  INFO(result.output_text);
+  if (device == count) {
+   CHECK(result.exit_code != 0);
+   CHECK(result.stderr_text.find("resolve actual CUDA-visible device") != std::string::npos);
+  } else {
+   CHECK(result.exit_code == 0);
+   CHECK(result.stdout_text.find("gpu=" + std::to_string(device)) != std::string::npos);
+   CHECK(result.stdout_text.find("Epoch 0: 1 images") != std::string::npos);
+  }
+ }
+}
+TEST_CASE("CLI GPU selection preserves training request exclusivity", "[core][cli][rfdetr][gpu]") {
+ for (const auto option : {"--device-ids", "--request-json"}) {
+  const auto result = run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", "train", "--gpu=1", option, std::string_view(option) == "--device-ids" ? "0,1" : "{}"});
+  INFO(result.output_text);
+  CHECK(result.exit_code != 0);
+  CHECK(result.stderr_text.find(std::string_view(option) == "--device-ids" ? "accepts only one of" : "mutually exclusive") != std::string::npos);
  }
 }
 TEST_CASE("CLI rejects invalid resize modes through ordinary option parsing", "[core][cli][rfdetr][data]") {

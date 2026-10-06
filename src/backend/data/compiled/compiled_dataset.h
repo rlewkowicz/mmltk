@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <string>
 #include <system_error>
@@ -15,7 +16,20 @@
 #include <optional>
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/io/file_memory.h"
+#include "src/common/types/cancellation_observation.h"
+namespace mmltk::common::concurrency {
+class WorkerPool;
+}
 namespace mmltk::backend::data {
+struct CompiledDatasetOpenOptions {
+ // Compiler-published metadata is trusted by every reader. Opening copies the
+ // index and totals its recorded counts without verifying slots or payloads.
+ mmltk::common::concurrency::WorkerPool* workers = nullptr;
+ mmltk::common::concurrency::CancellationObservation cancellation{};
+ // Optional diagnostics; called from admission workers, possibly concurrently.
+ // Neither callback delivery nor these counts govern admission or lifetime.
+ std::function<void(std::size_t completed, std::size_t total)> progress{};
+};
 struct CompiledImageRead {
  std::uint32_t index = 0;
  std::size_t destination_offset = 0;
@@ -29,8 +43,8 @@ public:
  CompiledDataset(CompiledDataset&&) noexcept = default;
  CompiledDataset& operator=(CompiledDataset&&) noexcept = default;
  ~CompiledDataset() = default;
- [[nodiscard]] static CompiledDataset open(const std::filesystem::path& path, AccessPattern access = AccessPattern::Random);
- [[nodiscard]] static std::expected<CompiledDataset, std::error_code> open_source(const std::filesystem::path& path, std::size_t image_limit);
+ [[nodiscard]] static CompiledDataset open(const std::filesystem::path& path, AccessPattern access = AccessPattern::Random, const CompiledDatasetOpenOptions& = {});
+ [[nodiscard]] static std::expected<CompiledDataset, std::error_code> open_source(const std::filesystem::path& path, std::size_t image_limit, const CompiledDatasetOpenOptions& = {});
  [[nodiscard]] const std::filesystem::path& path() const noexcept;
  [[nodiscard]] const mmltk::backend::data::FileHeader& header() const noexcept;
  [[nodiscard]] std::span<const std::string> class_names() const noexcept;
@@ -46,7 +60,7 @@ public:
  [[nodiscard]] ImageAnnotations annotations(std::uint32_t slot) const;
  [[nodiscard]] std::span<const std::byte> label_payload(std::uint32_t slot) const;
  [[nodiscard]] std::size_t pixel_offset(std::uint32_t slot) const { return layout_.pixel_offset(slot); }
- [[nodiscard]] bool masks_available() const noexcept;
+ [[nodiscard]] bool masks_available() const;
  [[nodiscard]] const mmltk::backend::data::ImageEntry& image_entry(std::uint32_t compiled_index) const;
  [[nodiscard]] std::span<const mmltk::backend::data::PackedInstance> image_labels(std::uint32_t compiled_index) const;
  [[nodiscard]] std::span<const mmltk::backend::data::RLEPair> instance_rle(std::uint32_t slot, const mmltk::backend::data::PackedInstance& instance) const;
@@ -90,7 +104,7 @@ public:
  [[nodiscard]] bool read_images(std::span<const CompiledImageRead> reads, std::span<std::byte> destination, const std::atomic<bool>& cancelled, bool prefault = false) const;
 
 private:
- [[nodiscard]] static CompiledDataset open_mapped(const std::filesystem::path&, mmltk::common::io::MappedFile, std::size_t image_limit, AccessPattern);
+ [[nodiscard]] static CompiledDataset open_mapped(const std::filesystem::path&, mmltk::common::io::MappedFile, std::size_t image_limit, AccessPattern, const CompiledDatasetOpenOptions&);
  std::filesystem::path path_;
  mmltk::common::io::MappedFile mapping_;
  mmltk::backend::data::FileHeader header_{};
@@ -98,6 +112,5 @@ private:
  FileLayout layout_;
  std::size_t label_count_ = 0, run_count_ = 0;
  std::shared_ptr<const catalog::ClassCatalog> catalog_;
- bool masks_available_ = false;
 };
 }  // namespace mmltk::backend::data

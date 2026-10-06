@@ -4,6 +4,7 @@
 #include "src/pch_std.h"
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augmentation_donor_index.h"
+#include "src/common/concurrency/worker_pool.h"
 namespace mmltk::backend::models::rfdetr {
 namespace {
 const mmltk::backend::data::PackedInstance& donor_instance(const mmltk::backend::data::DatasetLoader& loader, const TrainingDonorDescriptor& descriptor) {
@@ -14,18 +15,28 @@ const mmltk::backend::data::PackedInstance& donor_instance(const mmltk::backend:
  if (instance.is_crowd()) throw std::invalid_argument("crowd annotation cannot enter logical donor history");
  return instance;
 }
-std::vector<TrainingImageClasses> image_classes(const mmltk::backend::data::DatasetLoader& loader) {
+std::vector<TrainingImageClasses> image_classes(const mmltk::backend::data::DatasetLoader& loader, mmltk::common::concurrency::WorkerPool* workers) {
  std::vector<TrainingImageClasses> images(loader.compiled_source()->slot_count());
- for (auto& image : images) image.eligible = false;
- for (const auto image : loader.eligible_slots()) {
-  images[image].eligible = true;
-  for (const auto& instance : loader.annotations(image).labels)
-   if (!instance.is_crowd()) images[image].classes.push_back(instance.class_id);
- }
+ const auto collect = [&](std::size_t begin, std::size_t end) {
+  for (auto image = begin; image != end; ++image) {
+   auto& membership = images[image];
+   membership.eligible = loader.eligible(static_cast<std::uint32_t>(image));
+   if (!membership.eligible) continue;
+   const auto labels = loader.annotations(static_cast<std::uint32_t>(image)).labels;
+   membership.classes.reserve(labels.size());
+   for (const auto& instance : labels)
+    if (!instance.is_crowd()) membership.classes.push_back(instance.class_id);
+  }
+ };
+ if (workers)
+  workers->parallel_for<std::size_t>(0, images.size(), -1, collect);
+ else
+  collect(0, images.size());
  return images;
 }
 }  // namespace
-TrainingDataPlan::TrainingDataPlan(const mmltk::backend::data::DatasetLoader& loader, const TrainRequest& request) : TrainingDataPlan(image_classes(loader), loader.num_classes(), request) {}
+TrainingDataPlan::TrainingDataPlan(const mmltk::backend::data::DatasetLoader& loader, const TrainRequest& request, mmltk::common::concurrency::WorkerPool* workers)
+    : TrainingDataPlan(image_classes(loader, workers), loader.num_classes(), request) {}
 TrainingDataPlan::TrainingDataPlan(std::vector<TrainingImageClasses> images, std::uint32_t classes, const TrainRequest& request)
     : membership_(std::move(images)), policy_(request.data_policy), batch_(request.batch_size), contributions_(derive_execution_facts(request, 0).microbatches_per_attempt) {
  if (classes > mmltk::backend::data::MAX_CLASSES) throw std::invalid_argument("training class catalog exceeds compiled format");

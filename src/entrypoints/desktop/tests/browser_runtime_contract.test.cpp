@@ -22,11 +22,13 @@ TEST_CASE("desktop shell configuration carries presentation settings") {
 }
 }  // namespace
 TEST_CASE("desktop NUMA override is reflected, validated and materialized") {
- const std::array<std::string_view, 5> arguments{"--device-id", "2", "--numa-node", "3", "--gdrcopy"};
- const auto configuration = mmltk::entrypoints::desktop::parse_browser_runtime_options(arguments);
- CHECK(configuration.presentation.cuda_device_index == 2);
- CHECK(configuration.presentation.numa_node == 3);
- CHECK_FALSE(configuration.h2d_dataloader);
+ for (const auto option : {"--device-id", "--gpu"}) {
+  const std::array<std::string_view, 5> arguments{option, "2", "--numa-node", "3", "--gdrcopy"};
+  const auto configuration = mmltk::entrypoints::desktop::parse_browser_runtime_options(arguments);
+  CHECK(configuration.presentation.cuda_device_index == 2);
+  CHECK(configuration.presentation.numa_node == 3);
+  CHECK_FALSE(configuration.h2d_dataloader);
+ }
  CHECK(mmltk::entrypoints::desktop::parse_browser_runtime_options({}).h2d_dataloader);
  const std::array<std::string_view, 1> removed{"--h2d-dataloader"};
  CHECK_THROWS(mmltk::entrypoints::desktop::parse_browser_runtime_options(removed));
@@ -44,13 +46,13 @@ TEST_CASE("ordinary shell and native presentation configuration disable acceptan
 TEST_CASE("desktop scoped options retain public spellings help and emission order") {
  namespace desktop = mmltk::entrypoints::desktop;
  namespace reflection = mmltk::frameworks::reflection;
- const auto configuration = desktop::parse_browser_runtime_options(std::array<std::string_view, 3>{"--device-id=2", "--numa-node=3", "--gdrcopy"});
+ const auto configuration = desktop::parse_browser_runtime_options(std::array<std::string_view, 3>{"--gpu=2", "--numa-node=3", "--gdrcopy"});
  std::vector<std::string> emitted;
  reflection::emit(emitted, configuration, desktop::kBrowserExecutionOptions);
  CHECK((emitted == std::vector<std::string>{"--device-id", "2", "--numa-node", "3", "--gdrcopy"}));
  CHECK(reflection::help("desktop [options]", "Desktop", desktop::kBrowserExecutionOptions) ==
        "Desktop\nUsage: desktop [options]\nExecution"
-       "\n  --device-id  CUDA-visible visual device"
+       "\n  --device-id, --gpu  CUDA-visible visual device"
        "\n  --numa-node  GPU-local NUMA node (-1 selects automatic locality)"
        "\n  --gdrcopy  Use GDRCopy for compiled-image loading");
  for (const std::string_view spelling : {"--cuda-device-index", "--no-numa-node", "--h2d-dataloader"}) { CHECK_THROWS(desktop::parse_browser_runtime_options(std::array{spelling})); }

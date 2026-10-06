@@ -10,6 +10,9 @@
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augmentation_donor_index.h"
 #include "src/backend/models/rfdetr/contract/execution_plan.h"
+namespace mmltk::common::concurrency {
+class WorkerPool;
+}
 namespace mmltk::backend::data {
 class DatasetLoader;
 struct DatasetIndexSchedule;
@@ -35,7 +38,7 @@ struct TrainingDonorSource final {
 class TrainingDataPlan final {
 public:
  TrainingDataPlan(std::vector<TrainingImageClasses>, std::uint32_t classes, const TrainRequest&);
- explicit TrainingDataPlan(const mmltk::backend::data::DatasetLoader&, const TrainRequest&);
+ explicit TrainingDataPlan(const mmltk::backend::data::DatasetLoader&, const TrainRequest&, mmltk::common::concurrency::WorkerPool* = nullptr);
  [[nodiscard]] const std::vector<TrainingShard>& shards() const noexcept { return shards_; }
  [[nodiscard]] TrainingEpochDraws epoch(std::size_t model, std::uint64_t epoch) const;
  [[nodiscard]] std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> rank_schedule(const TrainingEpochDraws&, std::uint32_t rank, std::uint32_t world) const;

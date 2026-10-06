@@ -530,21 +530,47 @@ public:
  [[nodiscard]] ExploreOpened Open(const std::string_view source, const std::stop_token stop) override {
   gallery_.Suspend();
   open_candidate_.reset();
-  auto opened = mmltk::backend::data::CompiledDataset::open_source(std::filesystem::path{source}, configuration_.image_limit);
-  if (!opened) throw std::system_error(opened.error(), "Explore compiled source could not be opened");
+  std::atomic_bool cancelled = false;
+  std::stop_callback cancellation{stop, [&cancelled] { cancelled.store(true, std::memory_order_release); }};
+  data::CompiledDatasetOpenOptions options{.workers = &gallery_.workers(), .cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)};
+  if (configuration_.diagnostics.valid()) {
+   options.progress = [diagnostics = configuration_.diagnostics](std::size_t completed, std::size_t total) {
+    diagnostics.Emit([&] { return VisualDiagnosticFact{.operation = VisualDiagnosticOperation::ExploreDatasetAdmission, .value = completed, .detail = total}; });
+   };
+  }
+  std::expected<data::CompiledDataset, std::error_code> opened;
+  services::RuntimeDiagnosticSpan opening{configuration_.diagnostics, [] {
+   return visual_diagnostic_boundary({.operation = VisualDiagnosticOperation::ExploreDatasetOpenStarted}, VisualDiagnosticOperation::ExploreDatasetOpenCompleted);
+  }};
+  try {
+   opened = data::CompiledDataset::open_source(std::filesystem::path{source}, configuration_.image_limit, options);
+   if (!opened) throw std::system_error(opened.error(), "Explore compiled source could not be opened");
+   opening.Finish();
+  } catch (...) {
+   if (stop.stop_requested()) {
+    opening.Finish(contracts::DiagnosticSpanOutcome::Cancelled);
+    return {};
+   }
+   throw;
+  }
   if (opened->header().num_images == 0U) throw contracts::InvalidIntentError("Explore compiled source contains no images");
   if (opened->image_entries().size() > std::numeric_limits<std::uint32_t>::max()) throw contracts::InvalidIntentError("Explore image catalog exceeds the application boundary");
   if (opened->class_names().size() > kExploreClassCapacity) throw contracts::InvalidIntentError("Explore class catalog exceeds the application boundary");
   if (std::ranges::any_of(opened->class_names(), [](const auto& name) { return name.size() > mmltk::backend::data::catalog::kClassNameCapacity; }))
    throw contracts::InvalidIntentError("Explore class name exceeds the application boundary");
   auto store = std::move(*opened);
-  std::atomic_bool cancelled = false;
-  std::stop_callback cancellation{stop, [&cancelled] { cancelled.store(true, std::memory_order_release); }};
   std::vector<explore::ExploreImageSummary> summaries;
+  services::RuntimeDiagnosticSpan summarizing{configuration_.diagnostics, [] {
+   return visual_diagnostic_boundary({.operation = VisualDiagnosticOperation::ExploreDatasetSummariesStarted}, VisualDiagnosticOperation::ExploreDatasetSummariesCompleted);
+  }};
   try {
    summaries = explore::build_explore_summaries(store, &cancelled, &gallery_.workers());
+   summarizing.Finish();
   } catch (...) {
-   if (stop.stop_requested()) return {};
+   if (stop.stop_requested()) {
+    summarizing.Finish(contracts::DiagnosticSpanOutcome::Cancelled);
+    return {};
+   }
    throw;
   }
   std::vector<std::uint32_t> order;
@@ -578,8 +604,10 @@ public:
    .scratch = std::move(scratch),
   };
   candidate.annotated_indices.reserve(candidate.store.header().num_images);
-  for (const auto index : candidate.store.eligible_slots())
-   if (std::ranges::any_of(candidate.store.image_labels(index), [](const auto& instance) { return !instance.is_crowd(); })) candidate.annotated_indices.push_back(index);
+  for (const auto index : candidate.store.eligible_slots()) {
+   if ((index & 4095U) == 0U && stop.stop_requested()) return {};
+   if (candidate.summaries[index].has_non_crowd) candidate.annotated_indices.push_back(index);
+  }
   candidate.identity = explore_dataset_identity(source, candidate.store.header(), candidate.summaries);
   ExploreOrderFacts order_facts{
    .matching_count = static_cast<std::uint32_t>(candidate.order.size()),

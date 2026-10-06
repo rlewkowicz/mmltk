@@ -1,13 +1,15 @@
 """Required parser, bounded selection, and log format behavior for ./mmltk --logs."""
 
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from itertools import permutations
 import errno
 import json
 import os
 from pathlib import Path
+import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1186,6 +1188,33 @@ class FileQueryTests(unittest.TestCase):
         status, output, diagnostics = self.run_query(*arguments)
         values = [json.loads(line.removeprefix("Statistics ")) for line in (output + diagnostics).splitlines() if line.startswith("Statistics ")]
         return status, values, output, diagnostics
+
+    def test_json_documents_preserve_nested_facts_and_line_span(self):
+        facts = {"record": {"progress": {"phase": "Train", "completed_images": 24}}, "persistence": {"degraded": False}}
+        content = json.dumps(facts, indent=2) + "\n"
+        path = self.write("progress.json", content)
+        status, rows, _ = self.exported(str(path), "-q", "record.progress.completed_images=24", "--strict")
+        self.assertEqual(status, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["data"], facts)
+        self.assertEqual(rows[0]["_log"]["line"], 1)
+        self.assertEqual(rows[0]["_log"]["line_end"], len(content.splitlines()))
+        with patch.object(logs, "MAX_LINE_BYTES", 32):
+            status, rows, _ = self.exported(str(path), "--strict")
+        self.assertEqual(status, 2)
+        self.assertIn("exceeds byte limit", rows[0]["_log"]["parse_error"])
+
+    def test_damaged_json_documents_remain_searchable(self):
+        for content in ('{\n  "stage": "Dataset"', '{"event":"one"}\n{"event":"two"}', '{"message":"bad bytes \ufffd"}'):
+            path = self.write("preparation.json", content)
+            status, rows, _ = self.exported(str(path))
+            self.assertEqual(status, 0)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["text"], content)
+        path.write_bytes(b'{"message":"bad bytes \xff"}')
+        status, rows, _ = self.exported(str(path), "--strict")
+        self.assertEqual(status, 2)
+        self.assertIn("UTF-8", rows[0]["_log"]["parse_error"])
 
     def test_statistics_preserve_integer_sums_buckets_and_full_match_counts(self):
         start = 18446744073709000000
@@ -2396,6 +2425,171 @@ esac
                 if child.poll() is None:
                     child.kill()
                 child.wait(timeout=5)
+
+    @contextmanager
+    def runtime_wrapper_fixture(self):
+        wrapper, environment = self.wrapper_fixture(r'''#!/usr/bin/env python3
+import json, os, signal, socket, sys
+from pathlib import Path
+args = sys.argv[1:]
+state = Path(os.environ["TEST_RUNTIME_STATE"])
+def option(name):
+    return args[args.index(name) + 1] if name in args else ""
+def notify(stage, owner):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
+        channel.sendto(f"{stage} {owner}".encode(), os.environ["TEST_RUNTIME_NOTIFY"])
+if args[0] in ("version", "image"):
+    print("fixture-image")
+elif args[0] in ("ps", "container") and "inspect" not in args:
+    filters = [args[i + 1] for i, value in enumerate(args) if value == "--filter"]
+    for path in state.glob("*.json"):
+        labels = json.loads(path.read_text())
+        def matches(value):
+            if value.startswith("label="):
+                key, _, expected = value[6:].partition("=")
+                return key in labels and (not expected or labels[key] == expected)
+            return value == "name=^/" + path.stem + "$"
+        if all(matches(value) for value in filters):
+            if ".Label" in option("--format"):
+                print(path.stem, labels["com.mmltk.owner-pid"], labels["com.mmltk.owner-start"])
+            else:
+                print(path.stem)
+elif args[0] == "inspect" or args[:2] == ["container", "inspect"]:
+    path = state / (args[-1] + ".json")
+    if not path.exists():
+        sys.exit(1)
+    labels = json.loads(path.read_text())
+    template = option("--format")
+    for key, value in labels.items():
+        if key in template:
+            print(value)
+    if "State.Running" in template:
+        print("true")
+elif args[0] == "run":
+    labels = dict(args[i + 1].split("=", 1) for i, value in enumerate(args) if value == "--label")
+    if os.environ.get("TEST_HOLD_CREATION") == "1":
+        notify("preparing", labels["com.mmltk.owner-pid"])
+        signal.pause()
+    path = state / (option("--name") + ".json")
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(labels))
+    temporary.replace(path)
+elif args[0] in ("rm", "stop"):
+    (state / (args[-1] + ".json")).unlink(missing_ok=True)
+elif args[0] == "exec":
+    if any(value in ("/opt/mmltk/bin/mmltk-browser-host", "/opt/mmltk/bin/mmltk") for value in args):
+        for value in args:
+            path = state / (value + ".json")
+            if "/" not in value and path.is_file():
+                notify("running", json.loads(path.read_text())["com.mmltk.owner-pid"])
+                signal.pause()
+                break
+else:
+    raise SystemExit(f"unexpected Docker command: {args}")
+''')
+        state = self.root / "containers"
+        state.mkdir()
+        wayland = self.write("runtime/wayland-0", "fixture socket")
+        children = []
+        with ExitStack() as scope:
+            ready = scope.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM))
+            address = str(self.root / "runtime-ready.sock")
+            ready.bind(address)
+            environment.update(TEST_RUNTIME_STATE=str(state), TEST_RUNTIME_NOTIFY=address,
+                               XDG_RUNTIME_DIR=str(wayland.parent), WAYLAND_DISPLAY=wayland.name,
+                               DBUS_SESSION_BUS_ADDRESS="unix:path=" + str(self.write("runtime/bus", "fixture bus")))
+
+            def launch(*arguments, preparing=False, deferred=False):
+                output = self.root / f"wrapper-{len(children)}.log"
+                stream = scope.enter_context(output.open("w"))
+                command = ["bash", str(wrapper), *arguments]
+                if deferred:
+                    command = ["bash", "-c", 'read -r release; exec bash "$@"', "deferred-runtime", str(wrapper), *arguments]
+                process = subprocess.Popen(command, cwd=self.root,
+                    env=dict(environment, TEST_HOLD_CREATION=str(int(preparing))),
+                    stdin=subprocess.PIPE if deferred else subprocess.DEVNULL,
+                    stdout=stream, stderr=stream, start_new_session=True)
+                children.append(process)
+                return process, output
+
+            def wait_ready(child, stage="running"):
+                process, output = child
+                descriptor = os.pidfd_open(process.pid)
+                try:
+                    readable, _, _ = select.select([ready, descriptor], [], [], 45)
+                    self.assertIn(ready, readable, output.read_text())
+                    self.assertEqual(ready.recv(128).decode(), f"{stage} {process.pid}")
+                finally:
+                    os.close(descriptor)
+
+            try:
+                yield launch, wait_ready, state
+            finally:
+                for process in children:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
+
+    def test_gui_launch_replaces_runtime_sessions_and_preserves_other_owners(self):
+        with self.runtime_wrapper_fixture() as (launch, wait_ready, state):
+            owner_start = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            for name, repo, mode in (("test-owner", self.root, "test"), ("other-gui", self.root / "other", "gui")):
+                self.write(f"containers/{name}.json", json.dumps({
+                    "com.mmltk.wrapper": "1", "com.mmltk.repo": str(repo), "com.mmltk.mode": mode,
+                    "com.mmltk.owner-pid": str(os.getpid()), "com.mmltk.owner-start": owner_start,
+                }))
+            raw = []
+            for _ in range(2):
+                raw.append(launch("--help"))
+                wait_ready(raw[-1])
+            # An already-running wrapper from before owner registration still
+            # has authoritative ownership on its container labels.
+            (self.root / f".cache/locks/runtime-run-{raw[0][0].pid}.owner").unlink(missing_ok=True)
+            first = launch("--gui")
+            wait_ready(first)
+            for process, _ in raw:
+                self.assertNotEqual(process.wait(timeout=5), 0)
+            second = launch("--gui")
+            wait_ready(second)
+            self.assertNotEqual(first[0].wait(timeout=5), 0)
+            self.assertIsNone(second[0].poll())
+            rejected, output = launch("--help")
+            self.assertNotEqual(rejected.wait(timeout=5), 0)
+            self.assertIn("raw mmltk invocation cannot start while the GUI is active", output.read_text())
+            self.assertIsNone(second[0].poll())
+            self.assertEqual(len(list((self.root / ".cache/locks").glob("runtime-run-*.owner"))), 1)
+            self.assertEqual(len(list(state.glob("*.json"))), 3)
+            self.assertTrue((state / "test-owner.json").exists())
+            self.assertTrue((state / "other-gui.json").exists())
+
+    def test_gui_launch_replaces_an_owner_still_preparing_its_container(self):
+        with self.runtime_wrapper_fixture() as (launch, wait_ready, state):
+            first = launch("--gui", preparing=True)
+            wait_ready(first, "preparing")
+            self.assertEqual(list(state.glob("*.json")), [])
+            second = launch("--gui")
+            wait_ready(second)
+            self.assertNotEqual(first[0].wait(timeout=5), 0)
+            self.assertIsNone(second[0].poll())
+            self.assertEqual(len(list(state.glob("*.json"))), 1)
+
+    def test_delayed_older_gui_launch_preserves_the_newer_runtime(self):
+        with self.runtime_wrapper_fixture() as (launch, wait_ready, state):
+            earlier, output = launch("--gui", deferred=True)
+            raw = launch("--help")
+            wait_ready(raw)
+            newest = launch("--gui")
+            wait_ready(newest)
+            earlier.stdin.write(b"continue\n")
+            earlier.stdin.flush()
+            self.assertNotEqual(earlier.wait(timeout=5), 0)
+            self.assertIn("superseded by a newer runtime invocation", output.read_text())
+            self.assertIsNone(newest[0].poll())
+            self.assertEqual(len(list(state.glob("*.json"))), 1)
 
     def family_fixture(self):
         self.write("build/validation/session.jsonl", [

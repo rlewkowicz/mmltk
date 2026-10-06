@@ -57,6 +57,10 @@ impl RetainedChart {
                 Chart::Loss | Chart::Components => "Loss",
                 Chart::LearningRate => "Rate",
                 Chart::Errors => "Error",
+                Chart::Throughput => "Images / second",
+                Chart::GpuUtilization => "%",
+                Chart::GpuMemory => "GiB",
+                Chart::GpuTemperature => "°C",
                 _ => "Score",
             });
             self.plot.set_y_axis_scale(if log {

@@ -103,6 +103,7 @@ void run_info(const std::string& compiled_path) {
  std::printf("Stride: %zu bytes/image (%.2f KB)\n", static_cast<std::size_t>(header.image_stride), static_cast<double>(header.image_stride) / 1024.0);
  std::printf("Classes: %u\n", header.num_classes);
  std::printf("Maximum instances per image: %u\n", header.max_instances_per_image);
+ std::printf("Maximum label payload per image: %u bytes\n", header.max_label_bytes);
  for (std::uint32_t index = 0U; index < header.num_classes; ++index) std::printf("  [%u] %s\n", index, header.class_names[index].data());
  std::printf("Batches (bs=1): %u\n", header.num_images);
 }
@@ -111,9 +112,10 @@ void run_bench(const BenchCommandRequest& request) {
  config.loading = request;
  config.compiled_path = request.compiled_path;
  config.batch_size = request.batch_size;
+ config.device_id = request.device_id;
  config.shuffle = true;
  data::DatasetLoader loader(config);
- std::printf("Benchmarking: %zu images, batch=%zu, stride=%zu, epochs=%d\n", loader.num_images(), config.batch_size, loader.image_stride(), request.epochs);
+ std::printf("Benchmarking: %zu images, batch=%zu, stride=%zu, epochs=%d, gpu=%d\n", loader.num_images(), config.batch_size, loader.image_stride(), request.epochs, config.device_id);
  for (int epoch = 0; epoch < request.epochs; ++epoch) {
   const auto started = std::chrono::steady_clock::now();
   loader.begin_epoch();

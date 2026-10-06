@@ -260,7 +260,7 @@ void apply_train_presence(TrainCliRequest& state, const reflection::PresenceSet&
  constexpr auto device_ids = Train::path<&TrainRequest::device_ids>;
  constexpr auto device_id_index = reflection::unique_descriptor_index(kTrainOptions, reflection::accessor_member_identity<TrainCliRequest, device_id>());
  constexpr auto device_ids_index = reflection::unique_descriptor_index(kTrainOptions, reflection::accessor_member_identity<TrainCliRequest, device_ids>());
- if (presence.test(device_id_index) && presence.test(device_ids_index)) { throw std::runtime_error("rfdetr train accepts only one of --device-id or --device-ids"); }
+ if (presence.test(device_id_index) && presence.test(device_ids_index)) { throw std::runtime_error("rfdetr train accepts only one of --device-id/--gpu or --device-ids"); }
 }
 class DistributedTrainingProcess final {
 public:

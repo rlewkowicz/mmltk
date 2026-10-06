@@ -433,7 +433,7 @@ const char* DatasetLoader::class_name(uint32_t id) const {
 size_t DatasetLoader::image_stride() const { return impl_->source->header().image_stride; }
 size_t DatasetLoader::num_label_instances() const { return impl_->source->label_count(); }
 size_t DatasetLoader::num_rle_pairs() const { return impl_->source->run_count(); }
-bool DatasetLoader::masks_available() const noexcept { return impl_->source->masks_available(); }
+bool DatasetLoader::masks_available() const { return impl_->source->masks_available(); }
 ImageAnnotations DatasetLoader::annotations(std::uint32_t slot) const { return impl_->source->annotations(slot); }
 const float* DatasetLoader::image_pixels(std::uint32_t slot) const { return impl_->source->image_pixels(slot); }
 }  // namespace mmltk::backend::data

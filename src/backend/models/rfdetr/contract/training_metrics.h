@@ -1,5 +1,6 @@
 #pragma once
 #include "src/frameworks/reflection/reflected_declarations.h"
+#include "src/frameworks/gpu/cuda/device_telemetry.h"
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -21,7 +22,7 @@ inline constexpr std::size_t kTrainingManifestBytes = 4U * 1024U * 1024U;
 inline constexpr std::string_view kTrainingPersistenceFailureLine = "\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\n";
 enum class TrainingPhase : std::uint8_t { Starting, Train, Validate, EpochComplete, Completed, Error, Cancelled, Merge };
 enum class TrainingRecordRole : std::uint8_t { Live, Boundary, Epoch, Terminal };
-enum class TrainingPreparationStage : std::uint8_t { Runtime, Distributed, Dataset, Model, Optimizers, Checkpoint, Weights, Synchronization };
+enum class TrainingPreparationStage : std::uint8_t { Runtime, Distributed, Dataset, Model, Optimizers, Checkpoint, Weights, Synchronization, Sampling };
 MMLTK_REFLECT_ENUM(TrainingPreparationStage)
 inline constexpr std::string_view kTrainingPreparationFile = "preparation.json";
 struct TrainingPreparationProgress final {
@@ -38,7 +39,10 @@ MMLTK_REFLECT_ENUM(TrainingRecordRole)
 // Dense correspondence is an explicitly overlapping diagnostic breakdown.
 // Total alone represents the complete optimized objective; raw main components
 // require their criterion coefficients before any comparison with weighted groups.
-struct TrainingScalars final {
+// Device counters are a separate reflected base populated only by telemetry.
+// The training tensor packet projects direct members, so monitoring adds no
+// per-batch CUDA scalars, kernels, collectives, or readback bytes.
+struct TrainingScalars final : mmltk::frameworks::gpu::CudaDeviceTelemetry {
  bool operator==(const TrainingScalars&) const = default;
  std::optional<double> total;
  std::optional<double> classification;

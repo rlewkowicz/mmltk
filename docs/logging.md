@@ -209,6 +209,28 @@ retirement, with the process-group ID in `value` and the output directory in
 `document_resource`. Its message admits the complete retained cause and OOM
 guidance within a 4096-byte bound.
 
+`training.progress.read.begin` / `training.progress.read.end` measure the GUI
+process client's progress-file read, decode, validation, and status projection.
+The end record carries the span duration and the output directory identifies
+the run. These spans collect nothing when GUI tracing is disabled. GPU counters
+are ordinary [saved training metrics](rfdetr-workflows.md#saved-history-and-plots)
+and do not require tracing. To compare launch settings and throughput before
+attributing a difference to rendering:
+
+```bash
+./mmltk --logs checkpoints/CLI_RUN/metrics.jsonl output/train/GUI_RUN/metrics.jsonl \
+  -q '@event=training.boundary.starting' \
+  --fields attempt_configuration --format jsonl
+./mmltk --logs output/train/GUI_RUN/metrics.jsonl \
+  -q '@event=training.live.train' \
+  --fields progress.completed_images,progress.images_per_second,progress.scalars \
+  --tail --limit 10 --format jsonl
+```
+
+Compare effective encoder-freeze, denoising, batch, GPU, loading, and
+augmentation settings. The throughput field is an epoch average; startup and
+different amounts of training work make isolated values incomparable.
+
 The training system also emits `training.inputs` before dataset inspection,
 including the operation generation (`sequence`), captured settings revision
 (`value`), requested and prepared preset/resolution, and compiled split paths.
@@ -620,6 +642,28 @@ skip progress locking and clock reads. Trace construction/serialization/callback
 failures are contained, with one delivery attempt. Invalid payloads go to
 diagnostic failure handling, never successful empty records or compilation
 failure. Complete-delivery acceptance may independently fail its evidence gate.
+
+## Compiled Explore opening
+
+`MMLTK_GUI_TRACE_FILE` includes `explore.dataset.open.started`/`.completed` and
+`explore.dataset.summaries.started`/`.completed`. These use the ordinary
+diagnostic span duration and outcome fields. `explore.dataset.admission`
+reports summarized index slots in `value` and total slots in `detail`;
+worker callbacks may arrive out of order. Opening cancellation covers the
+index copy and recorded-count aggregation, before Explore summary generation.
+These observations do not imply payload or per-sample metadata verification.
+Disabled tracing installs no progress observer or diagnostic clocks.
+
+```bash
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event:explore.dataset OR @event:shutdown.explore_join' \
+  --format timeline --limit 80
+```
+
+For isolated file-opening measurements, use the
+[compiled image diagnostic](commands.md#wrapper-operations) with
+`--profile-compiled WORKERS`; keep cache state and worker placement explicit
+when comparing captures.
 
 ## Delivery and acceptance ownership
 
@@ -1168,6 +1212,16 @@ segments index nested lists: `referenced_objects.0.handle` and
 `message_fields.clean_rgba.24` are examples. Negative, out-of-range, or noncanonical
 indices such as `01` are missing fields. Unqualified names also look inside
 `fields`; qualified paths specify the complete location.
+
+Explicit `.json` inputs such as training `progress.json`, `preparation.json`,
+and `run.json` are read as one bounded document, preserving nested fields and
+the physical line span. The limit is 1 MiB; oversized or damaged input remains
+searchable with a parse error. For example:
+
+```bash
+./mmltk --logs output/train/run-0021/progress.json --format jsonl \
+  --fields record.progress.phase,record.progress.completed_images,record.progress.images_per_second
+```
 
 A `message` or `fields.message` containing a complete JSON object of at most
 4096 characters is also exposed as `message_fields`. Its original message stays

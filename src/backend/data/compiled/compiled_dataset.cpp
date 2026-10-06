@@ -4,48 +4,72 @@
 #include "src/pch_std.h"
 #include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/common/math/checked_arithmetic.h"
+#include "src/common/concurrency/worker_pool.h"
+#include <mutex>
 namespace mmltk::backend::data {
-CompiledDataset CompiledDataset::open(const std::filesystem::path& path, const AccessPattern access) {
+CompiledDataset CompiledDataset::open(const std::filesystem::path& path, const AccessPattern access, const CompiledDatasetOpenOptions& options) {
+ throw_if_compiled_validation_cancelled(0, options.cancellation);
  auto mapping = mmltk::common::io::MappedFile::try_open_readonly(path.string());
  if (!mapping) { throw std::system_error{mapping.error(), "compiled dataset source open failed: " + path.string()}; }
- return open_mapped(path, std::move(*mapping), std::numeric_limits<std::size_t>::max(), access);
+ return open_mapped(path, std::move(*mapping), std::numeric_limits<std::size_t>::max(), access, options);
 }
-std::expected<CompiledDataset, std::error_code> CompiledDataset::open_source(const std::filesystem::path& path, const std::size_t image_limit) {
+std::expected<CompiledDataset, std::error_code> CompiledDataset::open_source(const std::filesystem::path& path, const std::size_t image_limit, const CompiledDatasetOpenOptions& options) {
+ throw_if_compiled_validation_cancelled(0, options.cancellation);
  auto mapping = mmltk::common::io::MappedFile::try_open_readonly(path.string());
  if (!mapping) { return std::unexpected{mapping.error()}; }
- return open_mapped(path, std::move(*mapping), image_limit, AccessPattern::Random);
+ return open_mapped(path, std::move(*mapping), image_limit, AccessPattern::Random, options);
 }
-CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, mmltk::common::io::MappedFile mapping, const std::size_t image_limit, const AccessPattern access) {
+CompiledDataset CompiledDataset::open_mapped(
+ const std::filesystem::path& path, mmltk::common::io::MappedFile mapping, const std::size_t image_limit, const AccessPattern access, const CompiledDatasetOpenOptions& options) {
  CompiledDataset store;
  store.path_ = path;
  store.mapping_ = std::move(mapping);
  if (store.mapping_.size() < sizeof(mmltk::backend::data::FileHeader)) { throw std::runtime_error("compiled dataset is smaller than its header"); }
  std::memcpy(&store.header_, store.mapping_.data(), sizeof(store.header_));
- mmltk::backend::data::validate_compiled_header(store.header_);
  if (store.header_.num_images > image_limit) { throw std::runtime_error("compiled dataset exceeds the caller image limit"); }
  const mmltk::backend::data::CompiledFileSections sections = mmltk::backend::data::validate_compiled_file_sections(store.header_, store.mapping_.size());
  store.layout_ = sections.layout;
  const int advice = access == AccessPattern::Normal ? MADV_NORMAL : access == AccessPattern::Sequential ? MADV_SEQUENTIAL : MADV_RANDOM;
  store.mapping_.advise_aligned_range(store.layout_.data_offset, store.layout_.index_offset - store.layout_.data_offset, advice);
  store.image_entries_.resize(store.header_.num_slots);
- std::memcpy(store.image_entries_.data(), store.mapping_.data() + sections.index_offset, sections.expected_index_bytes);
- std::size_t eligible = 0;
- std::uint32_t maximum_label_bytes = 0;
- for (std::uint32_t slot = 0; slot < store.header_.num_slots; ++slot) {
-  const auto& entry = store.image_entries_[slot];
-  if (entry.status != ImageStatus::Inactive && entry.status != ImageStatus::Eligible) throw std::runtime_error("invalid compiled slot status");
-  if (!entry.eligible()) {
-   if (entry.num_instances || entry.num_runs || entry.label_bytes) throw std::runtime_error("inactive compiled slot has published annotations");
-   continue;
-  }
-  ++eligible;
-  maximum_label_bytes = std::max(maximum_label_bytes, entry.label_bytes);
-  store.masks_available_ |= admit_compiled_annotations(entry, store.annotations(slot), store.header_, slot);
-  store.label_count_ += entry.num_instances;
-  store.run_count_ += entry.num_runs;
+ // Keep even the resident-index copy interruptible at a bounded read boundary.
+ for (std::size_t offset = 0; offset < sections.expected_index_bytes; offset += read_chunk_bytes) {
+  throw_if_compiled_validation_cancelled(0, options.cancellation);
+  const auto bytes = std::min(read_chunk_bytes, sections.expected_index_bytes - offset);
+  std::memcpy(reinterpret_cast<std::byte*>(store.image_entries_.data()) + offset, store.mapping_.data() + sections.index_offset + offset, bytes);
  }
- if (eligible != store.header_.num_images) throw std::runtime_error("compiled eligible population differs from header");
- if (maximum_label_bytes != store.header_.max_label_bytes) throw std::runtime_error("compiled maximum label size differs from eligible payloads");
+ std::mutex totals_mutex;
+ std::atomic_size_t observed{0};
+ const auto observe = [&](std::size_t count) noexcept {
+  if (!options.progress) return;
+  try {
+   options.progress(observed.fetch_add(count, std::memory_order_relaxed) + count, store.header_.num_slots);
+  } catch (...) {}
+ };
+ const auto summarize = [&](std::size_t begin, std::size_t end) {
+  std::size_t labels = 0, runs = 0, pending = 0;
+  for (auto slot = begin; slot != end; ++slot) {
+   throw_if_compiled_validation_cancelled(0, options.cancellation);
+   const auto& entry = store.image_entries_[slot];
+   if (entry.eligible()) {
+    labels += entry.num_instances;
+    runs += entry.num_runs;
+   }
+   if (options.progress && (++pending == 4096U || slot + 1U == end)) {
+    observe(pending);
+    pending = 0;
+   }
+  }
+  std::scoped_lock lock(totals_mutex);
+  store.label_count_ += labels;
+  store.run_count_ += runs;
+ };
+ observe(0);
+ if (options.workers)
+  options.workers->parallel_for<std::size_t>(0, store.header_.num_slots, -1, summarize);
+ else
+  summarize(0, store.header_.num_slots);
+ throw_if_compiled_validation_cancelled(0, options.cancellation);
  store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_));
  return store;
 }
@@ -53,7 +77,14 @@ const std::filesystem::path& CompiledDataset::path() const noexcept { return pat
 const mmltk::backend::data::FileHeader& CompiledDataset::header() const noexcept { return header_; }
 std::span<const std::string> CompiledDataset::class_names() const noexcept { return catalog_ ? catalog_->names() : std::span<const std::string>{}; }
 std::span<const mmltk::backend::data::ImageEntry> CompiledDataset::image_entries() const noexcept { return image_entries_; }
-bool CompiledDataset::masks_available() const noexcept { return masks_available_; }
+bool CompiledDataset::masks_available() const {
+ // Opening never reads labels just to answer an unused summary.
+ // An explicit query still preserves present-empty mask meaning.
+ for (const auto slot : eligible_slots())
+  for (const auto& label : image_labels(slot))
+   if (label.has_mask()) return true;
+ return false;
+}
 const ImageEntry& CompiledDataset::image_entry(std::uint32_t slot) const {
  if (!eligible(slot)) throw std::out_of_range("compiled image slot is not eligible");
  return image_entries_[slot];

@@ -132,6 +132,7 @@ struct CompileDiagnostic {
 struct CompilerConfig {
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
  bool perceptual_downscale = false;
+ MMLTK_MAXIMUM(std::uint32_t, COMPILED_LABEL_LIMIT) std::uint32_t max_label_bytes = COMPILED_LABEL_CAPACITY;
  // CLEANUP-IGNORE: Compiler input/output paths remain backend execution facts with canonical reflected limits.
  MMLTK_MAX_PATH_BYTES std::string source_dir;
  MMLTK_MAX_PATH_BYTES std::string output_dir;
@@ -156,6 +157,7 @@ static_assert(mmltk::frameworks::reflection::ingress_policies_are_valid<Compiler
 [[nodiscard]] inline std::expected<void, CompilerConfigViolation> validate_compiler_config(const CompilerConfig& config) noexcept {
  if (config.source_dir.empty() || config.output_dir.empty()) { return std::unexpected(CompilerConfigViolation::MissingStorage); }
  if (mmltk::frameworks::reflection::validate_reflected_fields(config)) { return std::unexpected(CompilerConfigViolation::InvalidStorage); }
+ if (config.max_label_bytes % sizeof(RLEPair)) return std::unexpected(CompilerConfigViolation::InvalidStorage);
  if (!mmltk::frameworks::reflection::unique_nonnegative_identifiers(config.worker_cpus)) { return std::unexpected(CompilerConfigViolation::InvalidWorkerCpu); }
  return {};
 }

@@ -16,7 +16,7 @@ struct BrowserRuntimeConfig final {
 MMLTK_REFLECT_FIELDS(BrowserRuntimeConfig)
 using BrowserPresentation = mmltk::frameworks::reflection::CliScope<BrowserRuntimeConfig>::within<&BrowserRuntimeConfig::presentation>;
 inline constexpr std::array kBrowserExecutionOptions{
- MMLTK_CLI_NAMED(BrowserPresentation, cuda_device_index, "--device-id", "CUDA-visible visual device", "Execution"),
+ MMLTK_CLI_NAMED(BrowserPresentation, cuda_device_index, "--device-id", "CUDA-visible visual device", "Execution", "--gpu"),
  MMLTK_CLI_OPTION(BrowserPresentation, numa_node, "GPU-local NUMA node (-1 selects automatic locality)", "Execution"),
  mmltk::frameworks::reflection::negative_flag<BrowserRuntimeConfig, &BrowserRuntimeConfig::h2d_dataloader>("--gdrcopy", "Use GDRCopy for compiled-image loading", "Execution")
 };

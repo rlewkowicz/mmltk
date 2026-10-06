@@ -77,7 +77,7 @@ void detail::prepare_augmentation_image(AugmentationImagePlan& plan, const GpuAu
  paste[0] = -1.0F;
  if (!selected || selected->label < 0 || selected->dataset_index == dataset_index || !augmentation_paste_admitted(config, key)) return;
  const auto& donor = *selected;
- const float scale = 0.5F + augment_math::uniform01(key, 0x4002ULL);
+ const float scale = 1.0F + (augment_math::uniform01(key, 0x4002ULL) - 0.5F) * 0.75F;
  const float destination_x = augment_math::uniform01(key, 0x4003ULL);
  const float destination_y = augment_math::uniform01(key, 0x4004ULL);
  const float source_x = (donor.box[0] + donor.box[2]) * 0.5F;
