@@ -30,6 +30,7 @@ pub(crate) struct ChartView {
     pub plot_bounds: iced::Rectangle,
     pub legend_collapsed: bool,
     pub legend_control: String,
+    pub plot_area_control: String,
     pub visible: bool,
 }
 pub struct Component {
@@ -74,6 +75,7 @@ impl Component {
             plot_bounds: chart.plot.view_bounds()?,
             legend_collapsed: chart.plot.legend_collapsed(),
             legend_control: chart.plot.legend_control_id(),
+            plot_area_control: chart.plot.plot_area_control_id(),
             visible: self
                 .expanded
                 .map_or(chart.visible, |expanded| expanded == kind),

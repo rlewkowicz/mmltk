@@ -245,6 +245,9 @@ impl PlotWidget {
     /// Stable identifier of this plot's legend control container.
     pub fn legend_control_id(&self) -> String { format!("plot.legend.{}", self.instance_id) }
 
+    /// Stable identifier of the plot-area container for scroll-aware widget operations.
+    pub fn plot_area_control_id(&self) -> String { format!("plot.area.{}", self.instance_id) }
+
     /// Whether the retained legend is collapsed.
     pub fn legend_collapsed(&self) -> bool { self.legend_collapsed }
 
@@ -885,6 +888,7 @@ impl PlotWidget {
         let plot_layers = shapes_bottom.chain(std::iter::once(plot)).chain(shapes_top);
 
         container(stack(plot_layers).width(Length::Fill).height(Length::Fill))
+            .id(self.plot_area_control_id())
             .clip(true)
             .padding(PLOT_CONTENT_PADDING)
             .style(|theme: &Theme| self.update_style(theme).plot_area)

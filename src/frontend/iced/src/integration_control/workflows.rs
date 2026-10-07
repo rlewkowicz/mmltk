@@ -1970,6 +1970,14 @@ impl State {
         true
     }
 
+    fn chart_wheel_control(&self, expanded: bool) -> String {
+        if expanded {
+            self.chart_view.as_ref().unwrap().plot_area_control.clone()
+        } else {
+            "train.metrics.chart.Loss".into()
+        }
+    }
+
     pub(super) fn primary_action_pixels(&mut self, driver: &Driver, control: &str, active: bool) {
         if !active {
             return;
@@ -2241,13 +2249,8 @@ impl State {
             Step::ChartWheel(index, expanded) => {
                 self.wheel_y = bounds.y;
                 driver.phase = Phase::Workflows(Step::ChartWheelPending(index, expanded));
-                let input_bounds = if expanded {
-                    self.chart_view.as_ref().unwrap().plot_bounds
-                } else {
-                    bounds
-                };
                 if !widget_ops::chart_wheel(
-                    crate::presentation_surface::physical_bounds(input_bounds, driver.input_scale),
+                    crate::presentation_surface::physical_bounds(bounds, driver.input_scale),
                     index,
                     driver.input_scale,
                     expanded,
@@ -3041,7 +3044,9 @@ impl State {
                             return Task::none();
                         }
                         if widgets.begin_location() {
-                            locate("train.metrics.chart.Loss".into(), driver.generation)
+                            // Observe the same target without revealing it again: scrolling
+                            // here would erase evidence of page movement caused by the wheel.
+                            locate(self.chart_wheel_control(expanded), driver.generation)
                         } else {
                             Task::none()
                         }
@@ -3063,8 +3068,9 @@ impl State {
                 }
                 Task::none()
             }
-            Step::ChartWheel(_, _) => {
-                self.workflow_control(widgets, driver, "train.metrics.chart.Loss")
+            Step::ChartWheel(_, expanded) => {
+                let control = self.chart_wheel_control(expanded);
+                self.workflow_control(widgets, driver, control)
             }
             Step::ChartSelector | Step::ChartCloseSelector => {
                 self.workflow_control(widgets, driver, "train.metrics.charts")
