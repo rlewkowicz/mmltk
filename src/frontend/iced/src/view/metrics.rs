@@ -597,6 +597,10 @@ pub(crate) mod tests {
     use iced::widget::shader::Program;
     use iced::{Event, Point, Rectangle, Size, mouse};
     use iced_plot::{PlotUiMessage, PlotWidget};
+    const BOX_AP50: catalog::Source = catalog::Source::Evaluation {
+        mask: false,
+        field: MetricSummaryField::Ap50,
+    };
     pub(super) fn source_catalog() -> TrainingSourceCatalog {
         let source = TrainingMetricSource {
             scope: TrainingRecordScope::Model,
@@ -795,33 +799,9 @@ pub(crate) mod tests {
         component.rebase(&model, false);
         component.rebase(&model, false);
         assert_eq!(component.live.sequence, Some(10));
-        assert_eq!(
-            field_curve(
-                &component.live,
-                &component.metrics,
-                catalog::Source::Evaluation {
-                    mask: false,
-                    field: MetricSummaryField::Ap50
-                }
-            )
-            .buckets
-            .len(),
-            1
-        );
-        assert_eq!(
-            field_curve(
-                &component.live,
-                &component.metrics,
-                catalog::Source::Evaluation {
-                    mask: false,
-                    field: MetricSummaryField::Ap50
-                }
-            )
-            .buckets[0]
-                .first
-                .order,
-            3
-        );
+        let ap = field_curve(&component.live, &component.metrics, BOX_AP50);
+        assert_eq!(ap.buckets.len(), 1);
+        assert_eq!(ap.buckets[0].first.order, 3);
         assert!(
             curve(&component.live, &component.metrics, Chart::Loss)
                 .buckets
@@ -889,14 +869,7 @@ pub(crate) mod tests {
             component.rebase(&model, false);
             assert_eq!(component.live.sequence, Some(12));
             assert_eq!(component.live.dropped, 3);
-            let ap = field_curve(
-                &component.live,
-                &component.metrics,
-                catalog::Source::Evaluation {
-                    mask: false,
-                    field: MetricSummaryField::Ap50,
-                },
-            );
+            let ap = field_curve(&component.live, &component.metrics, BOX_AP50);
             assert_eq!(ap.buckets.len(), 1);
             assert_eq!(ap.buckets[0].first.order, 11);
             let loss = curve(&component.live, &component.metrics, Chart::Loss);
@@ -916,16 +889,9 @@ pub(crate) mod tests {
             component.clear();
             component.rebase(&model, false);
             assert_eq!(
-                field_curve(
-                    &component.live,
-                    &component.metrics,
-                    catalog::Source::Evaluation {
-                        mask: false,
-                        field: MetricSummaryField::Ap50
-                    }
-                )
-                .buckets
-                .len(),
+                field_curve(&component.live, &component.metrics, BOX_AP50)
+                    .buckets
+                    .len(),
                 1
             );
             assert_eq!(component.live.sequence, Some(12));
@@ -959,16 +925,9 @@ pub(crate) mod tests {
                 1
             );
             assert_eq!(
-                field_curve(
-                    &component.live,
-                    &component.metrics,
-                    catalog::Source::Evaluation {
-                        mask: false,
-                        field: MetricSummaryField::Ap50
-                    }
-                )
-                .buckets
-                .len(),
+                field_curve(&component.live, &component.metrics, BOX_AP50)
+                    .buckets
+                    .len(),
                 1
             );
         }
@@ -1007,14 +966,7 @@ pub(crate) mod tests {
         let mut component = Component::default();
         component.rebase(&model, false);
         component.rebase(&model, false);
-        let ap = field_curve(
-            &component.saved,
-            &component.metrics,
-            catalog::Source::Evaluation {
-                mask: false,
-                field: MetricSummaryField::Ap50,
-            },
-        );
+        let ap = field_curve(&component.saved, &component.metrics, BOX_AP50);
         assert_eq!(ap.buckets.len(), 1);
         assert_eq!(ap.buckets[0].first.value, 0.9);
         let loss = curve(&component.saved, &component.metrics, Chart::Loss);
@@ -1028,18 +980,7 @@ pub(crate) mod tests {
         let mut history = histories(&metrics);
         let mut sample = record();
         history.ingest(&sample, &metrics);
-        assert!(
-            field_curve(
-                &history,
-                &metrics,
-                catalog::Source::Evaluation {
-                    mask: false,
-                    field: MetricSummaryField::Ap50
-                }
-            )
-            .buckets
-            .is_empty()
-        );
+        assert!(field_curve(&history, &metrics, BOX_AP50).buckets.is_empty());
         for epoch in 0..2 {
             sample.sequence += 1;
             sample.role = TrainingRecordRole::Epoch;
@@ -1051,14 +992,7 @@ pub(crate) mod tests {
             sample.progress.val = None;
             history.ingest(&sample, &metrics);
         }
-        let ap = field_curve(
-            &history,
-            &metrics,
-            catalog::Source::Evaluation {
-                mask: false,
-                field: MetricSummaryField::Ap50,
-            },
-        );
+        let ap = field_curve(&history, &metrics, BOX_AP50);
         assert_eq!(ap.buckets.len(), 2);
         assert_eq!(ap.buckets[0].first.value, 0.65);
         assert_eq!(ap.buckets[0].first.epoch, 1.0);
@@ -1069,19 +1003,7 @@ pub(crate) mod tests {
         sample.progress.val = Some(evaluation());
         sample.progress.test = Some(evaluation());
         history.ingest(&sample, &metrics);
-        assert_eq!(
-            field_curve(
-                &history,
-                &metrics,
-                catalog::Source::Evaluation {
-                    mask: false,
-                    field: MetricSummaryField::Ap50
-                }
-            )
-            .buckets
-            .len(),
-            2
-        );
+        assert_eq!(field_curve(&history, &metrics, BOX_AP50).buckets.len(), 2);
     }
     #[test]
     fn gaps_invalid_evaluations_and_resumed_attempts_never_join() {
@@ -1104,14 +1026,7 @@ pub(crate) mod tests {
         sample.attemptid = "resume".into();
         sample.sequence = 0;
         history.ingest(&sample, &metrics);
-        let ap = field_curve(
-            &history,
-            &metrics,
-            catalog::Source::Evaluation {
-                mask: false,
-                field: MetricSummaryField::Ap50,
-            },
-        );
+        let ap = field_curve(&history, &metrics, BOX_AP50);
         assert_eq!(ap.buckets.len(), 4);
         assert!(
             ap.buckets
