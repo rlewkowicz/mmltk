@@ -2534,119 +2534,120 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
  for (const auto dtype : {torch::kFloat16, torch::kBFloat16}) {
   if (dtype == torch::kBFloat16 && at::cuda::getCurrentDeviceProperties()->major < 8) continue;
   for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective}) {
-  DYNAMIC_SECTION("precision " << static_cast<int>(dtype) << " compilation " << static_cast<int>(mode)) {
-  auto config = admitted.artifacts.config;
-  config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
-  config.training_supervision.denoising.enabled = false;
-  const auto layout = rfdetr::testsupport::synthetic_training_layout(static_cast<std::size_t>(config.num_classes - 1));
-  rfdetr::NativeRfDetrModel eager(config, layout), compiled(config, layout);
-  for (auto* model : {&eager, &compiled}) {
-   model->commit_normalized_state(model->stage_normalized_state(admitted.model_state.entries(), rfdetr::detail::NormalizedModelStateAdmission::RequiredCore));
-   model->initialize_training_supervision(731);
-   model->to(torch::Device(torch::kCUDA));
-   model->train();
-   model->set_force_pytorch_deformable_attn(false);
-   model->set_force_math_attention(found->math_sdpa);
-   for (const auto& parameter : model->named_parameters(true))
-    if (rfdetr::is_encoder_param(parameter.key())) parameter.value().set_requires_grad(false);
-  }
-  compiled.optimize_for_inference(2, true, mode);
-  eager.optimize_for_inference(2, true, rfdetr::CompilationMode::kNone);
-  auto targets = rfdetr::testsupport::oracle_targets(archive, *found, torch::kCUDA);
-  targets.sampling_keys = torch::tensor({int64_t{9001}, int64_t{9002}}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-  targets.microbatch_key = 731;
-  const auto input = archive.tensor("input", torch::kCUDA);
-  const auto mask = archive.tensor("input_mask", torch::kCUDA);
-  auto request = gradient_update_request(1e-4);
-  auto eager_optimizer = rfdetr::build_optimizer(eager.named_parameters(true), request);
-  auto compiled_optimizer = rfdetr::build_optimizer(compiled.named_parameters(true), request);
-  const auto detection = training_detection_fixture(config);
-  const rfdetr::TrainingStep step(1, 1., true, dtype);
-  const std::string comparison_name = std::string(dtype == torch::kFloat16 ? "matchfree-nano384-fp16" : "matchfree-nano384-bf16") + (mode == rfdetr::CompilationMode::kNone ? "-eager-repeat" : "");
-  rfdetr::testsupport::OracleComparison comparison(*requested, comparison_name, dtype,
-   mode == rfdetr::CompilationMode::kNone ? "independent native Match-Free eager repetitions; compilation noise baseline" : "native Match-Free None/Selective compilation; independent equation/VJP coverage is separate from stock upstream");
-  comparison.fact("representative recipe",
-   {{"resolution", 384}, {"groups", config.group_detr}, {"frozen_encoder", true}, {"denoising", false}, {"semantic_draws", {9001, 9002}},
-    {"objective_evidence", "existing independent Match-Free pair-objective and VJP tests; this case composes imported upstream weights with production TrainingStep/CUDA/AdamW"}});
-  const auto compare_gradients = [&](const std::string& boundary) {
-   const auto other = compiled.named_parameters(true);
-   rfdetr::TensorMap actual, expected;
-   for (const auto& parameter : eager.named_parameters(true)) {
-    actual.emplace(parameter.key(), other[parameter.key()].grad());
-    expected.emplace(parameter.key(), parameter.value().grad());
-   }
-   comparison.derivatives(boundary, actual, expected);
-  };
-  comparison.compare_all([&] {
-  // Record and exercise the retained path before the one observed update.
-  for (int replay = 0; replay < 3; ++replay) {
-   comparison.fact("replay", replay);
-   eager_optimizer.optimizer.zero_grad(true);
-   compiled_optimizer.optimizer.zero_grad(true);
-   rfdetr::ModelOutputs ordinary, retained;
-   rfdetr::RoutedTrainingLoss eager_loss, compiled_loss;
-   step.forward([&] {
-    comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
-    ordinary = eager.forward_for_match_free({input, mask});
-    retained = compiled.forward_for_match_free({input, mask});
-    const auto expected = rfdetr::testsupport::oracle_output_tensors(ordinary), actual = rfdetr::testsupport::oracle_output_tensors(retained);
-    REQUIRE(expected.size() == actual.size());
-    for (const auto& [name, value] : expected) comparison.compare("output/" + name, actual.at(name), value, ComparisonPolicy::Value);
-    const rfdetr::DeviceLossNormalizer normalizer{torch::tensor(2.F, input.options())};
-    eager_loss = rfdetr::compute_routed_training_loss(eager, rfdetr::TrainingSupervisionRoute::MatchFree, ordinary, targets, normalizer, detection);
-    compiled_loss = rfdetr::compute_routed_training_loss(compiled, rfdetr::TrainingSupervisionRoute::MatchFree, retained, targets, normalizer, detection);
-    const auto components = [&]<class Value>(this auto&& self, const Value& actual_value, const Value& expected_value, const std::string& path) -> void {
-     if constexpr (std::is_same_v<Value, torch::Tensor>) {
-      comparison.compare(path, actual_value, expected_value, ComparisonPolicy::Value);
-     } else if constexpr (std::is_same_v<Value, rfdetr::TensorMap>) {
-      REQUIRE(actual_value.size() == expected_value.size());
-      for (const auto& [name, tensor] : expected_value) self(actual_value.at(name), tensor, path + "/" + name);
-     } else if constexpr (requires {
-                           actual_value.begin();
-                           actual_value.end();
-                          }) {
-      REQUIRE(actual_value.size() == expected_value.size());
-      for (std::size_t index = 0; index < expected_value.size(); ++index) self(actual_value[index], expected_value[index], path + "/" + std::to_string(index));
-     } else {
-      template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Value, std::meta::access_context::current()))) {
-       self(actual_value.[:member:], expected_value.[:member:], path + "/" + std::string(std::meta::identifier_of(member)));
-      }
+   DYNAMIC_SECTION("precision " << static_cast<int>(dtype) << " compilation " << static_cast<int>(mode)) {
+    auto config = admitted.artifacts.config;
+    config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
+    config.training_supervision.denoising.enabled = false;
+    const auto layout = rfdetr::testsupport::synthetic_training_layout(static_cast<std::size_t>(config.num_classes - 1));
+    rfdetr::NativeRfDetrModel eager(config, layout), compiled(config, layout);
+    for (auto* model : {&eager, &compiled}) {
+     model->commit_normalized_state(model->stage_normalized_state(admitted.model_state.entries(), rfdetr::detail::NormalizedModelStateAdmission::RequiredCore));
+     model->initialize_training_supervision(731);
+     model->to(torch::Device(torch::kCUDA));
+     model->train();
+     model->set_force_pytorch_deformable_attn(false);
+     model->set_force_math_attention(found->math_sdpa);
+     for (const auto& parameter : model->named_parameters(true))
+      if (rfdetr::is_encoder_param(parameter.key())) parameter.value().set_requires_grad(false);
+    }
+    compiled.optimize_for_inference(2, true, mode);
+    eager.optimize_for_inference(2, true, rfdetr::CompilationMode::kNone);
+    auto targets = rfdetr::testsupport::oracle_targets(archive, *found, torch::kCUDA);
+    targets.sampling_keys = torch::tensor({int64_t{9001}, int64_t{9002}}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+    targets.microbatch_key = 731;
+    const auto input = archive.tensor("input", torch::kCUDA);
+    const auto mask = archive.tensor("input_mask", torch::kCUDA);
+    auto request = gradient_update_request(1e-4);
+    auto eager_optimizer = rfdetr::build_optimizer(eager.named_parameters(true), request);
+    auto compiled_optimizer = rfdetr::build_optimizer(compiled.named_parameters(true), request);
+    const auto detection = training_detection_fixture(config);
+    const rfdetr::TrainingStep step(1, 1., true, dtype);
+    const std::string comparison_name = std::string(dtype == torch::kFloat16 ? "matchfree-nano384-fp16" : "matchfree-nano384-bf16") + (mode == rfdetr::CompilationMode::kNone ? "-eager-repeat" : "");
+    rfdetr::testsupport::OracleComparison comparison(*requested, comparison_name, dtype,
+     mode == rfdetr::CompilationMode::kNone ? "independent native Match-Free eager repetitions; compilation noise baseline"
+                                            : "native Match-Free None/Selective compilation; independent equation/VJP coverage is separate from stock upstream");
+    comparison.fact("representative recipe",
+     {{"resolution", 384}, {"groups", config.group_detr}, {"frozen_encoder", true}, {"denoising", false}, {"semantic_draws", {9001, 9002}},
+      {"objective_evidence", "existing independent Match-Free pair-objective and VJP tests; this case composes imported upstream weights with production TrainingStep/CUDA/AdamW"}});
+    const auto compare_gradients = [&](const std::string& boundary) {
+     const auto other = compiled.named_parameters(true);
+     rfdetr::TensorMap actual, expected;
+     for (const auto& parameter : eager.named_parameters(true)) {
+      actual.emplace(parameter.key(), other[parameter.key()].grad());
+      expected.emplace(parameter.key(), parameter.value().grad());
      }
+     comparison.derivatives(boundary, actual, expected);
     };
-    comparison.compare("loss/total", compiled_loss.total, eager_loss.total, ComparisonPolicy::Value);
-    components(compiled_loss, eager_loss, "components");
-   });
-   step.backward(eager_loss.total);
-   step.backward(compiled_loss.total);
-   compare_gradients("gradient/");
-  }
-  const auto gradient_norm = [](const rfdetr::NativeOptimizer& optimizer) {
-   std::vector<torch::Tensor> norms;
-   for (const auto& parameter : optimizer.parameters())
-    if (parameter.grad().defined()) norms.push_back(parameter.grad().norm());
-   return torch::stack(norms).norm();
-  };
-  comparison.compare("clip_norm", gradient_norm(compiled_optimizer.optimizer), gradient_norm(eager_optimizer.optimizer), ComparisonPolicy::Value);
-  eager_optimizer.optimizer.clip_grad_norm_(.1);
-  compiled_optimizer.optimizer.clip_grad_norm_(.1);
-  compare_gradients("clipped/");
-  rfdetr::TensorMap ordinary_before, compiled_before;
-  for (const auto& parameter : eager.named_parameters(true)) ordinary_before.emplace(parameter.key(), parameter.value().detach().clone());
-  for (const auto& parameter : compiled.named_parameters(true)) compiled_before.emplace(parameter.key(), parameter.value().detach().clone());
-  eager_optimizer.optimizer.step();
-  compiled_optimizer.optimizer.step();
-  const auto actual = compiled.named_parameters(true);
-  comparison.fact("independent AdamW updates", "measured after independent backwards; identical-gradient optimizer correctness is checked against actual PyTorch in the stock oracle case");
-  comparison.observe_values([&] {
-  for (const auto& parameter : eager.named_parameters(true)) {
-   comparison.compare("updated/" + parameter.key(), actual[parameter.key()], parameter.value(), ComparisonPolicy::Value);
-   comparison.compare("update/" + parameter.key(), actual[parameter.key()].detach() - compiled_before.at(parameter.key()), parameter.value().detach() - ordinary_before.at(parameter.key()),
-    ComparisonPolicy::Derivative);
-  }
-  });
-  REQUIRE_FALSE(torch::equal(ordinary_before.at("class_embed.weight"), eager.named_parameters(true)["class_embed.weight"]));
-  });
-  }
+    comparison.compare_all([&] {
+     // Record and exercise the retained path before the one observed update.
+     for (int replay = 0; replay < 3; ++replay) {
+      comparison.fact("replay", replay);
+      eager_optimizer.optimizer.zero_grad(true);
+      compiled_optimizer.optimizer.zero_grad(true);
+      rfdetr::ModelOutputs ordinary, retained;
+      rfdetr::RoutedTrainingLoss eager_loss, compiled_loss;
+      step.forward([&] {
+       comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
+       ordinary = eager.forward_for_match_free({input, mask});
+       retained = compiled.forward_for_match_free({input, mask});
+       const auto expected = rfdetr::testsupport::oracle_output_tensors(ordinary), actual = rfdetr::testsupport::oracle_output_tensors(retained);
+       REQUIRE(expected.size() == actual.size());
+       for (const auto& [name, value] : expected) comparison.compare("output/" + name, actual.at(name), value, ComparisonPolicy::Value);
+       const rfdetr::DeviceLossNormalizer normalizer{torch::tensor(2.F, input.options())};
+       eager_loss = rfdetr::compute_routed_training_loss(eager, rfdetr::TrainingSupervisionRoute::MatchFree, ordinary, targets, normalizer, detection);
+       compiled_loss = rfdetr::compute_routed_training_loss(compiled, rfdetr::TrainingSupervisionRoute::MatchFree, retained, targets, normalizer, detection);
+       const auto components = [&]<class Value>(this auto&& self, const Value& actual_value, const Value& expected_value, const std::string& path) -> void {
+        if constexpr (std::is_same_v<Value, torch::Tensor>) {
+         comparison.compare(path, actual_value, expected_value, ComparisonPolicy::Value);
+        } else if constexpr (std::is_same_v<Value, rfdetr::TensorMap>) {
+         REQUIRE(actual_value.size() == expected_value.size());
+         for (const auto& [name, tensor] : expected_value) self(actual_value.at(name), tensor, path + "/" + name);
+        } else if constexpr (requires {
+                              actual_value.begin();
+                              actual_value.end();
+                             }) {
+         REQUIRE(actual_value.size() == expected_value.size());
+         for (std::size_t index = 0; index < expected_value.size(); ++index) self(actual_value[index], expected_value[index], path + "/" + std::to_string(index));
+        } else {
+         template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Value, std::meta::access_context::current()))) {
+          self(actual_value.[:member:], expected_value.[:member:], path + "/" + std::string(std::meta::identifier_of(member)));
+         }
+        }
+       };
+       comparison.compare("loss/total", compiled_loss.total, eager_loss.total, ComparisonPolicy::Value);
+       components(compiled_loss, eager_loss, "components");
+      });
+      step.backward(eager_loss.total);
+      step.backward(compiled_loss.total);
+      compare_gradients("gradient/");
+     }
+     const auto gradient_norm = [](const rfdetr::NativeOptimizer& optimizer) {
+      std::vector<torch::Tensor> norms;
+      for (const auto& parameter : optimizer.parameters())
+       if (parameter.grad().defined()) norms.push_back(parameter.grad().norm());
+      return torch::stack(norms).norm();
+     };
+     comparison.compare("clip_norm", gradient_norm(compiled_optimizer.optimizer), gradient_norm(eager_optimizer.optimizer), ComparisonPolicy::Value);
+     eager_optimizer.optimizer.clip_grad_norm_(.1);
+     compiled_optimizer.optimizer.clip_grad_norm_(.1);
+     compare_gradients("clipped/");
+     rfdetr::TensorMap ordinary_before, compiled_before;
+     for (const auto& parameter : eager.named_parameters(true)) ordinary_before.emplace(parameter.key(), parameter.value().detach().clone());
+     for (const auto& parameter : compiled.named_parameters(true)) compiled_before.emplace(parameter.key(), parameter.value().detach().clone());
+     eager_optimizer.optimizer.step();
+     compiled_optimizer.optimizer.step();
+     const auto actual = compiled.named_parameters(true);
+     comparison.fact("independent AdamW updates", "measured after independent backwards; identical-gradient optimizer correctness is checked against actual PyTorch in the stock oracle case");
+     comparison.observe_values([&] {
+      for (const auto& parameter : eager.named_parameters(true)) {
+       comparison.compare("updated/" + parameter.key(), actual[parameter.key()], parameter.value(), ComparisonPolicy::Value);
+       comparison.compare("update/" + parameter.key(), actual[parameter.key()].detach() - compiled_before.at(parameter.key()), parameter.value().detach() - ordinary_before.at(parameter.key()),
+        ComparisonPolicy::Derivative);
+      }
+     });
+     REQUIRE_FALSE(torch::equal(ordinary_before.at("class_embed.weight"), eager.named_parameters(true)["class_embed.weight"]));
+    });
+   }
   }
  }
 }

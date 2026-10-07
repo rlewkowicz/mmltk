@@ -291,7 +291,8 @@ impl Component {
         let chart_width =
             (crate::view::workflow::Composition::new(crate::generated::FeatureId::Train, width)
                 .center_width()
-                - 2.0 * crate::view::workflow::CARD_PADDING).max(1.0);
+                - 2.0 * crate::view::workflow::CARD_PADDING)
+                .max(1.0);
         let aspect = settings.draft.as_ref().map_or(
             crate::generated::WorkspaceAspectRatio::Widescreen,
             |draft| draft.ui.workspaceaspectratio,

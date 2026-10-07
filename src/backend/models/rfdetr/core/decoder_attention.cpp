@@ -56,9 +56,7 @@ torch::Tensor isolated_group_self_attention(
   // Python batch-first MHA projects transposed [queries, groups * batch, width]
   // operands. Preserve both its group-major ordering and strides: ATen linear
   // chooses a different rounded bias operation for noncontiguous operands.
-  const auto sequence_first = [&](const torch::Tensor& input) {
-   return input.view({batch, groups, queries, width}).transpose(0, 1).reshape({groups * batch, queries, width}).transpose(0, 1);
-  };
+  const auto sequence_first = [&](const torch::Tensor& input) { return input.view({batch, groups, queries, width}).transpose(0, 1).reshape({groups * batch, queries, width}).transpose(0, 1); };
   const auto positioned = sequence_first(target + query_position);
   const auto q = project(positioned, 0), k = project(positioned, 1), v = project(sequence_first(target), 2);
   auto output = grouped_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), heads, 1, force_math);

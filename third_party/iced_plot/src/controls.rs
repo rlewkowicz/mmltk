@@ -548,7 +548,7 @@ impl PlotControls {
     ) -> Element<'a, Message> {
         Element::new(HeaderPanel {
             content: widget::container(widget::scrollable(content).height(Length::Shrink))
-                .max_height(max_height)
+                .height(Length::Shrink.max(max_height))
                 .into(),
             wheel_enabled: !self.scroll.is_empty(),
         })

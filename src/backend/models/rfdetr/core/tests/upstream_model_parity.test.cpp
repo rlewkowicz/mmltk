@@ -45,23 +45,26 @@ public:
   TORCH_CHECK(!active_, "forward operator observation is already active");
   callback_ = at::addThreadLocalCallback(at::RecordFunctionCallback(
    [](const at::RecordFunction& event) -> std::unique_ptr<at::ObserverContext> {
-    const std::string_view name(event.name());
-    if (name == "aten::topk") active_->finished_ = true;
-    if (active_->finished_) return {};
-    if (name != "aten::conv2d" && name != "aten::layer_norm" && name != "aten::linear" && name != "aten::gelu" && name != "aten::scaled_dot_product_attention") return {};
-    ++active_->depth_;
-    return std::make_unique<Event>(std::string(name.substr(6)));
-   }, [](const at::RecordFunction& event, at::ObserverContext* context) {
-    if (!context) return;
-    if (--active_->depth_) return;
-    const auto& name = static_cast<Event*>(context)->name;
-    if (active_->outputs_.size() >= 256 || event.outputs().size() != 1 || !event.outputs().front().isTensor()) {
-     active_->finished_ = true;
-     return;
-    }
-    const auto index = active_->counts_[name]++;
-    active_->outputs_.emplace("forward-operator/" + name + "/" + std::to_string(index), event.outputs().front().toTensor().detach().clone());
-   }).needsOutputs(true).scopes({at::RecordScope::FUNCTION}));
+   const std::string_view name(event.name());
+   if (name == "aten::topk") active_->finished_ = true;
+   if (active_->finished_) return {};
+   if (name != "aten::conv2d" && name != "aten::layer_norm" && name != "aten::linear" && name != "aten::gelu" && name != "aten::scaled_dot_product_attention") return {};
+   ++active_->depth_;
+   return std::make_unique<Event>(std::string(name.substr(6)));
+  },
+   [](const at::RecordFunction& event, at::ObserverContext* context) {
+   if (!context) return;
+   if (--active_->depth_) return;
+   const auto& name = static_cast<Event*>(context)->name;
+   if (active_->outputs_.size() >= 256 || event.outputs().size() != 1 || !event.outputs().front().isTensor()) {
+    active_->finished_ = true;
+    return;
+   }
+   const auto index = active_->counts_[name]++;
+   active_->outputs_.emplace("forward-operator/" + name + "/" + std::to_string(index), event.outputs().front().toTensor().detach().clone());
+  })
+    .needsOutputs(true)
+    .scopes({at::RecordScope::FUNCTION}));
   active_ = this;
  }
  ~ForwardOperatorObservation() {
@@ -235,7 +238,8 @@ TEST_CASE("Oracle comparison collection retains numerical failures and immediate
   ++observed;
   comparison.compare("second", one, zero, ComparisonPolicy::Derivative);
   ++observed;
- }), std::runtime_error);
+ }),
+  std::runtime_error);
  CHECK(observed == 2);
  const auto records = oracle_comparison_records(root.path(), "collection");
  REQUIRE(records.size() == 3);
@@ -247,12 +251,14 @@ TEST_CASE("Oracle comparison collection retains numerical failures and immediate
   REQUIRE_THROWS_AS(comparison.compare_all([&] {
    comparison.compare("structural", invalid, zero, ComparisonPolicy::Value);
    ++observed;
-  }), std::runtime_error);
+  }),
+   std::runtime_error);
  }
  REQUIRE_THROWS_AS(comparison.compare_all([&] {
   comparison.compare("discrete", one, zero, ComparisonPolicy::Exact);
   ++observed;
- }), std::runtime_error);
+ }),
+  std::runtime_error);
  CHECK(observed == 2);
  REQUIRE_NOTHROW(comparison.compare_all([&] { comparison.compare("equal", zero, zero, ComparisonPolicy::Value); }));
  REQUIRE_NOTHROW(comparison.observe_values([&] {
@@ -315,22 +321,22 @@ TEST_CASE("Independent upstream repetitions measure the numerical noise floor", 
    rf::testsupport::OracleComparison comparison(*requested, "repeat-" + entry.id, entry.dtype(), "two independent actual upstream executions; no native model execution");
    REQUIRE(found->steps.size() == entry.steps.size());
    comparison.observe_values([&] {
-   for (std::size_t step = 0; step < entry.steps.size(); ++step) {
-    comparison.fact("step", step);
-    const auto actual = repeat.archive(*found, step), expected = oracle.archive(entry, step);
-    for (const auto& [prefix, policy] : std::array{
-     std::pair{"output/", ComparisonPolicy::Value}, std::pair{"vjp/", ComparisonPolicy::Derivative}, std::pair{"gradient/", ComparisonPolicy::Derivative},
-     std::pair{"clipped/", ComparisonPolicy::Derivative}, std::pair{"updated/", ComparisonPolicy::Value}, std::pair{"encoder/", ComparisonPolicy::Exact},
-     std::pair{"assignment/", ComparisonPolicy::Exact}, std::pair{"loss/", ComparisonPolicy::Value}, std::pair{"held/encoder/", ComparisonPolicy::Exact},
-     std::pair{"held/assignment/", ComparisonPolicy::Exact}, std::pair{"held/output/", ComparisonPolicy::Value}, std::pair{"held/loss/", ComparisonPolicy::Value}
-    }) {
-     comparison.inventory(std::string(prefix) + "inventory", actual.names(prefix), expected.names(prefix));
-     for (const auto& name : expected.names(prefix)) {
-      const auto key = std::string(prefix) + name;
-      comparison.compare(key, actual.tensor(key), expected.tensor(key), policy);
+    for (std::size_t step = 0; step < entry.steps.size(); ++step) {
+     comparison.fact("step", step);
+     const auto actual = repeat.archive(*found, step), expected = oracle.archive(entry, step);
+     for (const auto& [prefix, policy] : std::array{
+           std::pair{"output/", ComparisonPolicy::Value}, std::pair{"vjp/", ComparisonPolicy::Derivative}, std::pair{"gradient/", ComparisonPolicy::Derivative},
+           std::pair{"clipped/", ComparisonPolicy::Derivative}, std::pair{"updated/", ComparisonPolicy::Value}, std::pair{"encoder/", ComparisonPolicy::Exact},
+           std::pair{"assignment/", ComparisonPolicy::Exact}, std::pair{"loss/", ComparisonPolicy::Value}, std::pair{"held/encoder/", ComparisonPolicy::Exact},
+           std::pair{"held/assignment/", ComparisonPolicy::Exact}, std::pair{"held/output/", ComparisonPolicy::Value}, std::pair{"held/loss/", ComparisonPolicy::Value}
+          }) {
+      comparison.inventory(std::string(prefix) + "inventory", actual.names(prefix), expected.names(prefix));
+      for (const auto& name : expected.names(prefix)) {
+       const auto key = std::string(prefix) + name;
+       comparison.compare(key, actual.tensor(key), expected.tensor(key), policy);
+      }
      }
     }
-   }
    });
   }
  }

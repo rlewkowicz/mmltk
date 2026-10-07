@@ -220,10 +220,26 @@ mod tests {
             assert_eq!(selected.next().map(|metric| metric.chart), expected_chart);
             assert!(selected.next().is_none());
         }
-        assert_eq!(Chart::ALL.into_iter().filter(|chart| chart.main()).collect::<Vec<_>>(),
-            [Chart::Loss, Chart::Ap, Chart::AverageRecall, Chart::Confidence, Chart::LearningRate]);
-        assert_eq!(Chart::ALL.into_iter().filter(|chart| chart.performance()).collect::<Vec<_>>(),
-            [Chart::Throughput, Chart::Gpu]);
+        assert_eq!(
+            Chart::ALL
+                .into_iter()
+                .filter(|chart| chart.main())
+                .collect::<Vec<_>>(),
+            [
+                Chart::Loss,
+                Chart::Ap,
+                Chart::AverageRecall,
+                Chart::Confidence,
+                Chart::LearningRate
+            ]
+        );
+        assert_eq!(
+            Chart::ALL
+                .into_iter()
+                .filter(|chart| chart.performance())
+                .collect::<Vec<_>>(),
+            [Chart::Throughput, Chart::Gpu]
+        );
     }
 
     #[test]

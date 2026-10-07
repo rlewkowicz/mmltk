@@ -335,11 +335,7 @@ impl SourceHistories {
         }
         changed
     }
-    pub(super) fn ingest(
-        &mut self,
-        record: &TrainingRecord,
-        metrics: &[Metric],
-    ) -> u16 {
+    pub(super) fn ingest(&mut self, record: &TrainingRecord, metrics: &[Metric]) -> u16 {
         if self.run != record.runid {
             return 0;
         }
@@ -379,8 +375,7 @@ impl SourceHistories {
                 continue;
             }
             let omitted = history.omitted;
-            let source_changed =
-                history.ingest(record, self.segment, metrics);
+            let source_changed = history.ingest(record, self.segment, metrics);
             self.omitted = self.omitted.saturating_add(history.omitted - omitted);
             self.conditions.observe_omitted(self.omitted);
             if self.selected == Some(index) {

@@ -64,7 +64,10 @@ impl Curve {
         };
         if self.external != Some(segment)
             || self.missing
-            || self.buckets.back().is_some_and(|last| point.step < last.last.step)
+            || self
+                .buckets
+                .back()
+                .is_some_and(|last| point.step < last.last.step)
         {
             self.segment = self.segment.wrapping_add(1);
         }
@@ -301,10 +304,13 @@ impl History {
                 }
             };
             let value = value.filter(|v| v.is_finite()).map(|value| {
-                if matches!(metric.source, Source::Scalar(
-                    crate::generated::TrainingScalarsField::GpuMemoryUsedBytes
-                    | crate::generated::TrainingScalarsField::GpuMemoryTotalBytes
-                )) {
+                if matches!(
+                    metric.source,
+                    Source::Scalar(
+                        crate::generated::TrainingScalarsField::GpuMemoryUsedBytes
+                            | crate::generated::TrainingScalarsField::GpuMemoryTotalBytes
+                    )
+                ) {
                     value / (1024.0 * 1024.0 * 1024.0)
                 } else {
                     value

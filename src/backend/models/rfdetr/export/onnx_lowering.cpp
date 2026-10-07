@@ -1930,7 +1930,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
  NODE(kAtenRepeat, lower_repeat_node)                                \
  NODE(kAtenSoftmax, lower_softmax_node)                              \
  SYMBOL(kAtenSigmoid, lower_unary_node, kOnnxSigmoid)                \
- NODE(kAtenSilu, lower_silu_node)                                  \
+ NODE(kAtenSilu, lower_silu_node)                                    \
  SYMBOL(kAtenRelu, lower_unary_node, kOnnxRelu)                      \
  SYMBOL(kAtenTanh, lower_unary_node, kOnnxTanh)                      \
  NODE(kAtenDropout, lower_dropout_node)                              \

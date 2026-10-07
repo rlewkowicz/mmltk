@@ -849,7 +849,9 @@ public:
   auto hs_chunks = hs_enc.chunk(groups, 1);
   std::vector<torch::Tensor> logits;
   logits.reserve(static_cast<size_t>(groups));
-  for (int64_t index = 0; index < groups; ++index) { logits.push_back(detail::linear_forward(enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(index)), hs_chunks[static_cast<size_t>(index)])); }
+  for (int64_t index = 0; index < groups; ++index) {
+   logits.push_back(detail::linear_forward(enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(index)), hs_chunks[static_cast<size_t>(index)]));
+  }
   return torch::cat(logits, 1);
  }
  NativeTransformerOutput forward(const std::vector<torch::Tensor>& srcs, const std::vector<torch::Tensor>& masks, const std::vector<torch::Tensor>& pos_embeds, const torch::Tensor& refpoint_embed,
@@ -909,8 +911,8 @@ public:
    memory_ts.reserve(static_cast<size_t>(groups));
    boxes_ts.reserve(static_cast<size_t>(groups));
    for (int64_t group_index = 0; group_index < groups; ++group_index) {
-    auto output_memory_group =
-     enc_output_norm->at<torch::nn::LayerNormImpl>(static_cast<size_t>(group_index)).forward(detail::linear_forward(enc_output->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)), output_memory));
+    auto output_memory_group = enc_output_norm->at<torch::nn::LayerNormImpl>(static_cast<size_t>(group_index))
+                                .forward(detail::linear_forward(enc_output->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)), output_memory));
     auto enc_outputs_class = detail::linear_forward(enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)), output_memory_group);
     auto proposal_scores = std::get<0>(enc_outputs_class.max(-1));
     const int64_t topk = std::min<int64_t>(config_.num_queries, enc_outputs_class.size(1));
@@ -1219,9 +1221,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
   combined_query_features = transformed.hidden_states.unbind(0);
   const auto& states = combined_query_features;
   decoder_query_features.reserve(states.size());
-  for (const auto& state : states) {
-   decoder_query_features.push_back(state.narrow(1, 0, active_query_count));
-  }
+  for (const auto& state : states) { decoder_query_features.push_back(state.narrow(1, 0, active_query_count)); }
  }
  std::vector<torch::Tensor> dense_masks;
  std::vector<SparsePredMasks> sparse_masks;
@@ -1284,9 +1284,9 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
    if (outputs.denoising) {
     DenoisingOutputLayer dn_layer;
     dn_layer.pred_logits = all_logits.narrow(1, active_query_count, denoising->layout.denoising_queries())
-                           .view({hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, config_.num_classes});
-    dn_layer.pred_boxes = all_boxes.narrow(1, active_query_count, denoising->layout.denoising_queries())
-                          .view({hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, 4});
+                            .view({hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, config_.num_classes});
+    dn_layer.pred_boxes =
+     all_boxes.narrow(1, active_query_count, denoising->layout.denoising_queries()).view({hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, 4});
     if (include_masks && segmentation_head_) {
      const auto& masks = sparse_masks[index];
      dn_layer.sparse_pred_masks =

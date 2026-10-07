@@ -216,8 +216,8 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   invalid("incompatible controlled numerical policy");
  const auto sdpa = manifest.at("policy").value("sdpa_backend", std::string("default"));
  if (sdpa != "default" && sdpa != "math") invalid("unknown SDPA comparison policy");
- if (sdpa == "math" && (manifest.at("policy").at("flash_sdp").get<bool>() || manifest.at("policy").at("memory_efficient_sdp").get<bool>() ||
-                        manifest.at("policy").at("cudnn_sdp").get<bool>() || !manifest.at("policy").at("math_sdp").get<bool>()))
+ if (sdpa == "math" && (manifest.at("policy").at("flash_sdp").get<bool>() || manifest.at("policy").at("memory_efficient_sdp").get<bool>() || manifest.at("policy").at("cudnn_sdp").get<bool>() ||
+                        !manifest.at("policy").at("math_sdp").get<bool>()))
   invalid("math SDPA policy disagrees with producer backends");
  for (const auto* key : {"producer_sha256", "dependency_sha256", "payload_sha256", "fingerprint"})
   if (manifest.at(key).get<std::string>().size() != 64) invalid("missing provenance identity");
@@ -327,13 +327,14 @@ OracleComparison::OracleComparison(const std::filesystem::path& root, std::strin
  if (!report_) invalid("cannot write comparison evidence");
  static const auto executable_hash = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file("/proc/self/exe"));
  record(
-  {{"boundary", "policy"}, {"precision", dtype_name(precision)},
-   {"matmul_tf32", at::globalContext().allowTF32CuBLAS()}, {"cudnn_tf32", at::globalContext().allowTF32CuDNN()}, {"forward_autocast", precision != torch::kFloat32},
-   {"cudnn_benchmark", at::globalContext().benchmarkCuDNN()}, {"flash_sdp", at::globalContext().userEnabledFlashSDP()}, {"memory_efficient_sdp", at::globalContext().userEnabledMemEfficientSDP()},
-   {"math_sdp", at::globalContext().userEnabledMathSDP()}, {"native_torch", TORCH_VERSION}, {"native_executable_sha256", executable_hash}, {"attention", "native production CUDA"},
-   {"matcher", "native FP32"}, {"objective", std::move(objective)},
+  {{"boundary", "policy"}, {"precision", dtype_name(precision)}, {"matmul_tf32", at::globalContext().allowTF32CuBLAS()}, {"cudnn_tf32", at::globalContext().allowTF32CuDNN()},
+   {"forward_autocast", precision != torch::kFloat32}, {"cudnn_benchmark", at::globalContext().benchmarkCuDNN()}, {"flash_sdp", at::globalContext().userEnabledFlashSDP()},
+   {"memory_efficient_sdp", at::globalContext().userEnabledMemEfficientSDP()}, {"math_sdp", at::globalContext().userEnabledMathSDP()}, {"native_torch", TORCH_VERSION},
+   {"native_executable_sha256", executable_hash}, {"attention", "native production CUDA"}, {"matcher", "native FP32"}, {"objective", std::move(objective)},
    {"hyperparameter_tolerance_reason", "eight float64 epsilons allow upstream decay**2 versus native repeated multiplication; zero settings and group membership remain exact"},
-   {"tolerance_reason", "FP32 operation/reduction order; AMP rounding and CUDA atomic accumulation. Derivatives gate the complete vector at the declared norm bound; per-tensor bounds remain reported. Matched-state identities are exact; independent trajectories measure values and identities. Shape/dtype/definedness/finite values remain required."}});
+   {"tolerance_reason",
+    "FP32 operation/reduction order; AMP rounding and CUDA atomic accumulation. Derivatives gate the complete vector at the declared norm bound; per-tensor bounds remain reported. Matched-state "
+    "identities are exact; independent trajectories measure values and identities. Shape/dtype/definedness/finite values remain required."}});
 }
 void OracleComparison::record(Json value) {
  value["run_unix_ns"] = run_unix_ns_;
@@ -391,13 +392,13 @@ void OracleComparison::inventory(const std::string& boundary, const std::set<std
 void OracleComparison::compare(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference) {
  compare_impl(boundary, actual, expected, policy, policy_difference, {});
 }
-void OracleComparison::parameter_update(const std::string& boundary, const torch::Tensor& actual_before, const torch::Tensor& actual_after,
- const torch::Tensor& expected_before, const torch::Tensor& expected_after) {
+void OracleComparison::parameter_update(
+ const std::string& boundary, const torch::Tensor& actual_before, const torch::Tensor& actual_after, const torch::Tensor& expected_before, const torch::Tensor& expected_after) {
  const auto before = expected_before.detach().cpu(), after = expected_after.detach().cpu();
  compare_impl(boundary, actual_after.detach().cpu() - actual_before.detach().cpu(), after - before, OracleComparisonPolicy::Derivative, false, torch::maximum(before.abs(), after.abs()));
 }
-void OracleComparison::compare_impl(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference,
- const torch::Tensor& rounding_scale) {
+void OracleComparison::compare_impl(
+ const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference, const torch::Tensor& rounding_scale) {
  Json result{{"boundary", boundary}, {"policy_difference", policy_difference}, {"measurement_only", observing_}, {"actual_defined", actual.defined()}, {"expected_defined", expected.defined()}};
  bool passed = actual.defined() == expected.defined();
  bool structurally_valid = passed;
@@ -445,7 +446,8 @@ void OracleComparison::compare_impl(const std::string& boundary, const torch::Te
       result["unadjusted_normalized_error"] = std::max(maximum / (absolute + relative * bv.abs().max().item<double>()), norm / (absolute + relative * bv.norm().item<double>()));
       bounded_error = (bounded_error - quantum.to(torch::kFloat64).masked_select(finite)).clamp_min(0);
      }
-     const double normalized = derivative ? std::max(bounded_error.max().item<double>() / (absolute + relative * bv.abs().max().item<double>()), bounded_error.norm().item<double>() / (absolute + relative * bv.norm().item<double>()))
+     const double normalized = derivative ? std::max(bounded_error.max().item<double>() / (absolute + relative * bv.abs().max().item<double>()),
+                                             bounded_error.norm().item<double>() / (absolute + relative * bv.norm().item<double>()))
                                           : (difference.abs() / (absolute + relative * bv.abs()).clamp_min(std::numeric_limits<double>::min())).max().item<double>();
      result["max_absolute"] = maximum;
      result["l2_error"] = norm;

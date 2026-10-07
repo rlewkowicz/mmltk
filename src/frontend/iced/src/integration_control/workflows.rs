@@ -1073,7 +1073,9 @@ mod tests {
         model.workflow.training.as_mut().unwrap().sources.execution =
             Some(opened.run.unwrap().execution);
         let mut fixture = super::TrainingFixture::new(&model).unwrap();
-        fixture.metrics.update(crate::view::metrics::Message::Selector);
+        fixture
+            .metrics
+            .update(crate::view::metrics::Message::Selector);
         let run = fixture.saved_run.run.as_ref().unwrap();
         let request = &run.configuration;
         use crate::generated::{
@@ -2260,11 +2262,16 @@ impl State {
                 return;
             }
             Step::ChartScrolled(index, expanded) => {
-                if if expanded { (bounds.y - self.wheel_y).abs() > 0.1 }
-                    else { bounds.y >= self.wheel_y - 0.1 }
-                {
-                    driver.fail(if expanded { "Expanded chart wheel scrolled the enclosing page" }
-                        else { "Grid chart wheel did not scroll the enclosing page" });
+                if if expanded {
+                    (bounds.y - self.wheel_y).abs() > 0.1
+                } else {
+                    bounds.y >= self.wheel_y - 0.1
+                } {
+                    driver.fail(if expanded {
+                        "Expanded chart wheel scrolled the enclosing page"
+                    } else {
+                        "Grid chart wheel did not scroll the enclosing page"
+                    });
                     return;
                 }
                 completed(
@@ -2316,11 +2323,18 @@ impl State {
                         &format!("chart_tile_{index}"),
                         [index as f64, bounds.width as f64, bounds.height as f64, 0.0],
                     );
-                    driver.phase = Phase::Workflows(if (index as usize + 1) < crate::view::metrics::Chart::ALL.into_iter().filter(|chart| chart.main()).count() {
-                        Step::ChartTile(index + 1)
-                    } else {
-                        Step::ChartLegend
-                    });
+                    driver.phase = Phase::Workflows(
+                        if (index as usize + 1)
+                            < crate::view::metrics::Chart::ALL
+                                .into_iter()
+                                .filter(|chart| chart.main())
+                                .count()
+                        {
+                            Step::ChartTile(index + 1)
+                        } else {
+                            Step::ChartLegend
+                        },
+                    );
                 }
                 return;
             }
@@ -2473,11 +2487,27 @@ impl State {
             Step::ChartReturn => Step::ChartSettle(Retention::Navigation),
             Step::ChartAspect(index) => Step::ChartAspectReady(index),
             Step::PerformanceSelector => Step::PerformanceToggle(0),
-            Step::PerformanceToggle(index) if (index as usize + 1) < crate::view::metrics::Chart::ALL.into_iter().filter(|chart| chart.performance()).count() => Step::PerformanceToggle(index + 1),
+            Step::PerformanceToggle(index)
+                if (index as usize + 1)
+                    < crate::view::metrics::Chart::ALL
+                        .into_iter()
+                        .filter(|chart| chart.performance())
+                        .count() =>
+            {
+                Step::PerformanceToggle(index + 1)
+            }
             Step::PerformanceToggle(_) => Step::PerformanceClose,
             Step::PerformanceClose => Step::PerformanceExpand(0),
             Step::PerformanceExpand(index) => Step::Pixels(Picture::Performance, index),
-            Step::PerformanceBack(index) if (index as usize + 1) < crate::view::metrics::Chart::ALL.into_iter().filter(|chart| chart.performance()).count() => Step::PerformanceExpand(index + 1),
+            Step::PerformanceBack(index)
+                if (index as usize + 1)
+                    < crate::view::metrics::Chart::ALL
+                        .into_iter()
+                        .filter(|chart| chart.performance())
+                        .count() =>
+            {
+                Step::PerformanceExpand(index + 1)
+            }
             Step::PerformanceBack(_) => Step::PerformanceResetSelector,
             Step::PerformanceResetSelector => Step::PerformanceReset,
             Step::PerformanceReset => Step::PerformanceResetClose,
@@ -3034,8 +3064,11 @@ impl State {
                     Step::ChartScrolled(_, expanded) => {
                         if expanded {
                             let previous = self.chart_view.as_ref().unwrap();
-                            if previous.ranges == view.ranges || previous.legend_collapsed != view.legend_collapsed {
-                                driver.fail("Expanded chart wheel did not zoom its retained camera");
+                            if previous.ranges == view.ranges
+                                || previous.legend_collapsed != view.legend_collapsed
+                            {
+                                driver
+                                    .fail("Expanded chart wheel did not zoom its retained camera");
                                 return Task::none();
                             }
                             reporting::chart_view("wheel_zoom", &view);
@@ -3102,8 +3135,11 @@ impl State {
                 self.workflow_control(widgets, driver, "train.metrics.plot")
             }
             Step::ChartTile(index) => {
-                let chart = crate::view::metrics::Chart::ALL.into_iter()
-                    .filter(|chart| chart.main()).nth(index as usize).unwrap();
+                let chart = crate::view::metrics::Chart::ALL
+                    .into_iter()
+                    .filter(|chart| chart.main())
+                    .nth(index as usize)
+                    .unwrap();
                 self.workflow_control(widgets, driver, format!("train.metrics.chart.{chart:?}"))
             }
             Step::ExpandChart => {

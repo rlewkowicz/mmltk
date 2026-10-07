@@ -178,102 +178,105 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
  for (const auto& entry : oracle.cases()) {
   if (!entry.training) continue;
   for (const bool matched_state : {true, false}) {
-  DYNAMIC_SECTION(entry.id << (matched_state ? " matched state" : " independent trajectory")) {
-   CAPTURE(entry.id);
-   auto model = oracle.model(entry);
-   const auto config = support::oracle_detection(model.config());
-   rf::TrainRequest request;
-   static_cast<rf::TrainRecipeValues&>(request.recipe) = entry.recipe;
-   request.fused_optimizer = false;
-   auto built = rf::build_optimizer(model.named_parameters(true), request);
-   const rf::TrainingStep step(1, 1., entry.dtype() != torch::kFloat32, entry.dtype());
-   support::OracleComparison comparison(*requested, (matched_state ? "training-" : "trajectory-") + entry.id, entry.dtype());
-   comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
-   std::set<std::string> actual_weights, expected_weights;
-   for (const auto& [name, weight] : entry.loss_weights) expected_weights.insert(name);
-   for (const auto& [name, weight] : config.weight_dict) {
-    actual_weights.insert(name);
-    comparison.compare("parameter-group/loss-weight/" + name, torch::tensor(weight, torch::kFloat64), torch::tensor(entry.loss_weights.at(name), torch::kFloat64), ComparisonPolicy::Hyperparameter);
-   }
-   comparison.inventory("loss weight inventory", actual_weights, expected_weights);
-   rf::TensorMap expected_before;
-   for (const auto& parameter : model.named_parameters(true))
-    if (parameter.value().requires_grad()) expected_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
-   comparison.fact("trajectory", {{"updates", entry.steps.size()}, {"optimizer_backend", built.optimizer.backend_name()},
-    {"matched_state", matched_state}, {"interpretation", matched_state ? "model/criterion at upstream weights; optimizer consumes identical upstream clipped gradients" : "independent updates; measured differences, no trajectory-equality or dataset AP claim"}});
-   const auto run_updates = [&] {
-   for (std::size_t update = 0; update < entry.steps.size(); ++update) {
-    CAPTURE(update);
-    comparison.fact("step", update);
-    const auto archive = oracle.archive(entry, update);
-    if (matched_state && update) {
-     torch::NoGradGuard no_grad;
-     for (const auto& parameter : model.named_parameters(true))
-      if (parameter.value().requires_grad()) parameter.value().copy_(expected_before.at(parameter.key()));
+   DYNAMIC_SECTION(entry.id << (matched_state ? " matched state" : " independent trajectory")) {
+    CAPTURE(entry.id);
+    auto model = oracle.model(entry);
+    const auto config = support::oracle_detection(model.config());
+    rf::TrainRequest request;
+    static_cast<rf::TrainRecipeValues&>(request.recipe) = entry.recipe;
+    request.fused_optimizer = false;
+    auto built = rf::build_optimizer(model.named_parameters(true), request);
+    const rf::TrainingStep step(1, 1., entry.dtype() != torch::kFloat32, entry.dtype());
+    support::OracleComparison comparison(*requested, (matched_state ? "training-" : "trajectory-") + entry.id, entry.dtype());
+    comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
+    std::set<std::string> actual_weights, expected_weights;
+    for (const auto& [name, weight] : entry.loss_weights) expected_weights.insert(name);
+    for (const auto& [name, weight] : config.weight_dict) {
+     actual_weights.insert(name);
+     comparison.compare("parameter-group/loss-weight/" + name, torch::tensor(weight, torch::kFloat64), torch::tensor(entry.loss_weights.at(name), torch::kFloat64), ComparisonPolicy::Hyperparameter);
     }
-    const auto targets = support::oracle_targets(archive, entry, torch::kCUDA);
-    built.optimizer.zero_grad(true);
-    auto input = archive.tensor("input", torch::kCUDA).clone().set_requires_grad(true);
-    const auto mask = archive.tensor("input_mask", torch::kCUDA);
-    std::vector<torch::Tensor> encoder;
-    rf::ModelOutputs outputs;
-    torch::Tensor total;
-    step.forward([&] {
-     comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
-     outputs = model.forward_observed({input, mask}, model.config().segmentation, encoder);
-     support::compare_oracle_outputs(comparison, archive, outputs, encoder);
-     total = compare_loss(comparison, archive, outputs, targets, config, true, "");
-    });
-    step.backward(total);
-    compare_gradients(comparison, archive, model, "gradient/", true);
-    std::vector<torch::Tensor> norms;
-    for (const auto& parameter : built.optimizer.parameters())
-     if (parameter.grad().defined()) norms.push_back(parameter.grad().norm());
-    comparison.compare("clip_norm", torch::stack(norms).norm(), archive.tensor("clip_norm"), ComparisonPolicy::Value);
-    if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/clip_norm", torch::stack(norms).norm(), archive.tensor("stock/clip_norm"), ComparisonPolicy::Value, true);
-    built.optimizer.clip_grad_norm_(entry.clip_max_norm);
-    compare_gradients(comparison, archive, model, "clipped/", entry.dtype() != torch::kFloat32);
-    rf::TensorMap actual_before;
+    comparison.inventory("loss weight inventory", actual_weights, expected_weights);
+    rf::TensorMap expected_before;
     for (const auto& parameter : model.named_parameters(true))
-     if (parameter.value().requires_grad()) actual_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
-    if (matched_state) {
-     // Isolate AdamW from floating backward noise. The production optimizer
-     // still owns every update, age and moment over the complete sequence.
-     for (const auto& parameter : model.named_parameters(true)) {
-      if (!parameter.value().requires_grad()) continue;
-      parameter.value().mutable_grad() = archive.tensor("clipped/" + parameter.key(), parameter.value().device());
+     if (parameter.value().requires_grad()) expected_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
+    comparison.fact("trajectory", {{"updates", entry.steps.size()}, {"optimizer_backend", built.optimizer.backend_name()}, {"matched_state", matched_state},
+                                   {"interpretation", matched_state ? "model/criterion at upstream weights; optimizer consumes identical upstream clipped gradients"
+                                                                    : "independent updates; measured differences, no trajectory-equality or dataset AP claim"}});
+    const auto run_updates = [&] {
+     for (std::size_t update = 0; update < entry.steps.size(); ++update) {
+      CAPTURE(update);
+      comparison.fact("step", update);
+      const auto archive = oracle.archive(entry, update);
+      if (matched_state && update) {
+       torch::NoGradGuard no_grad;
+       for (const auto& parameter : model.named_parameters(true))
+        if (parameter.value().requires_grad()) parameter.value().copy_(expected_before.at(parameter.key()));
+      }
+      const auto targets = support::oracle_targets(archive, entry, torch::kCUDA);
+      built.optimizer.zero_grad(true);
+      auto input = archive.tensor("input", torch::kCUDA).clone().set_requires_grad(true);
+      const auto mask = archive.tensor("input_mask", torch::kCUDA);
+      std::vector<torch::Tensor> encoder;
+      rf::ModelOutputs outputs;
+      torch::Tensor total;
+      step.forward([&] {
+       comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
+       outputs = model.forward_observed({input, mask}, model.config().segmentation, encoder);
+       support::compare_oracle_outputs(comparison, archive, outputs, encoder);
+       total = compare_loss(comparison, archive, outputs, targets, config, true, "");
+      });
+      step.backward(total);
+      compare_gradients(comparison, archive, model, "gradient/", true);
+      std::vector<torch::Tensor> norms;
+      for (const auto& parameter : built.optimizer.parameters())
+       if (parameter.grad().defined()) norms.push_back(parameter.grad().norm());
+      comparison.compare("clip_norm", torch::stack(norms).norm(), archive.tensor("clip_norm"), ComparisonPolicy::Value);
+      if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/clip_norm", torch::stack(norms).norm(), archive.tensor("stock/clip_norm"), ComparisonPolicy::Value, true);
+      built.optimizer.clip_grad_norm_(entry.clip_max_norm);
+      compare_gradients(comparison, archive, model, "clipped/", entry.dtype() != torch::kFloat32);
+      rf::TensorMap actual_before;
+      for (const auto& parameter : model.named_parameters(true))
+       if (parameter.value().requires_grad()) actual_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
+      if (matched_state) {
+       // Isolate AdamW from floating backward noise. The production optimizer
+       // still owns every update, age and moment over the complete sequence.
+       for (const auto& parameter : model.named_parameters(true)) {
+        if (!parameter.value().requires_grad()) continue;
+        parameter.value().mutable_grad() = archive.tensor("clipped/" + parameter.key(), parameter.value().device());
+       }
+      }
+      built.optimizer.step();
+      for (const auto& parameter : model.named_parameters(true))
+       if (parameter.value().requires_grad()) {
+        const auto key = "updated/" + parameter.key();
+        comparison.compare(key, parameter.value(), archive.tensor(key), ComparisonPolicy::Value);
+        comparison.parameter_update("update/" + parameter.key(), actual_before.at(parameter.key()), parameter.value(), expected_before.at(parameter.key()), archive.tensor(key));
+        expected_before[parameter.key()] = archive.tensor(key);
+        if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/" + key, parameter.value(), archive.tensor("stock/" + key), ComparisonPolicy::Value, true);
+       }
+      compare_optimizer(comparison, archive, built.optimizer, entry, true);
+      if (matched_state) {
+       torch::NoGradGuard no_grad;
+       for (const auto& parameter : model.named_parameters(true))
+        if (parameter.value().requires_grad()) parameter.value().copy_(expected_before.at(parameter.key()));
+      }
+      model.eval();
+      {
+       torch::NoGradGuard no_grad;
+       step.forward([&] {
+        auto held = model.forward_observed({archive.tensor("held/input", torch::kCUDA), mask}, model.config().segmentation, encoder);
+        support::compare_oracle_outputs(comparison, archive, held, encoder, "held/");
+        (void)compare_loss(comparison, archive, held, targets, config, false, "held/");
+       });
+      }
+      model.train();
      }
-    }
-    built.optimizer.step();
-    for (const auto& parameter : model.named_parameters(true))
-     if (parameter.value().requires_grad()) {
-      const auto key = "updated/" + parameter.key();
-      comparison.compare(key, parameter.value(), archive.tensor(key), ComparisonPolicy::Value);
-      comparison.parameter_update("update/" + parameter.key(), actual_before.at(parameter.key()), parameter.value(), expected_before.at(parameter.key()), archive.tensor(key));
-      expected_before[parameter.key()] = archive.tensor(key);
-      if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/" + key, parameter.value(), archive.tensor("stock/" + key), ComparisonPolicy::Value, true);
-     }
-    compare_optimizer(comparison, archive, built.optimizer, entry, true);
-    if (matched_state) {
-     torch::NoGradGuard no_grad;
-     for (const auto& parameter : model.named_parameters(true))
-      if (parameter.value().requires_grad()) parameter.value().copy_(expected_before.at(parameter.key()));
-    }
-    model.eval();
-    {
-     torch::NoGradGuard no_grad;
-     step.forward([&] {
-      auto held = model.forward_observed({archive.tensor("held/input", torch::kCUDA), mask}, model.config().segmentation, encoder);
-      support::compare_oracle_outputs(comparison, archive, held, encoder, "held/");
-      (void)compare_loss(comparison, archive, held, targets, config, false, "held/");
-     });
-    }
-    model.train();
+    };
+    if (matched_state)
+     comparison.compare_all(run_updates);
+    else
+     comparison.observe_values(run_updates);
    }
-   };
-   if (matched_state) comparison.compare_all(run_updates);
-   else comparison.observe_values(run_updates);
-  }
   }
  }
 }

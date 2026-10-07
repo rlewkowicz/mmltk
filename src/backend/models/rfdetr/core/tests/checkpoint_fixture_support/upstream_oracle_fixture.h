@@ -101,12 +101,10 @@ public:
  void derivatives(const std::string& boundary, const TensorMap& actual, const TensorMap& expected);
  // Delta precision is limited by the stored parameter, not the much smaller
  // update. Admit one representable parameter interval, reporting it explicitly.
- void parameter_update(const std::string& boundary, const torch::Tensor& actual_before, const torch::Tensor& actual_after,
-  const torch::Tensor& expected_before, const torch::Tensor& expected_after);
+ void parameter_update(const std::string& boundary, const torch::Tensor& actual_before, const torch::Tensor& actual_after, const torch::Tensor& expected_before, const torch::Tensor& expected_after);
 
 private:
- void compare_impl(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference,
-  const torch::Tensor& rounding_scale);
+ void compare_impl(const std::string& boundary, const torch::Tensor& actual, const torch::Tensor& expected, OracleComparisonPolicy policy, bool policy_difference, const torch::Tensor& rounding_scale);
  void record(nlohmann::json value);
  std::ofstream report_;
  at::ScalarType precision_;

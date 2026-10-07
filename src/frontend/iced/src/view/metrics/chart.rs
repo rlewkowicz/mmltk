@@ -113,7 +113,11 @@ impl RetainedChart {
                     previous_order = Some(point.order);
                     if anchor.is_none_or(|step| point.step.abs_diff(step) >= step_frequency) {
                         self.positions.push([
-                            if epoch { point.epoch } else { point.step as f64 },
+                            if epoch {
+                                point.epoch
+                            } else {
+                                point.step as f64
+                            },
                             point.value,
                         ]);
                         anchor = Some(point.step);

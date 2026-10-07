@@ -16,9 +16,8 @@ namespace at::native {
 // convolution_backward dispatcher reads process-global cuDNN state; selecting
 // this exact backend locally preserves upstream's kernel without changing a
 // concurrent lane. Keep this declaration local to the operation's owner.
-std::tuple<Tensor, Tensor> conv_depthwise2d_backward_cuda(
- const Tensor&, const Tensor&, const Tensor&, IntArrayRef, IntArrayRef, IntArrayRef, IntArrayRef, std::array<bool, 2>);
-}
+std::tuple<Tensor, Tensor> conv_depthwise2d_backward_cuda(const Tensor&, const Tensor&, const Tensor&, IntArrayRef, IntArrayRef, IntArrayRef, IntArrayRef, std::array<bool, 2>);
+}  // namespace at::native
 namespace mmltk::backend::models::rfdetr {
 namespace {
 using DepthwiseOp = torch::Tensor(const torch::Tensor&, const torch::Tensor&, const std::optional<torch::Tensor>&, std::optional<at::ScalarType>);
@@ -35,11 +34,10 @@ torch::Tensor depthwise_forward(const torch::Tensor& input, const torch::Tensor&
  const auto b = autocast_dtype ? at::autocast::cached_cast(*autocast_dtype, bias, device) : bias;
  c10::impl::ExcludeDispatchKeyGuard precision(at::autocast::get_autocast_dispatch_key_from_device_type(device));
  const auto& context = at::globalContext();
- return at::_convolution(x, w, b, {1, 1}, {1, 1}, {1, 1}, false, {0, 0}, input.size(1), context.benchmarkCuDNN(),
-  context.deterministicCuDNN() || context.deterministicAlgorithms(), false, context.allowTF32CuDNN());
+ return at::_convolution(
+  x, w, b, {1, 1}, {1, 1}, {1, 1}, false, {0, 0}, input.size(1), context.benchmarkCuDNN(), context.deterministicCuDNN() || context.deterministicAlgorithms(), false, context.allowTF32CuDNN());
 }
-std::tuple<torch::Tensor, torch::Tensor> depthwise_cuda_derivatives(
- const torch::Tensor& incoming, const torch::Tensor& input, const torch::Tensor& weight, bool input_grad, bool weight_grad) {
+std::tuple<torch::Tensor, torch::Tensor> depthwise_cuda_derivatives(const torch::Tensor& incoming, const torch::Tensor& input, const torch::Tensor& weight, bool input_grad, bool weight_grad) {
  c10::cuda::CUDAGuard guard(input.device());
  return at::native::conv_depthwise2d_backward_cuda(incoming, input, weight, weight.sizes().slice(2), {1, 1}, {1, 1}, {1, 1}, {input_grad, weight_grad});
 }
@@ -49,8 +47,8 @@ std::tuple<torch::Tensor, torch::Tensor> depthwise_cuda_derivatives(
 // calls the identical CUDA kernel directly without allocating this tape.
 class DepthwiseBackward final : public torch::autograd::Function<DepthwiseBackward> {
 public:
- static torch::autograd::variable_list forward(torch::autograd::AutogradContext* ctx, const torch::Tensor& incoming, const torch::Tensor& input,
-  const torch::Tensor& weight, bool input_grad, bool weight_grad) {
+ static torch::autograd::variable_list forward(
+  torch::autograd::AutogradContext* ctx, const torch::Tensor& incoming, const torch::Tensor& input, const torch::Tensor& weight, bool input_grad, bool weight_grad) {
   ctx->save_for_backward({incoming, input, weight});
   ctx->set_materialize_grads(false);
   ctx->saved_data["input_grad"] = input_grad;
@@ -69,8 +67,8 @@ public:
   const bool input_grad = ctx->saved_data["input_grad"].toBool();
   const auto gg_input = input_grad ? gradients[0] : torch::Tensor{};
   const auto gg_weight = ctx->saved_data["weight_grad"].toBool() ? gradients[input_grad ? 1 : 0] : torch::Tensor{};
-  auto [dg, dx, dw] = at::_convolution_double_backward(gg_input, gg_weight, std::nullopt, saved[0], saved[2], saved[1],
-   {1, 1}, {1, 1}, {1, 1}, false, {0, 0}, saved[1].size(1), {ctx->needs_input_grad(0), ctx->needs_input_grad(1), ctx->needs_input_grad(2)});
+  auto [dg, dx, dw] = at::_convolution_double_backward(gg_input, gg_weight, std::nullopt, saved[0], saved[2], saved[1], {1, 1}, {1, 1}, {1, 1}, false, {0, 0}, saved[1].size(1),
+   {ctx->needs_input_grad(0), ctx->needs_input_grad(1), ctx->needs_input_grad(2)});
   return {dg, dx, dw, {}, {}};
  }
 };
@@ -79,8 +77,8 @@ public:
 // change process-global cuDNN state.
 class SegmentationDepthwise final : public torch::autograd::Function<SegmentationDepthwise> {
 public:
- static torch::Tensor forward(torch::autograd::AutogradContext* ctx, const torch::Tensor& input, const torch::Tensor& weight, const std::optional<torch::Tensor>& bias,
-  std::optional<at::ScalarType> autocast_dtype) {
+ static torch::Tensor forward(
+  torch::autograd::AutogradContext* ctx, const torch::Tensor& input, const torch::Tensor& weight, const std::optional<torch::Tensor>& bias, std::optional<at::ScalarType> autocast_dtype) {
   ctx->save_for_backward({input, weight});
   ctx->saved_data["has_bias"] = bias.has_value();
   at::AutoDispatchBelowADInplaceOrView below_autograd;
@@ -108,8 +106,7 @@ public:
      std::tie(dx, dw) = depthwise_cuda_derivatives(incoming, original_input, weight, input_grad, weight_grad);
     }
    } else {
-    const auto derivatives =
-     at::convolution_backward(incoming, original_input, weight, std::nullopt, {1, 1}, {1, 1}, {1, 1}, false, {0, 0}, input.size(1), {input_grad, weight_grad, false});
+    const auto derivatives = at::convolution_backward(incoming, original_input, weight, std::nullopt, {1, 1}, {1, 1}, {1, 1}, false, {0, 0}, input.size(1), {input_grad, weight_grad, false});
     dx = std::get<0>(derivatives);
     dw = std::get<1>(derivatives);
    }

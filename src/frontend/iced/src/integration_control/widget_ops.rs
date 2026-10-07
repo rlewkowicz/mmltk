@@ -449,12 +449,21 @@ pub(super) fn chart_wheel(bounds: Rectangle, index: u8, scale: f32, expanded: bo
     #[cfg(target_arch = "wasm32")]
     {
         let x = bounds.x
-            + if expanded { bounds.width * 0.6 } else { match index % 3 {
-                0 => bounds.width * 0.7,
-                1 => 10.0 * scale,
-                _ => 100.0 * scale,
-            }};
-        let y = bounds.y + if expanded { bounds.height * 0.6 } else { 42.0 * scale };
+            + if expanded {
+                bounds.width * 0.6
+            } else {
+                match index % 3 {
+                    0 => bounds.width * 0.7,
+                    1 => 10.0 * scale,
+                    _ => 100.0 * scale,
+                }
+            };
+        let y = bounds.y
+            + if expanded {
+                bounds.height * 0.6
+            } else {
+                42.0 * scale
+            };
         let pixels = index < 3;
         wheel_js(
             x as f64,
