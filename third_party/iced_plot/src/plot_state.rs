@@ -46,6 +46,11 @@ pub struct PlotState {
     pub(crate) hlines: Arc<[HLine]>,       // horizontal reference lines
     pub(crate) data_min: Option<DVec2>,
     pub(crate) data_max: Option<DVec2>,
+    // Autoscale policy is separate from complete data bounds and drawing geometry.
+    pub(crate) ignore_y_outliers: bool,
+    y_autoscale_bounds: Option<(f64, f64)>,
+    y_bounds_source: Option<(u64, u64, AxisScale, AxisScale, bool)>,
+    y_bounds_scratch: Vec<f64>,
     // Axis limits
     pub(crate) x_lim: Option<(f64, f64)>,
     pub(crate) y_lim: Option<(f64, f64)>,
@@ -117,6 +122,10 @@ impl Default for PlotState {
             hlines: Arc::new([]),
             data_min: None,
             data_max: None,
+            ignore_y_outliers: false,
+            y_autoscale_bounds: None,
+            y_bounds_source: None,
+            y_bounds_scratch: Vec::new(),
             x_lim: None,
             y_lim: None,
             x_axis_scale: AxisScale::Linear,
@@ -367,6 +376,7 @@ impl PlotState {
         self.fills = fills.into();
         self.data_min = data_min;
         self.data_max = data_max;
+        self.sync_y_autoscale(widget);
         self.last_point_y = rightmost_y;
         self.legend_collapsed = widget.legend_collapsed;
         self.x_lim = widget.x_lim;
@@ -391,6 +401,77 @@ impl PlotState {
         self.fills_version = self.fills_version.wrapping_add(1);
     }
 
+    /// Cache the visible world-Y order statistics independently of camera movement.
+    pub(crate) fn sync_y_autoscale(&mut self, widget: &PlotWidget) {
+        let source = (
+            widget.instance_id,
+            widget.data_version,
+            widget.x_axis_scale,
+            widget.y_axis_scale,
+            widget.ignore_y_outliers,
+        );
+        if self.y_bounds_source == Some(source) {
+            return;
+        }
+        self.y_bounds_source = Some(source);
+        self.ignore_y_outliers = widget.ignore_y_outliers;
+        self.y_autoscale_bounds = None;
+        self.y_bounds_scratch.clear();
+        if !self.ignore_y_outliers {
+            return;
+        }
+        for (id, series) in &widget.series {
+            if widget.hidden_shapes.contains(id)
+                || series.transform.y.as_ref().is_some_and(|transform| transform.uses_axes_coordinates())
+            {
+                continue;
+            }
+            self.y_bounds_scratch.extend(series.positions.iter().filter_map(|position| {
+                // Match whole-point projection admission. Axes-coordinate X
+                // needs only a finite domain here, independent of the camera.
+                data_point_to_plot_with_transform(
+                    *position,
+                    widget.x_axis_scale,
+                    widget.y_axis_scale,
+                    &series.transform,
+                    Some(([0.0, 1.0], [0.0, 1.0])),
+                )
+                .map(|point| point[1])
+            }));
+        }
+        let count = self.y_bounds_scratch.len();
+        if count == 0 {
+            return;
+        }
+        // TensorBoard line_chart_v2 uses these exact (non-interpolated) ranks.
+        // Selecting two ranks keeps work linear and retains the scratch allocation.
+        let (low, high) = if count > 2 {
+            (
+                ((count - 1) as f64 * 0.05).ceil() as usize,
+                ((count - 1) as f64 * 0.95).floor() as usize,
+            )
+        } else {
+            (0, count - 1)
+        };
+        let (_, minimum, upper) = self.y_bounds_scratch.select_nth_unstable_by(low, f64::total_cmp);
+        let minimum = *minimum;
+        let maximum = if low == high {
+            minimum
+        } else {
+            *upper.select_nth_unstable_by(high - low - 1, f64::total_cmp).1
+        };
+        self.y_autoscale_bounds = Some((minimum, maximum));
+        // PlotState is shallow-cloned for drawing. Keep scratch empty between
+        // updates so those snapshots neither allocate nor copy these values.
+        self.y_bounds_scratch.clear();
+    }
+
+    fn automatic_y_bounds(&self) -> Option<(f64, f64)> {
+        self.y_autoscale_bounds.or_else(|| {
+            self.data_min.zip(self.data_max).map(|(min, max)| (min.y, max.y))
+        })
+    }
+
     pub(crate) fn autoscale(&mut self, update_axis_links: bool) {
         // Use user-specified limits if available, otherwise use data bounds
         let mut min_v = DVec2::new(-1.0, -1.0);
@@ -399,6 +480,11 @@ impl PlotState {
         if let (Some(data_min), Some(data_max)) = (self.data_min, self.data_max) {
             min_v = data_min;
             max_v = data_max;
+        }
+
+        if let Some((minimum, maximum)) = self.automatic_y_bounds() {
+            min_v.y = minimum;
+            max_v.y = maximum;
         }
 
         if let Some((y_min, y_max)) = self.y_lim
@@ -430,18 +516,18 @@ impl PlotState {
     /// Only scales the Y-axis according to data bounds; does not touch the X camera.
     /// In follow mode: x is controlled by follow_x, y adapts to data.
     pub(crate) fn autoscale_y_only(&mut self) {
-        let (Some(data_min), Some(data_max)) = (self.data_min, self.data_max) else {
+        let Some((data_min, data_max)) = self.automatic_y_bounds() else {
             return;
         };
         let y_min = if let Some((y_min, _)) = self.y_lim {
-            self.y_axis_scale.data_to_plot(y_min).unwrap_or(data_min.y)
+            self.y_axis_scale.data_to_plot(y_min).unwrap_or(data_min)
         } else {
-            data_min.y
+            data_min
         };
         let y_max = if let Some((_, y_max)) = self.y_lim {
-            self.y_axis_scale.data_to_plot(y_max).unwrap_or(data_max.y)
+            self.y_axis_scale.data_to_plot(y_max).unwrap_or(data_max)
         } else {
-            data_max.y
+            data_max
         };
         let range = (y_max - y_min).max(1e-6);
         let padding = range * 0.05;

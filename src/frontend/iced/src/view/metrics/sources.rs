@@ -256,7 +256,7 @@ impl SourceHistories {
         {
             changed = u16::MAX;
         }
-        changed |= self.ingest(record, true, metrics);
+        changed |= self.ingest(record, metrics);
         for observation in &training.sources.observations {
             changed |= self.ingest_observation(observation, metrics);
         }
@@ -329,7 +329,7 @@ impl SourceHistories {
             && self.page.is_none_or(|cursor| page.nextcursor > cursor)
         {
             for record in &page.records {
-                changed |= self.ingest(record, false, metrics);
+                changed |= self.ingest(record, metrics);
             }
             self.page = Some(page.nextcursor);
         }
@@ -338,7 +338,6 @@ impl SourceHistories {
     pub(super) fn ingest(
         &mut self,
         record: &TrainingRecord,
-        live: bool,
         metrics: &[Metric],
     ) -> u16 {
         if self.run != record.runid {
@@ -381,7 +380,7 @@ impl SourceHistories {
             }
             let omitted = history.omitted;
             let source_changed =
-                history.ingest(record, live, self.segment, attempt_changed, metrics);
+                history.ingest(record, self.segment, metrics);
             self.omitted = self.omitted.saturating_add(history.omitted - omitted);
             self.conditions.observe_omitted(self.omitted);
             if self.selected == Some(index) {

@@ -33,6 +33,7 @@ pub struct PlotWidgetBuilder {
     x_label: Option<String>,
     y_label: Option<String>,
     autoscale_on_updates: Option<bool>,
+    ignore_y_outliers: bool,
     hover_radius_px: Option<f32>,
     highlight_on_hover: Option<bool>,
     pick_highlight_provider: Option<HighlightPointProvider>,
@@ -93,6 +94,12 @@ impl PlotWidgetBuilder {
     /// Enable or disable autoscaling of the plot when new data is added.
     pub fn with_autoscale_on_updates(mut self, enabled: bool) -> Self {
         self.autoscale_on_updates = Some(enabled);
+        self
+    }
+
+    /// Trim automatic Y bounds to visible world-Y 5th/95th percentile ranks.
+    pub fn with_ignore_y_outliers(mut self, enabled: bool) -> Self {
+        self.ignore_y_outliers = enabled;
         self
     }
 
@@ -390,6 +397,7 @@ impl PlotWidgetBuilder {
         }
 
         let mut w = PlotWidget::new();
+        w.set_ignore_y_outliers(self.ignore_y_outliers);
         w.set_x_axis_scale(x_axis_scale);
         w.set_y_axis_scale(y_axis_scale);
         if let Some(controls) = self.controls {

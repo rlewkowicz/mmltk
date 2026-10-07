@@ -6,71 +6,51 @@ use crate::generated::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chart {
     Loss,
-    Ap50,
     Ap,
     AverageRecall,
     Confidence,
     LearningRate,
-    Components,
-    Ap75,
     Errors,
-    Mask,
     Area,
     Throughput,
-    GpuUtilization,
-    GpuMemory,
-    GpuTemperature,
+    Gpu,
 }
 impl Chart {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 9] = [
         Self::Loss,
-        Self::Ap50,
         Self::Ap,
         Self::AverageRecall,
         Self::Confidence,
         Self::LearningRate,
-        Self::Components,
-        Self::Ap75,
         Self::Errors,
-        Self::Mask,
         Self::Area,
         Self::Throughput,
-        Self::GpuUtilization,
-        Self::GpuMemory,
-        Self::GpuTemperature,
+        Self::Gpu,
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Self::Loss => "Training loss",
-            Self::Ap50 => "AP50",
-            Self::Ap => "AP50:95",
+            Self::Loss => "Loss",
+            Self::Ap => "AP",
             Self::AverageRecall => "Average recall",
             Self::Confidence => "Precision / recall / F1",
             Self::LearningRate => "Learning rates",
-            Self::Components => "Loss components",
-            Self::Ap75 => "AP75",
             Self::Errors => "Class / cardinality errors",
-            Self::Mask => "Mask metrics",
             Self::Area => "Area breakdowns",
             Self::Throughput => "Images / second",
-            Self::GpuUtilization => "GPU utilization",
-            Self::GpuMemory => "GPU memory",
-            Self::GpuTemperature => "GPU temperature",
+            Self::Gpu => "GPU",
         }
     }
     pub fn loss(self) -> bool {
-        matches!(self, Self::Loss | Self::Components)
+        self == Self::Loss
     }
     pub fn main(self) -> bool {
-        Self::ALL[..6].contains(&self)
+        Self::ALL[..5].contains(&self)
     }
     pub fn performance(self) -> bool {
-        matches!(
-            self,
-            Self::Throughput | Self::GpuUtilization | Self::GpuMemory | Self::GpuTemperature
-        )
+        matches!(self, Self::Throughput | Self::Gpu)
     }
 }
+
 #[derive(Clone, Copy)]
 pub(super) enum Source {
     Scalar(TrainingScalarsField),
@@ -95,6 +75,15 @@ pub(super) fn catalog() -> Vec<Metric> {
                 TrainingScalarsField::GpuMemoryUsedBytes => "GPU memory used (GiB)".into(),
                 TrainingScalarsField::GpuMemoryTotalBytes => "GPU memory total (GiB)".into(),
                 TrainingScalarsField::GpuTemperatureCelsius => "GPU temperature (°C)".into(),
+                TrainingScalarsField::Total => "Total (epoch mean)".into(),
+                TrainingScalarsField::Classification => "Classification".into(),
+                TrainingScalarsField::L1 => "Box L1".into(),
+                TrainingScalarsField::Giou => "Box GIoU".into(),
+                TrainingScalarsField::MaskCe => "Mask CE".into(),
+                TrainingScalarsField::MaskDice => "Mask Dice".into(),
+                TrainingScalarsField::AuxiliaryWeighted => "Auxiliary (weighted)".into(),
+                TrainingScalarsField::DenoisingWeighted => "Denoising (weighted)".into(),
+                TrainingScalarsField::CorrespondenceWeighted => "Correspondence (weighted)".into(),
                 _ => name.replace('_', " "),
             };
             Metric {
@@ -113,11 +102,7 @@ pub(super) fn catalog() -> Vec<Metric> {
                 Some((
                     order,
                     Metric {
-                        chart: if mask && chart != Chart::Area {
-                            Chart::Mask
-                        } else {
-                            chart
-                        },
+                        chart,
                         label: format!("{prefix} {label}"),
                         source: Source::Evaluation {
                             mask,
@@ -130,7 +115,7 @@ pub(super) fn catalog() -> Vec<Metric> {
         selected.sort_by_key(|(order, _)| *order);
         metrics.extend(selected.into_iter().map(|(_, metric)| metric));
     }
-    // Append new cards without changing existing curve/color identities.
+    // Keep the metric inventory and color indices stable across chart grouping.
     metrics.extend(performance);
     metrics
 }
@@ -141,9 +126,9 @@ fn scalar_chart(field: TrainingScalarsField) -> Chart {
         LearningRate | LearningRateMin | LearningRateMax => Chart::LearningRate,
         ClassError | CardinalityError => Chart::Errors,
         ImagesPerSecond => Chart::Throughput,
-        GpuUtilizationPercent => Chart::GpuUtilization,
-        GpuMemoryUsedBytes | GpuMemoryTotalBytes => Chart::GpuMemory,
-        GpuTemperatureCelsius => Chart::GpuTemperature,
+        GpuUtilizationPercent => Chart::Gpu,
+        GpuMemoryUsedBytes | GpuMemoryTotalBytes => Chart::Gpu,
+        GpuTemperatureCelsius => Chart::Gpu,
         Classification
         | L1
         | Giou
@@ -151,7 +136,7 @@ fn scalar_chart(field: TrainingScalarsField) -> Chart {
         | MaskDice
         | AuxiliaryWeighted
         | DenoisingWeighted
-        | CorrespondenceWeighted => Chart::Components,
+        | CorrespondenceWeighted => Chart::Loss,
     }
 }
 // Exhaustive visual policy, deliberately independent of native declaration order.
@@ -160,8 +145,8 @@ fn evaluation_presentation(field: MetricSummaryField) -> Option<((usize, usize),
     use MetricSummaryField::*;
     let (order, chart, label) = match field {
         Ap => ((0, 0), Chart::Ap, "AP50:95".into()),
-        Ap50 => ((0, 1), Chart::Ap50, "AP50".into()),
-        Ap75 => ((0, 2), Chart::Ap75, "AP75".into()),
+        Ap50 => ((0, 1), Chart::Ap, "AP50".into()),
+        Ap75 => ((0, 2), Chart::Ap, "AP75".into()),
         AverageRecall(index) => ((index + 1, 0), Chart::AverageRecall, "AR".into()),
         Confidence(field) => {
             let (order, label) = match field {
@@ -199,24 +184,24 @@ mod tests {
         use TrainingScalarsField::*;
         let expected = [
             (Total, Some(Chart::Loss)),
-            (Classification, Some(Chart::Components)),
-            (L1, Some(Chart::Components)),
-            (Giou, Some(Chart::Components)),
-            (MaskCe, Some(Chart::Components)),
-            (MaskDice, Some(Chart::Components)),
-            (AuxiliaryWeighted, Some(Chart::Components)),
-            (DenoisingWeighted, Some(Chart::Components)),
-            (CorrespondenceWeighted, Some(Chart::Components)),
+            (Classification, Some(Chart::Loss)),
+            (L1, Some(Chart::Loss)),
+            (Giou, Some(Chart::Loss)),
+            (MaskCe, Some(Chart::Loss)),
+            (MaskDice, Some(Chart::Loss)),
+            (AuxiliaryWeighted, Some(Chart::Loss)),
+            (DenoisingWeighted, Some(Chart::Loss)),
+            (CorrespondenceWeighted, Some(Chart::Loss)),
             (ClassError, Some(Chart::Errors)),
             (CardinalityError, Some(Chart::Errors)),
             (LearningRate, Some(Chart::LearningRate)),
             (LearningRateMin, Some(Chart::LearningRate)),
             (LearningRateMax, Some(Chart::LearningRate)),
             (ImagesPerSecond, Some(Chart::Throughput)),
-            (GpuUtilizationPercent, Some(Chart::GpuUtilization)),
-            (GpuMemoryUsedBytes, Some(Chart::GpuMemory)),
-            (GpuMemoryTotalBytes, Some(Chart::GpuMemory)),
-            (GpuTemperatureCelsius, Some(Chart::GpuTemperature)),
+            (GpuUtilizationPercent, Some(Chart::Gpu)),
+            (GpuMemoryUsedBytes, Some(Chart::Gpu)),
+            (GpuMemoryTotalBytes, Some(Chart::Gpu)),
+            (GpuTemperatureCelsius, Some(Chart::Gpu)),
         ];
         let metrics = catalog();
         assert_eq!(
@@ -235,27 +220,10 @@ mod tests {
             assert_eq!(selected.next().map(|metric| metric.chart), expected_chart);
             assert!(selected.next().is_none());
         }
-        // Optional performance and evaluation families retain their own cards.
-        assert_eq!(
-            Chart::ALL,
-            [
-                Chart::Loss,
-                Chart::Ap50,
-                Chart::Ap,
-                Chart::AverageRecall,
-                Chart::Confidence,
-                Chart::LearningRate,
-                Chart::Components,
-                Chart::Ap75,
-                Chart::Errors,
-                Chart::Mask,
-                Chart::Area,
-                Chart::Throughput,
-                Chart::GpuUtilization,
-                Chart::GpuMemory,
-                Chart::GpuTemperature,
-            ]
-        );
+        assert_eq!(Chart::ALL.into_iter().filter(|chart| chart.main()).collect::<Vec<_>>(),
+            [Chart::Loss, Chart::Ap, Chart::AverageRecall, Chart::Confidence, Chart::LearningRate]);
+        assert_eq!(Chart::ALL.into_iter().filter(|chart| chart.performance()).collect::<Vec<_>>(),
+            [Chart::Throughput, Chart::Gpu]);
     }
 
     #[test]
@@ -292,43 +260,11 @@ mod tests {
             );
         }
         for metric in &metrics {
-            if let Source::Evaluation { mask, field } = metric.source {
+            if let Source::Evaluation { field, .. } = metric.source {
                 let expected_chart = match field {
-                    Ap => {
-                        if mask {
-                            Chart::Mask
-                        } else {
-                            Chart::Ap
-                        }
-                    }
-                    Ap50 => {
-                        if mask {
-                            Chart::Mask
-                        } else {
-                            Chart::Ap50
-                        }
-                    }
-                    Ap75 => {
-                        if mask {
-                            Chart::Mask
-                        } else {
-                            Chart::Ap75
-                        }
-                    }
-                    AverageRecall(_) => {
-                        if mask {
-                            Chart::Mask
-                        } else {
-                            Chart::AverageRecall
-                        }
-                    }
-                    Confidence(_) => {
-                        if mask {
-                            Chart::Mask
-                        } else {
-                            Chart::Confidence
-                        }
-                    }
+                    Ap | Ap50 | Ap75 => Chart::Ap,
+                    AverageRecall(_) => Chart::AverageRecall,
+                    Confidence(_) => Chart::Confidence,
                     AreaAp(_) | AreaAr(_) => Chart::Area,
                     Available | DetectionLimits(_) | ConfidenceThreshold => {
                         panic!("metadata entered the plotted catalog")

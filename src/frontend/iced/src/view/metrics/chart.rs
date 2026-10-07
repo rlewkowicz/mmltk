@@ -3,7 +3,7 @@ use super::{
     history::{BUCKETS, Curve},
 };
 use iced_plot::{
-    AxisScale, LineStyle, MarkerStyle, PlotWidget, PlotWidgetBuilder, Series, ShapeId,
+    AxisScale, LineStyle, MarkerStyle, PlotWidget, PlotWidgetBuilder, ScrollAction, Series, ShapeId,
 };
 
 pub(super) struct RetainedChart {
@@ -15,6 +15,7 @@ pub(super) struct RetainedChart {
     positions: Vec<[f64; 2]>,
     labels: Vec<String>,
     axes: Option<(bool, bool)>,
+    expanded: bool,
 }
 impl RetainedChart {
     pub fn new(kind: Chart, count: usize) -> Self {
@@ -30,6 +31,7 @@ impl RetainedChart {
         plot.get_controls_mut().clear_scroll_bindings();
         Self {
             axes: None,
+            expanded: false,
             labels: vec![String::new(); count],
             kind,
             visible: kind.main(),
@@ -39,12 +41,27 @@ impl RetainedChart {
             positions: Vec::with_capacity(BUCKETS * 5),
         }
     }
+    /// Scroll custody follows the dashboard placement, independent of data or remounts.
+    pub fn set_expanded(&mut self, expanded: bool) {
+        if self.expanded == expanded {
+            return;
+        }
+        self.expanded = expanded;
+        let controls = self.plot.get_controls_mut();
+        controls.clear_scroll_bindings();
+        if expanded {
+            controls
+                .bind_scroll(iced::keyboard::Modifiers::NONE, ScrollAction::Zoom)
+                .bind_scroll(iced::keyboard::Modifiers::CTRL, ScrollAction::Zoom);
+        }
+    }
     pub fn prepare(
         &mut self,
         curves: &[Curve],
         metrics: &[super::catalog::Metric],
         epoch: bool,
         log: bool,
+        step_frequency: u64,
     ) {
         if !self.dirty {
             return;
@@ -54,13 +71,11 @@ impl RetainedChart {
             self.plot
                 .set_x_axis_label(if epoch { "Epoch" } else { "Optimizer step" });
             self.plot.set_y_axis_label(match self.kind {
-                Chart::Loss | Chart::Components => "Loss",
+                Chart::Loss => "Loss (epoch mean)",
                 Chart::LearningRate => "Rate",
                 Chart::Errors => "Error",
                 Chart::Throughput => "Images / second",
-                Chart::GpuUtilization => "%",
-                Chart::GpuMemory => "GiB",
-                Chart::GpuTemperature => "°C",
+                Chart::Gpu => "Value (units in legend)",
                 _ => "Score",
             });
             self.plot.set_y_axis_scale(if log {
@@ -78,19 +93,30 @@ impl RetainedChart {
         {
             self.positions.clear();
             let mut segment = None;
+            let mut anchor: Option<i64> = None;
+            let mut previous_order = None;
             for bucket in &curve.buckets {
-                if segment != Some(bucket.segment) && !self.positions.is_empty() {
-                    self.positions.push([f64::NAN; 2]);
+                if segment != Some(bucket.segment) {
+                    if !self.positions.is_empty() {
+                        self.positions.push([f64::NAN; 2]);
+                    }
+                    segment = Some(bucket.segment);
+                    anchor = None;
+                    previous_order = None;
                 }
-                segment = Some(bucket.segment);
                 let mut points = [bucket.first, bucket.min, bucket.max, bucket.last];
                 points.sort_by_key(|point| point.order);
-                let mut previous = None;
                 for point in points {
-                    if previous != Some(point.order) {
-                        self.positions
-                            .push([if epoch { point.epoch } else { point.step }, point.value]);
-                        previous = Some(point.order);
+                    if previous_order == Some(point.order) {
+                        continue;
+                    }
+                    previous_order = Some(point.order);
+                    if anchor.is_none_or(|step| point.step.abs_diff(step) >= step_frequency) {
+                        self.positions.push([
+                            if epoch { point.epoch } else { point.step as f64 },
+                            point.value,
+                        ]);
+                        anchor = Some(point.step);
                     }
                 }
             }

@@ -1291,17 +1291,22 @@ export function mmltkIntegrationWheel(x, y, delta = -96, control = false, pixels
   if (!canvas || !Number.isFinite(x) || !Number.isFinite(y)) return 0;
   const rect = canvas.getBoundingClientRect();
   integrationMicrotask(() => {
-    // Iced receives wheel deltas separately from its retained cursor position.
+    // Iced receives wheel deltas separately from its retained cursor/modifier state.
     canvas.dispatchEvent(integrationPointer(rect, x, y, 'pointermove', 0));
-    canvas.dispatchEvent(new WheelEvent('wheel', {
-      bubbles: true,
-      cancelable: true,
-      clientX: rect.left + x,
-      clientY: rect.top + y,
-      deltaY: delta,
-      ctrlKey: control,
-      deltaMode: pixels ? WheelEvent.DOM_DELTA_PIXEL : WheelEvent.DOM_DELTA_LINE,
-    }));
+    try {
+      if (control) integrationKey(canvas, 'keydown', 'Control', 'ControlLeft', true, false);
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        bubbles: true,
+        cancelable: true,
+        clientX: rect.left + x,
+        clientY: rect.top + y,
+        deltaY: delta,
+        ctrlKey: control,
+        deltaMode: pixels ? WheelEvent.DOM_DELTA_PIXEL : WheelEvent.DOM_DELTA_LINE,
+      }));
+    } finally {
+      if (control) integrationKey(canvas, 'keyup', 'Control', 'ControlLeft', false, false);
+    }
   });
   return 1;
 }
@@ -1321,7 +1326,7 @@ export function mmltkIntegrationChartInput(x, y, width, height, pan, completed) 
   const rect = canvas.getBoundingClientRect();
   integrationMicrotask(() => {
     if (!pan) {
-      // The legend container includes entries; the header is its top row.
+      // Controls, including the above-plot legend toggle, use their top row.
       integrationClick(canvas, rect, x + Math.min(30, width * 0.5), y + 12);
       mmltkIntegrationChartSettled(completed);
       return;

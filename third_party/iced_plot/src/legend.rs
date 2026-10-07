@@ -19,16 +19,20 @@ pub(crate) struct LegendEntry {
     pub(crate) hidden: bool,
 }
 
-pub(crate) fn legend(widget: &PlotWidget, collapsed: bool) -> Option<Element<'_, PlotUiMessage>> {
-    let entries: Vec<LegendEntry> = widget.legend_entries();
-
+/// Reuse the same toggle and entries in overlays or an above-plot header.
+pub(crate) fn parts(
+    widget: &PlotWidget,
+    collapsed: bool,
+) -> Option<(Element<'_, PlotUiMessage>, Option<Element<'_, PlotUiMessage>>)> {
+    let entries = widget.legend_entries();
     if entries.is_empty() {
         return None;
-    } else if collapsed {
-        return Some(legend_container(label_button("▶ Legend")).into());
     }
-
-    let mut col = column![label_button("▼ Legend")]
+    let toggle = label_button(if collapsed { "▶ Legend" } else { "▼ Legend" });
+    if collapsed {
+        return Some((toggle, None));
+    }
+    let mut col = column![]
         .spacing(4.0)
         .width(Length::Shrink)
         .height(Length::Shrink);
@@ -59,11 +63,17 @@ pub(crate) fn legend(widget: &PlotWidget, collapsed: bool) -> Option<Element<'_,
         col = col.push(row);
     }
 
-    Some(
-        legend_container(col)
-            .style(|theme| widget.update_style(theme).legend)
-            .into(),
-    )
+    Some((toggle, Some(col.into())))
+}
+
+pub(crate) fn legend(widget: &PlotWidget, collapsed: bool) -> Option<Element<'_, PlotUiMessage>> {
+    let (toggle, entries) = parts(widget, collapsed)?;
+    let Some(entries) = entries else {
+        return Some(legend_container(toggle).into());
+    };
+    Some(legend_container(column![toggle, entries].spacing(4.0))
+        .style(|theme| widget.update_style(theme).legend)
+        .into())
 }
 fn label_button(label: &str) -> Element<'_, PlotUiMessage> {
     button(text(label).size(12.0))

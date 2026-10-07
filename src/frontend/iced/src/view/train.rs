@@ -289,19 +289,20 @@ impl Component {
         .spacing(crate::view::workflow::SECTION_SPACING)
         .into();
         let chart_width =
-            crate::view::workflow::Composition::new(crate::generated::FeatureId::Train, width)
+            (crate::view::workflow::Composition::new(crate::generated::FeatureId::Train, width)
                 .center_width()
-                - 2.0 * crate::view::workflow::CARD_PADDING;
+                - 2.0 * crate::view::workflow::CARD_PADDING).max(1.0);
         let aspect = settings.draft.as_ref().map_or(
             crate::generated::WorkspaceAspectRatio::Widescreen,
             |draft| draft.ui.workspaceaspectratio,
         );
         let active = progress::active(model);
         let available_height = (body_height
-            - self.metrics.controls_height()
+            - self.metrics.controls_height(chart_width)
             - 64.0
             - if active { 220.0 } else { 0.0 })
         .max(1.0);
+        let toolbar_width = chart_width;
         let (chart_width, chart_height) =
             crate::view::aspect_ratio::fit_extent(chart_width, available_height, aspect);
         let mut center = column![
@@ -311,7 +312,7 @@ impl Component {
                 Message::AspectSelected
             ),
             self.metrics
-                .view(chart_width, chart_height)
+                .view(toolbar_width, chart_width, chart_height)
                 .map(Message::Metrics),
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)

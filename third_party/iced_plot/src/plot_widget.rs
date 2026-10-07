@@ -65,6 +65,7 @@ pub(crate) struct ViewSource {
     y_lim: Option<(f64, f64)>,
     x_scale: AxisScale,
     y_scale: AxisScale,
+    ignore_y_outliers: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +96,7 @@ pub struct PlotWidget {
     pub(crate) reference_version: u64,
     // Configuration
     pub(crate) autoscale_on_updates: bool,
+    pub(crate) ignore_y_outliers: bool,
     pub(crate) controls: PlotControls,
     pub(crate) highlight_on_hover: bool,
     pub(crate) show_controls_help: bool,
@@ -171,6 +173,7 @@ impl PlotWidget {
             data_version: 1,
             reference_version: 1,
             autoscale_on_updates: false,
+            ignore_y_outliers: false,
             controls: PlotControls::default(),
             highlight_on_hover: true,
             show_controls_help: true,
@@ -223,7 +226,8 @@ impl PlotWidget {
     fn view_source(&self) -> ViewSource {
         ViewSource { instance: self.instance_id, data: self.data_version,
             x_lim: self.x_lim, y_lim: self.y_lim,
-            x_scale: self.x_axis_scale, y_scale: self.y_axis_scale }
+            x_scale: self.x_axis_scale, y_scale: self.y_axis_scale,
+            ignore_y_outliers: self.ignore_y_outliers }
     }
 
     /// Last settled camera ranges in plot coordinates, or None before first render.
@@ -736,7 +740,20 @@ impl PlotWidget {
     /// View the plot widget.
     pub fn view<'a>(&'a self) -> crate::Element<'a, PlotUiMessage> {
         self.shape_overlays_enabled.store(false, Ordering::Relaxed);
-        self.view_with_shape_elements(std::iter::empty(), std::iter::empty(), |message| message)
+        self.view_with_shape_elements(std::iter::empty(), std::iter::empty(), |message| message, None)
+    }
+
+    /// Compose a caller-owned title with the existing legend and help above the plot.
+    /// Expanded panels scroll within `max_panel_height`; they never cover plot data.
+    pub fn view_with_header<'a, Message: 'a>(
+        &'a self,
+        title: Element<'a, Message>,
+        max_panel_height: f32,
+        map_plot: impl Fn(PlotUiMessage) -> Message + Copy + 'a,
+    ) -> Element<'a, Message> {
+        self.shape_overlays_enabled.store(false, Ordering::Relaxed);
+        self.view_with_shape_elements(std::iter::empty(), std::iter::empty(), map_plot,
+            Some((title, max_panel_height.max(0.0))))
     }
 
     /// View the plot widget with external Iced elements anchored to plot coordinates.
@@ -753,7 +770,7 @@ impl PlotWidget {
 
         let shapes_bottom = shapes_bottom.filter_map(|shape| self.view_shape_overlay(shape));
         let shapes_top = shapes_top.filter_map(|shape| self.view_shape_overlay(shape));
-        self.view_with_shape_elements(shapes_bottom, shapes_top, map_plot)
+        self.view_with_shape_elements(shapes_bottom, shapes_top, map_plot, None)
     }
 
     fn view_with_shape_elements<'a, Message, MapPlot>(
@@ -761,6 +778,7 @@ impl PlotWidget {
         shapes_bottom: impl Iterator<Item = Element<'a, Message>>,
         shapes_top: impl Iterator<Item = Element<'a, Message>>,
         map_plot: MapPlot,
+        header: Option<(Element<'a, Message>, f32)>,
     ) -> crate::Element<'a, Message>
     where
         Message: 'a,
@@ -774,7 +792,7 @@ impl PlotWidget {
 
         let inner_container = self.view_plot_area(shapes_bottom, shapes_top, map_plot);
 
-        let legend = if self.legend_enabled {
+        let legend = if self.legend_enabled && header.is_none() {
             legend::legend(self, self.legend_collapsed)
         } else {
             None
@@ -783,7 +801,11 @@ impl PlotWidget {
 
         let mut layers = Vec::new();
         layers.push(inner_container);
-        layers.push(self.view_top_right_overlay(has_legend).map(map_plot));
+        if header.is_none() {
+            layers.push(self.view_top_right_overlay(has_legend).map(map_plot));
+        } else if let Some(caption) = self.view_cursor_overlay() {
+            layers.push(container(caption.map(map_plot)).align_right(Length::Fill).into());
+        }
 
         if let Some(legend) = legend {
             layers.push(container(legend.map(map_plot)).id(self.legend_control_id()).into());
@@ -794,7 +816,7 @@ impl PlotWidget {
             .height(Length::Fill)
             .into();
 
-        container(axes_labels::stack_with_labels(
+        let plot: Element<'a, Message> = container(axes_labels::stack_with_labels(
             elements,
             self.view_tick_labels(true).map(|labels| labels.map(map_plot)).unwrap_or_else(|| container(widget::space()).height(Length::Fill).into()),
             self.view_tick_labels(false).map(|labels| labels.map(map_plot)).unwrap_or_else(|| container(widget::space()).width(Length::Fill).into()),
@@ -806,7 +828,35 @@ impl PlotWidget {
         ))
         .padding(3.0)
         .style(|theme: &Theme| self.update_style(theme).frame)
-        .into()
+        .into();
+        let Some((title, max_panel_height)) = header else {
+            return plot;
+        };
+        let legend = self.legend_enabled.then(|| legend::parts(self, self.legend_collapsed)).flatten();
+        let has_legend = legend.is_some();
+        let mut heading = widget::row![title].spacing(6.0).align_y(Vertical::Center);
+        let mut panels = widget::row![].spacing(6.0);
+        let mut has_panel = false;
+        if let Some((toggle, entries)) = legend {
+            heading = heading.push(container(toggle.map(map_plot)).id(self.legend_control_id()));
+            if let Some(entries) = entries {
+                panels = panels.push(container(entries.map(map_plot)).width(Length::FillPortion(1))
+                    .padding(4.0).style(|theme| self.update_style(theme).legend));
+                has_panel = true;
+            }
+        }
+        if let Some(help) = self.view_help_button() {
+            heading = heading.push(help.map(map_plot));
+        }
+        if self.show_controls_help && let Some(help) = self.view_controls_overlay_panel(has_legend) {
+            panels = panels.push(container(help.map(map_plot)).width(Length::FillPortion(1)));
+            has_panel = true;
+        }
+        let mut content = widget::column![heading].spacing(2.0);
+        if has_panel {
+            content = content.push(self.controls.bounded_panel(panels.into(), max_panel_height));
+        }
+        content.push(plot).width(Length::Fill).height(Length::Fill).into()
     }
 
     fn view_plot_area<'a, Message, MapPlot>(
@@ -870,6 +920,12 @@ impl PlotWidget {
     /// Enable or disable autoscaling on updates (default: enabled)
     pub fn autoscale_on_updates(&mut self, enabled: bool) {
         self.autoscale_on_updates = enabled;
+    }
+
+    /// Use the visible world-Y 5th/95th percentile ranks for automatic Y bounds.
+    /// This never changes data, picking, X bounds, or explicit axis limits.
+    pub fn set_ignore_y_outliers(&mut self, enabled: bool) {
+        self.ignore_y_outliers = enabled;
     }
 
     /// Set hover radius in logical pixels for picking markers (default: 8 px)
@@ -978,6 +1034,15 @@ impl PlotWidget {
     /// Set the positions of an existing series.
     pub fn set_series_positions(&mut self, id: &ShapeId, positions: &[[f64; 2]]) {
         if let Some(series) = self.series.get_mut(id) {
+            // A display sampler can receive data without changing its projection.
+            // Bit identity also recognizes retained NaN gap markers as unchanged.
+            if series.positions.len() == positions.len()
+                && series.positions.iter().zip(positions).all(|(old, new)| {
+                    old[0].to_bits() == new[0].to_bits() && old[1].to_bits() == new[1].to_bits()
+                })
+            {
+                return;
+            }
             series.positions.clear();
             series.positions.extend_from_slice(positions);
             if let Some(colors) = &mut series.point_colors
@@ -1169,18 +1234,18 @@ impl PlotWidget {
         Some(bubble.into())
     }
 
-    fn view_top_right_overlay(&self, has_legend: bool) -> Element<'_, PlotUiMessage> {
-        let help_btn = self.show_controls_help.then(|| {
-            let help_label = if self.controls_overlay_open {
-                "×"
-            } else {
-                "?"
-            };
-
+    fn view_help_button(&self) -> Option<Element<'_, PlotUiMessage>> {
+        self.show_controls_help.then(|| {
+            let help_label = if self.controls_overlay_open { "×" } else { "?" };
             widget::button(widget::text(help_label).size(12.0))
                 .padding(6.0)
                 .on_press(PlotUiMessage::ToggleControlsOverlay)
-        });
+                .into()
+        })
+    }
+
+    fn view_top_right_overlay(&self, has_legend: bool) -> Element<'_, PlotUiMessage> {
+        let help_btn = self.view_help_button();
 
         let top_row = widget::row![self.view_cursor_overlay(), help_btn].spacing(6.0);
         let col = widget::column![top_row, self.view_controls_overlay_panel(has_legend)]
@@ -1636,7 +1701,8 @@ fn update_plot_program<const IS_CANVAS: bool>(
     } else {
         Some(ViewSource { instance: widget.instance_id, data: state.data_src_version,
             x_lim: state.x_lim, y_lim: state.y_lim,
-            x_scale: state.x_axis_scale, y_scale: state.y_axis_scale })
+            x_scale: state.x_axis_scale, y_scale: state.y_axis_scale,
+            ignore_y_outliers: state.ignore_y_outliers })
     };
     let source = widget.view_source();
 
@@ -1644,6 +1710,9 @@ fn update_plot_program<const IS_CANVAS: bool>(
     let limits_changed = previous_source.is_some_and(|previous|
         previous.x_lim != source.x_lim || previous.y_lim != source.y_lim
         || previous.x_scale != source.x_scale || previous.y_scale != source.y_scale);
+
+    let outlier_changed = previous_source.is_some_and(|previous|
+        previous.ignore_y_outliers != source.ignore_y_outliers);
 
     if instance_switched {
         // Keep projection origin/counters and GPU settlement in their existing
@@ -1663,7 +1732,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
     }
 
     let projection_changed = widget.data_version != state.data_src_version || instance_switched;
-    if projection_changed || limits_changed {
+    if projection_changed || limits_changed || outlier_changed {
         if projection_changed {
             state.rebuild_from_widget(widget);
             if let Some(position) = state.available_cursor_local_position_inside(cursor) {
@@ -1676,11 +1745,14 @@ fn update_plot_program<const IS_CANVAS: bool>(
             // Limits affect the view, not ordinary series geometry or picking custody.
             state.x_lim = widget.x_lim;
             state.y_lim = widget.y_lim;
+            if outlier_changed {
+                state.sync_y_autoscale(widget);
+            }
         }
 
         if first_time_widget_view || limits_changed || (data_changed && widget.autoscale_on_updates) {
             state.autoscale(!first_time_widget_view);
-        } else if data_changed && widget.autoscale_y_on_updates {
+        } else if outlier_changed || (data_changed && widget.autoscale_y_on_updates) {
             state.autoscale_y_only();
         }
 

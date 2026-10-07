@@ -444,17 +444,17 @@ pub(super) fn chart_input(bounds: Option<Rectangle>, pan: bool) -> bool {
     }
 }
 
-/// Exercise the enclosing page's wheel route without changing chart controls.
-pub(super) fn chart_wheel(bounds: Rectangle, index: u8, scale: f32) -> bool {
+/// Exercise page scrolling in the grid or cursor zoom inside the expanded plot.
+pub(super) fn chart_wheel(bounds: Rectangle, index: u8, scale: f32, expanded: bool) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
         let x = bounds.x
-            + match index % 3 {
+            + if expanded { bounds.width * 0.6 } else { match index % 3 {
                 0 => bounds.width * 0.7,
                 1 => 10.0 * scale,
                 _ => 100.0 * scale,
-            };
-        let y = bounds.y + 42.0 * scale;
+            }};
+        let y = bounds.y + if expanded { bounds.height * 0.6 } else { 42.0 * scale };
         let pixels = index < 3;
         wheel_js(
             x as f64,
@@ -466,7 +466,7 @@ pub(super) fn chart_wheel(bounds: Rectangle, index: u8, scale: f32) -> bool {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = (bounds, index, scale);
+        let _ = (bounds, index, scale, expanded);
         false
     }
 }

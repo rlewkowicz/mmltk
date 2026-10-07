@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 pub(super) const BUCKETS: usize = 128;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Point {
-    pub(super) step: f64,
+    pub(super) step: i64,
     pub(super) epoch: f64,
     pub(super) value: f64,
     pub(super) order: u64,
@@ -62,7 +62,10 @@ impl Curve {
             self.missing = true;
             return;
         };
-        if self.external != Some(segment) || self.missing {
+        if self.external != Some(segment)
+            || self.missing
+            || self.buckets.back().is_some_and(|last| point.step < last.last.step)
+        {
             self.segment = self.segment.wrapping_add(1);
         }
         self.external = Some(segment);
@@ -104,13 +107,11 @@ use crate::generated::{
     TrainingRecordScope,
 };
 
-/// One source's retained curves and sampling state. Run custody lives in SourceHistories.
+/// One source's retained curves and evaluation identity. Run custody lives in SourceHistories.
 pub(super) struct History {
     pub(super) curves: Vec<Curve>,
     pub(super) source: Option<TrainingMetricSource>,
     pub(super) omitted: u64,
-    last_live: Option<f64>,
-    last_phase_epoch: Option<(TrainingPhase, i32)>,
     last_evaluation: Option<(
         String,
         i32,
@@ -130,8 +131,6 @@ impl History {
                 .collect(),
             source: None,
             omitted: 0,
-            last_live: None,
-            last_phase_epoch: None,
             last_evaluation: None,
         }
     }
@@ -148,10 +147,6 @@ impl History {
         self.source = Some(source.clone());
     }
     fn clear_curves(&mut self, metrics: &[Metric], scalars: bool) {
-        if scalars {
-            self.last_live = None;
-            self.last_phase_epoch = None;
-        }
         self.last_evaluation = None;
         for (curve, metric) in self.curves.iter_mut().zip(metrics) {
             if scalars || matches!(metric.source, Source::Evaluation { .. }) {
@@ -214,8 +209,6 @@ impl History {
         true
     }
     pub(super) fn begin_attempt(&mut self) {
-        self.last_live = None;
-        self.last_phase_epoch = None;
         self.last_evaluation = None;
     }
     pub(super) fn matches_scalars(&self, record: &TrainingRecord) -> bool {
@@ -244,14 +237,12 @@ impl History {
         if !evaluation {
             return 0;
         }
-        self.plot(record, segment, true, evaluation, false, metrics)
+        self.plot(record, segment, evaluation, false, metrics)
     }
     pub(super) fn ingest(
         &mut self,
         record: &TrainingRecord,
-        live: bool,
         segment: u64,
-        attempt_changed: bool,
         metrics: &[Metric],
     ) -> u16 {
         let progress = &record.progress;
@@ -268,27 +259,13 @@ impl History {
         if !evaluation && !scalars {
             return 0;
         }
-        let phase_epoch = (progress.phase, progress.epoch);
-        let admit = !live
-            || record.role != TrainingRecordRole::Live
-            || attempt_changed
-            || self.last_phase_epoch != Some(phase_epoch)
-            || !self.last_live.is_some_and(|last| {
-                progress.elapsedseconds >= last && progress.elapsedseconds - last < 1.0
-            });
-        if scalars {
-            self.last_phase_epoch = Some(phase_epoch);
-            if admit && record.role == TrainingRecordRole::Live {
-                self.last_live = Some(progress.elapsedseconds);
-            }
-        }
-        self.plot(record, segment, admit, evaluation, scalars, metrics)
+        self.plot(record, segment, evaluation, scalars, metrics)
     }
+
     fn plot(
         &mut self,
         record: &TrainingRecord,
         segment: u64,
-        admit: bool,
         evaluation: bool,
         scalars: bool,
         metrics: &[Metric],
@@ -324,18 +301,15 @@ impl History {
                 }
             };
             let value = value.filter(|v| v.is_finite()).map(|value| {
-                if metric.chart == super::catalog::Chart::GpuMemory {
+                if matches!(metric.source, Source::Scalar(
+                    crate::generated::TrainingScalarsField::GpuMemoryUsedBytes
+                    | crate::generated::TrainingScalarsField::GpuMemoryTotalBytes
+                )) {
                     value / (1024.0 * 1024.0 * 1024.0)
                 } else {
                     value
                 }
             });
-            if !admit {
-                if value.is_none() {
-                    curve.missing = true;
-                }
-                continue;
-            }
             let fraction = if is_evaluation || record.role == TrainingRecordRole::Epoch {
                 1.0
             } else if progress.totalbatches > 0 {
@@ -350,7 +324,7 @@ impl History {
             curve.push(
                 segment,
                 value.map(|value| Point {
-                    step: progress.globaloptimizerstep as f64,
+                    step: progress.globaloptimizerstep,
                     epoch: progress.epoch as f64 + fraction,
                     value,
                     order: record.sequence,
@@ -384,18 +358,18 @@ mod tests {
         let mut record = super::super::tests::record();
         record.sequence = 0;
         record.progress.modelid = 1;
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         let segment = component.history().curves[0].segment;
         record.sequence += 1;
         record.progress.modelid = 2;
         record.progress.scalars.total = Some(99.0);
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         record.sequence += 1;
         record.role = TrainingRecordRole::Epoch;
         record.progress.scope = TrainingRecordScope::SynchronizedSession;
         record.progress.modelid = 0;
         record.progress.val = Some(super::super::tests::evaluation());
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.history().curves[0].buckets.len(), 1);
         let evaluation_curve = metrics
             .iter()
@@ -413,14 +387,14 @@ mod tests {
         record.evaluatedweights = EvaluatedWeights::Ema;
         record.progress.artifact.as_mut().unwrap().modelid = 1;
         record.progress.scalars.total = Some(2.0);
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         let observation = record.clone();
         record.sequence += 1;
         record.progress.scope = TrainingRecordScope::Session;
         record.progress.artifact = None;
         record.progress.val = None;
         record.progress.scalars.total = None;
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         assert!(!component.history().curves[0].missing);
         assert_eq!(component.history().curves[0].segment, segment);
         assert_eq!(component.history().curves[0].buckets.len(), 2);
@@ -433,7 +407,7 @@ mod tests {
         record.progress.artifact = observation.progress.artifact.clone();
         record.progress.val = observation.progress.val.clone();
         record.progress.test = observation.progress.val.clone();
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(
             component.history().curves[evaluation_curve].buckets.len(),
             1
@@ -447,7 +421,7 @@ mod tests {
         );
         let mut coalesced = super::super::tests::histories(&metrics);
         coalesced.reconcile(&catalog, &metrics);
-        coalesced.ingest(&record, true, &metrics);
+        coalesced.ingest(&record, &metrics);
         coalesced.ingest_observation(&observation, &metrics);
         coalesced.ingest_observation(&observation, &metrics);
         assert_eq!(coalesced.sequence, sequence);
@@ -463,24 +437,24 @@ mod tests {
         let mut component = super::super::tests::histories(&metrics);
         let mut record = super::super::tests::record();
         record.sequence = 0;
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         let segment = component.history().curves[0].segment;
         record.sequence = 1;
         record.role = TrainingRecordRole::Epoch;
         record.progress.scope = TrainingRecordScope::SynchronizedSession;
         record.progress.val = Some(super::super::tests::evaluation());
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         record.sequence = 2;
         record.progress.scope = TrainingRecordScope::Session;
         record.progress.artifact = None;
         record.progress.val = None;
         record.progress.scalars.total = None;
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         record.sequence = 3;
         record.role = TrainingRecordRole::Live;
         record.progress.scope = TrainingRecordScope::Model;
         record.progress.scalars.total = Some(2.0);
-        component.ingest(&record, false, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.history().curves[0].buckets.len(), 2);
         assert_eq!(component.history().curves[0].segment, segment);
         assert!(!component.history().curves[0].missing);
@@ -491,74 +465,75 @@ mod tests {
         let mut component = super::super::tests::histories(&metrics);
         let mut record = super::super::tests::record();
         record.sequence = 0;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.history().curves[0].buckets.len(), 1);
         let first = component.history().curves[0].segment;
         record.sequence = 1;
         record.progress.elapsedseconds = 1.5;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.sequence, Some(1));
         record.sequence = 2;
         record.role = TrainingRecordRole::Epoch;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.history().curves[0].segment, first);
-        component.ingest(&record, true, &metrics);
-        assert_eq!(component.history().curves[0].buckets.len(), 2);
+        component.ingest(&record, &metrics);
+        assert_eq!(component.history().curves[0].buckets.len(), 3);
         record.sequence = 3;
         record.droppedbefore = 1;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         let dropped = component.history().curves[0].segment;
         assert_ne!(first, dropped);
         record.sequence = 4;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.history().curves[0].segment, dropped);
         record.sequence = 5;
         record.droppedbefore = 2;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.history().curves[0].segment, dropped + 1);
         record.attemptid = "next".into();
         record.sequence = 0;
         record.droppedbefore = 0;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.sequence, Some(0));
         assert_eq!(component.dropped, 0);
     }
 
     #[test]
-    fn coalesced_actual_holes_and_unavailability_remain_pending() {
+    fn delivered_values_resume_pending_holes_without_a_time_throttle() {
         let metrics = super::super::catalog::catalog();
         let mut component = super::super::tests::histories(&metrics);
         let mut record = super::super::tests::record();
         record.sequence = 0;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         let first = component.history().curves[0].segment;
         record.sequence = 2;
         record.progress.elapsedseconds = 1.2;
         record.progress.scalars.total = None;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert!(component.history().curves[0].missing);
         assert_eq!(component.history().curves[0].buckets.len(), 1);
         record.sequence = 3;
         record.progress.elapsedseconds = 1.4;
         record.progress.scalars.total = Some(3.0);
-        component.ingest(&record, true, &metrics);
-        assert_eq!(component.history().curves[0].buckets.len(), 1);
+        component.ingest(&record, &metrics);
+        assert_eq!(component.history().curves[0].buckets.len(), 2);
         assert_eq!(component.history().curves[0].buckets[0].last.value, 1.0);
-        assert!(component.history().curves[0].missing);
+        assert!(!component.history().curves[0].missing);
+        assert_ne!(component.history().curves[0].segment, first);
         record.sequence = 4;
         record.progress.elapsedseconds = 2.0;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert_ne!(component.history().curves[0].segment, first);
         let resumed = component.history().curves[0].segment;
         record.sequence = 5;
         record.progress.elapsedseconds = 3.0;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert_eq!(component.history().curves[0].segment, resumed);
         record.sequence = 6;
         record.progress.scalars.total = None;
-        component.ingest(&record, true, &metrics);
+        component.ingest(&record, &metrics);
         assert!(component.history().curves[0].missing);
-        assert_eq!(component.history().curves[0].buckets.len(), 3);
+        assert_eq!(component.history().curves[0].buckets.len(), 4);
         assert_eq!(
             component.history().curves[0]
                 .buckets
@@ -571,12 +546,12 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_missing_and_drop_boundaries_break_once_without_sequence_holes() {
+    fn missing_and_drop_boundaries_break_once_without_sequence_holes() {
         let metrics = super::super::catalog::catalog();
         let mut component = super::super::tests::histories(&metrics);
         let mut sample = super::super::tests::record();
         sample.sequence = 0;
-        component.ingest(&sample, true, &metrics);
+        component.ingest(&sample, &metrics);
         for drop in [false, true] {
             let segment = component.history().curves[0].segment;
             sample.sequence += 1;
@@ -586,18 +561,18 @@ mod tests {
             } else {
                 sample.progress.scalars.total = None;
             }
-            component.ingest(&sample, true, &metrics);
+            component.ingest(&sample, &metrics);
             sample.sequence += 1;
             sample.progress.elapsedseconds += 0.2;
             sample.progress.scalars.total = Some(2.0);
-            component.ingest(&sample, true, &metrics);
-            assert_eq!(component.history().curves[0].segment, segment);
-            sample.sequence += 1;
-            sample.role = TrainingRecordRole::Epoch;
-            component.ingest(&sample, true, &metrics);
+            component.ingest(&sample, &metrics);
             assert_eq!(component.history().curves[0].segment, segment + 1);
             sample.sequence += 1;
-            component.ingest(&sample, true, &metrics);
+            sample.role = TrainingRecordRole::Epoch;
+            component.ingest(&sample, &metrics);
+            assert_eq!(component.history().curves[0].segment, segment + 1);
+            sample.sequence += 1;
+            component.ingest(&sample, &metrics);
             assert_eq!(component.history().curves[0].segment, segment + 1);
             sample.role = TrainingRecordRole::Live;
         }
@@ -607,7 +582,7 @@ mod tests {
     fn missing_values_form_gaps_and_disconnected_capacity_is_bounded() {
         let mut curve = Curve::new("loss");
         let point = Point {
-            step: 1.0,
+            step: 1,
             epoch: 1.0,
             value: 2.0,
             order: 1,
@@ -632,7 +607,7 @@ mod tests {
             curve.push(
                 7,
                 Some(Point {
-                    step: order as f64,
+                    step: order as i64,
                     epoch: 0.0,
                     value: if order == 100 { -99.0 } else { order as f64 },
                     order,
@@ -651,7 +626,7 @@ mod tests {
         curve.push(
             8,
             Some(Point {
-                step: 0.0,
+                step: 0,
                 epoch: 0.0,
                 value: 12.0,
                 order: 0,
