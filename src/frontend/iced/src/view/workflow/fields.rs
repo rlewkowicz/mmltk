@@ -8,27 +8,47 @@ const NUMERIC_TRAILING_PORTION: u16 = 3;
 pub fn rgb_resize_method<'a, Message: Clone + 'a>(
     id: &'static str,
     selected: crate::generated::RgbResizeMethod,
+    perceptual_downscale: Option<bool>,
     enabled: bool,
-    changed: impl Fn(crate::generated::RgbResizeMethod) -> Message + Copy + 'a,
+    changed: impl Fn(crate::generated::RgbResizeMethod, bool) -> Message + Copy + 'a,
     ignored: Message,
 ) -> Element<'a, Message> {
     use crate::generated::RgbResizeMethod;
-    let mut choices = column![text("RGB resampling").size(12)].spacing(super::FIELD_SPACING);
-    for (suffix, label, method) in [
-        ("native", "Native", RgbResizeMethod::Native),
-        ("torch", "PyTorch bilinear", RgbResizeMethod::TorchBilinear),
+    let selected = (
+        selected,
+        selected == RgbResizeMethod::Native && perceptual_downscale == Some(true),
+    );
+    let mut choices = column![text("Resize method").size(12)].spacing(super::FIELD_SPACING);
+    for (suffix, label, method, perceptual) in [
+        ("native", "AVIR", RgbResizeMethod::Native, false),
+        (
+            "perceptual",
+            "Perceptual downscaling",
+            RgbResizeMethod::Native,
+            true,
+        ),
+        (
+            "torch",
+            "PyTorch bilinear",
+            RgbResizeMethod::TorchBilinear,
+            false,
+        ),
         (
             "torch_antialias",
             "PyTorch bilinear + antialias",
             RgbResizeMethod::TorchBilinearAntialias,
+            false,
         ),
     ] {
+        if perceptual && perceptual_downscale.is_none() {
+            continue;
+        }
         let ignored = ignored.clone();
         choices = choices.push(
             iced::widget::container(
-                iced::widget::radio(label, method, Some(selected), move |value| {
+                iced::widget::radio(label, (method, perceptual), Some(selected), move |value| {
                     if enabled {
-                        changed(value)
+                        changed(value.0, value.1)
                     } else {
                         ignored.clone()
                     }

@@ -25,9 +25,8 @@ pub enum Message {
     TestSplitChanged(String),
     OverwriteChanged(bool),
     CompileDimensionsChanged(bool),
-    PerceptualDownscaleChanged(bool),
     ResizeModeChanged(ImageResizeMode),
-    ResizeMethodChanged(RgbResizeMethod),
+    ResizeMethodChanged(RgbResizeMethod, bool),
     ResolutionChanged(i32),
     Browse(u64),
     Compile,
@@ -86,11 +85,11 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<Outcome, St
         Message::ResizeModeChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraincompileresizemode(draft, value)
         })?,
-        Message::ResizeMethodChanged(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_workflowstraincompileresizemethod(draft, value)
-        })?,
-        Message::PerceptualDownscaleChanged(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_workflowstraincompileperceptualdownscale(draft, value)
+        Message::ResizeMethodChanged(method, perceptual) => model.edit_group(cadence, |draft| {
+            [
+                crate::generated::edit_workflowstraincompileresizemethod(draft, method),
+                crate::generated::edit_workflowstraincompileperceptualdownscale(draft, perceptual),
+            ]
         })?,
         Message::CompileDimensionsChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraincompiledimensions(draft, value)
@@ -250,28 +249,14 @@ pub fn view<'a>(
         ]
         .spacing(crate::view::workflow::FIELD_SPACING),
     );
-    let fields = fields
-        .push(crate::view::workflow::fields::rgb_resize_method(
-            "train.dataset.resampling",
-            train.compileresizemethod,
-            enabled,
-            Message::ResizeMethodChanged,
-            Message::Ignore,
-        ))
-        .push(text("Applies when compiling. Existing compiled pixels stay unchanged.").size(12));
-    let fields = fields.push(
-        container(crate::view::workflow::fields::toggle(
-            "Perceptual downscaling (Native only)",
-            train.compileperceptualdownscale,
-            enabled && train.compileresizemethod == RgbResizeMethod::Native,
-            Message::PerceptualDownscaleChanged,
-        ))
-        .id(
-            crate::generated::constraint_workflowstraincompileperceptualdownscale()
-                .stable_field_id
-                .to_string(),
-        ),
-    );
+    let fields = fields.push(crate::view::workflow::fields::rgb_resize_method(
+        "train.dataset.resampling",
+        train.compileresizemethod,
+        Some(train.compileperceptualdownscale),
+        enabled,
+        Message::ResizeMethodChanged,
+        Message::Ignore,
+    ));
     let dimensions = column![
         fields,
         disclosure(
@@ -677,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_radios_settle_independently_of_perceptual_choice() {
+    fn resize_method_radios_settle_together_and_preserve_geometry() {
         let mut model = installed_settings_model();
         assert_eq!(
             model
@@ -689,19 +674,21 @@ mod tests {
                 .compileresizemode,
             ImageResizeMode::Stretch
         );
-        update(&mut model, Message::PerceptualDownscaleChanged(true)).unwrap();
-        for method in [
-            RgbResizeMethod::TorchBilinear,
-            RgbResizeMethod::TorchBilinearAntialias,
-            RgbResizeMethod::Native,
+        for (method, perceptual) in [
+            (RgbResizeMethod::Native, true),
+            (RgbResizeMethod::TorchBilinear, false),
+            (RgbResizeMethod::TorchBilinearAntialias, false),
+            (RgbResizeMethod::Native, false),
+            (RgbResizeMethod::Native, true),
         ] {
             assert!(matches!(
-                update(&mut model, Message::ResizeMethodChanged(method)),
+                update(&mut model, Message::ResizeMethodChanged(method, perceptual)),
                 Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))
             ));
             let train = &model.draft.as_ref().unwrap().workflows.train;
             assert_eq!(train.compileresizemethod, method);
-            assert!(train.compileperceptualdownscale);
+            assert_eq!(train.compileperceptualdownscale, perceptual);
+            assert_eq!(train.compileresizemode, ImageResizeMode::Stretch);
         }
         for mode in [ImageResizeMode::Letterbox, ImageResizeMode::Stretch] {
             assert!(matches!(

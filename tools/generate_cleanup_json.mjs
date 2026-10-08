@@ -16,7 +16,7 @@ import { availableParallelism, cpus, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { classifyDeclarations, inventoryMacroConflicts, sourceOccurrence, lineStarts } from "./cleanup/declaration_patterns.mjs";
-import { filterCpdCandidates, sourceComments } from "./cleanup/cpd_patterns.mjs";
+import { filterCpdCandidates, sourceComments, tokenizeCpp } from "./cleanup/cpd_patterns.mjs";
 import { buildReview, renderReviewMarkdown } from "./cleanup/review_patterns.mjs";
 
 const REPO_ROOT = process.cwd();
@@ -107,7 +107,7 @@ const CPP_PROFILE = {
     minLines: 6,
     flags: ["-ip"],
     contentFilter:
-      "comments, strings, and preprocessor-only lines excluded",
+      "comments and preprocessor-only lines excluded; multiline literal content retained",
     filterNonCode: true,
   },
   cpd: {
@@ -120,6 +120,26 @@ const CPP_PROFILE = {
     all: "tracked_cpp_file_count",
     deleted: "worktree_deleted_cpp_files",
     missing: "missing_tracked_cpp_files",
+  },
+};
+
+const TOOLS_PROFILE = {
+  ...CPP_PROFILE,
+  name: "tools",
+  selector: "--tools",
+  output: "cleanup/tools-code-deduplication.json",
+  purpose: "Native tool and wrapper duplication cleanup for shared helpers, classes, and factories",
+  includedDescription: "Git-tracked and untracked-unignored native sources and headers under tools/, plus mmltk.cpp and mmltk_container_commands.hpp",
+  includedPrefix: "tools/",
+  includedFiles: ["mmltk.cpp", "mmltk_container_commands.hpp"],
+  exclusionRules: ["worktree-deleted paths", "Git-ignored paths", "third-party, build, target, dist, and generated output"],
+  detectorExcludedPrefixes: [],
+  retainedGeneratedPaths: [],
+  generatedOutputPatterns: [/(^|\/)(?:third_party|build|target|dist|generated)(?:\/|$)/u],
+  inventoryLabels: {
+    all: "candidate_tools_file_count",
+    deleted: "worktree_deleted_tools_files",
+    missing: "missing_candidate_tools_files",
   },
 };
 
@@ -176,6 +196,7 @@ const FRONTEND_PROFILE = {
 export const CLEANUP_PROFILES = deepFreeze({
   cpp: CPP_PROFILE,
   frontend: FRONTEND_PROFILE,
+  tools: TOOLS_PROFILE,
 });
 
 function run(command, args, options = {}) {
@@ -225,7 +246,7 @@ function runAsync(command, args, options = {}) {
 export function usageText() {
   return [
     "Usage:",
-    "  node tools/generate_cleanup_json.mjs [--cpp|--frontend]",
+    "  node tools/generate_cleanup_json.mjs [--cpp|--frontend|--tools]",
     "",
     "With no profile selector, --cpp is used. Each invocation scans the",
     "selected first-party source inventory with Duplo and PMD CPD, then writes",
@@ -233,17 +254,22 @@ export function usageText() {
     "",
     `  --cpp       C/C++/CUDA: Duplo ${CPP_PROFILE.duplo.minLines} lines; C++ CPD ${CPP_PROFILE.cpd.minTokens} tokens`,
     `  --frontend  Iced Rust: Duplo ${FRONTEND_PROFILE.duplo.minLines} lines; Rust CPD ${FRONTEND_PROFILE.cpd.minTokens} tokens`,
-    "  --raw-cpd [--review] [--min-tokens N] [--output PATH]  Standalone unfiltered C++ CPD (default 12 tokens)",
+    "  --tools     Native tools/ sources and headers, mmltk.cpp, and mmltk_container_commands.hpp; C++ detector settings",
+    "              Writes cleanup/tools-code-deduplication.json for shared-helper, class, and factory cleanup",
+    "  --raw-cpd [--tools] [--review] [--min-tokens N] [--output PATH]  Standalone unfiltered C++ CPD (default 12 tokens)",
     "  Raw mode retains every match, ignores no literal sequences/blocks or inline suppressions,",
     "  and reports original source spans separately from declaration classification.",
     "  --review adds authored-file triage and unreviewed lexical families, plus a Markdown sibling.",
+    "  --raw-cpd --tools keeps evidence and review within the tool inventory (cleanup/tools-raw.json or tools-review.json).",
     "  -h, --help  Show this help",
   ].join("\n");
 }
 
-export function rawCpdProfile(minTokens = 12) {
+export function rawCpdProfile(minTokens = 12, profileName = "cpp") {
   if (!Number.isSafeInteger(minTokens) || minTokens < 2) throw new Error("--min-tokens must be an integer >= 2");
-  return { ...CPP_PROFILE, cpd: { ...CPP_PROFILE.cpd, minTokens,
+  const profile = CLEANUP_PROFILES[profileName];
+  if (profile?.cpd.language !== "cpp") throw new Error("raw CPD requires a C++ profile");
+  return { ...profile, cpd: { ...profile.cpd, minTokens,
     raw: true, flags: ["--skip-blocks-pattern", ""] } };
 }
 
@@ -251,29 +277,30 @@ export function parseArgs(args) {
   if (args.length === 2 && args[0] === "--raw-cpd" && ["--help", "-h"].includes(args[1])) return { kind: "help" };
   if (args[0] === "--raw-cpd") {
     let minTokens = 12;
-    let output, review = false;
+    let output, review = false, tools = false;
     const seen = new Set();
     for (let index = 1; index < args.length; ++index) {
       const option = args[index];
-      if (!["--review", "--min-tokens", "--output"].includes(option) || seen.has(option)) {
-        throw new Error("--raw-cpd accepts --review, --min-tokens N and --output PATH once each");
+      if (!["--tools", "--review", "--min-tokens", "--output"].includes(option) || seen.has(option)) {
+        throw new Error("--raw-cpd accepts --tools, --review, --min-tokens N and --output PATH once each");
       }
       seen.add(option);
+      if (option === "--tools") { tools = true; continue; }
       if (option === "--review") { review = true; continue; }
       const value = args[++index];
       if (!value || value.startsWith("--")) throw new Error(`missing value for ${option}`);
       if (option === "--min-tokens") minTokens = Number(value);
       else output = value;
     }
-    return { kind: "raw-cpd", profile: rawCpdProfile(minTokens), review,
-      output: output ?? `cleanup/declarations-${review ? "review" : "raw"}.json` };
+    return { kind: "raw-cpd", profile: rawCpdProfile(minTokens, tools ? "tools" : "cpp"), review,
+      output: output ?? `cleanup/${tools ? "tools" : "declarations"}-${review ? "review" : "raw"}.json` };
   }
   if (args.length === 0) {
     return { kind: "profile", profile: CLEANUP_PROFILES.cpp };
   }
   if (args.length !== 1) {
     throw new Error(
-      "expected zero arguments or exactly one of --cpp and --frontend",
+      "expected zero arguments or exactly one of --cpp, --frontend, and --tools",
     );
   }
   const [argument] = args;
@@ -321,13 +348,8 @@ function isGeneratedFrontendOutput(path, profile) {
 
 export function profileIncludesPath(profile, path) {
   if (profile.name === "authored") return authoredLanguage(path) !== null;
-  if (profile.name === "cpp") {
-    return isCppPath(path);
-  }
-  return (
-    path.startsWith(profile.includedPrefix) &&
-    path.toLowerCase().endsWith(".rs")
-  );
+  if (!path.startsWith(profile.includedPrefix) && !profile.includedFiles?.includes(path)) return false;
+  return profile.cpd.language === "cpp" ? isCppPath(path) : path.toLowerCase().endsWith(".rs");
 }
 
 export function detectorArguments(profile, { threads = THREADS, fileList } = {}) {
@@ -882,13 +904,24 @@ export function filterDuploCandidates(
   const sourceLines = (path) => {
     let lines = cache.get(path);
     if (lines === undefined) {
-      lines = stripCommentsAndStrings(sourceReader(path)).split("\n");
+      const source = sourceReader(path);
+      const literalLines = new Set();
+      let offset = 0, line = 0;
+      for (const token of tokenizeCpp(source, { trivia: true })) {
+        while (offset < token.offset) if (source[offset++] === "\n") ++line;
+        const multiline = token.kind === "literal" && token.text.includes("\n");
+        while (offset < token.end) {
+          if (multiline && !/\s/u.test(source[offset])) literalLines.add(line);
+          if (source[offset++] === "\n") ++line;
+        }
+      }
+      lines = { code: stripCommentsAndStrings(source).split("\n"), literalLines };
       cache.set(path, lines);
     }
     return lines;
   };
-  const codeCount = (occurrence) => {
-    const lines = sourceLines(occurrence.path);
+  const codeCount = (occurrence, literal = false) => {
+    const { code: lines, literalLines } = sourceLines(occurrence.path);
     let count = 0;
     for (
       let index = occurrence.start - 1;
@@ -896,7 +929,7 @@ export function filterDuploCandidates(
       index += 1
     ) {
       const line = (lines[index] ?? "").trim();
-      if (line !== "" && !line.startsWith("#")) {
+      if (literal ? literalLines.has(index) : line !== "" && !line.startsWith("#")) {
         count += 1;
       }
     }
@@ -908,15 +941,23 @@ export function filterDuploCandidates(
         codeCount(occurrence) >= profile.duplo.minLines,
     ),
   );
-  const filteredCount = rawHits.length - hits.length;
-  if (profile.name !== "cpp") return { hits, filteredCount };
+  // Embedded scripts and multiline data are authored implementations too.
+  // Keep their literal evidence for review instead of treating it as comments.
+  const embedded = rawHits.filter((hit) => !hits.includes(hit) &&
+    [duploOccurrence(hit, 1), duploOccurrence(hit, 2)].every((occurrence) =>
+      codeCount(occurrence, true) >= profile.duplo.minLines));
+  const nonCodeRejected = rawHits.filter((hit) => !hits.includes(hit) && !embedded.includes(hit))
+    .map((hit) => ({ occurrences: [duploOccurrence(hit, 1), duploOccurrence(hit, 2)],
+      reason: "insufficient authored code or multiline literal content" }));
+  const filteredCount = nonCodeRejected.length;
+  if (profile.cpd.language !== "cpp") return { hits, filteredCount };
   const contextual = filterCpdCandidates(hits.map((hit, sourceHitIndex) => ({
     sourceHitIndex, lineCount: duploLineCount(hit),
     occurrences: [duploOccurrence(hit, 1), duploOccurrence(hit, 2)],
   })), { sourceReader, consolidate: false });
   const retained = new Set(contextual.duplications.map((hit) => hit.sourceHitIndex));
   return {
-    hits: hits.filter((_, index) => retained.has(index)), filteredCount,
+    hits: [...hits.filter((_, index) => retained.has(index)), ...embedded], filteredCount, nonCodeRejected,
     contextRejected: contextual.filtered.map(({ sourceHitIndex, ...hit }) => hit),
   };
 }
@@ -1243,13 +1284,14 @@ function scopeMetadata(profile, files) {
   return {
     ...shared,
     included_prefix: profile.includedPrefix,
+    ...(profile.includedFiles ? { included_files: profile.includedFiles } : {}),
     included_suffixes: profile.includedSuffixes,
     retained_generated_paths: profile.retainedGeneratedPaths,
     generated_output_exclusion_patterns: profile.generatedOutputPatterns.map(
       (pattern) => pattern.source,
     ),
     excluded_by_prefix_files: files.excludedByPrefix,
-    candidate_rust_file_count: files.candidates.length,
+    [profile.inventoryLabels.all]: files.candidates.length,
   };
 }
 
@@ -1277,6 +1319,7 @@ export function buildReport({
       min_lines: profile.duplo.minLines,
       content_filter: profile.duplo.contentFilter,
       non_code_hits_filtered: codeOnlyDuplo.filteredCount,
+      non_code_rejected: codeOnlyDuplo.nonCodeRejected ?? [],
       context_filter_rejected: codeOnlyDuplo.contextRejected ?? [],
       threads,
       status: duplo.status,
@@ -1289,7 +1332,7 @@ export function buildReport({
       language: profile.cpd.language,
       min_tokens: profile.cpd.minTokens,
       flags: profile.cpd.flags,
-      ...(profile.name === "cpp"
+      ...(profile.cpd.language === "cpp"
         ? {
             excluded_non_cpp_prefixes: profile.detectorExcludedPrefixes,
             excluded_non_cpp_file_count: cpd.excludedLexerCount,
@@ -1344,7 +1387,7 @@ export function rejectionReport(previous, report, filteredCpd) {
     [report.profile]: {
       ...diagnostics,
       cpd_candidate_filter: {
-        enabled: report.profile === "cpp",
+        enabled: report.cpd.language === "cpp",
         maximum_tokens: null,
         indexed_files: filteredCpd.indexedFiles,
         rejected: filteredCpd.filtered.map((duplication) => ({
@@ -1402,7 +1445,7 @@ export async function generateReport(
     codeOnlyDuplo.hits,
     files.scannedFiles,
   ).sort(compareHits);
-  const filteredCpd = profile.name === "cpp"
+  const filteredCpd = profile.cpd.language === "cpp"
     ? filterCpdCandidates(cpd.duplications)
     : { duplications: cpd.duplications, filtered: [], reasons: {}, indexedFiles: 0 };
   const rawCpdHits = structuralHits(
@@ -1458,7 +1501,7 @@ export async function generateReport(
           `excluded ${files.excludedByPrefix.length} tracked third-party files`,
         ]
       : [
-          `scanned ${files.scannedFiles.length} Iced Rust files`,
+          `scanned ${files.scannedFiles.length} ${profile.cpd.language === "cpp" ? "native tool and wrapper" : "Iced Rust"} files`,
           `excluded ${files.excludedByPrefix.length + files.excludedGeneratedOutput.length} out-of-scope files`,
         ];
   console.log(
@@ -1467,7 +1510,7 @@ export async function generateReport(
       ...inventoryMessages,
       `Duplo: ${report.summary.cross_file_hits} cross-file and ${report.summary.within_file_hits} within-file groups`,
       `CPD: ${report.structural_summary.cross_file_hits} cross-file and ${report.structural_summary.within_file_hits} within-file groups`,
-      ...(profile.name === "cpp" ? [`CPD candidate filter: ${filteredCpd.filtered.length} rejected; details in cleanup/rejected.json`] : []),
+      ...(profile.cpd.language === "cpp" ? [`CPD candidate filter: ${filteredCpd.filtered.length} rejected; details in cleanup/rejected.json`] : []),
       `timing: detectors ${externalSeconds.toFixed(1)}s, total ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
     ].join("\n"),
   );
@@ -1509,7 +1552,8 @@ export function rawCpdReport(profile, files, cpd, sourceReader = (path) => readF
 export async function generateRawCpd(profile, output, { review = false, inventoryInputs = collectInventoryInputs(), renderMarkdown = renderReviewMarkdown } = {}) {
   if (!output.endsWith(".json")) throw new Error("raw CPD output must be a .json report path");
   const files = buildInventory(profile, inventoryInputs);
-  const authored = review ? buildInventory(AUTHORED_PROFILE, inventoryInputs).scannedFiles : [];
+  const reviewProfile = profile.includedPrefix ? profile : AUTHORED_PROFILE;
+  const authored = review ? buildInventory(reviewProfile, inventoryInputs).scannedFiles : [];
   const snapshot = sourceSnapshot([...new Set([...files.scannedFiles, ...authored])]);
   const cpd = await runCpd(profile, files.scannedFiles, snapshot);
   const report = rawCpdReport(profile, files, cpd, (path) => snapshot.get(path).source);

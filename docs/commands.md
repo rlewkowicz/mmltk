@@ -20,8 +20,8 @@ invocation owns a repository-labeled container and streams application output.
 | `./mmltk --update-gui-lock` | Refresh the Cargo lock inputs for browser tests |
 | `./mmltk --update-firefox-lock` | Refresh Firefox's Cargo lock from its vendored sources, offline |
 | `./mmltk --tidy` | Format native sources and Iced application Rust; run configured native analysis |
-| `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
-| `./mmltk --raw-cpd [--review] [--min-tokens N] [--output PATH]` | Save exact-spelling C++ CPD evidence; `--review` adds an authored-file queue and lexical families in JSON/Markdown |
+| `./mmltk --cleanup-report cpp\|frontend\|tools\|all` | Generate the selected deduplication reports; `tools` scans native tool and wrapper sources independently |
+| `./mmltk --raw-cpd [--tools] [--review] [--min-tokens N] [--output PATH]` | Save exact-spelling C++ CPD evidence; `--tools` scopes it to native tools, and `--review` adds an authored-file queue and lexical families in JSON/Markdown |
 | `./mmltk --format-declarations check\|preview\|fix [--file PATH] [--report PATH]` | Report or safely shorten canonical reflection annotation syntax |
 | `./mmltk --audit-includes [--refresh] [report\|preview\|fix] [--output PREFIX] [--build-dir PATH]` | Inventory all compiler contexts and include-retention reasons; preview/apply replacements only under verified target-local PCH policy |
 | `./mmltk --test list` | List supported suites and test options |

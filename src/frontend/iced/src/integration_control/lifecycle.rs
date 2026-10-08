@@ -1058,7 +1058,11 @@ impl State {
                 else {
                     return Task::none();
                 };
-                if perceptual_control_values(&snapshot.settingsstate.workflows.train) != expected {
+                let train = &snapshot.settingsstate.workflows.train;
+                if perceptual_control_values(train) != expected
+                    || (index >= 4
+                        && train.compileresizemethod != crate::generated::RgbResizeMethod::Native)
+                {
                     return Task::none();
                 }
                 self.settings_revision = snapshot.revision;
@@ -1137,8 +1141,8 @@ impl State {
                     }) =>
             {
                 let train = &settings.draft.as_ref().unwrap().workflows.train;
-                if train.compileperceptualdownscale != self.perceptual_baseline[2] {
-                    driver.fail("RGB method selection changed the stored perceptual choice");
+                if train.compileperceptualdownscale {
+                    driver.fail("Resize method selection retained perceptual downscaling");
                     return Task::none();
                 }
                 reporting::emit(|sink| {
@@ -1766,7 +1770,7 @@ impl State {
             Phase::BenchmarkChoice(index) => self.benchmark_choice(index).0.to_owned(),
             Phase::DatasetSource => DATASET_SOURCE.to_owned(),
             Phase::CompiledDirectory => COMPILED_DIRECTORY.to_owned(),
-            Phase::PerceptualControl(index) => perceptual_control_id(index),
+            Phase::PerceptualControl(index) => perceptual_control_id(index, self.perceptual_baseline[2]),
             Phase::CompileDimensions => COMPILE_DIMENSIONS.to_owned(),
             Phase::CompileResizeMode => self.compile_resize_control().to_owned(),
             Phase::CompileResolution => COMPILE_RESOLUTION.to_owned(),
@@ -2150,7 +2154,7 @@ impl State {
             return Task::none();
         }
         reveal_control(
-            perceptual_control_id(index),
+            perceptual_control_id(index, self.perceptual_baseline[2]),
             driver.generation,
             AnnotationReveal::Control,
         )
@@ -2177,7 +2181,7 @@ pub(super) fn perceptual_control_slot(index: usize) -> usize {
     [0, 1, 1, 0, 2, 2][index]
 }
 
-pub(super) fn perceptual_control_id(index: usize) -> String {
+pub(super) fn perceptual_control_id(index: usize, compile_baseline: bool) -> String {
     match perceptual_control_slot(index) {
         0 => {
             crate::generated::constraint_workflowstrainrequestgpuaugmentationenabled()
@@ -2188,7 +2192,17 @@ pub(super) fn perceptual_control_id(index: usize) -> String {
                 .stable_field_id
         }
         _ => {
-            crate::generated::constraint_workflowstraincompileperceptualdownscale().stable_field_id
+            let perceptual = if index == 4 {
+                !compile_baseline
+            } else {
+                compile_baseline
+            };
+            return if perceptual {
+                "train.dataset.resampling.perceptual"
+            } else {
+                "train.dataset.resampling.native"
+            }
+            .into();
         }
     }
     .to_string()
@@ -2562,7 +2576,13 @@ mod tests {
                                                 "handoff must locate the first perceptual control"
                                             );
                                         };
-                                        assert_eq!(control, perceptual_control_id(0));
+                                        assert_eq!(
+                                            control,
+                                            perceptual_control_id(
+                                                0,
+                                                controller.lifecycle.perceptual_baseline[2]
+                                            )
+                                        );
                                         located += 1;
                                     }
                                     _ => panic!("unexpected perceptual handoff task"),

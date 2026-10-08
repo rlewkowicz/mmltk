@@ -164,14 +164,14 @@ graphics-device boundary.
 ### Dataset compilation controls
 
 The [Dataset component](../src/frontend/iced/src/view/train/dataset.rs) offers
-Stretch/Letterbox radios and Native, PyTorch bilinear, and PyTorch bilinear +
-antialias RGB resampling radios. **Perceptual downscaling (Native only)** retains
-its saved value while disabled for either Torch choice. Native
-[resize defaults and semantics](datasets.md#rgb-resampling-methods) drive these
-choices; controls explain that existing compiled pixels stay unchanged.
-Predict exposes the same RGB choices for **Image file** only and retains the
-selection across compiled/image/video source switches. C++ reflected settings
-own the values; the shared Rust field component owns labels and presentation.
+Stretch/Letterbox geometry radios and a separate **Resize method** group:
+**AVIR**, **Perceptual downscaling**, **PyTorch bilinear**, and **PyTorch bilinear +
+antialias**. The group edits the existing method and perceptual settings together.
+Native [resize defaults and semantics](datasets.md#rgb-resampling-methods)
+drive these choices. Predict exposes AVIR and the two PyTorch methods for
+**Image file** only and retains the selection across compiled/image/video source
+switches. C++ reflected settings own the values; the shared Rust field component
+owns labels and presentation.
 **Compile Benchmark Dataset Override** switches the explicit compile
 action between a source directory and a built-in recipe.
 
@@ -536,6 +536,9 @@ expanded chart. Selecting no charts leaves an explicit empty-selection state.
 Charts with no measurements show a waiting/empty state instead of fabricated zero values.
 Average-recall labels use the recorded detection caps. Mask and area values
 remain unavailable when the selected evaluation did not produce them.
+Point tooltips show values with four significant figures, using scientific
+notation for very small or large values. Formatting leaves plotted coordinates
+unchanged.
 
 Source controls select a native model/weight trajectory or synchronized ordinary
 session results. Live and saved history keep separate source selections and

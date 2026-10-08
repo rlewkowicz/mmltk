@@ -3368,11 +3368,14 @@ run_cleanup_report() {
         frontend)
             selectors=(--frontend)
             ;;
+        tools)
+            selectors=(--tools)
+            ;;
         all)
             selectors=(--cpp --frontend)
             ;;
         *)
-            die "--cleanup-report requires cpp, frontend, or all"
+            die "--cleanup-report requires cpp, frontend, tools, or all"
             ;;
     esac
 
@@ -4362,7 +4365,7 @@ if ((${#passthrough_args[@]} > 0)); then
     elif [[ "${passthrough_args[0]}" == "--cleanup-report" ]]; then
         cleanup_report_mode=1
         ((${#passthrough_args[@]} == 2)) ||
-            die "--cleanup-report requires exactly one of cpp, frontend, or all"
+            die "--cleanup-report requires exactly one of cpp, frontend, tools, or all"
         cleanup_report_profile="${passthrough_args[1]}"
         passthrough_args=()
     elif [[ "${passthrough_args[0]}" == --cleanup-report=* ]]; then
@@ -4371,7 +4374,7 @@ if ((${#passthrough_args[@]} > 0)); then
             die "--cleanup-report does not accept additional arguments"
         cleanup_report_profile="${passthrough_args[0]#--cleanup-report=}"
         [[ -n "${cleanup_report_profile}" ]] ||
-            die "--cleanup-report requires cpp, frontend, or all"
+            die "--cleanup-report requires cpp, frontend, tools, or all"
         passthrough_args=()
     fi
 fi

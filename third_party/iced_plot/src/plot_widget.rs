@@ -2195,19 +2195,32 @@ pub struct HighlightPoint {
     pub mask_padding: Option<f32>,
 }
 
+/// A point coordinate formatted to four significant figures, using percentages
+/// for axes coordinates and scientific notation for very small or large values.
 pub struct PositionDisplay<'a> {
     pos: f64,
     transform: &'a Option<Transform>,
 }
 impl fmt::Display for PositionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(transform) = self.transform
-            && transform.uses_axes_coordinates()
-        {
-            write!(f, "{:.1}%", self.pos * 100.0)
+        let percent = self.transform.as_ref().is_some_and(Transform::uses_axes_coordinates);
+        let value = if percent { self.pos * 100.0 } else { self.pos };
+        if value.is_finite() {
+            // Use the rounded exponent so carries (0.99995 -> 1.000) still
+            // display four significant figures. Scientific formatting also
+            // handles subnormal and extreme values without scaling overflow.
+            let scientific = format!("{value:.3e}");
+            let exponent = scientific.rsplit_once('e').expect("finite scientific value").1
+                .parse::<i32>().expect("scientific exponent");
+            if (-4..4).contains(&exponent) {
+                write!(f, "{value:.precision$}", precision = (3 - exponent) as usize)?;
+            } else {
+                f.write_str(&scientific)?;
+            }
         } else {
-            write!(f, "{:.2}", self.pos)
+            write!(f, "{value}")?;
         }
+        if percent { f.write_str("%") } else { Ok(()) }
     }
 }
 

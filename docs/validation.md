@@ -114,6 +114,7 @@ establishes build/test success or a measured PCH speedup.
 ```bash
 ./mmltk --cleanup-report cpp
 ./mmltk --cleanup-report frontend
+./mmltk --cleanup-report tools
 ./mmltk --cleanup-report all
 ```
 
@@ -128,6 +129,12 @@ and inline-suppression details live separately in `cleanup/rejected.json`,
 under the selected profile. Running one profile preserves the other's rejection
 record. Its `duplo.raw_hits` retains the detector's original hits before source
 filtering. Each output is replaced atomically.
+
+The standalone `tools` profile writes `cleanup/tools-code-deduplication.json`.
+It covers native sources and headers recursively under `tools/`, plus root
+`mmltk.cpp` and `mmltk_container_commands.hpp`, including untracked, unignored
+files. Build, generated, vendor, and deleted files stay outside that inventory.
+It uses the C++ detector settings; `all` continues to select `cpp` and `frontend`.
 
 C++ Duplo uses a six-line minimum; CPD uses a 39-token minimum with identifiers
 anonymized and literal sequences ignored. Frontend minima are nine lines and
@@ -156,6 +163,13 @@ Unbalanced syntax stays visible for manual review. The lexical index supplies
 candidate triage; extraction still requires ownership, resource-lifetime, and
 existing-API review. Match sizes do not estimate removable lines.
 
+Default argument initializers do not interrupt function indexing. When a match
+crosses functions or includes different neighboring statements, the filter also
+compares balanced complete statement spans within each function. Compound return
+expressions remain candidates, with their constants intact. Duplo retains
+multiline literal content, including embedded scripts, for manual review;
+rejected non-code ranges and reasons are recorded with the other rejections.
+
 Each affected file is indexed once, with one file's token index resident at a
 time. Statement boundaries and scope ownership are cached; reported spans and
 pattern identities are grouped without all-pairs function comparisons. No
@@ -177,6 +191,8 @@ human review of every file.
 ./mmltk --raw-cpd --min-tokens 12 --output cleanup/declarations-raw.json
 ./mmltk --raw-cpd --review
 ./mmltk --raw-cpd --review --output cleanup/declarations-review.json
+./mmltk --raw-cpd --tools
+./mmltk --raw-cpd --tools --review
 ./mmltk --format-declarations check
 ./mmltk --format-declarations preview --file src/backend/models/rfdetr/contract/train_recipe.h
 ./mmltk --format-declarations fix --file src/backend/models/rfdetr/contract/train_recipe.h
@@ -189,7 +205,9 @@ and applies no source-context filter or inline suppression. Its first-party
 C/C++/CUDA inventory includes ordinary and template headers, modules, and
 untracked unignored files, excludes `third_party`, and omits deleted paths.
 This is declaration triage, not a verdict that every lexical match should be
-extracted into a shared algorithm.
+extracted into a shared algorithm. `--tools` selects the standalone native tool
+inventory and defaults to `cleanup/tools-raw.json`, or
+`cleanup/tools-review.json` and `.md` with `--review`.
 
 Ordinary and raw CPD both scan immutable temporary copies with unique supported
 `.cpp` or `.rs` suffixes, so CUDA, module, and template-header inputs actually

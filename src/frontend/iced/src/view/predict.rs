@@ -137,8 +137,9 @@ impl Component {
                                 draft.map_or(crate::generated::RgbResizeMethod::Native, |value| {
                                     value.request.resizemethod
                                 }),
+                                None,
                                 settings_edit_available,
-                                Message::ResizeMethodChanged,
+                                |method, _| Message::ResizeMethodChanged(method),
                                 Message::Ignore,
                             ),
                         ),

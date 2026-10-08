@@ -239,6 +239,12 @@ export class SourceIndex {
     let boundary = 0;
     for (let index = 0; index < tokens.length; ++index) {
       const text = tokens[index].text;
+      // Defaults and lambdas inside a parameter/call expression must not
+      // advance the enclosing declaration boundary past its function name.
+      if (text === "(" || text === "[") {
+        const close = this.pairs.get(index);
+        if (close !== undefined && close > index) { index = close; continue; }
+      }
       if (text !== "{") {
         if (text === ";" || text === "}") boundary = index + 1;
         continue;
@@ -378,6 +384,40 @@ export class SourceIndex {
     const [rawStart, rawEnd] = this.range(occurrence);
     const start = this.statementStarts[rawStart] ?? rawStart;
     const end = this.statementEnds[rawEnd - 1] ?? rawEnd;
+    const description = this.describeTokens(occurrence, rawStart, rawEnd, start, end);
+    description.parts = [];
+    // A detector span can straddle unrelated function tails and signatures.
+    // Compare each intersected body independently; never concatenate getters
+    // into an invented multi-statement implementation.
+    const owners = new Set(this.owners.slice(start, end));
+    owners.delete(-1);
+    for (const owner of owners) {
+        const fn = this.functions[owner];
+        const first = Math.max(start, fn.open + 1);
+        const last = Math.min(end, fn.end);
+        if (last <= first) continue;
+        // CPD's identifier overlay can join a shared run to a different
+        // neighboring operation. Consider bounded edge trims, while comparing
+        // every retained statement in full (including callees and arguments).
+        const starts = new Set([first, this.statementEnds[first]]);
+        const ends = new Set([last, this.statementStarts[last - 1]]);
+        for (const from of starts) for (const to of ends) {
+          if (from === undefined || to === undefined || to <= from || from < first || to > last) continue;
+          let complete = true;
+          for (let at = from; at < to; ++at) {
+            const pair = this.pairs.get(at);
+            if (pair !== undefined && (pair < from || pair >= to)) { complete = false; break; }
+          }
+          if (!complete) continue;
+          const part = this.describeTokens(occurrence, rawStart, rawEnd, from, to);
+          if (part.key !== null) description.parts.push({ ...part,
+            occurrence: this.occurrence(occurrence.path, from, to) });
+        }
+      }
+    return description;
+  }
+
+  describeTokens(occurrence, rawStart, rawEnd, start, end) {
     const prefixes = [];
     const calls = [];
     const assertions = [];
@@ -475,7 +515,13 @@ export class SourceIndex {
       : arithmetic ? algorithmReceivers(executable) : executable;
     const record = declarations.length >= 2 && records.size === 1
       ? this.records[[...records][0]] : null;
-    const key = maxStatements >= 2
+    // A compound predicate/calculation is reusable behavior even when written
+    // as one return expression. Plain getters, forwarding calls and assertion
+    // operands are still excluded, and all operation/constant facts survive.
+    const expression = maxStatements === 1 && assertions.length === 0 &&
+      executable[0] === "return" &&
+      executable.filter((text) => ["&&", "||", "+", "-", "*", "/", "%", "<<", ">>", "&", "|"].includes(text)).length >= 2;
+    const key = maxStatements >= 2 || expression
       ? calls.length !== 0
         ? JSON.stringify(["operations", operations])
         : assertions.length >= 2
@@ -489,7 +535,7 @@ export class SourceIndex {
     const identity = JSON.stringify([occurrence.path,
       maxStatements < 2 && record !== null ? record.start : start,
       maxStatements < 2 && record !== null ? record.end : end]);
-    return { prefixes, key, identity, statements: maxStatements, executableTokens, balanced: this.balanced };
+    return { prefixes, key, identity, statements: maxStatements, expression, executableTokens, balanced: this.balanced };
   }
 
   recordKey(record) {
@@ -546,7 +592,7 @@ export function filterCpdCandidates(candidates, {
     };
     for (const group of groupOccurrences(entries, (entry) => entry.description.key,
       (entry) => entry.description.identity)) {
-      keep(group, group[0].description.statements >= 2
+      keep(group, group[0].description.statements >= 2 || group[0].description.expression
         ? "shared executable operations" : "same complete record declaration",
       group.map((entry) => entry.description.identity), group[0].description.key);
     }
@@ -563,6 +609,20 @@ export function filterCpdCandidates(candidates, {
       if (group.size < 2 || new Set([...group.values()].map((entry) => entry.parameterTypes)).size < 2) continue;
       keep([...group.values()], "same function, first parameter and opening statement",
         [...group.keys()], `prefix:${key}`);
+    }
+    if (accepted.size < 2) {
+      const parts = entries.flatMap((entry) => entry.description.parts.map((part) =>
+        ({ original: entry, occurrence: part.occurrence, description: part })));
+      const groups = groupOccurrences(parts, (entry) => entry.description.key,
+        (entry) => entry.description.identity).sort((a, b) => b[0].description.executableTokens - a[0].description.executableTokens);
+      const covered = [];
+      for (const group of groups) {
+        const spans = group.map((entry) => JSON.parse(entry.description.identity));
+        if (spans.every(([path, start, end]) => covered.some(([p, a, b]) => p === path && a <= start && b >= end))) continue;
+        keep(group, "shared complete statements within a larger match",
+          group.map((entry) => entry.description.identity), group[0].description.key);
+        covered.push(...spans);
+      }
     }
     // Conditional preprocessing and unsupported syntax must not silently lose
     // executable candidates merely because this lightweight index is uncertain.

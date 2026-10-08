@@ -154,7 +154,11 @@ Torch choice requires the pinned Torch/OpenMP payload and fails admission when
 unavailable. It never silently selects Native. Identity geometry uses the
 ordinary exact RGB-to-float conversion.
 
-The perceptual flag remains saved independently but applies only to Native.
+The stored perceptual flag applies only to Native. The Dataset GUI presents
+Native without that flag as **AVIR** and Native with it as **Perceptual
+downscaling** in one **Resize method** radio group. Choosing either Torch method
+or AVIR clears the flag; choosing Perceptual sets Native and the flag together.
+Perceptual selection uses AVIR when either dimension grows.
 Torch choices retain Stretch/Letterbox geometry, zero padding, boxes, and
 nearest-sampled categorical masks. They do not change format 10 or reinterpret
 existing compiled pixels/metadata. Benchmark manifests record the selected

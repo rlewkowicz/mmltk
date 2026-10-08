@@ -420,7 +420,10 @@ mod tests {
         assert!(captured.matches(model.draft.as_ref().unwrap()));
         crate::view::train::dataset::update(
             &mut model,
-            crate::view::train::dataset::Message::PerceptualDownscaleChanged(true),
+            crate::view::train::dataset::Message::ResizeMethodChanged(
+                crate::generated::RgbResizeMethod::Native,
+                true,
+            ),
         )
         .unwrap();
         assert!(!captured.matches(model.draft.as_ref().unwrap()));

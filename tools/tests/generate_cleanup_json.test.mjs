@@ -96,12 +96,14 @@ test("profiles and arguments select exactly one frozen configuration", () => {
   assert.equal(parseArgs([]).profile, cpp);
   assert.equal(parseArgs(["--cpp"]).profile, cpp);
   assert.equal(parseArgs(["--frontend"]).profile, frontend);
+  assert.equal(parseArgs(["--tools"]).profile, CLEANUP_PROFILES.tools);
   assert.equal(parseArgs(["--help"]).kind, "help");
   assert.ok(Object.isFrozen(CLEANUP_PROFILES));
   assert.ok(Object.isFrozen(frontend.cpd));
   for (const args of [
     ["--cpp", "--frontend"],
     ["--cpp", "--cpp"],
+    ["--tools", "--cpp"],
     ["frontend"],
     ["--unknown"],
   ]) {
@@ -204,6 +206,12 @@ test("frontend inventory unions tracked and untracked-unignored files", () => {
     "src/frontend/iced/generated/bindings.rs",
   ]);
   assert.equal(inventory.untrackedCandidateCount, 2);
+  const tools = buildInventory(CLEANUP_PROFILES.tools, {
+    tracked: ["mmltk.cpp", "mmltk_container_commands.hpp", "tools/a.cpp", "tools/deleted.cpp", "src/a.cpp", "tools/a.mjs", "tools/build/a.cpp", "tools/generated/a.hpp"],
+    untracked: ["tools/new.hpp", "tools/tests/new.cpp", "tools/third_party/a.cpp"],
+    deleted: ["tools/deleted.cpp"],
+  }, () => true);
+  assert.deepEqual(tools.scannedFiles, ["mmltk.cpp", "mmltk_container_commands.hpp", "tools/a.cpp", "tools/new.hpp", "tools/tests/new.cpp"]);
 });
 
 test("inventory rejects unavailable and newline paths", () => {
@@ -407,6 +415,19 @@ test("context filtering checks every match size and retains repeated implementat
       "b.cpp": "void B() { auto value = acquire(); inspect(value); publish(value); }",
     }, {}, tokenCount).duplications.length, 1);
   }
+  const predicate = "bool space(char16_t c) { return c == 32 || c == 160 || (c >= 8192 && c <= 8202); }";
+  assert.equal(classifySources({ "a.cpp": predicate, "b.cpp": predicate.replace(/\bc\b/gu, "x") }).duplications.length, 1);
+  assert.equal(classifySources({ "a.cpp": predicate, "b.cpp": predicate.replace("160", "161") }).duplications.length, 0);
+  assert.equal(classifySources({
+    "a.cpp": "void previous() { first(); }\nvoid shared() { auto item = acquire(); inspect(item); publish(item); }\nvoid next() { first(); }",
+    "b.cpp": "void previous() { second(); }\nvoid shared() { auto item = acquire(); inspect(item); publish(item); }\nvoid next() { second(); }",
+  }).duplications.length, 1);
+  assert.equal(classifySources({
+    "a.cpp": "void A(const Options& options = {}) { auto item = acquire(); inspect(item); publish(item); }",
+    "b.cpp": "void B(const Options& options = {}) { auto value = acquire(); inspect(value); publish(value); }",
+  }).duplications.length, 1);
+  const neighbors = (edge) => `void work() { ${edge}(); inspect(value); publish(value); ${edge}(); }`;
+  assert.equal(classifySources({ "a.cpp": neighbors("first"), "b.cpp": neighbors("second") }).duplications.length, 1);
 });
 
 test("CPD retains overloaded conversion setup despite distinct enum types and fallbacks", () => {
@@ -541,6 +562,11 @@ publish(fact);
   assert.deepEqual(rejected.contextRejected[0].occurrences.map(({ start, end }) => [start, end]), [[2, 7], [2, 7]]);
   const body = "void work() {\nauto item = acquire();\ninspect(item);\nprepare(item);\nwrite(item);\npublish(item);\nrelease(item);\n}";
   assert.deepEqual(filterDuploCandidates(cpp, [hit], () => body).hits, [hit]);
+  const embedded = 'const auto script = R"SH(\nconfigure\nvalidate\ninspect\nbuild\npackage\nreport\n)SH";';
+  assert.deepEqual(filterDuploCandidates(CLEANUP_PROFILES.tools, [hit], () => embedded).hits, [hit]);
+  const comments = filterDuploCandidates(cpp, [hit], () => "// header\n// a\n// b\n// c\n// d\n// e\n// f");
+  assert.deepEqual(comments.hits, []);
+  assert.equal(comments.nonCodeRejected.length, 1);
 });
 
 test("CPD does not present ordinary declarations or concatenated getters as extraction work", () => {
@@ -812,6 +838,10 @@ test("raw CPD argument validation cannot alter ordinary profile thresholds", () 
   assert.equal(raw.output, "cleanup/raw.json");
   assert.equal(cpp.cpd.minTokens, 39);
   assert.deepEqual(raw.profile.cpd.flags, ["--skip-blocks-pattern", ""]);
+  const tools = parseArgs(["--raw-cpd", "--tools", "--review"]);
+  assert.equal(tools.profile.name, "tools");
+  assert.equal(tools.output, "cleanup/tools-review.json");
+  assert.equal(parseArgs(["--raw-cpd", "--tools"]).output, "cleanup/tools-raw.json");
   for (const args of [["--raw-cpd", "--min-tokens", "1"], ["--raw-cpd", "--min-tokens", "NaN"],
     ["--raw-cpd", "--min-tokens", "12.5"], ["--raw-cpd", "--output"], ["--raw-cpd", "--cpp"],
     ["--raw-cpd", "--output", "a", "--output", "b"]]) assert.throws(() => parseArgs(args));
