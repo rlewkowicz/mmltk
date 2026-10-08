@@ -247,6 +247,9 @@ For browser-app, arguments after -- are Cargo test arguments.
   --rust-package <package> to run one Rust package without JavaScript.
 For cleanup-tool, use -- --test-name-pattern PATTERN to rerun selected native cases.
 For log-query-tool, arguments after -- select Class.test_method cases.
+Use ./mmltk --test log-query-tool --tools-ownership for the focused cold tools
+ownership fixture with root UID/GID handoff capabilities; normal cases keep
+their restricted container permissions.
 For headless-compositor, arguments after -- run a command in the private compositor.
 For cuda-vulkan, arguments after -- are width height allocation-pairs transfers validation context-mode memory-owner process-mode; use -- --help.
 Test options:

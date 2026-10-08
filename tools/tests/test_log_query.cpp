@@ -42,8 +42,11 @@ module;
 #include <span>
 #include <system_error>
 #include <fcntl.h>
+#include <grp.h>
 #include <poll.h>
+#include <pwd.h>
 #include <spawn.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -132,7 +135,7 @@ template<class E = logs::QueryError, class F> void raises(F&& fn, std::string_vi
     try { fn(); } catch (const E& error) { require(contains(error.what(), message), "exception message", __LINE__); return; }
     throw Failure("expected exception: " + std::string(message));
 }
-struct Case { std::string_view name; void (*run)(); };
+struct Case { std::string_view name; void (*run)(); bool tools_ownership = false; };
 
 J j(std::string_view text) { return J::parse(text); }
 std::string fixture_json(const J& value) { return value.dump(-1, ' ', true); }
@@ -1350,49 +1353,156 @@ void test_tools_tidy_grouped_selection_and_module_resume() {
     auto resumed = run_tidy({"--start-at", "tools/b.cpp"});
     includes(resumed, {"b.cpp.o", "c.cpp.o"}); LACKS(resumed, "a.cpp.o");
 }
+void check_tools_handoff_consumed(const fs::path& root) {
+    for (const auto* key : {"MMLTK_BOOTSTRAP_LOCK_FD", "MMLTK_BOOTSTRAP_CHECKOUT", "MMLTK_BOOTSTRAP_CACHE", "MMLTK_BOOTSTRAP_STAGE"})
+        CHECK(::getenv(key) == nullptr);
+    const auto lock = root / ".cache/locks/tools.lock";
+    for (const auto& entry : fs::directory_iterator("/proc/self/fd")) {
+        std::error_code error;
+        const auto target = fs::read_symlink(entry.path(), error);
+        if (!error) NE(target, lock);
+    }
+}
+void tools_fixture_user(std::string_view identity) {
+    const auto fields = support::split(identity, ':');
+    EQ(fields.size(), 2U);
+    const auto uid = static_cast<uid_t>(std::stoul(fields[0]));
+    const auto gid = static_cast<gid_t>(std::stoul(fields[1]));
+    if (::getuid() == 0 && (uid != ::getuid() || gid != ::getgid())) {
+        CHECK(::setgroups(0, nullptr) == 0);
+        CHECK(::setgid(gid) == 0);
+        CHECK(::setuid(uid) == 0);
+    }
+    EQ(::getuid(), uid); EQ(::getgid(), gid);
+}
+int tools_docker(const Strings& arguments) {
+    CHECK(!arguments.empty());
+    const fs::path root = support::env("TEST_BOOTSTRAP_ROOT");
+    check_tools_handoff_consumed(root);
+    const auto& operation = arguments[0];
+    const auto active = root / "build/tools-writer";
+    if (operation == "rm" || operation == "ps") {
+        if (!fs::exists(active / "owner.json")) return 0;
+        const auto owner = support::read_json(active / "owner.json");
+        if (operation == "ps") std::cout << owner.at("name").get<std::string>() << '\n';
+        else if (arguments.back() == owner.at("name")) {
+            const auto ready = support::env("TEST_TOOLS_CLEANUP_READY");
+            if (!ready.empty()) {
+                support::write_text(ready, "cleanup\n");
+                std::string release;
+                CHECK(static_cast<bool>(std::getline(std::cin, release)));
+                EQ(release, "continue");
+            }
+            fs::remove_all(active);
+        }
+        return 0;
+    }
+    if (operation == "version" || operation == "tag" || operation == "buildx") return 0;
+    if (operation == "image") {
+        if (std::find(arguments.begin(), arguments.end(), "{{.Id}}") != arguments.end())
+            std::cout << "sha256:" << std::string(63, '0') << "1\n";
+        return 0;
+    }
+    EQ(operation, "run");
+    std::map<std::string, std::string> environment;
+    std::string identity, name;
+    for (std::size_t i = 0; i + 1 < arguments.size(); ++i) {
+        if (arguments[i] == "--env") {
+            const auto& assignment = arguments[++i];
+            const auto at = assignment.find('=');
+            environment[assignment.substr(0, at)] = assignment.substr(at + 1);
+        } else if (arguments[i] == "--user") identity = arguments[++i];
+        else if (arguments[i] == "--name") name = arguments[++i];
+    }
+    if (std::find(arguments.begin(), arguments.end(), "log-query") != arguments.end()) return 0;
+    const bool build = environment.contains("MMLTK_TOOLS_STAGE");
+    const std::string kind = build ? "build" : "tidy";
+    auto host_path = [&](const std::string& value) {
+        CHECK(value.starts_with("/workspace/"));
+        return root / value.substr(11);
+    };
+    const auto cache = host_path(environment.at(build ? "MMLTK_TOOLS_BUILD" : "MMLTK_TIDY_BUILD_DIR"));
+    support::FileDescriptor lock(::open((root / ".cache/locks/tools.lock").c_str(), O_RDWR | O_CLOEXEC));
+    CHECK(lock.get() >= 0);
+    EQ(::flock(lock.get(), LOCK_EX | LOCK_NB), -1); EQ(errno, EWOULDBLOCK);
+    {
+        std::ofstream calls(support::env("TEST_BOOTSTRAP_CALLS"), std::ios::app);
+        calls << J({{"kind", kind}, {"user", identity}, {"cache", cache.string()}}).dump() << '\n';
+        CHECK(calls.good());
+    }
+    tools_fixture_user(identity);
+    CHECK(fs::create_directory(active));
+    struct Writer {
+        fs::path path;
+        ~Writer() { std::error_code error; fs::remove_all(path, error); }
+    } writer{active};
+    support::write_json(active / "owner.json", {{"name", name}, {"pid", ::getpid()}});
+    fs::create_directories(cache);
+    if (build) support::write_text(cache / "compile_commands.json", "[");
+    const auto ready = support::env("TEST_BOOTSTRAP_READY");
+    if (!ready.empty()) {
+        support::write_text(ready, std::to_string(::getpid()));
+        for (;;) ::pause();
+    }
+    if (support::env("TEST_TOOLS_HOLD") == kind) {
+        support::write_text(support::env("TEST_TOOLS_READY"), kind + "\n");
+        std::string release;
+        CHECK(static_cast<bool>(std::getline(std::cin, release)));
+        EQ(release, "continue");
+    }
+    if ((build && support::env("TEST_BOOTSTRAP_FAILURE") == "1") || support::env("TEST_TOOLS_FAILURE") == kind) return 43;
+    if (build) {
+        support::write_json(cache / "compile_commands.json", J::array({{{"file", "/workspace/tools/input.cpp"}}}));
+        const auto stage = host_path(environment.at("MMLTK_TOOLS_STAGE"));
+        fs::create_directories(stage);
+        fs::create_symlink(support::env("TEST_BOOTSTRAP_BINARY"), stage / "mmltk");
+    } else support::write_text(cache / "tidy-object", "checked\n");
+    return 0;
+}
+struct NativeToolsFixture : FileFixture {
+    fs::path checkout = root / "checkout with spaces";
+    fs::path calls;
+    support::RunOptions options;
+    NativeToolsFixture() {
+        const auto& root = checkout;
+        fs::create_directories(root / "tools"); fs::create_directories(root / "docker");
+        fs::create_directories(root / "third_party/json/include");
+        support::write_text(root / "mmltk", support::read_text(repository() / "mmltk"));
+        support::write_text(root / "tools/bootstrap_mmltk.sh", support::read_text(repository() / "tools/bootstrap_mmltk.sh"));
+        fs::permissions(root / "mmltk", fs::perms::owner_all);
+        fs::permissions(root / "tools/bootstrap_mmltk.sh", fs::perms::owner_all);
+        for (const auto* path : {"docker/Dockerfile.gcc", "docker/Dockerfile.tools", "tools/input.cpp"}) support::write_text(root / path, "fixture\n");
+        support::write_text(root / "docker/nvidia-payload.json", "{\"donor\": \"fixture@sha256:0123456789abcdef\",\n\"cuda_source\": \"/usr/local/cuda-fixture\"}\n");
+        fs::create_symlink(support::executable_path(), root / "native");
+        auto docker = write("bin/docker", "#!/bin/sh\nexec " + support::command::shell_invocation(support::command::Command::test_log_query, {"--fixture-tools-docker"}) + " \"$@\"\n");
+        auto flock = write("bin/flock", "#!/bin/sh\nif [ -n \"${TEST_TOOLS_ADMISSION:-}\" ] && [ \"$1\" = -x ]; then printf 'waiting\\n' >\"${TEST_TOOLS_ADMISSION}\"; fi\nexec /usr/bin/flock \"$@\"\n");
+        for (const auto& path : {docker, flock}) fs::permissions(path, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read | fs::perms::others_exec);
+        options.cwd = checkout; options.capture_stdout = options.capture_stderr = true; options.timeout = std::chrono::seconds(20);
+        for (char** item = ::environ; item && *item; ++item) { std::string entry(*item); auto key = entry.substr(0, entry.find('=')); if (key.starts_with("MMLTK_")) options.unset_env.push_back(key); }
+        calls = write("bootstrap-calls", "");
+        options.env = {{"PATH", docker.parent_path().string() + ':' + support::env("PATH")}, {"PWD", checkout.string()},
+            {"MMLTK_DOCKER_CONTAINER", "host"}, {"MMLTK_BOOTSTRAP_CAPTURED", "1"},
+            {"MMLTK_USER", std::to_string(::getuid())},
+            {"TEST_BOOTSTRAP_BINARY", support::executable_path().string()}, {"TEST_BOOTSTRAP_ROOT", root.string()}, {"TEST_BOOTSTRAP_CALLS", calls.string()}};
+    }
+    Strings bootstrap(std::string operation = "--ensure") const { return {"bash", (checkout / "tools/bootstrap_mmltk.sh").string(), std::move(operation), checkout.string()}; }
+    Strings native(Strings arguments) const { return plus({(checkout / "native").string()}, std::move(arguments)); }
+    support::ProcessResult run(const Strings& command) const { return support::run(command, options); }
+    std::vector<J> invocations() const {
+        std::vector<J> rows;
+        for (const auto& line : support::lines(support::read_text(calls))) rows.push_back(J::parse(line));
+        return rows;
+    }
+    void succeeded(const support::ProcessResult& result) const { if (result.exit_code) throw Failure(result.err); }
+    void initialize() const { succeeded(run(bootstrap())); }
+    void release(Child& child) const { const std::string text = "continue\n"; EQ(::write(child.input.get(), text.data(), text.size()), static_cast<ssize_t>(text.size())); }
+};
 void test_bootstrap_atomic_publication_concurrency_and_spaces() {
-    FileFixture f;
-    const auto root = f.root / "checkout with spaces";
-    fs::create_directories(root / "tools"); fs::create_directories(root / "docker");
-    fs::create_directories(root / "third_party/json/include");
-    support::write_text(root / "mmltk", support::read_text(repository() / "mmltk"));
-    support::write_text(root / "tools/bootstrap_mmltk.sh", support::read_text(repository() / "tools/bootstrap_mmltk.sh"));
-    fs::permissions(root / "mmltk", fs::perms::owner_all);
-    fs::permissions(root / "tools/bootstrap_mmltk.sh", fs::perms::owner_all);
-    for (const auto* path : {"docker/Dockerfile.gcc", "docker/Dockerfile.tools", "tools/input.cpp"}) support::write_text(root / path, "fixture\n");
-    support::write_text(root / "docker/nvidia-payload.json", "{\"donor\": \"fixture@sha256:0123456789abcdef\",\n\"cuda_source\": \"/usr/local/cuda-fixture\"}\n");
-    auto docker = f.write("bin/docker", R"SH(#!/bin/bash
-set -euo pipefail
-case "$1" in
- version|tag|rm) exit 0;;
- image) if [[ "$*" == *'{{.Id}}'* ]]; then printf 'sha256:%064d\n' 1; fi;;
- buildx) exit 0;;
- run)
-  printf 'build\n' >>"${TEST_BOOTSTRAP_CALLS}"
-  [[ "${TEST_BOOTSTRAP_FAILURE:-0}" == 0 ]] || exit 43
-  if [[ -n "${TEST_BOOTSTRAP_READY:-}" ]]; then
-   printf '%s\n' "$$" >"${TEST_BOOTSTRAP_READY}"
-   exec sleep 600
-  fi
-  stage=''
-  for argument in "$@"; do
-   if [[ "${argument}" == MMLTK_TOOLS_STAGE=* ]]; then stage="${argument#MMLTK_TOOLS_STAGE=/workspace}"; fi
-  done
-  [[ -n "${stage}" ]]
-  mkdir -p "${TEST_BOOTSTRAP_ROOT}${stage}"
-  ln -s "${TEST_BOOTSTRAP_BINARY}" "${TEST_BOOTSTRAP_ROOT}${stage}/mmltk"
-  ;;
- *) exit 99;;
-esac
-)SH");
-    fs::permissions(docker, fs::perms::owner_all);
-    support::RunOptions options; options.cwd = f.root; options.capture_stdout = options.capture_stderr = true; options.timeout = std::chrono::seconds(20);
-    for (char** item = ::environ; item && *item; ++item) { std::string entry(*item); auto key = entry.substr(0, entry.find('=')); if (key.starts_with("MMLTK_")) options.unset_env.push_back(key); }
-    auto calls = f.write("bootstrap-calls", "");
-    options.env = {{"PATH", docker.parent_path().string() + ':' + support::env("PATH")},
-        {"MMLTK_DOCKER_CONTAINER", "host"}, {"MMLTK_BOOTSTRAP_CAPTURED", "1"},
-        {"TEST_BOOTSTRAP_BINARY", support::executable_path().string()}, {"TEST_BOOTSTRAP_ROOT", root.string()}, {"TEST_BOOTSTRAP_CALLS", calls.string()}};
-    Strings command{"bash", (root / "tools/bootstrap_mmltk.sh").string(), "--ensure", root.string()};
+    NativeToolsFixture f;
+    const auto& root = f.checkout;
+    auto& options = f.options;
+    const auto& calls = f.calls;
+    const auto command = f.bootstrap();
     auto readonly = support::run({(root / "mmltk").string(), "--logs", "--help"}, options);
     EQ(readonly.exit_code, 1); HAS(readonly.err, "diagnostic did not build or pull");
     CHECK(support::read_text(calls).empty());
@@ -1403,6 +1513,9 @@ esac
     EQ(support::run(command, options).exit_code, 0);
     EQ(support::lines(support::read_text(calls)).size(), 1U);
     support::write_text(root / "tools/input.cpp", "changed\n");
+    const auto stale = support::run({(root / "mmltk").string(), "--logs", "--help"}, options);
+    EQ(stale.exit_code, 1); HAS(stale.err, "diagnostic did not build or pull");
+    EQ(support::lines(support::read_text(calls)).size(), 1U);
     options.env["TEST_BOOTSTRAP_FAILURE"] = "1";
     EQ(support::run(command, options).exit_code, 43);
     EQ(fs::read_symlink(root / "build/tools"), first);
@@ -1424,6 +1537,241 @@ esac
     EQ(fs::read_symlink(root / "build/tools"), published);
     EQ(::kill(client, 0), -1); EQ(errno, ESRCH);
     EQ(std::distance(fs::directory_iterator(root / "build/.tools-generations"), fs::directory_iterator{}), 2);
+}
+class ToolsLockOpen {
+    support::FileDescriptor notifications{::inotify_init1(IN_CLOEXEC)};
+public:
+    explicit ToolsLockOpen(const NativeToolsFixture& fixture) {
+        CHECK(notifications.get() >= 0);
+        CHECK(::inotify_add_watch(notifications.get(), (fixture.checkout / ".cache/locks/tools.lock").c_str(), IN_OPEN) >= 0);
+    }
+    void wait() {
+        pollfd watch{notifications.get(), POLLIN, 0};
+        int result;
+        do { result = ::poll(&watch, 1, 5000); } while (result < 0 && errno == EINTR);
+        CHECK(result > 0);
+        std::array<char, 4096> events{};
+        CHECK(::read(notifications.get(), events.data(), events.size()) > 0);
+    }
+};
+void test_tools_tidy_waits_for_bootstrap_database_publication() {
+    NativeToolsFixture f;
+    f.initialize();
+    const auto prior = fs::read_symlink(f.checkout / "build/tools");
+    auto settings = f.options;
+    const auto ready = f.write("build-ready", "");
+    settings.env["TEST_TOOLS_HOLD"] = "build";
+    settings.env["TEST_TOOLS_READY"] = ready.string();
+    Child build(f.bootstrap("--build"), settings, f.root / "build.log", true);
+    wait_ready_file(ready);
+    EQ(support::read_text(f.checkout / ".cache/cmake/tools/compile_commands.json"), "[");
+    ToolsLockOpen admission(f);
+    Child tidy(f.native({"--tidy-tools", "--file", "tools/input.cpp"}), f.options, f.root / "tidy.log");
+    admission.wait();
+    EQ(f.invocations().size(), 2U);
+    FALSE(tidy.poll());
+    f.release(build);
+    EQ(build.wait(20), 0); EQ(tidy.wait(20), 0);
+    EQ(f.invocations().back()["kind"], "tidy");
+    NE(fs::read_symlink(f.checkout / "build/tools"), prior);
+    CHECK(fs::exists(f.checkout / "build" / prior / "mmltk"));
+    CHECK(fs::is_regular_file(f.checkout / ".cache/cmake/tools/tidy-object"));
+}
+void test_bootstrap_waits_for_tidy_recomputes_inputs_and_shares_cache_subroots() {
+    for (const auto* cache : {".cache", ".cache/alternate"}) {
+        NativeToolsFixture f;
+        f.initialize();
+        auto settings = f.options;
+        const auto ready = f.write("tidy-ready", ""), queued = f.write("build-waiting", "");
+        settings.env["TEST_TOOLS_HOLD"] = "tidy";
+        settings.env["TEST_TOOLS_READY"] = ready.string();
+        Child tidy(f.native({"--tidy-tools"}), settings, f.root / "tidy.log", true);
+        wait_ready_file(ready);
+        settings = f.options;
+        settings.env["MMLTK_CACHE_ROOT"] = cache;
+        settings.env["TEST_TOOLS_ADMISSION"] = queued.string();
+        Child build(f.bootstrap("--build"), settings, f.root / "build.log");
+        wait_ready_file(queued);
+        EQ(f.invocations().size(), 2U);
+        // This write represents the formatter inside the held tools-stage interval.
+        support::write_text(f.checkout / "tools/input.cpp", "formatted while bootstrap waited\n");
+        f.release(tidy);
+        EQ(tidy.wait(20), 0); EQ(build.wait(20), 0);
+        EQ(f.invocations().back()["kind"], "build");
+        EQ(f.invocations().back()["cache"], (f.checkout / cache / "cmake/tools").string());
+        const auto published = fs::read_symlink(f.checkout / "build/tools");
+        f.options.env["MMLTK_CACHE_ROOT"] = cache;
+        f.initialize();
+        EQ(f.invocations().size(), 3U);
+        EQ(fs::read_symlink(f.checkout / "build/tools"), published);
+        f.succeeded(f.run(f.native({"--build-tools"})));
+        EQ(f.invocations().size(), 4U);
+        f.succeeded(f.run(f.native({"--tidy-tools", "--file", "tools/input.cpp"})));
+        CHECK(fs::exists(f.checkout / ".cache/cmake/tools/tidy-object"));
+        CHECK(fs::exists(f.checkout / cache / "cmake/tools/tidy-object"));
+    }
+}
+void test_tools_lock_wait_cancellation_and_failure_release() {
+    NativeToolsFixture f;
+    f.initialize();
+    const auto prior = fs::read_symlink(f.checkout / "build/tools");
+    auto settings = f.options;
+    const auto ready = f.write("writer-ready", ""), queued = f.write("waiter-ready", "");
+    settings.env["TEST_TOOLS_HOLD"] = "build";
+    settings.env["TEST_TOOLS_READY"] = ready.string();
+    settings.env["TEST_TOOLS_FAILURE"] = "build";
+    Child writer(f.bootstrap("--build"), settings, f.root / "writer.log", true);
+    wait_ready_file(ready);
+    settings = f.options;
+    settings.env["TEST_TOOLS_ADMISSION"] = queued.string();
+    Child bootstrap(f.bootstrap("--build"), settings, f.root / "bootstrap-wait.log");
+    wait_ready_file(queued);
+    EQ(::kill(bootstrap.pid(), SIGTERM), 0); EQ(bootstrap.wait(10), 143);
+    {
+        ToolsLockOpen admission(f);
+        Child tidy(f.native({"--tidy-tools", "--file", "tools/input.cpp"}), f.options, f.root / "tidy-wait.log");
+        admission.wait();
+        EQ(::kill(tidy.pid(), SIGTERM), 0); EQ(tidy.wait(10), 143);
+    }
+    EQ(f.invocations().size(), 2U);
+    f.release(writer);
+    EQ(writer.wait(20), 43);
+    EQ(fs::read_symlink(f.checkout / "build/tools"), prior);
+    f.succeeded(f.run(plus({(f.checkout / "build/tools/mmltk").string()}, {"--tool", "runtime-package", "--", "inventory"})));
+    f.succeeded(f.run(f.native({"--build-tools"})));
+    const auto published = fs::read_symlink(f.checkout / "build/tools");
+    f.options.env["TEST_TOOLS_FAILURE"] = "tidy";
+    EQ(f.run(f.native({"--tidy-tools"})).exit_code, 43);
+    EQ(fs::read_symlink(f.checkout / "build/tools"), published);
+    f.options.env.erase("TEST_TOOLS_FAILURE");
+    f.succeeded(f.run(f.native({"--build-tools"})));
+    const auto before_cancel = fs::read_symlink(f.checkout / "build/tools");
+    support::write_text(ready, ""); support::write_text(queued, "");
+    const auto cleanup = f.write("cleanup-ready", "");
+    settings = f.options;
+    settings.env["TEST_TOOLS_HOLD"] = "tidy";
+    settings.env["TEST_TOOLS_READY"] = ready.string();
+    settings.env["TEST_TOOLS_CLEANUP_READY"] = cleanup.string();
+    Child cancelled(f.native({"--tidy-tools"}), settings, f.root / "tidy-cancel.log", true);
+    wait_ready_file(ready);
+    EQ(::kill(cancelled.pid(), SIGTERM), 0);
+    wait_ready_file(cleanup);
+    const auto count = f.invocations().size();
+    settings = f.options;
+    settings.env["TEST_TOOLS_ADMISSION"] = queued.string();
+    Child after_cancel(f.bootstrap("--build"), settings, f.root / "after-cancel.log");
+    wait_ready_file(queued);
+    EQ(f.invocations().size(), count);
+    EQ(fs::read_symlink(f.checkout / "build/tools"), before_cancel);
+    f.release(cancelled);
+    EQ(cancelled.wait(20), 143); EQ(after_cancel.wait(20), 0);
+}
+int tools_handoff_state() {
+    const fs::path root = support::env("TEST_BOOTSTRAP_ROOT");
+    check_tools_handoff_consumed(root);
+    support::FileDescriptor lock(::open((root / ".cache/locks/tools.lock").c_str(), O_RDWR | O_CLOEXEC));
+    CHECK(lock.get() >= 0);
+    EQ(::flock(lock.get(), LOCK_EX | LOCK_NB), 0);
+    FALSE(fs::exists(root / ".cache/locks/checkout.lock"));
+    return 0;
+}
+void test_tools_cold_root_ownership_handoff() {
+    EQ(::getuid(), 0U);
+    const auto* selected = ::getpwnam("nobody");
+    CHECK(selected != nullptr); NE(selected->pw_uid, 0U);
+    const auto uid = selected->pw_uid;
+    const auto gid = selected->pw_gid;
+    const auto identity = std::to_string(uid) + ':' + std::to_string(gid);
+    const auto permission = fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read | fs::perms::others_exec;
+    for (const bool internal : {false, true}) {
+        NativeToolsFixture f;
+        fs::permissions(f.root, permission);
+        fs::permissions(f.checkout / "mmltk", permission);
+        fs::permissions(f.checkout / "tools/bootstrap_mmltk.sh", permission);
+        fs::permissions(f.calls, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::group_write | fs::perms::others_read | fs::perms::others_write);
+        f.options.env["MMLTK_USER"] = internal ? "nobody" : std::to_string(uid);
+        f.options.env["MMLTK_CACHE_ROOT"] = ".cache/selected/tools-owner";
+        const auto cache = f.checkout / ".cache/selected/tools-owner/cmake/tools";
+        const auto launch = plus({(f.checkout / "mmltk").string()}, internal ?
+            Strings{"--tool", "test-log-query", "--", "--fixture-tools-state"} : Strings{"--tidy-tools"});
+        f.succeeded(f.run(launch));
+        auto owner = [&](const fs::path& path, uid_t expected_uid, gid_t expected_gid) {
+            struct stat metadata{};
+            EQ(::lstat(path.c_str(), &metadata), 0);
+            EQ(metadata.st_uid, expected_uid); EQ(metadata.st_gid, expected_gid);
+            return metadata.st_mode & 0777;
+        };
+        EQ(owner(f.checkout / ".cache/locks/tools.lock", uid, gid), 0664U);
+        for (const auto& path : {cache, f.checkout / "build", f.checkout / "build/.tools-generations", f.checkout / "build/tools"}) owner(path, uid, gid);
+        for (const auto& entry : fs::recursive_directory_iterator(cache)) owner(entry.path(), uid, gid);
+        const auto generation = fs::read_symlink(f.checkout / "build/tools");
+        for (const auto& entry : fs::recursive_directory_iterator(f.checkout / "build" / generation)) owner(entry.path(), uid, gid);
+        // Native repair is confined to tools resources, including in a cache subroot.
+        owner(f.checkout / "tools/input.cpp", 0, ::getgid());
+        if (internal) {
+            FALSE(fs::exists(f.checkout / ".cache/locks/checkout.lock"));
+            f.succeeded(f.run(f.native({"--tidy-tools"})));
+        }
+        EQ(f.invocations().front()["user"], "0:" + std::to_string(::getgid()));
+        EQ(f.invocations().back()["kind"], "tidy");
+        EQ(f.invocations().back()["user"], identity);
+        CHECK(fs::exists(cache / "tidy-object"));
+        f.succeeded(f.run(f.native({"--build-tools"})));
+        EQ(f.invocations().back()["user"], identity);
+        const auto before_nonroot = fs::read_symlink(f.checkout / "build/tools");
+        auto unprivileged = support::command::self_invocation(support::command::Command::test_log_query,
+            plus({"--fixture-tools-user", identity}, {(f.checkout / "native").string(), "--build-tools"}));
+        f.succeeded(f.run(unprivileged));
+        EQ(f.invocations().back()["user"], identity);
+        NE(fs::read_symlink(f.checkout / "build/tools"), before_nonroot);
+        CHECK(fs::exists(f.checkout / "build" / generation / "mmltk"));
+        // A warm read-only invocation does not repair ownership or rebuild tools.
+        const auto lock_path = f.checkout / ".cache/locks/tools.lock";
+        EQ(::chown(lock_path.c_str(), 0, ::getgid()), 0);
+        EQ(::chmod(lock_path.c_str(), 0600), 0);
+        const auto count = f.invocations().size();
+        f.succeeded(f.run({(f.checkout / "mmltk").string(), "--logs", "--help"}));
+        EQ(f.invocations().size(), count);
+        EQ(owner(lock_path, 0, ::getgid()), 0600U);
+        f.options.env["MMLTK_USER"] = "mmltk-user-that-does-not-exist";
+        f.succeeded(f.run({(f.checkout / "mmltk").string(), "--tool", "runtime-package", "--", "inventory"}));
+    }
+}
+void test_tools_ownership_selection_keeps_normal_fixture_restrictions() {
+    WrapperFixture f(R"SH(#!/bin/sh
+case "$1" in
+ version|image) printf 'fixture-image\n';;
+ run) printf '%s\n' "$@" >"${TEST_TOOLS_CONTAINER_ARGS}";;
+esac
+)SH");
+    const auto calls = f.write("container-arguments", "");
+    f.options.env["TEST_TOOLS_CONTAINER_ARGS"] = calls.string();
+    for (const bool ownership : {false, true}) {
+        const auto result = f.invoke({"--test", "log-query-tool", ownership ? "--tools-ownership" : "--list-tests"});
+        if (result.exit_code) throw Failure(result.err);
+        const auto arguments = support::lines(support::read_text(calls));
+        auto option = [&](std::string_view name) {
+            const auto found = std::find(arguments.begin(), arguments.end(), name);
+            CHECK(found != arguments.end() && std::next(found) != arguments.end());
+            return *std::next(found);
+        };
+        EQ(option("--cap-drop"), "ALL");
+        EQ(option("--security-opt"), "no-new-privileges");
+        EQ(option("--network"), "none");
+        EQ(option("--volume"), f.root.string() + ":/workspace:ro");
+        CHECK(std::find(arguments.begin(), arguments.end(), "--read-only") != arguments.end());
+        EQ(option("--tmpfs"), "/tmp:rw,exec,nosuid,nodev,size=32m");
+        Strings capabilities;
+        for (auto found = arguments.begin(); found != arguments.end(); ++found)
+            if (*found == "--cap-add") capabilities.push_back(*++found);
+        EQ(capabilities, ownership ? Strings({"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "KILL"}) : Strings{});
+        if (ownership) EQ(option("--user"), "0:0");
+        EQ(arguments.back(), ownership ? "--tools-ownership" : "--list-tests");
+    }
+    auto ordinary = support::capture(support::command::self_invocation(support::command::Command::test_log_query,
+        {"NativeToolTests.test_tools_cold_root_ownership_handoff"}));
+    EQ(ordinary.exit_code, 2);
+    HAS(ordinary.err, "--tools-ownership");
 }
 
 void family_fixture(FileFixture& f) {
@@ -1718,6 +2066,11 @@ void test_triage_parse_damage_is_bounded_evidence_and_strict_remains_strict() {
 constexpr Case cases[]{
     {"NativeToolTests.test_bootstrap_atomic_publication_concurrency_and_spaces", test_bootstrap_atomic_publication_concurrency_and_spaces},
     {"NativeToolTests.test_tools_tidy_grouped_selection_and_module_resume", test_tools_tidy_grouped_selection_and_module_resume},
+    {"NativeToolTests.test_tools_tidy_waits_for_bootstrap_database_publication", test_tools_tidy_waits_for_bootstrap_database_publication},
+    {"NativeToolTests.test_bootstrap_waits_for_tidy_recomputes_inputs_and_shares_cache_subroots", test_bootstrap_waits_for_tidy_recomputes_inputs_and_shares_cache_subroots},
+    {"NativeToolTests.test_tools_lock_wait_cancellation_and_failure_release", test_tools_lock_wait_cancellation_and_failure_release},
+    {"NativeToolTests.test_tools_cold_root_ownership_handoff", test_tools_cold_root_ownership_handoff, true},
+    {"NativeToolTests.test_tools_ownership_selection_keeps_normal_fixture_restrictions", test_tools_ownership_selection_keeps_normal_fixture_restrictions},
     {"NativeToolTests.test_native_package_inventory_completeness_and_stable_archive_identity", test_native_package_inventory_completeness_and_stable_archive_identity},
     {"NativeToolTests.test_native_compiler_launcher_preserves_arguments_cache_and_status", test_native_compiler_launcher_preserves_arguments_cache_and_status},
     {"ParserTests.test_boolean_precedence_implicit_and_and_quoted_terms", test_boolean_precedence_implicit_and_and_quoted_terms},
@@ -1914,6 +2267,13 @@ int mmltk::log_query::test_entry(int argc, char** argv) {
     using namespace log_query_test;
     try {
         if (argc > 1 && std::string_view(argv[1]) == "--fixture-runtime-docker") return runtime_docker(Strings(argv + 2, argv + argc));
+        if (argc > 1 && std::string_view(argv[1]) == "--fixture-tools-docker") return tools_docker(Strings(argv + 2, argv + argc));
+        if (argc == 2 && std::string_view(argv[1]) == "--fixture-tools-state") return tools_handoff_state();
+        if (argc > 3 && std::string_view(argv[1]) == "--fixture-tools-user") {
+            tools_fixture_user(argv[2]);
+            ::execv(argv[3], argv + 3);
+            throw std::system_error(errno, std::generic_category(), "exec fixture as tools user");
+        }
         if (argc > 1 && std::string_view(argv[1]) == "--fixture-pause") {
             if (argc > 2 && std::string_view(argv[2]) == "ignore-term") ::signal(SIGTERM, SIG_IGN);
             std::cout << "ready" << std::endl; for (;;) ::pause();
@@ -1922,13 +2282,16 @@ int mmltk::log_query::test_entry(int argc, char** argv) {
             for (const auto& test : cases) std::cout << test.name << '\n';
             return 0;
         }
+        const bool tools_ownership = argc == 2 && std::string_view(argv[1]) == "--tools-ownership";
         std::size_t failed = 0, ran = 0;
         for (const auto& test : cases) {
-            bool selected = argc == 1;
+            bool selected = tools_ownership ? test.tools_ownership : argc == 1 && !test.tools_ownership;
             for (int index = 1; index < argc; ++index)
                 selected = selected || test.name == argv[index] ||
-                    (std::string_view(argv[index]).find('.') == std::string_view::npos && contains(test.name, argv[index]));
+                    (!test.tools_ownership && std::string_view(argv[index]).find('.') == std::string_view::npos && contains(test.name, argv[index]));
             if (!selected) continue;
+            if (test.tools_ownership && !tools_ownership)
+                throw Failure("tools ownership coverage requires ./mmltk --test log-query-tool --tools-ownership");
             ++ran;
             try { test.run(); std::cout << "[ OK ] " << test.name << '\n'; }
             catch (const std::exception& error) { ++failed; std::cerr << "[ FAILED ] " << test.name << ": " << error.what() << '\n'; }

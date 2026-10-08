@@ -211,6 +211,77 @@ struct Fd {
   if (value >= 0) close(std::exchange(value, -1));
  }
 };
+struct ContainerUser {
+ uid_t uid = getuid();
+ gid_t gid = getgid();
+ std::string target;
+};
+template<class Capture> ContainerUser resolve_container_user(Capture&& capture) {
+ ContainerUser selected;
+ if (selected.uid != 0) return selected;
+ selected.target = env("MMLTK_USER");
+ if (!selected.target.empty()) {
+  selected.uid = static_cast<uid_t>(std::stoul(capture(Args{"id", "-u", selected.target})));
+  selected.gid = static_cast<gid_t>(std::stoul(capture(Args{"id", "-g", selected.target})));
+ } else {
+  for (const auto& line : support::lines(read_text("/etc/passwd"))) {
+   const auto fields = support::split(line, ':');
+   if (fields.size() < 7) continue;
+   if (std::stoul(fields[2]) >= 1000 && !fields[6].ends_with("/nologin") && !fields[6].ends_with("/false")) {
+    selected.target = fields[0];
+    selected.uid = static_cast<uid_t>(std::stoul(fields[2]));
+    selected.gid = static_cast<gid_t>(std::stoul(fields[3]));
+    break;
+   }
+  }
+ }
+ return selected;
+}
+std::optional<ContainerUser> consume_bootstrap_handoff() {
+ const auto descriptor = env("MMLTK_BOOTSTRAP_LOCK_FD");
+ const auto checkout = env("MMLTK_BOOTSTRAP_CHECKOUT");
+ const auto cache = env("MMLTK_BOOTSTRAP_CACHE");
+ const auto stage = env("MMLTK_BOOTSTRAP_STAGE");
+ for (const auto* name : {"MMLTK_BOOTSTRAP_LOCK_FD", "MMLTK_BOOTSTRAP_CHECKOUT", "MMLTK_BOOTSTRAP_CACHE", "MMLTK_BOOTSTRAP_STAGE"}) unsetenv(name);
+ if (descriptor.empty()) return {};
+ require(matches(descriptor, "[0-9]+"), "invalid bootstrap lock descriptor");
+ const int raw = std::stoi(descriptor);
+ require(raw > STDERR_FILENO, "invalid bootstrap lock descriptor");
+ Fd lock(raw);
+ require(fcntl(lock.value, F_SETFD, FD_CLOEXEC) == 0, "cannot adopt bootstrap lock descriptor");
+ require(!checkout.empty() && fs::canonical(checkout) == fs::path(checkout) &&
+         within(cache, checkout + "/.cache") && fs::weakly_canonical(cache) == fs::path(cache) &&
+         parent(stage) == checkout + "/build/.tools-generations" && fs::is_directory(stage), "invalid bootstrap tools paths");
+ const auto lock_path = checkout + "/.cache/locks/tools.lock";
+ struct stat inherited{}, expected{};
+ require(fstat(lock.value, &inherited) == 0 && stat(lock_path.c_str(), &expected) == 0 &&
+         S_ISREG(inherited.st_mode) && inherited.st_dev == expected.st_dev && inherited.st_ino == expected.st_ino &&
+         flock(lock.value, LOCK_EX | LOCK_NB) == 0, "invalid bootstrap tools lock");
+ const auto selected = resolve_container_user([](const Args& args) {
+  support::RunOptions options;
+  options.capture_stdout = true;
+  const auto result = support::run(args, options);
+  if (result.exit_code) throw Exit{result.exit_code};
+  return mmltk::tools::text::trim_newlines(result.out);
+ });
+ auto own = [&](const fs::path& path) {
+  struct stat metadata{};
+  require(lstat(path.c_str(), &metadata) == 0, "cannot inspect bootstrap tools path '" + path.string() + "'");
+  if ((metadata.st_uid != selected.uid || metadata.st_gid != selected.gid) && lchown(path.c_str(), selected.uid, selected.gid) != 0)
+   die("cannot own bootstrap tools path '" + path.string() + "': " + std::strerror(errno));
+ };
+ for (auto path = fs::path(cache) / "cmake"; within(path.string(), checkout + "/.cache"); path = path.parent_path()) own(path);
+ for (const auto& path : {checkout + "/.cache/locks", lock_path, checkout + "/build", checkout + "/build/.tools-generations", checkout + "/build/tools"}) own(path);
+ require(fchmod(lock.value, 0664) == 0, "cannot set bootstrap tools lock permissions");
+ for (const auto& tree : {cache + "/cmake/tools", stage}) {
+  require(fs::canonical(tree) == fs::path(tree), "bootstrap tools tree must remain inside its owned path: " + tree);
+  own(tree);
+  for (const auto& entry : fs::recursive_directory_iterator(tree)) own(entry.path());
+ }
+ // Closing the inherited open-file description releases admission before the
+ // wrapper takes checkout/cache locks; no child inherits the descriptor.
+ return selected;
+}
 Fd anonymous_file() {
  std::string pattern = env("TMPDIR", "/tmp") + "/mmltk-native.XXXXXX";
  int fd = mkstemp(pattern.data());
@@ -292,7 +363,9 @@ class Wrapper {
  std::string gui_platform, gui_runtime = "/tmp/mmltk-gui-runtime", wayland_host, wayland_container, dbus_host, dbus_container, runtime_label;
  std::string trace_file, ccache_stats, sccache_stats, container_trace, container_ccache_stats, container_sccache_stats, firefox_trace, container_firefox_trace;
  std::string operation_log, test_registration, runtime_registration;
- Fd checkout_lock, cache_lock, runtime_lock, saved_stdout, saved_stderr;
+ // Tools admission survives exceptional child exits until finish settles the
+ // owned container; a stack-local lock would unlock before cancellation.
+ Fd checkout_lock, cache_lock, runtime_lock, tools_stage_lock, saved_stdout, saved_stderr;
  std::vector<pid_t> log_pids;
  std::vector<Child> processes, build_children;
  std::vector<std::pair<std::string, std::string>> daemon_mounts;
@@ -521,6 +594,7 @@ class Wrapper {
  Fd lock_file(const std::string& path, int flags, const std::string& error = {}) {
   prepare_lock(path);
   Fd fd(open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC));
+  interrupted();
   while (flock(fd.value, flags) != 0) {
    if (errno == EINTR) {
     interrupted();
@@ -528,6 +602,7 @@ class Wrapper {
    }
    die(error.empty() ? "cannot lock '" + path + "'" : error);
   }
+  interrupted();
   return fd;
  }
  void acquire_mutation() {
@@ -1665,7 +1740,7 @@ class Wrapper {
   const auto result = owned_container(name, [&] {
    return run({"bash", repo + "/tools/bootstrap_mmltk.sh", force ? "--build" : "--ensure", repo},
        {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}, {"MMLTK_BOOTSTRAP_CONTAINER", name},
-                        {"MMLTK_BOOTSTRAP_OWNER_PID", std::to_string(wrapper_pid)}}});
+                        {"MMLTK_BOOTSTRAP_OWNER_PID", std::to_string(wrapper_pid)}, {"MMLTK_BOOTSTRAP_USER", user()}}});
   });
   if (result.status) throw Exit{result.status};
  }
@@ -1762,6 +1837,7 @@ class Wrapper {
   auto standalone_source = [&](const std::string& path) {
    if (!path.starts_with("tools/")) return false;
    if (!registered_tools) {
+    const auto tools_lock = lock_file(repository_cache + "/locks/tools.lock", LOCK_EX);
     registered_tools.emplace();
     const auto database = cache + "/cmake/tools/compile_commands.json";
     require(fs::is_regular_file(database), "tools compile database is missing; run ./mmltk --build-tools");
@@ -1805,6 +1881,8 @@ class Wrapper {
   const auto tool_options = selection_options(tool_files, true), product_options = selection_options(product_files, false);
   if (!rust_only && !only_product_resume && (!files || !tool_files.empty())) {
    must({"bash", repo + "/tools/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
+   tools_stage_lock = lock_file(repository_cache + "/locks/tools.lock", LOCK_EX);
+   owned_dirs({cache, cmake, cmake + "/tools"});
    Args args{"run", "--rm", "--init", "-i", "--name", tidy_container, "--user", user(),
      "--volume", repo + ":/workspace:rw", "--workdir", "/workspace", "--env", "HOME=/tmp",
      "--env", "MMLTK_REPO_ROOT=/workspace", "--env", "MMLTK_TIDY_BUILD_DIR=" + container_cache + "/cmake/tools",
@@ -1815,6 +1893,7 @@ class Wrapper {
    append(args, tail(tool_arguments(Command::run_static_analysis, {"--tools-only"})));
    append(args, tool_options);
    owned_docker_must(tidy_container, args);
+   tools_stage_lock.reset();
   }
   if (tidy_tools || (files && product_files.empty())) { release_mutation(); return; }
   ensure_docker();
@@ -1902,16 +1981,19 @@ class Wrapper {
  }
  int log_tool(bool fixture, const Args& arguments) {
   require(repo.find(':') == std::string::npos, "--logs repository path cannot contain ':'");
+  const bool tools_ownership = fixture && arguments == Args{"--tools-ownership"};
   const auto id = existing_diagnostic_image(build_image, "docker daemon is unavailable; log tooling did not start", "log tooling requires existing image '" + build_image + "'; no image was built or pulled");
   const auto name = container_name + "-logs";
   Args args{"run", "--rm", "--init", "--name", name, "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--network", "none", "--user",
-    user(), "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "MMLTK_LOG_HOST_ROOT=" + repo, "--volume", repo + ":/workspace:ro", "--workdir", "/workspace",
+    tools_ownership ? "0:0" : user(), "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "MMLTK_LOG_HOST_ROOT=" + repo, "--volume", repo + ":/workspace:ro", "--workdir", "/workspace",
     "--entrypoint", "/workspace/build/tools/mmltk"};
   labels(args, mode);
   if (fixture) {
    append(args, {"--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=32m"});
+   if (tools_ownership)
+    for (const auto* capability : {"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "KILL"}) append(args, {"--cap-add", capability});
    for (const auto& item : arguments)
-    require(item == "--list-tests" || matches(item, "[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*"), "--test log-query-tool expects Class.test_method selectors");
+    require(tools_ownership || item == "--list-tests" || matches(item, "[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*"), "--test log-query-tool expects Class.test_method selectors or the standalone --tools-ownership option");
   }
   args.push_back(id);
   auto invocation = tool_arguments(fixture ? Command::test_log_query : Command::log_query, arguments);
@@ -2792,7 +2874,7 @@ cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" --parallel "${MMLTK_JOBS
    "--build, --build-tools, --tidy-tools, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --update-firefox-lock, --test, --tidy, --cleanup-report, --diagnose-io, --diagnose-nvidia-payload, and --diagnose-gpu-environment are standalone");
  }
 public:
- Wrapper(int argc, char** argv) {
+ Wrapper(int argc, char** argv, std::optional<ContainerUser> bootstrap_user = {}) {
   original.assign(argv + 1, argv + argc);
   repo = support::repository_root(argv[0]).string();
   self = support::executable_path().string();
@@ -2841,26 +2923,12 @@ public:
   trace_file = env("MMLTK_BUILD_TRACE_FILE");
   ccache_stats = env("MMLTK_CCACHE_STATS_FILE");
   sccache_stats = env("MMLTK_FIREFOX_SCCACHE_STATS_FILE");
-  if (uid == 0) {
-   std::string target = env("MMLTK_USER");
-   if (!target.empty()) {
-    uid = static_cast<uid_t>(std::stoul(get({"id", "-u", target})));
-    gid = static_cast<gid_t>(std::stoul(get({"id", "-g", target})));
-   }
-   else {
-    for (const auto& line : support::lines(read_text("/etc/passwd"))) {
-     const auto fields = support::split(line, ':');
-     if (fields.size() < 7) continue;
-     if (std::stoul(fields[2]) >= 1000 && !fields[6].ends_with("/nologin") && !fields[6].ends_with("/false")) {
-      target = fields[0];
-      uid = static_cast<uid_t>(std::stoul(fields[2]));
-      gid = static_cast<gid_t>(std::stoul(fields[3]));
-      break;
-     }
-    }
-   }
-   if (target.empty()) log("warning: running as root, no real user found (set MMLTK_USER to override)");
-   else quiet_log("running as root, resolved container user to " + target + " (" + user() + ")");
+  const auto selected = bootstrap_user ? std::move(*bootstrap_user) : resolve_container_user([&](const Args& args) { return get(args); });
+  uid = selected.uid;
+  gid = selected.gid;
+  if (getuid() == 0) {
+   if (selected.target.empty()) log("warning: running as root, no real user found (set MMLTK_USER to override)");
+   else quiet_log("running as root, resolved container user to " + selected.target + " (" + user() + ")");
   }
   const auto hash = sha(repo).substr(0, 12);
   base_name = env("MMLTK_CONTAINER_NAME", "mmltk-" + hash);
@@ -3100,6 +3168,7 @@ public:
     cleanup_failure();
    }
   }
+  tools_stage_lock.reset();
   release_runtime();
   release_mutation();
   return status;
@@ -3108,11 +3177,12 @@ public:
 } // namespace
 
 int main(int argc, char** argv) {
- if (argc > 1 && std::string_view(argv[1]) == "--tool")
-  return mmltk::tools::command::entry(argc - 2, argv + 2);
- install_signals();
  try {
-  Wrapper wrapper(argc, argv);
+  auto bootstrap_user = consume_bootstrap_handoff();
+  if (argc > 1 && std::string_view(argv[1]) == "--tool")
+   return mmltk::tools::command::entry(argc - 2, argv + 2);
+  install_signals();
+  Wrapper wrapper(argc, argv, std::move(bootstrap_user));
  int status = 0;
   try {
   status = wrapper.execute();
