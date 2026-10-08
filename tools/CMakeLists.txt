@@ -91,7 +91,7 @@ if(MMLTK_TOOLS_BUILD_DRIVER)
     PRIVATE FILE_SET internal_modules TYPE CXX_MODULES FILES
         log_query_internal.cpp
         tests/test_log_query.cpp)
-    target_sources(mmltk_tool_modules PRIVATE tool_dispatch.cpp)
+    target_sources(mmltk_tool_modules PRIVATE tool_dispatch.cpp log_query_runtime.cpp)
     target_link_libraries(mmltk_tool_modules PUBLIC mmltk_tool_support
         Boost::headers tomlplusplus::tomlplusplus ICU::uc ICU::i18n PkgConfig::PCRE2 LibArchive::LibArchive ${CMAKE_DL_LIBS})
     # CUDA, Vulkan and NUMA contribute declarations only. Runtime observation

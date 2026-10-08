@@ -17,7 +17,6 @@ module;
 #include <string_view>
 #include <utility>
 export module mmltk.tools.diagnose_coconut_mask;
-
 using Json = nlohmann::json;
 template <class T>
 T take(arrow::Result<T> result) {
@@ -87,7 +86,6 @@ void inspect(std::string_view encoded, std::uint64_t id, Json metadata, bool exp
  }
  std::cout << metadata.dump() << '\n';
 }
-
 export int mmltk_tool_diagnose_coconut_mask(int argc, char** argv) try {
  if (argc != 5) throw std::runtime_error("expected mode, file, image ID, export flag");
  const std::string mode = argv[1], path = argv[2];

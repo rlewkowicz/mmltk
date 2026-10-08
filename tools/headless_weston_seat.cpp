@@ -3,9 +3,7 @@ module;
 #include <libweston/libweston.h>
 #include <memory>
 #include <new>
-
 export module mmltk.tools.headless_weston_seat;
-
 // These exported functions are private in Weston 13. The builder and runtime
 // packages must retain the identical version pinned in the validation image.
 // Declarations: wayland/weston tag 13.0.0, libweston/libweston-internal.h.
@@ -17,7 +15,6 @@ int weston_seat_init_pointer(weston_seat*);
 int weston_seat_init_keyboard(weston_seat*, xkb_keymap*);
 void weston_seat_release(weston_seat*);
 }
-
 namespace {
 class HeadlessSeat final {
 public:

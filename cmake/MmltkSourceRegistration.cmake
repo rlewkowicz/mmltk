@@ -147,6 +147,7 @@ function(mmltk_register_retained_module_providers target)
     target_sources("${target}" "${_mmltk_visibility}"
         FILE_SET "mmltk_${_mmltk_file_set_visibility}_modules"
         TYPE CXX_MODULES
+        BASE_DIRS "${CMAKE_SOURCE_DIR}"
         FILES ${_mmltk_modules})
 endfunction()
 
