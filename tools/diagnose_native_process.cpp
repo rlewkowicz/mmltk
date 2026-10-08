@@ -206,9 +206,11 @@ int backtrace(pid_t pid) {
 
 int diagnose(const Arguments& args) {
     std::vector<pid_t> matches;
+    const auto inspector = std::to_string(::getpid());
     for (const auto& entry : fs::directory_iterator("/proc")) {
         const auto name = entry.path().filename().string();
         if (name.empty() || name.find_first_not_of("0123456789") != name.npos) continue;
+        if (name == inspector) continue;
         std::error_code error;
         const auto executable = fs::canonical(entry.path() / "exe", error);
         if (error) {

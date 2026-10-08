@@ -3,7 +3,10 @@ module;
 // and trusted annotation views stay with the Dataset system's ordinary headers.
 #include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/concurrency/worker_pool.h"
+#include "src/common/io/file_memory.h"
+#include "src/common/system/execution_policy.h"
 #include <array>
 #include <charconv>
 #include <chrono>

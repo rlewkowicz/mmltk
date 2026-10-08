@@ -12,6 +12,7 @@ module;
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -47,6 +48,7 @@ module;
 #include <pwd.h>
 #include <spawn.h>
 #include <sys/file.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -1127,12 +1129,12 @@ public:
         do { ready = ::poll(&watch, 1, seconds * 1000); } while (ready < 0 && errno == EINTR); CHECK(ready > 0); auto result = poll(); CHECK(result); return *result;
     }
 };
-void wait_ready_file(const fs::path& path) {
+void wait_ready_file(const fs::path& path, int seconds = 5) {
     support::FileDescriptor notifications(::inotify_init1(IN_CLOEXEC));
     CHECK(notifications.get() >= 0);
-    CHECK(::inotify_add_watch(notifications.get(), path.c_str(), IN_MODIFY | IN_CLOSE_WRITE) >= 0);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (support::read_text(path).empty()) {
+    CHECK(::inotify_add_watch(notifications.get(), path.parent_path().c_str(), IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO) >= 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (!fs::exists(path) || support::read_text(path).empty()) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
         CHECK(remaining > 0);
         pollfd watched{notifications.get(), POLLIN, 0};
@@ -1282,17 +1284,27 @@ void test_native_compiler_launcher_preserves_arguments_cache_and_status() {
     EQ(support::run(support::command::self_invocation(support::command::Command::module_safe_compiler_launcher, {compiler.string(), "-fmodules"}), options).exit_code, 47);
     EQ(support::run(support::command::self_invocation(support::command::Command::module_safe_compiler_launcher), options).exit_code, 2);
 }
-void test_native_package_inventory_completeness_and_stable_archive_identity() {
-    namespace package = mmltk::tools::runtime_package;
-    FileFixture f;
-    const auto root = f.root / "package";
-    for (const auto& row : package::inventory()) {
+void populate_package(const fs::path& root) {
+    for (const auto& row : support::runtime_package::inventory()) {
         fs::create_directories(root / row.path);
         for (auto entry : row.entries) if (!entry.starts_with('?'))
             support::write_text(root / row.path / entry, "payload\n");
     }
+}
+void test_native_package_inventory_completeness_and_stable_archive_identity() {
+    namespace package = mmltk::tools::runtime_package;
+    FileFixture f;
+    const auto root = f.root / "package";
+    populate_package(root);
     CHECK(package::complete(root));
     const auto initial = package::fingerprint(root);
+    EQ(support::capture(support::command::self_invocation(support::command::Command::runtime_package,
+        {"fingerprint", root.string()})).out, initial + '\n');
+    for (const auto& path : {root / "bin", root / "missing", root / "bin/mmltk"}) {
+        const auto result = support::capture(support::command::self_invocation(support::command::Command::runtime_package,
+            {"path-fingerprint", path.string()}));
+        EQ(result.exit_code, 0); EQ(result.out, package::path_fingerprint(path) + '\n');
+    }
     const auto moved = f.root / "moved package";
     fs::rename(root, moved);
     EQ(package::fingerprint(moved), initial);
@@ -1315,6 +1327,348 @@ void test_native_package_inventory_completeness_and_stable_archive_identity() {
     EQ(result.out, expected);
     fs::remove(moved / "models/ShiftLUT_fp32.onnx");
     FALSE(package::complete(moved));
+}
+
+// Only the external daemon is simulated. The wrapper still performs admission,
+// hashing, child ownership, package publication and image-label verification.
+int package_docker(const Strings& args) {
+    CHECK(!args.empty());
+    const fs::path root = support::env("TEST_PACKAGE_ROOT");
+    const auto option = [&](std::string_view name) {
+        const auto it = std::find(args.begin(), args.end(), name);
+        return it == args.end() || std::next(it) == args.end() ? std::string{} : *std::next(it);
+    };
+    const auto image_file = [&](const std::string& tag) { return root / "images" / (tag + ".json"); };
+    const auto identity = "sha256:" + std::string(64, '1');
+    if (args[0] == "image") {
+        const auto format = option("--format");
+        if (format == "{{.Id}}") std::cout << identity << '\n';
+        else if (format == "{{.Os}}/{{.Architecture}}") std::cout << "linux/amd64\n";
+        else if (!format.empty() && fs::exists(image_file(args.at(2)))) {
+            const auto labels = support::read_json(image_file(args.at(2)));
+            for (auto it = labels.begin(); it != labels.end(); ++it)
+                if (contains(format, "\"com.mmltk." + it.key() + "\"")) std::cout << it.value().get<std::string>() << '\n';
+        }
+    } else if (args[0] == "buildx" && args.at(1) == "inspect") {
+        std::cout << "Driver: " << (args.at(2) == "default" ? "docker" : "docker-container") << '\n';
+    } else if (args[0] == "buildx" && args.at(1) == "build") {
+        J labels = J::object();
+        const auto file = fs::path(option("--file")).filename().string();
+        if (file == "Dockerfile.runtime") labels = support::read_json(image_file("mmltk-runtime-base:latest"));
+        for (std::size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == "--build-arg") {
+            const auto assignment = args[++i];
+            const auto equals = assignment.find('=');
+            auto key = assignment.substr(6, equals - 6);
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return c == '_' ? '-' : static_cast<char>(std::tolower(c)); });
+            if (key == "image-fingerprint") key = "input-fingerprint";
+            if (key == "nvidia-donor-image") key = "nvidia-donor";
+            labels[key] = assignment.substr(equals + 1);
+        }
+        if (file == "Dockerfile.ubuntu") labels["ubuntu-source-identity"] = labels["ubuntu-identity"];
+        if (file == "Dockerfile.nvidia") labels["payload-mode"] = "extraction";
+        if (file == "Dockerfile.toolchain") labels["payload-mode"] = "development";
+        if (file == "Dockerfile.runtime-base") labels["payload-mode"] = "runtime";
+        support::write_json(image_file(option("--tag")), labels);
+    } else if (args[0] == "run") {
+        const auto name = option("--name");
+        support::write_json(root / "containers" / (name + ".json"), args);
+        if (name.ends_with("-build-package")) {
+            const auto stage = root / "build/release.next";
+            fs::remove_all(stage);
+            populate_package(stage);
+            for (const auto& argument : args) if (argument.starts_with("MMLTK_PACKAGE_FINGERPRINT="))
+                support::write_text(stage / ".mmltk-package-fingerprint", argument.substr(26) + '\n');
+        }
+        if (name.ends_with("-upstream")) return 41; // Stop before native numerical comparisons.
+    } else if (args[0] != "version" && args[0] != "rm" && args[0] != "ps" && args[0] != "tag" && args[0] != "buildx")
+        throw Failure("unexpected package Docker operation: " + args[0]);
+    return 0;
+}
+
+struct PackageFixture : WrapperFixture {
+    PackageFixture() : WrapperFixture("#!/bin/sh\nexec " + support::command::shell_invocation(
+        support::command::Command::test_log_query, {"--fixture-package-docker"}) + " \"$@\"\n") {
+        options.env["TEST_PACKAGE_ROOT"] = root.string();
+        options.env["PWD"] = root.string();
+        options.env["MMLTK_USER"] = std::to_string(::getuid());
+        options.timeout = std::chrono::seconds(45);
+        fs::create_directory_symlink(repository() / "docker", root / "docker");
+        for (const auto& entry : fs::directory_iterator(repository() / "tools"))
+            if (entry.path().filename() != "bootstrap_mmltk.sh") fs::create_symlink(entry.path(), root / "tools" / entry.path().filename());
+        write("tools/bootstrap_mmltk.sh", "#!/bin/sh\nexit 0\n");
+        write("build/tools/.inputs.sha256", "fixture tools\n");
+        fs::create_symlink(support::executable_path(), root / "build/tools/mmltk");
+        for (const auto* path : {"src/entrypoints/desktop/firefox_runtime_build.cmake", "src/entrypoints/desktop/build_firefox_runtime.sh",
+                "src/entrypoints/desktop/firefox_runtime_files.txt", "src/frontend/iced/wasm-opt-wrapper"}) write(path, "fixture\n");
+        write(".cache/cmake/release/build.ninja", "build mmltk_frontend_iced_bundle: phony\n");
+        write(".cache/cmake/release/CMakeCache.txt", "BUILD_MMLTK_BROWSER_HOST:BOOL=ON\nBUILD_MMLTK_FIREFOX_RUNTIME:BOOL=ON\n");
+        for (const auto& row : support::runtime_package::inventory()) {
+            fs::path source;
+            if (row.source_kind == "release") source = root / ".cache/cmake/release";
+            else if (row.source_kind == "repository") source = root / row.source_path;
+            else if (row.source_kind == "firefox") source = root / ".cache/firefox/obj-minimal-opt/dist/firefox";
+            else if (row.source_kind == "browser") source = root / ".cache/cmake/release/frontend/iced/dist";
+            else continue;
+            fs::create_directories(source);
+            for (auto entry : row.entries) if (!entry.starts_with('?')) support::write_text(source / entry, "payload\n");
+        }
+        write(".cache/cmake/release/generated/frontend/iced/browser_protocol.marker", "marker\n");
+        for (const auto* directory : {"images", "containers", "descendants", "upstream/.git"}) fs::create_directories(root / directory);
+        auto git = write("bin/git", R"SH(#!/bin/sh
+case "$*" in
+ *--absolute-git-dir*|*--git-common-dir*) printf '%s/upstream/.git\n' "$TEST_PACKAGE_ROOT";;
+ *'rev-parse HEAD') printf 'e9a138f70cc14e3fddca029a0683055e34ab8f35\n';;
+ *rev-parse*) printf 'fixture-tree\n';;
+esac
+)SH");
+        fs::permissions(git, fs::perms::owner_all);
+        for (const auto* role : {"tar", "sha256sum"}) {
+            auto program = write(std::string("bin/") + role, "#!/bin/sh\nexec " + support::command::shell_invocation(
+                support::command::Command::test_log_query, {"--fixture-package-child", role}) + " \"$@\"\n");
+            fs::permissions(program, fs::perms::owner_all);
+        }
+    }
+    void unchanged_release() {
+        EQ(support::read_text(root / "build/release/sentinel"), "retained\n");
+        FALSE(fs::exists(root / "build/release/.mmltk-package-fingerprint"));
+        FALSE(fs::exists(root / "build/release.previous"));
+        FALSE(fs::exists(root / "images/mmltk.json"));
+    }
+};
+
+int package_child(const Strings& args) {
+    CHECK(!args.empty());
+    const auto parent = ::getppid();
+    const auto command = support::split(support::read_text("/proc/" + std::to_string(parent) + "/cmdline"), '\0', false);
+    const auto selected = std::find(command.begin(), command.end(), "runtime-package");
+    const bool package = selected != command.end() && std::next(selected) != command.end() &&
+        std::find(selected, command.end(), support::env("TEST_PACKAGE_OPERATION")) != command.end();
+    if (package && support::env("TEST_PACKAGE_HOLD") == "1") {
+        const fs::path root = support::env("TEST_PACKAGE_ROOT");
+        const auto record = root / "descendants" / std::to_string(::getpid());
+        support::write_json(record,
+            {{"pid", ::getpid()}, {"parent", parent}, {"role", args[0]}});
+        fs::rename(record, record.string() + ".json");
+        if (args[0] == "tar") support::write_text(support::env("TEST_PACKAGE_READY"), "ready\n");
+        for (;;) ::pause();
+    }
+    if (package && support::env("TEST_PACKAGE_FAIL") == args[0]) {
+        if (args[0] == "sha256sum") {
+            std::array<char, 65536> buffer{};
+            for (;;) {
+                const auto count = ::read(STDIN_FILENO, buffer.data(), buffer.size());
+                if (count < 0 && errno == EINTR) continue;
+                CHECK(count >= 0);
+                if (!count) break;
+            }
+        }
+        std::cerr << "fixture " << args[0] << " failed\n";
+        return args[0] == "tar" ? 46 : 47;
+    }
+    auto invocation = args;
+    invocation[0] = "/usr/bin/" + invocation[0];
+    support::exec(invocation);
+}
+
+void test_package_callers_preserve_status_output_and_publication() {
+    PackageFixture f;
+    f.write("build/release/sentinel", "retained\n");
+    for (const auto* operation : {"path-fingerprint", "fingerprint"}) {
+        f.options.env["TEST_PACKAGE_OPERATION"] = operation;
+        for (const auto* role : {"tar", "sha256sum"}) {
+            f.options.env["TEST_PACKAGE_FAIL"] = role;
+            const auto result = f.invoke({"--build"});
+            EQ(result.exit_code, std::string_view(role) == "tar" ? 46 : 47);
+            HAS(result.err, std::string("fixture ") + role + " failed");
+            HAS(result.err, std::string("runtime-package: runtime package ") + role + " failed (exit ");
+            f.unchanged_release();
+        }
+    }
+    f.options.env.erase("TEST_PACKAGE_FAIL");
+    const auto result = f.invoke({"--build"});
+    if (result.exit_code) throw Failure(result.err);
+    CHECK(support::runtime_package::complete(f.root / "build/release"));
+    FALSE(fs::exists(f.root / "build/release/sentinel"));
+    // The input stored in the image includes the command's exact digest newline.
+    const auto files = support::capture({"sha256sum", (f.root / "docker/Dockerfile.runtime").string(), (f.root / "tools/runtime_package.cpp").string()});
+    EQ(files.exit_code, 0);
+    support::RunOptions hashing;
+    hashing.capture_stdout = true;
+    hashing.input = "mmltk-runtime-image-v6\nsha256:" + std::string(64, '1') + '\n' + files.out +
+        support::runtime_package::fingerprint(f.root / "build/release") + "\nfixture tools";
+    const auto digest = support::run({"sha256sum"}, hashing);
+    EQ(digest.exit_code, 0);
+    EQ(support::read_json(f.root / "images/mmltk.json").at("release-fingerprint"), digest.out.substr(0, 64));
+}
+
+void test_package_callers_cancel_and_reap_archive_and_hash_descendants() {
+    int previous = 0;
+    CHECK(::prctl(PR_GET_CHILD_SUBREAPER, &previous) == 0);
+    CHECK(::prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+    struct Reaper {
+        int previous;
+        std::set<pid_t> descendants;
+        ~Reaper() {
+            for (const auto pid : descendants) ::kill(pid, SIGKILL);
+            for (const auto pid : descendants) while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+            ::prctl(PR_SET_CHILD_SUBREAPER, previous);
+        }
+    } reaper{previous};
+    for (const auto* operation : {"path-fingerprint", "fingerprint"}) for (const auto number : {SIGINT, SIGTERM}) {
+        PackageFixture f;
+        f.write("build/release/sentinel", "retained\n");
+        const auto ready = f.write("package-ready", "");
+        f.options.env["TEST_PACKAGE_OPERATION"] = operation;
+        f.options.env["TEST_PACKAGE_HOLD"] = "1";
+        f.options.env["TEST_PACKAGE_READY"] = ready.string();
+        Child wrapper({f.wrapper.string(), "--build"}, f.options, f.root / "wrapper.log", false, true);
+        wait_ready_file(ready, 45);
+        // The archive cannot start until its HashStreams have spawned. Wait
+        // for their publication as well, even if a hash child has not run yet.
+        const auto archive_records = matching_files(f.root / "descendants", "", ".json");
+        CHECK(!archive_records.empty());
+        const auto helper = support::read_json(archive_records.front()).at("parent").get<pid_t>();
+        const auto children = support::split(support::trim(support::read_text("/proc/" + std::to_string(helper) +
+            "/task/" + std::to_string(helper) + "/children")), ' ', false);
+        EQ(children.size(), std::string_view(operation) == "fingerprint" ? 3U : 2U);
+        for (const auto& child : children) wait_ready_file(f.root / "descendants" / (child + ".json"));
+        std::set<std::string> roles;
+        std::set<pid_t> helpers;
+        for (const auto& file : matching_files(f.root / "descendants", "", ".json")) {
+            const auto process = support::read_json(file);
+            const auto pid = process.at("pid").get<pid_t>();
+            CHECK(::kill(pid, 0) == 0);
+            reaper.descendants.insert(pid);
+            helpers.insert(process.at("parent").get<pid_t>());
+            roles.insert(process.at("role").get<std::string>());
+        }
+        EQ(roles, (std::set<std::string>{"tar", "sha256sum"}));
+        EQ(helpers.size(), 1U);
+        NE(*helpers.begin(), wrapper.pid());
+        EQ(::kill(wrapper.pid(), number), 0);
+        EQ(wrapper.wait(10), 128 + number);
+        while (!reaper.descendants.empty()) {
+            const auto pid = *reaper.descendants.begin();
+            support::FileDescriptor event(static_cast<int>(::syscall(SYS_pidfd_open, pid, 0)));
+            CHECK(event.get() >= 0);
+            pollfd watch{event.get(), POLLIN, 0};
+            int ready;
+            do { ready = ::poll(&watch, 1, 2000); } while (ready < 0 && errno == EINTR);
+            CHECK(ready > 0);
+            int status = 0;
+            EQ(::waitpid(pid, &status, 0), pid);
+            reaper.descendants.erase(pid);
+            CHECK(WIFSIGNALED(status)); EQ(WTERMSIG(status), SIGKILL);
+        }
+        EQ(::kill(*helpers.begin(), 0), -1); EQ(errno, ESRCH);
+        f.unchanged_release();
+    }
+}
+
+void test_native_process_selection_artifact_bounds_and_actions() {
+    FileFixture f;
+    support::RunOptions options;
+    options.cwd = f.root;
+    options.capture_stdout = options.capture_stderr = true;
+    options.timeout = std::chrono::seconds(10);
+    const auto name = "mmltk-selector-" + std::to_string(::getpid());
+    const auto target = f.root / name;
+    fs::copy_file("/usr/bin/sleep", target);
+    const auto artifact = f.write("artifact", std::string("a\0b\n", 4));
+    const auto inspect = [&](Strings args) {
+        return support::run(support::command::self_invocation(support::command::Command::diagnose_native_process, args), options);
+    };
+    const auto read = [&](const std::string& executable, Strings selector = {}) {
+        return inspect(plus({"--read-file", executable, "--file", artifact.string()}, selector));
+    };
+    auto absent = read(name);
+    EQ(absent.exit_code, 2); HAS(absent.err, "matching container PIDs: []");
+    Child first({target.string(), "120"}, options, f.root / "first.log");
+    auto single = read(name);
+    EQ(single.exit_code, 0); HAS(single.out, "container pid=" + std::to_string(first.pid()));
+    HAS(single.out, "b'a\\x00b\\n'");
+    Child second({target.string(), "120"}, options, f.root / "second.log");
+    const auto ambiguous = read(name);
+    EQ(ambiguous.exit_code, 2);
+    for (auto pid : {first.pid(), second.pid()}) HAS(ambiguous.err, std::to_string(pid));
+    const Strings selected{"--pid", std::to_string(first.pid())};
+    EQ(read(name, selected).exit_code, 0);
+    EQ(read(name + "-suffix", selected).exit_code, 2);
+    EQ(read(name, {"--pid", "999999999999999999999999999999"}).exit_code, 2);
+
+    support::write_text(artifact, std::string(4 * 1024 * 1024, 'x'));
+    const auto limit = read(name, selected);
+    EQ(limit.exit_code, 0); HAS(limit.out, "bytes=4194304\n");
+    fs::resize_file(artifact, 4 * 1024 * 1024 + 1);
+    const auto oversized = read(name, selected);
+    EQ(oversized.exit_code, 2); HAS(oversized.err, "no larger than 4 MiB");
+    fs::remove(artifact);
+    CHECK(::mkfifo(artifact.c_str(), 0600) == 0);
+    EQ(read(name, selected).exit_code, 2);
+    fs::remove(artifact);
+    support::write_text(artifact, "retained\n");
+
+    const auto debugger = f.write("bin/gdb", "#!/bin/sh\nprintf '%s\\0' \"$@\" >\"${TEST_DEBUGGER_ARGS}\"\nexit \"${TEST_DEBUGGER_STATUS}\"\n");
+    fs::permissions(debugger, fs::perms::owner_all);
+    options.env["PATH"] = debugger.parent_path().string() + ':' + support::env("PATH");
+    options.env["TEST_DEBUGGER_ARGS"] = (f.root / "debugger-args").string();
+    for (const int status : {0, 43}) {
+        options.env["TEST_DEBUGGER_STATUS"] = std::to_string(status);
+        EQ(inspect(plus({"--backtrace", name}, selected)).exit_code, status);
+    }
+    EQ(support::split(support::read_text(f.root / "debugger-args"), '\0', false),
+        Strings({"--batch", "--nx", "--quiet", "-p", std::to_string(first.pid()), "-ex", "set pagination off",
+            "-ex", "set print thread-events off", "-ex", "thread apply all bt", "-ex", "detach"}));
+    EQ(inspect(plus({"--terminate", name}, selected)).exit_code, 0);
+    EQ(first.wait(), -SIGTERM);
+    EQ(read(name).exit_code, 0);
+
+    // A different process executing this same native binary remains selectable.
+    const auto paused_log = f.write("same-binary.log", "");
+    Child same(support::command::self_invocation(support::command::Command::test_log_query, {"--fixture-pause"}), options, paused_log);
+    wait_ready_file(paused_log);
+    const auto native_name = support::executable_path().filename().string();
+    const auto native = read(native_name, {"--pid", std::to_string(same.pid())});
+    EQ(native.exit_code, 0); HAS(native.out, "container pid=" + std::to_string(same.pid()));
+    const auto self = support::run(support::command::self_invocation(support::command::Command::test_log_query,
+        {"--fixture-inspector-self", artifact.string()}), options);
+    EQ(self.exit_code, 2); HAS(self.err, "matching container PIDs: []");
+    EQ(inspect({"--terminate", native_name, "--pid", std::to_string(same.pid())}).exit_code, 0);
+    EQ(same.wait(), -SIGTERM);
+}
+
+void test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly() {
+    PackageFixture f;
+    const auto tidy = f.invoke({"--tidy-tools"});
+    if (tidy.exit_code) throw Failure(tidy.err);
+    f.write("upstream/src/rfdetr/models/lwdetr.py", "fixture\n");
+    f.write(".cache/mmltk/weights/rf-detr-nano.pth", "fixture\n");
+    f.write(".cache/mmltk/weights/rf-detr-seg-nano.pt", "fixture\n");
+    const auto oracle = f.invoke({"--diagnose-rfdetr-upstream", "--upstream", (f.root / "upstream").string(), "--output", (f.root / "evidence").string()});
+    EQ(oracle.exit_code, 41);
+    std::set<std::string> checked;
+    for (const auto& path : matching_files(f.root / "containers", "", ".json")) {
+        const auto arguments = support::read_json(path).get<Strings>();
+        const auto name = path.stem().string();
+        const bool oracle = name.ends_with("-upstream");
+        if (!oracle && !name.ends_with("-tidy")) continue;
+        checked.insert(oracle ? "oracle" : "tidy");
+        const auto mount = f.root.string() + "/build/tools:/opt/mmltk-tools:ro";
+        const auto found = std::find(arguments.begin(), arguments.end(), mount);
+        CHECK(found != arguments.end()); CHECK(found != arguments.begin()); EQ(*std::prev(found), "--volume");
+        CHECK(fs::exists(f.root / "build/tools/mmltk"));
+        CHECK(std::find(arguments.begin(), arguments.end(), "com.mmltk.wrapper=1") != arguments.end());
+        if (oracle) {
+            for (const auto* value : {"--read-only", "ALL", "no-new-privileges", "none", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "7200s"})
+                CHECK(std::find(arguments.begin(), arguments.end(), value) != arguments.end());
+            CHECK(std::find(arguments.begin(), arguments.end(), (f.root / "upstream").string() + ":/upstream:ro") != arguments.end());
+            CHECK(std::find(arguments.begin(), arguments.end(), (f.root / "evidence").string() + ":/evidence:rw") != arguments.end());
+        } else {
+            CHECK(std::find(arguments.begin(), arguments.end(), "/workspace/build/tools/mmltk") != arguments.end());
+            CHECK(std::find(arguments.begin(), arguments.end(), "--tools-only") != arguments.end());
+        }
+    }
+    EQ(checked, (std::set<std::string>{"oracle", "tidy"}));
 }
 void test_tools_tidy_grouped_selection_and_module_resume() {
     FileFixture f;
@@ -2072,6 +2426,10 @@ constexpr Case cases[]{
     {"NativeToolTests.test_tools_cold_root_ownership_handoff", test_tools_cold_root_ownership_handoff, true},
     {"NativeToolTests.test_tools_ownership_selection_keeps_normal_fixture_restrictions", test_tools_ownership_selection_keeps_normal_fixture_restrictions},
     {"NativeToolTests.test_native_package_inventory_completeness_and_stable_archive_identity", test_native_package_inventory_completeness_and_stable_archive_identity},
+    {"NativeToolTests.test_package_callers_preserve_status_output_and_publication", test_package_callers_preserve_status_output_and_publication},
+    {"NativeToolTests.test_package_callers_cancel_and_reap_archive_and_hash_descendants", test_package_callers_cancel_and_reap_archive_and_hash_descendants},
+    {"NativeToolTests.test_native_process_selection_artifact_bounds_and_actions", test_native_process_selection_artifact_bounds_and_actions},
+    {"NativeToolTests.test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly", test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly},
     {"NativeToolTests.test_native_compiler_launcher_preserves_arguments_cache_and_status", test_native_compiler_launcher_preserves_arguments_cache_and_status},
     {"ParserTests.test_boolean_precedence_implicit_and_and_quoted_terms", test_boolean_precedence_implicit_and_and_quoted_terms},
     {"ParserTests.test_exact_numeric_values_preserve_uint64_and_boolean_type", test_exact_numeric_values_preserve_uint64_and_boolean_type},
@@ -2268,6 +2626,11 @@ int mmltk::log_query::test_entry(int argc, char** argv) {
     try {
         if (argc > 1 && std::string_view(argv[1]) == "--fixture-runtime-docker") return runtime_docker(Strings(argv + 2, argv + argc));
         if (argc > 1 && std::string_view(argv[1]) == "--fixture-tools-docker") return tools_docker(Strings(argv + 2, argv + argc));
+        if (argc > 1 && std::string_view(argv[1]) == "--fixture-package-docker") return package_docker(Strings(argv + 2, argv + argc));
+        if (argc > 2 && std::string_view(argv[1]) == "--fixture-package-child") return package_child(Strings(argv + 2, argv + argc));
+        if (argc == 3 && std::string_view(argv[1]) == "--fixture-inspector-self")
+            return support::command::invoke(support::command::Command::diagnose_native_process,
+                {"--read-file", support::executable_path().filename().string(), "--pid", std::to_string(::getpid()), "--file", argv[2]});
         if (argc == 2 && std::string_view(argv[1]) == "--fixture-tools-state") return tools_handoff_state();
         if (argc > 3 && std::string_view(argv[1]) == "--fixture-tools-user") {
             tools_fixture_user(argv[2]);

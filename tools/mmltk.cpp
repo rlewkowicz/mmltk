@@ -1627,7 +1627,9 @@ class Wrapper {
   else data = "missing\n";
   return sha(std::move(data));
  }
- std::string package_hash(const std::string& path) { return package::path_fingerprint(path); }
+ std::string package_hash(const std::string& path) {
+  return get(native::self_invocation(Command::runtime_package, {"path-fingerprint", path}));
+ }
  bool package_complete(const std::string& path) { return package::complete(path); }
  void firefox_build_input() {
   const auto identity = image_id(toolchain_image);
@@ -1702,8 +1704,9 @@ class Wrapper {
   const auto id = image_id(runtime_base);
   nvidia_inputs();
   verify_nvidia(runtime_base, "runtime");
-  const auto package_result = package::fingerprint(stage) + "\n";
-  const auto input = sha("mmltk-runtime-image-v6\n" + id + "\n" + sha_files({repo + "/docker/Dockerfile.runtime", repo + "/tools/runtime_package.cpp"}) + package_result + trim(read_optional(repo + "/build/tools/.inputs.sha256"))),
+  const auto package_result = capture(native::self_invocation(Command::runtime_package, {"fingerprint", stage}));
+  if (package_result.status) throw Exit{package_result.status};
+  const auto input = sha("mmltk-runtime-image-v6\n" + id + "\n" + sha_files({repo + "/docker/Dockerfile.runtime", repo + "/tools/runtime_package.cpp"}) + package_result.out + trim(read_optional(repo + "/build/tools/.inputs.sha256"))),
    alias = image_alias("runtime-base", id);
   cached_image("default", "-", image_name, repo + "/docker/Dockerfile.runtime", "runtime", input, stage, {"--build-context", "mmltk_tools=" + repo + "/build/tools",
     "--build-arg", "MMLTK_RUNTIME_BASE_IMAGE=" + alias, "--build-arg", "MMLTK_RELEASE_FINGERPRINT=" + input, "--build-arg", "MMLTK_RUNTIME_BASE_IDENTITY=" + id});
@@ -1889,6 +1892,7 @@ class Wrapper {
      "--env", "MMLTK_TIDY_LOG_FILE=" + operation_log, "--env", "MMLTK_TIDY_TEE_STARTED=1",
      "--entrypoint", "/workspace/build/tools/mmltk"};
    labels(args, mode);
+   diagnostic_tools(args);
    args.push_back(tools_image);
    append(args, tail(tool_arguments(Command::run_static_analysis, {"--tools-only"})));
    append(args, tool_options);
@@ -2328,6 +2332,7 @@ class Wrapper {
     "/usr/bin/timeout"};
   execution_policy(args);
   labels(args, mode);
+  diagnostic_tools(args);
   append(args, {image, "--signal=TERM", "--kill-after=15s", "7200s", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "--upstream", "/upstream", "--output",
     "/evidence", "--weights", "/weights", "--fingerprint", input, "--sdpa", sdpa});
   const int status = owned_docker(name, args).status;
