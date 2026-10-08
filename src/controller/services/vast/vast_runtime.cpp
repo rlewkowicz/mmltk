@@ -156,6 +156,7 @@ std::string run_vast_bridge_command(const VastBridgeConfig& config, const std::v
  argv_strings.reserve(bridge_args.size() + 2U);
  argv_strings.push_back(config.python_executable.empty() ? std::string{kDefaultPythonExecutable} : config.python_executable.string());
  argv_strings.push_back(config.bridge_script_path.empty() ? std::string{kDefaultBridgeScript} : config.bridge_script_path.string());
+ // CLEANUP-IGNORE: Different process protocols append their own arguments before using the shared owning ArgvBuffer; prefixes and launch contracts differ.
  argv_strings.insert(argv_strings.end(), bridge_args.begin(), bridge_args.end());
  const mmltk::frameworks::process::ArgvBuffer argv(std::move(argv_strings));
  const std::string http_timeout_seconds = std::to_string(std::chrono::duration<double>(config.http_timeout).count());

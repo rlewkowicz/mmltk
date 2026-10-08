@@ -584,10 +584,12 @@ TEST_CASE("canonical application schema owns endpoint dispatch and stable identi
  CHECK_FALSE(malformed.error.has_value());
  TestSystems unavailable_systems{};
  const auto unavailable = dispatch_interaction(unavailable_systems, counter_interaction(interaction_id, 7));
+ // CLEANUP-IGNORE: Unavailable and failed endpoints independently require a rejected disposition and error presence before different category checks.
  CHECK(unavailable.disposition == InteractionDispatchDisposition::ApplicationRejected);
  REQUIRE(unavailable.error.has_value());
  CHECK(unavailable.error->category == contracts::ApplicationErrorCategory::Unavailable);
  const auto failed = dispatch_interaction(systems, counter_interaction(interaction_id, 13));
+ // CLEANUP-IGNORE: Unavailable and failed endpoints independently require a rejected disposition and error presence before different category checks.
  CHECK(failed.disposition == InteractionDispatchDisposition::ApplicationRejected);
  REQUIRE(failed.error.has_value());
  CHECK(failed.error->category == contracts::ApplicationErrorCategory::Failed);
@@ -938,38 +940,37 @@ TEST_CASE("static outer routing derives intent-only ownership from an endpoint-o
  RoutingTextWriter writer(output);
  emit_application_outer_routing<RoutingSystems>(writer);
  const auto text = output.str();
+ const auto checked_slice = [&](std::size_t begin, std::size_t end) {
+  REQUIRE(begin != std::string::npos);
+  REQUIRE(end != std::string::npos);
+  return std::string_view(text).substr(begin, end - begin);
+ };
+ const auto check_intent_names = [](std::string_view part) {
+  CHECK(part.find("CounterIncrementBy") != std::string_view::npos);
+  CHECK(part.find("AdditionalApply") != std::string_view::npos);
+  CHECK(part.find("CounterReplace") == std::string_view::npos);
+  CHECK(part.find("AdditionalObserve") == std::string_view::npos);
+ };
  const auto endpoint_begin = text.find("pub enum ApplicationEndpoint");
  const auto intent_begin = text.find("pub enum ApplicationIntentEndpoint");
  REQUIRE(endpoint_begin != std::string::npos);
  const auto intent_end = text.find("pub const fn application_endpoint_stable_id", intent_begin);
- REQUIRE(intent_begin != std::string::npos);
- REQUIRE(intent_end != std::string::npos);
- const auto intents = std::string_view(text).substr(intent_begin, intent_end - intent_begin);
+ const auto intents = checked_slice(intent_begin, intent_end);
  const auto endpoints = std::string_view(text).substr(endpoint_begin, intent_begin - endpoint_begin);
  CHECK(endpoints.find("CounterReplace") != std::string_view::npos);
  CHECK(endpoints.find("AdditionalObserve") != std::string_view::npos);
- CHECK(intents.find("CounterIncrementBy") != std::string_view::npos);
- CHECK(intents.find("AdditionalApply") != std::string_view::npos);
- CHECK(intents.find("CounterReplace") == std::string_view::npos);
- CHECK(intents.find("AdditionalObserve") == std::string_view::npos);
+ check_intent_names(intents);
  const auto decode_begin = text.find("decode_application_intent_endpoint");
  const auto decode_end = text.find("application_intent_endpoint_stable_id", decode_begin);
- REQUIRE(decode_begin != std::string::npos);
- REQUIRE(decode_end != std::string::npos);
- const auto decode = std::string_view(text).substr(decode_begin, decode_end - decode_begin);
+ const auto decode = checked_slice(decode_begin, decode_end);
  CHECK(decode.find(std::to_string(application_stable_id("counter", "IncrementBy"))) != std::string_view::npos);
  CHECK(decode.find(std::to_string(application_stable_id("additional", "Apply"))) != std::string_view::npos);
  CHECK(decode.find(std::to_string(application_stable_id("counter", "Replace"))) == std::string_view::npos);
  CHECK(decode.find(std::to_string(application_stable_id("additional", "Observe"))) == std::string_view::npos);
  const auto reply_begin = text.find("application_reply_endpoint");
  const auto reply_end = text.find("decode_application_snapshot", reply_begin);
- REQUIRE(reply_begin != std::string::npos);
- REQUIRE(reply_end != std::string::npos);
- const auto replies = std::string_view(text).substr(reply_begin, reply_end - reply_begin);
- CHECK(replies.find("CounterIncrementBy") != std::string_view::npos);
- CHECK(replies.find("AdditionalApply") != std::string_view::npos);
- CHECK(replies.find("CounterReplace") == std::string_view::npos);
- CHECK(replies.find("AdditionalObserve") == std::string_view::npos);
+ const auto replies = checked_slice(reply_begin, reply_end);
+ check_intent_names(replies);
  const std::array fixture_constants{
   std::pair{"SYSTEM_Counter", application_stable_id("counter")},
   std::pair{"SYSTEM_Additional", application_stable_id("additional")},
@@ -1097,10 +1098,12 @@ TEST_CASE("native application fingerprint contribution changes with an inherited
  const auto repeated = inherited_field_contribution.template operator()<InheritedSystems, InheritedRequestBase>();
  // CLEANUP-IGNORE: This independent schema-change oracle is unrelated to the import-channel provenance field assertions.
  const auto changed = inherited_field_contribution.template operator()<ChangedInheritedSystems, ChangedInheritedRequestBase>();
+ // CLEANUP-IGNORE: The fingerprint oracle separately compares stable identity fields for identical and changed inherited policies before opposite word-array expectations.
  CHECK(inherited.endpoint_id == repeated.endpoint_id);
  CHECK(inherited.field_id == repeated.field_id);
  CHECK(inherited.name == repeated.name);
  CHECK(inherited.words == repeated.words);
+ // CLEANUP-IGNORE: The fingerprint oracle separately compares stable identity fields for identical and changed inherited policies before opposite word-array expectations.
  CHECK(inherited.endpoint_id == changed.endpoint_id);
  CHECK(inherited.field_id == changed.field_id);
  CHECK(inherited.name == changed.name);
@@ -1592,6 +1595,7 @@ TEST_CASE("Maximum training source retention fits JSON process browser and boots
  r::TrainRequest request;
  request.lanes = r::kMaximumTrainingModels;
  request.use_ema = true;
+ // CLEANUP-IGNORE: Telemetry and browser-contract fixtures independently select the maximal periodic model catalog before distinct projections.
  request.lane_configuration.mode = r::TrainLaneMode::PeriodicAveraging;
  r::resize_training_models(request.lane_configuration, r::kMaximumTrainingModels, request.recipe, request.seed);
  r::TrainingProgressDocument document;

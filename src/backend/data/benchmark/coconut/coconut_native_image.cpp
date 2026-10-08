@@ -265,8 +265,7 @@ void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const
  if (!supplied.empty()) prepare_support(supplied.subspan(bytes));
  if (supplied.empty()) {
   if (!decode_memory_) decode_memory_ = std::make_unique<common::system::NumaMemory>(common::system::NumaTopology::Capture().permitted_nodes.front(), common::system::NumaMemory::Lock::Pages);
-  decode_memory_->ensure_bytes(bytes);
-  supplied = {static_cast<std::byte*>(decode_memory_->data()), decode_memory_->capacity_bytes()};
+  supplied = decode_memory_->ensure_storage(bytes);
  }
  std::span<const std::uint8_t> pixels;
  try {
@@ -331,15 +330,19 @@ void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const
  active_record_ = &record;
  active_dimensions_ = dimensions;
 }
+std::shared_ptr<CoconutNativeImage> CoconutNativeWorkspace::begin_product(const CoconutRecord& record, std::shared_ptr<const CoconutNativeLineage> lineage) {
+ auto product = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(std::move(lineage)));
+ scratch().boxes.clear();
+ scratch().runs.clear();
+ product->segment_begin_ = record.first_segment_ordinal;
+ return product;
+}
 std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const CoconutRecord& record, const CoconutPhysicalImage& physical, dataset::MaskDimensions dimensions,
  std::shared_ptr<const CoconutNativeLineage> lineage, const CoconutRejectedObject& rejected_object, CoconutNativeOutput* output) {
  if (active_record_ != &record || active_dimensions_.width != dimensions.width || active_dimensions_.height != dimensions.height || !lineage || lineage->component.source != physical.source)
   throw std::logic_error("COCONut: native image has no matching production workspace");
  const auto width = dimensions.width, height = dimensions.height;
- auto product = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(std::move(lineage)));
- scratch().boxes.clear();
- scratch().runs.clear();
- product->segment_begin_ = record.first_segment_ordinal;
+ auto product = begin_product(record, std::move(lineage));
  const auto& component = product->lineage().component;
  CoconutRecoveryImage recovery{physical.image_id, 0, {}};
  bool unchanged = !unlisted_segment_;
@@ -436,10 +439,7 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::reuse(const Co
  std::size_t position, const CoconutInventoryImage& inventory, const CoconutRecoveryImage* recovered, std::shared_ptr<const CoconutNativeLineage> lineage, std::string_view dependency,
  bool required_labels_valid, CoconutNativeOutput* output) {
  if (!lineage || lineage->component.source != physical.source || inventory.physical != physical) throw std::logic_error("COCONut: reused native image has no matching physical input");
- auto product = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(std::move(lineage)));
- scratch().boxes.clear();
- scratch().runs.clear();
- product->segment_begin_ = record.first_segment_ordinal;
+ auto product = begin_product(record, std::move(lineage));
  auto image = source.image(position);
  image.first_box = scratch().boxes.size();
  scratch().segments.assign(std::bit_ceil(std::max<std::size_t>(2, record.segments.size() * 2)), {});

@@ -45,6 +45,15 @@ const std::string& download_failure_sha256(DownloadResult& artifact, mmltk::comm
  if (memo.error) std::rethrow_exception(memo.error);
  return memo.sha256;
 }
+void trace_download_failure(const DownloadRequest& request, std::string_view reason, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace) {
+ if (!trace.accepts("benchmark.download.failure_sha256")) return;
+ try {
+  if (std::filesystem::is_regular_file(request.destination)) {
+   const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
+   trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", digest}, {"reason", reason}}; });
+  }
+ } catch (...) { throw_if_benchmark_cancelled(cancellation); }
+}
 [[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout& cache, const std::string_view source, const CatalogArtifact& artifact) {
  DownloadRequest request;
  request.artifact_id = artifact.artifact_id;
@@ -66,6 +75,13 @@ using mmltk::common::math::checked_multiply;
 using mmltk::common::types::trim_http_field_value;
 namespace {
 using Clock = std::chrono::steady_clock;
+template <class Transfer>
+void wait_download_retry(CurlMultiTransfers<Transfer>& active, Clock::time_point deadline, mmltk::common::concurrency::CancellationObservation cancellation) {
+ while (Clock::now() < deadline) {
+  throw_if_benchmark_cancelled(cancellation);
+  active.wait_until(std::min(deadline, Clock::now() + std::chrono::milliseconds{250}));
+ }
+}
 void trace_transfer_progress(const BenchmarkTraceSink& trace, const DownloadRequest& request, const std::uint64_t completed, const std::uint64_t total, const std::uint32_t attempt, const bool resumed,
  const std::uint64_t retained, const std::uint64_t durable, const bool redownload) {
  trace_benchmark_event(trace, "benchmark.download.progress", [&] {
@@ -199,15 +215,19 @@ struct ParsedContentRange {
  std::uint64_t total = 0U;
  bool unsatisfied = false;
 };
+[[nodiscard]] std::optional<std::pair<std::string_view, std::string_view>> split_range_field(const std::string_view value, const char delimiter) {
+ const auto position = value.find(delimiter);
+ if (position == std::string_view::npos) return std::nullopt;
+ return std::pair{value.substr(0U, position), value.substr(position + 1U)};
+}
 [[nodiscard]] std::optional<ParsedContentRange> parse_content_range(std::string_view header) {
  constexpr std::string_view kPrefix = "bytes ";
  header = trim_http_field_value(header);
  if (!starts_with_case_insensitive(header, kPrefix)) { return std::nullopt; }
  header.remove_prefix(kPrefix.size());
- const std::size_t slash = header.find('/');
- if (slash == std::string_view::npos) { return std::nullopt; }
- const std::string_view range = header.substr(0U, slash);
- const std::string_view total_text = header.substr(slash + 1U);
+ const auto slash = split_range_field(header, '/');
+ if (!slash) return std::nullopt;
+ const auto [range, total_text] = *slash;
  ParsedContentRange parsed;
  const auto total = std::from_chars(total_text.data(), total_text.data() + total_text.size(), parsed.total);
  if (total.ec != std::errc{} || total.ptr != total_text.data() + total_text.size() || parsed.total == 0U) { return std::nullopt; }
@@ -215,10 +235,9 @@ struct ParsedContentRange {
   parsed.unsatisfied = true;
   return parsed;
  }
- const std::size_t dash = range.find('-');
- if (dash == std::string_view::npos) { return std::nullopt; }
- const std::string_view start_text = range.substr(0U, dash);
- const std::string_view end_text = range.substr(dash + 1U);
+ const auto dash = split_range_field(range, '-');
+ if (!dash) return std::nullopt;
+ const auto [start_text, end_text] = *dash;
  const auto start = std::from_chars(start_text.data(), start_text.data() + start_text.size(), parsed.start);
  const auto end = std::from_chars(end_text.data(), end_text.data() + end_text.size(), parsed.end);
  if (start.ec != std::errc{} || start.ptr != start_text.data() + start_text.size() || end.ec != std::errc{} || end.ptr != end_text.data() + end_text.size() || parsed.end < parsed.start ||
@@ -595,10 +614,7 @@ struct IdentityProbe {
   // The remote probe retry is intentionally deadline-based HTTP backoff, not local status polling.
   throw_if_benchmark_cancelled(cancel_requested);
   const auto deadline = Clock::now() + std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(attempt - 1U, 4U))};
-  while (Clock::now() < deadline) {
-   throw_if_benchmark_cancelled(cancel_requested);
-   active.wait_until(std::min(deadline, Clock::now() + std::chrono::milliseconds{250}));
-  }
+  wait_download_retry(active, deadline, cancel_requested);
   throw_if_benchmark_cancelled(cancel_requested);
  }
  throw std::runtime_error("segmented identity probe did not run");
@@ -1173,10 +1189,7 @@ DownloadResult download_locked_artifact(const DownloadRequest& request, std::siz
    redownload = transfer.redownload || reset;
    completed.reset();
    const auto deadline = Clock::now() + std::chrono::milliseconds{std::min<std::uint64_t>(4000, 250U << std::min<std::uint32_t>(attempt - 1, 4))};
-   while (Clock::now() < deadline) {
-    throw_if_benchmark_cancelled(cancellation);
-    active.wait_until(std::min(deadline, Clock::now() + std::chrono::milliseconds{250}));
-   }
+   wait_download_retry(active, deadline, cancellation);
   }
  } catch (...) {
   const auto original = std::current_exception();

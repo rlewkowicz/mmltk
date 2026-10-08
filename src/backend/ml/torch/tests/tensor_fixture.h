@@ -46,6 +46,10 @@ private:
  }
  return result;
 }
+inline void require_finite_gradient(const torch::Tensor& parameter) {
+ REQUIRE(parameter.grad().defined());
+ REQUIRE(torch::isfinite(parameter.grad()).all().item<bool>());
+}
 inline void require_zero_gradients(std::initializer_list<torch::Tensor> operands) {
  for (const auto& operand : operands) {
   REQUIRE(operand.grad().defined());

@@ -2,13 +2,24 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cuda_runtime_api.h>
 #include <expected>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 namespace mmltk::testsupport {
+template <class T>
+[[nodiscard]] auto allocate_cuda_test_object() {
+ T* device = nullptr;
+ REQUIRE(cudaMalloc(reinterpret_cast<void**>(&device), sizeof(T)) == cudaSuccess);
+ auto release = [](T* value) { static_cast<void>(cudaFree(value)); };
+ return std::unique_ptr<T, decltype(release)>(device, release);
+}
 class ScopedTestStream final {
 public:
- ScopedTestStream() { REQUIRE(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) == cudaSuccess); }
+ explicit ScopedTestStream(int device = -1) {
+  if (device >= 0) REQUIRE(cudaSetDevice(device) == cudaSuccess);
+  REQUIRE(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) == cudaSuccess);
+ }
  ~ScopedTestStream() { static_cast<void>(cudaStreamDestroy(stream_)); }
  ScopedTestStream(const ScopedTestStream&) = delete;
  ScopedTestStream& operator=(const ScopedTestStream&) = delete;

@@ -243,6 +243,7 @@ void test_matcher_and_losses() {
  REQUIRE(loss_dict.count("loss_ce_0") == 1);
  REQUIRE(loss_dict.count("loss_ce_1") == 1);
  REQUIRE(loss_dict.count("loss_ce_enc") == 1);
+ // CLEANUP-IGNORE: Independent criterion configurations verify finite aggregate losses before distinct expectations for included terms.
  const auto weighted = mmltk::backend::models::rfdetr::weighted_detection_loss(loss_dict, config, torch::Device(torch::kCPU));
  REQUIRE(torch::isfinite(weighted).item<bool>());
  REQUIRE(weighted.item<float>() > 0.0f);
@@ -338,11 +339,7 @@ void test_rectangular_matcher_layers_preserve_all_targets() {
  targets.resolved_query_count = 300;
  targets.counts = {0, target_count, 1};
  targets.offsets = {0, 0, target_count};
- targets.targets.resize(3);
- for (size_t image = 0; image < targets.targets.size(); ++image) {
-  targets.targets[image].boxes = targets.all_boxes.narrow(0, targets.offsets[image], targets.counts[image]);
-  targets.targets[image].labels = targets.all_labels.narrow(0, targets.offsets[image], targets.counts[image]);
- }
+ rfdetr::testsupport::populate_target_views(targets);
  rfdetr::ModelOutputs outputs;
  outputs.aux_outputs.resize(1);
  outputs.enc_outputs.emplace();
@@ -422,6 +419,7 @@ void test_cpu_mask_loss_uses_upstream_keys() {
  REQUIRE(loss_dict.count("loss_mask_ce") == 1);
  REQUIRE(loss_dict.count("loss_mask_dice") == 1);
  REQUIRE(loss_dict.count("loss_dice") == 0);
+ // CLEANUP-IGNORE: Independent criterion configurations verify finite aggregate losses before distinct expectations for included terms.
  const auto weighted = mmltk::backend::models::rfdetr::weighted_detection_loss(loss_dict, config, torch::Device(torch::kCPU));
  REQUIRE(torch::isfinite(weighted).item<bool>());
 }
@@ -465,8 +463,7 @@ void test_matcher_mask_cost_handles_zero_point_sampling_on_cuda() {
  };
  auto config = make_mask_loss_config(16);
  auto outputs = make_mask_outputs(1, 1);
- outputs.main.pred_logits = outputs.main.pred_logits.to(torch::kCUDA);
- outputs.main.pred_boxes = outputs.main.pred_boxes.to(torch::kCUDA);
+ mmltk::backend::models::rfdetr::testsupport::move_required_output_tensors(outputs.main, torch::Device(torch::kCUDA));
  outputs.main.pred_masks = require_optional_ref(outputs.main.pred_masks, "expected mask outputs for CUDA matcher test").to(torch::kCUDA);
  const auto indices = mmltk::backend::models::rfdetr::matcher_indices(outputs, targets, config, true);
  assert_single_trivial_match(indices);
@@ -544,6 +541,7 @@ void test_postprocess() {
 }
 void test_postprocess_cuda_stream_replacement() {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
+ // CLEANUP-IGNORE: Each test owns two pooled streams and a guard across different geometry and pending-read lifetimes.
  const auto first_stream = c10::cuda::getStreamFromPool(false, 0);
  const auto second_stream = c10::cuda::getStreamFromPool(false, 0);
  c10::cuda::CUDAStreamGuard first_guard(first_stream);
@@ -576,6 +574,7 @@ TEST_CASE("test_postprocess", "[model][rfdetr][native_ops]") { test_postprocess(
 TEST_CASE("test_postprocess_cuda_stream_replacement", "[model][rfdetr][native_ops][cuda]") { test_postprocess_cuda_stream_replacement(); }
 TEST_CASE("LSAP solver arrays use the owning node resource and retain capacity", "[rfdetr][lsap][numa]") {
  using namespace mmltk::backend::models::rfdetr;
+ // CLEANUP-IGNORE: Independent NUMA tests inspect the host topology and use the existing permitted-CPU fixture before different resource admission.
  using namespace mmltk::common::system;
  const auto topology = NumaTopology::Capture();
  const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
@@ -688,6 +687,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
  REQUIRE(observed.statistics.gdr_writes == (selected_h2d ? 0 : 1));
 }
 TEST_CASE("native inference requests valid optional mask outputs", "[model][rfdetr][native_ops]") {
+ // CLEANUP-IGNORE: Independent inference and checkpoint-admission fixtures select different model shapes after this preset prefix.
  namespace rfdetr = mmltk::backend::models::rfdetr;
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  config.resolution = 64;
@@ -796,6 +796,7 @@ TEST_CASE("mask materialization follows selected query identity and bounded reus
  output.pred_masks = torch::tensor({1.F, -1.F, 1.F}).view({1, 3, 1, 1});
  auto selected = rfdetr::select_output_batch_fixed_size(output, 1080, 1920, 500, true);
  CHECK(selected.scores.size(1) == 6);
+ // CLEANUP-IGNORE: Independent ranking tests require explicit expected labels while deliberately expecting different query orders.
  CHECK(selected.labels[0][0].item<int64_t>() == 0);
  CHECK(selected.labels[0][1].item<int64_t>() == 1);
  CHECK(selected.query_indices[0][0].item<int64_t>() == 1);
@@ -836,6 +837,7 @@ TEST_CASE("Physical ranking precedes slot filtering and keeps stable query mask 
   CHECK(discarded.query_indices.size(1) == 2);
   const auto selected = r::select_output_batch_fixed_size(outputs, 10, 20, 4, true, &classes);
   REQUIRE(selected.counts.item<int64_t>() == 2);
+  // CLEANUP-IGNORE: Independent ranking tests require explicit expected labels while deliberately expecting different query orders.
   CHECK(selected.labels[0][0].item<int64_t>() == 0);
   CHECK(selected.labels[0][1].item<int64_t>() == 1);
   CHECK(selected.query_indices[0][0].item<int64_t>() == 0);
@@ -1004,6 +1006,7 @@ TEST_CASE("Postprocess scale replacement retains pending reads through geometry 
  namespace r = mmltk::backend::models::rfdetr;
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable; pending scale custody coverage remains unverified");
  r::PostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(r::unresolved_class_layout(2)));
+ // CLEANUP-IGNORE: Each test owns two pooled streams and a guard across different geometry and pending-read lifetimes.
  const auto first_stream = c10::cuda::getStreamFromPool(false, 0);
  const auto second_stream = c10::cuda::getStreamFromPool(false, 0);
  c10::cuda::CUDAStreamGuard first_guard(first_stream);

@@ -46,6 +46,7 @@ TEST_CASE("video admission pauses before source reads and Stop wakes it without 
  CHECK(playback.WaitAdmission({}));
 }
 TEST_CASE("video scheduling accounts for fallback before timestamp recovery", "[controller][video]") {
+ // CLEANUP-IGNORE: Explicit independent timestamp sequences test fallback, backward recovery and pause accounting; their deadlines are separate oracles.
  Playback playback;
  CHECK(playback.Schedule(10.0, 4.0, start) == start);
  CHECK(playback.Schedule({}, 4.0, start) == start + 250ms);
@@ -68,6 +69,7 @@ TEST_CASE("video fallback retains the valid cursor through invalid timestamps", 
 }
 TEST_CASE("video recovery never moves a deadline backward when fallback overtakes PTS", "[controller][video]") {
  for (const double recovered : {10.25, 10.5}) {
+  // CLEANUP-IGNORE: Explicit independent timestamp sequences test fallback, backward recovery and pause accounting; their deadlines are separate oracles.
   Playback playback;
   CHECK(playback.Schedule(10.0, 4.0, start) == start);
   CHECK(playback.Schedule({}, 4.0, start) == start + 250ms);
@@ -112,6 +114,7 @@ TEST_CASE("video deadlines account for inference time and rebase overdue frames"
  CHECK(playback.Schedule(11.25, 4.0, start + 4200ms) == start + 4350ms);
 }
 TEST_CASE("video pause excludes wall time without consuming source fallback credit", "[controller][video]") {
+ // CLEANUP-IGNORE: Explicit independent timestamp sequences test fallback, backward recovery and pause accounting; their deadlines are separate oracles.
  Playback playback;
  CHECK(playback.Schedule(10.0, 4.0, start) == start);
  CHECK(playback.Schedule({}, 4.0, start) == start + 250ms);

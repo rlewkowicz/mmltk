@@ -23,6 +23,7 @@ public:
   [[nodiscard]] explicit operator bool() const noexcept;
 
  private:
+  void take(Lease& other) noexcept;
   static constexpr std::size_t kStorageBytes = 64U;
   alignas(std::max_align_t) std::array<std::byte, kStorageBytes> storage_{};
   bool engaged_ = false;

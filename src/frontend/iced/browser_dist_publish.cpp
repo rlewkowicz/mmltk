@@ -108,12 +108,7 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
  return relative.lexically_normal();
 }
 [[nodiscard]] bool contained_by(const std::filesystem::path& root, const std::filesystem::path& candidate) {
- auto root_component = root.begin();
- auto candidate_component = candidate.begin();
- while (root_component != root.end() && candidate_component != candidate.end() && *root_component == *candidate_component) {
-  ++root_component;
-  ++candidate_component;
- }
+ const auto [root_component, candidate_component] = std::ranges::mismatch(root, candidate);
  return root_component == root.end() && candidate_component != candidate.end();
 }
 [[nodiscard]] std::filesystem::path selected_wasm(const std::filesystem::path& asset_root) {

@@ -244,7 +244,7 @@ std::optional<ContainerUser> consume_bootstrap_handoff() {
    die("cannot own bootstrap tools path '" + path.string() + "': " + std::strerror(errno));
  };
  for (auto path = fs::path(cache) / "cmake"; within(path.string(), checkout + "/.cache"); path = path.parent_path()) own(path);
- for (const auto& path : {checkout + "/.cache/locks", lock_path, checkout + "/build", checkout + "/build/.tools-generations", checkout + "/build/tools"}) own(path);
+ for (const auto& path : {checkout + "/.cache/locks", lock_path, checkout + "/build", checkout + "/build/.tools-generations", checkout + "/build/tools", checkout + "/mmltk"}) own(path);
  require(fchmod(lock.value, 0664) == 0, "cannot set bootstrap tools lock permissions");
  for (const auto& tree : {cache + "/cmake/tools", stage}) {
   require(fs::canonical(tree) == fs::path(tree), "bootstrap tools tree must remain inside its owned path: " + tree);
@@ -1953,7 +1953,7 @@ class Wrapper {
   ensure_docker();
   cache_layout();
   ensure_build_image();
-  for (const auto& selector : profile == "all" ? Args{"cpp", "frontend"} : Args{profile}) {
+  for (const auto& selector : profile == "all" ? Args{"cpp", "frontend", "tools"} : Args{profile}) {
    quiet_log("generating " + selector + " cleanup report");
    must_toolchain(cleanup_container, "set -euo pipefail\n" + tool_shell(Command::generate_cleanup_json) + " --" + selector);
   }
@@ -3074,7 +3074,8 @@ public:
   rewrite_args();
   if (build_tools) {
    if (passthrough == Args{"--help"} || passthrough == Args{"-h"}) {
-    std::cout << "Usage: ./mmltk --build-tools\nBuild the standalone GCC 16.2/C++26 tools graph and publish build/tools/mmltk.\nUse --tidy-tools [--file PATH...] [--start-at PATH] for native tools "
+    std::cout << "Usage: ./mmltk --build-tools\nBuild the standalone GCC 16.2/C++26 tools graph and publish ./mmltk (optimized standalone executable).\nUse --tidy-tools [--file PATH...] [--start-at "
+                 "PATH] for native tools "
                  "analysis.\n";
     return 0;
    }

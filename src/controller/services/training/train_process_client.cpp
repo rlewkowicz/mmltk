@@ -278,6 +278,7 @@ TrainProcessClient TrainProcessClient::launch(
  std::vector<std::string> argv_storage;
  argv_storage.reserve(arguments.size() + 1U);
  argv_storage.push_back(cli_path.string());
+ // CLEANUP-IGNORE: Different process protocols append their own arguments before using the shared owning ArgvBuffer; prefixes and launch contracts differ.
  argv_storage.insert(argv_storage.end(), arguments.begin(), arguments.end());
  const mmltk::frameworks::process::ArgvBuffer argv(std::move(argv_storage));
  auto child = mmltk::frameworks::process::spawn_captured_child_process("local training", [&](const int output, const int setup) {

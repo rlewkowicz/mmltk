@@ -559,6 +559,7 @@ void test_log_file_flag_creates_requested_log_file() {
   log_path.string(),
   "--help",
  });
+ // CLEANUP-IGNORE: Flag and environment logging scenarios independently check the created log and remove it before their distinct override cases.
  REQUIRE((result.exit_code == 0));
  REQUIRE((fs::exists(log_path)));
  fs::remove(log_path);
@@ -586,6 +587,7 @@ void test_log_dir_flag_creates_default_log_file() {
   temp_dir.string(),
   "--help",
  });
+ // CLEANUP-IGNORE: The flag and default-log scenarios independently assert process success and the externally created log path.
  REQUIRE((result.exit_code == 0));
  REQUIRE((fs::exists(temp_dir / "mmltk.log")));
 }
@@ -599,6 +601,7 @@ void test_env_log_file_creates_requested_log_file() {
   mmltk_cli_path(),
   "--help",
  });
+ // CLEANUP-IGNORE: Flag and environment logging scenarios independently check the created log and remove it before their distinct override cases.
  REQUIRE((result.exit_code == 0));
  REQUIRE((fs::exists(log_path)));
  fs::remove(log_path);
@@ -625,6 +628,7 @@ void test_env_log_dir_creates_default_log_file() {
   mmltk_cli_path(),
   "--help",
  });
+ // CLEANUP-IGNORE: The flag and default-log scenarios independently assert process success and the externally created log path.
  REQUIRE((result.exit_code == 0));
  REQUIRE((fs::exists(temp_dir / "mmltk.log")));
 }
@@ -635,6 +639,7 @@ void test_invalid_log_level_flag_reports_error_on_stderr() {
   "banana",
   "--help",
  });
+ // CLEANUP-IGNORE: Independent flag and environment inputs require the same public invalid-log-level error.
  REQUIRE((result.exit_code == 1));
  REQUIRE((result.stderr_text.find("invalid MMLTK log level: banana") != std::string::npos));
 }
@@ -645,6 +650,7 @@ void test_invalid_log_level_env_reports_error_on_stderr() {
   mmltk_cli_path(),
   "--help",
  });
+ // CLEANUP-IGNORE: Independent flag and environment inputs require the same public invalid-log-level error.
  REQUIRE((result.exit_code == 1));
  REQUIRE((result.stderr_text.find("invalid MMLTK log level: banana") != std::string::npos));
 }
@@ -689,6 +695,7 @@ std::vector<std::string> capture_wrapper_logging_arguments(
 }
 void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
  const ScopedTempDir directory{"mmltk-wrapper-log-env"};
+ // CLEANUP-IGNORE: These temporary-directory and state-path bindings belong to independent wrapper environment, argument, and GUI-mount fixtures.
  const fs::path& temp_dir = directory.path();
  const fs::path state_dir = temp_dir / "state";
  const fs::path log_path = temp_dir / "wrapper.log";
@@ -716,6 +723,7 @@ void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
 }
 void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
  const ScopedTempDir directory{"mmltk-wrapper-log-cli"};
+ // CLEANUP-IGNORE: These temporary-directory and state-path bindings belong to independent wrapper environment, argument, and GUI-mount fixtures.
  const fs::path& temp_dir = directory.path();
  const fs::path state_dir = temp_dir / "state";
  const fs::path log_path = temp_dir / "explicit.log";
@@ -768,6 +776,7 @@ void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
 }
 void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
  const ScopedTempDir directory{"mmltk-wrapper-gui-tmpfs"};
+ // CLEANUP-IGNORE: These temporary-directory and state-path bindings belong to independent wrapper environment, argument, and GUI-mount fixtures.
  const fs::path& temp_dir = directory.path();
  const fs::path state_dir = temp_dir / "state";
  const fs::path runtime_dir = temp_dir / "runtime";
@@ -1014,6 +1023,7 @@ TEST_CASE("CLI logging admission precedes root and RF-DETR help and dispatch", "
    if (environment) command.emplace_back("MMLTK_LOG_LEVEL=banana");
    command.push_back(mmltk_cli_path());
    command.emplace_back(environment ? "--log-level=off" : "--log-level=banana");
+   // CLEANUP-IGNORE: Distinct CLI admission failures append different argument sets and independently require rejection before checking their own diagnostics.
    command.insert(command.end(), arguments.begin(), arguments.end());
    const auto result = run_subprocess_capture_output(command);
    CHECK(result.exit_code == 1);
@@ -1032,6 +1042,7 @@ TEST_CASE("CLI prediction source finalization preserves empty and conflicting so
  };
  for (const auto& source : sources) {
   std::vector<std::string> command{mmltk_cli_path(), "--log-level=off", "rfdetr", "predict", "--onnx", (root.path() / "model.onnx").string(), "--output", (root.path() / "result.json").string()};
+  // CLEANUP-IGNORE: Distinct CLI admission failures append different argument sets and independently require rejection before checking their own diagnostics.
   command.insert(command.end(), source.begin(), source.end());
   const auto result = run_subprocess_capture_output(command);
   CHECK(result.exit_code == 1);

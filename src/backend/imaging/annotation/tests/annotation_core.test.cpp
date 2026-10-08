@@ -379,12 +379,14 @@ TEST_CASE("test_persistent_capture_space_model_mask_survives_live_mode", "[backe
  assert_single_resolved_bbox_and_mask(preview, AnnotationBox{0, 0, 1, 1}, "0:1");
 }
 TEST_CASE("test_live_model_mask_requires_matching_live_frame_identity", "[backend][imaging][annotation]") {
+ // CLEANUP-IGNORE: The frame factory is shared; distinct live-frame identity mutations and matching expectations are the subject of these tests.
  AnnotationFrame cropped = make_capture_space_frame();
  cropped.live_frame_id = ContentIdentity{41U, cropped.frame_id};
  const std::vector<AnnotationResolvedObject> preview = make_capture_space_preview_result(cropped, cropped.frame_id, ContentIdentity{99U, cropped.frame_id}, true);
  assert_single_resolved_bbox_and_mask(preview, AnnotationBox{0, 0, 2, 2}, "0:4");
 }
 TEST_CASE("test_live_model_mask_uses_matching_live_frame_identity_even_if_display_id_drifts", "[backend][imaging][annotation]") {
+ // CLEANUP-IGNORE: The frame factory is shared; distinct live-frame identity mutations and matching expectations are the subject of these tests.
  AnnotationFrame cropped = make_capture_space_frame();
  cropped.live_frame_id = ContentIdentity{41U, cropped.frame_id};
  const std::vector<AnnotationResolvedObject> preview = make_capture_space_preview_result(cropped, cropped.frame_id + 100U, cropped.live_frame_id, true);
@@ -436,6 +438,7 @@ TEST_CASE("test_save_scene_writes_outputs", "[backend][imaging][annotation]") {
  REQUIRE(loaded_box->box.y2 == 2);
 }
 TEST_CASE("test_scene_round_trip_preserves_point_capture_space", "[backend][imaging][annotation]") {
+ // CLEANUP-IGNORE: Point and spline round trips explicitly construct different shape oracles in the same cropped coordinate system.
  const AnnotationFrame cropped = extract_annotation_frame_region(make_large_frame(), AnnotationBox{4, 3, 20, 18});
  AnnotationObject point;
  point.object_id = "manual-1";
@@ -503,6 +506,7 @@ TEST_CASE("test_load_annotation_scene_objects_rejects_malformed_shape_records", 
  expect_runtime_error_contains([&]() { (void)load_annotation_scene_objects(scene_path, nullptr); }, "skeleton record is missing array `shape.edges`");
 }
 TEST_CASE("test_scene_round_trip_preserves_spline_topology", "[backend][imaging][annotation]") {
+ // CLEANUP-IGNORE: Point and spline round trips explicitly construct different shape oracles in the same cropped coordinate system.
  const AnnotationFrame cropped = extract_annotation_frame_region(make_large_frame(), AnnotationBox{4, 3, 20, 18});
  AnnotationObject spline;
  spline.object_id = "manual-1";

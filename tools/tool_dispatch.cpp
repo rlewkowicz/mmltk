@@ -1,5 +1,6 @@
 module;
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -30,11 +31,13 @@ import mmltk.tools.run_static_analysis;
 import mmltk.tools.run_traced_command;
 import mmltk.tools.run_uncomment;
 import mmltk.tools.runtime_package;
+#ifdef MMLTK_TOOL_FIXTURES
 import mmltk.tools.tests.audit_includes_test;
 import mmltk.tools.tests.format_declarations_test;
 import mmltk.tools.tests.generate_cleanup_json_test;
 import mmltk.tools.tests.review_candidates_test;
 import mmltk.tools.tests.test_headless_compositor;
+#endif
 namespace mmltk::tools::command {
 namespace {
 template <Command Selected>
@@ -87,6 +90,7 @@ constexpr auto implementation() {
   return &mmltk_tool_run_uncomment;
  else if constexpr (Selected == Command::runtime_package)
   return &mmltk_tool_runtime_package;
+#ifdef MMLTK_TOOL_FIXTURES
  else if constexpr (Selected == Command::test_audit_includes)
   return &mmltk_tool_audit_includes_test;
  else if constexpr (Selected == Command::test_format_declarations)
@@ -99,6 +103,7 @@ constexpr auto implementation() {
   return &mmltk_tool_test_headless_compositor;
  else if constexpr (Selected == Command::test_log_query)
   return &mmltk::log_query::test_entry;
+#endif
  else
   static_assert(false, "native command has no implementation");
 }
@@ -109,7 +114,16 @@ int invoke(Command selected, const std::vector<std::string>& arguments, std::str
  storage.emplace_back(argv0.empty() ? program(selected) : argv0);
  storage.insert(storage.end(), arguments.begin(), arguments.end());
  auto pointers = tools::detail::argument_pointers(storage);
- return visit(selected, [&](auto command) { return implementation<decltype(command)::value>()(static_cast<int>(storage.size()), pointers.data()); });
+ return visit(selected, [&](auto command) -> int {
+#ifndef MMLTK_TOOL_FIXTURES
+  if constexpr (fixture(decltype(command)::value)) {
+   auto runner = executable_path().parent_path() / "mmltk-tests";
+   if (!fs::exists(runner)) runner = executable_path().parent_path() / "build/tools/mmltk-tests";
+   tools::exec(self_invocation(selected, arguments, argv0, runner.string()));
+  } else
+#endif
+   return implementation<decltype(command)::value>()(static_cast<int>(storage.size()), pointers.data());
+ });
 }
 int entry(int argc, char** argv) {
  try {

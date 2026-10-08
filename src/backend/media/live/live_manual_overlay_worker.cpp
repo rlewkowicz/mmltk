@@ -80,6 +80,7 @@ void LiveManualOverlayWorker::publish_slot(Slot& slot, const SlotState published
  publish_latest_live_owner_slot(latest_, slot.index, slot.state, published, [&slot] noexcept { ScrubProduct(slot); });
 }
 void LiveManualOverlayWorker::stop() noexcept {
+ // CLEANUP-IGNORE: Admission closure precedes distinct analysis-slot and overlay-generation retirement; the partial prefix is not a shared shutdown owner.
  close_admission();
  if (slots_ == nullptr) return;
  latest_.store(-1, std::memory_order_release);
@@ -167,6 +168,7 @@ LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(
  auto* points = static_cast<int*>(slot.points.host);
  auto* edges = static_cast<std::uint32_t*>(slot.edges.host);
  for (std::size_t index = 0U; index < instance_count; ++index) {
+  // CLEANUP-IGNORE: This enabled-instance prefix belongs to separate packing and rendering passes with different storage and failure behavior.
   const ManualOverlayInstance& instance = instance_at(snapshot, index);
   const PackedInstance& packed = slot.packed[index];
   if (!instance.enabled) continue;
@@ -218,6 +220,7 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
  bool has_content = false;
  const raster::MutableBytes target{reinterpret_cast<std::uint8_t*>(slot.rgba), slot.pitch, static_cast<int>(width_), static_cast<int>(height_)};
  for (std::size_t index = 0U; index < instance_count && status == cudaSuccess; ++index) {
+  // CLEANUP-IGNORE: This enabled-instance prefix belongs to separate packing and rendering passes with different storage and failure behavior.
   const ManualOverlayInstance& instance = instance_at(snapshot, index);
   const PackedInstance& packed = slot.packed[index];
   if (!instance.enabled) continue;
@@ -340,19 +343,15 @@ bool LiveManualOverlayWorker::render_pending() {
   publish_slot(slot, SlotState::Free);
   return true;
  }
- if (prepared == PrepareResult::CudaFailure) {
-  auto scope = cuda_.scope();
+ const auto settle_failure = [&](LiveCudaCommandScope& scope) {
   const bool synchronized = scope && scope.Record(cudaStreamSynchronize(slot.stream)) == cudaSuccess;
   consumed_generation_ = snapshot->generation;
   publish_slot(slot, synchronized ? SlotState::Free : SlotState::Terminal);
   return false;
- }
- if (!render_snapshot(*snapshot, slot, instance_count)) {
+ };
+ if (prepared == PrepareResult::CudaFailure || !render_snapshot(*snapshot, slot, instance_count)) {
   auto scope = cuda_.scope();
-  const bool synchronized = scope && scope.Record(cudaStreamSynchronize(slot.stream)) == cudaSuccess;
-  consumed_generation_ = snapshot->generation;
-  publish_slot(slot, synchronized ? SlotState::Free : SlotState::Terminal);
-  return false;
+  return settle_failure(scope);
  }
  auto scope = cuda_.scope();
  if (!scope) {
@@ -363,12 +362,7 @@ bool LiveManualOverlayWorker::render_pending() {
  slot.generation = snapshot->generation;
  cudaError_t status = scope.Record(cudaEventRecord(slot.ready, slot.stream));
  if (status == cudaSuccess) status = scope.Record(cudaLaunchHostFunc(slot.stream, RenderComplete, &slot));
- if (status != cudaSuccess) {
-  const bool synchronized = scope.Record(cudaStreamSynchronize(slot.stream)) == cudaSuccess;
-  consumed_generation_ = snapshot->generation;
-  publish_slot(slot, synchronized ? SlotState::Free : SlotState::Terminal);
-  return false;
- }
+ if (status != cudaSuccess) return settle_failure(scope);
  consumed_generation_ = snapshot->generation;
  return true;
 }
@@ -386,6 +380,7 @@ void CUDART_CB LiveManualOverlayWorker::RenderComplete(void* context) noexcept {
  slot.owner->ready_.notify();
 }
 bool LiveManualOverlayWorker::try_acquire_latest(OverlayView* output) {
+ // CLEANUP-IGNORE: Published-slot lookup precedes distinct raw-frame and overlay lease construction; slot-state transition is already shared.
  if (output == nullptr) return false;
  const int index = latest_.load(std::memory_order_acquire);
  if (index < 0 || index >= static_cast<int>(slot_count_)) return false;
@@ -415,6 +410,7 @@ void LiveManualOverlayWorker::release(const std::uint32_t index) noexcept {
 }
 void LiveManualOverlayWorker::terminalize(const std::uint32_t index) noexcept {
  Slot* const slot = index < slot_count_ ? &slots_[index] : nullptr;
+ // CLEANUP-IGNORE: Slot claiming is already shared; analysis and manual-overlay owners retain their distinct terminal publication and notification effects.
  if (!claim_acquired_live_slot(slot == nullptr ? nullptr : &slot->state, cuda_)) return;
  publish_slot(*slot, SlotState::Terminal);
  ready_.notify();

@@ -23,6 +23,12 @@ function(mmltk_tools_configure_target target)
     target_compile_features(${target} PUBLIC cxx_std_26)
     target_compile_options(${target} PRIVATE -freflection -Wall -Wextra -Wpedantic
         "$<$<CONFIG:Debug,RelWithDebInfo,Dev>:-g1>")
+    if(MMLTK_TOOLS_OPTIMIZE_SIZE)
+        target_compile_options(${target} PRIVATE
+            "$<$<CONFIG:Release>:-Os;-ffunction-sections;-fdata-sections>")
+        target_link_options(${target} PRIVATE "$<$<CONFIG:Release>:-Wl,--gc-sections>")
+        set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    endif()
     find_program(MMLTK_TOOLS_MOLD_PROGRAM mold REQUIRED)
     target_link_options(${target} PRIVATE -fuse-ld=mold -Wl,--as-needed)
     set_target_properties(${target} PROPERTIES

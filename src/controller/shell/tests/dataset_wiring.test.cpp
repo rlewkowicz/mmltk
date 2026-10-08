@@ -1,3 +1,4 @@
+#include "src/controller/services/tests/support/diagnostics_test_fixture.h"
 #include <catch2/catch_test_macros.hpp>
 #include <fcntl.h>
 #include <chrono>
@@ -31,11 +32,10 @@ TEST_CASE("production dataset factory connects optional tracing through staged o
  settings.workflows.train.compile_benchmark_dataset_override = true;
  settings.workflows.train.overwrite_compiled_dataset = true;
  settings.workflows.train.compiled_dataset_dir = output;
+ // CLEANUP-IGNORE: Independent wiring and model tests persist distinct settings through the shared store before different system construction.
  const services::SettingsLocation location{(root.path() / "settings.json").string()};
  REQUIRE(services::SettingsStore::save(location.value(), settings, 1U).succeeded());
- const auto log = root.path() / "trace.jsonl";
- services::DiagnosticsClient client{mmltk::common::io::ScopedFd{::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)}, services::DiagnosticsExecutionPolicy::CallerDriven};
- REQUIRE(client.enabled());
+ auto [log, client] = mmltk::controller::test_support::DiagnosticFileFixture{root.path()};
  bool enabled = true;
  SECTION("enabled factory retains the target beyond configuration and creator lifetimes") {}
  SECTION("disabled factory supplies no benchmark observer") { enabled = false; }

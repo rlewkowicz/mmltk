@@ -7,6 +7,7 @@
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"
+#include "src/test_support/image_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -46,9 +47,7 @@ struct RenderedImageFixture final {
  }
 };
 void check_writer_pixels(const fs::path& path, unsigned char expected) {
- int width = 0, height = 0, channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
- REQUIRE(pixels);
+ auto [width, height, pixels] = mmltk::testsupport::read_rgba_image(path);
  REQUIRE(width == 7);
  REQUIRE(height == 5);
  for (int index = 0; index < width * height * 4; ++index) CHECK(pixels.get()[index] == expected);
@@ -120,10 +119,12 @@ TEST_CASE("rendered image writer atomically publishes owned pixels and preserves
  refused_encoder.Write(runtime.Borrow(), destination);
  CHECK_THROWS_AS(refused_encoder.Flush(), std::runtime_error);
  CHECK(fs::is_regular_file(destination));
+ // CLEANUP-IGNORE: The same file-count invariant is independently checked before and after rewriting an existing completed destination.
  CHECK(fs::exists(occupied_partial));
  CHECK(std::distance(fs::directory_iterator(destination.parent_path()), fs::directory_iterator{}) == 2);
  writer.Write(runtime.Borrow(), destination);
  CHECK(writer.Flush() == destination);
+ // CLEANUP-IGNORE: The same file-count invariant is independently checked before and after rewriting an existing completed destination.
  CHECK(fs::exists(occupied_partial));
  CHECK(std::distance(fs::directory_iterator(destination.parent_path()), fs::directory_iterator{}) == 2);
  writer.Write(runtime.Borrow(), directory.path() / "retry.png");

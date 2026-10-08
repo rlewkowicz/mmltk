@@ -29,6 +29,21 @@ namespace mmltk::backend::models::rfdetr {
 namespace {
 using namespace torch::indexing;
 namespace F = torch::nn::functional;
+std::pair<torch::Tensor, torch::Tensor> focal_classification_terms(const torch::Tensor& logits, const double alpha) {
+ const auto probability = logits.sigmoid();
+ const auto negative = (1.0 - alpha) * probability.square() * F::softplus(logits);
+ const auto positive = alpha * (1.0 - probability).square() * F::softplus(-logits);
+ return {negative, positive};
+}
+template <class... Terms>
+void zero_invalid_terms(const torch::Tensor& valid, Terms&... terms) {
+ ((terms = torch::where(valid, terms, torch::zeros_like(terms))), ...);
+}
+void add_detection_losses(TrainingLoss& result, const TrainingLoss& terms) {
+ result.classification = result.classification + terms.classification;
+ result.box = result.box + terms.box;
+ result.giou = result.giou + terms.giou;
+}
 constexpr const char* kGtProjectionMetric = "rfdetr.supervision.match_free.gt_projection_gpu_ns";
 constexpr const char* kAffinityMetric = "rfdetr.supervision.match_free.affinity_gpu_ns";
 constexpr const char* kSparseMetric = "rfdetr.supervision.match_free.sparse_gpu_ns";
@@ -320,16 +335,8 @@ TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& confi
  }
 }
 void TrainingSupervisionImpl::append_class_axes(std::vector<detail::ClassTensorAxis>& axes) const {
- const auto append = [&](const auto& module, const detail::ClassTensorFamily& family) {
-  if (!module) return;
-  const auto prefix = family.prefix();
-  for (const auto& parameter : module->named_parameters(true)) {
-   const auto name = prefix + parameter.key();
-   if (const auto axis = family.Match(name)) axes.push_back({name, axis->dimension, axis->coordinates});
-  }
- };
- append(denoising_label_embedding_, detail::kDenoisingClassAxis);
- append(ground_truth_mlp_, detail::kMatchFreeClassAxis);
+ if (denoising_label_embedding_) detail::kDenoisingClassAxis.AppendParameters(axes, *denoising_label_embedding_);
+ if (ground_truth_mlp_) detail::kMatchFreeClassAxis.AppendParameters(axes, *ground_truth_mlp_);
 }
 TrainingSupervisionImpl::~TrainingSupervisionImpl() = default;
 TrainingSupervisionImpl::PaddedTargets TrainingSupervisionImpl::pad_targets(const PreparedTargets& targets, const torch::Device& device, const int64_t batch, const bool reuse_construction_scratch) {
@@ -588,9 +595,7 @@ MatchFreeCost TrainingSupervisionImpl::broadcast_cost(const torch::Tensor& padde
  }
  const auto logits = layer.pred_logits.to(torch::kFloat32).view({batch, layout.groups, layout.queries_per_group, config_.num_classes});
  const auto boxes = layer.pred_boxes.to(torch::kFloat32).view({batch, layout.groups, layout.queries_per_group, 4});
- const auto probability = logits.sigmoid();
- const auto negative = (1.0 - config_.focal_alpha) * probability.square() * F::softplus(logits);
- const auto positive = config_.focal_alpha * (1.0 - probability).square() * F::softplus(-logits);
+ const auto [negative, positive] = focal_classification_terms(logits, config_.focal_alpha);
  const auto negative_sum = negative.sum(-1).unsqueeze(-2);
  const auto label_index = padded_labels.unsqueeze(1).unsqueeze(2).expand({batch, layout.groups, layout.queries_per_group, padded_labels.size(1)});
  const auto correction = (positive - negative).gather(-1, label_index).permute({0, 1, 3, 2});
@@ -598,9 +603,7 @@ MatchFreeCost TrainingSupervisionImpl::broadcast_cost(const torch::Tensor& padde
  auto box = (boxes.unsqueeze(-3) - padded_boxes.unsqueeze(1).unsqueeze(-2)).abs().sum(-1);
  auto giou = 1.0F - batched_pairwise_generalized_box_iou(box_cxcywh_to_xyxy(padded_boxes.unsqueeze(1).expand({batch, layout.groups, padded_boxes.size(1), 4})), box_cxcywh_to_xyxy(boxes));
  const auto valid = valid_rows.unsqueeze(1).unsqueeze(-1);
- classification = torch::where(valid, classification, torch::zeros_like(classification));
- box = torch::where(valid, box, torch::zeros_like(box));
- giou = torch::where(valid, giou, torch::zeros_like(giou));
+ zero_invalid_terms(valid, classification, box, giou);
  classification = classification * config_.set_cost_class;
  box = box * config_.set_cost_bbox;
  giou = giou * config_.set_cost_giou;
@@ -708,15 +711,11 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(
     throw std::runtime_error("DN prediction layer does not match its target layout");
    }
    const auto logits = layer->pred_logits.to(torch::kFloat32);
-   const auto probability = logits.sigmoid();
-   const auto negative = (1.0 - config_.focal_alpha) * probability.square() * F::softplus(logits);
-   const auto positive = config_.focal_alpha * (1.0 - probability).square() * F::softplus(-logits);
+   const auto [negative, positive] = focal_classification_terms(logits, config_.focal_alpha);
    auto classification = negative.sum(-1) + (positive - negative).gather(-1, labels.unsqueeze(-1)).squeeze(-1);
    auto box = (layer->pred_boxes.to(torch::kFloat32) - targets).abs().sum(-1);
    auto giou = 1.0F - aligned_generalized_box_iou(box_cxcywh_to_xyxy(layer->pred_boxes.to(torch::kFloat32)), box_cxcywh_to_xyxy(targets));
-   classification = torch::where(valid, classification, torch::zeros_like(classification));
-   box = torch::where(valid, box, torch::zeros_like(box));
-   giou = torch::where(valid, giou, torch::zeros_like(giou));
+   zero_invalid_terms(valid, classification, box, giou);
    result.classification = result.classification + config_.cls_loss_coef * classification.sum() / divisor;
    result.box = result.box + config_.bbox_loss_coef * box.sum() / divisor;
    result.giou = result.giou + config_.giou_loss_coef * giou.sum() / divisor;
@@ -889,9 +888,7 @@ TrainingLoss TrainingSupervisionImpl::loss(
    auto auxiliary = terms.classification + terms.box + terms.giou + ce_term + dice_term;
    result.auxiliary = result.auxiliary.defined() ? result.auxiliary + auxiliary : auxiliary;
   }
-  result.classification = result.classification + terms.classification;
-  result.box = result.box + terms.box;
-  result.giou = result.giou + terms.giou;
+  add_detection_losses(result, terms);
   result.correspondence = result.correspondence + terms.correspondence;
  }
  result.total = result.classification + result.box + result.giou + result.mask_ce + result.mask_dice;
@@ -899,9 +896,7 @@ TrainingLoss TrainingSupervisionImpl::loss(
   mmltk::backend::ml::cuda::TorchAutocastScope forward_scope(forward_autocast, forward_dtype);
   const auto dn = denoising_loss(*outputs.denoising, targets, normalizer, mask_samples, selective_[training_mode ? 1 : 0]);
   result.total = result.total + dn.total;
-  result.classification = result.classification + dn.classification;
-  result.box = result.box + dn.box;
-  result.giou = result.giou + dn.giou;
+  add_detection_losses(result, dn);
   if (config_.segmentation) {
    result.mask_ce = result.mask_ce + dn.mask_ce;
    result.mask_dice = result.mask_dice + dn.mask_dice;

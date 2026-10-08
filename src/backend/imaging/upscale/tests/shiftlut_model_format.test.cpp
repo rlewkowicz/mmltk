@@ -85,6 +85,7 @@ TEST_CASE("ShiftLUT packed storage rejects invalid lengths before scalar access"
 TEST_CASE("ShiftLUT packed storage rejects nonfinite and excessive LUT magnitudes", "[shiftlut_format]") {
  const auto value = GENERATE(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), -32768.0F, 32768.0F);
  const auto index = GENERATE(std::size_t{0}, lut::table_offset(lut::TableFamily::Shifts) - 1);
+ // CLEANUP-IGNORE: Magnitude and shift-table tests use independent boundary/value generators; each invokes the validator on its explicit malformed table.
  std::vector<float> tables(lut::kTableElements);
  tables[index] = value;
  REQUIRE_THROWS_AS(lut::validate_tables(std::as_bytes(std::span{tables})), std::invalid_argument);
@@ -92,6 +93,7 @@ TEST_CASE("ShiftLUT packed storage rejects nonfinite and excessive LUT magnitude
 TEST_CASE("ShiftLUT packed storage rejects invalid shifts including the last element", "[shiftlut_format]") {
  const auto value = GENERATE(-2.0F, 2.0F, -0.5F, 0.5F, std::numeric_limits<float>::quiet_NaN());
  const auto index = GENERATE(lut::table_offset(lut::TableFamily::Shifts), lut::kTableElements - 1);
+ // CLEANUP-IGNORE: Magnitude and shift-table tests use independent boundary/value generators; each invokes the validator on its explicit malformed table.
  std::vector<float> tables(lut::kTableElements);
  tables[index] = value;
  REQUIRE_THROWS_AS(lut::validate_tables(std::as_bytes(std::span{tables})), std::invalid_argument);

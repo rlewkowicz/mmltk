@@ -93,14 +93,14 @@ private:
 };
 class ApplicationDataFixture final {
 public:
+ using Systems = std::tuple<SettingsSystem&, DatasetSystem&, ModelSystem&>;
  explicit ApplicationDataFixture(std::filesystem::path root)
      : root_(std::move(root)),
        loaded_(root_),
        dataset_gate_(std::make_shared<mmltk::testsupport::StopGate>()),
        dataset_(loaded_.settings, [gate = dataset_gate_] { return std::make_unique<FakeDatasetRuntime>(gate, false); }),
        model_(loaded_.settings, [] {
-        auto gate = std::make_shared<mmltk::testsupport::StopGate>();
-        gate->Release();
+        auto gate = std::make_shared<mmltk::testsupport::StopGate>(true);
         return std::make_unique<BlockingModelRuntime>(std::move(gate));
        }, [this](ModelSystem::event_type event) {
         if (std::holds_alternative<ModelChanged>(event)) {
@@ -113,7 +113,7 @@ public:
        }) {
   dataset_gate_->Release();
  }
- void PrepareModel(const contracts::FeatureId workflow = contracts::FeatureId::Train) {
+ Systems PrepareModel(const contracts::FeatureId workflow = contracts::FeatureId::Train) {
   std::ofstream(root_ / "train.bin").put('\0');
   std::ofstream(root_ / "val.bin").put('\0');
   std::ofstream(root_ / "weights.pt").put('\0');
@@ -135,8 +135,9 @@ public:
   REQUIRE(accepted.terminal.outcome == contracts::ModelSelectionOutcome::Accepted);
   CHECK(accepted.selection.key == expected->key);
   CHECK(accepted.selection.artifact == expected->custom_artifact);
+  return systems();
  }
- [[nodiscard]] auto systems() noexcept { return std::tie(loaded_.settings, dataset_, model_); }
+ [[nodiscard]] Systems systems() noexcept { return std::tie(loaded_.settings, dataset_, model_); }
 
 private:
  class LoadedSettings final {
@@ -187,6 +188,11 @@ private:
  }
  void Leave() noexcept { --observation_->active_calls; }
  std::shared_ptr<DatasetRuntimeObservation> observation_;
+};
+struct BlockingDatasetFixture final {
+ std::shared_ptr<DatasetRuntimeObservation> observation = std::make_shared<DatasetRuntimeObservation>();
+ DatasetSystem dataset;
+ explicit BlockingDatasetFixture(SettingsSystem& settings) : dataset(settings, [observation = observation] { return std::make_unique<BlockingInspectRuntime>(observation); }) {}
 };
 template <class Event>
 class TerminalSequence final {

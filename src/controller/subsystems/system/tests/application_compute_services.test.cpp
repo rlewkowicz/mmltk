@@ -1,3 +1,4 @@
+#include "src/common/io/poll.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include <poll.h>
@@ -134,6 +135,10 @@ public:
  std::string payload = "abc";
  std::string md5 = "900150983cd24fb0d6963f7d28e17f72";
 };
+[[nodiscard]] TrainProcessRunResult finish_train_client(TrainProcessClient& client) {
+ auto [source, token] = TrainProcessStopSource::Mint();
+ return client.Run(std::move(token));
+}
 [[nodiscard]] rfdetr::TrainRequest train_request(const std::filesystem::path& output) {
  rfdetr::TrainRequest request;
  request.train_compiled_path = output / "train.bin";
@@ -144,6 +149,18 @@ public:
  request.device_id = 0;
  return request;
 }
+struct GatedTrainFixture {
+ mmltk::testsupport::ScopedTempDir temp{"mmltk-train-service"};
+ const std::filesystem::path output = temp.path() / "output";
+ GatedTrainFixture() {
+  std::filesystem::create_directories(output);
+  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
+ }
+ void Release() {
+  std::ofstream gate(temp.path() / "gate");
+  gate << "go\n";
+ }
+};
 [[nodiscard]] std::filesystem::path script(mmltk::testsupport::ScopedTempDir& temp, std::string_view body) {
  const auto path = temp.path() / "fixture.sh";
  mmltk::testsupport::write_text_file(path, std::string("#!/bin/sh\n") + std::string(body));
@@ -153,6 +170,16 @@ public:
 [[nodiscard]] bool ready(const int fd) {
  pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
  return ::poll(&descriptor, 1U, 2'000) > 0;
+}
+auto await_train_exit(TrainProcessClient& client) {
+ REQUIRE(ready(client.pid_fd()));
+ auto terminal = client.consume_exit();
+ REQUIRE(terminal.has_value());
+ return terminal;
+}
+void require_invalid_train_progress(TrainProcessClient& client) {
+ REQUIRE(ready(client.progress_fd()));
+ CHECK_THROWS(client.consume_progress());
 }
 [[nodiscard]] TrainProcessRunResult run_train_failure_with_split_output(TrainProcessClient& client, std::size_t read_budget = 1U) {
  std::string discarded;
@@ -174,6 +201,13 @@ public:
  client.consume_output(readiness, 5U);
  REQUIRE(readiness == "ready");
  return client;
+}
+std::unique_ptr<VastTestOperations> single_vast_offer() {
+ auto operations = std::make_unique<VastTestOperations>();
+ operations->offers.resize(1U);
+ operations->offers.front().offer_id = 7;
+ operations->offers.front().num_gpus = 1;
+ return operations;
 }
 [[nodiscard]] VastBridgeConfig valid_vast_config() {
  VastBridgeConfig config;
@@ -217,6 +251,7 @@ TEST_CASE("artifact service refuses invalid and cancelled work without shared li
  ArtifactCancellationFixture cancellation;
  cancellation.cancel();
  const std::array<std::filesystem::path, domain::kArtifactSplitCapacity> paths{};
+ // CLEANUP-IGNORE: Empty and oversized artifact inputs independently require incompatibility and useful errors before different bounded-detail checks.
  const domain::ArtifactInspection inspection = store.inspect(paths, "rf-detr-nano", 384U, cancellation.token);
  CHECK_FALSE(inspection.compatible);
  CHECK_FALSE(inspection.detail.empty());
@@ -233,6 +268,7 @@ TEST_CASE("artifact service derives bounded inspection contracts from reflected 
  CHECK(accepted.detail.size() <= domain::kArtifactErrorCapacity);
  std::array<std::filesystem::path, domain::kArtifactSplitCapacity> oversized{};
  oversized.front() = std::string(domain::kArtifactPathCapacity + 1U, 'p');
+ // CLEANUP-IGNORE: Empty and oversized artifact inputs independently require incompatibility and useful errors before different bounded-detail checks.
  const domain::ArtifactInspection rejected = store.inspect(oversized, "rf-detr-nano", 384U, cancellation.token);
  CHECK_FALSE(rejected.compatible);
  CHECK_FALSE(rejected.detail.empty());
@@ -275,11 +311,8 @@ TEST_CASE("artifact compile progress is borrowed for invalid and cancelled calls
 TEST_CASE("artifact benchmark compilation uses the environment cache and retires staging", "[gui][services][benchmark]") {
  namespace fs = std::filesystem;
  mmltk::testsupport::ScopedTempDir temporary{"artifact-benchmark-cache"};
- const auto original_directory = fs::current_path();
  const mmltk::testsupport::ScopedEnvironmentVariable environment{"MMLTK_BENCHMARK_DATASET_CACHE_ROOT"};
- const mmltk::testsupport::ScopedTestCleanup restore_directory{[&] { fs::current_path(original_directory); }};
- fs::create_directories(temporary.path() / "working");
- fs::current_path(temporary.path() / "working");
+ const mmltk::testsupport::ScopedWorkingDirectory working{temporary.path() / "working"};
  const auto output = temporary.path() / "compiled";
  auto cache = temporary.path() / "source-cache";
  bool overlap = false;
@@ -544,11 +577,8 @@ TEST_CASE("Vast provider cancellation transfers one system source to one worker 
  CHECK_FALSE(source.RequestCancel());
 }
 TEST_CASE("Vast provider client retains its immutable ordinary dependency", "[gui][services]") {
- auto operations_storage = std::make_unique<VastTestOperations>();
+ auto operations_storage = single_vast_offer();
  auto* const operations = operations_storage.get();
- operations->offers.resize(1U);
- operations->offers.front().offer_id = 7;
- operations->offers.front().num_gpus = 1;
  std::size_t query_count = 0U;
  operations->query_observer = &query_count;
  VastProviderClient stale;
@@ -556,11 +586,13 @@ TEST_CASE("Vast provider client retains its immutable ordinary dependency", "[gu
   VastProviderOwner owner{valid_vast_config(), std::move(operations_storage)};
   stale = owner.client();
   REQUIRE(stale.valid());
+  // CLEANUP-IGNORE: The same retained provider is queried before and after its issuer owner dies; both cancellation sources must remain in their own scope.
   auto [source, cancellation] = VastCancellationSource::Mint();
   static_cast<void>(source);
   CHECK(VastClient{stale}.query(valid_provider_preferences(), cancellation).size() == 1U);
  }
  CHECK(stale.valid());
+ // CLEANUP-IGNORE: The same retained provider is queried before and after its issuer owner dies; both cancellation sources must remain in their own scope.
  auto [source, cancellation] = VastCancellationSource::Mint();
  static_cast<void>(source);
  CHECK(VastClient{stale}.query(valid_provider_preferences(), cancellation).size() == 1U);
@@ -591,8 +623,7 @@ TEST_CASE("duplicated Vast cancellation signal reaches a running invocation fd",
   std::vector<VastOfferSummary> query(const VastQueryConfig&, const std::vector<ProviderGpuFamily>&, const VastBridgeInvocation& invocation) const override {
    started.count_down();
    pollfd event{.fd = invocation.cancellation_fd, .events = POLLIN, .revents = 0};
-   int ready = -1;
-   do { ready = ::poll(&event, 1U, -1); } while (ready < 0 && errno == EINTR);
+   const int ready = mmltk::common::io::poll_descriptors({&event, 1U});
    observed = ready > 0 && (event.revents & POLLIN) != 0;
    return {};
   }
@@ -621,11 +652,8 @@ TEST_CASE("duplicated Vast cancellation signal reaches a running invocation fd",
  CHECK_FALSE(signal.RequestCancel());
 }
 TEST_CASE("Vast client owns bounded conversion and reconciliation over injected operations", "[gui][services]") {
- auto operations_storage = std::make_unique<VastTestOperations>();
+ auto operations_storage = single_vast_offer();
  auto* const operations = operations_storage.get();
- operations->offers.resize(1U);
- operations->offers.front().offer_id = 7;
- operations->offers.front().num_gpus = 1;
  operations->record.actual_status = "running";
  operations->output.assign(kVastLogCapacity + 8U, 'x');
  operations->create_result = {.success = true, .offer_id = 7, .instance_id = 9, .instance_api_key = {}};
@@ -670,6 +698,7 @@ TEST_CASE("Vast client rejects duplicate offer identities at the injected servic
  operations->offers[0].num_gpus = 1;
  operations->offers[1].offer_id = 8;
  operations->offers[1].num_gpus = 1;
+ // CLEANUP-IGNORE: Provider and cancellation factories already own setup; distinct malformed provider records require separate owner lifetimes.
  VastProviderOwner provider{valid_vast_config(), std::move(operations_storage)};
  VastClient client{provider.client()};
  auto [source, cancellation] = VastCancellationSource::Mint();
@@ -696,6 +725,7 @@ TEST_CASE("Vast client rejects mismatched exact-instance provider records", "[gu
  auto* const operations = operations_storage.get();
  operations->record.actual_status = "running";
  operations->returned_instance_id = 18;
+ // CLEANUP-IGNORE: Provider and cancellation factories already own setup; distinct malformed provider records require separate owner lifetimes.
  VastProviderOwner provider{valid_vast_config(), std::move(operations_storage)};
  VastClient client{provider.client()};
  auto [source, cancellation] = VastCancellationSource::Mint();
@@ -941,9 +971,7 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
 TEST_CASE("Train process client exposes setup failure and one terminal", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), temp.path() / "missing");
- REQUIRE(ready(client.pid_fd()));
- const auto terminal = client.consume_exit();
- REQUIRE(terminal.has_value());
+ const auto terminal = await_train_exit(client);
  CHECK(terminal->setup_failure);
  CHECK(terminal->exit_code != 0);
  CHECK(terminal->error.find("local training") != std::string::npos);
@@ -985,10 +1013,9 @@ TEST_CASE("Train process run consumes a separately-owned stop capability and esc
 // CLEANUP-IGNORE: The independently named "Train process client observes bounded output and inotify progress" scenario
 // keeps its own setup and oracle adjacent.
 TEST_CASE("Train process client observes bounded output and inotify progress", "[gui][services]") {
- mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
- const auto output = temp.path() / "output";
- std::filesystem::create_directories(output);
- REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
+ GatedTrainFixture fixture;
+ auto& temp = fixture.temp;
+ const auto& output = fixture.output;
  const auto executable = script(temp, "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE
                                       "\" \"$@\") || exit $?\n"
                                       "read ignored < \"$(dirname \"$out\")/gate\"\n"
@@ -996,10 +1023,7 @@ TEST_CASE("Train process client observes bounded output and inotify progress", "
                                       "\" \"$@\" > /dev/null\n"
                                       "printf second\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
- {
-  std::ofstream gate(temp.path() / "gate");
-  gate << "go\n";
- }
+ fixture.Release();
  REQUIRE(ready(client.stdout_fd()));
  std::string stdout;
  client.consume_output(stdout, 5U);
@@ -1019,46 +1043,34 @@ TEST_CASE("Train process client observes bounded output and inotify progress", "
  CHECK(progress->sources.observations.front().sequence == 3);
  CHECK(progress->sources.observations.front().progress.artifact->path == "scheduled-ema.pt");
  CHECK(progress->sources.observations.front().progress.val->bbox.ap == .75);
- REQUIRE(ready(client.pid_fd()));
- const auto terminal = client.consume_exit();
- REQUIRE(terminal.has_value());
+ const auto terminal = await_train_exit(client);
  CHECK(terminal->outcome == services::TrainProcessExitOutcome::Succeeded);
 }
 // CLEANUP-IGNORE: The independently named "Train process client rejects oversized public progress fields" scenario
 // keeps its own setup and oracle adjacent.
 TEST_CASE("Train process client rejects oversized public progress fields", "[gui][services]") {
- mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
- const auto output = temp.path() / "output";
- std::filesystem::create_directories(output);
- REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
+ GatedTrainFixture fixture;
+ auto& temp = fixture.temp;
+ const auto& output = fixture.output;
  const auto executable = script(temp, "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE
                                       "\" \"$@\") || exit $?\n"
                                       "read ignored < \"$(dirname \"$out\")/gate\"\n"
                                       "MMLTK_TRAIN_FIXTURE_PROGRESS=invalid-phase \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
- {
-  std::ofstream gate(temp.path() / "gate");
-  gate << "go\n";
- }
- REQUIRE(ready(client.progress_fd()));
- CHECK_THROWS(client.consume_progress());
+ fixture.Release();
+ require_invalid_train_progress(client);
 }
 TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gui][services]") {
- mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
- const auto output = temp.path() / "output";
- std::filesystem::create_directories(output);
- REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
+ GatedTrainFixture fixture;
+ auto& temp = fixture.temp;
+ const auto& output = fixture.output;
  const auto executable = script(temp, "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE
                                       "\" \"$@\") || exit $?\n"
                                       "read ignored < \"$(dirname \"$out\")/gate\"\n"
                                       "MMLTK_TRAIN_FIXTURE_PROGRESS=invalid-path \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
- {
-  std::ofstream gate(temp.path() / "gate");
-  gate << "go\n";
- }
- REQUIRE(ready(client.progress_fd()));
- CHECK_THROWS(client.consume_progress());
+ fixture.Release();
+ require_invalid_train_progress(client);
 }
 TEST_CASE("Train process client admits only bounded identified retained observations", "[gui][services]") {
  for (const auto mode :
@@ -1113,9 +1125,7 @@ TEST_CASE("Train process client escalates a stopped process group", "[gui][servi
  REQUIRE(client.consume_stop_request());
  REQUIRE(ready(client.escalation_fd()));
  CHECK(client.consume_escalation());
- REQUIRE(ready(client.pid_fd()));
- const auto terminal = client.consume_exit();
- REQUIRE(terminal.has_value());
+ const auto terminal = await_train_exit(client);
  CHECK(terminal->outcome == services::TrainProcessExitOutcome::Cancelled);
  REQUIRE(WIFSIGNALED(terminal->wait_status));
  CHECK(WTERMSIG(terminal->wait_status) == SIGKILL);
@@ -1152,9 +1162,9 @@ TEST_CASE("Train observes persistence failure beyond bounded console output with
  const auto executable = script(temp,
   "head -c 131064 /dev/zero\n"
   "printf '\\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\\n'\n");
+ // CLEANUP-IGNORE: The existing process completion helper is shared; each test keeps its own launched child alive while checking a different terminal result.
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
- auto [source, token] = TrainProcessStopSource::Mint();
- const auto result = client.Run(std::move(token));
+ const auto result = finish_train_client(client);
  CHECK(result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded);
  REQUIRE(result.terminal.final_progress.has_value());
  CHECK(result.terminal.final_progress->persistence.degraded);
@@ -1268,12 +1278,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  };
  request.source = data::BenchmarkDatasetSource::kObjects365V2;
  constexpr std::uint64_t retained = 512U;
- {
-  std::ofstream partial(request.destination.string() + ".part", std::ios::binary);
-  partial.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(retained));
-  REQUIRE(partial.good());
- }
- write_json_atomically(request.destination.string() + ".part.json", {{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}}, {});
+ mmltk::backend::data::testsupport::seed_partial_benchmark_download(request, std::span{payload}.first(retained));
  server.RestartNextRangedTransfer();
  std::vector<DownloadProgress> observed;
  std::vector<domain::ArtifactProgress> displayed;
@@ -1465,9 +1470,9 @@ TEST_CASE("Train process retains bounded late fatal causes independently of cons
   "head -c 131072 /dev/zero; printf '\\n'\n"
   "printf 'fatal: mmltk rfdetr error: CUDA out of memory. Tried to allocate 24.00 MiB. GPU 0 has a total capacity of 11.62 GiB of which 42.00 MiB is free.\n'\n"
   "exit 1\n");
+ // CLEANUP-IGNORE: The existing process completion helper is shared; each test keeps its own launched child alive while checking a different terminal result.
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
- auto [source, token] = TrainProcessStopSource::Mint();
- const auto result = client.Run(std::move(token));
+ const auto result = finish_train_client(client);
  CHECK(result.output.size() == services::kTrainProcessReadBudget);
  CHECK(result.terminal.exit_code == 1);
  CHECK(result.terminal.signal_number == 0);
@@ -1502,8 +1507,7 @@ TEST_CASE("Train process publishes fatal causes before bounded peer retirement",
  const auto diagnostic = nlohmann::json::parse(diagnostic_input);
  CHECK(diagnostic.at("event") == "training.worker_failed");
  CHECK(diagnostic.at("message") == progress->failure);
- auto [source, token] = TrainProcessStopSource::Mint();
- const auto result = client.Run(std::move(token));
+ const auto result = finish_train_client(client);
  CHECK(result.terminal.outcome == TrainProcessExitOutcome::Failed);
  CHECK(result.terminal.signal_number == SIGKILL);
  CHECK(result.terminal.error.contains(progress->failure));
@@ -1575,9 +1579,9 @@ TEST_CASE("Train consumes native selected results and typed degraded persistence
  mmltk::testsupport::ScopedTempDir temp("training-native-progress");
  const auto mode = selected ? "selected-result" : "degraded";
  const auto executable = script(temp, std::string("MMLTK_TRAIN_FIXTURE_PROGRESS=") + mode + " \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
+ // CLEANUP-IGNORE: The existing process completion helper is shared; each test keeps its own launched child alive while checking a different terminal result.
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
- auto [source, token] = TrainProcessStopSource::Mint();
- const auto result = client.Run(std::move(token));
+ const auto result = finish_train_client(client);
  REQUIRE(result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded);
  REQUIRE(result.terminal.final_progress);
  const auto& progress = *result.terminal.final_progress;
@@ -1594,9 +1598,9 @@ TEST_CASE("Train preserves a canonical remote first cause across generic parent 
  const std::string generic = "printf 'fatal: distributed training failed\\n'\n";
  const std::string native = "MMLTK_TRAIN_FIXTURE_PROGRESS=remote-fatal \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n";
  const auto executable = script(temp, (before ? generic + native : native + generic) + "exit 7\n");
+ // CLEANUP-IGNORE: The existing process completion helper is shared; each test keeps its own launched child alive while checking a different terminal result.
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
- auto [source, token] = TrainProcessStopSource::Mint();
- const auto result = client.Run(std::move(token));
+ const auto result = finish_train_client(client);
  CHECK(result.terminal.outcome == services::TrainProcessExitOutcome::Failed);
  CHECK(result.terminal.error.find("remote optimizer allocation failed") != std::string::npos);
  REQUIRE(result.terminal.final_progress);

@@ -1,4 +1,5 @@
 module;
+#include <cstdint>
 #include <cstddef>
 #include <algorithm>
 #include <initializer_list>
@@ -86,21 +87,27 @@ export {
   return result;
  }
  inline char repr_quote(std::string_view value) { return value.find('\'') != std::string_view::npos && value.find('"') == std::string_view::npos ? '"' : '\''; }
+ inline bool append_repr_escape(std::string& result, std::uint32_t ch, char quote) {
+  if (ch == static_cast<unsigned char>(quote) || ch == '\\') {
+   result += '\\';
+   result += static_cast<char>(ch);
+  } else if (ch == '\n')
+   result += "\\n";
+  else if (ch == '\r')
+   result += "\\r";
+  else if (ch == '\t')
+   result += "\\t";
+  else
+   return false;
+  return true;
+ }
  inline std::string byte_repr(std::string_view value, bool escape_non_ascii = false) {
   const char quote = repr_quote(value);
   std::string result(1, quote);
   constexpr char hex[] = "0123456789abcdef";
   for (const unsigned char ch : value) {
-   if (ch == quote || ch == '\\') {
-    result += '\\';
-    result += static_cast<char>(ch);
-   } else if (ch == '\n')
-    result += "\\n";
-   else if (ch == '\r')
-    result += "\\r";
-   else if (ch == '\t')
-    result += "\\t";
-   else if (ch < 32 || ch == 127 || (escape_non_ascii && ch >= 128)) {
+   if (append_repr_escape(result, ch, quote)) continue;
+   if (ch < 32 || ch == 127 || (escape_non_ascii && ch >= 128)) {
     result += "\\x";
     result += hex[ch >> 4];
     result += hex[ch & 15];

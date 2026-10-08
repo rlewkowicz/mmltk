@@ -136,13 +136,6 @@ struct NativeTransformerOutput {
  torch::Tensor enc_memory;
  torch::Tensor enc_boxes;
 };
-void append_classifier_axes(std::vector<detail::ClassTensorAxis>& axes, const torch::nn::Module& module, const detail::ClassTensorFamily& family) {
- const auto prefix = family.prefix();
- for (const auto& parameter : module.named_parameters(true)) {
-  const auto name = prefix + parameter.key();
-  if (const auto axis = family.Match(name)) axes.push_back({name, axis->dimension, axis->coordinates});
- }
-}
 torch::Tensor gen_sineembed_for_position(const torch::Tensor& pos_tensor, int64_t dim) {
  const double scale = 2.0 * M_PI;
  auto dim_t = torch::arange(dim, torch::TensorOptions().dtype(pos_tensor.dtype()).device(pos_tensor.device()));
@@ -762,6 +755,7 @@ std::pair<torch::Tensor, torch::Tensor> gen_encoder_output_proposals(const torch
  proposals.reserve(static_cast<size_t>(spatial_shapes.size(0)));
  int64_t start = 0;
  for (int64_t level = 0; level < spatial_shapes.size(0); ++level) {
+  // CLEANUP-IGNORE: Independent attention sampling and proposal generation read the canonical spatial-shape tensor before different tensor algorithms.
   const auto height = spatial_shapes.index({level, 0}).item<int64_t>();
   const auto width = spatial_shapes.index({level, 1}).item<int64_t>();
   torch::Tensor valid_h;
@@ -842,7 +836,7 @@ public:
   }
  }
  void set_decoder_bbox_embed(const std::shared_ptr<RfDetrMlpImpl>& bbox_embed) { decoder->set_bbox_embed(bbox_embed); }
- void append_class_axes(std::vector<detail::ClassTensorAxis>& axes) const { append_classifier_axes(axes, *enc_out_class_embed, detail::kEncoderClassAxis); }
+ void append_class_axes(std::vector<detail::ClassTensorAxis>& axes) const { detail::kEncoderClassAxis.AppendParameters(axes, *enc_out_class_embed); }
  torch::Tensor encoder_class_logits(const torch::Tensor& hs_enc, bool training_mode) {
   if (!hs_enc.defined()) { return {}; }
   const int64_t groups = training_mode ? std::max<int64_t>(1, config_.group_detr) : 1;
@@ -1042,7 +1036,7 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
 }
 std::vector<detail::ClassTensorAxis> NativeRfDetrModel::Impl::class_axes() const {
  std::vector<detail::ClassTensorAxis> axes;
- append_classifier_axes(axes, *class_embed, detail::kDecoderClassAxis);
+ detail::kDecoderClassAxis.AppendParameters(axes, *class_embed);
  std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->append_class_axes(axes);
  if (training_supervision_) training_supervision_->append_class_axes(axes);
  return axes;

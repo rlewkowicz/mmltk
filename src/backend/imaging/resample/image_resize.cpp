@@ -220,6 +220,10 @@ struct RgbShuffleMasks {
  };
  return masks;
 }
+inline void store_sixteen_scaled_bytes(float* destination, const __m128i bytes, const __m256 scale) {
+ _mm256_storeu_ps(destination, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes)), scale));
+ _mm256_storeu_ps(destination + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(bytes, 8))), scale));
+}
 inline void convert_sixteen_rgb_pixels(const std::uint8_t* source, float* destination_r, float* destination_g, float* destination_b, const __m256 scale, const RgbShuffleMasks& masks) {
  const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(source));
  const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(source + 16));
@@ -227,12 +231,9 @@ inline void convert_sixteen_rgb_pixels(const std::uint8_t* source, float* destin
  const __m128i r = _mm_or_si128(_mm_shuffle_epi8(a, masks.r_a), _mm_or_si128(_mm_shuffle_epi8(b, masks.r_b), _mm_shuffle_epi8(c, masks.r_c)));
  const __m128i g = _mm_or_si128(_mm_shuffle_epi8(a, masks.g_a), _mm_or_si128(_mm_shuffle_epi8(b, masks.g_b), _mm_shuffle_epi8(c, masks.g_c)));
  const __m128i blue = _mm_or_si128(_mm_shuffle_epi8(a, masks.b_a), _mm_or_si128(_mm_shuffle_epi8(b, masks.b_b), _mm_shuffle_epi8(c, masks.b_c)));
- _mm256_storeu_ps(destination_r, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(r)), scale));
- _mm256_storeu_ps(destination_r + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(r, 8))), scale));
- _mm256_storeu_ps(destination_g, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(g)), scale));
- _mm256_storeu_ps(destination_g + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(g, 8))), scale));
- _mm256_storeu_ps(destination_b, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(blue)), scale));
- _mm256_storeu_ps(destination_b + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(blue, 8))), scale));
+ store_sixteen_scaled_bytes(destination_r, r, scale);
+ store_sixteen_scaled_bytes(destination_g, g, scale);
+ store_sixteen_scaled_bytes(destination_b, blue, scale);
 }
 void clear_letterbox_padding(float* plane, const std::uint32_t destination_width, const std::uint32_t destination_height, const std::uint32_t source_width, const std::uint32_t source_height,
  const std::uint32_t offset_x, const std::uint32_t offset_y) {

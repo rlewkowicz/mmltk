@@ -49,6 +49,7 @@ void convert_cmyk_to_rgb(const std::span<const std::uint8_t> cmyk, const bool in
  const std::size_t pixels = rgb.size() / 3U;
  if (inverted) {
   for (std::size_t pixel = 0U; pixel < pixels; ++pixel) {
+   // CLEANUP-IGNORE: The two offsets express source and destination pixel layout; the surrounding inverted and ordinary CMYK conversion arithmetic is different.
    const std::size_t source = pixel * 4U;
    const std::size_t destination = pixel * 3U;
    const std::uint32_t key = cmyk[source + 3U];
@@ -59,6 +60,7 @@ void convert_cmyk_to_rgb(const std::span<const std::uint8_t> cmyk, const bool in
   return;
  }
  for (std::size_t pixel = 0U; pixel < pixels; ++pixel) {
+  // CLEANUP-IGNORE: The two offsets express source and destination pixel layout; the surrounding inverted and ordinary CMYK conversion arithmetic is different.
   const std::size_t source = pixel * 4U;
   const std::size_t destination = pixel * 3U;
   const std::uint32_t key = 255U - cmyk[source + 3U];

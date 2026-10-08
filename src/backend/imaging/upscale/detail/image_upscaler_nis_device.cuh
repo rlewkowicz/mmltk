@@ -18,6 +18,11 @@ struct alignas(8) HalfRgba final {
  __half blue;
  __half alpha;
 };
+__device__ __forceinline__ void accumulate_rgb(float3& color, float coefficient, float3 sample) {
+ color.x = fmaf(coefficient, sample.x, color.x);
+ color.y = fmaf(coefficient, sample.y, color.y);
+ color.z = fmaf(coefficient, sample.z, color.z);
+}
 __device__ __forceinline__ std::uint32_t phase(const float source_coordinate) {
  const float fraction = source_coordinate - floorf(source_coordinate);
  return min(kPhaseCount - 1U, static_cast<std::uint32_t>(fraction * static_cast<float>(kPhaseCount)));
@@ -48,24 +53,16 @@ __device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, co
    const float red = pixels[offset] * channel_std(0U) + channel_mean(0U);
    const float green = pixels[plane + offset] * channel_std(1U) + channel_mean(1U);
    const float blue = pixels[plane * 2U + offset] * channel_std(2U) + channel_mean(2U);
-   color.x = fmaf(coefficient, red, color.x);
-   color.y = fmaf(coefficient, green, color.y);
-   color.z = fmaf(coefficient, blue, color.z);
-   horizontal_detail.x = fmaf(horizontal_coefficient, red, horizontal_detail.x);
-   horizontal_detail.y = fmaf(horizontal_coefficient, green, horizontal_detail.y);
-   horizontal_detail.z = fmaf(horizontal_coefficient, blue, horizontal_detail.z);
-   vertical_detail.x = fmaf(vertical_coefficient, red, vertical_detail.x);
-   vertical_detail.y = fmaf(vertical_coefficient, green, vertical_detail.y);
-   vertical_detail.z = fmaf(vertical_coefficient, blue, vertical_detail.z);
+   accumulate_rgb(color, coefficient, make_float3(red, green, blue));
+   accumulate_rgb(horizontal_detail, horizontal_coefficient, make_float3(red, green, blue));
+   accumulate_rgb(vertical_detail, vertical_coefficient, make_float3(red, green, blue));
   }
  }
  const float horizontal_luma = fabsf(fmaf(0.2126F, horizontal_detail.x, fmaf(0.7152F, horizontal_detail.y, 0.0722F * horizontal_detail.z)));
  const float vertical_luma = fabsf(fmaf(0.2126F, vertical_detail.x, fmaf(0.7152F, vertical_detail.y, 0.0722F * vertical_detail.z)));
  const float3 detail = horizontal_luma <= vertical_luma ? horizontal_detail : vertical_detail;
  constexpr float kSharpness = 0.18F;
- color.x = fmaf(kSharpness, detail.x, color.x);
- color.y = fmaf(kSharpness, detail.y, color.y);
- color.z = fmaf(kSharpness, detail.z, color.z);
+ accumulate_rgb(color, kSharpness, detail);
  return color;
 }
 }  // namespace mmltk::backend::imaging::upscale::image_upscaler_nis::device

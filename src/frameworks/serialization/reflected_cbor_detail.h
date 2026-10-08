@@ -695,6 +695,7 @@ template <class T>
  if constexpr (mmltk::frameworks::reflection::kOpaqueRelationStorage<T>) {
   return OpaqueCborFacade::DecodeObject<T>(value);
  } else {
+  // CLEANUP-IGNORE: The common object-kind guard precedes different ordinary reflected and opaque-relation decoding algorithms.
   const auto* object = std::get_if<wire::Value::Object>(&value.storage);
   if (object == nullptr) return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
   T result{};
@@ -740,6 +741,7 @@ template <class T>
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> OpaqueCborFacade::DecodeObject(const wire::Value& value) {
  static_assert(mmltk::frameworks::reflection::kOpaqueRelationStorage<T>);
+ // CLEANUP-IGNORE: The common object-kind guard precedes different ordinary reflected and opaque-relation decoding algorithms.
  const auto* object = std::get_if<wire::Value::Object>(&value.storage);
  if (object == nullptr) return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
  T result{};
@@ -1553,6 +1555,11 @@ template <class Variant>
  return std::move(*result);
 }
 template <class T>
+[[nodiscard]] std::expected<T, wire::DecodeError> decode_projected_scalar(wire::Reader& reader, const std::size_t depth) {
+ auto decoded = reader.read_scalar_item(depth);
+ return decoded ? from_projected_scalar<T>(std::move(*decoded)) : std::unexpected(decoded.error());
+}
+template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode_projected(wire::Reader& reader, const std::size_t depth) {
  using U = RemoveCvRef<T>;
  if constexpr (std::is_same_v<U, wire::Value>) {
@@ -1571,8 +1578,7 @@ template <class T>
   auto decoded = decode_projected<Element>(reader, depth);
   return decoded ? std::expected<U, wire::DecodeError>(U(std::move(*decoded))) : std::unexpected(decoded.error());
  } else if constexpr (kByteSequence<U>) {
-  auto decoded = reader.read_scalar_item(depth);
-  return decoded ? from_projected_scalar<U>(std::move(*decoded)) : std::unexpected(decoded.error());
+  return decode_projected_scalar<U>(reader, depth);
  } else if constexpr (kIsArray<U> || kIsVector<U> || kIsInplaceVector<U>) {
   return decode_projected_sequence<U>(reader, depth);
  } else if constexpr (kIsVariant<U>) {
@@ -1580,8 +1586,7 @@ template <class T>
  } else if constexpr (kReflectedObject<U>) {
   return decode_projected_object<U>(reader, depth);
  } else {
-  auto decoded = reader.read_scalar_item(depth);
-  return decoded ? from_projected_scalar<U>(std::move(*decoded)) : std::unexpected(decoded.error());
+  return decode_projected_scalar<U>(reader, depth);
  }
 }
 }  // namespace detail

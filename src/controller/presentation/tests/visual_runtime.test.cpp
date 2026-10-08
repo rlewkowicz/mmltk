@@ -1,3 +1,5 @@
+#include "src/test_support/image_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/numa_topology.h"
@@ -19,7 +21,6 @@
 #include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
-#include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -102,8 +103,7 @@ public:
 };
 [[nodiscard]] detail::VisualRuntimeOwner::Notification no_op_visual_work(mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) { return {}; }
 [[nodiscard]] std::uint64_t borrowed_visual_revision(detail::VisualRuntimeOwner& owner) {
- const auto borrowed = owner.Borrow();
- REQUIRE(borrowed.valid());
+ const auto borrowed = mmltk::testsupport::require_borrowed_image(owner);
  return borrowed.plane(0U).revision();
 }
 [[nodiscard]] VisualRuntimeFactory gated_visual_construction(VisualRuntimeFactory factory, std::promise<void>& constructing, std::shared_future<void> release, const std::size_t ordinal) {
@@ -181,8 +181,25 @@ void submit_visual_completion(detail::VisualRuntimeOwner& owner, std::promise<vo
   return detail::VisualRuntimeOwner::Notification{[&completed] { completed.set_value(); }};
  }));
 }
+std::uint64_t submit_completed_revision(detail::VisualRuntimeOwner& owner, std::promise<void>& completed) {
+ submit_visual_completion(owner, completed);
+ mmltk::testsupport::await_test_promise(completed, "first");
+ return borrowed_visual_revision(owner);
+}
+void check_failed_visual_owner(detail::VisualRuntimeOwner& owner, std::promise<void>& failed) {
+ REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", std::chrono::seconds{2}));
+ CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
+ owner.StopAndWait();
+ CHECK(owner.stopped());
+}
 // Declared before the runtime owner so recorded-work callbacks settle before
 // their result storage and completion promise are destroyed.
+void check_failed_owner_released(detail::VisualRuntimeOwner& owner, const std::atomic_uint& failures, const FakeImageBackend& backend) {
+ owner.StopAndWait();
+ CHECK(failures == 1U);
+ CHECK(backend.planes_allocated == backend.planes_freed);
+ CHECK(backend.contexts_created == backend.contexts_destroyed);
+}
 class VisualWorkLog final {
 public:
  void Append(const int value) {
@@ -197,6 +214,12 @@ public:
   };
  }
  void AwaitCompletion() { mmltk::testsupport::await_test_promise(completed_, "recorded visual work completion", 2s); }
+ void CheckCompleted(detail::VisualRuntimeOwner& owner, std::promise<void>& release, const std::vector<int>& expected) {
+  release.set_value();
+  REQUIRE_NOTHROW(AwaitCompletion());
+  owner.StopAndWait();
+  CHECK(values() == expected);
+ }
  // The test reads only after stopping and joining its runtime owner.
  [[nodiscard]] const std::vector<int>& values() const noexcept { return values_; }
 
@@ -224,8 +247,7 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
  using mmltk::frameworks::gpu::SystemImageRuntime;
  using mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess;
  const bool fail_release = GENERATE(false, true);
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  std::atomic<std::size_t> constructions{0U};
  std::promise<SystemImageRuntime::CompletedOutput> created_workspace;
  auto workspace_result = created_workspace.get_future();
@@ -281,8 +303,7 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
 TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake", "[workspace]") {
  using mmltk::frameworks::gpu::SystemImageRuntime;
  using mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  std::promise<SystemImageRuntime::CompletedOutput> created;
  auto ready = created.get_future();
  auto owner = std::make_unique<detail::VisualRuntimeOwner>([&](auto revisions) {
@@ -316,6 +337,7 @@ TEST_CASE("a failed visual aggregate publishes once and reconstructs lazily") {
  CHECK_FALSE(explore.snapshot().busy);
  CHECK_FALSE(explore.snapshot().cancellation_requested);
  static_cast<void>(explore.Open({.viewport = {.extent = {32U, 32U}}, .compiled_source = "/test"}));
+ // CLEANUP-IGNORE: Different systems wait for readiness then check different counters: construction failures versus actual upscale runs.
  REQUIRE(scenario.Wait([&] { return explore.snapshot().ready; }));
  CHECK(failures->load(std::memory_order_acquire) == 1U);
  CHECK(constructions->load(std::memory_order_acquire) == 2U);
@@ -413,9 +435,7 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
  const auto first_revision = first_completed.get_future().get();
  REQUIRE(owner.SubmitDiscrete(no_op_visual_work, {}, true));
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
- auto retained = owner.Borrow();
- REQUIRE(retained.valid());
- CHECK(retained.plane(0U).revision() == first_revision);
+ auto retained = mmltk::testsupport::require_borrowed_image(owner, first_revision);
  std::promise<void> rejected;
  REQUIRE(owner.SubmitDiscrete([&rejected](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&rejected] { rejected.set_value(); }}; }, {}, true));
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(rejected, "rejected", 2s));
@@ -434,6 +454,7 @@ TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement 
  auto released = release.get_future().share();
  std::promise<void> settled;
  std::atomic_bool success_notified = false;
+ // CLEANUP-IGNORE: The runtime factory and existing settlement fixture already own their behavior; each local scope supplies different ordered work and release receipts.
  detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
  auto settle_owner = settle_visual_on_exit(owner, release);
  REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
@@ -457,14 +478,13 @@ TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement 
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(settled, "settled", 2s));
  CHECK(revision == incumbent);
  CHECK_FALSE(success_notified.load());
- auto retained = owner.Borrow();
- REQUIRE(retained.valid());
- CHECK(retained.plane(0U).revision() == incumbent);
+ auto retained = mmltk::testsupport::require_borrowed_image(owner, incumbent);
  retained = {};
  owner.StopAndWait();
 }
 // CLEANUP-IGNORE: This fixture combines producer completion and followup cancellation; the other test combines output wakeups and input preservation with separate event receipts.
 TEST_CASE("staged completion wins late stop before promotion and publishes its exact borrowed product") {
+ // CLEANUP-IGNORE: The generated booleans name different completion, cancellation, and retirement axes before fake-backend construction.
  const bool producer_claims_completion = GENERATE(false, true);
  const bool cancel_followup = GENERATE(false, true);
  auto backend = std::make_shared<FakeImageBackend>();
@@ -485,9 +505,7 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
   }
  }};
  auto settle_owner = settle_visual_on_exit(owner, release);
- submit_visual_completion(owner, first);
- mmltk::testsupport::await_test_promise(first, "first");
- const auto prior_revision = borrowed_visual_revision(owner);
+ const auto prior_revision = submit_completed_revision(owner, first);
  REQUIRE(owner.SubmitDiscrete([&](auto& runtime, std::stop_token) {
   if (producer_claims_completion && !owner.TryCompleteActiveWork()) throw std::runtime_error("producer completion unexpectedly cancelled");
   runtime.Publish(8U, 8U, [](auto, auto, auto) {});
@@ -518,8 +536,7 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
  release.set_value();
  auto publication = published.get_future();
  REQUIRE(publication.wait_for(2s) == std::future_status::ready);
- auto borrowed = owner.Borrow();
- REQUIRE(borrowed.valid());
+ auto borrowed = mmltk::testsupport::require_borrowed_image(owner);
  const auto revision = publication.get();
  CHECK(revision > prior_revision);
  CHECK(borrowed.plane(0U).revision() == revision);
@@ -571,8 +588,7 @@ TEST_CASE("safe incumbent retirement failure preserves the promoted runtime and 
   return detail::VisualRuntimeOwner::Notification{};
  }, {}, true));
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
- auto retained = owner.Borrow();
- REQUIRE(retained.valid());
+ auto retained = mmltk::testsupport::require_borrowed_image(owner);
  CHECK(retained.plane(0U).revision() == promoted.load(std::memory_order_acquire));
  retained = {};
  REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { next.set_value(); }}; }));
@@ -592,9 +608,7 @@ TEST_CASE("active stop during staged construction rejects replacement before dom
  std::atomic_bool entered = false;
  detail::VisualRuntimeOwner owner{gated_visual_construction(std::move(factory), constructing, released, 2U), [](std::exception_ptr) {}};
  auto settle_owner = settle_visual_on_exit(owner, release);
- submit_visual_completion(owner, first);
- mmltk::testsupport::await_test_promise(first, "first");
- const auto revision = borrowed_visual_revision(owner);
+ const auto revision = submit_completed_revision(owner, first);
  REQUIRE(owner.SubmitDiscrete([&](auto&, std::stop_token) {
   entered = true;
   return detail::VisualRuntimeOwner::Notification{};
@@ -606,20 +620,22 @@ TEST_CASE("active stop during staged construction rejects replacement before dom
  // CLEANUP-IGNORE: This assertion proves work never entered during construction cancellation, not absence of a completion notification.
  CHECK_FALSE(entered.load());
  // CLEANUP-IGNORE: Borrow retention after construction cancellation is a separate oracle from in-flight work cancellation.
- auto retained = owner.Borrow();
- REQUIRE(retained.valid());
- CHECK(retained.plane(0U).revision() == revision);
+ auto retained = mmltk::testsupport::require_borrowed_image(owner, revision);
  retained = {};
  owner.StopAndWait();
 }
 // CLEANUP-IGNORE: Ordered replaceable-input semantics are independent from queued discrete cancellation.
 TEST_CASE("ordered visual input retains boundaries and only the latest replaceable sample") {
+ // CLEANUP-IGNORE: Independent visual scenarios use the same backend, counter, and promise primitives; ordering and cancellation stay with their different runtime owners.
  auto backend = std::make_shared<FakeImageBackend>();
+ // CLEANUP-IGNORE: These independent ordering and cancellation tests use separate counters and promise receipts; only fixture construction is repeated.
  auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
  std::promise<void> boundary_entered;
  std::promise<void> release_boundary;
  auto release = release_boundary.get_future().share();
+ // CLEANUP-IGNORE: Each visual concurrency scenario owns its work log, runtime, and existing cancellation guard until its different queued operations settle.
  VisualWorkLog work;
+ // CLEANUP-IGNORE: The runtime factory and existing settlement fixture already own their behavior; each local scope supplies different ordered work and release receipts.
  detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
  auto settle_owner = settle_visual_on_exit(owner, release_boundary);
  REQUIRE(owner.SubmitOrdered([&boundary_entered, release, &work](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
@@ -634,10 +650,7 @@ TEST_CASE("ordered visual input retains boundaries and only the latest replaceab
  owner.SubmitLatest(work.Record(2));
  owner.SubmitLatest(work.Record(3));
  REQUIRE(owner.SubmitDiscrete(work.Record(4, true)));
- release_boundary.set_value();
- REQUIRE_NOTHROW(work.AwaitCompletion());
- owner.StopAndWait();
- CHECK(work.values() == std::vector<int>{1, 3, 4});
+ work.CheckCompleted(owner, release_boundary, {1, 3, 4});
 }
 // CLEANUP-IGNORE: Coalescing owns a boundary gate distinct from the blocked-borrow concurrency scenario.
 TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
@@ -646,7 +659,9 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
  std::promise<void> boundary_entered;
  std::promise<void> release_boundary;
  const auto release = release_boundary.get_future().share();
+ // CLEANUP-IGNORE: Each visual concurrency scenario owns its work log, runtime, and existing cancellation guard until its different queued operations settle.
  VisualWorkLog work;
+ // CLEANUP-IGNORE: The runtime factory and existing settlement fixture already own their behavior; each local scope supplies different ordered work and release receipts.
  detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
  auto settle_owner = settle_visual_on_exit(owner, release_boundary);
  REQUIRE(owner.SubmitOrdered([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
@@ -660,10 +675,7 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
  REQUIRE(owner.NotifyContinuation());
  owner.SubmitLatest(work.Record(3));
  REQUIRE(owner.NotifyContinuation());
- release_boundary.set_value();
- REQUIRE_NOTHROW(work.AwaitCompletion());
- owner.StopAndWait();
- CHECK(work.values() == std::vector<int>{1, 3, 4});
+ work.CheckCompleted(owner, release_boundary, {1, 3, 4});
  EventGate retry_events;
  std::atomic_uint32_t retry_calls{0U}, cycles{0U};
  std::atomic_uint64_t wake_again{0U};
@@ -726,6 +738,7 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
  CHECK(retry_calls.load(std::memory_order_acquire) == 2U);
 }
 TEST_CASE("visual continuation cancellation policy is independent of output availability registration") {
+ // CLEANUP-IGNORE: The generated booleans name different completion, cancellation, and retirement axes before fake-backend construction.
  const bool output_wake = GENERATE(false, true);
  // CLEANUP-IGNORE: Continuation input preservation and producer completion are different booleans with independent event receipts.
  const bool preserve_input = GENERATE(false, true);
@@ -735,6 +748,7 @@ TEST_CASE("visual continuation cancellation policy is independent of output avai
  std::promise<void> release_work;
  const auto released = release_work.get_future().share();
  std::promise<bool> cancelled;
+ // CLEANUP-IGNORE: The runtime factory and existing settlement fixture already own their behavior; each local scope supplies different ordered work and release receipts.
  detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
  auto settle_owner = settle_visual_on_exit(owner, release_work);
  owner.RegisterContinuation([&](auto&, const std::stop_token stop) {
@@ -813,6 +827,7 @@ TEST_CASE("visual continuation arrivals while draining survive without later inp
  const auto release = release_drain.get_future().share();
  std::promise<void> completed;
  std::atomic_uint32_t drains = 0U;
+ // CLEANUP-IGNORE: The runtime factory and existing settlement fixture already own their behavior; each local scope supplies different ordered work and release receipts.
  detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
  auto settle_owner = settle_visual_on_exit(owner, release_drain);
  owner.RegisterContinuation([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
@@ -842,6 +857,7 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
  std::promise<void> release_boundary;
  const auto release = release_boundary.get_future().share();
  std::promise<void> terminal_completed;
+ // CLEANUP-IGNORE: The runtime, settlement and work factories are shared; terminal barriers and RequestStop exercise separate continuation-discard paths.
  detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
  auto settle_owner = settle_visual_on_exit(owner, release_boundary);
  submit_blocked_visual_work(owner, boundary_entered, release);
@@ -852,6 +868,7 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
  }));
  release_boundary.set_value();
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(terminal_completed, "terminal_completed", 2s));
+ // CLEANUP-IGNORE: The match crosses terminal assertions into the next scenario's promise declarations; stop and failure remain separate transitions.
  owner.StopAndWait();
  CHECK(continuations.load(std::memory_order_acquire) == 0U);
  std::promise<void> failed;
@@ -866,11 +883,13 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
  submit_counting_continuation(failing, continuations);
  release_failure_boundary.set_value();
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
+ // CLEANUP-IGNORE: The match crosses terminal assertions into the next scenario's promise declarations; stop and failure remain separate transitions.
  failing.StopAndWait();
  CHECK(continuations.load(std::memory_order_acquire) == 0U);
  std::promise<void> stop_boundary_entered;
  std::promise<void> release_stop_boundary;
  const auto stop_release = release_stop_boundary.get_future().share();
+ // CLEANUP-IGNORE: The runtime, settlement and work factories are shared; terminal barriers and RequestStop exercise separate continuation-discard paths.
  detail::VisualRuntimeOwner stopping{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
  auto settle_stopping = settle_visual_on_exit(stopping, release_stop_boundary);
  submit_blocked_visual_work(stopping, stop_boundary_entered, stop_release);
@@ -904,7 +923,9 @@ private:
 };
 TEST_CASE("visual runtime failures retain initiating execution and model retirement identities") {
  using namespace mmltk::frameworks::gpu;
+ // CLEANUP-IGNORE: The generated booleans name different completion, cancellation, and retirement axes before fake-backend construction.
  const bool safe = GENERATE(false, true);
+ // CLEANUP-IGNORE: Boolean axes, fake backends and destruction flags belong to independent model-retirement scenarios.
  const bool staged = GENERATE(false, true);
  auto backend = std::make_shared<FakeImageBackend>();
  auto destroyed = std::make_shared<std::atomic_bool>(false);
@@ -923,8 +944,7 @@ TEST_CASE("visual runtime failures retain initiating execution and model retirem
  };
  REQUIRE((staged ? owner.SubmitDiscrete(work, {}, true) : owner.SubmitOrdered(work)));
  auto result = reported.get_future();
- REQUIRE(result.wait_for(2s) == std::future_status::ready);
- const auto failure = result.get();
+ const auto failure = mmltk::testsupport::await_test_future(result, "result", 2s);
  CHECK(is_image_execution_failure(failure));
  CHECK(find_image_failure<GdrTransportUnavailable>(failure) == initiating);
  for (const auto& expected : {initiating, settlement, retirement}) CHECK(mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, expected));
@@ -964,10 +984,7 @@ void check_visual_construction_custody(
   }};
   backend->FailAfter(failure_point, 0U, construction_failure);
   REQUIRE(owner.SubmitOrdered(no_op_visual_work));
-  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
-  CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
-  owner.StopAndWait();
-  CHECK(owner.stopped());
+  check_failed_visual_owner(owner, failed);
   CHECK(reported_typed_failure.load(std::memory_order_acquire));
   CHECK(constructions.load(std::memory_order_acquire) == 1U);
   CHECK(release_calls->load(std::memory_order_acquire) == expected_release_calls);
@@ -988,6 +1005,7 @@ TEST_CASE("visual runtime retirement preserves the model and context while relea
  auto releases = std::make_shared<std::atomic_uint64_t>(0U);
  auto runtime = std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
   mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .model = std::make_unique<RetainedConstructionModel>(destroyed, releases)});
+ // CLEANUP-IGNORE: Each retirement scenario independently checks unsafe custody before exercising its distinct retained-resource failure path.
  const auto retirement = runtime->Retire();
  CHECK_FALSE(retirement.safe_to_destroy);
  REQUIRE(retirement.custody.valid());
@@ -1015,10 +1033,7 @@ TEST_CASE("visual retirement reports an unestablished context boundary and disab
   backend->FailPersistently(FakeImageBackend::FailurePoint::Bind);
   throw std::runtime_error("deterministic work failure before retirement");
  }));
- REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
- CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
- owner.StopAndWait();
- CHECK(owner.stopped());
+ check_failed_visual_owner(owner, failed);
  CHECK(constructions.load(std::memory_order_acquire) == 1U);
  CHECK(backend->streams_destroyed == 0U);
  CHECK(backend->contexts_destroyed == 0U);
@@ -1241,6 +1256,7 @@ TEST_CASE("Deferred product completion reports terminal failure without addition
  std::promise<void> submitted;
  // CLEANUP-IGNORE: The tests own separate concurrency counters and ordered submissions; their injected work and settlement paths differ.
  std::atomic_uint failures{0U}, completions{0U};
+ // CLEANUP-IGNORE: The same runtime and observer factories establish distinct healthy and unsafe notification-custody lifetimes.
  detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend), first_visual_failure(failures, failed));
  auto admitted = backend->ObserveNextNotificationStream();
  REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
@@ -1264,10 +1280,7 @@ TEST_CASE("Deferred product completion reports terminal failure without addition
  const auto failure = mmltk::testsupport::await_test_promise(failed, "autonomous deferred product failure");
  CHECK(gpu::test_support::ContainsImageFailure(failure, expected));
  CHECK(completions == 0U);
- owner.StopAndWait();
- CHECK(failures == 1U);
- CHECK(backend->planes_allocated == backend->planes_freed);
- CHECK(backend->contexts_created == backend->contexts_destroyed);
+ check_failed_owner_released(owner, failures, *backend);
 }
 TEST_CASE("Stopping a deferred product settles pending notification before candidate destruction", "[presentation][workspace]") {
  namespace gpu = mmltk::frameworks::gpu;
@@ -1307,6 +1320,7 @@ TEST_CASE("Terminal product notification reports unproved settlement with physic
  std::promise<std::exception_ptr> failed;
  std::atomic_uint failures{0U}, completions{0U};
  {
+  // CLEANUP-IGNORE: The same runtime and observer factories establish distinct healthy and unsafe notification-custody lifetimes.
   detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend), first_visual_failure(failures, failed));
   auto admitted = backend->ObserveNextNotificationStream();
   REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
@@ -1366,16 +1380,12 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
  CHECK(*reinterpret_cast<const std::byte*>(previous.workspace->plane(4U, 3U).data) == previous_pixel);
  previous.workspace.reset();
  candidate.workspace.reset();
- owner.StopAndWait();
- CHECK(failures == 1U);
- CHECK(backend->planes_allocated == backend->planes_freed);
- CHECK(backend->contexts_created == backend->contexts_destroyed);
+ check_failed_owner_released(owner, failures, *backend);
 }
 TEST_CASE("Background visual work yields until requested display pixels physically complete", "[presentation][workspace][background]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace fixture = gpu::test_support;
- fixture::ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  ProducerWorkspaceRequest display{.workspace = fixture::ImageWorkspaceTestAccess::CreateAdmitted(backend, fixture::ImageWorkspaceTestAccess::Layout(0))};
  std::promise<void> published, entered, preempted, release;
  auto released = release.get_future().share();

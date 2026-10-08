@@ -149,6 +149,7 @@ TEST_CASE("evaluation matches eligible physical slots across inactive holes", "[
  CHECK(owner.image_ids() == std::vector<int>{2});
  CHECK_THROWS_AS(match(owner, 0, {}, 10, true), std::out_of_range);
  owner.merge_matches(match(owner, 1, {prediction}, 10, true));
+ // CLEANUP-IGNORE: Physical-slot eligibility and original-area boundaries independently assert expected AP before different mask and area checks.
  const auto result = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
  CHECK(result.bbox.ap == Approx(1.0));
  REQUIRE(result.mask);
@@ -217,6 +218,7 @@ TEST_CASE("evaluation areas use original geometry and preserve the inclusive 96 
  EvaluationFixture fixture({{box(0, {0, 0, 96, 96})}}, 64);
  r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBox);
  owner.merge_matches(match(owner, 0, {box(0, {0, 0, 48, 48})}, 10));
+ // CLEANUP-IGNORE: Physical-slot eligibility and original-area boundaries independently assert expected AP before different mask and area checks.
  const auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
  CHECK(summary.bbox.ap == Approx(1.0));
  CHECK_FALSE(summary.bbox.area_ap[0]);
@@ -355,6 +357,7 @@ TEST_CASE("evaluation retains duplicate fractional boxes and declared source are
   prediction.mask.area += runs[i].length;
  }
  owner.merge_matches(match(owner, 0, {prediction, prediction}, 10, true));
+ // CLEANUP-IGNORE: Duplicate geometry and known-empty masks independently assert their own expected box AP before distinct mask availability checks.
  const auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
  CHECK(summary.bbox.ap == Approx(1));
  CHECK(summary.mask->ap == Approx(1));
@@ -374,6 +377,7 @@ TEST_CASE("known empty evaluation masks remain positive annotations and missing 
  CHECK(owner.facts().mask_rle_pair_count == 0U);
  CHECK(r::resolve_evaluation_metric_set(*fixture.loader, true) == r::EvaluationMetricSet::BBoxAndMask);
  owner.merge_matches(match(owner, 0, {annotation}, 10, true));
+ // CLEANUP-IGNORE: Duplicate geometry and known-empty masks independently assert their own expected box AP before distinct mask availability checks.
  const auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
  CHECK(summary.bbox.ap == Approx(1));
  REQUIRE(summary.mask);

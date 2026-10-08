@@ -81,15 +81,18 @@ void GalleryReadScheduler::FinishReadLane(const std::size_t lane_index, std::exc
    return fact;
   });
  }
+ const auto finish_stale = [&] {
+  {
+   std::scoped_lock lock(lanes_mutex_);
+   lane.state = lane.transfer_ready ? LaneState::StaleReady : LaneState::AwaitingTransfer;
+   sink = ready_sink_;
+  }
+  if (sink) (*sink)();
+ };
  try {
   if (failure) std::rethrow_exception(failure);
   if (!read) {
-   {
-    std::scoped_lock lock(lanes_mutex_);
-    lane.state = lane.transfer_ready ? LaneState::StaleReady : LaneState::AwaitingTransfer;
-    sink = ready_sink_;
-   }
-   if (sink) (*sink)();
+   finish_stale();
    return;
   }
   ReadLanePayload(lane);
@@ -106,12 +109,7 @@ void GalleryReadScheduler::FinishReadLane(const std::size_t lane_index, std::exc
    else if (acceptance_->ClaimTerminalReport())
     AcceptanceDiagnostic(VisualDiagnosticOperation::AcceptanceGateTerminal, lane, lane.compiled_index);
    if (released == ExploreAcceptanceGate::WaitResult::Stale) {
-    {
-     std::scoped_lock lock(lanes_mutex_);
-     lane.state = lane.transfer_ready ? LaneState::StaleReady : LaneState::AwaitingTransfer;
-     sink = ready_sink_;
-    }
-    if (sink) (*sink)();
+    finish_stale();
     return;
    }
   }

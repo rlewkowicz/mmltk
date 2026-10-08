@@ -1,3 +1,4 @@
+#include "src/common/io/poll.h"
 #include "src/frameworks/process/subprocess_utils.h"
 #include <fcntl.h>
 #include <poll.h>
@@ -262,8 +263,7 @@ ArgvBuffer::~ArgvBuffer() = default;
 char* const* ArgvBuffer::data() const noexcept { return impl_->data(); }
 char* ArgvBuffer::program() const noexcept { return impl_->program(); }
 inline void poll_child_process_events(std::array<pollfd, 4U>& wait_fds, const std::string_view wait_context) {
- int ready = -1;
- do { ready = ::poll(wait_fds.data(), wait_fds.size(), -1); } while (ready < 0 && errno == EINTR);
+ const int ready = mmltk::common::io::poll_descriptors(wait_fds);
  if (ready < 0) { throw std::runtime_error(std::string("failed to wait for ") + std::string(wait_context) + ": " + std::strerror(errno)); }
 }
 inline void read_captured_child_output(
@@ -310,10 +310,13 @@ CapturedChildProcessResult run_captured_child_process_erased(const std::string_v
  ScopedFd timeout_fd = make_timeout_fd(timeout, process_name);
  CapturedChildProcess process = spawn_captured_child_process_erased(process_name, child_setup, true);
  CapturedChildProcessResult result;
+ const auto read_output = [&](std::size_t burst = kCapturedChildReadBudget) {
+  read_captured_child_output(process.stdout_fd(), result, output_error_prefix, output_limit, burst);
+  if (result.output_limit_exceeded) { throw std::runtime_error(std::string(process_name) + " output exceeded capture limit"); }
+ };
  try {
   while (true) {
-   read_captured_child_output(process.stdout_fd(), result, output_error_prefix, output_limit);
-   if (result.output_limit_exceeded) { throw std::runtime_error(std::string(process_name) + " output exceeded capture limit"); }
+   read_output();
    if (cancellation.is_requested()) { abort_captured_child_process(process, result, process_name, output_error_prefix, CapturedChildAbortReason::Cancelled, kill_process_group, output_limit); }
    std::array<pollfd, 4U> wait_fds{{
     pollfd{process.stdout_fd(), POLLIN, 0},
@@ -323,11 +326,9 @@ CapturedChildProcessResult run_captured_child_process_erased(const std::string_v
    }};
    poll_child_process_events(wait_fds, process_name);
    if ((wait_fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-    read_captured_child_output(process.stdout_fd(), result, output_error_prefix, output_limit);
-    if (result.output_limit_exceeded) { throw std::runtime_error(std::string(process_name) + " output exceeded capture limit"); }
+    read_output();
     if ((wait_fds[0].revents & POLLHUP) != 0) {
-     read_captured_child_output(process.stdout_fd(), result, output_error_prefix, output_limit, output_limit + 1U);
-     if (result.output_limit_exceeded) { throw std::runtime_error(std::string(process_name) + " output exceeded capture limit"); }
+     read_output(output_limit + 1U);
      process.close_output();
     }
    }
@@ -344,8 +345,7 @@ CapturedChildProcessResult run_captured_child_process_erased(const std::string_v
      process, result, process_name, output_error_prefix, cancelled ? CapturedChildAbortReason::Cancelled : CapturedChildAbortReason::TimedOut, kill_process_group, output_limit);
    }
   }
-  read_captured_child_output(process.stdout_fd(), result, output_error_prefix, output_limit, output_limit + 1U);
-  if (result.output_limit_exceeded) { throw std::runtime_error(std::string(process_name) + " output exceeded capture limit"); }
+  read_output(output_limit + 1U);
   result.setup_failure = read_child_setup_failure(process.setup_error_fd());
   process.close();
   return result;

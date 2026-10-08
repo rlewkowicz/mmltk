@@ -760,6 +760,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
  torch::Tensor image_ids_gpu;
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_targets_h2d{"rfdetr.targets.h2d"};
+  // CLEANUP-IGNORE: These device and stream guards protect different upload and submission-completion scopes; their lifetimes must remain local.
   torch_cuda::TorchCudaDeviceGuard device_guard(mmltk::backend::ml::cuda::checked_device_index(device_id));
   const auto copy_stream = require_copy_stream(scratch);
   torch_cuda::TorchCudaStreamGuard stream_guard(copy_stream);
@@ -795,6 +796,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   }
  }
  {
+  // CLEANUP-IGNORE: These device and stream guards protect different upload and submission-completion scopes; their lifetimes must remain local.
   torch_cuda::TorchCudaDeviceGuard device_guard(mmltk::backend::ml::cuda::checked_device_index(device_id));
   const auto copy_stream = require_copy_stream(scratch);
   torch_cuda::TorchCudaStreamGuard stream_guard(copy_stream);

@@ -27,13 +27,13 @@ finish() {
             exec {original_stdout}>&- {original_stderr}>&-
         fi
         trap - EXIT HUP INT TERM
-        exec "${checkout}/build/tools/mmltk" "${launch_arguments[@]}"
+        exec "${checkout}/mmltk" "${launch_arguments[@]}"
     fi
 }
 # Hash bytes and names, including untracked edits, without any compiler on the host.
 inputs() {
     cd -- "${checkout}"
-    printf '%s\0' mmltk docker/Dockerfile.gcc docker/Dockerfile.tools docker/nvidia-payload.json
+    printf '%s\0' docker/Dockerfile.gcc docker/Dockerfile.tools docker/nvidia-payload.json
     find tools third_party/json/include -type f ! -path '*/__pycache__/*' ! -path '*/build/*' ! -path '*/generated/*' -print0
 }
 input_fingerprint() {
@@ -41,7 +41,7 @@ input_fingerprint() {
     fingerprint="${fingerprint%% *}"
 }
 input_fingerprint
-if [[ "${operation}" == --ensure && -x "${checkout}/build/tools/mmltk" && -f "${checkout}/build/tools/.inputs.sha256" && "$(<"${checkout}/build/tools/.inputs.sha256")" == "${fingerprint}" ]]; then finish; exit 0; fi
+if [[ "${operation}" == --ensure && -x "${checkout}/mmltk" && -x "${checkout}/build/tools/mmltk" && -f "${checkout}/build/tools/.inputs.sha256" && "$(<"${checkout}/build/tools/.inputs.sha256")" == "${fingerprint}" ]]; then finish; exit 0; fi
 # Read-only operations retain their no-build/no-pull admission on a cold checkout.
 if [[ "${operation}" == --ensure ]]; then
     case "${3:-}:${4:-}" in
@@ -64,7 +64,7 @@ cleanup() {
     fi
     if [[ -n "${container}" ]]; then timeout --signal=KILL 5s docker rm -f "${container}" {tools_lock}>&- >/dev/null 2>&1 || true; fi
     if [[ -n "${stage}" && ! -f "${stage}/.inputs.sha256" ]]; then rm -rf -- "${stage}"; fi
-    rm -f -- "${checkout}/build/.tools-next-$$"
+    rm -f -- "${checkout}/build/.tools-next-$$" "${checkout}/.mmltk-next-$$"
     if (( status != 0 )); then printf 'mmltk bootstrap: native tools failed (exit %s)\n' "${status}" >&2; fi
     exit "${status}"
 }
@@ -81,7 +81,7 @@ wait "${child}"
 child=''
 # A formatter may have changed the inputs while this writer waited.
 input_fingerprint
-if [[ "${operation}" == --ensure && -x "${checkout}/build/tools/mmltk" && -f "${checkout}/build/tools/.inputs.sha256" && "$(<"${checkout}/build/tools/.inputs.sha256")" == "${fingerprint}" ]]; then finish; exit 0; fi
+if [[ "${operation}" == --ensure && -x "${checkout}/mmltk" && -x "${checkout}/build/tools/mmltk" && -f "${checkout}/build/tools/.inputs.sha256" && "$(<"${checkout}/build/tools/.inputs.sha256")" == "${fingerprint}" ]]; then finish; exit 0; fi
 mkdir -p -- "${checkout}/build/.tools-generations" "${cache}/cmake"
 # Bootstrap failures retain evidence even before the native transcript owner exists.
 if [[ "${MMLTK_BOOTSTRAP_CAPTURED:-0}" != 1 ]]; then
@@ -175,9 +175,9 @@ if [[ -n "${MMLTK_BOOTSTRAP_USER:-}" ]]; then
 fi
 container_cache="/workspace${cache#"${checkout}"}/cmake/tools"
 docker run --rm --init --name "${container}" --label com.mmltk.wrapper=1 --label "com.mmltk.repo=${checkout}" --label "com.mmltk.owner-pid=${owner_pid}" --label "com.mmltk.owner-start=${owner_start}" --label com.mmltk.mode=build-tools --user "${build_user}" --volume "${host_checkout}:/workspace:rw" --workdir /workspace --env HOME=/tmp --env "MMLTK_TOOLS_BUILD=${container_cache}" --env "MMLTK_TOOLS_STAGE=/workspace/build/.tools-generations/${generation}" --env "MMLTK_JOBS=$(getconf _NPROCESSORS_ONLN)" --entrypoint /bin/bash "${tools_image}" -c 'set -euo pipefail
-cmake -S /workspace/tools -B "${MMLTK_TOOLS_BUILD}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DMMLTK_TOOLS_BUILD_DRIVER=ON
-cmake --build "${MMLTK_TOOLS_BUILD}" --parallel "${MMLTK_JOBS}" --target mmltk
-cmake --install "${MMLTK_TOOLS_BUILD}" --prefix "${MMLTK_TOOLS_STAGE}" --component Runtime
+cmake -S /workspace/tools -B "${MMLTK_TOOLS_BUILD}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DMMLTK_TOOLS_BUILD_DRIVER=ON -DMMLTK_TOOLS_OPTIMIZE_SIZE=ON -DMMLTK_TOOLS_HOST_LIBRARY_DIR="${MMLTK_TOOLS_STAGE#/workspace/}/lib"
+cmake --build "${MMLTK_TOOLS_BUILD}" --parallel "${MMLTK_JOBS}" --target mmltk mmltk_tool_tests
+cmake --install "${MMLTK_TOOLS_BUILD}" --prefix "${MMLTK_TOOLS_STAGE}" --component Runtime --strip
 '
 # The loader check runs the new native command itself; it performs no workload.
 "${stage}/mmltk" --tool runtime-package -- inventory >/dev/null {tools_lock}>&-
@@ -186,5 +186,8 @@ ln -s -- ".tools-generations/${generation}" "${checkout}/build/.tools-next-$$"
 # A directory at build/tools indicates an older manually populated closure.
 [[ ! -d "${checkout}/build/tools" || -L "${checkout}/build/tools" ]] || { printf '%s\n' 'mmltk bootstrap: build/tools must be a published symlink' >&2; exit 1; }
 mv -Tf -- "${checkout}/build/.tools-next-$$" "${checkout}/build/tools"
-printf '%s\n' 'mmltk: native tools published' >&2
+# Publish the host ELF after its immutable dependency closure is complete.
+cp -p -- "${stage}/mmltk" "${checkout}/.mmltk-next-$$"
+mv -Tf -- "${checkout}/.mmltk-next-$$" "${checkout}/mmltk"
+printf '%s\n' 'mmltk: published ./mmltk and the container tools closure' >&2
 finish

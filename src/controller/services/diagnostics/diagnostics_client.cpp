@@ -11,6 +11,11 @@ struct DiagnosticsClient::State final {
  };
  explicit State(mmltk::common::io::ScopedFd adopted, DiagnosticsExecutionPolicy next_policy) noexcept;
  [[nodiscard]] DiagnosticSubmitResult admit_locked(std::unique_lock<std::mutex>& lock, std::size_t count, bool wait) noexcept;
+ [[nodiscard]] bool record_too_large(const DiagnosticRecord record) noexcept {
+  if (record.json.size() <= kRecordCapacity) return false;
+  dropped.fetch_add(1U, std::memory_order_relaxed);
+  return true;
+ }
  void signal_locked() noexcept;
  void discard_locked() noexcept;
  [[nodiscard]] bool flush_locked() noexcept;
@@ -285,19 +290,18 @@ void DiagnosticsClient::initialize(mmltk::common::io::ScopedFd descriptor, const
  try {
   state_ = std::make_shared<State>(std::move(descriptor), policy);
  } catch (...) { return; }
- const int terminal_wake = ::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
- if (terminal_wake < 0) {
-  state_.reset();
-  return;
- }
- state_->terminal_wake.reset(terminal_wake);
- if (policy == DiagnosticsExecutionPolicy::BackgroundWriter) {
+ const auto create_wake = [&](mmltk::common::io::ScopedFd& wake_descriptor) {
   const int wake = ::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
   if (wake < 0) {
    state_.reset();
-   return;
+   return false;
   }
-  state_->wake.reset(wake);
+  wake_descriptor.reset(wake);
+  return true;
+ };
+ if (!create_wake(state_->terminal_wake)) return;
+ if (policy == DiagnosticsExecutionPolicy::BackgroundWriter) {
+  if (!create_wake(state_->wake)) return;
   try {
    // The execution's capture is its sole lifetime owner after the
    // client releases its handle.  Detaching at creation makes every
@@ -418,10 +422,7 @@ bool DiagnosticsClient::wait_for_capacity_waiter_for_test() noexcept {
 DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRecord record, const bool wait_for_capacity, const bool validate) const noexcept {
  if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
  if (wait_for_capacity && !validate && state_->policy == DiagnosticsExecutionPolicy::CallerDriven) return DiagnosticSubmitResult::Capacity;
- if (record.json.size() > DiagnosticsClient::kRecordCapacity) {
-  state_->dropped.fetch_add(1U, std::memory_order_relaxed);
-  return DiagnosticSubmitResult::RecordTooLarge;
- }
+ if (state_->record_too_large(record)) return DiagnosticSubmitResult::RecordTooLarge;
  if (validate && !valid_json_object(record.json)) {
   state_->dropped.fetch_add(1U, std::memory_order_relaxed);
   return DiagnosticSubmitResult::InvalidJson;
@@ -446,10 +447,7 @@ DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRe
 }
 DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_terminal_encoded(const DiagnosticRecord record) const noexcept {
  if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
- if (record.json.size() > DiagnosticsClient::kRecordCapacity) {
-  state_->dropped.fetch_add(1U, std::memory_order_relaxed);
-  return DiagnosticSubmitResult::RecordTooLarge;
- }
+ if (state_->record_too_large(record)) return DiagnosticSubmitResult::RecordTooLarge;
  std::lock_guard lock(state_->mutex);
  if (state_->closing || state_->failed || state_->descriptor.get() < 0) return DiagnosticSubmitResult::Closed;
  if (state_->terminal_pending) {

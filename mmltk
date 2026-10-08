@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-mmltk_checkout="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-exec "${mmltk_checkout}/tools/bootstrap_mmltk.sh" --launch "${mmltk_checkout}" "$@"

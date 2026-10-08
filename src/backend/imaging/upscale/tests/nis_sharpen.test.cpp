@@ -27,6 +27,7 @@ TEST_CASE("Basic selected sharpening matches independent dual-direction arithmet
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  const auto device = mmltk::testsupport::select_cuda_test_device(0);
  INFO(device);
+ // CLEANUP-IGNORE: Geometry generators exercise independent NIS sharpening and LUT conversion cases; the Boolean axes have different meanings.
  const auto output_width = GENERATE(1U, 3U, 19U, 257U);
  const auto output_height = GENERATE(1U, 5U);
  const bool cropped = GENERATE(false, true);

@@ -58,6 +58,7 @@ torch::Tensor reference_corners(const torch::Tensor& boxes) {
 torch::Tensor reference_giou(const torch::Tensor& a, const torch::Tensor& b, bool generalized = true, bool pairwise = false) {
  // CLEANUP-IGNORE: Independent upstream area oracle; sharing production promotion or arithmetic would hide defects.
  const auto box_area = [](const torch::Tensor& value) {
+  // CLEANUP-IGNORE: This upstream numerical oracle independently verifies promotion and area arithmetic; sharing the production operation would make the parity check circular.
   const auto promoted = value.scalar_type() == torch::kFloat16 || value.scalar_type() == torch::kBFloat16 ? value.to(torch::kFloat32) : value;
   return (promoted.select(-1, 2) - promoted.select(-1, 0)) * (promoted.select(-1, 3) - promoted.select(-1, 1));
  };
@@ -457,6 +458,7 @@ TEST_CASE("IA-BCE casts detached quality independently into mixed precision dest
     torch::Tensor actual, expected;
     {
      mmltk::backend::ml::cuda::TorchAutocastScope scope(amp != torch::kFloat32, amp);
+     // CLEANUP-IGNORE: Different AMP parity cases explicitly assert their expected native assignment before distinct independent numerical comparisons.
      const auto indices = rf::matcher_indices(outputs, gt, config, true);
      REQUIRE(indices[0].first.item<int64_t>() == 0);
      actual = rf::detection_loss_dict(outputs, gt, config, true, 1.).at("loss_ce");
@@ -594,6 +596,7 @@ TEST_CASE("Matcher FP32 policy retains the upstream AMP assignment difference", 
   config.use_jit_traced_loss_ops = false;
   // CLEANUP-IGNORE: Fixed BF16 matching policy differs from the varying-dtype IA-BCE destination case.
   mmltk::backend::ml::cuda::TorchAutocastScope amp(device.is_cuda(), torch::kBFloat16);
+  // CLEANUP-IGNORE: Different AMP parity cases explicitly assert their expected native assignment before distinct independent numerical comparisons.
   const auto assignment = rf::matcher_indices(outputs, gt, config, true);
   REQUIRE(assignment[0].first.item<int64_t>() == 0);
   if (!device.is_cuda()) continue;

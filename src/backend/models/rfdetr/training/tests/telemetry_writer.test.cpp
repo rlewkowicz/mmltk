@@ -118,6 +118,11 @@ public:
   writer = std::make_unique<r::TrainingTelemetryWriter>(std::move(run));
  }
  ~HeldHistory() { Drain(); }
+ void Finish(r::TrainingMetricProgress& progress) {
+  progress.phase = r::TrainingPhase::Completed;
+  writer->Finish(progress, {});
+  Drain();
+ }
  void Drain() {
   if (drained_) return;
   const int stream = ::open(path_.c_str(), O_RDWR | O_CLOEXEC);
@@ -172,6 +177,7 @@ private:
 };
 void test_telemetry_boundary_pressure_reserves_epoch_and_terminal() {
  mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-boundaries"};
+ // CLEANUP-IGNORE: The notice and held-history owners are shared fixtures; these independent tests inject different persistence boundaries and terminal failures.
  PersistenceNotice notice(temp.path());
  HeldHistory held(temp.path());
  r::TrainingMetricProgress progress;
@@ -186,9 +192,7 @@ void test_telemetry_boundary_pressure_reserves_epoch_and_terminal() {
  progress.full_checkpoint_path = temp.path() / "checkpoint.pt";
  held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
  held.writer->Submit(progress, r::TrainingRecordRole::Boundary);  // still full
- progress.phase = r::TrainingPhase::Completed;
- held.writer->Finish(progress, {});
- held.Drain();
+ held.Finish(progress);
  std::istringstream stream(held.history);
  std::string line;
  std::vector<r::TrainingRecord> records;
@@ -214,6 +218,7 @@ void test_telemetry_boundary_pressure_reserves_epoch_and_terminal() {
 }
 void test_invalid_terminal_has_truthful_degraded_custody_and_notice() {
  mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-invalid-terminal"};
+ // CLEANUP-IGNORE: The notice and held-history owners are shared fixtures; these independent tests inject different persistence boundaries and terminal failures.
  PersistenceNotice notice(temp.path());
  HeldHistory held(temp.path());
  r::TrainingMetricProgress progress;
@@ -229,11 +234,13 @@ void test_invalid_terminal_has_truthful_degraded_custody_and_notice() {
  REQUIRE(record.progress.full_checkpoint_path == progress.full_checkpoint_path);
  REQUIRE(record.dropped_before == 1);
  REQUIRE(held.writer->persistence().degraded);
+ // CLEANUP-IGNORE: Independent terminal-pressure and empty-close failures explicitly require the notice and absence of a persisted result.
  REQUIRE(notice.observed());
  REQUIRE_FALSE(std::filesystem::exists(temp.path() / "results.json"));
 }
 void test_rejected_only_submission_notifies_before_empty_close() {
  mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-empty-close"};
+ // CLEANUP-IGNORE: The notice and held-history owners are shared fixtures; these independent tests inject different persistence boundaries and terminal failures.
  PersistenceNotice notice(temp.path());
  HeldHistory held(temp.path());
  r::TrainingMetricProgress progress;
@@ -247,6 +254,7 @@ void test_rejected_only_submission_notifies_before_empty_close() {
 }
 void test_unencodable_terminal_notifies_without_later_submission() {
  mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-unencodable-terminal"};
+ // CLEANUP-IGNORE: The notice and held-history owners are shared fixtures; these independent tests inject different persistence boundaries and terminal failures.
  PersistenceNotice notice(temp.path());
  HeldHistory held(temp.path());
  r::TrainingMetricProgress progress;
@@ -256,6 +264,7 @@ void test_unencodable_terminal_notifies_without_later_submission() {
  REQUIRE(held.history.empty());
  REQUIRE(held.writer->persistence().degraded);
  REQUIRE(held.writer->persistence().dropped_records == 1);
+ // CLEANUP-IGNORE: Independent terminal-pressure and empty-close failures explicitly require the notice and absence of a persisted result.
  REQUIRE(notice.observed());
  REQUIRE_FALSE(std::filesystem::exists(temp.path() / "results.json"));
 }
@@ -265,9 +274,7 @@ void test_telemetry_distinct_heads_drain_by_sequence() {
  r::TrainingMetricProgress progress;
  progress.phase = r::TrainingPhase::Train;
  for (const auto role : {r::TrainingRecordRole::Boundary, r::TrainingRecordRole::Epoch, r::TrainingRecordRole::Live, r::TrainingRecordRole::Boundary}) held.writer->Submit(progress, role);
- progress.phase = r::TrainingPhase::Completed;
- held.writer->Finish(progress, {});
- held.Drain();
+ held.Finish(progress);
  std::istringstream stream(held.history);
  std::string line;
  std::uint64_t sequence = 0;
@@ -521,6 +528,7 @@ TEST_CASE("Retained selectable sources reject foreign duplicate inconsistent and
  r::TrainRequest request;
  request.use_ema = true;
  request.lanes = 16;
+ // CLEANUP-IGNORE: Telemetry and browser-contract fixtures independently select the maximal periodic model catalog before distinct projections.
  request.lane_configuration.mode = r::TrainLaneMode::PeriodicAveraging;
  r::resize_training_models(request.lane_configuration, r::kMaximumTrainingModels, request.recipe, request.seed);
  r::TrainingSources sources;
@@ -607,6 +615,7 @@ TEST_CASE("Retained selectable sources reject foreign duplicate inconsistent and
  r::TrainingSelection selection;
  selection.artifact.session_id = document.record.run_id;
  selection.artifact.model_id = 1;
+ // CLEANUP-IGNORE: Independent persisted run and telemetry fixtures specify fixed artifact identity bytes before distinct publication checks.
  selection.artifact.path = "selected.pt";
  selection.artifact.initialization = selection.artifact.configuration = selection.artifact.content = selection.artifact.sha256 = selection.artifact.validation = std::string(64, 'a');
  selection.validation.bbox.ap = .5;

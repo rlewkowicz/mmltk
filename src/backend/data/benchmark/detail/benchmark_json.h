@@ -15,6 +15,12 @@ using detail::CompileExecution;
 struct ByteRange {
  std::size_t begin = 0, end = 0;
 };
+// Keep at least one row, then bound each parser scheduling window by bytes.
+[[nodiscard]] inline std::size_t annotation_json_chunk_end(std::span<const ByteRange> rows, std::size_t begin) {
+ auto end = begin + 1;
+ while (end < rows.size() && rows[end].end - rows[begin].begin <= (256U << 10)) ++end;
+ return end;
+}
 class PaddedMappedFile final {
 public:
  explicit PaddedMappedFile(const std::filesystem::path&);

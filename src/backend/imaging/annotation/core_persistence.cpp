@@ -214,14 +214,11 @@ AnnotationObject annotation_object_from_scene_record(const json& record, Annotat
  const std::string shape_type_name = shape_type_it->get<std::string>();
  const AnnotationShapeType shape_type = annotation_shape_type_from_name(shape_type_name);
  const json& image_size = required_array_field("image_size_wh", 2U);
- const std::uint32_t image_width = image_size.at(0).get<std::uint32_t>();
- const std::uint32_t image_height = image_size.at(1).get<std::uint32_t>();
+ const auto [image_width, image_height] = image_size.get<std::array<std::uint32_t, 2>>();
  const json& view_origin = required_array_field("view_origin_xy", 2U);
- const std::uint32_t view_x = view_origin.at(0).get<std::uint32_t>();
- const std::uint32_t view_y = view_origin.at(1).get<std::uint32_t>();
+ const auto [view_x, view_y] = view_origin.get<std::array<std::uint32_t, 2>>();
  const json& capture_size = required_array_field("capture_size_wh", 2U);
- const std::uint32_t capture_width = capture_size.at(0).get<std::uint32_t>();
- const std::uint32_t capture_height = capture_size.at(1).get<std::uint32_t>();
+ const auto [capture_width, capture_height] = capture_size.get<std::array<std::uint32_t, 2>>();
  AnnotationObject object;
  object.object_id.clear();
  object.category_index = category_index;

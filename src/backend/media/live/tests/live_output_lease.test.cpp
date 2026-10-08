@@ -113,32 +113,29 @@ TEST_CASE("Live single-attempt claim preserves a concurrently replaced state", "
  CHECK_FALSE(claim_live_slot(state, observed));
  CHECK(slot_state_is(state, replacement));
 }
-TEST_CASE("Live source slot publishes Free only after product scrub") {
- std::atomic<std::uint32_t> state{slot_state_value(SlotState::Acquired)};
- PhysicalFrameRevision product = kRevision;
- bool scrub_observed_exclusive = false;
- REQUIRE(claim_live_slot(state, SlotState::Acquired));
+void check_live_product_scrub(std::atomic<std::uint32_t>& state, PhysicalFrameRevision& product) {
+ bool exclusive = false;
  publish_live_owner_slot(state, SlotState::Free, [&] noexcept {
-  scrub_observed_exclusive = slot_state_is(state, SlotState::Completing);
+  exclusive = slot_state_is(state, SlotState::Completing);
   product = {};
  });
- CHECK(scrub_observed_exclusive);
+ CHECK(exclusive);
  CHECK_FALSE(product.valid());
  CHECK(slot_state_is(state, SlotState::Free));
+}
+TEST_CASE("Live source slot publishes Free only after product scrub") {
+ // CLEANUP-IGNORE: Free-slot and terminal-slot publication independently start from the same acquired state and then verify distinct required transitions.
+ std::atomic<std::uint32_t> state{slot_state_value(SlotState::Acquired)};
+ PhysicalFrameRevision product = kRevision;
+ REQUIRE(claim_live_slot(state, SlotState::Acquired));
+ check_live_product_scrub(state, product);
 }
 TEST_CASE("Live fanout slot publishes Free only after completion scrub") {
  std::atomic<std::uint32_t> state{slot_state_value(SlotState::Published)};
  REQUIRE(claim_live_slot(state, SlotState::Published));
  CHECK_FALSE(transition_slot_state(state, SlotState::Published, SlotState::Acquired));
  PhysicalFrameRevision product = kRevision;
- bool scrub_observed_completing = false;
- publish_live_owner_slot(state, SlotState::Free, [&] noexcept {
-  scrub_observed_completing = slot_state_is(state, SlotState::Completing);
-  product = {};
- });
- CHECK(scrub_observed_completing);
- CHECK_FALSE(product.valid());
- CHECK(slot_state_is(state, SlotState::Free));
+ check_live_product_scrub(state, product);
 }
 struct CallbackWakeProbe final {
  std::size_t wakes = 0U;
@@ -161,6 +158,7 @@ TEST_CASE("Live output callback guard protects source work after slot release") 
  CHECK(wake.wakes == 1U);
 }
 TEST_CASE("Live incomplete fanout release publishes Terminal after scrub") {
+ // CLEANUP-IGNORE: Free-slot and terminal-slot publication independently start from the same acquired state and then verify distinct required transitions.
  std::atomic<std::uint32_t> state{slot_state_value(SlotState::Acquired)};
  PhysicalFrameRevision product = kRevision;
  REQUIRE(claim_live_slot(state, SlotState::Acquired));
@@ -201,6 +199,11 @@ public:
   result = std::async(std::launch::async, [this] { return revisions.Wait(stop.get_token(), &probe, &GatedRevisionSnapshotProbe::Snapshot); });
   REQUIRE(probe.checked.WaitEntered(std::chrono::seconds{2}));
  }
+ void SettleNotifier(std::promise<void>& started, std::future<void>& notifier) {
+  mmltk::testsupport::await_test_promise(started, "Live notifier started");
+  probe.checked.Release();
+  mmltk::testsupport::await_test_future(notifier, "Live notification settlement");
+ }
  LiveRevisionWait revisions;
  GatedRevisionSnapshotProbe probe;
  std::stop_source stop;
@@ -215,10 +218,9 @@ TEST_CASE("Live revision notification is retained after checked snapshot") {
   notifier_started.set_value();
   wait.revisions.RevisionReady();
  });
+ // CLEANUP-IGNORE: The release guard must live beside its notifier future; the shared settlement method precedes opposite revision-success and terminal-failure assertions.
  const mmltk::testsupport::ScopedTestCleanup release_snapshot([&] { wait.probe.checked.Release(); });
- mmltk::testsupport::await_test_promise(notifier_started, "Live notifier started");
- wait.probe.checked.Release();
- mmltk::testsupport::await_test_future(notifier, "Live notification settlement");
+ wait.SettleNotifier(notifier_started, notifier);
  const auto observed = mmltk::testsupport::await_test_future(wait.result, "Live revision settlement");
  REQUIRE(observed.has_value());
  CHECK(observed->revision == kRevision.revision);
@@ -245,10 +247,9 @@ TEST_CASE("Live admitted-run terminal notification is retained after checked sna
   notifier_started.set_value();
   listener(terminal);
  });
+ // CLEANUP-IGNORE: The release guard must live beside its notifier future; the shared settlement method precedes opposite revision-success and terminal-failure assertions.
  const mmltk::testsupport::ScopedTestCleanup release_snapshot([&] { wait.probe.checked.Release(); });
- mmltk::testsupport::await_test_promise(notifier_started, "Live notifier started");
- wait.probe.checked.Release();
- mmltk::testsupport::await_test_future(notifier, "Live notification settlement");
+ wait.SettleNotifier(notifier_started, notifier);
  CHECK_FALSE(mmltk::testsupport::await_test_future(wait.result, "Live revision settlement").has_value());
  CHECK(wait.revisions.failed());
  CHECK(terminal_probe.notifications == 1U);

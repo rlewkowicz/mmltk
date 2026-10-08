@@ -205,6 +205,7 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
  INFO(device);
  namespace tiles = mmltk::backend::imaging::upscale::image_upscaler_cuda;
  // CLEANUP-ON
+ // CLEANUP-IGNORE: Geometry generators exercise independent NIS sharpening and LUT conversion cases; the Boolean axes have different meanings.
  const auto width = GENERATE(1U, 3U, 19U, 257U);
  const auto height = GENERATE(1U, 5U);
  const bool lut = GENERATE(false, true);
@@ -251,6 +252,7 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
  CHECK(unchanged == source);
 }
 TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched guard bytes", "[upscale_gpu]") {
+ // CLEANUP-IGNORE: CUDA admission and selected-device diagnostics precede independent tile-stitching and ShiftLUT replay oracles.
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  const auto device = mmltk::testsupport::select_cuda_test_device(0);
  INFO(device);
@@ -297,6 +299,7 @@ TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched
   for (std::size_t byte = width * 4; byte < pitch; ++byte) REQUIRE(result[y * pitch + byte] == 0xA9);
  for (std::size_t byte = pitch * height; byte < result.size(); ++byte) REQUIRE(result[byte] == 0xA9);
 }
+// CLEANUP-IGNORE: CUDA admission and selected-device diagnostics precede independent tile-stitching and ShiftLUT replay oracles.
 TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles across graph replay and capacity changes", "[upscale_gpu]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  const auto device = mmltk::testsupport::select_cuda_test_device(0);
@@ -322,6 +325,7 @@ TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles acr
   Ort::MemoryInfo memory{"Cuda", OrtArenaAllocator, 0, OrtMemTypeDefault};
   auto input_value = Ort::Value::CreateTensor<float>(memory, input.as<float>(), 3U * 256U * 256U, input_shape.data(), input_shape.size());
   auto output_value = Ort::Value::CreateTensor<float>(memory, output.as<float>(), 3U * 1024U * 1024U, output_shape.data(), output_shape.size());
+  // CLEANUP-IGNORE: The LUT oracle binds the externally visible model inputs and outputs directly so generator binding mistakes remain observable.
   Ort::IoBinding binding{session};
   binding.BindInput("image", input_value);
   binding.BindOutput("upscaled", output_value);

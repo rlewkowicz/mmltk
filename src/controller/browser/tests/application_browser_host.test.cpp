@@ -414,6 +414,24 @@ private:
  REQUIRE(decoded);
  return std::move(*decoded);
 }
+[[nodiscard]] ServerRecord receive_record(LoopbackWebSocket& peer) {
+ const auto frame = peer.receive();
+ REQUIRE(frame);
+ return decode(*frame);
+}
+ServerRecord exchange_intent(LoopbackWebSocket& peer, std::span<const std::byte> intent) {
+ peer.send_binary(intent);
+ auto reply = receive_record(peer);
+ REQUIRE(std::holds_alternative<IntentReply>(reply));
+ return reply;
+}
+auto receive_retired_event(RunningHost& server, LoopbackWebSocket& peer, SystemEvent& event) {
+ server.context()->owner->publish(std::move(event));
+ event = {};
+ auto frame = peer.receive();
+ REQUIRE(frame);
+ return frame;
+}
 [[nodiscard]] std::uint64_t settings_reset_endpoint() {
  std::uint64_t result = 0U;
  ApplicationIntentSurface<ApplicationSystems>::Visit([&]<class Endpoint>() {
@@ -436,9 +454,8 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
  REQUIRE(first);
  REQUIRE(std::holds_alternative<Bootstrap>(decode(*first)));
  CHECK(std::get<Bootstrap>(decode(*first)).input_epoch != 0U);
- const auto progress_frame = peer.receive();
- REQUIRE(progress_frame);
- const auto progress = decode(*progress_frame);
+ // CLEANUP-IGNORE: Bootstrap traffic and application interaction rejection independently inspect their expected wire alternative before distinct endpoint assertions.
+ const auto progress = receive_record(peer);
  REQUIRE(std::holds_alternative<InteractionRejected>(progress));
  CHECK(std::get<InteractionRejected>(progress).endpoint_id == std::get<Bootstrap>(decode(*first)).input_epoch);
  const auto endpoint = settings_reset_endpoint();
@@ -450,17 +467,12 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
                                .fields = {},
                               }},
   intent));
- peer.send_binary(intent);
- auto reply_frame = peer.receive();
- REQUIRE(reply_frame);
- const auto reply = decode(*reply_frame);
- REQUIRE(std::holds_alternative<IntentReply>(reply));
+ const auto reply = exchange_intent(peer, intent);
  CHECK(std::get<IntentReply>(reply).correlation == 7U);
  CHECK(std::get<IntentReply>(reply).error.has_value());
+ // CLEANUP-IGNORE: Replacement and failure-reconnect peers have distinct lifetimes and independently require Bootstrap before different epoch and schema checks.
  LoopbackWebSocket replacement{server.websocket()};
- const auto replacement_first = replacement.receive();
- REQUIRE(replacement_first);
- const auto bootstrap = decode(*replacement_first);
+ const auto bootstrap = receive_record(replacement);
  REQUIRE(std::holds_alternative<Bootstrap>(bootstrap));
  CHECK(std::get<Bootstrap>(bootstrap).input_epoch > std::get<Bootstrap>(decode(*first)).input_epoch);
  const auto replacement_progress = replacement.receive();
@@ -496,9 +508,8 @@ TEST_CASE("direct host keeps a real peer after decoded application interaction r
  wire::ByteBuffer interaction;
  REQUIRE(encode_client_record(ClientRecord{explore_viewport_interaction()}, interaction));
  peer.send_binary(interaction);
- const auto rejected_frame = peer.receive();
- REQUIRE(rejected_frame);
- const auto rejected = decode(*rejected_frame);
+ // CLEANUP-IGNORE: Bootstrap traffic and application interaction rejection independently inspect their expected wire alternative before distinct endpoint assertions.
+ const auto rejected = receive_record(peer);
  REQUIRE(std::holds_alternative<InteractionRejected>(rejected));
  CHECK(std::get<InteractionRejected>(rejected).endpoint_id == application_stable_id("explore", "UpdateViewport"));
  CHECK(std::get<InteractionRejected>(rejected).error.category == contracts::ApplicationErrorCategory::Unavailable);
@@ -509,11 +520,7 @@ TEST_CASE("direct host keeps a real peer after decoded application interaction r
                                .fields = {},
                               }},
   later_intent));
- peer.send_binary(later_intent);
- const auto reply_frame = peer.receive();
- REQUIRE(reply_frame);
- const auto reply = decode(*reply_frame);
- REQUIRE(std::holds_alternative<IntentReply>(reply));
+ const auto reply = exchange_intent(peer, later_intent);
  CHECK(std::get<IntentReply>(reply).correlation == 29U);
 }
 TEST_CASE("application interaction rejection emits bounded endpoint and error diagnostics") {
@@ -575,16 +582,18 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
   annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, kind, {float(sequence + 1U), float(sequence + 2U)}));
  };
  auto rendered = annotation.snapshot().frame.revision;
- gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
- REQUIRE(ready.Wait([&] { return annotation.snapshot().frame.revision > rendered; }));
+ const auto begin_and_wait = [&] {
+  gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
+  REQUIRE(ready.Wait([&] { return annotation.snapshot().frame.revision > rendered; }));
+ };
+ begin_and_wait();
  rendered = annotation.snapshot().frame.revision;
  callbacks.closed(callbacks.context.get());
  REQUIRE(ready.Wait([&] { return annotation.snapshot().frame.revision > rendered; }));
  CHECK(annotation.snapshot().ui.scene.objects.empty());
  annotation.SetInputPeer(1U);
  rendered = annotation.snapshot().frame.revision;
- gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
- REQUIRE(ready.Wait([&] { return annotation.snapshot().frame.revision > rendered; }));
+ begin_and_wait();
  host.close_admission();
  callbacks.closed(callbacks.context.get());
  gesture(1U, contracts::AnnotationPointerPhase::End, 2U, 2U);
@@ -640,10 +649,7 @@ TEST_CASE("direct host retains nested event bytes after publisher ownership ends
   };
   wire::ByteBuffer expected;
   REQUIRE(encode_server_record(ServerRecord{event}, expected));
-  server.context()->owner->publish(std::move(event));
-  event = {};
-  const auto frame = peer.receive();
-  REQUIRE(frame);
+  const auto frame = receive_retired_event(server, peer, event);
   CHECK(frame->payload == expected);
  }
 }
@@ -662,10 +668,7 @@ TEST_CASE("direct host queues exact 64 KiB neighboring records with retired publ
   event.value = payload(text_size);
   REQUIRE(encode_server_record(ServerRecord{event}, expected));
   REQUIRE(expected.size() == target);
-  server.context()->owner->publish(std::move(event));
-  event = {};
-  const auto frame = peer.receive();
-  REQUIRE(frame);
+  const auto frame = receive_retired_event(server, peer, event);
   REQUIRE(frame->payload.size() == target);
   CHECK(frame->payload == expected);
  }
@@ -709,10 +712,9 @@ TEST_CASE("essential typed encoding failure closes once and reconnect restores b
   CHECK((!terminal || terminal->opcode == 8U));
   CHECK(failures == 1U);
  }
+ // CLEANUP-IGNORE: Replacement and failure-reconnect peers have distinct lifetimes and independently require Bootstrap before different epoch and schema checks.
  LoopbackWebSocket reconnected{server.websocket()};
- const auto frame = reconnected.receive();
- REQUIRE(frame);
- const auto record = decode(*frame);
+ const auto record = receive_record(reconnected);
  REQUIRE(std::holds_alternative<Bootstrap>(record));
  CHECK(std::get<Bootstrap>(record).schema_fingerprint == application_schema_fingerprint<ApplicationSystems>().words);
  REQUIRE(std::get<Bootstrap>(record).snapshots.size() == 1U);
@@ -724,9 +726,7 @@ TEST_CASE("direct host preserves the final complete state across a snapshot burs
  const auto bootstrap = peer.receive();
  REQUIRE(bootstrap);
  CHECK(std::holds_alternative<Bootstrap>(decode(*bootstrap)));
- const auto frame = peer.receive();
- REQUIRE(frame);
- const auto record = decode(*frame);
+ const auto record = receive_record(peer);
  REQUIRE(std::holds_alternative<SystemEvent>(record));
  const auto& event = std::get<SystemEvent>(record);
  CHECK(event.delivery == contracts::reflection::EventDelivery::LatestState);

@@ -7,24 +7,14 @@ module;
 export module mmltk.backend.imaging.raster;
 export namespace mmltk::backend::imaging::raster {
 template <class Pixel>
-struct PitchedView {
- Pixel* pixels = nullptr;
- std::size_t pitch_bytes = 0U;
- int width = 0;
- int height = 0;
- [[nodiscard]] bool valid(const std::size_t channels) const noexcept { return pixels != nullptr && width > 0 && height > 0 && pitch_bytes >= static_cast<std::size_t>(width) * channels; }
-};
+using PitchedView = detail::draw_launch::PitchedSurface<Pixel*>;
 using MutableBytes = PitchedView<std::uint8_t>;
 using ConstBytes = PitchedView<const std::uint8_t>;
 // Exactly 25 RGBA samples, with explicit source pixel coordinates. Destination
 // storage belongs to the caller and is reusable across asynchronous launches.
 [[nodiscard]] std::int32_t probe_rgba(ConstBytes, std::uint32_t* samples, std::span<const std::uint32_t, 50> coordinates, std::uintptr_t stream) noexcept;
 [[nodiscard]] std::int32_t scale_rgba(ConstBytes, MutableBytes, std::uintptr_t stream, bool bilinear = false) noexcept;
-struct PackedImage {
- std::uint8_t* pixels = nullptr;
- int width = 0;
- int height = 0;
-};
+using PackedImage = detail::draw_launch::PackedImageU8;
 enum class RgbaTargetKind : std::uint8_t { Pitched = 1, SurfaceObject = 2 };
 struct RgbaTargetView {
  RgbaTargetKind kind = RgbaTargetKind::Pitched;

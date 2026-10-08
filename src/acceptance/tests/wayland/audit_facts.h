@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -17,6 +18,11 @@ constexpr std::size_t kAcceptanceSnapshotLimit = 256U;
 constexpr std::size_t kAcceptanceRecordLimit = 4096U;
 constexpr const char* kExploreGalleryControl = "explore.gallery.workspace";
 [[nodiscard]] constexpr std::string_view first_failed_check() noexcept { return {}; }
+[[nodiscard]] constexpr std::string_view first_blocker(std::span<const std::pair<bool, std::string_view>> checks) noexcept {
+ for (const auto& [blocked, reason] : checks)
+  if (blocked) return reason;
+ return {};
+}
 template <typename... Remaining>
 [[nodiscard]] constexpr std::string_view first_failed_check(const bool passed, const std::string_view label, Remaining&&... remaining) noexcept {
  return passed ? first_failed_check(std::forward<Remaining>(remaining)...) : label;

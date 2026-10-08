@@ -1,7 +1,8 @@
+#include "src/test_support/image_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
-#include "src/test_support/async_test_utils.hpp"
 #include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/frameworks/gpu/image/image_failure.h"
 #include "src/frameworks/gpu/image/imported_image_buffer.h"
@@ -32,6 +33,12 @@
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 namespace mmltk::frameworks::gpu {
 namespace {
+void check_quarantined_source(std::unique_ptr<SystemImageRuntime>& source, const test_support::FakeImageBackend& backend) {
+ CHECK_FALSE(source->Borrow().valid());
+ CHECK_THROWS_WITH(source->Publish(8U, 8U, [](auto, auto, auto) {}), "image product storage is quarantined");
+ source.reset();
+ CHECK(backend.planes_freed == 0U);
+}
 using test_support::FakeImageBackend;
 using test_support::make_clean_semantic_runtime;
 using test_support::RuntimeFactory;
@@ -68,8 +75,7 @@ TEST_CASE("Native image handoffs preserve both planes between every visible GPU 
      source.reset();
     }
     high_water = storage;
-    auto copied = receiver.Borrow();
-    REQUIRE(copied.valid());
+    auto copied = mmltk::testsupport::require_borrowed_image(receiver);
     REQUIRE(copied.plane_count() == 2U);
     for (std::size_t index = 0U; index < copied.plane_count(); ++index) {
      const auto plane = copied.plane(index).plane();
@@ -147,6 +153,7 @@ TEST_CASE("borrowed image storage remains stable until receiver completion") {
   runtime.Publish(8U, 8U, [](auto, auto, auto) {});
   auto borrowed = runtime.Borrow();
   SystemImageRuntime::CompletedOutput baseline;
+  // CLEANUP-IGNORE: Independent retained-plane and receiver-copy tests probe blocked output admission before different release and retry paths.
   auto reservation = std::async(std::launch::async, [&] { return runtime.TryAcquireOutput(baseline).valid(); });
   REQUIRE_FALSE(mmltk::testsupport::await_test_future(reservation, "held-reader reservation"));
   auto writer = std::async(std::launch::async, [&runtime] { runtime.Publish(16U, 16U, [](auto, auto, auto) {}); });
@@ -204,8 +211,7 @@ TEST_CASE("multi-plane products copy atomically and reject self copy") {
  const auto paths = receiver.CopyFrom(source.Borrow());
  CHECK(paths[0U] == ImageCopyPath::SameDevice);
  CHECK(paths[1U] == ImageCopyPath::SameDevice);
- auto product = receiver.Borrow();
- REQUIRE(product.valid());
+ auto product = mmltk::testsupport::require_borrowed_image(receiver);
  CHECK(product.plane_count() == 2U);
  CHECK(product.plane(1U).plane().descriptor.kind == ImagePlaneKind::Semantic);
  CHECK(*reinterpret_cast<const std::uint8_t*>(product.plane(0U).plane().data) == 0x31U);
@@ -249,6 +255,7 @@ TEST_CASE("failed single-plane mutations invalidate receiver storage") {
  REQUIRE(receiver.Borrow().valid());
  CHECK_THROWS(receiver.Write(stream, ImagePlaneKind::Clean, 16U, 16U, [](auto, auto) { throw std::runtime_error("submit failure"); }));
  CHECK_FALSE(receiver.Borrow().valid());
+ // CLEANUP-IGNORE: Independent runtime and receiver tests publish an initial product before exercising different storage and failure transitions.
  SystemImageRuntime source{{.device = 0, .backend = backend}};
  source.Publish(8U, 8U, [](auto, auto, auto) {});
  receiver.Write(stream, ImagePlaneKind::Clean, 8U, 8U, [](auto, auto) {});
@@ -337,6 +344,7 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
   stream.Await(product);
   return product.plane(0U).revision();
  });
+ // CLEANUP-IGNORE: The deferred-custody checker and release guard are shared; external stream readers and receiver copies complete different asynchronous owners.
  mmltk::testsupport::ScopedTestCleanup release_reader{[&] { producer.Complete(); }};
  check_deferred_source_custody(source, *producer.event_gate);
  producer.Complete();
@@ -354,10 +362,7 @@ TEST_CASE("terminal product custody retains pixels without blocking source shutd
  const auto data = borrowed.plane(0U).plane().data;
  borrowed.Quarantine();
  CHECK_FALSE(borrowed.valid());
- CHECK_FALSE(source->Borrow().valid());
- CHECK_THROWS_WITH(source->Publish(8U, 8U, [](auto, auto, auto) {}), "image product storage is quarantined");
- source.reset();
- CHECK(backend->planes_freed == 0U);
+ check_quarantined_source(source, *backend);
  CHECK(backend->contexts_destroyed == 0U);
  CHECK(*reinterpret_cast<const unsigned char*>(data) == 73U);
  // The fake has no pending GPU work; explicitly ending custody is safe here.
@@ -391,8 +396,7 @@ TEST_CASE("receiver completion releases product access across threads but retain
  CHECK(available.load() > before);
  // A one-slot producer can reuse its planes before diagnostic ownership of
  // the old physical handles is destroyed, without waiting for another sync.
- REQUIRE(writer.wait_for(1s) == std::future_status::ready);
- writer.get();
+ mmltk::testsupport::await_test_future(writer, "writer", 1s);
  CHECK(backend->planes_allocated == 2U);
  completion->Complete();
  source.reset();
@@ -409,10 +413,7 @@ TEST_CASE("unproved completion quarantines access without releasing physical cus
  completion.emplace(source->Borrow());
  completion->Quarantine();
  CHECK_FALSE(completion->pending());
- CHECK_FALSE(source->Borrow().valid());
- CHECK_THROWS_WITH(source->Publish(8U, 8U, [](auto, auto, auto) {}), "image product storage is quarantined");
- source.reset();
- CHECK(backend->planes_freed == 0U);
+ check_quarantined_source(source, *backend);
  completion.reset();
  CHECK(backend->planes_freed == 1U);
 }
@@ -457,6 +458,7 @@ TEST_CASE("receiver retains a product lease through deferred source completion")
  auto& source = producer.source;
  auto receiver = make_clean_semantic_runtime(backend);
  auto copy = std::async(std::launch::async, [&] { return receiver.CopyFrom(source.Borrow()); });
+ // CLEANUP-IGNORE: The deferred-custody checker and release guard are shared; external stream readers and receiver copies complete different asynchronous owners.
  mmltk::testsupport::ScopedTestCleanup release_copy{[&] { producer.Complete(); }};
  check_deferred_source_custody(source, *producer.event_gate);
  producer.Complete();

@@ -30,10 +30,8 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
   std::array<float, 2> confidences{0.437F, 0.4F};
   std::int64_t count = 2;
  } input;
- Input* device = nullptr;
- REQUIRE(cudaMalloc(reinterpret_cast<void**>(&device), sizeof(Input)) == cudaSuccess);
- auto release = [](Input* value) { static_cast<void>(cudaFree(value)); };
- std::unique_ptr<Input, decltype(release)> storage(device, release);
+ auto storage = mmltk::testsupport::allocate_cuda_test_object<Input>();
+ auto* device = storage.get();
  const auto draw = [&](bool add, bool device_count = false, const float* threshold = nullptr) {
   REQUIRE(cudaMemcpyAsync(device, &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
   REQUIRE(raster::raster_instance_overlay_rgba(
@@ -85,10 +83,8 @@ TEST_CASE("overwrite raster agrees with forward host painting for overlaps label
  input.pixels.fill(0xA7U);
  for (int instance = 0; instance < 3; ++instance)
   for (int pixel = 0; pixel < width * height; ++pixel) input.masks[instance * width * height + pixel] = (pixel + instance) % 5 != 0;
- Input* device = nullptr;
- REQUIRE(cudaMalloc(reinterpret_cast<void**>(&device), sizeof(Input)) == cudaSuccess);
- auto release = [](Input* value) { static_cast<void>(cudaFree(value)); };
- std::unique_ptr<Input, decltype(release)> storage(device, release);
+ auto storage = mmltk::testsupport::allocate_cuda_test_object<Input>();
+ auto* device = storage.get();
  // These literal glyphs are host-owned expected shapes, stamped forwards like
  // an ordinary painter; neither CUDA hit helpers nor reverse search are used.
  constexpr std::array<std::array<std::string_view, 7U>, 2U> glyphs{{{".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."}, {"..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."}}};

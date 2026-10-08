@@ -73,9 +73,7 @@ __global__ void horizontal_kernel(const void* source, const std::size_t source_p
   const auto crop_x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.crop_width) - 1, base + static_cast<int>(tap))));
   const float coefficient = device::kScaleCoefficients.values[source_phase][tap];
   const float3 sample = source_pixel(source, source_pitch, config.crop_x + crop_x, config.crop_y + pixel.y);
-  color.x = fmaf(coefficient, sample.x, color.x);
-  color.y = fmaf(coefficient, sample.y, color.y);
-  color.z = fmaf(coefficient, sample.z, color.z);
+  device::accumulate_rgb(color, coefficient, sample);
  }
  horizontal[pixel.index] = HalfRgba{__float2half_rn(color.x), __float2half_rn(color.y), __float2half_rn(color.z), __float2half_rn(0.0F)};
 }
@@ -96,9 +94,7 @@ __global__ void vertical_kernel(const HalfRgba* horizontal, HalfRgba* scaled, co
   const auto source_y_index = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.crop_height) - 1, base + static_cast<int>(tap))));
   const HalfRgba sample = horizontal[static_cast<std::size_t>(source_y_index) * config.output_width + pixel.x];
   const float coefficient = device::kScaleCoefficients.values[source_phase][tap];
-  color.x = fmaf(coefficient, __half2float(sample.red), color.x);
-  color.y = fmaf(coefficient, __half2float(sample.green), color.y);
-  color.z = fmaf(coefficient, __half2float(sample.blue), color.z);
+  device::accumulate_rgb(color, coefficient, make_float3(__half2float(sample.red), __half2float(sample.green), __half2float(sample.blue)));
  }
  scaled[pixel.index] = HalfRgba{__float2half_rn(color.x), __float2half_rn(color.y), __float2half_rn(color.z), __float2half_rn(0.0F)};
 }
@@ -126,9 +122,7 @@ __global__ void sharpen_kernel(const void* source, const std::size_t source_pitc
   const int offset = static_cast<int>(tap) - 2;
   const HalfRgba sample = load_clamped(scaled, config, static_cast<int>(pixel.x) + (horizontal ? offset : 0), static_cast<int>(pixel.y) + (horizontal ? 0 : offset));
   const float coefficient = device::kUsmCoefficients.values[selected_phase][tap];
-  detail.x = fmaf(coefficient, __half2float(sample.red), detail.x);
-  detail.y = fmaf(coefficient, __half2float(sample.green), detail.y);
-  detail.z = fmaf(coefficient, __half2float(sample.blue), detail.z);
+  device::accumulate_rgb(detail, coefficient, make_float3(__half2float(sample.red), __half2float(sample.green), __half2float(sample.blue)));
  }
  const float magnitude = fabsf(fmaf(0.2126F, detail.x, fmaf(0.7152F, detail.y, 0.0722F * detail.z)));
  const float strength = 0.18F + 0.16F * fminf(1.0F, magnitude * 8.0F);

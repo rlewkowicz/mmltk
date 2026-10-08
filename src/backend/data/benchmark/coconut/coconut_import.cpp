@@ -741,6 +741,10 @@ public:
    retain_image(position, std::move(product));
   }
  }
+ static void append_image_identity(CoconutComponentBuilder& component, const CoconutPhysicalImage& physical, const CoconutRecord& record) {
+  component.index.images.push_back({physical.image_id, 0, 0, record.width, record.height, physical.shard, 0});
+  component.inventory.push_back({physical, record.image_id, record.source_ordinal});
+ }
  void consume_image(const CoconutRecord& record, const CoconutPhysicalImage& physical, std::span<const std::uint8_t> png, CompileAllowance allowance, Worker* selected, std::size_t position,
   dataset::MaskDimensions dimensions) {
   if (position == SIZE_MAX) position = record.source_ordinal;
@@ -754,8 +758,7 @@ public:
    component.annotation_input_identity = component.input_identity = request_.input_identity;
    component.index.source = coconut_index_source(physical.source);
    component.index.split = coconut_component_split(request_.edition, physical.source);
-   component.index.images.push_back({physical.image_id, 0, 0, record.width, record.height, physical.shard, 0});
-   component.inventory.push_back({physical, record.image_id, record.source_ordinal});
+   append_image_identity(component, physical, record);
   }
   const bool normalize = !request_.metadata_only && std::ranges::find(request_.retained_sources, physical.source) == request_.retained_sources.end();
   const auto original = normalize && request_.originals && physical.archive_identity == "pending" ? CoconutOriginalReadiness{{}, false, 0}
@@ -808,8 +811,7 @@ public:
       auto& component = components_[physical.source];
       static_cast<CoconutComponentMetadata&>(component) = lineage->component;
       static_cast<NormalizedAnnotationMetadata&>(component.index) = lineage->index;
-      component.index.images.push_back({physical.image_id, 0, 0, record.width, record.height, physical.shard, 0});
-      component.inventory.push_back({physical, record.image_id, record.source_ordinal});
+      append_image_identity(component, physical, record);
       if (component.recovery_policy) component.recovery.push_back({physical.image_id, 0, {}});
      }
     } else if (!saved) {
@@ -1675,8 +1677,7 @@ void json_rows(const CoconutImportRequest& request, const PaddedMappedFile& inpu
  // Source/lane parser capacity survives bounded callbacks under IdleScratch
  // custody. The typed row borrows it only during this synchronous callback.
  for (std::size_t first = 0; first < rows.size();) {
-  auto end = first + 1;
-  while (end < rows.size() && rows[end].end - rows[first].begin <= (256U << 10)) ++end;
+  const auto end = annotation_json_chunk_end(rows, first);
   const auto parse = [&](std::size_t job) {
    auto& storage = parsers[request.execution ? request.execution->execution().current_lane() : 0];
    struct Account {

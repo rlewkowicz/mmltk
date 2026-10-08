@@ -1,3 +1,4 @@
+#include "src/common/types/container_utils.h"
 #include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/storage_reservation.h"
@@ -122,14 +123,7 @@ struct TracePath final {
  const std::string identity_material = normalized_output.generic_string();
  return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
 }
-[[nodiscard]] bool path_contains(const std::filesystem::path& parent, const std::filesystem::path& child) {
- auto parent_iterator = parent.begin();
- auto child_iterator = child.begin();
- for (; parent_iterator != parent.end() && child_iterator != child.end(); ++parent_iterator, ++child_iterator) {
-  if (*parent_iterator != *child_iterator) { return false; }
- }
- return parent_iterator == parent.end();
-}
+[[nodiscard]] bool path_contains(const std::filesystem::path& parent, const std::filesystem::path& child) { return std::ranges::mismatch(parent, child).in1 == parent.end(); }
 DownloadResult acquire_physical_archive(const AdmittedRecipeArchive& admitted, const BenchmarkCacheLayout& cache, ProgressReporter& progress, ArtifactProgressTotals& totals,
  detail::StorageReservationPool& storage, std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution) {
  const auto& artifact = admitted.origin.artifact;
@@ -326,12 +320,7 @@ public:
    }
    if (attempt_reported != 0U) { transfer_progress->images(source, artifact.artifact_id, 0, source_total_images, *progress, "Withdrawing failed " + archive_name + " attempt"); }
    throw_if_benchmark_cancelled(cancel_requested);
-   if (trace.accepts("benchmark.download.failure_sha256")) try {
-     if (std::filesystem::is_regular_file(request.destination)) {
-      const auto digest = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancel_requested.requested(); }));
-      trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", digest}, {"reason", failure_reason}}; });
-     }
-    } catch (...) { throw_if_benchmark_cancelled(cancel_requested); }
+   trace_download_failure(request, failure_reason, cancel_requested, trace);
    if (attempt == 3U) { break; }
    progress->source_activity(source, "Repairing " + archive_name + " extraction for retry " + std::to_string(attempt + 1U));
    invalidate_download_artifact(request, cancel_requested, trace, execution, source_handle);
@@ -1405,8 +1394,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    if (slot == 2)
     for (const auto& image : quarantined)
      if (image.source == BenchmarkDatasetSource::kOpenImagesV7) unavailable.push_back(image.image_id);
-   std::ranges::sort(unavailable);
-   unavailable.erase(std::unique(unavailable.begin(), unavailable.end()), unavailable.end());
+   mmltk::common::sort_unique(unavailable);
    progress.label_plan_started(slot);
    auto plan = make_split(slot == 3 ? "val" : "train");
    custom_label_counts[slot] = append_source_plan(

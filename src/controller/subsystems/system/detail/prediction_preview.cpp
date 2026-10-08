@@ -1,3 +1,4 @@
+#include <array>
 #include "src/backend/imaging/raster/image_containment.h"
 #include "prediction_preview.h"
 #include "src/backend/ml/runtime/backend_factory.h"
@@ -203,9 +204,12 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   ground_truth_words += gt.mask.runs.size() * 2U;
  }
  const auto raw_bytes = pixel_bytes + count * (5U * sizeof(float) + sizeof(std::int32_t) + 3U) + mask_bytes;
- const auto admitted_ground_truth_offset = (raw_bytes + 3U) & ~std::size_t{3U};
- const auto admitted_scratch_offset = admitted_ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
- const auto admitted_bytes = admitted_scratch_offset + (composition ? pixel_count * 8U : 0U);
+ const auto layout_after_pixels = [&](std::size_t bytes) {
+  const auto ground_truth_offset = (bytes + 3U) & ~std::size_t{3U};
+  const auto scratch_offset = ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
+  return std::array{ground_truth_offset, scratch_offset, scratch_offset + (composition ? pixel_count * 8U : 0U)};
+ };
+ const auto admitted_bytes = layout_after_pixels(raw_bytes)[2];
  if (admitted_bytes > rfdetr::kMaximumPredictionTensorBytes) throw std::invalid_argument("prediction raw preview exceeds storage capacity");
  // Admission above deliberately retains the former float and full aggregate bounds.
  // Every physical extent is bounded by that admitted layout; RGB's aligned prefix
@@ -213,9 +217,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
  const auto physical_pixels = rgb8 ? pixel_count * 3U : pixel_bytes;
  const auto boxes_offset = (physical_pixels + alignof(float) - 1U) & ~(alignof(float) - 1U);
  const auto physical_raw_bytes = boxes_offset + (raw_bytes - pixel_bytes);
- const auto ground_truth_offset = (physical_raw_bytes + 3U) & ~std::size_t{3U};
- const auto scratch_offset = ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
- const auto bytes = scratch_offset + (composition ? pixel_count * 8U : 0U);
+ const auto [ground_truth_offset, scratch_offset, bytes] = layout_after_pixels(physical_raw_bytes);
  if (bytes > admitted_bytes) throw std::invalid_argument("prediction compact preview exceeds admitted storage");
  const auto device = source_device >= 0 ? source_device : execution_.device;
  // Resolve policy before touching a reusable receiver slot. An unavailable

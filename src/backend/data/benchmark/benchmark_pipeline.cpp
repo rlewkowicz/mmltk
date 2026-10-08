@@ -556,6 +556,8 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  [[nodiscard]] bool label_retired(const LabelWork&) const;
  void finish_label(const std::shared_ptr<LabelWork>&, std::exception_ptr) noexcept;
  void write_label(LabelWork&);
+ void publish_label_product(const LabelWork&);
+ [[nodiscard]] bool label_current(const LabelWork&) const;
  void run_label(LabelWork&, std::size_t);
 };
 struct BenchmarkSourcePublication::State {
@@ -619,6 +621,7 @@ void BenchmarkCompilePipeline::bind_source(const std::filesystem::path& root, Be
  if (std::ranges::find(source.writers, &writer) == source.writers.end()) source.writers.push_back(&writer);
 }
 std::optional<std::uint32_t> BenchmarkCompilePipeline::image_slot(const std::filesystem::path& root, std::uint64_t id) const {
+ // CLEANUP-IGNORE: These queries inspect retained image storage but return different slot and completion facts; current-image lookup has different retirement semantics.
  const std::lock_guard lock(impl_->mutex);
  const auto* source = impl_->images.find(root);
  if (!source) return {};
@@ -970,6 +973,7 @@ void BenchmarkCompilePipeline::label_configuration(std::uint32_t resolution, mml
  impl_->label_completed = std::move(completed);
 }
 std::shared_ptr<const BenchmarkLabelChunk> BenchmarkCompilePipeline::image_labels(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency) const {
+ // CLEANUP-IGNORE: These synchronized lookups feed different product and completion queries, including different retirement admission.
  const std::lock_guard lock(impl_->mutex);
  const auto* image = impl_->images.find_image(root, id);
  const auto* label = image ? image->find_labels(dependency) : nullptr;
@@ -1734,6 +1738,16 @@ void BenchmarkCompilePipeline::Impl::finish_label(const std::shared_ptr<LabelWor
  owner->wake();
  owner->changed.notify_all();
 }
+bool BenchmarkCompilePipeline::Impl::label_current(const LabelWork& label) const {
+ const auto& result = *label.label;
+ const auto& image = *result.image;
+ return !stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() && label.generation == image.source->image_generation(image.image_id) &&
+        result.generation == image.source->label_generation;
+}
+void BenchmarkCompilePipeline::Impl::publish_label_product(const LabelWork& label) {
+ const std::lock_guard lock(mutex);
+ if (label_current(label)) label.label->product = label.product;
+}
 void BenchmarkCompilePipeline::Impl::run_label(LabelWork& label, std::size_t lane) {
  // The record bounds the entire conversion, including pinned output awaiting
  // file capacity. Keep its annotation class until physical settlement so other
@@ -1771,12 +1785,7 @@ void BenchmarkCompilePipeline::Impl::run_label(LabelWork& label, std::size_t lan
  label.target = target;
  label.product = std::move(product);
  label.output = std::move(output);
- if (!target) {
-  const std::lock_guard lock(mutex);
-  if (!stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() && label.generation == image.source->image_generation(image.image_id) &&
-      result.generation == image.source->label_generation)
-   result.product = label.product;
- }
+ if (!target) publish_label_product(label);
 }
 void BenchmarkCompilePipeline::Impl::write_label(LabelWork& label) {
  auto& result = *label.label;
@@ -1786,8 +1795,7 @@ void BenchmarkCompilePipeline::Impl::write_label(LabelWork& label) {
  bool current;
  {
   const std::lock_guard lock(mutex);
-  current = !stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() && label.generation == image.source->image_generation(image.image_id) &&
-            result.generation == image.source->label_generation && (!target->selected_label || result.priority >= target->selected_label->priority);
+  current = label_current(label) && (!target->selected_label || result.priority >= target->selected_label->priority);
  }
  if (current) {
   ImageEntry entry{};
@@ -1803,12 +1811,7 @@ void BenchmarkCompilePipeline::Impl::write_label(LabelWork& label) {
   }
   if (label_completed) label_completed(image.source->root, image.image_id);
  }
- {
-  const std::lock_guard lock(mutex);
-  if (!stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() && label.generation == image.source->image_generation(image.image_id) &&
-      result.generation == image.source->label_generation)
-   result.product = label.product;
- }
+ publish_label_product(label);
 }
 void BenchmarkCompilePipeline::write_remaining(BenchmarkSplitWriter& writer, const PreparedBenchmarkSplit& split, std::span<const std::size_t> slots) {
  for (std::size_t i = 0; i < split.images.size(); ++i) {
@@ -1859,6 +1862,7 @@ void BenchmarkCompilePipeline::write_remaining(BenchmarkSplitWriter& writer, con
  if (failure) std::rethrow_exception(failure);
 }
 CompileExecution::Completion BenchmarkCompilePipeline::image_completion(const std::filesystem::path& root, std::uint64_t id) const {
+ // CLEANUP-IGNORE: These queries inspect retained image storage but return different slot and completion facts; current-image lookup has different retirement semantics.
  const std::lock_guard lock(impl_->mutex);
  const auto* source = impl_->images.find(root);
  if (!source) return {};
@@ -1866,6 +1870,7 @@ CompileExecution::Completion BenchmarkCompilePipeline::image_completion(const st
  return image == source->images.end() || !image->second.submitted ? CompileExecution::Completion{} : image->second.job.completion.completion();
 }
 CompileExecution::Completion BenchmarkCompilePipeline::label_completion(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency) const {
+ // CLEANUP-IGNORE: These synchronized lookups feed different product and completion queries, including different retirement admission.
  const std::lock_guard lock(impl_->mutex);
  const auto* image = impl_->images.find_image(root, id);
  const auto* label = image ? image->find_labels(dependency) : nullptr;

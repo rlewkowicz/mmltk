@@ -61,6 +61,7 @@ TEST_CASE("Scoped boundary verifies effective placement and restores caller poli
  const auto after = capture_execution_policy_snapshot();
  CHECK(after.affinity == before.affinity);
  CHECK(after.nice_value == before.nice_value);
+ // CLEANUP-IGNORE: Dataset-reader restoration independently verifies NUMA policy against the execution-policy unit oracle.
  CHECK(after.memory_policy.mode == before.memory_policy.mode);
  CHECK(after.memory_policy.mask == before.memory_policy.mask);
  CHECK(after.io_class == before.io_class);

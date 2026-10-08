@@ -164,6 +164,7 @@ void ProgressReporter::label_plans(std::size_t total) {
  emit(lock, DeliveryMode::Boundary);
 }
 void ProgressReporter::label_plan_started(std::size_t slot) {
+ // CLEANUP-IGNORE: The callback guard and lock precede opposite label-plan transitions with different completion and invalidation semantics.
  if (!callback_) return;
  std::unique_lock lock(mutex_);
  auto& plan = label_plans_.at(slot);
@@ -176,6 +177,7 @@ void ProgressReporter::label_plan_started(std::size_t slot) {
  emit(lock, invalidated ? DeliveryMode::Boundary : DeliveryMode::Dirty);
 }
 void ProgressReporter::label_plan_completed(std::size_t slot) {
+ // CLEANUP-IGNORE: The callback guard and lock precede opposite label-plan transitions with different completion and invalidation semantics.
  if (!callback_) return;
  std::unique_lock lock(mutex_);
  auto& plan = label_plans_.at(slot);
@@ -461,6 +463,7 @@ void IndexingProgressTotals::publish(std::unique_lock<std::mutex>& lock, Progres
  reporter.phase_unlocked(lock, DatasetCompilePhase::Indexing, completed_, unknown_ ? 0 : total_, true);
 }
 void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed, ProgressReporter& reporter) {
+ // CLEANUP-IGNORE: The observer guard and lock precede different monotonic-update and settlement accounting rules.
  if (!reporter.normalization_observer_enabled()) return;
  std::unique_lock lock(reporter.mutex_);
  auto& observation = releases_.at(release);
@@ -472,6 +475,7 @@ void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed
  publish(lock, reporter);
 }
 void IndexingProgressTotals::settle(std::size_t release, std::uint64_t completed, ProgressReporter& reporter) {
+ // CLEANUP-IGNORE: The observer guard and lock precede different monotonic-update and settlement accounting rules.
  if (!reporter.normalization_observer_enabled()) return;
  std::unique_lock lock(reporter.mutex_);
  auto& observation = releases_.at(release);

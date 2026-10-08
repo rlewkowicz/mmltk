@@ -20,6 +20,14 @@ template <class T>
 inline constexpr bool is_optional = false;
 template <class T>
 inline constexpr bool is_optional<std::optional<T>> = true;
+template <class Left, class Right, class Visitor>
+void visit_matching_members(Left& left, const Right& right, Visitor&& visit) {
+ template for (constexpr auto left_member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Left, std::meta::access_context::current()))) {
+  template for (constexpr auto right_member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Right, std::meta::access_context::current()))) {
+   if constexpr (std::meta::identifier_of(left_member) == std::meta::identifier_of(right_member)) visit(left.[:left_member:], right.[:right_member:]);
+  }
+ }
+}
 }  // namespace mmltk::backend::models::rfdetr::model_state_detail
 namespace mmltk::backend::models::rfdetr {
 inline constexpr const char* kNativeCheckpointFormat = "mmltk.rfdetr.native_checkpoint";

@@ -225,6 +225,7 @@ public:
   return operation();
  }
  [[nodiscard]] contracts::ComputeUiState Stop() noexcept {
+  // CLEANUP-IGNORE: Independent compute systems lock their own state after stopping their own LocalRun; cancellation is already owned by the shared compute transition.
   static_cast<void>(run_.Stop());
   std::scoped_lock lock(mutex_);
   contracts::cancel_compute(state_);
@@ -254,6 +255,7 @@ public:
   return [this]() mutable noexcept { Changed(); };
  }
  void Progress(const contracts::ComputeProgress& progress) noexcept {
+  // CLEANUP-IGNORE: Each independent system advances its locked state through the common compute transition before publishing its distinct typed progress event.
   contracts::ComputeUiState snapshot;
   {
    std::scoped_lock lock(mutex_);

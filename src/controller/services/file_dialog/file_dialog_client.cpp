@@ -1,3 +1,4 @@
+#include "src/common/io/poll.h"
 #include "src/controller/services/file_dialog/file_dialog_client.h"
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
@@ -226,8 +227,7 @@ enum class OutputDrainState : std::uint8_t { Pending, Closed };
 void drain_output_to_eof(mmltk::common::io::ScopedFd& descriptor, FixedOutput& output) {
  while (drain_output_available(descriptor, output) != OutputDrainState::Closed) {
   pollfd event{.fd = descriptor.get(), .events = POLLIN | POLLHUP, .revents = 0};
-  int ready = -1;
-  do { ready = ::poll(&event, 1U, -1); } while (ready < 0 && errno == EINTR);
+  const int ready = mmltk::common::io::poll_descriptors({&event, 1U});
   if (ready < 0 || (event.revents & POLLNVAL) != 0) { throw std::runtime_error("file-dialog output drain failed: " + std::string{std::strerror(errno)}); }
  }
 }
@@ -315,8 +315,7 @@ FileDialogResult FileDialogClient::run(const FileDialogRequest& request, FileDia
     {child_pidfd.get(), POLLIN, 0},
     {cancellation_descriptor.get(), POLLIN, 0},
    }};
-   int ready = -1;
-   do { ready = ::poll(descriptors.data(), descriptors.size(), -1); } while (ready < 0 && errno == EINTR);
+   const int ready = mmltk::common::io::poll_descriptors(descriptors);
    if (ready < 0) { throw std::runtime_error("file-dialog wait failed: " + std::string{std::strerror(errno)}); }
    if ((descriptors[2].revents & (POLLIN | POLLERR | POLLHUP)) != 0) {
     terminate_and_reap(child);

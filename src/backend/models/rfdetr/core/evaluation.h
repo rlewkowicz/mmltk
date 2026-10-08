@@ -32,6 +32,12 @@ struct EncodedMask {
  uint32_t width = 0;
  uint32_t area = 0;
  std::vector<std::pair<uint32_t, uint32_t>> runs;
+ void reset(uint32_t new_height, uint32_t new_width) {
+  height = new_height;
+  width = new_width;
+  area = 0;
+  runs.clear();
+ }
  void append_run(uint32_t start, uint32_t length, std::size_t maximum_runs) {
   if (runs.size() == maximum_runs) throw std::invalid_argument("RF-DETR encoded masks exceed aggregate storage capacity");
   // Spare storage follows emitted runs, independently of the aggregate allowance.
@@ -41,10 +47,7 @@ struct EncodedMask {
 };
 template <typename ValueAt>
 void encode_mask_values_into(const uint32_t height, const uint32_t width, EncodedMask& mask, ValueAt&& value_at, std::size_t maximum_runs = kMaximumPredictionMaskRuns) {
- mask.height = height;
- mask.width = width;
- mask.area = 0;
- mask.runs.clear();
+ mask.reset(height, width);
  if (width == 0U || height == 0U) return;
  const auto pixel_count = static_cast<uint32_t>(checked_prediction_extent(width, height, kMaximumEncodedMaskPixels));
  maximum_runs = std::min(maximum_runs, kMaximumPredictionMaskRuns);

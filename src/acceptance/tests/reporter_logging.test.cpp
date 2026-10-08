@@ -72,6 +72,7 @@ void test_catch2_compact_reporter_formats_shared_assertion_details() {
  const SubprocessResult result = run_reporter_fixture("compact");
  REQUIRE((result.exit_code != 0));
  REQUIRE((result.output_text.find("failed: fixture_value == 2") != std::string::npos));
+ // CLEANUP-IGNORE: Console and TAP reporter acceptance independently require the shared diagnostic text in each externally visible format.
  REQUIRE((result.output_text.find("for: 1 == 2") != std::string::npos));
  REQUIRE((result.output_text.find("with 1 message: 'vendored reporter info'") != std::string::npos));
 }
@@ -80,6 +81,7 @@ void test_catch2_tap_reporter_formats_shared_assertion_details() {
  REQUIRE((result.exit_code != 0));
  REQUIRE((result.output_text.find("# vendored_catch2_reporter_fixture") != std::string::npos));
  REQUIRE((result.output_text.find("not ok 1 - fixture_value == 2") != std::string::npos));
+ // CLEANUP-IGNORE: Console and TAP reporter acceptance independently require the shared diagnostic text in each externally visible format.
  REQUIRE((result.output_text.find("for: 1 == 2") != std::string::npos));
  REQUIRE((result.output_text.find("with 1 message: 'vendored reporter info'") != std::string::npos));
 }

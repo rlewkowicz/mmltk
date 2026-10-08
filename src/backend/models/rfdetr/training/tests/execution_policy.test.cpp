@@ -24,6 +24,7 @@ TEST_CASE("Ultralytics scheduler retains literal warmup exit values across K ove
  auto recipe = sgd_recipe();
  recipe.warmup_epochs = .375;
  r::TrainingSchedule continuous(recipe, {.01, .01}, {r::TrainingGroupRole::Bias, r::TrainingGroupRole::Ordinary}, 4, 4, 2);
+ // CLEANUP-IGNORE: Schedule and continuation tests independently exercise the first epoch/microbatch boundary before different progression and restore checks.
  continuous.begin_epoch(0);
  continuous.consume_microbatch();
  CHECK(continuous.state().warmup_microbatches == 2);
@@ -170,12 +171,14 @@ TEST_CASE("Sparse training shards preserve empty images distinct support and sta
  CHECK((same.shards() == plan.shards()));
  CHECK(same.hash() == plan.hash());
  request.lane_configuration.mode = r::TrainLaneMode::SharedGradients;
+ // CLEANUP-IGNORE: Complete and sparse training plans explicitly require one shard before distinct image-membership expectations.
  r::TrainingDataPlan shared(images, 4, request);
  REQUIRE(shared.shards().size() == 1);
  CHECK(shared.shards()[0].images.size() == images.size());
  REQUIRE_THROWS(r::TrainingDataPlan({{{4}}}, 4, request));
  auto sparse = images;
  sparse[1].eligible = sparse[6].eligible = false;
+ // CLEANUP-IGNORE: Complete and sparse training plans explicitly require one shard before distinct image-membership expectations.
  r::TrainingDataPlan holes(sparse, 4, request);
  REQUIRE(holes.shards().size() == 1);
  CHECK(holes.shards()[0].images.size() == images.size() - 2);
@@ -262,12 +265,14 @@ TEST_CASE("Empty membership and base-only repeat policy retain deterministic tas
  request.data_policy.maximum_repeat_factor = 64;
  request.data_policy.maximum_draw_multiplier = 16;
  std::vector<r::TrainingImageClasses> images(65536);
+ // CLEANUP-IGNORE: Empty-membership and base-only policies independently verify schedule cardinality before different repeat and uniqueness assertions.
  r::TrainingDataPlan empty(images, 1, request);
  const auto baseline = empty.epoch(0, 0);
  CHECK(baseline.schedule->image_indices.size() == images.size());
  CHECK(empty.epoch(0, 0).schedule->image_indices == baseline.schedule->image_indices);
  request.data_policy.maximum_draw_multiplier = 1;
  images.front().classes = {0};
+ // CLEANUP-IGNORE: Empty-membership and base-only policies independently verify schedule cardinality before different repeat and uniqueness assertions.
  r::TrainingDataPlan base_only(images, 1, request);
  const auto draws = base_only.epoch(0, 0);
  CHECK(draws.schedule->image_indices.size() == images.size());
@@ -281,6 +286,7 @@ TEST_CASE("Logical donor history separates streams excludes self and retains inv
  const std::array<r::TrainingDonorDescriptor, 2> sources{{{7, 1, true}, {9, 2, true}}};
  CHECK_FALSE(history.plan(0, keys, images)[0].valid);
  history.replace(0, sources);
+ // CLEANUP-IGNORE: Schedule and continuation tests copy a borrowed donor plan for different later mutation and restore assertions.
  const auto planned_span = history.plan(0, keys, images);
  const std::vector<r::TrainingDonorDescriptor> planned(planned_span.begin(), planned_span.end());
  CHECK(planned[0] == sources[1]);

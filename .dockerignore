@@ -4,6 +4,8 @@
 .claude
 
 # Build outputs
+/mmltk
+/.mmltk-next-*
 /build/
 /workspace/
 /compiled/

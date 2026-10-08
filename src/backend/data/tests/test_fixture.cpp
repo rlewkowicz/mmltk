@@ -1,3 +1,6 @@
+#include "src/backend/data/benchmark/detail/benchmark_download.h"
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
@@ -40,9 +43,27 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <catch2/catch_test_macros.hpp>
 namespace fs = std::filesystem;
 namespace mmltk::backend::data::testsupport {
 using Json = nlohmann::json;
+void check_normal_compile_storage(const detail::CompileExecution& execution, std::uint64_t locked_bytes) {
+ CHECK(execution.snapshot().exceptional == 0);
+ CHECK(execution.snapshot().normal_locked == locked_bytes);
+}
+void check_compile_records_drained(const detail::CompileExecution& execution) {
+ CHECK(execution.snapshot().records == 0);
+ CHECK(execution.snapshot().leased == 0);
+}
+void check_compile_inputs_drained(const detail::CompileExecution& execution) {
+ CHECK(execution.snapshot().leased == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
+}
+void set_private_archive_entry(archive_entry* entry, std::size_t bytes) {
+ archive_entry_set_filetype(entry, AE_IFREG);
+ archive_entry_set_perm(entry, 0600);
+ archive_entry_set_size(entry, bytes);
+}
 void arrow_ok(const arrow::Status& status) {
  if (!status.ok()) throw std::runtime_error(status.ToString());
 }
@@ -169,9 +190,7 @@ std::vector<std::string> profile_archive_fixture(const fs::path& path, std::span
   std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
   if (!entry) throw std::bad_alloc{};
   archive_entry_set_pathname(entry.get(), names.back().c_str());
-  archive_entry_set_filetype(entry.get(), AE_IFREG);
-  archive_entry_set_perm(entry.get(), 0600);
-  archive_entry_set_size(entry.get(), input.size());
+  mmltk::backend::data::testsupport::set_private_archive_entry(entry.get(), input.size());
   require(archive_write_header(writer.get(), entry.get()) == ARCHIVE_OK);
   require(archive_write_data(writer.get(), input.data(), input.size()) == static_cast<la_ssize_t>(input.size()));
  }
@@ -514,6 +533,16 @@ CompilerConfig compiler_config(const FixtureSpec& spec) {
  config.target_height = spec.height;
  return config;
 }
+std::vector<RLEPair> alternating_mask_runs(std::size_t count) {
+ std::vector<RLEPair> runs(count);
+ for (std::size_t index = 0; index < runs.size(); ++index) runs[index] = {static_cast<std::uint32_t>(2 * index), 1};
+ return runs;
+}
+void seed_partial_benchmark_download(const benchmark_internal::DownloadRequest& request, std::span<const std::uint8_t> retained) {
+ mmltk::testsupport::write_binary_file(request.destination.string() + ".part", retained);
+ benchmark_internal::write_json_atomically(
+  request.destination.string() + ".part.json", {{"schema_version", benchmark_internal::kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}}, {});
+}
 void compile_existing_fixture(const FixtureSpec& spec) {
  auto config = compiler_config(spec);
  config.num_workers = 1;
@@ -571,6 +600,7 @@ std::vector<float> expected_resized_rgb(std::span<const std::uint8_t> rgb, const
  if (rgb.size() != std::size_t(width) * height * 3U) throw std::invalid_argument("RGB fixture extent mismatch");
  const auto geometry = compute_image_resize_geometry(width, height, target_width, target_height, mode);
  RgbImageResizer resizer(1, perceptual);
+ // CLEANUP-IGNORE: The standalone resampler test retains its independent projection oracle rather than using the data-compiler fixture being checked.
  std::vector<std::uint8_t> bytes(std::size_t(geometry.resized_width) * geometry.resized_height * 3U);
  resizer.resize(rgb.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width), static_cast<int>(geometry.resized_height));
  std::vector<float> expected(std::size_t(target_width) * target_height * 3U);

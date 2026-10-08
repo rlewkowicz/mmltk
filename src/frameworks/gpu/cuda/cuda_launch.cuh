@@ -4,6 +4,16 @@
 #include <cstddef>
 #include <cstdint>
 namespace mmltk::frameworks::gpu::launch {
+#ifdef __CUDACC__
+template <class Coordinate = unsigned int>
+struct PixelThread {
+ Coordinate x, y;
+};
+template <class Coordinate = unsigned int>
+__device__ PixelThread<Coordinate> global_pixel() noexcept {
+ return {static_cast<Coordinate>(blockIdx.x * blockDim.x + threadIdx.x), static_cast<Coordinate>(blockIdx.y * blockDim.y + threadIdx.y)};
+}
+#endif
 inline constexpr int kDefaultLinearThreads = 256;
 inline int linear_blocks_for(const int item_count, const int threads = kDefaultLinearThreads) {
  const int safe_threads = std::max(1, threads);

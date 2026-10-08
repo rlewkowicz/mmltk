@@ -142,6 +142,11 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
     CHECK(torch::equal(values[name], expected->tensor));
    }
   };
+  const auto require_transfer_refused = [&] {
+   REQUIRE_THROWS(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, retention));
+   REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
+   require_values(resized, fresh);
+  };
   for (const auto& name : query_names) {
    for (const std::string_view defect : {"missing", "duplicate", "undefined", "rank", "rows", "width"}) {
     CAPTURE(name, defect);
@@ -161,9 +166,7 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
     else
      found->tensor = found->tensor.narrow(1, 0, 1);
     checkpoint.replace_entries(std::move(malformed));
-    REQUIRE_THROWS(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, retention));
-    REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
-    require_values(resized, fresh);
+    require_transfer_refused();
     require_queries();
    }
   }
@@ -201,9 +204,7 @@ TEST_CASE("Production transfer requires complete core while explicit partial and
    }
   }
   checkpoint.replace_entries(fresh);
-  REQUIRE_THROWS(resized.stage_normalized_state(checkpoint.entries(), Admission::FreshTransfer, &semantic_source, retention));
-  REQUIRE_THROWS(r::load_training_model_weights(resized, checkpoint, r::TrainingSupervisionRoute::Hungarian));
-  require_values(resized, fresh);
+  require_transfer_refused();
   checkpoint.replace_entries(complete);
   for (const auto admission : {Admission::Exact, Admission::RequiredCore, Admission::PartialExact, Admission::PartialFreshTransfer})
    REQUIRE_THROWS(resized.stage_normalized_state(complete, admission, &semantic_source, retention));

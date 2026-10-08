@@ -109,6 +109,7 @@ TEST_CASE("browser server rejects output without an active peer epoch", "[framew
  CHECK(server.publish(output(BrowserRecordPriority::Critical, 8U * 1024U * 1024U + 1U)) == BrowserRecordPush::ClosePeer);
  CHECK(server.queued_records() == 0U);
  server.stop();
+ // CLEANUP-IGNORE: A stopped server and a running server without a peer intentionally require the same priority-dependent rejection behavior.
  CHECK(server.publish(output(BrowserRecordPriority::Transient, 1U)) == BrowserRecordPush::Dropped);
  CHECK(server.publish(output(BrowserRecordPriority::Critical, 1U)) == BrowserRecordPush::ClosePeer);
  CHECK(server.queued_records() == 0U);
@@ -119,6 +120,7 @@ TEST_CASE("browser server rejects output without an active peer epoch", "[framew
  CHECK_FALSE(server.websocket_url());
  CHECK(server.queued_records() == 0U);
  CHECK(facts->closed == 0U);
+ // CLEANUP-IGNORE: A stopped server and a running server without a peer intentionally require the same priority-dependent rejection behavior.
  CHECK(server.publish(output(BrowserRecordPriority::Transient, 1U)) == BrowserRecordPush::Dropped);
  CHECK(server.publish(output(BrowserRecordPriority::Critical, 1U)) == BrowserRecordPush::ClosePeer);
 }

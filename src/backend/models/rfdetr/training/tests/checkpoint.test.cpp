@@ -99,12 +99,14 @@ void test_upstream_checkpoint_parse(const ParityFixtureCase& fixture, const fs::
  bool found_refpoint = false;
  for (const auto& entry : state_entries(checkpoint)) {
   if (entry.name == "query_feat.weight") {
+   // CLEANUP-IGNORE: Query features and reference points have distinct named tensor shapes; their rank and row assertions intentionally precede different width expectations.
    found_query_feat = true;
    REQUIRE((entry.tensor.dim() == 2));
    REQUIRE((entry.tensor.size(0) == fixture.query_rows));
    REQUIRE((entry.tensor.size(1) == kParityFixtureHiddenDim));
   }
   if (entry.name == "refpoint_embed.weight") {
+   // CLEANUP-IGNORE: Query features and reference points have distinct named tensor shapes; their rank and row assertions intentionally precede different width expectations.
    found_refpoint = true;
    REQUIRE((entry.tensor.dim() == 2));
    REQUIRE((entry.tensor.size(0) == fixture.query_rows));
@@ -129,6 +131,7 @@ void test_native_checkpoint_roundtrip(const ParityFixtureCase& fixture, const fs
  const bool output_exists = fs::exists(output_path);
  REQUIRE((output_exists));
  REQUIRE((normalized.metadata.preset_name == fixture.preset_name));
+ // CLEANUP-IGNORE: Upstream conversion and native golden fixtures independently verify the published format before decoding with the shared codec.
  REQUIRE((mmltk::backend::models::rfdetr::is_native_checkpoint_file(output_path)));
  const auto native = mmltk::backend::models::rfdetr::decode_model_state(output_path);
  REQUIRE(native.class_artifact);
@@ -154,10 +157,16 @@ void test_native_golden_fixture_roundtrip(const ParityFixtureCase& fixture) {
  mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, expected);
  const bool output_exists = fs::exists(output_path);
  REQUIRE((output_exists));
+ // CLEANUP-IGNORE: Upstream conversion and native golden fixtures independently verify the published format before decoding with the shared codec.
  REQUIRE((mmltk::backend::models::rfdetr::is_native_checkpoint_file(output_path)));
  const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(output_path);
  require_detection_metadata_equal(expected.metadata, loaded.metadata);
  assert_matches_native_parity_fixture(loaded, fixture);
+}
+void require_prepared_tensor(const torch::Tensor& actual, const torch::Tensor& expected) {
+ REQUIRE(actual.device().is_cpu());
+ REQUIRE(actual.is_contiguous());
+ REQUIRE(torch::equal(actual, expected));
 }
 void test_native_checkpoint_tensor_preparation() {
  const fs::path output_path = fixture_root() / "native" / "tensor-prep.native.pt";
@@ -184,25 +193,25 @@ void test_native_checkpoint_tensor_preparation() {
  require_detection_metadata_equal(checkpoint.metadata, loaded.metadata);
  const auto* loaded_contiguous = find_entry(loaded, "cpu_contiguous");
  REQUIRE((loaded_contiguous != nullptr));
- REQUIRE((loaded_contiguous->tensor.device().is_cpu()));
- REQUIRE((loaded_contiguous->tensor.is_contiguous()));
- REQUIRE((torch::equal(loaded_contiguous->tensor, cpu_contiguous)));
+ require_prepared_tensor(loaded_contiguous->tensor, cpu_contiguous);
  const auto* loaded_non_contiguous = find_entry(loaded, "cpu_non_contiguous");
  REQUIRE((loaded_non_contiguous != nullptr));
- REQUIRE((loaded_non_contiguous->tensor.device().is_cpu()));
- REQUIRE((loaded_non_contiguous->tensor.is_contiguous()));
- REQUIRE((torch::equal(loaded_non_contiguous->tensor, cpu_non_contiguous.contiguous())));
+ require_prepared_tensor(loaded_non_contiguous->tensor, cpu_non_contiguous.contiguous());
  const auto* loaded_cuda = find_entry(loaded, "cuda_tensor");
  REQUIRE(((loaded_cuda != nullptr) == has_cuda));
  if (loaded_cuda != nullptr) {
   const auto expected = state_entries(checkpoint).back().tensor.detach().to(torch::Device(torch::kCPU)).contiguous();
-  REQUIRE((loaded_cuda->tensor.device().is_cpu()));
-  REQUIRE((loaded_cuda->tensor.is_contiguous()));
-  REQUIRE((torch::equal(loaded_cuda->tensor, expected)));
+  require_prepared_tensor(loaded_cuda->tensor, expected);
  }
  checkpoint.metadata.for_each_detection_field([](const char*, auto& field) { field.reset(); });
  mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, checkpoint);
  require_detection_metadata_equal(checkpoint.metadata, mmltk::backend::models::rfdetr::decode_model_state(output_path).metadata);
+}
+auto upstream_fixture_roundtrip(
+ mmltk::backend::models::rfdetr::DecodedNativeModelState& state, const std::vector<mmltk::backend::models::rfdetr::NormalizedModelStateEntry>& entries, const fs::path& path) {
+ set_synthetic_model_state(state, entries);
+ mmltk::backend::models::rfdetr::write_upstream_model_state(path, state);
+ return mmltk::backend::models::rfdetr::decode_model_state(path);
 }
 void test_upstream_checkpoint_scalar_type_bridge() {
  const fs::path upstream_path = fixture_root() / "upstream" / "rf-detr-nano-dtype-bridge.pth";
@@ -215,9 +224,7 @@ void test_upstream_checkpoint_scalar_type_bridge() {
   {"class_embed.weight", torch::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim}, torch::TensorOptions().dtype(torch::kFloat32))},
   {"class_embed.bias", torch::arange(kParityFixtureNumClasses, torch::TensorOptions().dtype(torch::kInt64))},
  };
- set_synthetic_model_state(state, entries);
- mmltk::backend::models::rfdetr::write_upstream_model_state(upstream_path, state);
- const auto checkpoint = mmltk::backend::models::rfdetr::decode_model_state(upstream_path);
+ const auto checkpoint = upstream_fixture_roundtrip(state, entries, upstream_path);
  require_detection_metadata_equal(state.metadata, checkpoint.metadata);
  const auto* query_feat = find_entry(checkpoint, "query_feat.weight");
  const auto* class_bias = find_entry(checkpoint, "class_embed.bias");
@@ -242,9 +249,7 @@ void test_cuda_upstream_raw_state_preserves_logical_values() {
  std::vector<const void*> pointers;
  for (const auto& entry : entries) pointers.push_back(entry.tensor.const_data_ptr());
  const auto path = temp.path() / "rf-detr-nano-readback.pth";
- set_synthetic_model_state(state, entries);
- mmltk::backend::models::rfdetr::write_upstream_model_state(path, state);
- const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(path);
+ const auto loaded = upstream_fixture_roundtrip(state, entries, path);
  for (std::size_t index = 0; index < entries.size(); ++index) {
   const auto& expected = entries[index];
   const auto* actual = find_entry(loaded, expected.name.c_str());
@@ -269,10 +274,14 @@ void test_legacy_native_checkpoint_format_support() {
 auto round_trip_training_supervision_config(const fs::path& path, const mmltk::backend::models::rfdetr::TrainingSupervisionConfig& config) {
  torch::serialize::OutputArchive output;
  mmltk::backend::models::rfdetr::detail::write_training_supervision_config(output, config);
- output.save_to(path.string());
- torch::serialize::InputArchive input;
- input.load_from(path.string());
+ auto input = mmltk::backend::models::rfdetr::testsupport::reload_archive(output, path);
  return mmltk::backend::models::rfdetr::detail::read_training_supervision_config(input);
+}
+void require_invalid_supervision_blob(const fs::path& path, const torch::Tensor& encoded) {
+ torch::serialize::OutputArchive output;
+ output.write("training_supervision_config_cbor", encoded);
+ auto input = reload_archive(output, path);
+ REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(input));
 }
 void test_training_supervision_checkpoint_blob_admission() {
  const fs::path path = fixture_root() / "native" / "supervision-config.pt";
@@ -288,9 +297,7 @@ void test_training_supervision_checkpoint_blob_admission() {
  input.read("training_supervision_config_cbor", encoded);
  torch::serialize::OutputArchive obsolete_key_output;
  obsolete_key_output.write("training_supervision_config", encoded);
- obsolete_key_output.save_to(path.string());
- torch::serialize::InputArchive obsolete_key_input;
- obsolete_key_input.load_from(path.string());
+ auto obsolete_key_input = mmltk::backend::models::rfdetr::testsupport::reload_archive(obsolete_key_output, path);
  REQUIRE(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(obsolete_key_input) == mmltk::backend::models::rfdetr::TrainingSupervisionConfig{});
  const std::array variants{
   [] {
@@ -306,53 +313,16 @@ void test_training_supervision_checkpoint_blob_admission() {
   config,
  };
  for (const auto& variant : variants) { REQUIRE(round_trip_training_supervision_config(path, variant) == variant); }
- torch::serialize::OutputArchive trailing_output;
- trailing_output.write("training_supervision_config_cbor", torch::cat({encoded, torch::zeros({1}, torch::TensorOptions().dtype(torch::kUInt8))}));
- trailing_output.save_to(path.string());
- torch::serialize::InputArchive trailing_input;
- trailing_input.load_from(path.string());
- REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(trailing_input));
- torch::serialize::OutputArchive malformed_output;
- malformed_output.write("training_supervision_config_cbor", torch::zeros({4}));
- malformed_output.save_to(path.string());
- torch::serialize::InputArchive malformed_input;
- malformed_input.load_from(path.string());
- REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(malformed_input));
- torch::serialize::OutputArchive wrong_rank_output;
- wrong_rank_output.write("training_supervision_config_cbor", encoded.reshape({1, encoded.numel()}));
- wrong_rank_output.save_to(path.string());
- torch::serialize::InputArchive wrong_rank_input;
- wrong_rank_input.load_from(path.string());
- REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(wrong_rank_input));
- torch::serialize::OutputArchive truncated_output;
- truncated_output.write("training_supervision_config_cbor", encoded.narrow(0, 0, encoded.numel() - 1));
- truncated_output.save_to(path.string());
- torch::serialize::InputArchive truncated_input;
- truncated_input.load_from(path.string());
- REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(truncated_input));
- if (torch::cuda::is_available()) {
-  torch::serialize::OutputArchive wrong_device_output;
-  wrong_device_output.write("training_supervision_config_cbor", encoded.to(torch::Device(torch::kCUDA)));
-  wrong_device_output.save_to(path.string());
-  torch::serialize::InputArchive wrong_device_input;
-  wrong_device_input.load_from(path.string());
-  REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(wrong_device_input));
- }
- torch::serialize::OutputArchive oversized_output;
- oversized_output.write("training_supervision_config_cbor", torch::zeros({4096}, torch::TensorOptions().dtype(torch::kUInt8)));
- oversized_output.save_to(path.string());
- torch::serialize::InputArchive oversized_input;
- oversized_input.load_from(path.string());
- REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(oversized_input));
+ require_invalid_supervision_blob(path, torch::cat({encoded, torch::zeros({1}, torch::TensorOptions().dtype(torch::kUInt8))}));
+ require_invalid_supervision_blob(path, torch::zeros({4}));
+ require_invalid_supervision_blob(path, encoded.reshape({1, encoded.numel()}));
+ require_invalid_supervision_blob(path, encoded.narrow(0, 0, encoded.numel() - 1));
+ if (torch::cuda::is_available()) { require_invalid_supervision_blob(path, encoded.to(torch::Device(torch::kCUDA))); }
+ require_invalid_supervision_blob(path, torch::zeros({4096}, torch::TensorOptions().dtype(torch::kUInt8)));
  const auto require_raw_cbor_rejected = [&](const std::span<const std::uint8_t> raw) {
   auto blob = torch::empty({static_cast<std::int64_t>(raw.size())}, torch::TensorOptions().dtype(torch::kUInt8));
   std::memcpy(blob.data_ptr<std::uint8_t>(), raw.data(), raw.size());
-  torch::serialize::OutputArchive raw_output;
-  raw_output.write("training_supervision_config_cbor", blob);
-  raw_output.save_to(path.string());
-  torch::serialize::InputArchive raw_input;
-  raw_input.load_from(path.string());
-  REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(raw_input));
+  require_invalid_supervision_blob(path, blob);
  };
  constexpr std::array<std::uint8_t, 25> duplicate_assignment{
   0xa2U,
@@ -400,6 +370,7 @@ void test_training_supervision_checkpoint_blob_admission() {
  require_raw_cbor_rejected(missing_required_field);
 }
 void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
+ // CLEANUP-IGNORE: Independent inference and checkpoint-admission fixtures select different model shapes after this preset prefix.
  namespace rfdetr = mmltk::backend::models::rfdetr;
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  config.resolution = 64;

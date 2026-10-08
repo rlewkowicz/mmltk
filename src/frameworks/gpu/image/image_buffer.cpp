@@ -81,6 +81,11 @@ void CheckCuda(const char* operation, const CUresult result) {
 [[noreturn]] void ThrowExecutionFailure(const ImageCopyBackend::StreamSettlement& settled, std::exception_ptr initiating = {}) {
  throw ImageStreamExecutionFailure(combine_image_failures(std::move(initiating), settled.failure));
 }
+void SettleReceiver(ImageStream& stream, bool& completed) {
+ const auto settled = stream.Settle();
+ completed = settled.completion_reached;
+ if (!settled.completion_reached || settled.failure) ThrowExecutionFailure(settled);
+}
 void LogCopyFailure(const DeviceContext& receiver, const char* boundary, const bool completion_reached) noexcept {
  const TransferTrace trace;
  if (!trace.enabled()) return;
@@ -151,6 +156,7 @@ public:
   return reinterpret_cast<std::uintptr_t>(stream);
  }
  void DestroyStream(const std::uintptr_t context, const std::uintptr_t stream) noexcept override {
+  // CLEANUP-IGNORE: A nullable handle and context binding precede distinct CUDA stream, event, and allocation destruction contracts.
   if (stream == 0U) return;
   static_cast<void>(cuCtxSetCurrent(reinterpret_cast<CUcontext>(context)));
   static_cast<void>(cuStreamDestroy(reinterpret_cast<CUstream>(stream)));
@@ -163,6 +169,7 @@ public:
   return reinterpret_cast<std::uintptr_t>(event);
  }
  void DestroyEvent(const std::uintptr_t context, const std::uintptr_t event) noexcept override {
+  // CLEANUP-IGNORE: A nullable handle and context binding precede distinct CUDA stream, event, and allocation destruction contracts.
   if (event == 0U) return;
   static_cast<void>(cuCtxSetCurrent(reinterpret_cast<CUcontext>(context)));
   static_cast<void>(cuEventDestroy(reinterpret_cast<CUevent>(event)));
@@ -185,6 +192,7 @@ public:
   };
  }
  void FreePlane(const std::uintptr_t context, const CUdeviceptr data) noexcept override {
+  // CLEANUP-IGNORE: A nullable handle and context binding precede distinct CUDA stream, event, and allocation destruction contracts.
   if (data == 0U) return;
   static_cast<void>(cuCtxSetCurrent(reinterpret_cast<CUcontext>(context)));
   static_cast<void>(cuMemFree(data));
@@ -608,15 +616,16 @@ ImageCopyPath ImageBuffer::CopyFrom(ImageStream& stream, BorrowedImageReadView s
   const int receiver_device = state_->context.device();
   const int source_device = source.device();
   ImageCopyPath path = ImageCopyPath::SameDevice;
-  if (receiver_device == source_device) {
+  const bool same_device = receiver_device == source_device;
+  if (same_device || backend.CanAccessPeer(receiver_device, source_device)) {
    backend.WaitEvent(state_->context.state_->context, stream.stream_, source.lease_->completion);
    reads_submitted = true;
-   backend.CopySameDevice(state_->context.state_->context, stream.stream_, state_->plane, source.lease_->state->context.state_->context, source_plane);
-  } else if (backend.CanAccessPeer(receiver_device, source_device)) {
-   backend.WaitEvent(state_->context.state_->context, stream.stream_, source.lease_->completion);
-   reads_submitted = true;
-   backend.CopyPeer(state_->context.state_->context, stream.stream_, receiver_device, state_->plane, source.lease_->state->context.state_->context, source_device, source_plane);
-   path = ImageCopyPath::Peer;
+   if (same_device) {
+    backend.CopySameDevice(state_->context.state_->context, stream.stream_, state_->plane, source.lease_->state->context.state_->context, source_plane);
+   } else {
+    backend.CopyPeer(state_->context.state_->context, stream.stream_, receiver_device, state_->plane, source.lease_->state->context.state_->context, source_device, source_plane);
+    path = ImageCopyPath::Peer;
+   }
   } else {
    const std::size_t row_bytes = source_plane.descriptor.row_bytes();
    if (source_plane.descriptor.height > std::numeric_limits<std::size_t>::max() / row_bytes) throw std::overflow_error("staged image byte size exceeds addressable memory");
@@ -629,9 +638,7 @@ ImageCopyPath ImageBuffer::CopyFrom(ImageStream& stream, BorrowedImageReadView s
    path = ImageCopyPath::PinnedStaging;
   }
   backend.RecordEvent(state_->context.state_->context, stream.stream_, state_->completion);
-  auto settled = stream.Settle();
-  receiver_completed = settled.completion_reached;
-  if (!settled.completion_reached || settled.failure) ThrowExecutionFailure(settled);
+  SettleReceiver(stream, receiver_completed);
   state_->revision = next_revision;
   return path;
  } catch (...) {
@@ -1129,9 +1136,7 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
    });
   }
   backend.RecordEvent(state_->context_.state_->context, stream.native_handle(), state_->completion_);
-  auto settled = stream.Settle();
-  receiver_completed = settled.completion_reached;
-  if (!settled.completion_reached || settled.failure) ThrowExecutionFailure(settled);
+  SettleReceiver(stream, receiver_completed);
   state_->generation_sequence_ = std::max(state_->generation_sequence_, next_generation);
   state_->generation_ = next_generation;
   return paths;

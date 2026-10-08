@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <utility>
 #include <catch2/catch_test_macros.hpp>
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/presentation/visual_diagnostics.h"
@@ -22,12 +23,30 @@ inline controller::WorkspaceMouse annotation_mouse(controller::AnnotationSystem&
   .brush_radius = controller::contracts::kDefaultAnnotationBrushRadius
  };
 }
+inline controller::WorkspaceMouse press_annotation_right(controller::AnnotationSystem& annotation, std::uint64_t peer, controller::WorkspacePoint point) {
+ annotation.SetInputPeer(peer);
+ auto mouse = annotation_mouse(annotation, peer, controller::WorkspaceMouseKind::Press, point);
+ mouse.button = controller::WorkspaceMouseButton::Right;
+ annotation.Input(mouse);
+ return mouse;
+}
 template <class Events>
 void await_annotation_command(controller::AnnotationSystem& annotation, Events& events, std::uint64_t admitted_revision) {
  REQUIRE(events.Wait([&] {
   const auto state = annotation.snapshot();
   return !state.busy && state.revision > admitted_revision;
  }));
+}
+template <class Events>
+[[nodiscard]] controller::AnnotationSnapshot edit_annotation(controller::AnnotationSystem& annotation, Events& events, controller::AnnotationEditRequest request) {
+ auto admitted = annotation.Edit(std::move(request));
+ await_annotation_command(annotation, events, admitted.revision);
+ return admitted;
+}
+template <class Events>
+void await_annotation_saved(controller::AnnotationSystem& annotation, Events& events, std::uint64_t admitted_revision) {
+ await_annotation_command(annotation, events, admitted_revision);
+ CHECK(annotation.snapshot().ui.save_status == controller::contracts::AnnotationSaveStatus::Saved);
 }
 template <class Events>
 void await_annotation_render(controller::AnnotationSystem& annotation, Events& events) {

@@ -1,3 +1,4 @@
+#include "src/test_support/async_test_utils.hpp"
 #include <algorithm>
 #include "src/controller/presentation/tests/support/visual_runtime_fixture.h"
 #include "src/controller/presentation/tests/support/visual_system_fixture.h"
@@ -65,8 +66,7 @@ TEST_CASE("Explore visible loading and independent producers progress through sh
  REQUIRE(scenario.Wait([&]() -> bool { return explore.snapshot().gallery.slots[0U]; }));
  CHECK(explore.snapshot().order.visible_indices == placeholders.order.visible_indices);
  CHECK_FALSE(explore.snapshot().gallery.slots[3U]);
- independent.probe().AllowAllocation();
- REQUIRE(independent.probe().Wait([&] { return independent.probe().assignments.size() == 1U; }));
+ independent.probe().AllowAllocationAndWait(1U);
  independent.probe().Release(0U);
  REQUIRE(independent.Wait([&]() -> bool { return independent.system().snapshot().gallery.slots[0U]; }));
  explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{8.0F, 4.0F}});
@@ -137,6 +137,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
   return state.viewport.extent.width == 32U && state.frame.extent.width == 32U;
  }));
  CHECK(explore.snapshot().nproc == 4U);
+ // CLEANUP-IGNORE: End-to-end visual routing independently checks the selected image revision against the Explore subsystem test boundary.
  REQUIRE(explore.BorrowFrame().valid());
  CHECK(explore.BorrowFrame().plane(0U).revision() == explore.snapshot().frame.revision);
  CHECK(observed_nproc->load(std::memory_order_acquire) == 4U);
@@ -169,12 +170,10 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
  mmltk::testsupport::ScopedTempDir saved_document{"mmltk-annotation-independent-save"};
  const auto destination = saved_document.path() / "annotation.cbor";
  const auto saved = annotation.Save({.destination = destination.string()});
- mmltk::testsupport::await_annotation_command(annotation, annotation_events, saved.revision);
- CHECK(annotation.snapshot().ui.save_status == contracts::AnnotationSaveStatus::Saved);
+ mmltk::testsupport::await_annotation_saved(annotation, annotation_events, saved.revision);
  std::filesystem::remove(destination);
  const auto objects = annotation.snapshot().ui.scene.objects.size();
- const auto undo = annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}});
- mmltk::testsupport::await_annotation_command(annotation, annotation_events, undo.revision);
+ const auto undo = mmltk::testsupport::edit_annotation(annotation, annotation_events, {.edit = {.value = AnnotationUndoEdit{}}});
  CHECK(annotation.snapshot().ui.scene.objects.size() + 1U == objects);
  CHECK(annotation.snapshot().frame == initial.frame);
  retained = {};
@@ -201,8 +200,7 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
   kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [extents] { return std::make_unique<ExtentUpscaleAlgorithm>(extents); }, 4U),
   borrow_exactly_from(source), [&upscale_events](UpscaleSystem::event_type) { upscale_events.Advance(); }
  };
- static_cast<void>(upscale.Start(test_upscale_request({.source = source.snapshot().frame})));
- REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready; }));
+ start_upscale_and_wait(upscale, upscale_events, {.source = source.snapshot().frame});
  REQUIRE((upscale.snapshot().frame.extent == VisualExtent{320U, 160U}));
  REQUIRE(upscale.BorrowFrame().valid());
  const auto large_output = upscale.BorrowFrame().plane(0U).plane();
@@ -245,9 +243,7 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
  CHECK(backend->same_copies.load(std::memory_order_acquire) == copies_at_high_water + 3U);
  CHECK(backend->staged_downloads.load(std::memory_order_acquire) == 0U);
  CHECK(backend->staged_uploads.load(std::memory_order_acquire) == 0U);
- presentation.CloseAdmission();
- presentation.BrowserPeerLost();
- CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+ CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
  upscale.Shutdown();
  CHECK(upscale.stopped());
  CHECK(backend->contexts_destroyed.load(std::memory_order_acquire) >= 2U);
@@ -257,9 +253,8 @@ TEST_CASE("Presentation forwards every private visual product to the simulated b
  const auto sources = products.sources();
  EventGate events;
  auto writer_state = std::make_shared<TestPresentationWriterState>();
- PresentationSystem presentation{kDevice, [backend = products.backend(), writer_state] {
-  return std::make_unique<TestPresentationWriter>(0, backend, writer_state);
- }, sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+ // CLEANUP-IGNORE: The shared writer factory and PresentationScenario already own setup and settlement; these tests retain different source and publication scenarios.
+ PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(products.backend(), writer_state), sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
  PresentationScenario scenario{presentation, writer_state};
  std::uint64_t previous_presentation_revision = 0U;
  for (auto source = sources.rbegin(); source != sources.rend(); ++source) {
@@ -274,9 +269,7 @@ TEST_CASE("Presentation forwards every private visual product to the simulated b
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == sources.size());
  CHECK(writer_state->timeline.load(std::memory_order_acquire) == sources.size());
  CHECK_THROWS_AS(presentation.Select({PresentationSourceKind::Explore, 2U}), contracts::InvalidIntentError);
- presentation.CloseAdmission();
- presentation.BrowserPeerLost();
- CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+ CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
 }
 TEST_CASE("Presentation switches sources while Live advances in background") {
  auto backend = std::make_shared<FakeImageBackend>();
@@ -306,14 +299,12 @@ TEST_CASE("Presentation switches sources while Live advances in background") {
  CHECK(writer_state->constructions.load(std::memory_order_acquire) == 1U);
  const auto first_selection = presentation.Select(sources[0].source);
  CHECK(first_selection.revision != 0U);
- REQUIRE(first_submission.wait_for(2s) == std::future_status::ready);
- first_submission.get();
+ mmltk::testsupport::await_test_future(first_submission, "first submission", 2s);
  REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().capability.valid(); }));
  CHECK(presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted);
  const auto second_selection = presentation.Select(sources[1].source);
  CHECK(second_selection.revision > first_selection.revision);
- writer_state->allow_publication.store(true, std::memory_order_release);
- writer_state->SignalReadiness();
+ writer_state->AllowPublication();
  REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().completed.source == sources[1].source; }));
  CHECK(presentation.snapshot().capability.condition == PresentationCapabilityCondition::Ready);
  REQUIRE(live_events.Wait([&] { return live.snapshot().completed_frames > before_switch; }));
@@ -329,8 +320,7 @@ TEST_CASE("Presentation switches sources while Live advances in background") {
  presentation.BrowserPeerLost();
  presentation.BrowserPeerLost();
  CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
- CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
- CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
+ writer_state->CheckRetired();
  const auto stopping_live = live.Stop();
  CHECK(stopping_live.running);
  CHECK(stopping_live.cancellation_requested);
@@ -394,10 +384,9 @@ void complete_producer_workspace(Producer& producer, const std::shared_ptr<FakeI
 TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained workspaces independently", "[presentation][workspace]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace fixture = gpu::test_support;
- fixture::ImageWorkspaceTestAccess::Reset();
  // A backend models one CUDA implementation; independent producers create
  // separate contexts within it, including for cross-context source copies.
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  auto explore_work = std::make_shared<ExploreWorkProbe>();
  LoadedSettings settings;
  ExploreScenario opened(settings, 2U, RuntimeFactory(0, backend, gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(explore_work), 3U, fixture::FakeWorkspaceFinalizer(backend)));
@@ -429,8 +418,7 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
    0, backend, gpu::ImageProductLayout::CleanAndSemantic, [=] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, upscale_runs); }, 4U, fixture::FakeWorkspaceFinalizer(backend)),
   borrow_exactly_from(explore), [&](UpscaleSystem::event_type) { upscale_events.Advance(); }
  };
- static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
- REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready; }));
+ start_upscale_and_wait(upscale, upscale_events, {.source = explore.snapshot().frame});
  {
   const std::array contexts{explore.BorrowFrame().plane(0U).context(), annotation.BorrowFrame().plane(0U).context(), live.BorrowFrame().plane(0U).context(), upscale.BorrowFrame().plane(0U).context()};
   for (std::size_t left = 0U; left != contexts.size(); ++left)

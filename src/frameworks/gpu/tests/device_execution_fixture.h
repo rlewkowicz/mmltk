@@ -9,7 +9,21 @@
 #include <span>
 #include <cstddef>
 #include <utility>
+#include <cuda_runtime_api.h>
 namespace mmltk::frameworks::gpu::test_support {
+struct TestDevicePair final {
+ DeviceExecution first;
+ DeviceExecution second;
+ int count;
+};
+[[nodiscard]] inline TestDevicePair test_device_pair() {
+ const auto topology = mmltk::common::system::NumaTopology::Capture();
+ auto first = resolve_device_execution(0, topology);
+ int count = 0;
+ REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
+ auto second = count > 1 ? resolve_device_execution(1, topology) : first;
+ return {std::move(first), std::move(second), count};
+}
 struct IsolatedTestDevice final {
  DeviceExecution execution;
  DeviceContext context;

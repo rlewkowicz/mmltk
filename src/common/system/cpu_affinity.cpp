@@ -1,3 +1,4 @@
+#include "src/common/types/container_utils.h"
 #include "src/common/system/cpu_affinity.h"
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -51,6 +52,7 @@ int parse_cpu_id(std::string_view token) {
  token = trim_ascii(token);
  if (token.empty()) { throw std::runtime_error("cpu affinity token must not be empty"); }
  int value = -1;
+ // CLEANUP-IGNORE: Unrelated CPU and mask parsers form a from_chars range before distinct validation and error policies.
  const char* begin = token.data();
  const char* end = token.data() + token.size();
  const auto [ptr, ec] = std::from_chars(begin, end, value);
@@ -106,8 +108,7 @@ std::vector<int> parse_cpu_list(const std::string& spec) {
   if (next == spec.size()) { break; }
   cursor = next + 1;
  }
- std::ranges::sort(cpus);
- cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+ mmltk::common::sort_unique(cpus);
  if (cpus.empty()) { throw std::runtime_error("cpu affinity list must not be empty"); }
  return cpus;
 }
@@ -154,8 +155,7 @@ void set_thread_affinity(const std::vector<int>& cpus) {
  const int rc = ::pthread_setaffinity_np(::pthread_self(), mask.bytes(), mask.get());
  if (rc) throw std::system_error(rc, std::generic_category(), "set thread affinity");
  auto expected = cpus;
- std::ranges::sort(expected);
- expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+ mmltk::common::sort_unique(expected);
  if (allowed_cpu_set() != expected) throw std::runtime_error("effective thread affinity differs from request");
 }
 void set_thread_name(const std::string& name) {

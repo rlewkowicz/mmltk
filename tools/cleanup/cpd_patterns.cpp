@@ -114,6 +114,8 @@ export {
   std::string recordKey(Record& record);
 
  private:
+  bool skipPairedTokens(std::size_t& index) const;
+  bool isFailureTransfer(std::size_t start, std::size_t end) const;
   Json describeTokens(const Json& occurrence, std::size_t rawStart, std::size_t rawEnd, std::size_t start, std::size_t end);
   std::u16string sourceUnits_;
  };
@@ -140,7 +142,9 @@ bool lowSurrogate(char16_t ch) { return ch >= 0xdc00 && ch <= 0xdfff; }
 bool control(std::string_view text) {
  return oneOf(text, {"if", "for", "while", "switch", "catch", "sizeof", "alignof", "decltype", "noexcept", "requires", "static_assert", "constexpr", "consteval"});
 }
-bool nonType(std::string_view text) { return control(text) || oneOf(text, {"return", "throw", "case", "co_return", "co_yield", "delete", "new", "break", "continue", "else", "goto", "operator"}); }
+bool nonType(std::string_view text) {
+ return control(text) || oneOf(text, {"return", "throw", "case", "co_return", "co_yield", "co_await", "delete", "new", "break", "continue", "else", "goto", "operator"});
+}
 bool assertion(std::string_view text) {
  for (const std::string_view name : {"CHECK", "REQUIRE", "ASSERT"}) {
   if (text == name) return true;
@@ -595,6 +599,12 @@ SourceIndex::SourceIndex(std::string_view text) : source(text), sourceUnits_(toU
  indexStatements();
  indexLocals();
 }
+bool SourceIndex::skipPairedTokens(std::size_t& index) const {
+ const auto close = pairs.find(index);
+ if (close == pairs.end() || close->second <= index) return false;
+ index = close->second;
+ return true;
+}
 void SourceIndex::indexStatements() {
  const auto size = tokens.size();
  statementStarts.assign(size, 0);
@@ -615,11 +625,7 @@ void SourceIndex::indexStatements() {
   // Parenthesized expressions, for headers and aggregate initializers belong
   // to their complete statement, including the callee and every argument.
   if (text == "(" || text == "[" || (text == "{" && !block)) {
-   const auto close = pairs.find(index);
-   if (close != pairs.end() && close->second > index) {
-    index = close->second;
-    continue;
-   }
+   if (skipPairedTokens(index)) continue;
   }
   if (text == ";" || text == "}" || block) finish(index + 1);
  }
@@ -630,11 +636,7 @@ void SourceIndex::indexFunctions() {
  for (std::size_t index = 0; index < tokens.size(); ++index) {
   const auto& text = tokens[index].text;
   if (text == "(" || text == "[") {
-   const auto close = pairs.find(index);
-   if (close != pairs.end() && close->second > index) {
-    index = close->second;
-    continue;
-   }
+   if (skipPairedTokens(index)) continue;
   }
   if (text != "{") {
    if (text == ";" || text == "}") boundary = index + 1;
@@ -701,7 +703,7 @@ void SourceIndex::indexFunctions() {
    fn.parameters = std::move(parameters);
    fn.parameterTypes = json_dump(parameterTypes);
    if (guard) fn.guardEnd = firstStatementEnd;
-   if (setup && !firstParameter.empty() && firstParameter != "void") fn.prefix = json_dump(Json::array({fn.name, firstParameter, *firstStatement}));
+   if (setup && fn.name != "$lambda" && !firstParameter.empty() && firstParameter != "void") fn.prefix = json_dump(Json::array({fn.name, firstParameter, *firstStatement}));
    functions.push_back(std::move(fn));
   }
   boundary = index + 1;
@@ -718,7 +720,18 @@ void SourceIndex::indexLocals() {
   const auto owner = owners[index];
   if (owner < 0) continue;
   const auto& name = tokens[index].text;
-  if (!identifier(name) || !oneOf(tokens[index + 1].text, {"=", "{", ";", ":"})) continue;
+  if (!identifier(name)) continue;
+  const auto& fn = functions[static_cast<std::size_t>(owner)];
+  const auto next = at(tokens, index + 1);
+  // A direct initializer names a local just as an equals/braced initializer
+  // does. Require an expression argument so function declarations and calls
+  // retain their operation/type identities.
+  const auto close = pairs.find(index + 1);
+  const auto first = at(tokens, index + 2);
+  const bool directInitializer = next == "(" && close != pairs.end() && at(tokens, close->second + 1) == ";" &&
+                                 (oneOf(first, {"*", "&", "!", "~", "true", "false", "nullptr"}) || fn.locals.contains(std::string(first)) ||
+                                  (index + 2 < tokens.size() && (tokens[index + 2].kind == "literal" || (!first.empty() && digit(static_cast<unsigned char>(first.front()))))));
+  if (!oneOf(next, {"=", "{", ";", ":"}) && !directInitializer) continue;
   auto prior = index - 1;
   while (prior < tokens.size() && oneOf(at(tokens, prior), {"*", "&", "&&", "const"})) --prior;
   const auto type = at(tokens, prior);
@@ -739,7 +752,11 @@ std::optional<Parameters> SourceIndex::findParameters(std::size_t start, std::si
    continue;
   }
   if (at(tokens, index - 2) == "operator") name = "operator" + name;
-  const bool suffix = close + 1 == end || oneOf(at(tokens, close + 1), {"const", "volatile", "&", "&&", "noexcept", "override", "final", "->", "requires", ":", "["});
+  if (name == "]") {
+   const auto capture = pairs.find(index - 1);
+   if (capture != pairs.end() && (capture->second == start || oneOf(at(tokens, capture->second - 1), {"=", "(", ",", "{", ";", "return", "?", ":"}))) name = "$lambda";
+  }
+  const bool suffix = close + 1 == end || oneOf(at(tokens, close + 1), {"const", "volatile", "&", "&&", "mutable", "noexcept", "override", "final", "->", "requires", ":", "["});
   if (suffix && ((identifier(name) && !control(name) && !oneOf(name, {"static_cast", "dynamic_cast", "reinterpret_cast", "const_cast"})) || name.starts_with("operator")))
    return Parameters{name, index, close};
   index = close;
@@ -761,8 +778,66 @@ Json SourceIndex::occurrence(std::string_view path, std::size_t start, std::size
  const auto endLine = static_cast<std::size_t>(std::lower_bound(lines.begin(), lines.end(), last.offset + 1) - lines.begin());
  return {{"path", path}, {"start", startLine}, {"end", endLine}, {"column", first.offset - lines[startLine - 1] + 1}, {"endColumn", last.end - lines[endLine - 1] + 1}};
 }
+bool SourceIndex::isFailureTransfer(std::size_t start, std::size_t end) const {
+ // Forwarding the failure of one operation is not a second operation. Keep
+ // conditions, error transformations and side effects outside this exact form.
+ auto guard = start;
+ if (oneOf(at(tokens, start), {"return", "throw"})) {
+  if (at(tokens, start - 1) != "{" || at(tokens, start - 2) != ")") return false;
+  const auto open = pairs.find(start - 2);
+  if (open == pairs.end() || open->second == 0) return false;
+  guard = open->second - 1;
+ }
+ if (at(tokens, guard) != "if" || at(tokens, guard + 1) != "(" || at(tokens, guard + 2) != "!" || at(tokens, guard + 4) != ")") return false;
+ const auto& value = tokens[guard + 3].text;
+ if (!identifier(value)) return false;
+ auto body = guard + 5;
+ if (at(tokens, body) == "{") ++body;
+ std::vector<std::string> returned;
+ for (auto index = body; index < end; ++index) returned.push_back(tokens[index].text);
+ return returned == std::vector<std::string>{"return", "std", "::", "unexpected", "(", value, ".", "error", "(", ")", ")", ";"} ||
+        returned == std::vector<std::string>{"throw", value, ".", "error", "(", ")", ";"};
+}
 bool SourceIndex::isBinding(std::size_t start, std::size_t end, const Function& fn) const {
  if (end <= start || end > tokens.size() || tokens[end - 1].text != ";") return false;
+ // A block/lambda terminator can leave an empty statement in the containing
+ // scope. Aliases and using-directives also have no executable operation.
+ if (end == start + 1 || oneOf(tokens[start].text, {"using", "typedef"})) return true;
+ // Empty and scalar list initialization express the same binding as `T x;`
+ // and `T x = value;`. Calls and compound initializer expressions still count.
+ const auto brace = end >= start + 3 && at(tokens, end - 2) == "}" ? pairs.find(end - 2) : pairs.end();
+ if (brace != pairs.end() && brace->second > start + 1) {
+  const auto open = brace->second;
+  const auto name = open - 1;
+  const bool declaration = fn.locals.contains(tokens[name].text) && !nonType(tokens[start].text) &&
+                           std::none_of(tokens.begin() + static_cast<std::ptrdiff_t>(start), tokens.begin() + static_cast<std::ptrdiff_t>(name),
+                            [](const Token& token) { return oneOf(token.text, {".", "->", "[", "{", "}", "="}); });
+  if (declaration && (open + 1 == end - 2 || (open + 2 == end - 2 && (tokens[open + 1].kind == "literal" || oneOf(tokens[open + 1].text, {"true", "false", "nullptr"}) ||
+                                                                      digit(static_cast<unsigned char>(tokens[open + 1].text.front()))))))
+   return true;
+ }
+ // An uninitialized built-in declaration can have several declarators. None
+ // performs work; counting `int x, y;` differently from `int x; int y;` would
+ // turn a single following operation into a duplicate algorithm.
+ auto declarator = start;
+ while (declarator + 1 < end &&
+        oneOf(tokens[declarator].text, {"const", "volatile", "signed", "unsigned", "short", "long", "int", "char", "char8_t", "char16_t", "char32_t", "wchar_t", "bool", "float", "double"}))
+  ++declarator;
+ if (declarator > start) {
+  bool expectsName = true;
+  auto index = declarator;
+  for (; index + 1 < end; ++index) {
+   const auto& text = tokens[index].text;
+   if (expectsName && oneOf(text, {"*", "&", "&&"})) continue;
+   if (expectsName && identifier(text))
+    expectsName = false;
+   else if (!expectsName && text == ",")
+    expectsName = true;
+   else
+    break;
+  }
+  if (index == end - 1 && !expectsName) return true;
+ }
  auto equal = start;
  while (equal < end && tokens[equal].text != "=") ++equal;
  const auto nameIndex = equal == end ? end - 2 : equal - 1;
@@ -771,24 +846,36 @@ bool SourceIndex::isBinding(std::size_t start, std::size_t end, const Function& 
   if (oneOf(tokens[index].text, {".", "->", "[", "{", "}"})) return false;
  if (equal == end) return true;
  if (end - equal == 3) return true;
- std::string rhs;
- for (auto index = equal + 1; index + 1 < end; ++index) rhs += tokens[index].text;
- std::size_t offset = 0, components = 0;
- while (offset < rhs.size()) {
-  const auto first = offset;
-  while (offset < rhs.size() && word(static_cast<unsigned char>(rhs[offset]))) ++offset;
-  if (offset == first) return false;
-  ++components;
-  if (offset == rhs.size()) break;
-  if (rhs[offset] == '.')
-   ++offset;
-  else if (std::string_view(rhs).substr(offset, 2) == "->" || std::string_view(rhs).substr(offset, 2) == "::")
-   offset += 2;
-  else
-   return false;
-  if (offset == rhs.size()) return false;
- }
- return components >= 2;
+ // Names, member paths, dereferences and simple subscripts all bind existing
+ // values. Preserve calls, arithmetic indices and every mutation as work.
+ const auto advance_balanced = [&](const auto& read, std::size_t& first, const std::size_t last) {
+  const auto close = pairs.find(first);
+  if (close == pairs.end() || close->second >= last || !read(first + 1, close->second)) return false;
+  first = close->second + 1;
+  return true;
+ };
+ const auto read = [&](this const auto& self, std::size_t first, const std::size_t last) -> bool {
+  while (first < last && oneOf(at(tokens, first), {"*", "&"})) ++first;
+  if (first == last) return false;
+  if (at(tokens, first) == "(") {
+   if (!advance_balanced(self, first, last)) return false;
+  } else {
+   const auto& token = tokens[first];
+   if (!identifier(token.text) && token.kind != "literal" && !digit(static_cast<unsigned char>(token.text.front()))) return false;
+   ++first;
+  }
+  while (first < last) {
+   if (oneOf(at(tokens, first), {".", "->", "::"})) {
+    if (first + 1 >= last || !identifier(tokens[first + 1].text)) return false;
+    first += 2;
+   } else if (at(tokens, first) == "[") {
+    if (!advance_balanced(self, first, last)) return false;
+   } else
+    return false;
+  }
+  return true;
+ };
+ return read(equal + 1, end - 1);
 }
 Json SourceIndex::describe(const Json& occurrenceValue) {
  const auto [rawStart, rawEnd] = range(occurrenceValue);
@@ -879,7 +966,7 @@ Json SourceIndex::describeTokens(const Json& occurrenceValue, std::size_t rawSta
    executable.push_back(text);
   if (text == ";" && statementEnds[index] == index + 1 && (!fn.guardEnd || index > *fn.guardEnd)) {
    const auto first = statementStarts[index];
-   const bool transfer = index == first + 1 && oneOf(tokens[first].text, {"return", "break", "continue"});
+   const bool transfer = (index == first + 1 && oneOf(tokens[first].text, {"return", "throw", "break", "continue"})) || isFailureTransfer(first, index + 1);
    auto& count = statementsByFunction[functionIndex];
    if (!transfer && !isBinding(first, index + 1, fn)) ++count;
    maxStatements = std::max(maxStatements, count);

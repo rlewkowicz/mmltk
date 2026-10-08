@@ -69,6 +69,7 @@ public:
   validate_engine();
  }
  ImageUpscalerOutcome ActivateBackend(ImageUpscalerCurrent current) {
+  // CLEANUP-IGNORE: ONNX and TensorRT activation share only cancellation and descriptor access; each backend owns different admission, runtime, and failure paths.
   if (!current()) return ImageUpscalerOutcome::Cancelled;
   const auto& descriptor = this->descriptor();
   const auto device_id = this->device_id();

@@ -273,6 +273,7 @@ void TrainingGradientReducer::begin_attempt(std::size_t count) {
  p.active = true;
 }
 void TrainingGradientReducer::arm(std::size_t index) {
+ // CLEANUP-IGNORE: The reducer lock, failure check, and slot lookup precede different arm and collection transitions; extracting a callback lock wrapper would obscure ownership.
  auto& p = *impl_;
  std::lock_guard lock(p.mutex);
  p.check();
@@ -288,6 +289,7 @@ void TrainingGradientReducer::arm(std::size_t index) {
  for (std::size_t b = 0; b < p.buckets.size(); ++b) slot.remaining[b] = p.buckets[b].parameters.size();
 }
 void TrainingGradientReducer::collect(std::size_t index) {
+ // CLEANUP-IGNORE: The reducer lock, failure check, and slot lookup precede different arm and collection transitions; extracting a callback lock wrapper would obscure ownership.
  auto& p = *impl_;
  std::lock_guard lock(p.mutex);
  p.check();
@@ -325,6 +327,7 @@ void TrainingGradientReducer::collect(std::size_t index) {
  ++p.finished;
 }
 void TrainingGradientReducer::contribute_empty() {
+ // CLEANUP-IGNORE: Locking and checking this reducer precede distinct contribution, handoff, and finalization transitions; the reducer already owns their shared state.
  auto& p = *impl_;
  std::lock_guard lock(p.mutex);
  p.check();
@@ -345,6 +348,7 @@ void TrainingGradientReducer::enable_gradient_launch_after_counts() {
  p.launch_ready();
 }
 const std::vector<torch::Tensor>& TrainingGradientReducer::finish_attempt() {
+ // CLEANUP-IGNORE: Locking and checking this reducer precede distinct contribution, handoff, and finalization transitions; the reducer already owns their shared state.
  auto& p = *impl_;
  std::lock_guard lock(p.mutex);
  p.check();
@@ -375,6 +379,7 @@ const std::vector<torch::Tensor>& TrainingGradientReducer::finish_attempt() {
  return p.finite_gradients;
 }
 void TrainingGradientReducer::finalize_attempt() {
+ // CLEANUP-IGNORE: Locking and checking this reducer precede distinct contribution, handoff, and finalization transitions; the reducer already owns their shared state.
  auto& p = *impl_;
  std::lock_guard lock(p.mutex);
  p.check();

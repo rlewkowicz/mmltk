@@ -14,6 +14,7 @@
 #include <limits>
 #include <cmath>
 #include <bit>
+#include <span>
 #include <vector>
 #include <cstring>
 #include <new>
@@ -82,6 +83,10 @@ struct CpuDownscalerTestAccess {
 }  // namespace mmltk::backend::imaging::resample::perceptual
 using namespace mmltk::backend::imaging::resample;
 namespace {
+std::span<std::byte> aligned_test_arena(std::span<std::byte> backing, std::size_t bytes) {
+ const auto aligned = (reinterpret_cast<std::uintptr_t>(backing.data()) + 63) / 64 * 64;
+ return {reinterpret_cast<std::byte*>(aligned), bytes};
+}
 std::vector<uint8_t> make_test_image(int width, int height) {
  std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
  for (int y = 0; y < height; ++y) {
@@ -154,6 +159,7 @@ TEST_CASE("perceptual resampling matches independent moments and full-area geome
   for (const auto& dims : geometries)
    for (unsigned pattern = 0; pattern < 8; ++pattern) {
     INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3] << " pattern " << pattern);
+    // CLEANUP-IGNORE: Independent scalar geometry and SIMD boundaries use explicit padded image inputs before different numerical oracle comparisons.
     Image source(dims[0], dims[1], format, 3), output(dims[2], dims[3], format, 5);
     source.fill(pattern);
     const auto expected = reference(source, dims[2], dims[3], 5);
@@ -175,6 +181,7 @@ TEST_CASE("perceptual SIMD handles lane boundaries and unequal fractional footpr
         })
     for (unsigned pattern : {0U, 3U, 5U, 6U, 7U}) {
      INFO("format " << static_cast<int>(format) << " geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " pattern " << pattern);
+     // CLEANUP-IGNORE: Independent scalar geometry and SIMD boundaries use explicit padded image inputs before different numerical oracle comparisons.
      Image source(dims[0], dims[1], format, 3), output(dims[2], dims[3], format, 5);
      source.fill(pattern);
      resizer.downscale(source.read(), output.write());
@@ -418,6 +425,7 @@ TEST_CASE("perceptual checked views reject unsafe geometry before writing", "[ba
  bad = source.read();
  bad.data = nullptr;
  REQUIRE_THROWS(resizer.downscale(bad, output.write()));
+ // CLEANUP-IGNORE: Both tests explicitly construct an overflowing row stride but assert different general-view and typed-overflow contracts.
  bad = source.read();
  bad.layout.row_stride_bytes = std::numeric_limits<std::size_t>::max();
  REQUIRE_THROWS(resizer.downscale(bad, output.write()));
@@ -470,6 +478,7 @@ TEST_CASE("perceptual logical admission preserves format alignment alias and ove
  bad = source.read();
  bad.data = reinterpret_cast<const void*>(std::numeric_limits<std::uintptr_t>::max() - 3);
  REQUIRE_THROWS_AS(resizer.downscale(bad, output.write()), std::overflow_error);
+ // CLEANUP-IGNORE: Both tests explicitly construct an overflowing row stride but assert different general-view and typed-overflow contracts.
  bad = source.read();
  bad.layout.row_stride_bytes = std::numeric_limits<std::size_t>::max();
  REQUIRE_THROWS_AS(resizer.downscale(bad, output.write()), std::overflow_error);
@@ -514,6 +523,7 @@ namespace {
 void check_compiler_projection(
  RgbImageResizer& resizer, const std::vector<std::uint8_t>& source, std::uint32_t width, std::uint32_t height, std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode mode) {
  const auto geometry = compute_image_resize_geometry(width, height, target_width, target_height, mode);
+ // CLEANUP-IGNORE: The standalone resampler test retains its independent projection oracle rather than using the data-compiler fixture being checked.
  std::vector<std::uint8_t> bytes(std::size_t(geometry.resized_width) * geometry.resized_height * 3U);
  resizer.resize(source.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width), static_cast<int>(geometry.resized_height));
  const auto plane = std::size_t(target_width) * target_height;
@@ -742,8 +752,7 @@ TEST_CASE("one supplied arena supports poisoned mixed geometry and rejects stale
   maximum = std::max(maximum, plans.back().bytes());
  }
  std::vector<std::byte> backing(maximum + 127, std::byte{0x53});
- const auto aligned = (reinterpret_cast<std::uintptr_t>(backing.data()) + 63) / 64 * 64;
- const std::span memory(reinterpret_cast<std::byte*>(aligned), maximum);
+ const auto memory = aligned_test_arena(backing, maximum);
  RgbImageResizer supplied(1, perceptual), owned(1, perceptual);
  // Repeated and shuffled geometry must not depend on retained pixels, old
  // coefficient contents, or an allocator from a prior arena lease.
@@ -806,8 +815,7 @@ TEST_CASE("SIMD final rows retain scalar patch reconstruction and output bits", 
       const bool alpha = format == RgbPixelFormat::RGBA8;
       const auto bytes = perceptual::CpuDownscaler::workspace_bytes(width, height, alpha);
       std::vector<std::byte> backing(bytes + 127);
-      const auto aligned = (reinterpret_cast<std::uintptr_t>(backing.data()) + 63) / 64 * 64;
-      const std::span memory(reinterpret_cast<std::byte*>(aligned), bytes);
+      const auto memory = aligned_test_arena(backing, bytes);
       for (const auto poison : {std::byte{0xA7}, std::byte{0xFF}}) {
        std::ranges::fill(backing, poison);
        owner.bind(width, height, alpha, memory);

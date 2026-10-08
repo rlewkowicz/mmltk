@@ -98,13 +98,11 @@ Options parse_options(int argc, char** argv) {
 [[nodiscard]] std::string profile_run_label(const Options& options) { return "rfdetr.train.assignment-" + options.assignment + (options.denoising ? ".dn-on" : ".dn-off"); }
 void build_fixture(const Options& options, const FixtureSpec& fixture) {
  mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
- CompilerConfig config;
- config.source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture);
- config.output_dir = mmltk::backend::data::testsupport::compiled_dir(fixture);
- config.split = fixture.split;
+ auto config = mmltk::backend::data::testsupport::compiler_config(fixture);
  config.target_width = static_cast<uint32_t>(fixture.width);
  config.target_height = static_cast<uint32_t>(fixture.height);
  config.num_workers = options.compile_workers;
+ // CLEANUP-IGNORE: Independent profilers invoke the public prepare/compile boundary before measuring different products; compilation is already shared.
  const DatasetCompilePlan plan = DatasetCompiler::prepare(config, {config.split});
  DatasetCompiler::compile(plan, 0U);
  const auto compiled = mmltk::backend::data::inspect_compiled_dataset(mmltk::backend::data::testsupport::compiled_bin_path(fixture));

@@ -33,6 +33,22 @@ struct Target final {
  std::uint32_t height = 0U;
 };
 MMLTK_DEVICE_FN Target target_view(const ExploreRenderTargetView view) noexcept { return {view.data, view.pitch_bytes, view.width, view.height}; }
+template <class Index>
+MMLTK_DEVICE_FN bool target_thread_index(const Target target, Index& index) noexcept {
+ index = static_cast<Index>(blockIdx.x) * blockDim.x + threadIdx.x;
+ return index < static_cast<Index>(target.width) * target.height;
+}
+MMLTK_DEVICE_FN bool target_thread_pixel(const Target target, std::uint32_t& x, std::uint32_t& y) noexcept {
+ std::uint64_t index;
+ if (!target_thread_index(target, index)) return false;
+ x = static_cast<std::uint32_t>(index % target.width);
+ y = static_cast<std::uint32_t>(index / target.width);
+ return true;
+}
+MMLTK_DEVICE_FN ExploreRenderTileDescriptor tile_for_plane(ExploreRenderTileDescriptor tile, const ExploreRenderAtlasView view) noexcept {
+ if (view.draw_base == 0U) tile.destination_y = static_cast<std::uint32_t>(static_cast<std::int64_t>(tile.destination_y) + tile.semantic_y_offset);
+ return tile;
+}
 MMLTK_DEVICE_FN uchar4 class_colour(const ExploreRenderClassDescriptor* classes, const std::uint16_t class_id) noexcept {
  const auto& color = classes[class_id].color;
  return make_uchar4(color[0], color[1], color[2], 255U);
@@ -93,14 +109,24 @@ MMLTK_DEVICE_FN bool apply_masks(float& red, float& green, float& blue, float& a
  }
  return applied;
 }
+__device__ __forceinline__ void apply_pixel_masks(uchar4& output, const ExploreRenderAnnotationDescriptor* annotations, const ExploreRenderRlePair* pairs, const ExploreRenderClassDescriptor* classes,
+ const std::uint32_t annotation_offset, const std::uint32_t annotation_count, const std::uint32_t annotation_capacity, const ExploreRenderSemanticView semantics, const std::uint32_t width,
+ const std::uint32_t height, const float x, const float y) noexcept {
+ float red = MMLTK_FLOAT(output.x) / 255.0F;
+ float green = MMLTK_FLOAT(output.y) / 255.0F;
+ float blue = MMLTK_FLOAT(output.z) / 255.0F;
+ float alpha = MMLTK_FLOAT(output.w) / 255.0F;
+ const bool mask_applied =
+  apply_masks(red, green, blue, alpha, annotations, pairs, classes, annotation_offset, annotation_count, annotation_capacity, semantics.rle_count, semantics.class_count, width, height, x, y);
+ if (mask_applied && alpha > 0.0F) { output = make_uchar4(to_byte(red / alpha), to_byte(green / alpha), to_byte(blue / alpha), to_byte(alpha)); }
+}
 __global__ void atlas_tile_base_kernel(const ExploreRenderTargetView target_view_value, const ExploreRenderCardDescriptor* cards, const ExploreRenderAnnotationDescriptor* annotations,
  const ExploreRenderRlePair* pairs, const ExploreRenderClassDescriptor* classes, const ExploreRenderTileDescriptor* tiles, const ExploreRenderAtlasView view, const ExploreRenderTileBatchView batch,
  const ExploreRenderSemanticView semantics, const std::uint32_t annotation_capacity) {
  const Target target = target_view(target_view_value);
  const std::uint32_t tile_index = blockIdx.z;
  if (tile_index >= batch.tile_count) return;
- auto tile = tiles[tile_index];
- if (view.draw_base == 0U) tile.destination_y = static_cast<std::uint32_t>(static_cast<std::int64_t>(tile.destination_y) + tile.semantic_y_offset);
+ const auto tile = tile_for_plane(tiles[tile_index], view);
  if (tile.generation.viewport != batch.viewport_generation || tile.destination_width == 0U || tile.destination_height == 0U || tile.destination_x >= target.width ||
      tile.destination_y >= target.height || tile.destination_width > target.width - tile.destination_x || tile.destination_height > target.height - tile.destination_y) {
   return;
@@ -140,24 +166,16 @@ __global__ void atlas_tile_base_kernel(const ExploreRenderTargetView target_view
    255U);
  }
  if (semantics.show_masks != 0U && card.annotation_count != 0U && !erases_sample(card.erasure, normalized_x, normalized_y, card.source_width, card.source_height)) {
-  float red = MMLTK_FLOAT(output.x) / 255.0F;
-  float green = MMLTK_FLOAT(output.y) / 255.0F;
-  float blue = MMLTK_FLOAT(output.z) / 255.0F;
-  float alpha = MMLTK_FLOAT(output.w) / 255.0F;
-  const bool mask_applied = apply_masks(red, green, blue, alpha, annotations, pairs, classes, card.annotation_offset, card.annotation_count, annotation_capacity, semantics.rle_count,
-   semantics.class_count, card.source_width, card.source_height, normalized_x, normalized_y);
-  if (mask_applied && alpha > 0.0F) { output = make_uchar4(to_byte(red / alpha), to_byte(green / alpha), to_byte(blue / alpha), to_byte(alpha)); }
+  apply_pixel_masks(
+   output, annotations, pairs, classes, card.annotation_offset, card.annotation_count, annotation_capacity, semantics, card.source_width, card.source_height, normalized_x, normalized_y);
  }
  store(target, MMLTK_INT(x), MMLTK_INT(y), output);
 }
 __global__ void detail_base_kernel(const ExploreRenderTargetView target_view_value, const ExploreRenderDetailView view, const ExploreRenderAnnotationDescriptor* annotations,
  const ExploreRenderRlePair* pairs, const ExploreRenderClassDescriptor* classes, const ExploreRenderSemanticView semantics, const std::uint32_t annotation_capacity) {
  const Target target = target_view(target_view_value);
- const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
- const std::uint64_t total = static_cast<std::uint64_t>(target.width) * target.height;
- if (index >= total) return;
- const auto x = static_cast<std::uint32_t>(index % target.width);
- const auto y = static_cast<std::uint32_t>(index / target.width);
+ std::uint32_t x, y;
+ if (!target_thread_pixel(target, x, y)) return;
  uchar4 output = view.draw_base != 0U ? make_uchar4(0U, 0U, 0U, 255U) : make_uchar4(0U, 0U, 0U, 0U);
  const float normalized_x = (MMLTK_FLOAT(x) + 0.5F) / MMLTK_FLOAT(target.width);
  const float normalized_y = (MMLTK_FLOAT(y) + 0.5F) / MMLTK_FLOAT(target.height);
@@ -171,13 +189,7 @@ __global__ void detail_base_kernel(const ExploreRenderTargetView target_view_val
  const float mask_x = (source_x + 0.5F) / MMLTK_FLOAT(view.source_width);
  const float mask_y = (source_y + 0.5F) / MMLTK_FLOAT(view.source_height);
  if (semantics.show_masks != 0U && semantics.annotation_count != 0U && !erases_sample(view.erasure, mask_x, mask_y, view.source_width, view.source_height)) {
-  float red = MMLTK_FLOAT(output.x) / 255.0F;
-  float green = MMLTK_FLOAT(output.y) / 255.0F;
-  float blue = MMLTK_FLOAT(output.z) / 255.0F;
-  float alpha = MMLTK_FLOAT(output.w) / 255.0F;
-  const bool mask_applied = apply_masks(red, green, blue, alpha, annotations, pairs, classes, 0U, semantics.annotation_count, annotation_capacity, semantics.rle_count, semantics.class_count,
-   view.source_width, view.source_height, mask_x, mask_y);
-  if (mask_applied && alpha > 0.0F) { output = make_uchar4(to_byte(red / alpha), to_byte(green / alpha), to_byte(blue / alpha), to_byte(alpha)); }
+  apply_pixel_masks(output, annotations, pairs, classes, 0U, semantics.annotation_count, annotation_capacity, semantics, view.source_width, view.source_height, mask_x, mask_y);
  }
  store(target, MMLTK_INT(x), MMLTK_INT(y), output);
 }
@@ -227,8 +239,7 @@ __global__ void atlas_tile_box_kernel(const ExploreRenderTargetView target_view_
  const Target target = target_view(target_view_value);
  const std::uint32_t tile_index = blockIdx.z;
  if (tile_index >= batch.tile_count || semantics.show_boxes == 0U) return;
- auto tile = tiles[tile_index];
- if (view.draw_base == 0U) tile.destination_y = static_cast<std::uint32_t>(static_cast<std::int64_t>(tile.destination_y) + tile.semantic_y_offset);
+ const auto tile = tile_for_plane(tiles[tile_index], view);
  if (tile.generation.viewport != batch.viewport_generation || tile.placeholder != 0U || tile.card_index >= view.card_count || tile.destination_width == 0U || tile.destination_height == 0U ||
      tile.destination_x >= target.width || tile.destination_y >= target.height || tile.destination_width > target.width - tile.destination_x ||
      tile.destination_height > target.height - tile.destination_y || cards[tile.card_index].placeholder != 0U) {
@@ -263,17 +274,15 @@ __global__ void detail_box_kernel(const ExploreRenderTargetView target_view_valu
 }
 __global__ void count_nonzero_alpha_kernel(const ExploreRenderTargetView target_view_value, unsigned long long* count) {
  const Target target = target_view(target_view_value);
- const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
- const std::uint64_t total = static_cast<std::uint64_t>(target.width) * target.height;
- if (index >= total) return;
+ std::uint64_t index;
+ if (!target_thread_index(target, index)) return;
  const auto* row = rgba_row(target.data, (index / target.width) * target.pitch);
  if (row[index % target.width].w != 0U) atomicAdd(count, 1ULL);
 }
 __global__ void checksum_pixels_kernel(const ExploreRenderTargetView target_view_value, unsigned long long* checksum) {
  const Target target = target_view(target_view_value);
- const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
- const unsigned long long total = static_cast<unsigned long long>(target.width) * target.height;
- if (index >= total) return;
+ unsigned long long index;
+ if (!target_thread_index(target, index)) return;
  const auto* row = rgba_row(target.data, (index / target.width) * target.pitch);
  const uchar4 pixel = row[index % target.width];
  const unsigned long long packed =
@@ -283,11 +292,8 @@ __global__ void checksum_pixels_kernel(const ExploreRenderTargetView target_view
 __global__ void probe_rendered_card_kernel(const ExploreRenderTargetView clean_view, const ExploreRenderTargetView semantic_view, const ExploreRenderedCardProbeAbi probe, unsigned long long* counts) {
  const Target clean = target_view(clean_view);
  const Target semantic = target_view(semantic_view);
- const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
- const std::uint64_t total = static_cast<std::uint64_t>(clean.width) * clean.height;
- if (index >= total) return;
- const auto x = static_cast<std::uint32_t>(index % clean.width);
- const auto y = static_cast<std::uint32_t>(index / clean.width);
+ std::uint32_t x, y;
+ if (!target_thread_pixel(clean, x, y)) return;
  const auto* clean_row = rgba_row(clean.data, static_cast<std::size_t>(y) * clean.pitch);
  const auto* semantic_row = rgba_row(semantic.data, static_cast<std::size_t>(y) * semantic.pitch);
  const uchar4 clean_pixel = clean_row[x];
@@ -380,12 +386,14 @@ cudaError_t render_explore_detail_cuda(const ExploreRenderDetailView& view, cons
  return cudaPeekAtLastError();
 }
 cudaError_t count_explore_nonzero_alpha_cuda(const ExploreRenderTargetView& target, std::uint64_t* const count, const cudaStream_t stream) noexcept {
+ // CLEANUP-IGNORE: The common launch constant and pixel extent precede different diagnostic kernels; they are launch geometry, not repeated diagnostic computation.
  constexpr std::uint32_t threads = 256U;
  const std::uint64_t pixels = static_cast<std::uint64_t>(target.width) * target.height;
  count_nonzero_alpha_kernel<<<static_cast<unsigned int>((pixels + threads - 1U) / threads), threads, 0U, stream>>>(target, reinterpret_cast<unsigned long long*>(count));
  return cudaPeekAtLastError();
 }
 cudaError_t checksum_explore_pixels_cuda(const ExploreRenderTargetView& target, std::uint64_t* const checksum, const cudaStream_t stream) noexcept {
+ // CLEANUP-IGNORE: The common launch constant and pixel extent precede different diagnostic kernels; they are launch geometry, not repeated diagnostic computation.
  constexpr std::uint32_t threads = 256U;
  const std::uint64_t pixels = static_cast<std::uint64_t>(target.width) * target.height;
  checksum_pixels_kernel<<<static_cast<unsigned int>((pixels + threads - 1U) / threads), threads, 0U, stream>>>(target, reinterpret_cast<unsigned long long*>(checksum));
@@ -393,6 +401,7 @@ cudaError_t checksum_explore_pixels_cuda(const ExploreRenderTargetView& target, 
 }
 cudaError_t probe_explore_rendered_card_cuda(
  const ExploreRenderTargetView& clean, const ExploreRenderTargetView& semantic, const ExploreRenderedCardProbeAbi& probe, std::uint64_t* const counts, const cudaStream_t stream) noexcept {
+ // CLEANUP-IGNORE: The common launch constant and pixel extent precede different diagnostic kernels; they are launch geometry, not repeated diagnostic computation.
  constexpr std::uint32_t threads = 256U;
  const std::uint64_t pixels = static_cast<std::uint64_t>(clean.width) * clean.height;
  probe_rendered_card_kernel<<<static_cast<unsigned int>((pixels + threads - 1U) / threads), threads, 0U, stream>>>(clean, semantic, probe, reinterpret_cast<unsigned long long*>(counts));

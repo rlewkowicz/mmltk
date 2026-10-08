@@ -205,6 +205,7 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts, cons
   ccfg.observation = &observation;
  }
  const auto compile_start = std::chrono::steady_clock::now();
+ // CLEANUP-IGNORE: Independent profilers invoke the public prepare/compile boundary before measuring different products; compilation is already shared.
  const DatasetCompilePlan compile_plan = DatasetCompiler::prepare(ccfg, {ccfg.split});
  DatasetCompiler::compile(compile_plan, 0U);
  const auto compile_end = std::chrono::steady_clock::now();

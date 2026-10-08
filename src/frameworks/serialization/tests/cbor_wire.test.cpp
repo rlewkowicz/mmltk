@@ -71,10 +71,20 @@ static_assert(!std::constructible_from<wire::FlatValue, wire::ByteBuffer>);
 constexpr wire::Limits test_limits(const std::size_t max_bytes, const std::size_t max_items = 256U, const std::size_t max_depth = wire::kMaximumNestingDepth) {
  return {.max_bytes = max_bytes, .max_items = max_items, .max_depth = max_depth};
 }
+wire::ByteBuffer literal_short_text(std::string_view text) {
+ wire::ByteBuffer bytes{std::byte(0x60U + text.size())};
+ for (const unsigned char byte : text) bytes.push_back(std::byte{byte});
+ return bytes;
+}
 template <class Result>
 void require_decode_error(const Result& result, const wire::ErrorCode code) {
  REQUIRE_FALSE(result.has_value());
  CHECK(result.error().code == code);
+}
+template <std::size_t N>
+void require_structural_error(const std::array<std::byte, N>& bytes, wire::ErrorCode code) {
+ std::array<std::uint32_t, N> scratch{};
+ require_decode_error(wire::validate_raw_item_structural(bytes, {N, N, 4U}, {.key_offsets = scratch}), code);
 }
 template <class Check>
 void check_separate_splits(const wire::ByteView encoded, Check check) {
@@ -234,6 +244,7 @@ TEST_CASE("reflected CBOR flattens inherited members base first and enforces the
  InheritedCbor source;
  source.inherited_limit = 7;
  source.derived_count = 5U;
+ // CLEANUP-IGNORE: Inheritance and opaque-relation projection independently inspect their two-field object representation before different field oracles.
  const auto reflected = mmltk::frameworks::serialization::reflected_value(source);
  REQUIRE(reflected.has_value());
  const auto& object = std::get<wire::Value::Object>(reflected->storage);
@@ -248,8 +259,7 @@ TEST_CASE("reflected CBOR flattens inherited members base first and enforces the
  };
  const wire::Value missing_inherited(wire::Value::Object{{"derived_count", wire::Value(std::uint64_t{5U})}});
  const auto missing = decode_wire_object(missing_inherited);
- REQUIRE_FALSE(missing.has_value());
- CHECK(missing.error().code == wire::ErrorCode::UnknownKey);
+ require_decode_error(missing, wire::ErrorCode::UnknownKey);
  CHECK(missing.error().path == "inherited_limit");
  const wire::Value unknown_member(wire::Value::Object{
   {"inherited_limit", wire::Value(std::int64_t{7})},
@@ -257,16 +267,14 @@ TEST_CASE("reflected CBOR flattens inherited members base first and enforces the
   {"unknown", wire::Value(true)},
  });
  const auto unknown = decode_wire_object(unknown_member);
- REQUIRE_FALSE(unknown.has_value());
- CHECK(unknown.error().code == wire::ErrorCode::UnknownKey);
+ require_decode_error(unknown, wire::ErrorCode::UnknownKey);
  CHECK(unknown.error().path == "unknown");
  const wire::Value invalid_inherited(wire::Value::Object{
   {"inherited_limit", wire::Value(std::int64_t{10})},
   {"derived_count", wire::Value(std::uint64_t{5U})},
  });
  const auto invalid = decode_wire_object(invalid_inherited);
- REQUIRE_FALSE(invalid.has_value());
- CHECK(invalid.error().code == wire::ErrorCode::LimitExceeded);
+ require_decode_error(invalid, wire::ErrorCode::LimitExceeded);
  CHECK(invalid.error().path == "inherited_limit");
  // The owned path must enforce the same contract without wire-reader guards.
  const auto check_owned = [&](wire::Value::Object fields, const bool valid, const std::optional<std::uint16_t> optional = {}) {
@@ -311,8 +319,7 @@ TEST_CASE("reflected CBOR flattens inherited members base first and enforces the
  invalid_source.derived_count = 5U;
  wire::ByteBuffer rejected_bytes;
  const auto rejected_encode = mmltk::frameworks::serialization::encode(invalid_source, rejected_bytes, test_limits(128U));
- REQUIRE_FALSE(rejected_encode.has_value());
- CHECK(rejected_encode.error().code == wire::ErrorCode::LimitExceeded);
+ require_decode_error(rejected_encode, wire::ErrorCode::LimitExceeded);
  CHECK(rejected_encode.error().path == "inherited_limit");
  CHECK(rejected_bytes.empty());
 }
@@ -632,6 +639,7 @@ TEST_CASE("opaque relation storage remains sealed while every reflected CBOR fac
  Owner source;
  source.value = 19U;
  Relation::set(source.overrides);
+ // CLEANUP-IGNORE: Inheritance and opaque-relation projection independently inspect their two-field object representation before different field oracles.
  const auto reflected = mmltk::frameworks::serialization::reflected_value(source);
  REQUIRE(reflected.has_value());
  const auto& owner_object = std::get<wire::Value::Object>(reflected->storage);
@@ -691,8 +699,7 @@ TEST_CASE("opaque relation storage remains sealed while every reflected CBOR fac
  preserved.value = 27U;
  const auto before_invalid = preserved;
  const auto invalid_regular = mmltk::frameworks::serialization::decode_into(preserved, invalid_owner);
- REQUIRE_FALSE(invalid_regular.has_value());
- CHECK(invalid_regular.error().code == wire::ErrorCode::LimitExceeded);
+ require_decode_error(invalid_regular, wire::ErrorCode::LimitExceeded);
  CHECK(invalid_regular.error().path.ends_with("mask"));
  CHECK(preserved == before_invalid);
  const wire::Value projected(wire::Value::Object{
@@ -702,8 +709,7 @@ TEST_CASE("opaque relation storage remains sealed while every reflected CBOR fac
  wire::ByteBuffer projected_bytes;
  REQUIRE(wire::encode(projected, projected_bytes, test_limits(128U)).has_value());
  const auto invalid_projected = mmltk::frameworks::serialization::decode<mmltk::frameworks::serialization::test::OpaqueProjectedEnvelope>({projected_bytes, {}}, test_limits(128U));
- REQUIRE_FALSE(invalid_projected.has_value());
- CHECK(invalid_projected.error().code == wire::ErrorCode::LimitExceeded);
+ require_decode_error(invalid_projected, wire::ErrorCode::LimitExceeded);
  CHECK(invalid_projected.error().path.ends_with("mask"));
 }
 TEST_CASE("reflected CBOR audit detects duplicate flattened inherited member names", "[frameworks][serialization][reflection][inheritance]") {
@@ -914,6 +920,7 @@ TEST_CASE("configured maximum scalar and flat array inputs retain independent ow
   }
   auto insufficient = limits;
   --insufficient.max_bytes;
+  // CLEANUP-IGNORE: The shared decoder and error assertion exercise independent byte-budget and preallocation-capacity refusals with different offset and allocation oracles.
   const auto rejected = wire::Reader({encoded, {}}, insufficient).read_flat();
   require_decode_error(rejected, wire::ErrorCode::LimitExceeded);
   CHECK(rejected.error().offset == 0U);
@@ -960,11 +967,13 @@ TEST_CASE("segmented scalar failures preserve complete payload admission and off
   require_decode_error(value, wire::ErrorCode::InvalidUtf8);
   CHECK(value.error().offset == invalid.size());
   auto limits = test_limits(invalid.size() - 1U);
+  // CLEANUP-IGNORE: Byte-budget refusal and allocator refusal intentionally use the same error oracle with different failure offsets.
   const auto budget = wire::Reader(input, limits).read_flat();
   require_decode_error(budget, wire::ErrorCode::LimitExceeded);
   CHECK(budget.error().offset == 0U);
   limits.max_bytes = invalid.size();
   limits.allocation_policy.allows = [](const void*, const wire::AllocationRequest&) noexcept { return false; };
+  // CLEANUP-IGNORE: Byte-budget refusal and allocator refusal intentionally use the same error oracle with different failure offsets.
   const auto denied = wire::Reader(input, limits).read_flat();
   require_decode_error(denied, wire::ErrorCode::LimitExceeded);
   CHECK(denied.error().offset == 1U);
@@ -1086,8 +1095,7 @@ TEST_CASE("UTF8 scalar limits preserve literal text across every segment split",
        std::string_view{"\xf0\x90\x80\x80"},
        std::string_view{"\xf4\x8f\xbf\xbf"},
       }) {
-  wire::ByteBuffer expected{std::byte(0x60U + text.size())};
-  for (const unsigned char byte : text) expected.push_back(std::byte{byte});
+  auto expected = literal_short_text(text);
   wire::ByteBuffer encoded;
   REQUIRE(wire::encode(wire::Value(std::string{text}), encoded, test_limits(64U)).has_value());
   CHECK(encoded == expected);
@@ -1107,13 +1115,11 @@ TEST_CASE("UTF8 scalar limits preserve literal text across every segment split",
 }
 TEST_CASE("malformed UTF8 categories consume complete segmented payloads before failure", "[frameworks][serialization]") {
  for (const std::string_view malformed : mmltk::testsupport::kMalformedUtf8) {
-  wire::ByteBuffer encoded{std::byte(0x60U + malformed.size())};
-  for (const unsigned char byte : malformed) encoded.push_back(std::byte{byte});
+  auto encoded = literal_short_text(malformed);
   const wire::ByteBuffer retained{std::byte{0xaa}, std::byte{0xbb}};
   wire::ByteBuffer destination = retained;
   const auto rejected_encode = wire::encode(wire::Value(std::string{malformed}), destination, test_limits(64U));
-  REQUIRE_FALSE(rejected_encode.has_value());
-  CHECK(rejected_encode.error().code == wire::ErrorCode::InvalidUtf8);
+  require_decode_error(rejected_encode, wire::ErrorCode::InvalidUtf8);
   CHECK(destination == retained);
   for (std::size_t split = 0U; split <= encoded.size(); ++split) {
    wire::Reader reader({std::span(encoded).first(split), std::span(encoded).subspan(split)}, test_limits(encoded.size()));
@@ -1203,13 +1209,13 @@ TEST_CASE("flat_dynamic_values_use_an_opaque_direct_reader_and_reject_recursive_
  REQUIRE(decoded.has_value());
  CHECK(flat_item_count(*decoded) == 2U);
  const std::array nested_array{std::byte{0x81}, std::byte{0x81}, std::byte{0xf5}};
+ // CLEANUP-IGNORE: Nested arrays and maps are separate literal forbidden flat-value inputs; the reader and shared error assertion retain both required rejection cases.
  const auto nested = wire::Reader({nested_array, {}}, test_limits(nested_array.size(), 3U, 2U)).read_flat();
- REQUIRE_FALSE(nested.has_value());
- CHECK(nested.error().code == wire::ErrorCode::TypeMismatch);
+ require_decode_error(nested, wire::ErrorCode::TypeMismatch);
  const std::array object{std::byte{0xa1}, std::byte{0x61}, std::byte{'x'}, std::byte{0xf5}};
+ // CLEANUP-IGNORE: Nested arrays and maps are separate literal forbidden flat-value inputs; the reader and shared error assertion retain both required rejection cases.
  const auto mapped = wire::Reader({object, {}}, test_limits(object.size(), 3U, 2U)).read_flat();
- REQUIRE_FALSE(mapped.has_value());
- CHECK(mapped.error().code == wire::ErrorCode::TypeMismatch);
+ require_decode_error(mapped, wire::ErrorCode::TypeMismatch);
 }
 TEST_CASE("flat_reader_refuses_declared_capacity_before_allocating_an_array", "[frameworks][serialization]") {
  struct AllocationProbe {
@@ -1230,13 +1236,12 @@ TEST_CASE("flat_reader_refuses_declared_capacity_before_allocating_an_array", "[
   .max_depth = 1U,
   .allocation_policy = {.context = &probe, .allows = refuse_flat_array},
  };
+ // CLEANUP-IGNORE: The shared decoder and error assertion exercise independent byte-budget and preallocation-capacity refusals with different offset and allocation oracles.
  const auto rejected = wire::Reader({flat_array, {}}, limits).read_flat();
- REQUIRE_FALSE(rejected.has_value());
- CHECK(rejected.error().code == wire::ErrorCode::LimitExceeded);
+ require_decode_error(rejected, wire::ErrorCode::LimitExceeded);
  CHECK(probe.denied);
  const auto capacity_rejected = wire::Reader({flat_array, {}}, test_limits(flat_array.size(), 2U, 1U)).read_flat();
- REQUIRE_FALSE(capacity_rejected.has_value());
- CHECK(capacity_rejected.error().code == wire::ErrorCode::LimitExceeded);
+ require_decode_error(capacity_rejected, wire::ErrorCode::LimitExceeded);
 }
 TEST_CASE("fixed_cbor_destination_is_exact_and_rejects_capacity_before_writing", "[frameworks][serialization]") {
  const wire::Value value(wire::Value::Object{
@@ -1253,8 +1258,7 @@ TEST_CASE("fixed_cbor_destination_is_exact_and_rejects_capacity_before_writing",
  std::array<std::byte, 128U> undersized;
  undersized.fill(std::byte{0xa5});
  const auto rejected = wire::encode(value, std::span(undersized).first(expected.size() - 1U), test_limits(expected.size()));
- REQUIRE_FALSE(rejected.has_value());
- CHECK(rejected.error().code == wire::ErrorCode::LimitExceeded);
+ require_decode_error(rejected, wire::ErrorCode::LimitExceeded);
  CHECK(std::ranges::all_of(undersized, [](const std::byte byte_value) { return byte_value == std::byte{0xa5}; }));
 }
 TEST_CASE("raw_array_substitution_validates_and_splices_canonical_items", "[frameworks][serialization]") {
@@ -1292,25 +1296,18 @@ TEST_CASE("rejects_nonminimal_malformed_duplicate_and_invalid_utf8_values", "[fr
  // CLEANUP-IGNORE: The root duplicate-key oracle and the later nested-map oracle are separate raw CBOR schemas
  // whose similar validation sequence proves different path scopes.
  REQUIRE(!wire::validate_raw_item({duplicate, {}}, {duplicate.size(), 16U, 4U}).has_value());
- std::array<std::uint32_t, duplicate.size()> duplicate_scratch{};
- const auto structural_duplicate = wire::validate_raw_item_structural(duplicate, {duplicate.size(), duplicate.size(), 4U}, {.key_offsets = duplicate_scratch});
- REQUIRE_FALSE(structural_duplicate.has_value());
- CHECK(structural_duplicate.error().code == wire::ErrorCode::DuplicateKey);
+ require_structural_error(duplicate, wire::ErrorCode::DuplicateKey);
  const std::array non_text_key{std::byte{0xa1}, std::byte{0x01}, std::byte{0x01}};
  std::array<std::uint32_t, non_text_key.size()> non_text_scratch{};
  const auto structural_non_text = wire::validate_raw_item_structural(non_text_key, {non_text_key.size(), non_text_key.size(), 2U}, {.key_offsets = non_text_scratch});
- REQUIRE_FALSE(structural_non_text.has_value());
- CHECK(structural_non_text.error().code == wire::ErrorCode::TypeMismatch);
+ require_decode_error(structural_non_text, wire::ErrorCode::TypeMismatch);
  const std::array nested_reused_key{std::byte{0xa1}, std::byte{0x61}, std::byte{'a'}, std::byte{0xa1}, std::byte{0x61}, std::byte{'a'}, std::byte{0x01}};
  std::array<std::uint32_t, nested_reused_key.size()> nested_scratch{};
  CHECK(wire::validate_raw_item_structural(nested_reused_key, {nested_reused_key.size(), nested_reused_key.size(), 4U}, {.key_offsets = nested_scratch}).has_value());
  const std::array nested_duplicate{
   std::byte{0xa1}, std::byte{0x61}, std::byte{'o'}, std::byte{0xa2}, std::byte{0x61}, std::byte{'a'}, std::byte{0x01}, std::byte{0x61}, std::byte{'a'}, std::byte{0x02}
  };
- std::array<std::uint32_t, nested_duplicate.size()> nested_duplicate_scratch{};
- const auto nested_structural_duplicate = wire::validate_raw_item_structural(nested_duplicate, {nested_duplicate.size(), nested_duplicate.size(), 4U}, {.key_offsets = nested_duplicate_scratch});
- REQUIRE_FALSE(nested_structural_duplicate.has_value());
- CHECK(nested_structural_duplicate.error().code == wire::ErrorCode::DuplicateKey);
+ require_structural_error(nested_duplicate, wire::ErrorCode::DuplicateKey);
  const std::array invalid_utf8{std::byte{0x61}, std::byte{0x80}};
  require_malformed_scalar(invalid_utf8, wire::ErrorCode::InvalidUtf8);
  const std::array nested_invalid_utf8{

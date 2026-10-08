@@ -635,6 +635,7 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
    state.max_exp_avg_sq = torch::Tensor();
   }
  });
+ // CLEANUP-IGNORE: These swaps commit different typed optimizer archives after different admission rules; no shared optimizer-state algorithm is present in this fragment.
  groups_.swap(candidate_groups);
  state_.swap(candidate_state);
 }
@@ -800,6 +801,7 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
   state.exp_avg_sq = std::move(exp_avg_sq);
   // CLEANUP-IGNORE: This fragment crosses typed archive commit, inspection and construction boundaries; their shared storage and parser operations already have one implementation.
  });
+ // CLEANUP-IGNORE: These swaps commit different typed optimizer archives after different admission rules; no shared optimizer-state algorithm is present in this fragment.
  groups_.swap(candidate_groups);
  state_.swap(candidate_state);
 }

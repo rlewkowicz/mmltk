@@ -178,6 +178,7 @@ private:
  }
  // CLEANUP-IGNORE: This system captures its own locked frame before calling the shared borrow_matching_visual_product; runtime borrowing must occur outside that lock.
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const {
+  // CLEANUP-IGNORE: Each system snapshots its own locked frame before using the shared matching-product borrow API outside the lock.
   VisualFrame committed;
   {
    std::scoped_lock lock(mutex_);

@@ -4,7 +4,14 @@
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/services/settings/settings_store.h"
 #include "src/controller/services/settings/settings_location.h"
+#include "src/controller/services/settings/settings_system.h"
+#include <utility>
 namespace mmltk::controller::test_support {
+struct LoadedSettingsFixture {
+ const services::SettingsLocation location;
+ SettingsSystem settings;
+ explicit LoadedSettingsFixture(services::SettingsLocation input) : location(std::move(input)) { REQUIRE(settings.Load(location).applied()); }
+};
 [[nodiscard]] inline services::SettingsLocation install_settings(const std::filesystem::path& root) {
  auto settings = contracts::default_gui_settings_state();
  settings.workflows.train.dataset_source_dir = root / "source";
@@ -30,6 +37,7 @@ namespace mmltk::controller::test_support {
  settings.workflows.predict.model_input = contracts::ModelArtifactInputKind::Weights;
  settings.workflows.export_state.weights_path = root / "weights.pt";
  settings.workflows.export_state.output = {.automatic = false, .directory = (root / "export").string()};
+ // CLEANUP-IGNORE: The model-admission test deliberately specifies its own settings facts independently of the generic persisted-settings fixture.
  settings.workflows.export_state.model_source = contracts::ModelSelectionSource::Custom;
  settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Weights;
  REQUIRE(contracts::gui_settings_valid(settings));

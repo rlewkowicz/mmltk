@@ -18,6 +18,11 @@ void validate_resume_continuation_manifest(const ResumeContinuationManifest& man
 namespace detail {
 namespace serialization = mmltk::frameworks::serialization;
 namespace {
+void write_bytes(torch::serialize::OutputArchive& archive, const char* key, const serialization::wire::ByteBuffer& bytes) {
+ auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
+ std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
+ archive.write(key, tensor);
+}
 template <class Values, class Visitor>
 void visit_continuation_values(Values& values, Visitor&& visitor) {
  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^TrainingContinuationValues, std::meta::access_context::current()))) {
@@ -43,9 +48,7 @@ void write_scalar(torch::serialize::OutputArchive& archive, const char* key, con
   serialization::wire::ByteBuffer bytes;
   if (!serialization::encode(value, bytes, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32}))
    throw std::runtime_error("invalid continuation structure");
-  auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
-  std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
-  archive.write(key, tensor);
+  write_bytes(archive, key, bytes);
  }
 }
 template <class T>
@@ -116,9 +119,7 @@ void write_training_configuration(torch::serialize::OutputArchive& archive, cons
  serialization::wire::ByteBuffer bytes;
  const auto encoded = serialization::encode(request, bytes, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
  if (!encoded) throw std::runtime_error("training configuration violates its checkpoint schema");
- auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
- std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
- archive.write("training_configuration_cbor", tensor);
+ write_bytes(archive, "training_configuration_cbor", bytes);
 }
 TrainRequest read_training_configuration(torch::serialize::InputArchive& archive) {
  torch::Tensor configuration;

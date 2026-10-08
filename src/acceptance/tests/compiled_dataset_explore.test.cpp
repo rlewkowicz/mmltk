@@ -38,6 +38,27 @@ namespace {
 namespace data = mmltk::backend::data;
 namespace explore = mmltk::backend::imaging::explore;
 namespace controller = mmltk::controller;
+struct NativeExploreReceiver {
+ const decltype(mmltk::frameworks::gpu::cuda_image_copy_backend()) backend = mmltk::frameworks::gpu::cuda_image_copy_backend();
+ mmltk::frameworks::gpu::DeviceContext context{0, backend};
+ mmltk::frameworks::gpu::ImageStream stream{context};
+ mmltk::frameworks::gpu::ImageProductBuffer receiver{context, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic};
+};
+struct ExploreGateConnection {
+ mmltk::common::io::ScopedFd commands;
+ std::shared_ptr<controller::ExploreAcceptanceGate> gate;
+ ExploreGateConnection() {
+  std::array<int, 2U> sockets{-1, -1};
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+  commands.reset(sockets[0]);
+  gate = std::make_shared<controller::ExploreAcceptanceGate>(sockets[1]);
+ }
+};
+auto checked_explore_document(const controller::ExploreSystem& system, const auto& frame) {
+ auto borrowed = system.BorrowDocument(frame);
+ REQUIRE(borrowed.valid());
+ return borrowed;
+}
 class NativeExploreAudit final {
  struct PublicationObservation final {
   void Observe(const std::uint64_t sequence, const controller::VisualDiagnosticFact& fact) noexcept {
@@ -386,6 +407,7 @@ void test_compiled_explore_sparse_physical_slots() {
   check_published_frame(system);
  };
  settle(system.Open({.viewport = viewport, .compiled_source = path.string()}));
+ // CLEANUP-IGNORE: Successful open and failed replacement independently assert retained dataset counts at different acceptance boundaries.
  CHECK(system.snapshot().dataset.image_count == 2U);
  CHECK(system.snapshot().dataset.slot_count == slot_count);
  CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{0U, 65U});
@@ -409,6 +431,7 @@ void test_compiled_explore_sparse_physical_slots() {
   filter(66U, slot_count - 1U);
   CHECK(system.snapshot().order.matching_count == 0U);
  }
+ // CLEANUP-IGNORE: The shared filter helper restores a baseline before distinct invalid-range and shuffled-order mutations.
  filter(0U, std::numeric_limits<std::uint64_t>::max());
  auto outside = controller::ExploreFilterUpdate{.filter = system.snapshot().filter, .overlay = system.snapshot().overlay};
  outside.filter.maximum_compiled_index = slot_count;
@@ -422,6 +445,7 @@ void test_compiled_explore_sparse_physical_slots() {
  settle(system.UpdateAugmentation({.enabled = true}));
  REQUIRE(audit.Wait([&] { return audit.donor_count() != 0U && audit.last_valid_donors() != 0U; }));
  settle(system.UpdateAugmentation({.enabled = false}));
+ // CLEANUP-IGNORE: The shared filter helper restores a baseline before distinct invalid-range and shuffled-order mutations.
  filter(0U, std::numeric_limits<std::uint64_t>::max());
  auto shuffled = controller::ExploreFilterUpdate{.filter = system.snapshot().filter, .overlay = system.snapshot().overlay};
  shuffled.filter.order = controller::ExploreOrder::Shuffled;
@@ -451,8 +475,10 @@ void test_compiled_explore_sparse_physical_slots() {
  REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > failed.revision && !system.snapshot().failure.empty(); }));
  CHECK(system.snapshot().ready);
  CHECK(system.snapshot().dataset.identity == prior.dataset.identity);
+ // CLEANUP-IGNORE: Successful open and failed replacement independently assert retained dataset counts at different acceptance boundaries.
  CHECK(system.snapshot().dataset.image_count == 2U);
  CHECK(system.snapshot().dataset.slot_count == slot_count);
+ // CLEANUP-IGNORE: Compiled-dataset acceptance independently verifies filter/order continuity against the subsystem unit-test boundary.
  CHECK(system.snapshot().filter == prior.filter);
  CHECK(system.snapshot().order.visible_indices == prior.order.visible_indices);
  CHECK(system.snapshot().frame == prior.frame);
@@ -697,15 +723,17 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  REQUIRE(retained_pinned_bytes > 0U);
  placeholder_count = audit.placeholder_count();
  tile_count = audit.tile_count();
- static_cast<void>(system.Open({.viewport = first_view, .compiled_source = compiled.string()}));
- wait_for_native_gallery(audit, system, placeholder_count, tile_count);
+ const auto open_compiled_gallery = [&](const std::filesystem::path& path) {
+  static_cast<void>(system.Open({.viewport = first_view, .compiled_source = path.string()}));
+  wait_for_native_gallery(audit, system, placeholder_count, tile_count);
+ };
+ open_compiled_gallery(compiled);
  CHECK(system.snapshot().ready);
  CHECK(audit.pinned_storage() >= retained_pinned_bytes);
  CHECK_FALSE(audit.failed());
  placeholder_count = audit.placeholder_count();
  tile_count = audit.tile_count();
- static_cast<void>(system.Open({.viewport = first_view, .compiled_source = non_square_compiled.string()}));
- wait_for_native_gallery(audit, system, placeholder_count, tile_count);
+ open_compiled_gallery(non_square_compiled);
  CHECK(system.snapshot().augmentation.seed == 0U);
  CHECK_FALSE(system.snapshot().augmentation.enabled);
  check_published_frame(system);
@@ -728,6 +756,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U, 11U});
  CHECK(audit.last_descriptor_annotations() == 2U);
  CHECK(audit.last_descriptor_rle() != 0U);
+ // CLEANUP-IGNORE: Separate filter transitions capture their own diagnostic counter baselines; no counter update or projection algorithm is duplicated.
  placeholder_count = audit.placeholder_count();
  tile_count = audit.tile_count();
  semantic_count = audit.semantic_count();
@@ -738,6 +767,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  wait_for_native_gallery(audit, system, placeholder_count, tile_count);
  REQUIRE(audit.Wait([&] { return audit.semantic_count() > semantic_count; }));
  CHECK(audit.semantic_nonzero_cards() == 0U);
+ // CLEANUP-IGNORE: Separate filter transitions capture their own diagnostic counter baselines; no counter update or projection algorithm is duplicated.
  placeholder_count = audit.placeholder_count();
  tile_count = audit.tile_count();
  semantic_count = audit.semantic_count();
@@ -897,8 +927,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  placeholder_count = audit.placeholder_count();
  tile_count = audit.tile_count();
  const auto empty_augmentation_count = audit.augmentation_count();
- static_cast<void>(system.Open({.viewport = first_view, .compiled_source = empty_compiled.string()}));
- wait_for_native_gallery(audit, system, placeholder_count, tile_count);
+ open_compiled_gallery(empty_compiled);
  CHECK(system.snapshot().augmentation.enabled);
  CHECK(audit.augmentation_count() > empty_augmentation_count);
  CHECK_FALSE(audit.failed());
@@ -941,10 +970,7 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
  wait_for_native_gallery(audit, system, 0U, 0U, 1U);
  REQUIRE(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U});
  namespace gpu = mmltk::frameworks::gpu;
- const auto backend = gpu::cuda_image_copy_backend();
- gpu::DeviceContext receiver_context{0, backend};
- gpu::ImageStream receiver_stream{receiver_context};
- gpu::ImageProductBuffer receiver{receiver_context, gpu::ImageProductLayout::CleanAndSemantic};
+ auto [backend, receiver_context, receiver_stream, receiver] = NativeExploreReceiver{};
  const auto check_semantics = [&](const bool atlas) {
   const auto frame = system.snapshot().frame;
   auto source = system.BorrowFrame();
@@ -978,14 +1004,15 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
   CHECK(system.snapshot().frame == frame);
  };
  check_semantics(true);
+ // CLEANUP-IGNORE: Separate semantics and augmentation transitions use different completion predicates; the match ends before that distinction.
  const auto previous = system.snapshot().frame;
  static_cast<void>(system.Select({.compiled_index = 10U}));
  REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().mode == controller::ExploreMode::Detail && system.snapshot().frame != previous; }));
  check_semantics(false);
  const auto detail = system.snapshot().frame;
  {
-  auto borrowed = system.BorrowDocument(detail);
-  REQUIRE(borrowed.valid());
+  // CLEANUP-IGNORE: The checked document borrow remains live through independent geometry and donor-object oracles; materialization itself already has one implementation.
+  auto borrowed = checked_explore_document(system, detail);
   const auto editable = controller::materialize_visual_document(*borrowed.document, detail.extent, detail.content);
   REQUIRE(editable.objects.size() == 1);
   const auto& object = editable.objects[0];
@@ -1054,6 +1081,7 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
   CHECK((audit.last_valid_donors() != 0U) == donor_fits);
   if (!donor_fits) CHECK(audit.last_planned_pastes() == 0U);
   check_published_frame(system);
+  // CLEANUP-IGNORE: Separate semantics and augmentation transitions use different completion predicates; the match ends before that distinction.
   const auto previous = system.snapshot().frame;
   static_cast<void>(system.Select({.compiled_index = 10U}));
   REQUIRE(audit.Wait([&] { return system.snapshot().mode == controller::ExploreMode::Detail && system.snapshot().frame != previous; }));
@@ -1156,10 +1184,12 @@ void test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer() {
  wait_for_native_gallery(audit, system, 0, 0);
  const auto gallery = system.snapshot();
  const auto selected = system.Select({.compiled_index = 0});
+ // CLEANUP-IGNORE: Separate selection and overlay admissions await their own revision before comparing different frame properties.
  REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > selected.revision; }));
+ // CLEANUP-IGNORE: The frame snapshot identifies a caller-owned document borrow; the shared checked-borrow helper precedes independent donor and geometric projection oracles.
  const auto frame = system.snapshot().frame;
- auto borrowed = system.BorrowDocument(frame);
- REQUIRE(borrowed.valid());
+ // CLEANUP-IGNORE: The checked document borrow remains live through independent geometry and donor-object oracles; materialization itself already has one implementation.
+ auto borrowed = checked_explore_document(system, frame);
  const auto editable = controller::materialize_visual_document(*borrowed.document, frame.extent, frame.content);
  REQUIRE_FALSE(editable.objects.empty());
  REQUIRE(editable.objects.back().category == donor_class);
@@ -1209,11 +1239,11 @@ void test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer() {
  auto overlay = system.snapshot().overlay;
  overlay.class_selection = {.mode = controller::ExploreClassSelectionMode::Subset, .classes = {source_class}};
  const auto hidden = system.UpdateOverlay(overlay);
+ // CLEANUP-IGNORE: Separate selection and overlay admissions await their own revision before comparing different frame properties.
  REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > hidden.revision; }));
  const auto hidden_frame = system.snapshot().frame;
  CHECK(hidden_frame.clean_revision == frame.clean_revision);
- borrowed = system.BorrowDocument(hidden_frame);
- REQUIRE(borrowed.valid());
+ borrowed = checked_explore_document(system, hidden_frame);
  const auto hidden_editable = controller::materialize_visual_document(*borrowed.document, hidden_frame.extent, hidden_frame.content);
  CHECK(hidden_editable.objects == editable.objects);
  borrowed = {};
@@ -1229,10 +1259,7 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
  const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "fixture", 6);
  controller::SettingsSystem settings;
  load_explore_transport(settings, root.path() / "gui.json", h2d);
- std::array<int, 2U> sockets{-1, -1};
- REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
- mmltk::common::io::ScopedFd commands{sockets[0]};
- auto gate = std::make_shared<controller::ExploreAcceptanceGate>(sockets[1]);
+ auto [commands, gate] = ExploreGateConnection{};
  NativeExploreAudit audit;
  mmltk::testsupport::TestGate prefetch_lane{"second Explore image before viewport growth"};
  mmltk::testsupport::TestGate stale_lane{"third Explore lane before acceptance wait"};
@@ -1412,10 +1439,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
  // CLEANUP-IGNORE: This transaction fixture uses the same transport selector as cancellation coverage but
  // establishes different socket, product-observer, and fault-boundary evidence.
  load_explore_transport(settings, root.path() / "gui.json", true);
- std::array<int, 2U> sockets{-1, -1};
- REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
- mmltk::common::io::ScopedFd commands{sockets[0]};
- auto gate = std::make_shared<controller::ExploreAcceptanceGate>(sockets[1]);
+ auto [commands, gate] = ExploreGateConnection{};
  struct Observation {
   std::mutex mutex;
   std::weak_ptr<const void> prepared, released;
@@ -1468,10 +1492,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
  auto held = system.BorrowFrame();
  REQUIRE(controller::visual_product_matches_frame(incumbent.frame, held));
  namespace gpu = mmltk::frameworks::gpu;
- const auto backend = gpu::cuda_image_copy_backend();
- gpu::DeviceContext receiver_context{0, backend};
- gpu::ImageStream receiver_stream{receiver_context};
- gpu::ImageProductBuffer receiver{receiver_context, gpu::ImageProductLayout::CleanAndSemantic};
+ auto [backend, receiver_context, receiver_stream, receiver] = NativeExploreReceiver{};
  const auto pixels = [&] {
   static_cast<void>(receiver.CopyFrom(receiver_stream, system.BorrowFrame()));
   const auto read = receiver.Borrow();
@@ -1517,6 +1538,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
   // CLEANUP-IGNORE: These end-to-end rollback assertions intentionally restate the public continuity contract
   // across a separate compiled-data acceptance boundary.
   CHECK(settled.frame == incumbent.frame);
+  // CLEANUP-IGNORE: Real compiled-data acceptance independently asserts catalog, ordering and viewport continuity against the fake-system unit oracle.
   CHECK(settled.dataset.identity == incumbent.dataset.identity);
   CHECK(settled.order.visible_indices == incumbent.order.visible_indices);
   CHECK(settled.viewport == incumbent.viewport);
@@ -1553,9 +1575,9 @@ TEST_CASE("Compiled Explore imports independent masks through both geometries an
  wait_for_native_gallery(fixture.audit, system, 0, 0, 1);
  static_cast<void>(system.Select({.compiled_index = 0}));
  REQUIRE(fixture.audit.Wait([&] { return !system.snapshot().busy && system.snapshot().mode == controller::ExploreMode::Detail; }));
+ // CLEANUP-IGNORE: The frame snapshot identifies a caller-owned document borrow; the shared checked-borrow helper precedes independent donor and geometric projection oracles.
  const auto frame = system.snapshot().frame;
- auto borrowed = system.BorrowDocument(frame);
- REQUIRE(borrowed.valid());
+ auto borrowed = checked_explore_document(system, frame);
  const auto original = controller::materialize_visual_document(*borrowed.document, frame.extent, frame.content, {8U, 4U});
  REQUIRE(original.objects.size() == 3);
  CHECK(original.objects[0].box == controller::contracts::AnnotationBox{{4.25F, 1.25F}, {7.75F, 3.75F}});

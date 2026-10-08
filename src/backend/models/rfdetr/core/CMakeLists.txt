@@ -59,6 +59,7 @@ mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
     artifact_publication.cpp
     class_artifact.cpp
+    class_tensor_axes.cpp
     class_layout.cpp
     inference_lanes.cpp
     python_checkpoint_bridge.cpp

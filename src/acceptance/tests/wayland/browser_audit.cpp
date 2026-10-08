@@ -2233,8 +2233,7 @@ auto BrowserAudit::failure_blocker() const noexcept -> std::string_view {
   std::pair{panic, std::string_view{"browser panic"}},
   std::pair{workspace_protocol_failure, std::string_view{"workspace protocol failure"}},
  };
- const auto blocker = std::ranges::find_if(checks, [](const auto& check) { return check.first; });
- return blocker == checks.end() ? std::string_view{} : blocker->second;
+ return first_blocker(checks);
 }
 bool BrowserAudit::benchmark_choices_complete() const {
  if (!benchmark_inactive || !benchmark_baseline || benchmark_choices.size() != 12U || benchmark_visibility.size() != 60U) return false;

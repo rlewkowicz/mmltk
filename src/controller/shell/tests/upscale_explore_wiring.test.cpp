@@ -108,6 +108,7 @@ TEST_CASE("shell forwards the first ready Explore event unchanged and warms Upsc
  auto upscale = shell_upscale(backend, probe);
  ExploreRouteHarness route(upscale);
  route.Route();
+ // CLEANUP-IGNORE: Success and isolated warm failure independently verify that the shell forwards its own original Explore event unchanged.
  REQUIRE(warmed.wait_for(2s) == std::future_status::ready);
  REQUIRE(route.forwarded().size() == 1U);
  CHECK(route.forwarded().front() == route.expected());
@@ -155,6 +156,7 @@ TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale fai
  ExploreRouteHarness route(upscale);
  route.Route();
  REQUIRE(failed.wait_for(2s) == std::future_status::ready);
+ // CLEANUP-IGNORE: Success and isolated warm failure independently verify that the shell forwards its own original Explore event unchanged.
  REQUIRE(settled.wait_for(2s) == std::future_status::ready);
  REQUIRE(route.forwarded().size() == 1U);
  CHECK(route.forwarded().front() == route.expected());

@@ -5,7 +5,7 @@ function(mmltk_tools_install_runtime target)
     # a host invocation never depends on a build-container library directory.
     set_target_properties(${target} PROPERTIES
         BUILD_RPATH "/opt/gcc-16.2/lib64"
-        INSTALL_RPATH "$ORIGIN/lib"
+        INSTALL_RPATH "$ORIGIN/lib;$ORIGIN/${MMLTK_TOOLS_HOST_LIBRARY_DIR}"
         INSTALL_RPATH_USE_LINK_PATH OFF)
     target_link_options(${target} PRIVATE -Wl,--disable-new-dtags)
     install(TARGETS ${target} RUNTIME_DEPENDENCY_SET ${target}_runtime

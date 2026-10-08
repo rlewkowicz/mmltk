@@ -1,5 +1,5 @@
-#include "upstream_oracle_fixture.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "upstream_oracle_fixture.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/ml/torch/archive.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"
@@ -170,6 +170,7 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
  const auto requested = support::UpstreamOracle::requested();
  if (!requested) SKIP("optional independent upstream artifacts absent; default skip is not parity evidence");
  const support::UpstreamOracle oracle(*requested);
+ // CLEANUP-IGNORE: CUDA availability, device scope, and precision scope are separate prerequisites; model, training, and optimizer oracles retain independent setup.
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  c10::cuda::CUDAGuard guard(0);
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;

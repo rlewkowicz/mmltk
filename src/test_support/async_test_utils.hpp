@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <condition_variable>
@@ -49,6 +50,7 @@ private:
 // Stop-aware, reusable admission gate; TestGate instead models one engagement.
 class StopGate final {
 public:
+ explicit StopGate(bool released = false) : released_(released) {}
  void Release() {
   {
    std::scoped_lock lock(mutex_);
@@ -124,5 +126,28 @@ public:
 
 private:
  std::shared_ptr<State> state_;
+};
+// Declare after the asynchronous work: failure and scope exit release the gate
+// before a joining future is destroyed, including a failed admission wait.
+class AwaitedTestGate final {
+ const TestGate& gate_;
+ std::atomic<bool>* cancellation_;
+ void Release() const noexcept {
+  if (cancellation_) cancellation_->store(true);
+  gate_.Release();
+ }
+
+public:
+ AwaitedTestGate(const TestGate& gate, std::chrono::milliseconds timeout, std::size_t count = 1, std::atomic<bool>* cancellation = nullptr) : gate_(gate), cancellation_(cancellation) {
+  try {
+   if (!gate_.WaitEntered(timeout, count)) throw std::runtime_error(gate_.name() + ": admission deadline expired");
+  } catch (...) {
+   Release();
+   throw;
+  }
+ }
+ ~AwaitedTestGate() { Release(); }
+ AwaitedTestGate(const AwaitedTestGate&) = delete;
+ AwaitedTestGate& operator=(const AwaitedTestGate&) = delete;
 };
 }  // namespace mmltk::testsupport

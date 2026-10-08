@@ -107,6 +107,8 @@ struct Decode final {
    }
   };
   while (av_read_frame(format, packet) >= 0) {
+   // CLEANUP-IGNORE: These independent FFmpeg decoder oracles enforce different demux and frame-receive error policies; the matched suffix omits those policies and their separate pixel/timestamp
+   // checks.
    if (packet->stream_index == track) {
     REQUIRE(avcodec_send_packet(codec, packet) >= 0);
     receive();
@@ -172,6 +174,7 @@ TEST_CASE("annotated video retains variable source timestamp progression", "[vid
  input_video(temporary.path() / "source.y4m");
  const auto generated = mmltk::testsupport::run_subprocess_capture_output(
   {"ffmpeg", "-v", "error", "-i", (temporary.path() / "source.y4m").string(), "-vf", "setpts=N*(N+1)/(8*TB)", "-fps_mode", "vfr", "-c:v", "ffv1", (temporary.path() / "source.mkv").string()});
+ // CLEANUP-IGNORE: Timestamp and audio-track acceptance independently require successful external fixture generation before different encoding oracles.
  REQUIRE(generated.exit_code == 0);
  encode(temporary.path(), true, true);
  const auto times = [](const std::filesystem::path& path) {
@@ -203,6 +206,7 @@ TEST_CASE("annotated Matroska copies multiple audio tracks and their disposition
   {"ffmpeg", "-v", "error", "-i", (temporary.path() / "source.y4m").string(), "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=4", "-f", "lavfi", "-i",
    "sine=frequency=880:sample_rate=8000:duration=4", "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "ffv1", "-c:a", "pcm_s16le", "-disposition:a:0", "default", "-disposition:a:1", "comment",
    (temporary.path() / "source.mkv").string()});
+ // CLEANUP-IGNORE: Timestamp and audio-track acceptance independently require successful external fixture generation before different encoding oracles.
  REQUIRE(generated.exit_code == 0);
  encode(temporary.path(), true, true);
  AVFormatContext* input = nullptr;

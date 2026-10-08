@@ -84,6 +84,7 @@ void test_reflected_cbor_round_trip_preserves_complete_nested_value() {
  const auto size = serialization::encode(source, encoded, limits);
  REQUIRE(size.has_value());
  const auto decoded = serialization::decode<TrainingSupervisionConfig>({std::span(encoded).first(*size), {}}, limits);
+ // CLEANUP-IGNORE: Separate reflected request schemas have independent round-trip assertions; their encoding and decoding are already shared.
  REQUIRE(decoded.has_value());
  CHECK(*decoded == source);
 }

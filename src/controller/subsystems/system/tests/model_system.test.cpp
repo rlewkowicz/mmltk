@@ -84,6 +84,7 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  settings.workflows.export_state.device_id = 9;
  settings.workflows.export_state.build_tensorrt = false;
  settings.workflows.export_state.weights_path = "/tmp/export.pt";
+ // CLEANUP-IGNORE: The model-admission test deliberately specifies its own settings facts independently of the generic persisted-settings fixture.
  settings.workflows.export_state.model_source = contracts::ModelSelectionSource::Custom;
  settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Weights;
  REQUIRE(contracts::gui_settings_valid(settings));
@@ -133,6 +134,7 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  CHECK(validation_request->onnx_path == "/tmp/validate.onnx");
  CHECK(validation_request->eval_order == "onnx");
  CHECK(validation_request->tensorrt_path.empty());
+ // CLEANUP-IGNORE: Initial and rebound model selections intentionally materialize against different settings snapshots before different admission assertions.
  const auto predict = selected_model(settings, contracts::FeatureId::Predict);
  const auto predict_request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, predict);
  REQUIRE(predict_request);
@@ -154,6 +156,7 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  stale = settings;
  stale.workflows.predict.request.class_layout_path = "/tmp/selected.classes.json";
  CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Predict(stale, inspection, predict));
+ // CLEANUP-IGNORE: Initial and rebound model selections intentionally materialize against different settings snapshots before different admission assertions.
  const auto rebound = selected_model(stale, contracts::FeatureId::Predict);
  const auto rebound_request = subsystems::system::ComputeIntentMaterializer::Predict(stale, inspection, rebound);
  REQUIRE(rebound_request);
@@ -181,6 +184,7 @@ TEST_CASE("ModelSystem records the CUDA ordinal used to inspect TensorRT", "[con
  draft.workflows.validate.model_input = contracts::ModelArtifactInputKind::TensorRt;
  draft.workflows.validate.request.tensorrt_path = "/tmp/model.engine";
  draft.workflows.validate.request.device_id = 3;
+ // CLEANUP-IGNORE: Independent wiring and model tests persist distinct settings through the shared store before different system construction.
  const services::SettingsLocation location{(root.path() / "settings.json").string()};
  REQUIRE(services::SettingsStore::save(location.value(), draft, 1U).succeeded());
  SettingsSystem settings;
@@ -345,6 +349,7 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
   settings.workflows.export_state.class_layout_path = "/tmp/export.classes.json";
   const auto projection = contracts::model_settings_projection(settings, workflow);
   REQUIRE(projection);
+  // CLEANUP-IGNORE: The intent projection and admitted model result independently assert the same externally required key fields.
   CHECK(projection->key.workflow == workflow);
   CHECK(projection->key.source == source);
   CHECK(projection->key.input == selected_input);
@@ -377,6 +382,7 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
   CHECK(projection->compatible == expected);
   if (!result) return;
   CHECK(result->key == projection->key);
+  // CLEANUP-IGNORE: The intent projection and admitted model result independently assert the same externally required key fields.
   CHECK(result->key.workflow == workflow);
   CHECK(result->key.source == source);
   CHECK(result->key.input == selected_input);

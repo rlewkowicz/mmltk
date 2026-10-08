@@ -168,8 +168,9 @@ void indexed_families() {
  const std::string path = "src/options.h";
  const std::string source =
   "option<Root, &Root::first>(\"--first\", \"One\", \"Input\");\noption<Root, &Root::second>(\"--second\", \"Two\", \"Input\");\noption<Root, &Root::third>(\"--third\", \"Three\", \"Input\");";
- auto files = Json::array({{{"path", path}, {"language", "cpp"}, {"source", source}}, {{"path", "src/more.h"}, {"language", "cpp"}, {"source", R"cpp(option<Other, &Other::fourth>(
-                                                                                                                                                      "--fourth", "Four", "Output");)cpp"}}});
+ auto files = Json::array(
+  {{{"path", path}, {"language", "cpp"}, {"source", source}},
+   {{"path", "src/more.h"}, {"language", "cpp"}, {"source", R"fixture(option<Other, &Other::fourth>("--fourth", "Four", "Output");)fixture"}}});
  auto occurrences = Json::array();
  for (int line : {1, 2}) occurrences.push_back({{"path", path}, {"start", line}, {"end", line}, {"column", 1}, {"endColumn", 10}});
  const Json match{{"tokenCount", 12}, {"lineCount", 1}, {"occurrences", occurrences}};

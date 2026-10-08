@@ -63,6 +63,7 @@ TEST_CASE("serialization slots retain simultaneous exact GPU extents and reuse c
  auto detached_reader = first.detach();
  first = at::Tensor{};
  second = at::Tensor{};
+ // CLEANUP-IGNORE: Release refusal, last-reader destruction and reopening are independently exercised on CPU freezing and GPU staging owners.
  empty = at::Tensor{};
  REQUIRE_THROWS(readback.Release());
  detached_reader = at::Tensor{};
@@ -94,6 +95,7 @@ TEST_CASE("freezing CPU readback owns values through readers and reuses released
  REQUIRE(at::equal(view, expected));
  REQUIRE(view.is_contiguous());
  REQUIRE_THROWS(readback.Release());
+ // CLEANUP-IGNORE: Release refusal, last-reader destruction and reopening are independently exercised on CPU freezing and GPU staging owners.
  view = at::Tensor{};
  REQUIRE_THROWS(readback.Release());
  detached = at::Tensor{};

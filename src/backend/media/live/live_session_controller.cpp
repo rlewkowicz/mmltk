@@ -98,10 +98,7 @@ void LiveMediaDataPlane::Impl::PhysicalResources::settle() noexcept {
  {
   std::lock_guard lock(owner.lifecycle_);
   if (owner.raw_readback_.phase == RawReadbackPhase::Pending) {
-   owner.raw_readback_.phase = RawReadbackPhase::Delivered;
-   const LiveFrameId frame = owner.raw_readback_.request->frame;
-   raw_delivery = RawReadbackDelivery{std::move(*owner.raw_readback_.request), {frame, nullptr, 0U, false}};
-   owner.raw_readback_.request.reset();
+   raw_delivery = owner.cancel_pending_raw_readback();
   } else {
    raw_active = owner.raw_readback_.phase == RawReadbackPhase::Active;
   }
@@ -148,10 +145,7 @@ bool LiveMediaDataPlane::Impl::PhysicalResources::drain() {
     owner.raw_readback_.phase = RawReadbackPhase::Active;
     raw_work = LiveRawFrameReadbackWork{owner.raw_readback_.request->frame, owner.raw_readback_.request->destination.size()};
    } else {
-    owner.raw_readback_.phase = RawReadbackPhase::Delivered;
-    const LiveFrameId frame = owner.raw_readback_.request->frame;
-    raw_delivery = RawReadbackDelivery{std::move(*owner.raw_readback_.request), {frame, nullptr, 0U, false}};
-    owner.raw_readback_.request.reset();
+    raw_delivery = owner.cancel_pending_raw_readback();
    }
   }
  }
@@ -342,6 +336,14 @@ void LiveMediaDataPlane::Impl::publish_revision() noexcept {
  }
  wake_condition_.notify_one();
  listener();
+}
+LiveMediaDataPlane::Impl::RawReadbackDelivery LiveMediaDataPlane::Impl::cancel_pending_raw_readback() noexcept {
+ // The lifecycle lock protects request custody and the phase transition.
+ raw_readback_.phase = RawReadbackPhase::Delivered;
+ const LiveFrameId frame = raw_readback_.request->frame;
+ RawReadbackDelivery delivery{std::move(*raw_readback_.request), {frame, nullptr, 0U, false}};
+ raw_readback_.request.reset();
+ return delivery;
 }
 std::optional<LiveMediaDataPlane::Impl::RawReadbackDelivery> LiveMediaDataPlane::Impl::finish_raw_readback(LiveRawFrameReadbackResult result) noexcept {
  std::lock_guard lock(lifecycle_);

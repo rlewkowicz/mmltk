@@ -503,6 +503,7 @@ void CompiledImageStream::close() {
 }
 void CompiledImageStream::prepare_host(const std::size_t index, const std::size_t bytes) {
  std::lock_guard lock(impl_->mutex);
+ // CLEANUP-IGNORE: The slot lookup and failure propagation precede independent host-pixel and label-read storage admission.
  auto& slot = *impl_->slots.at(index);
  if (impl_->failure) std::rethrow_exception(impl_->failure);
  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled image host storage is still borrowed");
@@ -510,6 +511,7 @@ void CompiledImageStream::prepare_host(const std::size_t index, const std::size_
 }
 void CompiledImageStream::prepare_reads(std::size_t index, std::size_t count, std::optional<std::size_t> max_label_bytes) {
  const std::lock_guard lock(impl_->mutex);
+ // CLEANUP-IGNORE: The slot lookup and failure propagation precede independent host-pixel and label-read storage admission.
  auto& slot = *impl_->slots.at(index);
  if (impl_->failure) std::rethrow_exception(impl_->failure);
  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled read storage is still borrowed");

@@ -797,6 +797,13 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   request.recovery = recovery ? &*recovery : nullptr;
   std::atomic<std::uint64_t> used_original_generation{0};
   std::atomic<bool> original_changed{false};
+  const auto reset_recovery_inputs = [&] {
+   request.recovery = recovery ? &*recovery : nullptr;
+   reusable_images.clear();
+   request.reusable_images = {};
+   used_original_generation.store(0);
+   original_changed.store(false);
+  };
   request.originals = !original_provider ? CoconutOriginalProvider{} : CoconutOriginalProvider{[&](CoconutImageNamespace source, bool wait, std::stop_token stop) {
    auto input = original_provider(source, wait, stop);
    if (input.terminal) {
@@ -889,22 +896,14 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
         cached_components.push_back(std::move(component));
        }
       request.retained_sources = retained_sources;
-      request.recovery = recovery ? &*recovery : nullptr;
-      reusable_images.clear();
-      request.reusable_images = {};
-      used_original_generation.store(0);
-      original_changed.store(false);
+      reset_recovery_inputs();
       continue;
      }
     }
     break;
    } catch (const CoconutOriginalChanged&) {
     (void)refresh_original(true);
-    request.recovery = recovery ? &*recovery : nullptr;
-    reusable_images.clear();
-    request.reusable_images = {};
-    used_original_generation.store(0);
-    original_changed.store(false);
+    reset_recovery_inputs();
     --attempt;
     continue;
    } catch (const std::bad_alloc&) { throw; } catch (const CoconutPhysicalMembershipError&) {

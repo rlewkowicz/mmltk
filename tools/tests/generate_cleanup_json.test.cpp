@@ -390,6 +390,18 @@ void aliases_and_transfers() {
  for (const std::string body : {
        "const int threads = launch::kThreads; const int blocks = blocks_for(count, threads);",
        "PixelThread pixel; if (!locate_pixel(width, height, pixel)) return;",
+       "PixelThread pixel{}; if (!locate_pixel(width, height, pixel)) return;",
+       "std::atomic<bool> stopped{false}; auto observation = observe(stopped);",
+       "int x, y; if (!locate_pixel(width, height, x, y)) return;",
+       "unsigned long first, *second; inspect(first, second);",
+       "using Value = Item; inspect(value);",
+       "; inspect(value);",
+       "auto result = inspect(); if (!result) return std::unexpected(result.error());",
+       "auto result = inspect(); if (!result) { return std::unexpected(result.error()); }",
+       "auto result = inspect(); if (!result) throw result.error();",
+       "if (auto checked = validate(count); !checked) return std::unexpected(checked.error());",
+       "const auto slot = slots[index]; const auto& value = *values[slot]; inspect(value);",
+       "const auto* value = &items[index].member; inspect(value);",
        "store(pixel, color); return;",
        "continue; } store(pixel, color);",
       }) {
@@ -407,6 +419,12 @@ void aliases_and_transfers() {
  CHECK(classifySources({
                         {"a.cpp", "void A() { prepare(); store(pixel, color); return; }"},
                         {"b.cpp", "void B() { prepare(); store(pixel, color); return; }"},
+                       })
+        .at("duplications")
+        .size() == 1);
+ CHECK(classifySources({
+                        {"a.cpp", "void A() { if (auto checked = validate(count); !checked) return std::unexpected(checked.error()); auto ranges = payload(count); }"},
+                        {"b.cpp", "void B() { if (auto checked = validate(count); !checked) return std::unexpected(checked.error()); auto ranges = payload(count); }"},
                        })
         .at("duplications")
         .size() == 1);
@@ -691,21 +709,16 @@ void overlapping_spans() {
  CHECK(result.at("filtered").at(0).at("reason").get<std::string>().find("already represented") != std::string::npos);
 }
 void overload_family() {
- const std::string source = R"cpp(void read(const char* key, A& value) {
-                                   int index = static_cast<int>(value);
-                                   decode(key, index);
-                                   first(index, value);
-                                  }
-                                  void read(const char* key, B& value) {
-                                   int index = static_cast<int>(value);
-                                   decode(key, index);
-                                   second(index, value);
-                                  }
-                                  void read(const char* key, C& value) {
-                                   int index = static_cast<int>(value);
-                                   decode(key, index);
-                                   third(index, value);
-                                  })cpp";
+ // The raw spelling preserves the fixture line coordinates through formatting.
+ const std::string source = R"fixture(void read(const char* key, A& value) {
+  int index = static_cast<int>(value); decode(key, index); first(index, value);
+}
+void read(const char* key, B& value) {
+  int index = static_cast<int>(value); decode(key, index); second(index, value);
+}
+void read(const char* key, C& value) {
+  int index = static_cast<int>(value); decode(key, index); third(index, value);
+})fixture";
  const auto result = filterCpdCandidates(R"json([
     {"lineCount":3,"tokenCount":39,"occurrences":[
       {"path":"a.cpp","start":1,"end":3},{"path":"a.cpp","start":4,"end":6}
@@ -752,6 +765,28 @@ void strings_and_callbacks() {
  CHECK(!includes(result.at("duplications").at(0).at("patterns"), "unclassified syntax requires manual review"));
 }
 void lambda_capture() {
+ const std::string body = R"fixture(void outer() {
+ const auto read = [&](this const auto& self, int kind) -> bool {
+  if (kind == 0) {
+   const auto close = pairs.find(first);
+   if (close == pairs.end() || close->second >= last || !self(first + 1, close->second)) return false;
+   first = close->second + 1;
+  } else {
+   const auto close = pairs.find(first);
+   if (close == pairs.end() || close->second >= last || !self(first + 1, close->second)) return false;
+   first = close->second + 1;
+  }
+  return true;
+ };
+})fixture";
+ const Json candidate{
+  {"tokenCount", 55}, {"occurrences", Json::array({
+                                       {{"path", "lambda.cpp"}, {"start", 4}, {"end", 6}},
+                                       {{"path", "lambda.cpp"}, {"start", 8}, {"end", 10}},
+                                      })}
+ };
+ const auto nested = filterCpdCandidates(Json::array({candidate}), {.sourceReader = [&](const std::string&) { return body; }});
+ CHECK(nested.at("duplications").size() == 1);
  CHECK(classifySources({
                         {"a.cpp", "void A(Runtime& runtime) { owner.Defer(runtime, [value = std::move(candidate)]() mutable { runtime.Commit(std::move(value)); first(); }); }"},
                         {"b.cpp", "void B(Runtime& runtime) { owner.Defer(runtime, [value = std::move(candidate)]() mutable { runtime.Commit(std::move(value)); second(); }); }"},

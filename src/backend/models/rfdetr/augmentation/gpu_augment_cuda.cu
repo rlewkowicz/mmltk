@@ -26,6 +26,21 @@ enum CopyPasteParameterIndex : std::uint8_t {
  kPasteInverse12 = 7,
 };
 __host__ __device__ constexpr std::int64_t ceil_div(const std::int64_t value, const std::int64_t divisor) { return (value + divisor - 1) / divisor; }
+struct PackedThreadCoordinate {
+ int x = 0, y = 0;
+ std::int64_t plane = 0;
+};
+__device__ __forceinline__ bool packed_thread_coordinate(const std::int64_t planes, const int height, const int width, PackedThreadCoordinate& coordinate) {
+ const int groups_per_row = static_cast<int>(ceil_div(width, 4));
+ const std::int64_t group_index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+ const std::int64_t total_groups = planes * static_cast<std::int64_t>(height) * groups_per_row;
+ if (group_index >= total_groups) return false;
+ const std::int64_t row_index = group_index / groups_per_row;
+ coordinate.x = static_cast<int>(group_index % groups_per_row) * 4;
+ coordinate.y = static_cast<int>(row_index % height);
+ coordinate.plane = row_index / height;
+ return true;
+}
 __device__ __forceinline__ float channel_mean(const int channel) { return channel == 0 ? 0.485F : (channel == 1 ? 0.456F : 0.406F); }
 __device__ __forceinline__ float channel_std(const int channel) { return channel == 0 ? 0.229F : (channel == 1 ? 0.224F : 0.225F); }
 template <typename Output>
@@ -58,17 +73,11 @@ __device__ __forceinline__ __nv_bfloat16 zero_output<__nv_bfloat16>() {
 }
 template <typename Output>
 __global__ void normalize_images_kernel(const float* input, Output* output, const std::int64_t active_batch_size, const std::int64_t output_batch_size, const int height, const int width) {
- const int groups_per_row = static_cast<int>(ceil_div(width, 4));
- const std::int64_t group_index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
- const std::int64_t total_groups = output_batch_size * 3 * static_cast<std::int64_t>(height) * groups_per_row;
- if (group_index >= total_groups) { return; }
- const int group_x = static_cast<int>(group_index % groups_per_row);
- const std::int64_t row_index = group_index / groups_per_row;
- const int row = static_cast<int>(row_index % height);
- const std::int64_t plane_index = row_index / height;
- const int channel = static_cast<int>(plane_index % 3);
- const std::int64_t image = plane_index / 3;
- const int x = group_x * 4;
+ PackedThreadCoordinate coordinate;
+ if (!packed_thread_coordinate(output_batch_size * 3, height, width, coordinate)) return;
+ const int channel = static_cast<int>(coordinate.plane % 3);
+ const std::int64_t image = coordinate.plane / 3;
+ const int x = coordinate.x, row = coordinate.y;
  const std::int64_t offset = ((image * 3 + channel) * height + row) * static_cast<std::int64_t>(width) + x;
  const bool active = image < active_batch_size;
  float4 values{};
@@ -145,17 +154,12 @@ __device__ __forceinline__ float4 reverse_float4(const float4 value) { return ma
 template <bool ExplicitKeys>
 __global__ void pointwise_images_kernel(const float* input, float* output, const float* parameters, const std::uint64_t* image_keys, const std::int64_t batch_size, const int height, const int width,
  const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence, const GpuAugmentationOutputDomain output_domain, const float* const* input_slots) {
- const int groups_per_row = static_cast<int>(ceil_div(width, 4));
- const std::int64_t group_index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
- const std::int64_t total_groups = batch_size * static_cast<std::int64_t>(height) * groups_per_row;
- if (group_index >= total_groups) { return; }
- const int group_x = static_cast<int>(group_index % groups_per_row);
- const std::int64_t row_index = group_index / groups_per_row;
- const int output_y = static_cast<int>(row_index % height);
- const std::int64_t image = row_index / height;
+ PackedThreadCoordinate coordinate;
+ if (!packed_thread_coordinate(batch_size, height, width, coordinate)) return;
+ const auto image = coordinate.plane;
  const auto source_image = input_slots ? 0 : image;
  if (input_slots) input = input_slots[image];
- const int output_x = group_x * 4;
+ const int output_x = coordinate.x, output_y = coordinate.y;
  const float* values = parameters + image * kGpuAugmentationParameterCount;
  const bool flip_x = values[kFlipX] != 0.0F;
  const bool flip_y = values[kFlipY] != 0.0F;
@@ -314,6 +318,7 @@ __global__ void update_donor_images_kernel(const float* source_images, float* do
 }
 __global__ void rgba8_to_planar_float_kernel(const std::uint8_t* input, float* output, const std::int64_t image_pixels, const std::int64_t pixels) {
  const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+ // CLEANUP-IGNORE: Mask-byte addressing and RGBA batch addressing use different storage units and bounds; this quotient/remainder prefix has no shared storage policy.
  if (index >= pixels) { return; }
  const std::int64_t image = index / image_pixels;
  const std::int64_t pixel = index - image * image_pixels;

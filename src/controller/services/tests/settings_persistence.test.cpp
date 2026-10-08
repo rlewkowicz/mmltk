@@ -65,9 +65,10 @@ TEST_CASE("prediction source saving choices persist independently", "[controller
  edit.updates.push_back({.path = "workflows.predict.saving.compiled_percent", .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{37}}});
  edit.updates.push_back({.path = "workflows.predict.saving.compiled_total", .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{3}}});
  edit.updates.push_back({.path = "workflows.predict.saving.video_samples", .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{17}}});
+ // CLEANUP-IGNORE: The existing loading fixture owns deserialization; each distinct settings mutation must be persisted before creating its independent restoration owner.
  static_cast<void>(settings.Update(std::move(edit)));
- SettingsSystem restored;
- REQUIRE(restored.Load(services::SettingsLocation{(root / "settings.json").string()}).applied());
+ LoadedSettingsFixture restored_fixture{services::SettingsLocation{(root / "settings.json").string()}};
+ auto& restored = restored_fixture.settings;
  const auto saved = restored.snapshot().settings_state.workflows.predict.saving;
  CHECK_FALSE(saved.single_enabled);
  CHECK(saved.compiled_enabled);
@@ -83,9 +84,10 @@ TEST_CASE("Shared native inference compilation policies survive settings reconst
  contracts::SettingsUpdateRequest edit;
  edit.updates.push_back({.path = "workflows.predict.request.compilation_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{0}}});
  edit.updates.push_back({.path = "workflows.validate.request.compilation_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{0}}});
+ // CLEANUP-IGNORE: The existing loading fixture owns deserialization; each distinct settings mutation must be persisted before creating its independent restoration owner.
  static_cast<void>(settings.Update(std::move(edit)));
- SettingsSystem restored;
- REQUIRE(restored.Load(services::SettingsLocation{(root / "settings.json").string()}).applied());
+ LoadedSettingsFixture restored_fixture{services::SettingsLocation{(root / "settings.json").string()}};
+ auto& restored = restored_fixture.settings;
  const auto state = restored.snapshot().settings_state;
  CHECK(state.workflows.predict.request.compilation_mode == mmltk::backend::models::rfdetr::CompilationMode::kNone);
  CHECK(state.workflows.validate.request.compilation_mode == mmltk::backend::models::rfdetr::CompilationMode::kNone);
@@ -97,9 +99,10 @@ TEST_CASE("accepted display confidence survives Settings reconstruction", "[cont
  CHECK(settings.validation_display_settings().confidence_threshold == 0.4F);
  contracts::SettingsUpdateRequest edit;
  edit.updates.push_back({.path = "workflows.validate.display.confidence_threshold", .value = mmltk::frameworks::serialization::wire::FlatValue{0.437}});
+ // CLEANUP-IGNORE: The existing loading fixture owns deserialization; each distinct settings mutation must be persisted before creating its independent restoration owner.
  static_cast<void>(settings.Update(std::move(edit)));
- SettingsSystem restored;
- REQUIRE(restored.Load(services::SettingsLocation{(root / "settings.json").string()}).applied());
+ LoadedSettingsFixture restored_fixture{services::SettingsLocation{(root / "settings.json").string()}};
+ auto& restored = restored_fixture.settings;
  CHECK(restored.validation_display_settings().confidence_threshold == 0.437F);
 }
 TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, and reconstruction", "[controller][systems][services]") {
@@ -299,6 +302,7 @@ TEST_CASE("Explore catalog identity changes only through successful catalog pers
  CHECK_THROWS_AS(settings.Update(std::move(request)), contracts::InvalidIntentError);
  CHECK(settings.snapshot() == before);
  constexpr ExploreClassCatalogIdentity identity = 0x9123'4567'89ab'cdefULL;
+ // CLEANUP-IGNORE: Different persisted catalog identities are committed against their own settings candidates before distinct recovery assertions.
  const auto candidate = settings.explore_settings_candidate();
  static_cast<void>(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = identity}));
  CHECK(settings.snapshot().settings_state.workflows.explore.class_catalog_identity == identity);
@@ -314,6 +318,7 @@ TEST_CASE("successful Explore catalog persistence includes a pending Settings re
  queue_failed_dark_mode_update(settings, root);
  REQUIRE(std::filesystem::remove(root / "settings.json"));
  constexpr ExploreClassCatalogIdentity identity = 0x1234'5678U;
+ // CLEANUP-IGNORE: Different persisted catalog identities are committed against their own settings candidates before distinct recovery assertions.
  const auto candidate = settings.explore_settings_candidate();
  static_cast<void>(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = identity}));
  const auto committed = settings.snapshot();

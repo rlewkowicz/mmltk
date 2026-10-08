@@ -41,12 +41,14 @@ template <class Slot>
  }
  const int candidate = latest == nullptr ? -1 : latest->load(std::memory_order_acquire);
  if (candidate >= 0 && candidate < static_cast<int>(count) && claim_live_slot(slots[candidate].state, SlotState::Published)) {
+  // CLEANUP-IGNORE: Separate preferred-slot and fallback searches publish through the canonical slot-state helper and return the acquired reservation.
   publish_live_slot_state(slots[candidate].state, SlotState::Uploading);
   return {.slot = &slots[candidate], .replaced = true};
  }
  for (std::uint32_t index = 0U; index < count; ++index) {
   if (static_cast<int>(index) == candidate) continue;
   if (claim_live_slot(slots[index].state, SlotState::Published)) {
+   // CLEANUP-IGNORE: Separate preferred-slot and fallback searches publish through the canonical slot-state helper and return the acquired reservation.
    publish_live_slot_state(slots[index].state, SlotState::Uploading);
    return {.slot = &slots[index], .replaced = true};
   }

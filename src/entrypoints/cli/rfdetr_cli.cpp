@@ -1,3 +1,4 @@
+#include "src/frameworks/process/subprocess_utils.h"
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/scoped_fd.h"
 #include <sys/eventfd.h>
@@ -295,11 +296,8 @@ public:
     const pid_t pid = ::fork();
     if (pid < 0) throw std::system_error(errno, std::generic_category(), "failed to fork RF-DETR worker");
     if (pid == 0) {
-     std::vector<char*> argv;
-     argv.reserve(arguments.size() + 1U);
-     for (auto& argument : arguments) argv.push_back(argument.data());
-     argv.push_back(nullptr);
-     ::execv(argv.front(), argv.data());
+     const mmltk::frameworks::process::ArgvBuffer argv(std::move(arguments));
+     ::execv(argv.program(), argv.data());
      std::_Exit(127);
     }
     children.push_back(pid);

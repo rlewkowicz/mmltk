@@ -44,6 +44,12 @@ volatile std::sig_atomic_t pending_signal = 0;
 void defer_signal(int signal) {
  if (pending_signal == 0) pending_signal = signal;
 }
+void install_handler(int signal, void (*handler)(int), const char* failure) {
+ struct sigaction action{};
+ action.sa_handler = handler;
+ ::sigemptyset(&action.sa_mask);
+ if (::sigaction(signal, &action, nullptr) != 0) throw std::system_error(errno, std::generic_category(), failure);
+}
 // Like a shell waiting for a foreground command, remain in the inherited
 // process group and defer termination until the foreground child settles.
 // Spawn resets caught dispositions in the child; inherited ignores survive.
@@ -54,10 +60,7 @@ public:
    struct sigaction previous{};
    if (::sigaction(signal, nullptr, &previous) != 0) throw std::system_error(errno, std::generic_category(), "sigaction");
    if (previous.sa_handler == SIG_IGN) continue;
-   struct sigaction action{};
-   action.sa_handler = defer_signal;
-   ::sigemptyset(&action.sa_mask);
-   if (::sigaction(signal, &action, nullptr) != 0) throw std::system_error(errno, std::generic_category(), "sigaction");
+   install_handler(signal, defer_signal, "sigaction");
   }
  }
 };
@@ -119,10 +122,7 @@ int run(int argc, char** argv) {
  } catch (const std::exception& error) { std::cerr << "run_traced_command: " << error.what() << '\n'; }
  trace_event(phase, "finish", status == 0 ? "success" : "failure:" + std::to_string(status));
  if (signal != 0) {
-  struct sigaction action{};
-  action.sa_handler = SIG_DFL;
-  ::sigemptyset(&action.sa_mask);
-  if (::sigaction(signal, &action, nullptr) != 0) throw std::system_error(errno, std::generic_category(), "restore terminating signal");
+  install_handler(signal, SIG_DFL, "restore terminating signal");
   ::raise(signal);
  }
  return status;

@@ -80,6 +80,7 @@ TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits",
  auto& gate = fixture.gate();
  for (const auto command : std::array<std::uint8_t, 3U>{1U, 2U, 4U}) REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
  gate.AdvanceGeneration(7U);
+ // CLEANUP-IGNORE: Each acceptance-gate scenario independently waits on its own asynchronous initial release before distinct queued-command behavior.
  auto initial = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(7U); });
  CHECK(fixture.Await(initial) == ExploreAcceptanceGate::WaitResult::Proceed);
  REQUIRE(gate.ClaimHeldCompletion());
@@ -174,6 +175,7 @@ TEST_CASE("acceptance redraw is one shot and preserves the held read boundary", 
  if (path == 5U) send(2U);
  if (path == 6U) {
   send(1U);
+  // CLEANUP-IGNORE: Each acceptance-gate scenario independently waits on its own asynchronous initial release before distinct queued-command behavior.
   auto initial = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(7U); });
   CHECK(fixture.Await(initial) == ExploreAcceptanceGate::WaitResult::Proceed);
  }

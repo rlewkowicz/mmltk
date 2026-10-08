@@ -447,7 +447,7 @@ struct Selection {
  json cppcheck_commands = json::array();
  Arguments reflection_units;
  std::set<std::string> reflection_targets;
- std::map<std::string, std::string> reflection_objects;
+ std::map<std::string, std::set<std::string>> reflection_objects;
  std::set<std::string> cuda_removed_args;
 };
 Selection select_units(const Options& options, const Commands& commands, const fs::path& database, const Termination& termination) {
@@ -487,7 +487,7 @@ Selection select_units(const Options& options, const Commands& commands, const f
      target = rel;
     }
     selection.reflection_targets.insert(target.generic_string());
-    selection.reflection_objects.emplace(relative, target.generic_string());
+    selection.reflection_objects[relative].insert(target.generic_string());
    }
    return;
   }
@@ -597,7 +597,10 @@ int analyze(Options& options, Output& output, const Termination& termination) {
   if (found == selection.reflection_units.end()) throw ToolError("start file '" + start + "' is not a registered tools translation unit");
   selection.reflection_units.erase(selection.reflection_units.begin(), found);
   selection.reflection_targets.clear();
-  for (const auto& file : selection.reflection_units) selection.reflection_targets.insert(selection.reflection_objects.at(file));
+  for (const auto& file : selection.reflection_units) {
+   const auto& objects = selection.reflection_objects.at(file);
+   selection.reflection_targets.insert(objects.begin(), objects.end());
+  }
  }
  const auto project_path = scratch.path() / "cppcheck-project.json";
  write_json(project_path, selection.cppcheck_commands, -1);

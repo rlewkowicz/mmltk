@@ -40,6 +40,11 @@ import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 export {
  namespace mmltk::tools {
+ inline struct stat file_metadata(const std::filesystem::path& path) {
+  struct stat metadata{};
+  if (::stat(path.c_str(), &metadata) != 0) throw std::system_error(errno, std::generic_category(), "stat " + path.string());
+  return metadata;
+ }
  class CpuAffinity {
  public:
   explicit CpuAffinity(std::size_t initial = CPU_SETSIZE, std::string_view overflow = {}) {

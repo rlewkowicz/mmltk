@@ -21,12 +21,18 @@ namespace gpu = mmltk::frameworks::gpu;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 using namespace mmltk::controller;
 using namespace mmltk::controller::test_support;
+auto begin_video_samples(detail::PredictionOutput& output) {
+ auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"frame"});
+ output.Begin({.class_catalog = catalog, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground});
+ return catalog;
+}
 void capture_decoded_sample(detail::PredictionOutput& output, int index, const std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>& catalog) {
  std::vector<std::uint8_t> pixels(16U * 16U * 3U, 80U);
  auto source = PredictionSource::Decoded({16, 16}, pixels, catalog);
  REQUIRE(output.Capture({.dataset_index = index}, {.width = 16, .height = 16, .device = 0, .rgb8 = source.rgb8(), .custody = source.custody()}, source.annotations()));
 }
 TEST_CASE("prediction samples capture native pixels independently of browser and inference population", "[controller][prediction][output][gpu]") {
+ // CLEANUP-IGNORE: The hardware admission guard and device selection precede independent prediction-output scenarios.
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::testsupport::ScopedTempDir directory("prediction-samples");
@@ -81,6 +87,7 @@ TEST_CASE("prediction samples capture native pixels independently of browser and
  CHECK(pngs == facts.completed_samples);
 }
 TEST_CASE("video reservoir shortfall retains completed disk samples", "[controller][prediction][output][gpu]") {
+ // CLEANUP-IGNORE: The hardware admission guard and device selection precede independent prediction-output scenarios.
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::testsupport::ScopedTempDir directory("prediction-shortfall");
@@ -90,8 +97,7 @@ TEST_CASE("video reservoir shortfall retains completed disk samples", "[controll
  contracts::WorkflowOutputFacts facts;
  options.progress = [&](const auto& value) { facts = value; };
  detail::PredictionOutput output({execution}, rfdetr::PredictSourceKind::VideoFile, options, {});
- auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"frame"});
- output.Begin({.class_catalog = catalog, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground});
+ auto catalog = begin_video_samples(output);
  for (int index = 0; index < 3; ++index) {
   REQUIRE(output.Wants(index));
   capture_decoded_sample(output, index, catalog);
@@ -101,6 +107,7 @@ TEST_CASE("video reservoir shortfall retains completed disk samples", "[controll
  for (int index = 0; index < 3; ++index) CHECK(std::filesystem::exists(directory.path() / "samples" / ("frame-" + std::to_string(index) + ".png")));
 }
 TEST_CASE("failed reservoir replacement preserves the published incumbent", "[controller][prediction][output][gpu]") {
+ // CLEANUP-IGNORE: The hardware admission guard and device selection precede independent prediction-output scenarios.
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::testsupport::ScopedTempDir directory("prediction-replacement-failure");
@@ -112,8 +119,7 @@ TEST_CASE("failed reservoir replacement preserves the published incumbent", "[co
  unsigned writes = 0;
  detail::PredictionOutput output({execution}, rfdetr::PredictSourceKind::VideoFile, options, {},
   [&](const char* path, int width, int height, int channels, const void* pixels, int stride) { return ++writes == 1U ? stbi_write_png(path, width, height, channels, pixels, stride) : 0; }, 0U);
- auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"frame"});
- output.Begin({.class_catalog = catalog, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground});
+ auto catalog = begin_video_samples(output);
  REQUIRE(output.Wants(0));
  capture_decoded_sample(output, 0, catalog);
  int replacement = 1;
@@ -126,6 +132,7 @@ TEST_CASE("failed reservoir replacement preserves the published incumbent", "[co
  CHECK_FALSE(std::filesystem::exists(directory.path() / "samples" / ("frame-" + std::to_string(replacement) + ".png")));
 }
 TEST_CASE("compiled samples select actual processing order under an unchanged limit", "[controller][prediction][output][gpu]") {
+ // CLEANUP-IGNORE: The hardware admission guard and device selection precede independent prediction-output scenarios.
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::testsupport::ScopedTempDir directory("prediction-limited");
@@ -303,8 +310,7 @@ TEST_CASE("video samples use actual decoded population despite AVI count metadat
   contracts::WorkflowOutputFacts facts;
   options.progress = [&](const auto& value) { facts = value; };
   detail::PredictionOutput output({execution}, rfdetr::PredictSourceKind::VideoFile, options, context, {}, 91U);
-  auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"frame"});
-  output.Begin({.class_catalog = catalog, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground});
+  auto catalog = begin_video_samples(output);
   std::size_t processed = 0;
   while (auto frame = source->Next()) {
    if (output.Wants(frame->index))

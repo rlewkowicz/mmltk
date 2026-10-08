@@ -29,6 +29,12 @@ export {
              -DMMLTK_BUILD_JOBS="${MMLTK_JOBS}" \
              -DMMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT}"
 )MMLTK";
+ inline const std::string format_iced = tool(Command::run_traced_command) + R"MMLTK( cargo_fmt_iced_aw \
+             cargo fmt --manifest-path /workspace/third_party/iced_aw/Cargo.toml
+         )MMLTK" + tool(Command::run_traced_command) +
+                                        R"MMLTK( cargo_fmt_frontend_iced \
+             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml --package mmltk-browser-app
+)MMLTK";
  inline const std::string release_ninja = R"MMLTK(set -euo pipefail
          capture_compiler_cache_stats() {
              if [[ -n "${MMLTK_CCACHE_STATS_FILE:-}" ]]; then
@@ -50,14 +56,8 @@ export {
          if [[ -x "${sccache_bin}" && -n "${MMLTK_FIREFOX_SCCACHE_STATS_FILE:-}" ]]; then
              "${sccache_bin}" --zero-stats || true
          fi
-         )MMLTK" + tool(Command::run_traced_command) +
-                                          R"MMLTK( cargo_fmt_iced_aw \
-             cargo fmt --manifest-path /workspace/third_party/iced_aw/Cargo.toml
-         )MMLTK" + tool(Command::run_traced_command) +
-                                          R"MMLTK( cargo_fmt_frontend_iced \
-             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml --package mmltk-browser-app
-)MMLTK" + configure_release + R"MMLTK(         )MMLTK" +
-                                          tool(Command::run_traced_command) + R"MMLTK( ninja_build \
+         )MMLTK" + format_iced + configure_release +
+                                          R"MMLTK(         )MMLTK" + tool(Command::run_traced_command) + R"MMLTK( ninja_build \
              cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
              --parallel "${MMLTK_JOBS}"
          )MMLTK" + tool(Command::check_toolchain_invariants) +
@@ -122,13 +122,7 @@ export {
          )MMLTK" + tool(Command::configure_cmake_graph) +
                                       R"MMLTK( \
              gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"
-         )MMLTK" + tool(Command::run_traced_command) +
-                                      R"MMLTK( cargo_fmt_iced_aw \
-             cargo fmt --manifest-path /workspace/third_party/iced_aw/Cargo.toml
-         )MMLTK" + tool(Command::run_traced_command) +
-                                      R"MMLTK( cargo_fmt_frontend_iced \
-             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml --package mmltk-browser-app
-         cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
+         )MMLTK" + format_iced + R"MMLTK(         cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
              --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_check
          cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
              --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_bundle

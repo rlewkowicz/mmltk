@@ -124,12 +124,14 @@ public:
  UpscaleStreamBridge(const UpscaleStreamBridge&) = delete;
  UpscaleStreamBridge& operator=(const UpscaleStreamBridge&) = delete;
  void AwaitSource(const std::uintptr_t source_stream, const std::uintptr_t model_stream) const {
+  // CLEANUP-IGNORE: This stream/context admission precedes opposite source-readiness and model-completion fences with distinct events and errors.
   if (source_stream == model_stream) return;
   ensure_cuda_driver_ok(cuCtxSetCurrent(context_), "bind Upscale bridge context");
   ensure_cuda_driver_ok(cuEventRecord(source_ready_, reinterpret_cast<CUstream>(source_stream)), "record Upscale source readiness");
   ensure_cuda_driver_ok(cuStreamWaitEvent(reinterpret_cast<CUstream>(model_stream), source_ready_, 0U), "wait for Upscale source readiness");
  }
  void JoinModel(const std::uintptr_t source_stream, const std::uintptr_t model_stream) const {
+  // CLEANUP-IGNORE: This stream/context admission precedes opposite source-readiness and model-completion fences with distinct events and errors.
   if (source_stream == model_stream) return;
   ensure_cuda_driver_ok(cuCtxSetCurrent(context_), "bind Upscale bridge context");
   ensure_cuda_driver_ok(cuEventRecord(model_done_, reinterpret_cast<CUstream>(model_stream)), "record Upscale model completion");

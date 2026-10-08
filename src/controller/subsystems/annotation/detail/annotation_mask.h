@@ -21,6 +21,7 @@ class MaskRows final {
  struct Index final {
   std::vector<std::shared_ptr<Block>> blocks;
   std::size_t run_count = 0U;
+  std::shared_ptr<Block>& EnsureBlock(std::size_t);
  };
 
 public:

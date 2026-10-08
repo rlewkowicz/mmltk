@@ -51,6 +51,7 @@ import mmltk.tools.cpp_linux;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 import mmltk.tools.headless_compositor;
+import mmltk.tools.tests.cpp_test_support;
 namespace {
 namespace native = mmltk::tools;
 namespace runner = native::headless;
@@ -432,10 +433,7 @@ constexpr std::array cases{
 export int mmltk_tool_test_headless_compositor(int argc, char** argv) {
  try {
   if (argc >= 2 && std::string_view(argv[1]) == "--fixture") return run_fixture({argv + 2, argv + argc});
-  if (argc == 2 && std::string_view(argv[1]) == "--list-tests") {
-   for (const auto& test : cases) std::cout << test.name << '\n';
-   return 0;
-  }
+  if (argc == 2 && std::string_view(argv[1]) == "--list-tests") return native::testing::list_cases(cases);
   require(argc <= 2, "usage: test_headless_compositor [--list-tests | test_name]");
   std::size_t selected = 0;
   std::size_t failed = 0;

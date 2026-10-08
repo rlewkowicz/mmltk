@@ -16,6 +16,7 @@ torch::Tensor corner_span_area(const torch::Tensor& lower, const torch::Tensor& 
  return extent.select(-1, 0) * extent.select(-1, 1);
 }
 torch::Tensor box_area(const torch::Tensor& boxes) {
+ // CLEANUP-IGNORE: This upstream numerical oracle independently verifies promotion and area arithmetic; sharing the production operation would make the parity check circular.
  const auto promoted = boxes.scalar_type() == torch::kFloat16 || boxes.scalar_type() == torch::kBFloat16 ? boxes.to(torch::kFloat32) : boxes;
  return (promoted.select(-1, 2) - promoted.select(-1, 0)) * (promoted.select(-1, 3) - promoted.select(-1, 1));
 }

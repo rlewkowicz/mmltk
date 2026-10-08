@@ -242,6 +242,10 @@ struct AdmittedSource final {
   workspace_retirement.SetWake({});
   return failure;
  }
+ void FinishReleaseSpan() {
+  if (release_span) release_span->FinishWith([](auto& fact) { fact.context.outcome = 1U; });
+  release_span.reset();
+ }
  [[nodiscard]] native::WorkspaceSurfaceImportId id() const noexcept { return {description.id_high, description.id_low}; }
  [[nodiscard]] native::WorkspaceSurfaceImportId arena() const noexcept { return {description.arena_high, description.arena_low}; }
  const abi::Record description;
@@ -477,8 +481,7 @@ private:
    source->workspace->CancelDisplayWrite();
    source->transfer.reset();
    source->exposed = source->acquired = source->release_submitted = source->release_complete = false;
-   if (source->release_span) source->release_span->FinishWith([](auto& fact) { fact.context.outcome = 1U; });
-   source->release_span.reset();
+   source->FinishReleaseSpan();
   }
   if (ready_span_) ready_span_->FinishWith([](auto& fact) { fact.context.outcome = 1U; });
   ready_span_.reset();
@@ -513,8 +516,7 @@ private:
    const auto& frame = transfer.pending.submitted.observation.frame;
    if (!channel_.read_settled(source->id(), {presentation_source_session(frame.source.kind), frame.revision}, transfer.publication.presentation_revision, transfer.publication.transfer_sequence))
     continue;
-   if (source->release_span) source->release_span->FinishWith([](auto& fact) { fact.context.outcome = 1U; });
-   source->release_span.reset();
+   source->FinishReleaseSpan();
    source->transfer.reset();
    source->exposed = source->acquired = source->release_submitted = source->release_complete = false;
   }

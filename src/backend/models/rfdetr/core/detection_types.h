@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <meta>
+#include <type_traits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -137,6 +139,12 @@ struct OutputLayer {
  std::optional<SupervisedQueryLayout> query_layout;
  std::optional<torch::Tensor> pred_masks;
  std::optional<SparsePredMasks> sparse_pred_masks;
+ template <class Self, class Visitor>
+ void for_each_required_tensor(this Self&& self, Visitor&& visit) {
+  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^OutputLayer, std::meta::access_context::current()))) {
+   if constexpr (std::is_same_v<std::remove_cvref_t<decltype(self.[:member:])>, torch::Tensor>) visit(self.[:member:]);
+  }
+ }
 };
 struct ModelOutputs {
  OutputLayer main;

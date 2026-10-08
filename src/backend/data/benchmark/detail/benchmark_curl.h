@@ -178,6 +178,7 @@ public:
   void remove_all();
 
  private:
+  void unregister(std::unique_lock<std::mutex>& lock);
   Channel(std::shared_ptr<Impl>, Class, mmltk::common::concurrency::CancellationObservation, CompileResources);
   std::shared_ptr<Impl> owner_;
   std::shared_ptr<State> state_;

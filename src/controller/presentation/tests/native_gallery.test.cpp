@@ -1,3 +1,4 @@
+#include "src/test_support/image_test_utils.hpp"
 #include "support/allocation_tracking.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -383,11 +384,40 @@ public:
   }
   return advanced;
  }
- void SetBoxes(bool enabled) {
-  plan.overlay.show_boxes = enabled;
+ ExploreGalleryPublication BeginNextGeneration(const ExploreOrderCandidate* order = nullptr) {
   ++plan.generation;
   demand->store(plan.generation);
-  static_cast<void>(Begin());
+  return Begin(order);
+ }
+ void SetMode(ExploreMode mode, std::optional<std::uint32_t> selected = {}) {
+  plan.mode = mode;
+  plan.selected_image = selected;
+  demand->store(++plan.generation);
+ }
+ void CheckReusedOrder(ExploreOrderCandidate order) {
+  CHECK(BeginNextGeneration(&order).remaining_tiles == 0U);
+  algorithm->Commit(std::move(order));
+ }
+ void CheckStoppedReads() {
+  const auto before = evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
+  static_cast<void>(algorithm->AdvanceGallery());
+  CHECK(evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == before);
+ }
+ void CheckNewSourceReads() {
+  ++plan.generation;
+  demand->store(plan.generation);
+  const auto before = evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
+  Begin();
+  Drain();
+  CHECK(evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) > before);
+ }
+ void RenderNextGeneration() {
+  static_cast<void>(BeginNextGeneration());
+  Drain();
+ }
+ void SetBoxes(bool enabled) {
+  plan.overlay.show_boxes = enabled;
+  static_cast<void>(BeginNextGeneration());
  }
  void Drain() {
   for (;;) {
@@ -404,6 +434,11 @@ public:
    if (algorithm->HasGalleryTiles()) return;
    evidence.Wait(observed);
   }
+ }
+ void CheckRetained(std::span<const std::uint8_t> clean, std::span<const std::uint8_t> semantic, std::span<const ExploreLabel> labels) {
+  CHECK(std::ranges::equal(Pixels(0U), clean));
+  CHECK(std::ranges::equal(Pixels(1U), semantic));
+  check_labels(algorithm->Labels(), labels);
  }
  [[nodiscard]] std::vector<std::uint8_t> Pixels(const std::size_t plane_index) {
   if (displayed_mode != ExploreMode::Gallery) return copy_product_plane(runtime->Borrow(), plane_index);
@@ -572,8 +607,7 @@ TEST_CASE("Detail framework prewrite failure invalidates its atlas before enteri
   return runtime.CommitOutput(std::move(output));
  };
  const auto check_selected = [&](const unsigned char value) {
-  auto selected = runtime.Borrow();
-  REQUIRE(selected.valid());
+  auto selected = mmltk::testsupport::require_borrowed_image(runtime);
   CHECK(*reinterpret_cast<const unsigned char*>(selected.plane(0U).plane().data) == value);
   static_cast<void>(directory.Begin(selected.plane(0U).plane(), selected.plane(1U).plane(), viewport, pixels));
   CHECK(directory.Contains(0U, meaning, 0U));
@@ -650,16 +684,12 @@ TEST_CASE("Native gallery return selects its actual completed product and resume
  const auto layout = gallery.displayed_layout;
  const auto readiness = gallery.algorithm->AdvanceGallery().ready_slots;
  REQUIRE((complete || std::ranges::any_of(readiness, [](bool value) { return !value; })));
- gallery.plan.mode = ExploreMode::Detail;
- gallery.plan.selected_image = 12U;
- gallery.demand->store(++gallery.plan.generation);
+ gallery.SetMode(ExploreMode::Detail, 12U);
  gallery.Begin();
  REQUIRE(gallery.algorithm->Document());
  const auto detail_revision = gallery.runtime->Completed().revision();
  REQUIRE(detail_revision != revision);
- gallery.plan.mode = ExploreMode::Gallery;
- gallery.plan.selected_image.reset();
- gallery.demand->store(++gallery.plan.generation);
+ gallery.SetMode(ExploreMode::Gallery);
  const auto acquisitions = gallery.acquisitions;
  gallery.Begin();
  CHECK(gallery.acquisitions == acquisitions);
@@ -680,14 +710,10 @@ TEST_CASE("Native gallery return selects its actual completed product and resume
  gallery.demand->store(++gallery.plan.generation);
  gallery.Begin();
  CHECK(gallery.Pixels(0U) == ready_pixels);
- gallery.plan.mode = ExploreMode::Detail;
- gallery.plan.selected_image = 12U;
- gallery.demand->store(++gallery.plan.generation);
+ gallery.SetMode(ExploreMode::Detail, 12U);
  gallery.Begin();
  ++gallery.plan.augmentation.seed;
- gallery.plan.mode = ExploreMode::Gallery;
- gallery.plan.selected_image.reset();
- gallery.demand->store(++gallery.plan.generation);
+ gallery.SetMode(ExploreMode::Gallery);
  const auto changed = gallery.Begin();
  CHECK(changed.remaining_tiles == 20U);
  CHECK(gallery.runtime->Completed().revision() != revision);
@@ -825,6 +851,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
   CHECK(output_storage.device_bytes == 2U * (clean_pitch + semantic_pitch) * 16U);
   CHECK(output_storage.pinned_bytes == 0U);
  }
+ // CLEANUP-IGNORE: Gallery reuse and detail selection capture separate plane and read-counter baselines for different transitions.
  const auto original = gallery.Pixels(0U);
  const auto original_semantics = gallery.Pixels(1U);
  const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
@@ -832,9 +859,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
  const auto transfers = gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer);
  const auto allocations = gallery.evidence.Count(VisualDiagnosticOperation::ExploreStorageGrown);
  REQUIRE(reads == explore_detail::GalleryThumbnailCache::WindowCount(203U, gallery.plan.viewport));
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- CHECK(gallery.Begin().remaining_tiles == 0U);
+ CHECK(gallery.BeginNextGeneration().remaining_tiles == 0U);
  gallery.Drain();
  CHECK(gallery.publications == published);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer) == transfers);
@@ -843,10 +868,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreAugmentationBatchPrepared) == 0U);
  CHECK(gallery.Pixels(0U) == original);
  gallery.plan.overlay.show_masks = !gallery.plan.overlay.show_masks;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
- gallery.Drain();
+ gallery.RenderNextGeneration();
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
  CHECK(gallery.Pixels(0U) == original);
  CHECK(gallery.Pixels(1U) != original_semantics);
@@ -873,9 +895,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
   CHECK(restored_tiles <= columns * 2U);
  }
  gallery.plan.viewport.first_row = 18U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  gallery.WaitForReadyTiles();
  const auto before_patch = gallery.Pixels(0U);
  const auto before_patch_bytes = gallery.algorithm->StorageFootprint().host_bytes;
@@ -883,24 +903,16 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
  CHECK(gallery.Pixels(0U) == before_patch);
  CHECK(gallery.transaction_storage.host_bytes > before_patch_bytes);
  gallery.plan.viewport.first_row = 2U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- CHECK(gallery.Begin().remaining_tiles == 0U);
+ CHECK(gallery.BeginNextGeneration().remaining_tiles == 0U);
  gallery.plan.viewport.first_row = 0U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
- gallery.Drain();
+ gallery.RenderNextGeneration();
  gallery.plan.viewport.first_row = 18U;
  ++gallery.plan.generation;
  gallery.demand->store(gallery.plan.generation);
  gallery.Begin(nullptr, false);
  CHECK(gallery.Pixels(0U) == original);
  gallery.plan.viewport.first_row = 0U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
- gallery.Drain();
+ gallery.RenderNextGeneration();
  CHECK(gallery.Pixels(0U) == original);
  const auto stable_seed_identity = gallery.plan.dataset_identity;
  gallery.plan.overlay.show_masks = true;
@@ -917,19 +929,9 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
  CHECK(gallery.Pixels(0U) != original);
  CHECK(gallery.Pixels(1U) != old_masks);
  gallery.plan.viewport.first_row = 18U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- const auto before_jump = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
- gallery.Begin();
- gallery.Drain();
- CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) > before_jump);
+ gallery.CheckNewSourceReads();
  gallery.plan.viewport.extent = {columns * 16U, 32U};
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- const auto before_resize = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
- gallery.Begin();
- gallery.Drain();
- CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) > before_resize);
+ gallery.CheckNewSourceReads();
  CHECK(gallery.Pixels(0U).size() == static_cast<std::size_t>(columns) * 16U * 32U * 4U);
  const auto before_preview_clean = gallery.Pixels(0U);
  const auto before_preview_semantic = gallery.Pixels(1U);
@@ -942,9 +944,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
  const auto before_augmentation = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
  const auto refreshing = gallery.Begin();
  CHECK(refreshing.remaining_tiles == columns * 2U);
- CHECK(std::ranges::equal(gallery.Pixels(0U), before_preview_clean));
- CHECK(std::ranges::equal(gallery.Pixels(1U), before_preview_semantic));
- check_labels(gallery.algorithm->Labels(), before_preview_labels);
+ gallery.CheckRetained(before_preview_clean, before_preview_semantic, before_preview_labels);
  {
   std::scoped_lock lock(gallery.evidence.mutex);
   const auto restored = std::ranges::find_if(
@@ -961,6 +961,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
  CHECK(augmented_storage.pinned_bytes >= augmented_storage.augmentation_pinned_bytes);
  for (const bool reroll : {true, false}) {
   CAPTURE(reroll);
+  // CLEANUP-IGNORE: These snapshots retain independent image planes and labels across different cache transitions; they are test observations rather than duplicated transformation logic.
   const auto retained_clean = gallery.Pixels(0U);
   const auto retained_semantic = gallery.Pixels(1U);
   const auto retained_labels = gallery.algorithm->Labels();
@@ -971,13 +972,9 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
    gallery.plan.augmentation.enabled = false;
   gallery.demand->store(++gallery.plan.generation);
   gallery.Begin(nullptr, false);
-  CHECK(std::ranges::equal(gallery.Pixels(0U), retained_clean));
-  CHECK(std::ranges::equal(gallery.Pixels(1U), retained_semantic));
-  check_labels(gallery.algorithm->Labels(), retained_labels);
+  gallery.CheckRetained(retained_clean, retained_semantic, retained_labels);
   CHECK(gallery.Begin().remaining_tiles == columns * 2U);
-  CHECK(std::ranges::equal(gallery.Pixels(0U), retained_clean));
-  CHECK(std::ranges::equal(gallery.Pixels(1U), retained_semantic));
-  check_labels(gallery.algorithm->Labels(), retained_labels);
+  gallery.CheckRetained(retained_clean, retained_semantic, retained_labels);
   // Semantics can update the retained image while its next preview is
   // still pending, without declaring the old clean tiles refreshed.
   gallery.plan.overlay.show_boxes = !gallery.plan.overlay.show_boxes;
@@ -989,9 +986,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
   CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) > prior_reads);
  }
  gallery.plan.viewport.first_row = 0U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  gallery.WaitForReadyTiles();
  const auto protected_storage = gallery.algorithm->StorageFootprint();
  static_cast<void>(gallery.Step(false));
@@ -1000,24 +995,16 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
  CHECK(candidate_storage.augmentation_device_bytes == protected_storage.augmentation_device_bytes);
  CHECK(candidate_storage.augmentation_pinned_bytes == protected_storage.augmentation_pinned_bytes);
  gallery.plan.viewport.first_row = 203U / columns;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
- gallery.Drain();
+ gallery.RenderNextGeneration();
  CHECK(gallery.algorithm->Visible(gallery.plan.viewport).visible_indices.size() == 3U);
  CHECK(gallery.Pixels(0U).back() == 0U);
  CHECK(gallery.Pixels(1U).back() == 0U);
  auto filtered = gallery.algorithm->PrepareFilter({.minimum_instances = 2U}, 0U, 2U, {});
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- CHECK(gallery.Begin(&filtered).remaining_tiles == 0U);
- gallery.algorithm->Commit(std::move(filtered));
+ gallery.CheckReusedOrder(std::move(filtered));
  gallery.Drain();
  gallery.evidence.enabled.store(false);
  gallery.demand->store(0U);
- const auto stopped_reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
- static_cast<void>(gallery.algorithm->AdvanceGallery());
- CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == stopped_reads);
+ gallery.CheckStoppedReads();
 }
 TEST_CASE("Native five six five row demand immediately retains pixel identity through reorder", "[explore][native][cache]") {
  int devices = 0;
@@ -1038,9 +1025,7 @@ TEST_CASE("Native five six five row demand immediately retains pixel identity th
  for (const auto rows : {6U, 5U, 6U, 5U}) {
   gallery.plan.viewport.row_count = rows;
   gallery.plan.viewport.extent.height = rows * 8U;
-  ++gallery.plan.generation;
-  gallery.demand->store(gallery.plan.generation);
-  const auto publication = gallery.Begin();
+  const auto publication = gallery.BeginNextGeneration();
   CHECK(publication.remaining_tiles == 0U);
   CHECK(std::ranges::all_of(publication.ready_slots, [](const bool ready) { return ready; }));
   const auto clean = gallery.Pixels(0U);
@@ -1056,10 +1041,7 @@ TEST_CASE("Native five six five row demand immediately retains pixel identity th
  }
  auto reordered = gallery.algorithm->PrepareFilter({}, 83U, 2U, {});
  const auto order = gallery.algorithm->Visible(gallery.plan.viewport, &reordered).visible_indices;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- CHECK(gallery.Begin(&reordered).remaining_tiles == 0U);
- gallery.algorithm->Commit(std::move(reordered));
+ gallery.CheckReusedOrder(std::move(reordered));
  const auto shuffled = gallery.Pixels(0U);
  for (std::size_t slot = 0U; slot < order.size(); ++slot)
   for (std::size_t row = 0U; row < 8U; ++row) {
@@ -1092,13 +1074,9 @@ TEST_CASE("Native visible admission retains completed gallery pixels through det
  const auto pixels = gallery.Pixels(0U);
  gallery.plan.mode = ExploreMode::Detail;
  gallery.plan.selected_image = 7U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  gallery.plan.mode = ExploreMode::Gallery;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- CHECK(gallery.Begin().cumulative_tiles == 8U);
+ CHECK(gallery.BeginNextGeneration().cumulative_tiles == 8U);
  CHECK(gallery.Pixels(0U) == pixels);
 }
 TEST_CASE("Native disk admission follows visible leading and prior rows in both directions", "[explore][native][priority]") {
@@ -1156,9 +1134,7 @@ TEST_CASE("Native viewport restoration publishes cached rows from either side be
  const auto move = [&](std::uint32_t row) {
   if (row != gallery.plan.viewport.first_row) gallery.plan.scroll_direction = row > gallery.plan.viewport.first_row ? ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
   gallery.plan.viewport.first_row = row;
-  ++gallery.plan.generation;
-  gallery.demand->store(gallery.plan.generation);
-  return gallery.Begin();
+  return gallery.BeginNextGeneration();
  };
  for (const auto row : {14U, 6U, 14U, 6U}) {
   const auto restored = move(row);
@@ -1217,9 +1193,7 @@ TEST_CASE("Native cold visible admission proceeds while obsolete speculation hol
  }
  held.Wait();
  gallery.plan.viewport.first_row = 20U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- CHECK(gallery.Begin().remaining_tiles == 4U);
+ CHECK(gallery.BeginNextGeneration().remaining_tiles == 4U);
  for (;;) {
   const auto observed = gallery.evidence.Epoch();
   static_cast<void>(gallery.algorithm->AdvanceGallery());
@@ -1258,9 +1232,7 @@ TEST_CASE("Native scroll reversal retains a useful pending read and cached visib
  for (const auto row : {11U, 10U, 11U, 10U}) {
   gallery.plan.scroll_direction = row == 11U ? ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
   gallery.plan.viewport.first_row = row;
-  ++gallery.plan.generation;
-  gallery.demand->store(gallery.plan.generation);
-  const auto initial = gallery.Begin();
+  const auto initial = gallery.BeginNextGeneration();
   REQUIRE(initial.ready_slots.size() == 4U);
   CHECK_FALSE(initial.ready_slots[row == 11U ? 0U : 2U]);
   if (row == 10U) {
@@ -1308,25 +1280,17 @@ TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed r
  gallery.Command(4U);
  gallery.gate->FailNextPublicationAt(ExploreAcceptanceGate::PublicationStage::DescriptorsPrepared);
  gallery.plan.viewport.first_row = 0U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- REQUIRE_THROWS(gallery.Begin());
+ REQUIRE_THROWS(gallery.BeginNextGeneration());
  REQUIRE(gallery.algorithm->RollbackOutputPublication());
  CHECK(gallery.Pixels(0U) == retained);
  gallery.plan.viewport.first_row = 18U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
- gallery.Drain();
+ gallery.RenderNextGeneration();
  CHECK(gallery.Pixels(0U) != retained);
  const auto clean = gallery.Pixels(0U);
  const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
  gallery.gate->FailNextProbe();
  gallery.plan.overlay.show_boxes = !gallery.plan.overlay.show_boxes;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
- gallery.Drain();
+ gallery.RenderNextGeneration();
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreProbeFailed) == 1U);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
  CHECK(gallery.Pixels(0U) == clean);
@@ -1335,10 +1299,7 @@ TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed r
  // scheduling and they intentionally assert different operations.
  const auto recorded = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
  gallery.plan.overlay.show_masks = !gallery.plan.overlay.show_masks;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
- gallery.Drain();
+ gallery.RenderNextGeneration();
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == recorded);
  CHECK(gallery.Pixels(0U) == clean);
 }
@@ -1364,10 +1325,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
  CHECK(gallery.logical_copies.load() - before_semantic == columns);
  gallery.plan.viewport.row_count = static_cast<std::uint32_t>(kExploreVisibleItemCapacity / columns);
  gallery.plan.viewport.extent.height = gallery.plan.viewport.row_count * 8U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
- gallery.Drain();
+ gallery.RenderNextGeneration();
  gallery.evidence.enabled.store(false);
  const auto copies = gallery.logical_copies.load();
  const auto publications = gallery.publications;
@@ -1385,6 +1343,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
   }
   CHECK(allocations == 0U);
   CHECK(gallery.logical_copies.load() == copies);
+  // CLEANUP-IGNORE: Exact reuse and class selection independently assert unchanged publication, acquisition, and revision observations before distinct pixel checks.
   CHECK(gallery.publications == publications);
   CHECK(gallery.acquisitions == acquisitions);
   CHECK(gallery.runtime->Completed().revision() == revision);
@@ -1394,22 +1353,16 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
  const auto descriptors = gallery.evidence.Count(VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared);
  const auto renders = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
  const auto transfers = gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer);
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared) == descriptors);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == renders);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer) == transfers);
  // A stationary repeat retains the cold viewport; its first visible card
  // starts when ordinary continuation scheduling advances.
  gallery.plan.viewport.first_row = 400U / columns;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  const auto cold_publications = gallery.publications;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  CHECK(gallery.publications == cold_publications);
  static_cast<void>(gallery.algorithm->AdvanceGallery());
  {
@@ -1420,9 +1373,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
  gallery.Drain();
  gallery.plan.mode = ExploreMode::Detail;
  gallery.plan.selected_image = 403U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  const auto detail_acquisitions = gallery.acquisitions;
  const auto detail_publications = gallery.publications;
  const auto detail_revision = gallery.runtime->Completed().revision();
@@ -1446,9 +1397,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
  CHECK(gallery.publications == detail_publications);
  CHECK(gallery.runtime->Completed().revision() == detail_revision);
  gallery.evidence.enabled.store(true);
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared) == detail_descriptors);
  CHECK(gallery.Pixels(0U) == detail_clean);
  CHECK(gallery.Pixels(1U) == detail_semantic);
@@ -1544,9 +1493,7 @@ TEST_CASE("Native retirement settles held GPU and probe callbacks before checked
   // so the held work can enter the background tier without starving
   // a foreground publication on this same test thread.
   gallery.plan.viewport.first_row = 4U;
-  ++gallery.plan.generation;
-  gallery.demand->store(gallery.plan.generation);
-  const auto visible = gallery.Begin();
+  const auto visible = gallery.BeginNextGeneration();
   REQUIRE(std::ranges::all_of(visible.ready_slots, [](const bool ready) { return ready; }));
   gallery.pause = &held;
   const auto before = gallery.evidence.BackgroundSubmissions();
@@ -1884,6 +1831,7 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
  gallery.plan.mode = ExploreMode::Detail;
  gallery.plan.selected_image = 0U;
  gallery.SetBoxes(false);
+ // CLEANUP-IGNORE: Gallery reuse and detail selection capture separate plane and read-counter baselines for different transitions.
  const auto clean = gallery.Pixels(0U);
  const auto semantic = gallery.Pixels(1U);
  const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
@@ -1891,24 +1839,19 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
  const auto allocations = gallery.evidence.Count(VisualDiagnosticOperation::ExploreStorageGrown);
  const auto published = gallery.publications;
  const auto copies = gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer);
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  CHECK(gallery.publications == published);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreStorageGrown) == allocations);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer) == copies);
  CHECK(gallery.Pixels(0U) == clean);
  CHECK(gallery.Pixels(1U) == semantic);
+ // CLEANUP-IGNORE: Detail and superseded-gallery scenarios explicitly change class selection before distinct plane-size and background-read assertions.
  gallery.plan.overlay.class_selection.mode = ExploreClassSelectionMode::None;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  CHECK(gallery.Pixels(0U) == clean);
  CHECK(gallery.Pixels(1U) == std::vector<std::uint8_t>(8U * 8U * 4U, 0U));
  gallery.plan.overlay.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {0U}};
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  CHECK(gallery.Pixels(1U) == semantic);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreAugmentationBatchPrepared) == augmented);
@@ -1930,6 +1873,7 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
   host_allocations = native_gallery_allocations::count;
  }
  CHECK(host_allocations == 0U);
+ // CLEANUP-IGNORE: Exact reuse and class selection independently assert unchanged publication, acquisition, and revision observations before distinct pixel checks.
  CHECK(gallery.publications == detail_publications);
  CHECK(gallery.acquisitions == detail_acquisitions);
  CHECK(gallery.runtime->Completed().revision() == detail_revision);
@@ -1951,9 +1895,7 @@ TEST_CASE("Native superseded background work preserves incumbent planes and mean
  // Initial demand retains 0..23. Row four is hot; new speculative rows
  // follow it without discarding the ready retained origin.
  gallery.plan.viewport.first_row = 4U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- CHECK(gallery.Begin().remaining_tiles == 0U);
+ CHECK(gallery.BeginNextGeneration().remaining_tiles == 0U);
  GalleryGpuPause pause;
  gallery.pause = &pause;
  const auto submitted_count = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
@@ -1983,17 +1925,14 @@ TEST_CASE("Native superseded background work preserves incumbent planes and mean
  // CLEANUP-IGNORE: This background-collision read count proves retained-cache reuse at a separate cancellation
  // boundary from the semantic-selection scenario.
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
+ // CLEANUP-IGNORE: Detail and superseded-gallery scenarios explicitly change class selection before distinct plane-size and background-read assertions.
  gallery.plan.overlay.class_selection.mode = ExploreClassSelectionMode::None;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  CHECK(gallery.Pixels(0U) == clean);
  CHECK(gallery.Pixels(1U) == std::vector<std::uint8_t>(4U * 8U * 16U * 4U, 0U));
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
  gallery.plan.overlay.class_selection.mode = ExploreClassSelectionMode::All;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ static_cast<void>(gallery.BeginNextGeneration());
  CHECK(gallery.Pixels(1U) == semantic);
 }
 TEST_CASE("Native cache admission retains only completely submitted obsolete pixels", "[explore][native][cache]") {
@@ -2012,9 +1951,7 @@ TEST_CASE("Native cache admission retains only completely submitted obsolete pix
  reference.Open(path);
  reference.Drain();
  reference.plan.viewport.first_row = 1U;
- ++reference.plan.generation;
- reference.demand->store(reference.plan.generation);
- const auto expected_ready = reference.Begin().ready_slots;
+ const auto expected_ready = reference.BeginNextGeneration().ready_slots;
  const auto expected_clean = reference.Pixels(0U);
  const auto expected_semantic = reference.Pixels(1U);
  const auto expected_labels = reference.algorithm->Labels();
@@ -2028,6 +1965,7 @@ TEST_CASE("Native cache admission retains only completely submitted obsolete pix
  gallery.Open(path);
  gallery.WaitForReadyTiles();
  static_cast<void>(gallery.Step());
+ // CLEANUP-IGNORE: These snapshots retain independent image planes and labels across different cache transitions; they are test observations rather than duplicated transformation logic.
  const auto incumbent_clean = gallery.Pixels(0U);
  const auto incumbent_semantic = gallery.Pixels(1U);
  const auto incumbent_labels = gallery.algorithm->Labels();
@@ -2053,15 +1991,11 @@ TEST_CASE("Native cache admission retains only completely submitted obsolete pix
  gallery.runtime->BindContext();
  const bool admitted = checkpoint != Stage::BeforeCacheAdmission;
  CHECK(gallery.evidence.BackgroundSubmissions() == before + (admitted ? 1U : 0U));
- CHECK(gallery.Pixels(0U) == incumbent_clean);
- CHECK(gallery.Pixels(1U) == incumbent_semantic);
- check_labels(gallery.algorithm->Labels(), incumbent_labels);
+ gallery.CheckRetained(incumbent_clean, incumbent_semantic, incumbent_labels);
  const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
  const auto renders = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
  gallery.plan.viewport.first_row = 1U;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- const auto revisited = gallery.Begin();
+ const auto revisited = gallery.BeginNextGeneration();
  CHECK(revisited.ready_slots == std::vector<bool>{admitted});
  CHECK(revisited.reused_tiles == (admitted ? 1U : 0U));
  if (!admitted) {
@@ -2072,9 +2006,7 @@ TEST_CASE("Native cache admission retains only completely submitted obsolete pix
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
  CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == renders + (admitted ? 0U : 1U));
  CHECK(gallery.algorithm->AdvanceGallery().ready_slots == expected_ready);
- CHECK(gallery.Pixels(0U) == expected_clean);
- CHECK(gallery.Pixels(1U) == expected_semantic);
- check_labels(gallery.algorithm->Labels(), expected_labels);
+ gallery.CheckRetained(expected_clean, expected_semantic, expected_labels);
 }
 TEST_CASE("Native submitted GPU work settles after Stop without publication or new reads", "[explore][native][shutdown]") {
  int devices = 0;
@@ -2100,9 +2032,7 @@ TEST_CASE("Native submitted GPU work settles after Stop without publication or n
  gallery.pause = nullptr;
  gallery.runtime->BindContext();
  CHECK(gallery.Pixels(0U) == retained);
- const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
- static_cast<void>(gallery.algorithm->AdvanceGallery());
- CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
+ gallery.CheckStoppedReads();
 }
 }  // namespace
 }  // namespace mmltk::controller

@@ -267,6 +267,7 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
    for (const auto& item : actual->named_parameters()) REQUIRE(torch::allclose(item.value().grad(), oracle->named_parameters()[item.key()].grad(), 2e-2, 3e-3));
    torch::optim::SGD update(actual->parameters(), torch::optim::SGDOptions(0.01));
    torch::optim::SGD reference_update(oracle->parameters(), torch::optim::SGDOptions(0.01));
+   // CLEANUP-IGNORE: Native and independent dense oracles each apply their own optimizer update; different learning rates and tolerance checks follow.
    update.step();
    reference_update.step();
    for (const auto& item : actual->named_parameters()) REQUIRE(torch::allclose(item.value(), oracle->named_parameters()[item.key()], 2e-2, 3e-3));
@@ -338,6 +339,7 @@ TEST_CASE("Ordinary and DN grouped SDPA match masked dense equations with retain
    }
    torch::optim::SGD optimizer(actual->parameters(), torch::optim::SGDOptions(0.001));
    torch::optim::SGD expected_optimizer(oracle->parameters(), torch::optim::SGDOptions(0.001));
+   // CLEANUP-IGNORE: Native and independent dense oracles each apply their own optimizer update; different learning rates and tolerance checks follow.
    optimizer.step();
    expected_optimizer.step();
    for (const auto& item : actual->named_parameters()) REQUIRE(torch::allclose(item.value(), oracle->named_parameters()[item.key()], 2e-3, 3e-4));

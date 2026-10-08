@@ -36,9 +36,7 @@ std::string tensor_entry_filename(const size_t index) { return std::format("entr
 fs::path make_temp_directory(const char* prefix) {
  const fs::path template_path = fs::temp_directory_path() / (std::string(prefix) + "XXXXXX");
  std::string template_string = template_path.string();
- std::vector<char> buffer(template_string.begin(), template_string.end());
- buffer.push_back('\0');
- char* created = ::mkdtemp(buffer.data());
+ char* created = ::mkdtemp(template_string.data());
  if (created == nullptr) { throw std::runtime_error(std::string("failed to create temporary RF-DETR checkpoint directory: ") + std::strerror(errno)); }
  return {created};
 }

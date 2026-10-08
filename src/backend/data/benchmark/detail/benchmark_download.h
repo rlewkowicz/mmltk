@@ -72,6 +72,7 @@ struct DownloadResult {
  bool cache_hit = false;
 };
 [[nodiscard]] const std::string& download_failure_sha256(DownloadResult&, mmltk::common::concurrency::CancellationObservation = {});
+void trace_download_failure(const DownloadRequest&, std::string_view reason, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
 [[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout&, std::string_view, const CatalogArtifact&);
 struct DownloadReady {
  std::size_t request_index = 0;

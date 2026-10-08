@@ -38,6 +38,10 @@ namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
 namespace torch_cuda = mmltk::backend::ml::cuda;
 namespace {
+std::string export_member_name(std::string name) {
+ std::replace(name.begin(), name.end(), '.', '_');
+ return name;
+}
 void erase_unused_module_self_input(const std::shared_ptr<torch::jit::Graph>& graph) {
  if (!graph->inputs().empty() && graph->inputs().front()->type()->kind() == c10::TypeKind::ClassType) { graph->eraseInput(0); }
 }
@@ -73,13 +77,11 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
   auto class_type = torch::jit::ClassType::create("__torch__.NativeRfDetrOnnxExport", compilation_unit, true);
   torch::jit::Module export_module(compilation_unit, class_type);
   for (const auto& parameter : technical_model.named_parameters(true)) {
-   std::string name = parameter.key();
-   std::replace(name.begin(), name.end(), '.', '_');
+   const auto name = export_member_name(parameter.key());
    export_module.register_parameter(name, parameter.value(), false);
   }
   for (const auto& buffer : technical_model.named_buffers(true)) {
-   std::string name = buffer.key();
-   std::replace(name.begin(), name.end(), '.', '_');
+   const auto name = export_member_name(buffer.key());
    export_module.register_buffer(name, buffer.value());
   }
   const bool has_masks = model.config().segmentation;

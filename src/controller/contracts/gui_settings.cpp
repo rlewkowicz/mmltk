@@ -285,6 +285,24 @@ void visit_record_fields(State& state, const Visitor& visit) {
  mmltk::frameworks::reflection::visit_materialized_bases<Record>([&]<class Base>() { visit_record_fields<Base>(state, visit); });
  mmltk::frameworks::reflection::visit_materialized_members<Record>([&]<class Declaration>(const auto& field) { visit(field.member_name.data(), state.*Declaration::pointer); });
 }
+template <auto SourceMember, class Record, class State, class Visitor>
+void visit_matching_field(State& state, const Visitor& visit) {
+ namespace reflection = mmltk::frameworks::reflection;
+ constexpr auto name = reflection::materialized_member_name<SourceMember>();
+ reflection::visit_materialized_bases<Record>([&]<class Base>() { visit_matching_field<SourceMember, Base>(state, visit); });
+ reflection::visit_materialized_members<Record>([&]<class Field>(const auto&) {
+  if constexpr (reflection::materialized_member_name<Field::pointer>() == name) visit(name.data(), state.*Field::pointer);
+ });
+}
+template <class Record, class State, class Visitor>
+void visit_matching_fields(State& state, const Visitor& visit) {
+ mmltk::frameworks::reflection::visit_materialized_members<Record>([&]<class Field>(const auto&) { visit_matching_field<Field::pointer, std::remove_cvref_t<State>>(state, visit); });
+}
+constexpr auto model_path_fields = [](auto& state, const auto& visit) {
+ mmltk::frameworks::reflection::visit_materialized_members<rfdetr::ModelArtifactRequest>([&]<class Field>(const auto&) {
+  if constexpr (std::is_same_v<typename Field::member_type, std::filesystem::path>) visit_matching_field<Field::pointer, std::remove_cvref_t<decltype(state)>>(state, visit);
+ });
+};
 constexpr auto benchmark_selection_fields = [](auto& selection, const auto& fields) { visit_record_fields<mmltk::backend::data::BenchmarkDatasetSelection>(selection, fields); };
 constexpr auto output_selection_fields = [](auto& state, const auto& visit) { visit_record_fields<WorkflowOutputSelection>(state, visit); };
 constexpr auto prediction_output_fields = [](auto& state, const auto& visit) { visit_record_fields<PredictionOutputSettings>(state, visit); };
@@ -405,14 +423,13 @@ constexpr auto predict_execution_fields = [](auto& request, const auto& visit) {
  visit("lanes", request.lanes);
  visit("progress_bar", request.progress_bar);
 };
-constexpr auto annotate_execution_fields = [](auto& state, const auto& visit) {
- visit("device_id", state.device_id);
- visit("allow_fp16", state.allow_fp16);
- visit("compile_mode", state.compile_mode);
-};
 constexpr auto export_execution_fields = [](auto& state, const auto& visit) {
- visit("device_id", state.device_id);
- visit("allow_fp16", state.allow_fp16);
+ visit_matching_fields<rfdetr::DeviceExecutionConfig>(state, visit);
+ visit_matching_fields<rfdetr::BuildEngineRequest>(state, visit);
+};
+constexpr auto annotate_execution_fields = [](auto& state, const auto& visit) {
+ export_execution_fields(state, visit);
+ visit("compile_mode", state.compile_mode);
 };
 nlohmann::json snapshot_train_workflow_state(const TrainViewState& state) { return snapshot_fields(state, train_training_fields); }
 nlohmann::json snapshot_gpu_augmentation(const rfdetr::GpuAugmentationConfig& config) { return snapshot_fields(config, gpu_augmentation_fields); }
@@ -422,24 +439,27 @@ nlohmann::json snapshot_model_artifacts(const ModelArtifactSelectionState& state
  model_artifact_fields(state, shape, JsonFieldWriter{json});
  return json;
 }
-template <ModelArtifactSelectionView State>
-void add_model_selection_json(nlohmann::json& json, const State& state) {
- ModelArtifactSelectionState selection = model_artifacts(state);
- JsonFieldWriter write{json};
- write("preset_name", selection.preset_name);
- write("model_resolution", selection.resolution);
- write("model_source", selection.source);
- write("model_input", selection.input);
+template <class Selection, class Visitor>
+void workflow_selection_fields(Selection& selection, const Visitor& visit) {
+ visit("preset_name", selection.preset_name);
+ visit("model_resolution", selection.resolution);
+ visit("model_source", selection.source);
+ visit("model_input", selection.input);
 }
 template <ModelArtifactSelectionView State>
-void apply_model_selection_json(const nlohmann::json& json, State& state) {
+void add_workflow_selection_json(nlohmann::json& json, const State& state) {
+ ModelArtifactSelectionState selection = model_artifacts(state);
+ JsonFieldWriter write{json};
+ workflow_selection_fields(selection, write);
+ if constexpr (requires { state.output; }) write.nested("output", state.output, output_selection_fields);
+}
+template <ModelArtifactSelectionView State>
+void apply_workflow_selection_json(const nlohmann::json& json, State& state) {
  ModelArtifactSelectionState selection = model_artifacts(state);
  JsonFieldReader read{json};
- read("preset_name", selection.preset_name);
- read("model_resolution", selection.resolution);
- read("model_source", selection.source);
- read("model_input", selection.input);
+ workflow_selection_fields(selection, read);
  apply_model_artifacts(state, selection);
+ if constexpr (requires { state.output; }) read.nested("output", state.output, output_selection_fields);
 }
 void apply_model_artifacts_json(const nlohmann::json& json, ModelArtifactSelectionState& state, const ModelArtifactsShape& shape) {
  model_artifact_fields(state, shape, JsonFieldReader{json});
@@ -487,10 +507,7 @@ constexpr auto validate_flat_fields = [](auto& state, const auto& visit) {
  validate_execution_fields(state, visit);
  visit("compiled_path", state.compiled_path);
  visit("source_dir", state.source_dir);
- visit("weights_path", state.weights_path);
- if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
- visit("onnx_path", state.onnx_path);
- visit("tensorrt_path", state.tensorrt_path);
+ model_path_fields(state, visit);
  validation_fields(state, visit);
 };
 constexpr auto predict_fields = [](auto& state, const auto& visit) {
@@ -502,10 +519,7 @@ constexpr auto predict_fields = [](auto& state, const auto& visit) {
 };
 constexpr auto predict_flat_fields = [](auto& state, const auto& visit) {
  visit_record_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
- visit("weights_path", state.weights_path);
- if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
- visit("onnx_path", state.onnx_path);
- visit("tensorrt_path", state.tensorrt_path);
+ model_path_fields(state, visit);
  visit("cpu_affinity", state.cpu_affinity);
  visit("device_id", state.device_id);
  visit("workers", state.workers);
@@ -525,13 +539,8 @@ constexpr auto annotate_fields = [](auto& state, const auto& visit) {
 };
 constexpr auto annotate_flat_fields = [](auto& state, const auto& visit) {
  visit("source", state.source);
- visit("weights_path", state.weights_path);
- if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
- visit("onnx_path", state.onnx_path);
- visit("tensorrt_path", state.tensorrt_path);
- visit("device_id", state.device_id);
- visit("allow_fp16", state.allow_fp16);
- visit("compile_mode", state.compile_mode);
+ model_path_fields(state, visit);
+ annotate_execution_fields(state, visit);
  annotate_fields(state, visit);
 };
 constexpr auto export_fields = [](auto& state, const auto& visit) {
@@ -629,8 +638,7 @@ void convert(JsonWrite<TrainViewState> value) {
  write.nested("gpu_augmentation", s.request.gpu_augmentation, gpu_augmentation_fields);
  write("visualize_augmentation_in_explore", s.visualize_augmentation_in_explore);
  train_execution_target_fields(s, write);
- add_model_selection_json(j, s);
- JsonFieldWriter{j}.nested("output", s.output, output_selection_fields);
+ add_workflow_selection_json(j, s);
 }
 void convert(JsonRead<TrainViewState> value) {
  const auto& j = value.json;
@@ -643,50 +651,45 @@ void convert(JsonRead<TrainViewState> value) {
  read.nested("gpu_augmentation", s.request.gpu_augmentation, gpu_augmentation_fields);
  read("visualize_augmentation_in_explore", s.visualize_augmentation_in_explore);
  apply_model_artifacts(s, artifact_state);
- apply_model_selection_json(j, s);
- JsonFieldReader{j}.nested("output", s.output, output_selection_fields);
+ apply_workflow_selection_json(j, s);
 }
 void convert(JsonWrite<AnnotateViewState> value) {
  auto& j = value.json;
  const auto& s = value.state;
  j = snapshot_fields(s, annotate_flat_fields);
- add_model_selection_json(j, s);
+ add_workflow_selection_json(j, s);
 }
 void convert(JsonRead<AnnotateViewState> value) {
  const auto& j = value.json;
  auto& s = value.state;
  annotate_flat_fields(s, JsonFieldReader{j});
- apply_model_selection_json(j, s);
+ apply_workflow_selection_json(j, s);
 }
 void convert(JsonWrite<ExportViewState> value) {
  auto& j = value.json;
  const auto& s = value.state;
  j = snapshot_fields(s, export_flat_fields);
- add_model_selection_json(j, s);
- JsonFieldWriter{j}.nested("output", s.output, output_selection_fields);
+ add_workflow_selection_json(j, s);
 }
 void convert(JsonRead<ExportViewState> value) {
  const auto& j = value.json;
  auto& s = value.state;
  export_flat_fields(s, JsonFieldReader{j});
- apply_model_selection_json(j, s);
- JsonFieldReader{j}.nested("output", s.output, output_selection_fields);
+ apply_workflow_selection_json(j, s);
 }
 void convert(JsonWrite<ValidateViewState> value) {
  auto& j = value.json;
  const auto& s = value.state;
  j = snapshot_fields(s.request, validate_flat_fields);
  JsonFieldWriter{j}.nested("display", s.display, validation_display_fields);
- add_model_selection_json(j, s);
- JsonFieldWriter{j}.nested("output", s.output, output_selection_fields);
+ add_workflow_selection_json(j, s);
 }
 void convert(JsonRead<ValidateViewState> value) {
  const auto& j = value.json;
  auto& s = value.state;
  validate_flat_fields(s.request, JsonFieldReader{j});
  JsonFieldReader{j}.nested("display", s.display, validation_display_fields);
- apply_model_selection_json(j, s);
- JsonFieldReader{j}.nested("output", s.output, output_selection_fields);
+ apply_workflow_selection_json(j, s);
 }
 void convert(JsonWrite<PredictViewState> value) {
  auto& j = value.json;
@@ -695,8 +698,7 @@ void convert(JsonWrite<PredictViewState> value) {
  j["source"] = s.source;
  j["live_split_count"] = s.live_split_count;
  j["write_report_json"] = s.write_report_json;
- add_model_selection_json(j, s);
- JsonFieldWriter{j}.nested("output", s.output, output_selection_fields);
+ add_workflow_selection_json(j, s);
 }
 void convert(JsonRead<PredictViewState> value) {
  const auto& j = value.json;
@@ -706,8 +708,7 @@ void convert(JsonRead<PredictViewState> value) {
  get_optional(j, "source", s.source);
  get_optional(j, "live_split_count", s.live_split_count);
  get_optional(j, "write_report_json", s.write_report_json);
- apply_model_selection_json(j, s);
- JsonFieldReader{j}.nested("output", s.output, output_selection_fields);
+ apply_workflow_selection_json(j, s);
 }
 void convert(JsonWrite<UiSettingsState> value) {
  auto& j = value.json;

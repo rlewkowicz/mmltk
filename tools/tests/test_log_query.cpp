@@ -64,6 +64,7 @@ import mmltk.tools.cpp_linux;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 import mmltk.tools.runtime_package;
+import mmltk.tools.tests.cpp_test_support;
 namespace log_query_test {
 using Json = mmltk::log_query::Json;
 using mmltk::log_query::detail::Observation;
@@ -684,6 +685,15 @@ logs::Triage triage_fixture(bool capture = true) {
  if (capture) triage.run = "capture";
  return triage;
 }
+struct PixelTriageFixture {
+ Limit limit;
+ logs::Triage triage;
+ explicit PixelTriageFixture(std::size_t capacity, bool capture = true) : limit(mmltk::log_query::detail::limits.pixel_samples, capacity), triage(triage_fixture(capture)) {}
+};
+void expect_no_pending_pixels(const logs::Triage& triage) {
+ FALSE(triage.pixel_pending);
+ EQ(triage.pixel_pending_count, 0U);
+}
 logs::Record row(const J& data, std::size_t line = 1, std::string source = "input.jsonl") {
  auto result = record(data, std::move(source), line);
  result.metadata.update({{"run", "capture"}, {"mtime_ns", 1}});
@@ -710,6 +720,12 @@ std::vector<logs::TriageFinding> findings(const logs::Triage& triage, std::strin
  for (const auto& [key, finding] : triage.findings)
   if (kind.empty() || finding.kind == kind) result.push_back(finding);
  return result;
+}
+std::vector<logs::TriageFinding> expect_native_pixel_comparison(const logs::Triage& triage, bool differs) {
+ auto native = findings(triage, "pixel-chain-divergence");
+ EQ(native.size(), static_cast<std::size_t>(differs));
+ if (!native.empty()) HAS(native[0].message, "native -> sample");
+ return native;
 }
 bool note(const logs::Triage& triage, std::string_view text) {
  return any(triage.notes, [&](auto& n) { return contains(n, text); });
@@ -843,9 +859,8 @@ void test_optional_direct_image_edges_preserve_native_comparison_in_every_arriva
     triage.observe_pixel_chain(sample, true);
    }
    triage.finalize_pixel_chain(true);
-   auto native = findings(triage, "pixel-chain-divergence"), optional = findings(triage, "pixel-direct-boundary-divergence");
-   EQ(native.size(), static_cast<std::size_t>(sampled != 10));
-   if (!native.empty()) HAS(native[0].message, "native -> sample");
+   auto native = expect_native_pixel_comparison(triage, sampled != 10);
+   auto optional = findings(triage, "pixel-direct-boundary-divergence");
    EQ(optional.size(), static_cast<std::size_t>((image != 10) + (image != sampled)));
    if (image != 10) CHECK(any(optional, [](auto& f) { return contains(f.message, "native -> direct_image"); }));
    if (image != sampled) CHECK(any(optional, [](auto& f) { return contains(f.message, "direct_image -> sample"); }));
@@ -939,9 +954,7 @@ void test_optional_source_copy_absence_and_retired_alias_keep_required_native_ev
    alias.data["event"] = "firefox.workspace.direct_memory_pixel";
    triage.observe_pixel_chain(alias, true);
    triage.finalize_pixel_chain(true);
-   auto required = findings(triage, "pixel-chain-divergence");
-   EQ(required.size(), static_cast<std::size_t>(rgba != 10));
-   if (!required.empty()) HAS(required[0].message, "native -> sample");
+   expect_native_pixel_comparison(triage, rgba != 10);
    if (rgba == 10) FALSE(triage.findings);
    FALSE(any(findings(triage), [](auto& f) { return contains(f.message, "direct_image"); }));
    CHECK(note(triage, "excluded from pixel comparisons"));
@@ -1111,8 +1124,7 @@ void test_absent_pixel_bridges_finalize_each_exact_transfer_once() {
   CHECK(logs::missing(found[i].record.get("@workspace_source")));
  }
  HAS(found[0].message, "2 pixel receipt(s)");
- FALSE(triage.pixel_pending);
- EQ(triage.pixel_pending_count, 0U);
+ expect_no_pending_pixels(triage);
  triage.finalize_pixel_chain(true);
  EQ(triage.findings.size(), 2U);
 }
@@ -1123,8 +1135,7 @@ void test_exact_pixel_bridge_succeeds_before_or_after_the_pixel() {
   for (auto& boundary : order) triage.observe_pixel_chain(pixel_row(boundary), true);
   triage.finalize_pixel_chain(true);
   FALSE(triage.findings);
-  FALSE(triage.pixel_pending);
-  EQ(triage.pixel_pending_count, 0U);
+  expect_no_pending_pixels(triage);
   EQ(stages(only(triage.pixel_samples).second), (std::set<std::string>{"native", "import"}));
  }
 }
@@ -1144,13 +1155,12 @@ void test_pending_pixel_capacity_counts_replay_and_finalization_exactly() {
  EQ(triage.pixel_pending_count, 2U);
  triage.finalize_pixel_chain(true);
  EQ(triage.findings.size(), 2U);
- FALSE(triage.pixel_pending);
- EQ(triage.pixel_pending_count, 0U);
+ expect_no_pending_pixels(triage);
 }
 void test_saturated_bridge_index_reports_incomplete_for_later_pixels() {
  for (bool emit : {false, true}) {
-  Limit limit(mmltk::log_query::detail::limits.pixel_samples, 2);
-  auto triage = triage_fixture(false);
+  PixelTriageFixture fixture(2, false);
+  auto& triage = fixture.triage;
   for (int transfer : {1, 2, 3}) triage.observe_pixel_chain(pixel_row("forwarded", transfer), emit);
   EQ(triage.pixel_sources.size(), 2U);
   CHECK(triage.pixel_sources_truncated);
@@ -1158,8 +1168,7 @@ void test_saturated_bridge_index_reports_incomplete_for_later_pixels() {
   for (auto boundary : {"import", "mailbox"}) triage.observe_pixel_chain(pixel_row(boundary, 3, 10, ++line), emit);
   EQ(triage.pixel_pending_count, 2U);
   triage.finalize_pixel_chain(emit);
-  FALSE(triage.pixel_pending);
-  EQ(triage.pixel_pending_count, 0U);
+  expect_no_pending_pixels(triage);
   FALSE(triage.pixel_samples);
   CHECK(note(triage, "Pixel transfer bridge capacity reached"));
   if (emit) {
@@ -1176,8 +1185,8 @@ void test_saturated_bridge_index_reports_incomplete_for_later_pixels() {
 }
 void test_saturated_bridge_index_resolves_pending_pixels_directly() {
  for (int rgba : {10, 11}) {
-  Limit limit(mmltk::log_query::detail::limits.pixel_samples, 2);
-  auto triage = triage_fixture(false);
+  PixelTriageFixture fixture(2, false);
+  auto& triage = fixture.triage;
   for (int transfer : {1, 2}) triage.observe_pixel_chain(pixel_row("forwarded", transfer), true);
   triage.observe_pixel_chain(pixel_row("native", 3), true);
   for (auto boundary : {"import", "mailbox"}) triage.observe_pixel_chain(pixel_row(boundary, 3, rgba), true);
@@ -1185,8 +1194,7 @@ void test_saturated_bridge_index_resolves_pending_pixels_directly() {
   triage.observe_pixel_chain(pixel_row("forwarded", 3), true);
   EQ(triage.pixel_sources.size(), 2U);
   CHECK(triage.pixel_sources_truncated);
-  FALSE(triage.pixel_pending);
-  EQ(triage.pixel_pending_count, 0U);
+  expect_no_pending_pixels(triage);
   triage.finalize_pixel_chain(true);
   EQ(stages(only(triage.pixel_samples).second), (std::set<std::string>{"native", "import", "mailbox"}));
   EQ(projected_set(findings(triage), [](auto& f) { return f.kind; }), rgba != 10 ? std::set<std::string>{"pixel-chain-divergence"} : std::set<std::string>{});
@@ -1229,8 +1237,7 @@ void test_missing_pixel_finalization_respects_finding_and_anchor_budgets() {
    EQ(triage.pixel_pending_count, 70U);
    triage.finalize_pixel_chain(emit);
   }
-  FALSE(triage.pixel_pending);
-  EQ(triage.pixel_pending_count, 0U);
+  expect_no_pending_pixels(triage);
   if (emit) {
    EQ(triage.findings.size(), 64U);
    CHECK(note(triage, "Finding inventory capped"));
@@ -2325,20 +2332,23 @@ std::vector<fs::path> matching_files(const fs::path& root, std::string_view pref
  return result;
 }
 using Environment = support::ScopedEnvironment;
+void unset_wrapper_environment(support::RunOptions& options) {
+ for (char** entry = ::environ; entry && *entry; ++entry) {
+  std::string value(*entry);
+  auto name = value.substr(0, value.find('='));
+  if (name.starts_with("MMLTK_")) options.unset_env.push_back(name);
+ }
+}
 struct WrapperFixture : FileFixture {
  fs::path wrapper;
  support::RunOptions options;
  explicit WrapperFixture(const std::string& script) {
   wrapper = root / "mmltk";
   fs::create_directories(root / "tools");
-  fs::create_symlink(support::executable_path(), wrapper);
+  fs::create_symlink(support::executable_path().parent_path() / "mmltk", wrapper);
   auto docker = write("bin/docker", script);
   fs::permissions(docker, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read | fs::perms::others_exec);
-  for (char** entry = ::environ; entry && *entry; ++entry) {
-   std::string value(*entry);
-   auto name = value.substr(0, value.find('='));
-   if (name.starts_with("MMLTK_")) options.unset_env.push_back(name);
-  }
+  unset_wrapper_environment(options);
   options.env["MMLTK_DOCKER_CONTAINER"] = "host";
   options.env["PATH"] = docker.parent_path().string() + ":" + support::env("PATH");
   options.cwd = root;
@@ -2414,30 +2424,47 @@ public:
   return *result;
  }
 };
+class FileNotifications {
+ support::FileDescriptor notifications{::inotify_init1(IN_CLOEXEC)};
+
+public:
+ FileNotifications(const fs::path& path, std::uint32_t mask) {
+  CHECK(notifications.get() >= 0);
+  CHECK(::inotify_add_watch(notifications.get(), path.c_str(), mask) >= 0);
+ }
+ bool wait(int milliseconds) {
+  pollfd watched{notifications.get(), POLLIN, 0};
+  const int result = ::poll(&watched, 1, milliseconds);
+  if (result < 0 && errno == EINTR) return false;
+  CHECK(result > 0);
+  std::array<char, 4096> events{};
+  CHECK(::read(notifications.get(), events.data(), events.size()) > 0);
+  return true;
+ }
+ void wait() {
+  while (!wait(5000)) {}
+ }
+};
 void wait_ready_file(const fs::path& path, int seconds = 5) {
- support::FileDescriptor notifications(::inotify_init1(IN_CLOEXEC));
- CHECK(notifications.get() >= 0);
- CHECK(::inotify_add_watch(notifications.get(), path.parent_path().c_str(), IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO) >= 0);
+ FileNotifications notifications(path.parent_path(), IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO);
  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
  while (!fs::exists(path) || support::read_text(path).empty()) {
   const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
   CHECK(remaining > 0);
-  pollfd watched{notifications.get(), POLLIN, 0};
-  const int result = ::poll(&watched, 1, static_cast<int>(remaining));
-  if (result < 0 && errno == EINTR) continue;
-  CHECK(result > 0);
-  std::array<char, 4096> events{};
-  CHECK(::read(notifications.get(), events.data(), events.size()) > 0);
+  notifications.wait(static_cast<int>(remaining));
  }
 }
-void test_help_documents_grammar_and_wrapper_shell_syntax_is_valid() {
+void test_help_documents_grammar_and_native_wrapper_is_executable() {
  FileFixture f;
  auto result = f.query({"--help"});
  EQ(result.status, 0);
  includes(result.out, {"Grammar", "--correlate"});
  support::RunOptions options;
  options.capture_stdout = options.capture_stderr = true;
- EQ(support::run({"bash", "-n", (repository() / "mmltk").string()}, options).exit_code, 0);
+ EQ(support::read_text(repository() / "mmltk").substr(0, 4), std::string("\x7f"
+                                                                         "ELF",
+                                                              4));
+ EQ(support::run({"bash", "-n", (repository() / "tools/bootstrap_mmltk.sh").string()}, options).exit_code, 0);
 }
 void test_wrapper_retains_both_streams_and_queryable_terminal_status() {
  WrapperFixture f(R"SH(#!/usr/bin/env bash
@@ -2537,13 +2564,13 @@ void send_ready(std::string_view stage, std::string_view owner) {
  auto message = std::string(stage) + ' ' + std::string(owner);
  CHECK(::sendto(channel.get(), message.data(), message.size(), 0, address.get(), sizeof(address.value)) == static_cast<ssize_t>(message.size()));
 }
+std::string option_value(const Strings& args, std::string_view name) {
+ const auto it = std::find(args.begin(), args.end(), name);
+ return it == args.end() || std::next(it) == args.end() ? std::string{} : *std::next(it);
+}
 int runtime_docker(const Strings& args) {
  CHECK(!args.empty());
  const fs::path state = support::env("TEST_RUNTIME_STATE");
- auto option = [&](std::string_view name) {
-  auto it = std::find(args.begin(), args.end(), name);
-  return it == args.end() || std::next(it) == args.end() ? std::string{} : *std::next(it);
- };
  const auto has = [&](std::string_view value) { return std::find(args.begin(), args.end(), value) != args.end(); };
  if (args[0] == "version" || args[0] == "image")
   std::cout << "fixture-image\n";
@@ -2564,7 +2591,7 @@ int runtime_docker(const Strings& args) {
    };
    if (all(filters, matches)) {
     std::cout << path.stem().string();
-    if (contains(option("--format"), ".Label")) std::cout << ' ' << labels["com.mmltk.owner-pid"].get<std::string>() << ' ' << labels["com.mmltk.owner-start"].get<std::string>();
+    if (contains(option_value(args, "--format"), ".Label")) std::cout << ' ' << labels["com.mmltk.owner-pid"].get<std::string>() << ' ' << labels["com.mmltk.owner-start"].get<std::string>();
     std::cout << '\n';
    }
   }
@@ -2572,7 +2599,7 @@ int runtime_docker(const Strings& args) {
   auto path = state / (args.back() + ".json");
   if (!fs::exists(path)) return 1;
   auto labels = support::read_json(path);
-  auto format = option("--format");
+  auto format = option_value(args, "--format");
   for (auto it = labels.begin(); it != labels.end(); ++it)
    if (contains(format, it.key())) std::cout << it.value().get<std::string>() << '\n';
   if (contains(format, "State.Running")) std::cout << "true\n";
@@ -2587,7 +2614,7 @@ int runtime_docker(const Strings& args) {
    send_ready("preparing", labels["com.mmltk.owner-pid"].get<std::string>());
    ::pause();
   }
-  auto path = state / (option("--name") + ".json"), temporary = path;
+  auto path = state / (option_value(args, "--name") + ".json"), temporary = path;
   temporary.replace_extension(".tmp");
   support::write_json(temporary, labels);
   fs::rename(temporary, path);
@@ -2776,14 +2803,10 @@ void test_native_package_inventory_completeness_and_stable_archive_identity() {
 int package_docker(const Strings& args) {
  CHECK(!args.empty());
  const fs::path root = support::env("TEST_PACKAGE_ROOT");
- const auto option = [&](std::string_view name) {
-  const auto it = std::find(args.begin(), args.end(), name);
-  return it == args.end() || std::next(it) == args.end() ? std::string{} : *std::next(it);
- };
  const auto image_file = [&](const std::string& tag) { return root / "images" / (tag + ".json"); };
  const auto identity = "sha256:" + std::string(64, '1');
  if (args[0] == "image") {
-  const auto format = option("--format");
+  const auto format = option_value(args, "--format");
   if (format == "{{.Id}}")
    std::cout << identity << '\n';
   else if (format == "{{.Os}}/{{.Architecture}}")
@@ -2797,7 +2820,7 @@ int package_docker(const Strings& args) {
   std::cout << "Driver: " << (args.at(2) == "default" ? "docker" : "docker-container") << '\n';
  } else if (args[0] == "buildx" && args.at(1) == "build") {
   J labels = J::object();
-  const auto file = fs::path(option("--file")).filename().string();
+  const auto file = fs::path(option_value(args, "--file")).filename().string();
   if (file == "Dockerfile.runtime") labels = support::read_json(image_file("mmltk-runtime-base:latest"));
   for (std::size_t i = 0; i + 1 < args.size(); ++i)
    if (args[i] == "--build-arg") {
@@ -2813,9 +2836,9 @@ int package_docker(const Strings& args) {
   if (file == "Dockerfile.nvidia") labels["payload-mode"] = "extraction";
   if (file == "Dockerfile.toolchain") labels["payload-mode"] = "development";
   if (file == "Dockerfile.runtime-base") labels["payload-mode"] = "runtime";
-  support::write_json(image_file(option("--tag")), labels);
+  support::write_json(image_file(option_value(args, "--tag")), labels);
  } else if (args[0] == "run") {
-  const auto name = option("--name");
+  const auto name = option_value(args, "--name");
   support::write_json(root / "containers" / (name + ".json"), args);
   if (name.ends_with("-build-package")) {
    const auto stage = root / "build/release.next";
@@ -2840,7 +2863,7 @@ struct PackageFixture : WrapperFixture {
    if (entry.path().filename() != "bootstrap_mmltk.sh") fs::create_symlink(entry.path(), root / "tools" / entry.path().filename());
   write("tools/bootstrap_mmltk.sh", "#!/bin/sh\nexit 0\n");
   write("build/tools/.inputs.sha256", "fixture tools\n");
-  fs::create_symlink(support::executable_path(), root / "build/tools/mmltk");
+  fs::create_symlink(support::executable_path().parent_path() / "mmltk", root / "build/tools/mmltk");
   for (const auto* path :
    {"src/entrypoints/desktop/firefox_runtime_build.cmake", "src/entrypoints/desktop/build_firefox_runtime.sh", "src/entrypoints/desktop/firefox_runtime_files.txt",
     "src/frontend/iced/wasm-opt-wrapper"})
@@ -3177,6 +3200,11 @@ void tools_fixture_user(std::string_view identity) {
  EQ(::getuid(), uid);
  EQ(::getgid(), gid);
 }
+support::FileDescriptor tools_lock(const fs::path& root) {
+ support::FileDescriptor lock(::open((root / ".cache/locks/tools.lock").c_str(), O_RDWR | O_CLOEXEC));
+ CHECK(lock.get() >= 0);
+ return lock;
+}
 int tools_docker(const Strings& arguments) {
  CHECK(!arguments.empty());
  const fs::path root = support::env("TEST_BOOTSTRAP_ROOT");
@@ -3226,8 +3254,7 @@ int tools_docker(const Strings& arguments) {
   return root / value.substr(11);
  };
  const auto cache = host_path(environment.at(build ? "MMLTK_TOOLS_BUILD" : "MMLTK_TIDY_BUILD_DIR"));
- support::FileDescriptor lock(::open((root / ".cache/locks/tools.lock").c_str(), O_RDWR | O_CLOEXEC));
- CHECK(lock.get() >= 0);
+ auto lock = tools_lock(root);
  EQ(::flock(lock.get(), LOCK_EX | LOCK_NB), -1);
  EQ(errno, EWOULDBLOCK);
  {
@@ -3263,7 +3290,9 @@ int tools_docker(const Strings& arguments) {
   support::write_json(cache / "compile_commands.json", J::array({{{"file", "/workspace/tools/input.cpp"}}}));
   const auto stage = host_path(environment.at("MMLTK_TOOLS_STAGE"));
   fs::create_directories(stage);
-  fs::create_symlink(support::env("TEST_BOOTSTRAP_BINARY"), stage / "mmltk");
+  fs::copy_file(support::env("TEST_BOOTSTRAP_BINARY"), stage / "mmltk");
+  fs::create_directory_symlink(fs::path(support::env("TEST_BOOTSTRAP_BINARY")).parent_path() / "lib", stage / "lib");
+  fs::create_symlink(support::executable_path(), stage / "mmltk-tests");
  } else
   support::write_text(cache / "tidy-object", "checked\n");
  return 0;
@@ -3277,28 +3306,26 @@ struct NativeToolsFixture : FileFixture {
   fs::create_directories(root / "tools");
   fs::create_directories(root / "docker");
   fs::create_directories(root / "third_party/json/include");
+  fs::create_directory_symlink(support::executable_path().parent_path() / "lib", root / "lib");
   support::write_text(root / "mmltk", support::read_text(repository() / "mmltk"));
   support::write_text(root / "tools/bootstrap_mmltk.sh", support::read_text(repository() / "tools/bootstrap_mmltk.sh"));
   fs::permissions(root / "mmltk", fs::perms::owner_all);
   fs::permissions(root / "tools/bootstrap_mmltk.sh", fs::perms::owner_all);
   for (const auto* path : {"docker/Dockerfile.gcc", "docker/Dockerfile.tools", "tools/input.cpp"}) support::write_text(root / path, "fixture\n");
   support::write_text(root / "docker/nvidia-payload.json", "{\"donor\": \"fixture@sha256:0123456789abcdef\",\n\"cuda_source\": \"/usr/local/cuda-fixture\"}\n");
-  fs::create_symlink(support::executable_path(), root / "native");
+  fs::create_symlink(support::executable_path().parent_path() / "mmltk", root / "native");
   auto docker = write("bin/docker", "#!/bin/sh\nexec " + support::command::shell_invocation(support::command::Command::test_log_query, {"--fixture-tools-docker"}) + " \"$@\"\n");
   auto flock = write("bin/flock", "#!/bin/sh\nif [ -n \"${TEST_TOOLS_ADMISSION:-}\" ] && [ \"$1\" = -x ]; then printf 'waiting\\n' >\"${TEST_TOOLS_ADMISSION}\"; fi\nexec /usr/bin/flock \"$@\"\n");
   for (const auto& path : {docker, flock}) fs::permissions(path, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read | fs::perms::others_exec);
   options.cwd = checkout;
   options.capture_stdout = options.capture_stderr = true;
   options.timeout = std::chrono::seconds(20);
-  for (char** item = ::environ; item && *item; ++item) {
-   std::string entry(*item);
-   auto key = entry.substr(0, entry.find('='));
-   if (key.starts_with("MMLTK_")) options.unset_env.push_back(key);
-  }
+  unset_wrapper_environment(options);
   calls = write("bootstrap-calls", "");
   options.env = {
    {"PATH", docker.parent_path().string() + ':' + support::env("PATH")}, {"PWD", checkout.string()}, {"MMLTK_DOCKER_CONTAINER", "host"}, {"MMLTK_BOOTSTRAP_CAPTURED", "1"},
-   {"MMLTK_USER", std::to_string(::getuid())}, {"TEST_BOOTSTRAP_BINARY", support::executable_path().string()}, {"TEST_BOOTSTRAP_ROOT", root.string()}, {"TEST_BOOTSTRAP_CALLS", calls.string()}
+   {"MMLTK_USER", std::to_string(::getuid())}, {"TEST_BOOTSTRAP_BINARY", (support::executable_path().parent_path() / "mmltk").string()}, {"TEST_BOOTSTRAP_ROOT", root.string()},
+   {"TEST_BOOTSTRAP_CALLS", calls.string()}
   };
  }
  Strings bootstrap(std::string operation = "--ensure") const { return {"bash", (checkout / "tools/bootstrap_mmltk.sh").string(), std::move(operation), checkout.string()}; }
@@ -3313,9 +3340,25 @@ struct NativeToolsFixture : FileFixture {
   if (result.exit_code) throw Failure(result.err);
  }
  void initialize() const { succeeded(run(bootstrap())); }
+ void require_unavailable_diagnostic() const {
+  const auto result = run(plus(bootstrap("--launch"), {"--logs", "--help"}));
+  EQ(result.exit_code, 1);
+  HAS(result.err, "diagnostic did not build or pull");
+ }
+ support::RunOptions holding_options(const std::string& stage, const fs::path& ready) const {
+  auto settings = options;
+  settings.env["TEST_TOOLS_HOLD"] = stage;
+  settings.env["TEST_TOOLS_READY"] = ready.string();
+  return settings;
+ }
  void release(Child& child) const {
   const std::string text = "continue\n";
   EQ(::write(child.input.get(), text.data(), text.size()), static_cast<ssize_t>(text.size()));
+ }
+ void complete_queued(Child& owner, Child& waiter) const {
+  release(owner);
+  EQ(owner.wait(20), 0);
+  EQ(waiter.wait(20), 0);
  }
 };
 void test_bootstrap_atomic_publication_concurrency_and_spaces() {
@@ -3324,9 +3367,7 @@ void test_bootstrap_atomic_publication_concurrency_and_spaces() {
  auto& options = f.options;
  const auto& calls = f.calls;
  const auto command = f.bootstrap();
- auto readonly = support::run({(root / "mmltk").string(), "--logs", "--help"}, options);
- EQ(readonly.exit_code, 1);
- HAS(readonly.err, "diagnostic did not build or pull");
+ f.require_unavailable_diagnostic();
  CHECK(support::read_text(calls).empty());
  auto cold = support::run(command, options);
  if (cold.exit_code) throw Failure(cold.err);
@@ -3337,9 +3378,7 @@ void test_bootstrap_atomic_publication_concurrency_and_spaces() {
  EQ(support::run(command, options).exit_code, 0);
  EQ(support::lines(support::read_text(calls)).size(), 1U);
  support::write_text(root / "tools/input.cpp", "changed\n");
- const auto stale = support::run({(root / "mmltk").string(), "--logs", "--help"}, options);
- EQ(stale.exit_code, 1);
- HAS(stale.err, "diagnostic did not build or pull");
+ f.require_unavailable_diagnostic();
  EQ(support::lines(support::read_text(calls)).size(), 1U);
  options.env["TEST_BOOTSTRAP_FAILURE"] = "1";
  EQ(support::run(command, options).exit_code, 43);
@@ -3355,7 +3394,7 @@ void test_bootstrap_atomic_publication_concurrency_and_spaces() {
  support::write_text(root / "tools/input.cpp", "interrupted generation\n");
  const auto ready = f.write("bootstrap-ready", "");
  options.env["TEST_BOOTSTRAP_READY"] = ready.string();
- Child cancelled({(root / "mmltk").string(), "--tool", "runtime-package", "--", "inventory"}, options, f.root / "cancelled.log");
+ Child cancelled(plus(f.bootstrap("--launch"), {"--tool", "runtime-package", "--", "inventory"}), options, f.root / "cancelled.log");
  wait_ready_file(ready);
  const auto client = static_cast<pid_t>(std::stoi(support::read_text(ready)));
  EQ(::kill(cancelled.pid(), SIGTERM), 0);
@@ -3365,42 +3404,21 @@ void test_bootstrap_atomic_publication_concurrency_and_spaces() {
  EQ(errno, ESRCH);
  EQ(std::distance(fs::directory_iterator(root / "build/.tools-generations"), fs::directory_iterator{}), 2);
 }
-class ToolsLockOpen {
- support::FileDescriptor notifications{::inotify_init1(IN_CLOEXEC)};
-
-public:
- explicit ToolsLockOpen(const NativeToolsFixture& fixture) {
-  CHECK(notifications.get() >= 0);
-  CHECK(::inotify_add_watch(notifications.get(), (fixture.checkout / ".cache/locks/tools.lock").c_str(), IN_OPEN) >= 0);
- }
- void wait() {
-  pollfd watch{notifications.get(), POLLIN, 0};
-  int result;
-  do { result = ::poll(&watch, 1, 5000); } while (result < 0 && errno == EINTR);
-  CHECK(result > 0);
-  std::array<char, 4096> events{};
-  CHECK(::read(notifications.get(), events.data(), events.size()) > 0);
- }
-};
 void test_tools_tidy_waits_for_bootstrap_database_publication() {
  NativeToolsFixture f;
  f.initialize();
  const auto prior = fs::read_symlink(f.checkout / "build/tools");
- auto settings = f.options;
  const auto ready = f.write("build-ready", "");
- settings.env["TEST_TOOLS_HOLD"] = "build";
- settings.env["TEST_TOOLS_READY"] = ready.string();
+ auto settings = f.holding_options("build", ready);
  Child build(f.bootstrap("--build"), settings, f.root / "build.log", true);
  wait_ready_file(ready);
  EQ(support::read_text(f.checkout / ".cache/cmake/tools/compile_commands.json"), "[");
- ToolsLockOpen admission(f);
+ FileNotifications admission(f.checkout / ".cache/locks/tools.lock", IN_OPEN);
  Child tidy(f.native({"--tidy-tools", "--file", "tools/input.cpp"}), f.options, f.root / "tidy.log");
  admission.wait();
  EQ(f.invocations().size(), 2U);
  FALSE(tidy.poll());
- f.release(build);
- EQ(build.wait(20), 0);
- EQ(tidy.wait(20), 0);
+ f.complete_queued(build, tidy);
  EQ(f.invocations().back()["kind"], "tidy");
  NE(fs::read_symlink(f.checkout / "build/tools"), prior);
  CHECK(fs::exists(f.checkout / "build" / prior / "mmltk"));
@@ -3410,10 +3428,8 @@ void test_bootstrap_waits_for_tidy_recomputes_inputs_and_shares_cache_subroots()
  for (const auto* cache : {".cache", ".cache/alternate"}) {
   NativeToolsFixture f;
   f.initialize();
-  auto settings = f.options;
   const auto ready = f.write("tidy-ready", ""), queued = f.write("build-waiting", "");
-  settings.env["TEST_TOOLS_HOLD"] = "tidy";
-  settings.env["TEST_TOOLS_READY"] = ready.string();
+  auto settings = f.holding_options("tidy", ready);
   Child tidy(f.native({"--tidy-tools"}), settings, f.root / "tidy.log", true);
   wait_ready_file(ready);
   settings = f.options;
@@ -3424,9 +3440,7 @@ void test_bootstrap_waits_for_tidy_recomputes_inputs_and_shares_cache_subroots()
   EQ(f.invocations().size(), 2U);
   // This write represents the formatter inside the held tools-stage interval.
   support::write_text(f.checkout / "tools/input.cpp", "formatted while bootstrap waited\n");
-  f.release(tidy);
-  EQ(tidy.wait(20), 0);
-  EQ(build.wait(20), 0);
+  f.complete_queued(tidy, build);
   EQ(f.invocations().back()["kind"], "build");
   EQ(f.invocations().back()["cache"], (f.checkout / cache / "cmake/tools").string());
   const auto published = fs::read_symlink(f.checkout / "build/tools");
@@ -3445,10 +3459,8 @@ void test_tools_lock_wait_cancellation_and_failure_release() {
  NativeToolsFixture f;
  f.initialize();
  const auto prior = fs::read_symlink(f.checkout / "build/tools");
- auto settings = f.options;
  const auto ready = f.write("writer-ready", ""), queued = f.write("waiter-ready", "");
- settings.env["TEST_TOOLS_HOLD"] = "build";
- settings.env["TEST_TOOLS_READY"] = ready.string();
+ auto settings = f.holding_options("build", ready);
  settings.env["TEST_TOOLS_FAILURE"] = "build";
  Child writer(f.bootstrap("--build"), settings, f.root / "writer.log", true);
  wait_ready_file(ready);
@@ -3459,7 +3471,7 @@ void test_tools_lock_wait_cancellation_and_failure_release() {
  EQ(::kill(bootstrap.pid(), SIGTERM), 0);
  EQ(bootstrap.wait(10), 143);
  {
-  ToolsLockOpen admission(f);
+  FileNotifications admission(f.checkout / ".cache/locks/tools.lock", IN_OPEN);
   Child tidy(f.native({"--tidy-tools", "--file", "tools/input.cpp"}), f.options, f.root / "tidy-wait.log");
   admission.wait();
   EQ(::kill(tidy.pid(), SIGTERM), 0);
@@ -3481,9 +3493,7 @@ void test_tools_lock_wait_cancellation_and_failure_release() {
  support::write_text(ready, "");
  support::write_text(queued, "");
  const auto cleanup = f.write("cleanup-ready", "");
- settings = f.options;
- settings.env["TEST_TOOLS_HOLD"] = "tidy";
- settings.env["TEST_TOOLS_READY"] = ready.string();
+ settings = f.holding_options("tidy", ready);
  settings.env["TEST_TOOLS_CLEANUP_READY"] = cleanup.string();
  Child cancelled(f.native({"--tidy-tools"}), settings, f.root / "tidy-cancel.log", true);
  wait_ready_file(ready);
@@ -3503,8 +3513,7 @@ void test_tools_lock_wait_cancellation_and_failure_release() {
 int tools_handoff_state() {
  const fs::path root = support::env("TEST_BOOTSTRAP_ROOT");
  check_tools_handoff_consumed(root);
- support::FileDescriptor lock(::open((root / ".cache/locks/tools.lock").c_str(), O_RDWR | O_CLOEXEC));
- CHECK(lock.get() >= 0);
+ auto lock = tools_lock(root);
  EQ(::flock(lock.get(), LOCK_EX | LOCK_NB), 0);
  FALSE(fs::exists(root / ".cache/locks/checkout.lock"));
  return 0;
@@ -3521,13 +3530,14 @@ void test_tools_cold_root_ownership_handoff() {
  for (const bool internal : {false, true}) {
   NativeToolsFixture f;
   fs::permissions(f.root, permission);
+  EQ(::chown(f.checkout.c_str(), uid, gid), 0);
   fs::permissions(f.checkout / "mmltk", permission);
   fs::permissions(f.checkout / "tools/bootstrap_mmltk.sh", permission);
   fs::permissions(f.calls, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::group_write | fs::perms::others_read | fs::perms::others_write);
   f.options.env["MMLTK_USER"] = internal ? "nobody" : std::to_string(uid);
   f.options.env["MMLTK_CACHE_ROOT"] = ".cache/selected/tools-owner";
   const auto cache = f.checkout / ".cache/selected/tools-owner/cmake/tools";
-  const auto launch = plus({(f.checkout / "mmltk").string()}, internal ? Strings{"--tool", "test-log-query", "--", "--fixture-tools-state"} : Strings{"--tidy-tools"});
+  const auto launch = plus(f.bootstrap("--launch"), internal ? Strings{"--tool", "test-log-query", "--", "--fixture-tools-state"} : Strings{"--tidy-tools"});
   f.succeeded(f.run(launch));
   auto owner = [&](const fs::path& path, uid_t expected_uid, gid_t expected_gid) {
    struct stat metadata{};
@@ -4647,7 +4657,7 @@ constexpr Case cases[]{
  {"FileQueryTests.test_projection_preserves_provenance_and_uint64", test_projection_preserves_provenance_and_uint64},
  {"FileQueryTests.test_error_filter_strict_mode_and_exit_statuses", test_error_filter_strict_mode_and_exit_statuses},
  {"FileQueryTests.test_summary_groups_are_deterministic_and_cardinality_is_bounded", test_summary_groups_are_deterministic_and_cardinality_is_bounded},
- {"FileQueryTests.test_help_documents_grammar_and_wrapper_shell_syntax_is_valid", test_help_documents_grammar_and_wrapper_shell_syntax_is_valid},
+ {"FileQueryTests.test_help_documents_grammar_and_native_wrapper_is_executable", test_help_documents_grammar_and_native_wrapper_is_executable},
  {"FileQueryTests.test_wrapper_retains_both_streams_and_queryable_terminal_status", test_wrapper_retains_both_streams_and_queryable_terminal_status},
  {"FileQueryTests.test_fresh_all_stops_registered_tests_and_orphans_but_preserves_other_owners", test_fresh_all_stops_registered_tests_and_orphans_but_preserves_other_owners},
  {"FileQueryTests.test_gui_launch_replaces_runtime_sessions_and_preserves_other_owners", test_gui_launch_replaces_runtime_sessions_and_preserves_other_owners},
@@ -4729,10 +4739,7 @@ int mmltk::log_query::test_entry(int argc, char** argv) {
    std::cout << "ready" << std::endl;
    for (;;) ::pause();
   }
-  if (argc == 2 && std::string_view(argv[1]) == "--list-tests") {
-   for (const auto& test : cases) std::cout << test.name << '\n';
-   return 0;
-  }
+  if (argc == 2 && std::string_view(argv[1]) == "--list-tests") return support::testing::list_cases(cases);
   const bool tools_ownership = argc == 2 && std::string_view(argv[1]) == "--tools-ownership";
   std::size_t failed = 0, ran = 0;
   for (const auto& test : cases) {

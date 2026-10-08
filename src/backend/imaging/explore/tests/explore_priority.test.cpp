@@ -621,6 +621,7 @@ TEST_CASE("Explore cropped detail clips exterior edges without painting survivin
  CHECK(combined.pixels == masks.pixels);
 }
 TEST_CASE("current focus and viewport precede cursor residency", "[backend][imaging][explore]") {
+ // CLEANUP-IGNORE: The same literal order is an independent input to focus and atlas-prefix tests with different viewport and capacity expectations.
  constexpr std::array<std::uint32_t, 8U> kOrder{10U, 11U, 12U, 13U, 14U, 15U, 16U, 17U};
  std::array<std::uint32_t, kOrder.size()> output{};
  const std::size_t count = prioritize_explore_work(kOrder, ExploreViewport{.first_row = 1U, .row_count = 1U, .columns = 2U}, 15U, 4U, output);
@@ -628,6 +629,7 @@ TEST_CASE("current focus and viewport precede cursor residency", "[backend][imag
  CHECK((output == std::array<std::uint32_t, 8U>{15U, 12U, 13U, 14U, 16U, 17U, 10U, 11U}));
 }
 TEST_CASE("atlas target prefix retains exact visible slot order", "[backend][imaging][explore]") {
+ // CLEANUP-IGNORE: The same literal order is an independent input to focus and atlas-prefix tests with different viewport and capacity expectations.
  constexpr std::array<std::uint32_t, 8U> kOrder{10U, 11U, 12U, 13U, 14U, 15U, 16U, 17U};
  std::array<std::uint32_t, kOrder.size()> output{};
  const std::size_t count = prioritize_explore_work(kOrder, ExploreViewport{.first_row = 1U, .row_count = 2U, .columns = 2U}, std::nullopt, 6U, output);
@@ -670,6 +672,7 @@ TEST_CASE("Explore fixed storage retries every retained leaf and preserves the f
    INFO("leaf=" << selected << " failure=" << static_cast<int>(status));
    HighWaterReleaseProbe probe;
    NativeExploreStorageTestAccess::Storage storage;
+   // CLEANUP-IGNORE: Bind and leaf enumeration expose storage under test before different allocation sizes and first-release-failure oracles; the subsequent cleanup paths differ.
    storage.Bind(probe.api());
    const auto leaves = NativeExploreStorageTestAccess::Leaves(storage);
    for (auto* leaf : leaves) REQUIRE(leaf->ensure_bytes(16U));
@@ -698,6 +701,7 @@ TEST_CASE("Explore fixed storage retries every retained leaf and preserves the f
   }
  }
  HighWaterReleaseProbe probe;
+ // CLEANUP-IGNORE: Bind and leaf enumeration expose storage under test before different allocation sizes and first-release-failure oracles; the subsequent cleanup paths differ.
  inventory.Bind(probe.api());
  const auto leaves = NativeExploreStorageTestAccess::Leaves(inventory);
  for (auto* leaf : leaves) REQUIRE(leaf->ensure_bytes(8U));
@@ -762,8 +766,11 @@ TEST_CASE("Explore CUDA atlas and detail preserve pixels, padding, and bilinear 
           {.tile_count = 1U, .tile_capacity = 1U, .max_tile_width = kCardExtent, .max_tile_height = kCardExtent, .viewport_generation = 7U}, {.class_count = 1U, .show_boxes = 0U, .show_masks = 0U},
           scratch, target, stream.address()) == kExploreStorageSuccess);
  std::array<std::array<std::uint8_t, 4U>, kCardExtent * kCardExtent> pixels{};
- REQUIRE(cudaMemcpyAsync(pixels.data(), target_device.data(), pixels.size() * 4U, cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
- REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+ const auto read_pixels = [&] {
+  REQUIRE(cudaMemcpyAsync(pixels.data(), target_device.data(), pixels.size() * 4U, cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+ };
+ read_pixels();
  if (ramp) {
   // At destination (1,2), source (x,y)=(.25,.75). The red
   // corner contributes .25*(1-.75)=.0625, rounded to 16.
@@ -774,8 +781,7 @@ TEST_CASE("Explore CUDA atlas and detail preserve pixels, padding, and bilinear 
   REQUIRE(render_explore_detail(
            {.pixels = static_cast<const float*>(source_device.data()), .source_width = source_width, .source_height = kSourceHeight, .crop_width = source_width, .crop_height = kSourceHeight},
            {.show_boxes = 0U, .show_masks = 0U}, scratch, target, stream.address()) == kExploreStorageSuccess);
-  REQUIRE(cudaMemcpyAsync(pixels.data(), target_device.data(), pixels.size() * 4U, cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
-  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+  read_pixels();
   CHECK(pixels == atlas_pixels);
  } else {
   for (std::uint32_t x = 0U; x != kCardExtent; ++x) {
@@ -857,6 +863,7 @@ TEST_CASE("Explore CUDA masks admit checked RLE and produce semantic composition
  ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U};
  const std::array runs{mmltk::backend::data::RLEPair{.start = 5U, .length = 1U}};
  std::array classes{ExploreRenderClassDescriptor{}};
+ // CLEANUP-IGNORE: Repeated calls exercise distinct transformed mask geometry and explicit coordinate expectations.
  const auto visible = oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes);
  CHECK(visible.nonzero_alpha == 1U);
  CHECK(visible.pixels[5U][3U] == 92U);
@@ -873,6 +880,7 @@ TEST_CASE("Explore CUDA masks admit checked RLE and produce semantic composition
  annotation.rle_offset = 0U;
  annotation.inverse[0] = -1.0F;
  annotation.inverse[2] = 1.0F;
+ // CLEANUP-IGNORE: Repeated calls exercise distinct transformed mask geometry and explicit coordinate expectations.
  const auto transformed = oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes);
  CHECK(transformed.nonzero_alpha == 1U);
  CHECK(transformed.pixels[6U][3U] == 92U);

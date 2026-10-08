@@ -261,22 +261,14 @@ bool present(const Json& j) { return !missing(j) && !j.is_null() && !(j.is_strin
 std::string python_repr(const Json& value) {
  if (value.is_string()) {
   const auto text = value.get<std::string>();
-  const char quote = text.find('\'') != std::string::npos && text.find('"') == std::string::npos ? '"' : '\'';
+  const char quote = mmltk::tools::text::repr_quote(text);
   std::string result(1, quote);
   auto unicode = icu::UnicodeString::fromUTF8(text);
   for (int32_t i = 0; i < unicode.length();) {
    auto c = unicode.char32At(i);
    i += U16_LENGTH(c);
-   if (c == quote || c == '\\') {
-    result += '\\';
-    result += static_cast<char>(c);
-   } else if (c == '\n')
-    result += "\\n";
-   else if (c == '\r')
-    result += "\\r";
-   else if (c == '\t')
-    result += "\\t";
-   else if (c != 0x20 && !u_isprint(c)) {
+   if (mmltk::tools::text::append_repr_escape(result, static_cast<std::uint32_t>(c), quote)) continue;
+   if (c != 0x20 && !u_isprint(c)) {
     std::ostringstream escaped;
     escaped << (c <= 0xff ? "\\x" : c <= 0xffff ? "\\u" : "\\U") << std::hex << std::setfill('0') << std::setw(c <= 0xff ? 2 : c <= 0xffff ? 4 : 8) << static_cast<std::uint32_t>(c);
     result += escaped.str();

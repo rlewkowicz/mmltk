@@ -1,3 +1,4 @@
+#include "src/common/io/poll.h"
 #include "audit_facts.h"
 #include "session.h"
 #include "src/backend/imaging/explore/tests/explore_dataset_fixture.h"
@@ -399,8 +400,7 @@ private:
    {.fd = process.pidfd(), .events = POLLIN, .revents = 0},
    {.fd = deadline, .events = POLLIN, .revents = 0},
   }};
-  int ready = -1;
-  do { ready = ::poll(descriptors.data(), descriptors.size(), -1); } while (ready < 0 && errno == EINTR);
+  const int ready = mmltk::common::io::poll_descriptors(descriptors);
   if (ready < 0) throw std::runtime_error("failed to await packaged browser shutdown");
   if ((descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) return process.reap();
   if ((descriptors[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
@@ -597,8 +597,7 @@ int WaylandSession::PollEvents(std::array<pollfd, 4U>& events) const {
   {.fd = deadline.get(), .events = POLLIN, .revents = 0},
  }};
  // CLEANUP-IGNORE: Wayland waits on its own four descriptors and returns status; subprocess capture has different failure policy.
- int ready = -1;
- do { ready = ::poll(events.data(), events.size(), -1); } while (ready < 0 && errno == EINTR);
+ const int ready = mmltk::common::io::poll_descriptors(events);
  return ready;
 }
 void WaylandSession::RunWorkflows() {
@@ -839,6 +838,12 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  };
  const auto report_artifacts = [&] {
   std::cerr << "\nnative diagnostics:\n" << read_tail(diagnostics) << "\nnative runtime log:\n" << read_tail(runtime_log) << "\nFirefox diagnostics:\n" << read_tail(firefox_log) << '\n';
+ };
+ const auto report_native_terminal = [&] {
+  report_artifacts();
+  std::cerr << std::flush;
+  const int terminal = process.reap();
+  std::cerr << "native host terminal status: " << process_status_text(terminal) << '\n' << std::flush;
  };
  bool exited_early = false;
  bool released_one_lane = false;
@@ -1162,10 +1167,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    if (terminal_failure_observed) {
     std::cerr << "workspace-wayland native host settled after a terminal integration failure";
     record_acceptance_state("acceptance.failure_settlement.completed", true);
-    report_artifacts();
-    std::cerr << std::flush;
-    const int terminal = process.reap();
-    std::cerr << "native host terminal status: " << process_status_text(terminal) << '\n' << std::flush;
+    report_native_terminal();
     FAIL("workspace Wayland product reported a terminal integration failure");
    }
    const bool terminal_window_close = termination == TerminationMode::WindowClose && native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) && !native.active_peer();
@@ -1173,10 +1175,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    if (exited_early) {
     std::cerr << "workspace-wayland child exited before readiness";
     record_acceptance_state("acceptance.readiness.blocked", true);
-    report_artifacts();
-    std::cerr << std::flush;
-    const int terminal = process.reap();
-    std::cerr << "native host terminal status: " << process_status_text(terminal) << '\n' << std::flush;
+    report_native_terminal();
    }
    break;
   }

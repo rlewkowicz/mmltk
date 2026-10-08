@@ -1,3 +1,4 @@
+#include "src/common/io/poll.h"
 #include "src/common/io/event_fd.h"
 #include <poll.h>
 #include <unistd.h>
@@ -7,6 +8,7 @@ namespace mmltk::common::io {
 bool signal_event_fd(const int descriptor) noexcept {
  if (descriptor < 0) return false;
  constexpr std::uint64_t value = 1U;
+ // CLEANUP-IGNORE: The external fixture requires a physical eventfd write; production wakeup separately accepts an already saturated counter.
  ssize_t written = -1;
  do { written = ::write(descriptor, &value, sizeof(value)); } while (written < 0 && errno == EINTR);
  return written == static_cast<ssize_t>(sizeof(value)) || (written < 0 && errno == EAGAIN);
@@ -19,8 +21,7 @@ CounterRead read_counter_fd(const int descriptor) noexcept {
 }
 EventFdWait wait_event_fd(const int descriptor) noexcept {
  pollfd readiness{.fd = descriptor, .events = POLLIN, .revents = 0};
- int poll_result = -1;
- do { poll_result = ::poll(&readiness, 1U, -1); } while (poll_result < 0 && errno == EINTR);
+ const int poll_result = mmltk::common::io::poll_descriptors({&readiness, 1U});
  if (poll_result != 1 || (readiness.revents & POLLIN) == 0) return {EventFdWaitStatus::WaitFailed, 0U};
  const auto result = read_counter_fd(descriptor);
  return result.bytes == static_cast<ssize_t>(sizeof(result.count)) ? EventFdWait{EventFdWaitStatus::Woken, result.count} : EventFdWait{EventFdWaitStatus::ReadFailed, 0U};

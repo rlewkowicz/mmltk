@@ -87,4 +87,9 @@ private:
  request.document = test_document({}).document->facts();
  return request;
 }
+inline void start_upscale_and_wait(UpscaleSystem& system, EventGate& events, UpscaleRequest request, bool require_input = false) {
+ const auto input = request.source;
+ static_cast<void>(system.Start(test_upscale_request(std::move(request))));
+ REQUIRE(events.Wait([&] { return system.snapshot().ready && (!require_input || system.snapshot().input == input); }));
+}
 }  // namespace mmltk::controller::visual_test_support

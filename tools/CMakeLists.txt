@@ -12,7 +12,9 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "${MMLTK_TOOLS_REPOSITORY}/build/tools" CACHE PATH "Published native tools" FORCE)
 endif()
 
-option(MMLTK_TOOLS_BUILD_DRIVER "Build the standalone driver and native fixtures" ON)
+option(MMLTK_TOOLS_BUILD_DRIVER "Build the standalone driver" ON)
+option(MMLTK_TOOLS_OPTIMIZE_SIZE "Optimize standalone Release executables for size" ON)
+set(MMLTK_TOOLS_HOST_LIBRARY_DIR "build/tools/lib" CACHE STRING "Runtime library directory relative to the host executable")
 option(MMLTK_TOOLS_BUILD_ORACLE "Build the oracle in the pinned CPython donor environment" OFF)
 option(MMLTK_TOOLS_BUILD_WESTON_SEAT "Build the Weston 13 validation plugin" OFF)
 include(cmake/RuntimeClosure.cmake)
@@ -91,7 +93,7 @@ if(MMLTK_TOOLS_BUILD_DRIVER)
     PRIVATE FILE_SET internal_modules TYPE CXX_MODULES FILES
         log_query_internal.cpp
         tests/test_log_query.cpp)
-    target_sources(mmltk_tool_modules PRIVATE tool_dispatch.cpp log_query_runtime.cpp)
+    target_sources(mmltk_tool_modules PRIVATE log_query_runtime.cpp)
     target_link_libraries(mmltk_tool_modules PUBLIC mmltk_tool_support
         Boost::headers tomlplusplus::tomlplusplus ICU::uc ICU::i18n PkgConfig::PCRE2 LibArchive::LibArchive ${CMAKE_DL_LIBS})
     # CUDA, Vulkan and NUMA contribute declarations only. Runtime observation
@@ -100,10 +102,19 @@ if(MMLTK_TOOLS_BUILD_DRIVER)
         "${MMLTK_TOOLS_CUDA_INCLUDE_DIR}"
         "${MMLTK_TOOLS_NUMA_INCLUDE_DIR}"
         "${MMLTK_TOOLS_VULKAN_INCLUDE_DIR}")
-    add_executable(mmltk mmltk.cpp)
+    add_executable(mmltk mmltk.cpp tool_dispatch.cpp)
     mmltk_tools_configure_target(mmltk)
     target_link_libraries(mmltk PRIVATE mmltk_tool_modules)
     mmltk_tools_install_runtime(mmltk)
+
+    # Fixture objects share the production module archive but are referenced
+    # only by this runner, so the release driver contains no fixture code.
+    add_executable(mmltk_tool_tests tests/tool_main.cpp tool_dispatch.cpp)
+    mmltk_tools_configure_target(mmltk_tool_tests)
+    target_compile_definitions(mmltk_tool_tests PRIVATE MMLTK_TOOL_FIXTURES=1)
+    target_link_libraries(mmltk_tool_tests PRIVATE mmltk_tool_modules)
+    set_target_properties(mmltk_tool_tests PROPERTIES OUTPUT_NAME mmltk-tests)
+    mmltk_tools_install_runtime(mmltk_tool_tests)
 endif()
 
 if(MMLTK_TOOLS_BUILD_ORACLE)

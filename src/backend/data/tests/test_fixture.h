@@ -21,6 +21,7 @@ namespace parquet {
 class ArrowWriterProperties;
 class WriterProperties;
 }  // namespace parquet
+struct archive_entry;
 namespace mmltk::backend::data {
 struct ImageEntry;
 struct FileHeader;
@@ -32,6 +33,7 @@ class IndexingProgressTotals;
 struct PreparedBenchmarkSplit;
 struct EncodedImageRecord;
 struct BenchmarkWriteRequest;
+struct DownloadRequest;
 struct BenchmarkLabelChunk;
 class NormalizedAnnotationReadView;
 }  // namespace benchmark_internal
@@ -40,6 +42,10 @@ namespace mmltk::backend::data::testsupport {
 // Arrow/Parquet definitions remain implementation dependencies for consumers
 // that only need ordinary profile fixtures. Malformed-schema tests opt in.
 void arrow_ok(const arrow::Status&);
+void check_normal_compile_storage(const detail::CompileExecution&, std::uint64_t locked_bytes);
+void check_compile_records_drained(const detail::CompileExecution&);
+void check_compile_inputs_drained(const detail::CompileExecution&);
+void set_private_archive_entry(archive_entry*, std::size_t bytes);
 [[nodiscard]] std::shared_ptr<arrow::DataType> coconut_parquet_segment_type(bool integer_area);
 [[nodiscard]] std::shared_ptr<arrow::Schema> coconut_parquet_schema(bool integer_area = false);
 void write_coconut_parquet(const std::filesystem::path&, const nlohmann::json&, std::shared_ptr<arrow::Schema> = {}, std::int64_t group_rows = 1, std::shared_ptr<parquet::ArrowWriterProperties> = {},
@@ -84,6 +90,7 @@ void bind_benchmark_slots(benchmark_internal::BenchmarkCompilePipeline&, benchma
 // The returned task runs the writer's actual decode/resize/store kernel.
 [[nodiscard]] detail::CompileExecution::Task prepare_benchmark_pixel(benchmark_internal::BenchmarkCompilePipeline&, benchmark_internal::BenchmarkSplitWriter&, std::uint32_t slot = 0);
 [[nodiscard]] ImageEntry benchmark_entry(const benchmark_internal::EncodedImageRecord&);
+void seed_partial_benchmark_download(const benchmark_internal::DownloadRequest&, std::span<const std::uint8_t>);
 void write_benchmark_fixture(const benchmark_internal::BenchmarkWriteRequest&, std::span<const std::shared_ptr<benchmark_internal::BenchmarkLabelChunk>>);
 struct FixtureSpec {
  std::string root_dir;
@@ -101,6 +108,7 @@ std::string compiled_bin_path(const FixtureSpec& spec);
 void create_synthetic_dataset(const FixtureSpec& spec);
 [[nodiscard]] CompilerConfig compiler_config(const FixtureSpec& spec);
 void compile_existing_fixture(const FixtureSpec& spec);
+[[nodiscard]] std::vector<RLEPair> alternating_mask_runs(std::size_t count);
 void replace_synthetic_image(const FixtureSpec& spec, int image_index, int width, int height);
 std::vector<float> expected_nchw_stub(const std::string& path, int width, int height);
 // Retained compiler algorithm: RGB8 resize, then the public planar converter.

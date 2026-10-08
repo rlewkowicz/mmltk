@@ -774,6 +774,25 @@ TEST_CASE("rendered_probe_audit_rejects_mismatched_identity", "[workspace_waylan
  record.erase("slot");
  return record;
 }
+void complete_surface_draw(SurfaceAudit& audit) {
+ for (const auto* event : {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.surface.draw_submitted", "iced.frame.draw_settled"}) audit.browser(browser_surface_record(event));
+}
+void retire_surface_source(SurfaceAudit& audit) {
+ for (const auto* event : {"presentation.source.withdrawal", "presentation.source.retirement"}) audit.native(native_surface_record(event));
+ for (const auto* event : {"firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}) audit.browser(browser_surface_record(event));
+}
+void settle_surface_scenario(SurfaceAudit& audit) {
+ REQUIRE(audit.evidence_settled());
+ audit.SettleScenario();
+ CHECK(audit.surfaces.empty());
+}
+auto direct_native_records(SurfaceAudit& audit, bool direct) {
+ return [&audit, direct](const char* event) {
+  auto record = native_surface_record(event);
+  record["direct_sampling"] = direct;
+  audit.native(record);
+ };
+}
 constexpr std::array native_surface_events{
  "presentation.arena.advertised", "presentation.admission.enqueued", "presentation.admission.written", "presentation.import.outcome", "presentation.source.admission.enqueued",
  "presentation.source.admission.written", "presentation.source.ready", "presentation.source_borrow.started", "presentation.source_borrow.completed", "presentation.source.read_submitted",
@@ -875,6 +894,7 @@ TEST_CASE("Image metadata stays paired with its acquired pixels through retained
  REQUIRE(audit.evidence_settled());
  audit.SettleScenario();
  for (const auto* event : {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.surface.draw_submitted", "iced.frame.draw_settled"}) audit.browser(browser_surface_record(event));
+ // CLEANUP-IGNORE: Evidence settlement and lookup expose different custody, metadata and release-only audit outcomes; the audit and key factories are already shared.
  REQUIRE(audit.evidence_settled());
  const auto& surface = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
  REQUIRE(surface.custody.at(1U).metadata.has_value());
@@ -953,18 +973,13 @@ TEST_CASE("scenario settlement retains physical reuse and waits for independent 
  REQUIRE(audit.surfaces.contains(id));
  CHECK(audit.surfaces.at(id).publications == publications);
  CHECK(audit.draws.empty());
- audit.browser(browser_surface_record("iced.surface.sample_draw_selected"));
- audit.browser(browser_surface_record("iced.surface.draw_encoded"));
- audit.browser(browser_surface_record("iced.surface.draw_submitted"));
- audit.browser(browser_surface_record("iced.frame.draw_settled"));
+ complete_surface_draw(audit);
  CHECK(audit.evidence_settled());
  CHECK(audit.draws.size() == 1U);
  for (std::size_t stage = 15U; stage < native_surface_events.size(); ++stage) audit.native(native_surface_record(native_surface_events[stage]));
  CHECK_FALSE(audit.evidence_settled());
  for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage) audit.browser(browser_surface_record(browser_surface_events[stage]));
- REQUIRE(audit.evidence_settled());
- audit.SettleScenario();
- CHECK(audit.surfaces.empty());
+ settle_surface_scenario(audit);
  CHECK(audit.failure.empty());
 }
 TEST_CASE("terminal reads require exact positive completion or installed custody evidence", "[workspace][audit]") {
@@ -974,11 +989,7 @@ TEST_CASE("terminal reads require exact positive completion or installed custody
  const std::string contradiction = retained ? GENERATE("none", "release_before", "release_after", "retirement_before", "retirement_after") : "none";
  CAPTURE(retained, direct, fault, contradiction);
  SurfaceAudit audit;
- const auto native = [&](const char* event) {
-  auto record = native_surface_record(event);
-  record["direct_sampling"] = direct;
-  audit.native(record);
- };
+ const auto native = direct_native_records(audit, direct);
  record_unsettled_source_read(audit, direct, fault != "dispatch");
  if (fault != "before_terminal") {
   native("shutdown.requested");
@@ -1110,6 +1121,7 @@ TEST_CASE("surface join rejects omitted admission and reordered observed copy st
   SurfaceAudit audit;
   for (std::size_t index = 0U; index < native_surface_events.size(); ++index)
    if (index != omitted) audit.native(native_surface_record(native_surface_events[index]));
+  // CLEANUP-IGNORE: Each deliberately incomplete native trace is joined with the full browser sequence and must independently fail the audit.
   for (const char* event : browser_surface_events) audit.browser(browser_surface_record(event));
   CHECK_FALSE(audit.joined_failure().empty());
  }
@@ -1140,6 +1152,7 @@ TEST_CASE("surface join rejects omitted admission and reordered observed copy st
  SurfaceAudit dropped_ready_start;
  for (std::size_t index = 0U; index < native_surface_events.size(); ++index)
   if (index != 10U) dropped_ready_start.native(native_surface_record(native_surface_events[index]));
+ // CLEANUP-IGNORE: Each deliberately incomplete native trace is joined with the full browser sequence and must independently fail the audit.
  for (const char* event : browser_surface_events) dropped_ready_start.browser(browser_surface_record(event));
  CHECK_FALSE(dropped_ready_start.joined_failure().empty());
  SurfaceAudit reordered_ready;
@@ -1903,16 +1916,12 @@ TEST_CASE("Source retirement remains independent of a retained sample arena", "[
  SurfaceAudit audit;
  for (std::size_t stage = 0U; stage < 15U; ++stage) audit.native(native_surface_record(native_surface_events[stage]));
  for (std::size_t stage = 0U; stage < browser_live_stages; ++stage) audit.browser(browser_surface_record(browser_surface_events[stage]));
- for (const auto* event : {"presentation.source.withdrawal", "presentation.source.retirement"}) audit.native(native_surface_record(event));
- for (const auto* event : {"firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}) audit.browser(browser_surface_record(event));
+ retire_surface_source(audit);
  REQUIRE(audit.failure.empty());
  CHECK(audit.surfaces.size() == 1U);
  CHECK(audit.sources.size() == 1U);
  CHECK(audit.evidence_settled());
- audit.browser(browser_surface_record("iced.surface.sample_draw_selected"));
- audit.browser(browser_surface_record("iced.surface.draw_encoded"));
- audit.browser(browser_surface_record("iced.surface.draw_submitted"));
- audit.browser(browser_surface_record("iced.frame.draw_settled"));
+ complete_surface_draw(audit);
  CHECK(audit.failure.empty());
  CHECK(audit.evidence_settled());
  audit.browser(browser_surface_record("firefox.workspace.source.retired"));
@@ -2021,17 +2030,14 @@ TEST_CASE("Source publication joins survive independent drains and retirement be
  for (const auto* event : browser_surface_events)
   if (std::string_view{event} != "firefox.workspace.copy_completed") audit.browser(browser_surface_record(event));
  for (const auto* event : native_surface_events) audit.native(native_surface_record(event));
- for (const auto* event : {"presentation.source.withdrawal", "presentation.source.retirement"}) audit.native(native_surface_record(event));
- for (const auto* event : {"firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}) audit.browser(browser_surface_record(event));
+ retire_surface_source(audit);
  REQUIRE(audit.failure.empty());
  CHECK_FALSE(audit.evidence_settled());
  audit.SettleScenario();
  CHECK(audit.surfaces.size() == 1U);
  CHECK(audit.sources.size() == 1U);
  audit.browser(browser_surface_record("firefox.workspace.copy_completed"));
- REQUIRE(audit.evidence_settled());
- audit.SettleScenario();
- CHECK(audit.surfaces.empty());
+ settle_surface_scenario(audit);
  CHECK(audit.sources.empty());
 }
 TEST_CASE("Direct fallback custody requires positive source read settlement without copy evidence", "[workspace][audit]") {
@@ -2089,11 +2095,7 @@ TEST_CASE("Release-only custody settles exact GPU work without creating a page s
  const bool direct = GENERATE(false, true);
  const bool receiver_first = GENERATE(false, true);
  SurfaceAudit audit;
- const auto native = [&](const char* event) {
-  auto record = native_surface_record(event);
-  record["direct_sampling"] = direct;
-  audit.native(record);
- };
+ const auto native = direct_native_records(audit, direct);
  for (std::size_t stage = 0U; stage < 13U; ++stage) native(native_surface_events[stage]);
  for (std::size_t stage = 0U; stage < 9U; ++stage) {
   auto record = browser_surface_record(browser_surface_events[stage]);
@@ -2114,6 +2116,7 @@ TEST_CASE("Release-only custody settles exact GPU work without creating a page s
   CHECK_FALSE(audit.evidence_settled());
   audit.browser(release_only_record("firefox.workspace.release_only_completed"));
  }
+ // CLEANUP-IGNORE: Evidence settlement and lookup expose different custody, metadata and release-only audit outcomes; the audit and key factories are already shared.
  REQUIRE(audit.evidence_settled());
  const auto& state = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
  CHECK(state.receipts.at(1U).release_only);
@@ -2155,6 +2158,7 @@ TEST_CASE("Two completed outputs join independent presentation and release-only 
  audit.browser(release_only_record("firefox.workspace.release_only_submitted"));
  audit.browser(release_only_record("firefox.workspace.release_only_completed"));
  REQUIRE(audit.failure.empty());
+ // CLEANUP-IGNORE: Evidence settlement and lookup expose different custody, metadata and release-only audit outcomes; the audit and key factories are already shared.
  REQUIRE(audit.evidence_settled());
  const auto& state = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
  CHECK(state.receipts.size() == 2U);

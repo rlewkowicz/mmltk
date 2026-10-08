@@ -50,8 +50,7 @@ public:
    custody_ = std::move(custody);
   } else {
    if (!owned_ || owned_.use_count() != 1) owned_ = std::make_shared<Memory>(common::system::NumaTopology::Capture().permitted_nodes.front(), Memory::Lock::Pages);
-   owned_->ensure_bytes(bytes);
-   storage = {static_cast<std::byte*>(owned_->data()), owned_->capacity_bytes()};
+   storage = owned_->ensure_storage(bytes);
    custody_ = {};
   }
   const auto bind = [&]<class T>(common::types::WorkspaceBuffer<T>& target, std::size_t count) {

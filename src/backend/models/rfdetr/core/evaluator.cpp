@@ -114,10 +114,7 @@ namespace mmltk::backend::models::rfdetr {
 void encode_mask_from_packed_data_into(const std::uint8_t* data, const uint32_t height, const uint32_t width, EncodedMask& mask, std::size_t maximum_runs) {
  mmltk::common::logging::ScopedNvtxRange nvtx_encode_mask_from_packed_data_into{"encode_mask_from_packed_data_into", mmltk::common::logging::nvtx_color_blue};
  mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_encode_mask_packed_reuse{"rfdetr.native.eval.encode_mask_packed_reuse"};
- mask.height = height;
- mask.width = width;
- mask.area = 0;
- mask.runs.clear();
+ mask.reset(height, width);
  if (width == 0U || height == 0U) return;
  const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
  maximum_runs = std::min(maximum_runs, kMaximumPredictionMaskRuns);

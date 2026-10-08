@@ -131,6 +131,7 @@ void LiveVideoIngress::fail_upload(DeviceSlot& slot, const cudaError_t failure, 
  publish_slot(slot, synchronized ? SlotState::Free : SlotState::Terminal);
 }
 bool LiveVideoIngress::try_acquire_latest(DeviceFrameView* output) {
+ // CLEANUP-IGNORE: Published-slot lookup precedes distinct raw-frame and overlay lease construction; slot-state transition is already shared.
  if (output == nullptr) return false;
  const int index = latest_.load(std::memory_order_acquire);
  if (index < 0 || index >= static_cast<int>(slot_count_)) return false;

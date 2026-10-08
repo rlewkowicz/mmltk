@@ -666,6 +666,13 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
      for (auto& model : models) {
       active_model = model->id();
       publications.push_back(model->begin_publication());
+      const auto update_evaluated_progress = [&](const auto& artifact, const auto& evaluated) {
+       latest = model->progress(TrainingPhase::EpochComplete);
+       latest.session_id = session.session_id;
+       latest.artifact = artifact.artifact;
+       latest.val = evaluated.summary;
+       latest.val_loss = evaluated.loss;
+      };
       if (!periodic && options.use_ema) model->save_ordinary_epoch(metadata, options.output_dir);
       if (!periodic || !synchronized) {
        const auto kind = !periodic && options.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
@@ -675,11 +682,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
        const auto evaluated = model->evaluate(*validation, kind);
        auto artifact =
         model->save_candidate(metadata, options.output_dir, session.session_id, initialization, session.configuration, validation_fingerprint, merge_schedule.state().merge, kind, evaluated.summary);
-       latest = model->progress(TrainingPhase::EpochComplete);
-       latest.session_id = session.session_id;
-       latest.artifact = artifact.artifact;
-       latest.val = evaluated.summary;
-       latest.val_loss = evaluated.loss;
+       update_evaluated_progress(artifact, evaluated);
        if (periodic) {
         latest.scope = TrainingRecordScope::SynchronizedSession;
         latest.model_id = 0;
@@ -701,11 +704,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
        const auto evaluated = model->evaluate(*validation, EvaluatedWeights::Ema);
        auto artifact = model->save_candidate(
         metadata, options.output_dir, session.session_id, initialization, session.configuration, validation_fingerprint, merge_schedule.state().merge, EvaluatedWeights::Ema, evaluated.summary);
-       latest = model->progress(TrainingPhase::EpochComplete);
-       latest.session_id = session.session_id;
-       latest.artifact = artifact.artifact;
-       latest.val = evaluated.summary;
-       latest.val_loss = evaluated.loss;
+       update_evaluated_progress(artifact, evaluated);
        retain_epoch(latest);
        submit(latest, TrainingRecordRole::Epoch);
        model->remember_candidate(std::move(artifact));

@@ -185,8 +185,7 @@ public:
     static_cast<void>(
      PredictionCapacity::Resolve(maximum_detections_, 1U, artifacts_.config.num_queries, artifacts_.config.num_classes, artifacts_.config.resolution, artifacts_.config.resolution, false));
     native_ = std::make_unique<NativeRfDetrModel>(artifacts_.config, artifacts_.class_layout);
-    postprocess_ = std::make_unique<PostprocessLane>(native_->class_layout());
-    postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
+    PreparePostprocess();
     auto& technical_model = (*native_);
     technical_model.commit_normalized_state(technical_model.stage_normalized_state(resolved.model_state.entries(), detail::NormalizedModelStateAdmission::RequiredCore));
     technical_model.to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
@@ -251,10 +250,13 @@ public:
  void Clone(const PredictionBackend& source) {
   if (source.native_) {
    native_ = source.native_->make_inference_clone(static_cast<std::int32_t>(requested_batch_), compilation_mode_);
-   postprocess_ = std::make_unique<PostprocessLane>(native_->class_layout());
-   postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
+   PreparePostprocess();
   } else
    runtime_ = source.runtime_->MakeLane(command_stream_, retirement_);
+ }
+ void PreparePostprocess() {
+  postprocess_ = std::make_unique<PostprocessLane>(native_->class_layout());
+  postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
  }
  ~PredictionBackend() { static_cast<void>(Close()); }
  [[nodiscard]] std::size_t batch_size() const {

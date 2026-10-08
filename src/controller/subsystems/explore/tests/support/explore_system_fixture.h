@@ -140,8 +140,7 @@ struct StreamingExploreProbe final : StreamingExplorePublicationState {
   ExploreAlgorithm::GalleryReadySink wake;
   {
    std::scoped_lock lock(mutex);
-   const auto found = std::ranges::find(assignments, compiled_index, &StreamingExploreAssignment::compiled_index);
-   REQUIRE(found != assignments.end());
+   auto* found = &AssignmentLocked(compiled_index);
    found->ready = true;
    wake = ready_sink;
    changed.notify_all();
@@ -160,8 +159,7 @@ struct StreamingExploreProbe final : StreamingExplorePublicationState {
  }
  void StartRead(const std::uint32_t compiled_index) {
   std::scoped_lock lock(mutex);
-  const auto found = std::ranges::find(assignments, compiled_index, &StreamingExploreAssignment::compiled_index);
-  REQUIRE(found != assignments.end());
+  auto* found = &AssignmentLocked(compiled_index);
   REQUIRE_FALSE(found->read_started);
   found->read_started = true;
   ++mapped_reads;
@@ -175,6 +173,10 @@ struct StreamingExploreProbe final : StreamingExplorePublicationState {
    wake = ready_sink;
   }
   if (wake) wake();
+ }
+ void AllowAllocationAndWait(std::size_t count) {
+  AllowAllocation();
+  REQUIRE(Wait([&] { return assignments.size() == count; }));
  }
  void AllowPreRead() { SignalGate(pre_read_allowed); }
  void AllowPostRead() { SignalGate(post_read_allowed); }
@@ -230,6 +232,11 @@ struct StreamingExploreProbe final : StreamingExplorePublicationState {
  std::size_t bound_opens = 0U;
 
 private:
+ StreamingExploreAssignment& AssignmentLocked(std::uint32_t compiled_index) {
+  const auto found = std::ranges::find(assignments, compiled_index, &StreamingExploreAssignment::compiled_index);
+  REQUIRE(found != assignments.end());
+  return *found;
+ }
  void SignalGate(bool& gate) {
   ExploreAlgorithm::GalleryReadySink wake;
   {
@@ -658,11 +665,16 @@ private:
  LoadedSettings settings_;
  ExploreSystem explore_;
 };
+inline void check_gallery_identity(const ExploreSnapshot& actual, const ExploreSnapshot& expected) {
+ CHECK(actual.gallery.generation == expected.gallery.generation);
+ CHECK(actual.gallery.slots == expected.gallery.slots);
+}
 class ExploreScenario final {
 public:
  using ModelFactory = std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>()>;
  using Observer = std::function<void(ExploreSystem::event_type)>;
- ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {}, VisualDiagnosticSink diagnostics = {})
+ ExploreScenario(
+  LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend = std::make_shared<FakeImageBackend>(), ModelFactory model = {}, Observer observer = {}, VisualDiagnosticSink diagnostics = {})
      : ExploreScenario(settings, 2U, RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, model ? std::move(model) : DefaultModel(), 3U),
         std::move(observer), diagnostics) {}
  ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {}, VisualDiagnosticSink diagnostics = {})
@@ -730,6 +742,15 @@ private:
  std::shared_ptr<std::atomic_uint64_t> failures_;
  ExploreScenario scenario_;
 };
+template <class Scenario>
+[[nodiscard]] ExploreSnapshot await_explore_settled(Scenario& scenario, std::uint64_t prior_revision) {
+ auto& explore = scenario.system();
+ REQUIRE(scenario.Wait([&] {
+  const auto value = explore.snapshot();
+  return !value.busy && value.revision > prior_revision;
+ }));
+ return explore.snapshot();
+}
 [[nodiscard]] inline ExactVisualDocumentBorrower borrow_exactly_from(ExploreSystem& explore) {
  return [&explore](const VisualFrame& frame) {
   if (frame.source != explore.snapshot().frame.source) return VisualDocumentRead{};

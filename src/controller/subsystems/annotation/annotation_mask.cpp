@@ -115,6 +115,12 @@ void normalize_mask(c::AnnotationObject& object) {
  normalize(object.mask.runs);
  update_mask_bounds(object);
 }
+std::shared_ptr<MaskRows::Block>& MaskRows::Index::EnsureBlock(const std::size_t block_index) {
+ if (blocks.size() <= block_index) blocks.resize(block_index + 1U);
+ auto& block = blocks[block_index];
+ if (!block) block = std::make_shared<Block>();
+ return block;
+}
 void MaskRows::Assign(const c::AnnotationObject& object) {
  if (!index_ || !index_.unique()) index_ = std::make_shared<Index>();
  for (auto& block : index_->blocks) {
@@ -130,9 +136,7 @@ void MaskRows::Assign(const c::AnnotationObject& object) {
  index_->run_count = 0U;
  for (const auto run : object.mask.runs) {
   const auto block_index = run.row / kRowsPerBlock;
-  if (index_->blocks.size() <= block_index) index_->blocks.resize(block_index + 1U);
-  auto& block = index_->blocks[block_index];
-  if (!block) block = std::make_shared<Block>();
+  auto& block = index_->EnsureBlock(block_index);
   auto& row = block->rows[run.row % kRowsPerBlock];
   if (!row) row = std::make_shared<Runs>();
   row->push_back(run);
@@ -182,12 +186,8 @@ void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint1
   auto end = begin + 1U;
   while (end < stroke.size() && stroke[end].row == stroke[begin].row) ++end;
   const auto block_index = stroke[begin].row / kRowsPerBlock;
-  if (index_->blocks.size() <= block_index) index_->blocks.resize(block_index + 1U);
-  auto& block = index_->blocks[block_index];
-  if (!block)
-   block = std::make_shared<Block>();
-  else if (!block.unique())
-   block = std::make_shared<Block>(*block);
+  auto& block = index_->EnsureBlock(block_index);
+  if (!block.unique()) block = std::make_shared<Block>(*block);
   auto& row = block->rows[stroke[begin].row % kRowsPerBlock];
   if (!row)
    row = std::make_shared<Runs>();

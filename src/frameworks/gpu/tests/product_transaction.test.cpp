@@ -1,3 +1,4 @@
+#include "src/test_support/image_test_utils.hpp"
 #include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 #include "src/test_support/async_test_utils.hpp"
@@ -74,9 +75,7 @@ TEST_CASE("product candidates preserve exact committed planes until readers rele
  CHECK(candidate_revision > incumbent_revision);
  CHECK(runtime.Borrow().plane(0U).revision() == incumbent_revision);
  runtime.CommitOutput(std::move(candidate));
- auto committed = runtime.Borrow();
- REQUIRE(committed.valid());
- CHECK(committed.plane(0U).revision() == candidate_revision);
+ auto committed = mmltk::testsupport::require_borrowed_image(runtime, candidate_revision);
  CHECK(*reinterpret_cast<const std::uint8_t*>(committed.plane(0U).plane().data) == 0x21U);
  CHECK(*reinterpret_cast<const std::uint8_t*>(committed.plane(1U).plane().data) == 0x65U);
  SystemImageRuntime::CompletedOutput unavailable_baseline;
@@ -97,25 +96,27 @@ TEST_CASE("completed products retain exact pixels and can be selected again") {
   .backend = backend,
   .output_buffer_count = 3U,
  }};
+ // CLEANUP-IGNORE: Separate output candidates are deliberately acquired and validated across two different pixel publications.
  auto first_candidate = runtime.AcquireOutput();
  REQUIRE(first_candidate.valid());
  runtime.Publish(first_candidate, 8U, 8U, [](const auto clean, const auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 0x31, clean.descriptor.pitch_bytes * clean.descriptor.height); });
+ // CLEANUP-IGNORE: Both separately published output candidates are independently committed and validated before retained-slot selection.
  auto first = runtime.CommitOutput(std::move(first_candidate));
  REQUIRE(first.valid());
+ // CLEANUP-IGNORE: Separate output candidates are deliberately acquired and validated across two different pixel publications.
  auto second_candidate = runtime.AcquireOutput();
  REQUIRE(second_candidate.valid());
  runtime.Publish(second_candidate, 8U, 8U, [](const auto clean, const auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 0x52, clean.descriptor.pitch_bytes * clean.descriptor.height); });
+ // CLEANUP-IGNORE: Both separately published output candidates are independently committed and validated before retained-slot selection.
  auto second = runtime.CommitOutput(std::move(second_candidate));
  REQUIRE(second.valid());
  REQUIRE(runtime.Borrow().valid());
  CHECK(*reinterpret_cast<const std::uint8_t*>(runtime.Borrow().plane(0U).plane().data) == 0x52U);
  runtime.SelectOutput(first);
- auto selected = runtime.Borrow();
- REQUIRE(selected.valid());
+ auto selected = mmltk::testsupport::require_borrowed_image(runtime);
  CHECK(selected.plane(0U).revision() == first.revision());
  CHECK(*reinterpret_cast<const std::uint8_t*>(selected.plane(0U).plane().data) == 0x31U);
- auto later = second.Borrow();
- REQUIRE(later.valid());
+ auto later = mmltk::testsupport::require_borrowed_image(second);
  CHECK(*reinterpret_cast<const std::uint8_t*>(later.plane(0U).plane().data) == 0x52U);
  auto remaining = std::async(std::launch::async, [&] { return runtime.AcquireOutput(); });
  CHECK(mmltk::testsupport::await_test_future(remaining, "remaining product slot").valid());
@@ -135,17 +136,14 @@ TEST_CASE("failed candidate growth retains the committed product and later initi
   backend->FailAfter(FakeImageBackend::FailurePoint::AllocatePlane, 1U);
   CHECK_THROWS(runtime.Publish(candidate, 16U, 16U, [](auto, auto, auto) {}));
  }
- auto retained = runtime.Borrow();
- REQUIRE(retained.valid());
- CHECK(retained.plane(0U).revision() == committed_revision);
+ auto retained = mmltk::testsupport::require_borrowed_image(runtime, committed_revision);
  CHECK(*reinterpret_cast<const std::uint8_t*>(retained.plane(0U).plane().data) == 0x17U);
  retained = {};
  auto replacement = runtime.AcquireOutput({}, runtime.Completed());
  REQUIRE(replacement.valid());
  runtime.Publish(replacement, 16U, 16U, [](const auto clean, const auto, auto) { *reinterpret_cast<std::uint8_t*>(clean.data) = 0x7BU; });
  runtime.CommitOutput(std::move(replacement));
- auto completed = runtime.Borrow();
- REQUIRE(completed.valid());
+ auto completed = mmltk::testsupport::require_borrowed_image(runtime);
  CHECK(*reinterpret_cast<const std::uint8_t*>(completed.plane(0U).plane().data) == 0x7BU);
  CHECK(*(reinterpret_cast<const std::uint8_t*>(completed.plane(0U).plane().data) + 1U) == 0U);
  CHECK(*reinterpret_cast<const std::uint8_t*>(completed.plane(1U).plane().data) == 0U);
@@ -172,8 +170,7 @@ TEST_CASE("candidate baselines remain exact across cached selection and handle m
  CHECK(runtime.Completed().revision() == first.revision());
  auto completed = runtime.CommitOutput(std::move(working));
  CHECK_FALSE(working.valid());
- auto read = completed.Borrow();
- REQUIRE(read.valid());
+ auto read = mmltk::testsupport::require_borrowed_image(completed);
  CHECK(*reinterpret_cast<const std::uint8_t*>(read.plane(0U).plane().data) == 0x37U);
  CHECK(*reinterpret_cast<const std::uint8_t*>(read.plane(1U).plane().data) == 0x55U);
  CHECK(read.plane(0U).revision() == completed.revision());
@@ -270,6 +267,7 @@ TEST_CASE("single-slot candidates expose only committed selection") {
 TEST_CASE("quarantined cached products reject reads and selection while retaining physical custody") {
  auto backend = std::make_shared<FakeImageBackend>();
  auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U});
+ // CLEANUP-IGNORE: The repeated publications create independently retained slots for distinct quarantine and pool-retirement contracts.
  runtime->Publish(8U, 8U, [](auto, auto, auto) {});
  auto healthy = runtime->Completed();
  runtime->Publish(8U, 8U, [](auto, auto, auto) {});
@@ -312,6 +310,7 @@ TEST_CASE("single-slot semantic replacement reuses clean pixels after its detach
  auto borrowed = baseline.Borrow();
  auto plane = std::move(borrowed).TakePlane(0U);
  borrowed = {};
+ // CLEANUP-IGNORE: Independent retained-plane and receiver-copy tests probe blocked output admission before different release and retry paths.
  auto reservation = std::async(std::launch::async, [&] { return runtime.TryAcquireOutput(baseline).valid(); });
  REQUIRE_FALSE(mmltk::testsupport::await_test_future(reservation, "held-reader reservation"));
  std::stop_source stop;
@@ -325,8 +324,7 @@ TEST_CASE("single-slot semantic replacement reuses clean pixels after its detach
  REQUIRE(candidate.valid());
  runtime.Publish(candidate, 8U, 8U, [](auto, auto semantic, auto) { std::memset(reinterpret_cast<void*>(semantic.data), 0x48, semantic.descriptor.pitch_bytes * semantic.descriptor.height); });
  auto completed = runtime.CommitOutput(std::move(candidate));
- auto read = completed.Borrow();
- REQUIRE(read.valid());
+ auto read = mmltk::testsupport::require_borrowed_image(completed);
  CHECK(*reinterpret_cast<const std::uint8_t*>(read.plane(0U).plane().data) == 0x26U);
  CHECK(*reinterpret_cast<const std::uint8_t*>(read.plane(1U).plane().data) == 0x48U);
  CHECK(backend->planes_allocated == 2U);
@@ -335,6 +333,7 @@ TEST_CASE("single-slot semantic replacement reuses clean pixels after its detach
 TEST_CASE("retained completed handles bound admission and stopping releases its wait") {
  using namespace std::chrono_literals;
  auto backend = std::make_shared<FakeImageBackend>();
+ // CLEANUP-IGNORE: Independent runtime and receiver tests publish an initial product before exercising different storage and failure transitions.
  SystemImageRuntime runtime{{.device = 0, .backend = backend}};
  runtime.Publish(8U, 8U, [](auto, auto, auto) {});
  auto retained = runtime.Completed();
@@ -357,6 +356,7 @@ TEST_CASE("retained completed handles bound admission and stopping releases its 
 TEST_CASE("completed custody retains only its slot and context after pool retirement") {
  auto backend = std::make_shared<FakeImageBackend>();
  auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend, .output_buffer_count = 2U});
+ // CLEANUP-IGNORE: The repeated publications create independently retained slots for distinct quarantine and pool-retirement contracts.
  runtime->Publish(8U, 8U, [](auto, auto, auto) {});
  auto retained = runtime->Completed();
  runtime->Publish(8U, 8U, [](auto, auto, auto) {});
@@ -409,9 +409,11 @@ TEST_CASE("retained candidates expose allocation-local storage without clear or 
  CHECK(first.allocations()[0].identity == 0U);
  runtime.PublishRetained(first, 8U, 8U, fill(17U));
  const auto first_allocation = first.allocations();
+ // CLEANUP-IGNORE: Each committed product is retained while the next candidate is acquired; extracting this sequence would obscure the slot custody under test.
  auto gallery = runtime.CommitOutput(std::move(first));
  auto second = runtime.TryAcquireOutput(baseline);
  runtime.PublishRetained(second, 8U, 8U, fill(33U));
+ // CLEANUP-IGNORE: Each committed product is retained while the next candidate is acquired; extracting this sequence would obscure the slot custody under test.
  auto detail = runtime.CommitOutput(std::move(second));
  auto third = runtime.TryAcquireOutput(baseline);
  runtime.PublishRetained(third, 8U, 8U, fill(49U));
@@ -490,8 +492,7 @@ TEST_CASE("held current display leaves replaceable overflow and exact readers cl
  CHECK(baseline.ObserveWorkspace().product_owner == overflow_allocation);
  CHECK(backend->same_copies == copies);
  CHECK(*reinterpret_cast<const std::uint8_t*>(current_pointer) == 11U);
- auto encoded = baseline.Borrow();
- REQUIRE(encoded.valid());
+ auto encoded = mmltk::testsupport::require_borrowed_image(baseline);
  CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
  REQUIRE(baseline.valid());
  encoded = {};

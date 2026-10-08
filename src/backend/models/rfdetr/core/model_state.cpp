@@ -48,23 +48,15 @@ void validate_queries(const NativeCheckpointMetadata& metadata, const std::strin
  if (!required && metadata.num_queries == 0 && metadata.num_select == 0) { return; }
  if (metadata.num_queries <= 0 || metadata.num_select <= 0 || metadata.num_select > metadata.num_queries) { throw std::runtime_error("RF-DETR native checkpoint has invalid query metadata: " + path); }
 }
-template <class Left, class Right, class Visitor>
-void visit_matching_members(Left& left, const Right& right, Visitor&& visit) {
- template for (constexpr auto left_member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Left, std::meta::access_context::current()))) {
-  template for (constexpr auto right_member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Right, std::meta::access_context::current()))) {
-   if constexpr (std::meta::identifier_of(left_member) == std::meta::identifier_of(right_member)) visit(left.[:left_member:], right.[:right_member:]);
-  }
- }
-}
 void apply_checkpoint_detection_overrides(NativeRfDetrConfig& config, const NativeCheckpointMetadata& metadata) {
- visit_matching_members(config, metadata, []<class Target, class Source>(Target& target, const Source& source) {
+ model_state_detail::visit_matching_members(config, metadata, []<class Target, class Source>(Target& target, const Source& source) {
   if constexpr (model_state_detail::is_optional<std::remove_cvref_t<Source>>) {
    if (source) target = *source;
   }
  });
 }
 void capture_checkpoint_detection_metadata(NativeCheckpointMetadata& metadata, const NativeRfDetrConfig& config) {
- visit_matching_members(metadata, config, []<class Target, class Source>(Target& target, const Source& source) {
+ model_state_detail::visit_matching_members(metadata, config, []<class Target, class Source>(Target& target, const Source& source) {
   if constexpr (model_state_detail::is_optional<std::remove_cvref_t<Target>>) target = source;
  });
 }

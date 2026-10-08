@@ -107,6 +107,7 @@ void observe(
   static_cast<unsigned long long>(base), device_uuid, layout.device, static_cast<unsigned long long>(layout.device_incarnation), layout.width, layout.height,
   std::strcmp(operation, "memory_import") == 0 && status == CUDA_SUCCESS ? "true" : "false", layout.required_allocation_bytes, layout.offset_bytes, layout.pitch_bytes,
   layout.dedicated ? "true" : "false", static_cast<int>(status));
+ // CLEANUP-IGNORE: Separate low-level diagnostic records preserve ambient errno after a bounded stderr write; record format and ownership differ.
  if (length > 0 && static_cast<std::size_t>(length) < sizeof(output)) mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(length)});
  errno = saved_errno;
 }

@@ -54,6 +54,30 @@
 #include "src/common/io/noexcept_io.h"
 namespace mmltk::controller::services {
 namespace {
+auto discard_diagnostics_on_exit(DiagnosticsClient& diagnostics, const mmltk::testsupport::TestGate& gate) {
+ return mmltk::testsupport::ScopedTestCleanup([&] {
+  gate.Release();
+  diagnostics.close(DiagnosticsCloseMode::Discard);
+ });
+}
+struct CallerDrivenDiagnosticFixture final {
+ DiagnosticsClient diagnostics;
+ RuntimeDiagnostics runtime;
+ explicit CallerDrivenDiagnosticFixture(const std::filesystem::path& path) : CallerDrivenDiagnosticFixture(::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR)) {}
+ explicit CallerDrivenDiagnosticFixture(int descriptor) : diagnostics(checked_descriptor(descriptor), DiagnosticsExecutionPolicy::CallerDriven), runtime(diagnostics.producer()) {}
+
+private:
+ static mmltk::common::io::ScopedFd checked_descriptor(int descriptor) {
+  REQUIRE(descriptor >= 0);
+  return mmltk::common::io::ScopedFd{descriptor};
+ }
+};
+auto submit_index_pair(DiagnosticsClient& diagnostics) {
+ auto operation = diagnostics.producer().acquire();
+ REQUIRE(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
+ REQUIRE(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Accepted);
+ return operation;
+}
 constexpr std::array kDiagnosticOwners{
  std::pair{contracts::DiagnosticOwner::BrowserRuntime, std::string_view{"browser_runtime"}},
  std::pair{contracts::DiagnosticOwner::BrowserServer, std::string_view{"browser_server"}},
@@ -122,11 +146,14 @@ using mmltk::testsupport::ScopedEnvironmentVariable;
  record += "\"}";
  return record;
 }
+void require_readable(int fd, int timeout_ms) {
+ pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
+ REQUIRE(::poll(&descriptor, 1U, timeout_ms) == 1);
+}
 void require_one_terminal_wake(DiagnosticsClient& diagnostics) {
  const int terminal_fd = diagnostics.terminal_fd();
  REQUIRE(terminal_fd >= 0);
- pollfd ready{.fd = terminal_fd, .events = POLLIN, .revents = 0};
- REQUIRE(::poll(&ready, 1U, 5000) == 1);
+ require_readable(terminal_fd, 5000);
  std::uint64_t wake = 0U;
  REQUIRE(::read(terminal_fd, &wake, sizeof(wake)) == static_cast<ssize_t>(sizeof(wake)));
  CHECK(wake == 1U);
@@ -368,10 +395,7 @@ TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][se
 TEST_CASE("runtime diagnostics preserve every owner label and reject unknown owners atomically", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-owners"};
  const auto path = temporary.path() / "trace.jsonl";
- const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
- REQUIRE(descriptor >= 0);
- DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
- RuntimeDiagnostics runtime{diagnostics.producer()};
+ auto [diagnostics, runtime] = CallerDrivenDiagnosticFixture{path};
  const auto target = runtime.target();
  std::array<RuntimeDiagnosticFact, kDiagnosticOwners.size()> facts{};
  for (std::size_t index = 0U; index < facts.size(); ++index) { facts[index] = {.owner = kDiagnosticOwners[index].first, .event = "owner.accepted", .sequence = index}; }
@@ -391,8 +415,7 @@ TEST_CASE("runtime diagnostics preserve every owner label and reject unknown own
  std::ifstream input{path};
  std::string line;
  for (std::size_t index = 0U; index < facts.size(); ++index) {
-  REQUIRE(static_cast<bool>(std::getline(input, line)));
-  const auto record = nlohmann::json::parse(line);
+  const auto record = mmltk::testsupport::read_json_line(input);
   CHECK(record["owner"] == kDiagnosticOwners[index].second);
   CHECK(record["sequence"] == index);
   CHECK(record["event"] == "owner.accepted");
@@ -437,10 +460,7 @@ TEST_CASE("effect-only submission drops on queue-lock contention while complete 
   held.receipt().ArriveAndWait();
  }};
  std::future<void> reliable;
- ScopedTestCleanup release{[&] {
-  held.Release();
-  diagnostics.close(DiagnosticsCloseMode::Discard);
- }};
+ const auto release = discard_diagnostics_on_exit(diagnostics, held);
  REQUIRE(held.WaitEntered(std::chrono::seconds{2}));
  CHECK(diagnostics.producer().acquire().try_submit({"{\"event\":\"lossy\"}"}) == DiagnosticSubmitResult::Contended);
  reliable = std::async(std::launch::async, [target = complete.target()] { target.write({.event = "reliable"}); });
@@ -456,10 +476,7 @@ TEST_CASE("effect-only submission drops on queue-lock contention while complete 
 TEST_CASE("bounded runtime projection escapes valid text and rejects malformed UTF8", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-text"};
  const auto path = temporary.path() / "trace.jsonl";
- const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
- REQUIRE(descriptor >= 0);
- DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
- RuntimeDiagnostics runtime{diagnostics.producer()};
+ auto [diagnostics, runtime] = CallerDrivenDiagnosticFixture{path};
  std::string message;
  SECTION("JSON escapes and valid scalar limits") {
   message =
@@ -481,9 +498,7 @@ TEST_CASE("diagnostic spans preserve typed correlation and explicit scope outcom
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostic-spans"};
  const auto path = temporary.path() / "spans.jsonl";
  const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
- REQUIRE(descriptor >= 0);
- DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
- RuntimeDiagnostics runtime{diagnostics.producer()};
+ auto [diagnostics, runtime] = CallerDrivenDiagnosticFixture{descriptor};
  const auto target = runtime.target();
  REQUIRE(target.valid());
  CHECK_FALSE(target.pixel_probes_enabled());
@@ -528,8 +543,7 @@ TEST_CASE("diagnostic spans preserve typed correlation and explicit scope outcom
  for (const auto outcome : outcomes) {
   REQUIRE(static_cast<bool>(std::getline(input, line)));
   CHECK(nlohmann::json::parse(line)["event"] == "boundary.started");
-  REQUIRE(static_cast<bool>(std::getline(input, line)));
-  const auto record = nlohmann::json::parse(line);
+  const auto record = mmltk::testsupport::read_json_line(input);
   CHECK(record["event"] == "boundary.completed");
   CHECK(record["owner"] == "presentation");
   CHECK(record["source_revision"] == 14U);
@@ -550,9 +564,7 @@ TEST_CASE("diagnostic spans preserve typed correlation and explicit scope outcom
 TEST_CASE("diagnostic span overflow and shutdown lose effects only", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostic-span-overflow"};
  const int descriptor = ::open((temporary.path() / "trace.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
- REQUIRE(descriptor >= 0);
- DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
- RuntimeDiagnostics runtime{diagnostics.producer()};
+ auto [diagnostics, runtime] = CallerDrivenDiagnosticFixture{descriptor};
  auto target = runtime.target();
  const auto operation = diagnostics.producer().acquire();
  for (std::size_t index = 0U; index < DiagnosticsClient::kQueueCapacity; ++index) REQUIRE(operation.submit({"{\"event\":\"full\"}"}) == DiagnosticSubmitResult::Accepted);
@@ -578,8 +590,7 @@ TEST_CASE("runtime trace overflow never waits for a stalled background writer", 
  const auto operation = diagnostics.producer().acquire();
  const std::string record = maximum_diagnostic_record();
  REQUIRE(operation.submit({record}) == DiagnosticSubmitResult::Accepted);
- pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
- REQUIRE(::poll(&readable, 1U, 5000) == 1);
+ require_readable(reader.get(), 5000);
  RuntimeDiagnostics runtime{diagnostics.producer()};
  for (std::size_t index = 0U; index < DiagnosticsClient::kQueueCapacity + 2U; ++index) runtime.target().write({.event = "capacity", .sequence = index});
  CHECK(diagnostics.counters().dropped >= 2U);
@@ -657,9 +668,7 @@ TEST_CASE("diagnostics close publishes one synchronous owner terminal for manual
 TEST_CASE("diagnostics flush close settles a queued manual owner exactly once", "[gui][services]") {
  auto [reader, writer] = make_diagnostic_pipe();
  DiagnosticsClient diagnostics{std::move(writer), DiagnosticsExecutionPolicy::CallerDriven};
- const auto operation = diagnostics.producer().acquire();
- REQUIRE(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
- REQUIRE(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Accepted);
+ const auto operation = submit_index_pair(diagnostics);
  diagnostics.close(DiagnosticsCloseMode::Flush);
  CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
  CHECK(diagnostics.counters().accepted == 2U);
@@ -725,11 +734,10 @@ TEST_CASE("diagnostics manual flush publishes one terminal after a partial write
 }
 TEST_CASE("diagnostics validates records and fixed capacity", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-capacity"};
+ // CLEANUP-IGNORE: Explicit descriptor open flags are inputs to different manual-capacity and background-writer ownership cases.
  const auto path = temporary.path() / "diagnostics.jsonl";
  const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
- REQUIRE(descriptor >= 0);
- DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
- RuntimeDiagnostics runtime{diagnostics.producer()};
+ auto [diagnostics, runtime] = CallerDrivenDiagnosticFixture{descriptor};
  const auto operation = diagnostics.producer().acquire();
  CHECK(operation.submit({"not-json"}) == DiagnosticSubmitResult::InvalidJson);
  CHECK(operation.submit({"[]"}) == DiagnosticSubmitResult::InvalidJson);
@@ -761,8 +769,7 @@ TEST_CASE("diagnostics close interrupts a stalled output descriptor", "[gui][ser
   REQUIRE(static_cast<std::size_t>(pipe_capacity) < maximum_record.size());
   DiagnosticsClient diagnostics{std::move(writer)};
   REQUIRE(diagnostics.producer().acquire().submit({maximum_record}) == DiagnosticSubmitResult::Accepted);
-  pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
-  REQUIRE(::poll(&readable, 1U, 5000) == 1);
+  require_readable(reader.get(), 5000);
   diagnostics.close(mode);
   require_one_terminal_wake(diagnostics);
   CHECK(diagnostics.counters().flushed == 0U);
@@ -773,13 +780,12 @@ TEST_CASE("diagnostics close interrupts a stalled output descriptor", "[gui][ser
 }
 TEST_CASE("diagnostics flush preserves order and reports write failure", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-order"};
+ // CLEANUP-IGNORE: Explicit descriptor open flags are inputs to different manual-capacity and background-writer ownership cases.
  const auto path = temporary.path() / "diagnostics.jsonl";
  const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
  REQUIRE(descriptor >= 0);
  DiagnosticsClient diagnostics{ScopedFd{descriptor}};
- const auto operation = diagnostics.producer().acquire();
- REQUIRE(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
- REQUIRE(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Accepted);
+ const auto operation = submit_index_pair(diagnostics);
  diagnostics.flush();
  CHECK(read_file(path) == "{\"index\":1}\n{\"index\":2}\n");
  diagnostics.close();
@@ -861,8 +867,7 @@ TEST_CASE("complete diagnostic records and batches wait atomically and settle on
  const auto operation = diagnostics.producer().acquire();
  const auto large = maximum_diagnostic_record();
  REQUIRE(operation.submit({large}) == DiagnosticSubmitResult::Accepted);
- pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
- REQUIRE(::poll(&readable, 1U, 2000) == 1);
+ require_readable(reader.get(), 2000);
  for (std::size_t index = 1U; index < DiagnosticsClient::kQueueCapacity - (record_count - 1U); ++index) REQUIRE(operation.submit({"{\"event\":\"filler\"}"}) == DiagnosticSubmitResult::Accepted);
  const auto before = diagnostics.counters().accepted;
  std::future<std::string> output;
@@ -928,10 +933,7 @@ TEST_CASE("complete lazy factories reserve delivery before closure or terminal s
    return {.event = "lazy.fact"};
   });
  });
- ScopedTestCleanup cleanup{[&] {
-  factory.Release();
-  diagnostics.close(DiagnosticsCloseMode::Discard);
- }};
+ const auto cleanup = discard_diagnostics_on_exit(diagnostics, factory);
  REQUIRE(factory.WaitEntered(std::chrono::seconds{2}));
  if (seal) runtime.target().write_required({.event = "shutdown.complete"});
  diagnostics.close(DiagnosticsCloseMode::Flush);
@@ -1019,11 +1021,9 @@ TEST_CASE("diagnostics destruction releases an active detached writer after its 
   REQUIRE(retained.submit({record}) == DiagnosticSubmitResult::Accepted);
   terminal.reset(::dup(diagnostics.terminal_fd()));
   REQUIRE(terminal.get() >= 0);
-  pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
-  REQUIRE(::poll(&readable, 1U, 5000) == 1);
+  require_readable(reader.get(), 5000);
  }
- pollfd terminal_ready{.fd = terminal.get(), .events = POLLIN, .revents = 0};
- REQUIRE(::poll(&terminal_ready, 1U, 5000) == 1);
+ require_readable(terminal.get(), 5000);
  std::uint64_t wake = 0U;
  REQUIRE(::read(terminal.get(), &wake, sizeof(wake)) == static_cast<ssize_t>(sizeof(wake)));
  CHECK(wake == 1U);
@@ -1372,6 +1372,7 @@ TEST_CASE("artifact diagnostic selection survives the public compiler adapter", 
 }
 TEST_CASE("backend benchmark diagnostic failures preserve operations and delivery policy", "[gui][services]") {
  using namespace mmltk::backend::data::benchmark_internal;
+ // CLEANUP-IGNORE: The generated axes cover input-storage pressure and diagnostic rejection independently.
  const bool complete = GENERATE(false, true);
  const bool encoding_failure = GENERATE(false, true);
  mmltk::testsupport::ScopedTempDir temporary{"benchmark-diagnostic-rejection"};

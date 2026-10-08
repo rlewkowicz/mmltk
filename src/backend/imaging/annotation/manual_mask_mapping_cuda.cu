@@ -27,6 +27,7 @@ __global__ void deferred_manual_mask_runs_kernel(const DeferredManualMaskRunsLau
  std::uint32_t high = launch.run_count;
  while (low < high) {
   const std::uint32_t middle = low + (high - low) / 2U;
+  // CLEANUP-IGNORE: Binary mask search and parallel run rasterization read the same wire pair but implement distinct traversal and clipping algorithms.
   const std::size_t pair_index = static_cast<std::size_t>(middle) * 2U;
   const std::uint64_t start = launch.run_pairs[pair_index];
   const std::uint64_t end = start + launch.run_pairs[pair_index + 1U];

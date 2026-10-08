@@ -6,6 +6,12 @@
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/model.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
+torch::serialize::InputArchive reload_archive(torch::serialize::OutputArchive& output, const std::filesystem::path& path) {
+ output.save_to(path.string());
+ torch::serialize::InputArchive input;
+ input.load_from(path.string());
+ return input;
+}
 std::vector<NormalizedModelStateEntry> make_minimal_upstream_checkpoint_state(const ParityFixtureCase& fixture) {
  return {
   {"query_feat.weight", make_fixture_query_feat(fixture)},

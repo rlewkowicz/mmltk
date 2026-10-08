@@ -1,3 +1,5 @@
+#include "src/frameworks/process/subprocess_utils.h"
+#include <optional>
 #include "src/controller/services/firefox/firefox_process_owner.h"
 #include "src/common/io/event_fd.h"
 #include "src/pch_linux.h"
@@ -104,24 +106,19 @@ public:
  [[nodiscard]] ChildSettlement Settle(const RuntimeDiagnosticTarget diagnostics) noexcept {
   if (pid_ <= 0) std::terminate();
   siginfo_t child{};
-  if (pidfd_.get() >= 0 && !prefer_retained_pid_wait_) {
+  const auto wait = [&](idtype_t kind, id_t identity) -> std::optional<ChildSettlement> {
    for (;;) {
     child = {};
     errno = 0;
-    if (::waitid(P_PIDFD, static_cast<id_t>(pidfd_.get()), &child, WEXITED) == 0 && child.si_pid != 0) return Complete(child);
+    if (::waitid(kind, identity, &child, WEXITED) == 0 && child.si_pid != 0) return Complete(child);
     if (errno == EINTR) continue;
     if (errno == ECHILD) return Complete({});
-    break;
+    return std::nullopt;
    }
-  }
-  for (;;) {
-   child = {};
-   errno = 0;
-   if (::waitid(P_PID, static_cast<id_t>(pid_), &child, WEXITED) == 0 && child.si_pid != 0) return Complete(child);
-   if (errno == EINTR) continue;
-   if (errno == ECHILD) return Complete({});
-   break;
-  }
+  };
+  if (pidfd_.get() >= 0 && !prefer_retained_pid_wait_)
+   if (auto settled = wait(P_PIDFD, static_cast<id_t>(pidfd_.get()))) return *settled;
+  if (auto settled = wait(P_PID, static_cast<id_t>(pid_))) return *settled;
   int status = 0;
   pid_t waited = -1;
   do { waited = ::waitpid(pid_, &status, 0); } while (waited < 0 && errno == EINTR);
@@ -216,17 +213,13 @@ public:
   }
   if (!valid_launch_inputs() || !prepare_profile()) return startup_failed("start.invalid");
   std::array<std::string, 10U> argument_storage;
-  std::vector<std::string> environment_storage;
-  std::vector<char*> environment;
+  std::optional<mmltk::frameworks::process::ArgvBuffer> environment;
   try {
    argument_storage = {
     executable_.string(), "--no-remote", "--new-instance", "--profile", profile_.string(), "--width", std::to_string(kInitialFirefoxWindowWidth), "--height",
     std::to_string(kInitialFirefoxWindowHeight), page_url_
    };
-   environment_storage = firefox_environment(executable_.parent_path(), workspace_import_socket_, integration_, integration_high_dpi_);
-   environment.reserve(environment_storage.size() + 1U);
-   for (auto& entry : environment_storage) environment.push_back(entry.data());
-   environment.push_back(nullptr);
+   environment.emplace(firefox_environment(executable_.parent_path(), workspace_import_socket_, integration_, integration_high_dpi_));
   } catch (...) { return startup_failed("start.arguments_refused"); }
   std::array<char*, 11U> arguments{
    argument_storage[0].data(), argument_storage[1].data(), argument_storage[2].data(), argument_storage[3].data(), argument_storage[4].data(), argument_storage[5].data(), argument_storage[6].data(),
@@ -247,7 +240,7 @@ public:
    return startup_failed("start.signal_mask_refused", signal_error);
   }
   pid_t child = -1;
-  const int spawn_result = ::posix_spawn(&child, executable_.c_str(), file_actions.get(), &attributes, arguments.data(), environment.data());
+  const int spawn_result = ::posix_spawn(&child, executable_.c_str(), file_actions.get(), &attributes, arguments.data(), environment->data());
   const int destroy_result = ::posix_spawnattr_destroy(&attributes);
   firefox_log_.reset();
   if (spawn_result != 0) return startup_failed("start.spawn_refused", spawn_result);
@@ -487,9 +480,7 @@ private:
    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
    const std::filesystem::path root = runtime && runtime[0] ? std::filesystem::path{runtime} : std::filesystem::temp_directory_path();
    std::string pattern = (root / "mmltk-firefox-XXXXXX").string();
-   std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
-   mutable_pattern.push_back('\0');
-   char* created = ::mkdtemp(mutable_pattern.data());
+   char* created = ::mkdtemp(pattern.data());
    if (!created) return false;
    profile_ = created;
    if (::chmod(profile_.c_str(), S_IRWXU) != 0) return false;

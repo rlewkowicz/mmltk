@@ -82,6 +82,7 @@ TEST_CASE("Nonempty class layouts retain full physical ranking capacity", "[mode
 }
 TEST_CASE("RF-DETR publication restores the complete bundle at every cancellation boundary", "[model][rfdetr][layout][publication]") {
  const mmltk::testsupport::ScopedTempDir root("class-bundle-publication");
+ // CLEANUP-IGNORE: Artifact, companion path, and class layout are explicit inputs to different publication cancellation and competing-reader cases.
  const auto artifact = root.path() / "model.engine";
  const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
  const auto layout = r::native_training_class_layout(c::ClassCatalog({"cat"}));
@@ -162,6 +163,7 @@ TEST_CASE("Class artifact admission waits for a complete published companion", "
 }
 TEST_CASE("Staged class publication permits old readers and rejects a competing commit", "[model][rfdetr][layout][publication]") {
  const mmltk::testsupport::ScopedTempDir root("class-bundle-staged-read");
+ // CLEANUP-IGNORE: Artifact, companion path, and class layout are explicit inputs to different publication cancellation and competing-reader cases.
  const auto artifact = root.path() / "model.engine";
  const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
  const auto layout = r::native_training_class_layout(c::ClassCatalog({"cat"}));

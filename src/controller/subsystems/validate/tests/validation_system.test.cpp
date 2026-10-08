@@ -1,5 +1,6 @@
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
+#include "src/test_support/image_test_utils.hpp"
 #include "src/controller/subsystems/validate/detail/validation_samples.h"
 #include "src/controller/subsystems/validate/detail/validation_sample_output.h"
 #include "src/backend/imaging/raster/detail/checked_png.h"
@@ -26,9 +27,7 @@
 using namespace mmltk::controller::test_support;
 namespace {
 void check_validation_png_pixels(const std::filesystem::path& path) {
- int width = 0, height = 0, channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
- REQUIRE(pixels);
+ auto [width, height, pixels] = mmltk::testsupport::read_rgba_image(path);
  CHECK(width == 32);
  CHECK(height == 24);
  CHECK(pixels.get()[0] == 64U);
@@ -49,8 +48,7 @@ public:
 };
 TEST_CASE("Validation retains stable admitted capacity independently of visual revisions", "[controller][validation]") {
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("validation-capacity-facts")};
- fixture.PrepareModel(contracts::FeatureId::Validate);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Validate);
  const auto revision = settings.snapshot().revision;
  std::promise<void> settled;
  ValidationSystem validation{settings, dataset, model, [](DirectComputeConfiguration) { return std::make_unique<AdmittedValidationRuntime>(); }, [&](ValidationSystem::event_type event) {
@@ -60,6 +58,7 @@ TEST_CASE("Validation retains stable admitted capacity independently of visual r
  const auto frame = validation.snapshot().frame;
  static_cast<void>(validation.Start({}));
  mmltk::testsupport::await_test_promise(settled, "validation admitted capacity");
+ // CLEANUP-IGNORE: Predict and Validate independently verify their public execution-generation handoff; each continues with its own outcome and frame assertions.
  const auto snapshot = validation.snapshot();
  CHECK(snapshot.execution.admitted_capacity == 1);
  CHECK(snapshot.execution.settings_revision == revision);
@@ -71,6 +70,18 @@ template <class Predicate>
 void await_validation(std::mutex& mutex, std::condition_variable& changed, Predicate predicate) {
  std::unique_lock lock(mutex);
  REQUIRE(changed.wait_for(lock, std::chrono::seconds(20), predicate));
+}
+PredictionSource validation_red_source(const mmltk::frameworks::gpu::DeviceExecution& execution, PredictionSource::Catalog classes) {
+ const std::array<float, 12U> red{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+ return PredictionSource::Device(execution, {2U, 2U}, red, {}, std::move(classes));
+}
+void capture_red_sample(detail::ValidationSamples& samples, PredictionSource& source, std::uint64_t generation, std::uint32_t index) {
+ const mmltk::backend::models::rfdetr::PredictionRecord record{.dataset_index = index};
+ samples.Capture(generation, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
+}
+void settle_validation_pair(detail::ValidationSamples& samples, std::mutex& mutex, std::condition_variable& changed, std::uint64_t generation) {
+ samples.Settle(generation, true);
+ await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0] && samples.snapshot().sample_available[1]; });
 }
 auto borrow_validation_frame(detail::ValidationSamples& samples) {
  auto image = samples.BorrowFrame();
@@ -92,6 +103,7 @@ std::array<std::uint8_t, 4U> validation_tile_pixel(const mmltk::frameworks::gpu:
 // CLEANUP-IGNORE: Independent custody test preamble; aliases and one execution-policy call are not a shared algorithm.
 TEST_CASE("composed preview retains every source after the outer draw callback", "[controller][gpu][validation]") {
  namespace gpu = mmltk::frameworks::gpu;
+ // CLEANUP-IGNORE: The match spans a type alias, execution input, and unrelated generated scenario axis, with no shared executable algorithm.
  using Composition = detail::PredictionPreviewComposition;
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  const bool outer = GENERATE(false, true);
@@ -120,6 +132,7 @@ TEST_CASE("composed preview retains every source after the outer draw callback",
   for (std::size_t index = 0U; index < regions.size(); ++index) {
    auto source = PredictionSource::Decoded({2U, 2U}, pixels);
    sources[index] = source.custody();
+   // CLEANUP-IGNORE: Separate source captures intentionally test capacity before and during a held draw; each result must be guarded at its own lifetime boundary.
    auto frame = pool.Capture(nullptr, {2U, 2U}, 0U, {}, source.annotations(), source.classes(), 0, source.rgb8(), source.custody(), nullptr, nullptr, {}, true);
    REQUIRE(frame);
    frames[index] = frame;
@@ -137,6 +150,7 @@ TEST_CASE("composed preview retains every source after the outer draw callback",
   CHECK(receiver_fault.uploads == (outer ? 6U : 3U));
   for (const auto& source : sources) CHECK_FALSE(source.expired());
   auto extra = PredictionSource::Decoded({2U, 2U}, pixels);
+  // CLEANUP-IGNORE: Separate source captures intentionally test capacity before and during a held draw; each result must be guarded at its own lifetime boundary.
   auto concurrent = pool.Capture(nullptr, {2U, 2U}, 0U, {}, extra.annotations(), extra.classes(), 0, extra.rgb8(), extra.custody(), nullptr, nullptr, {}, true);
   REQUIRE(concurrent);  // Source delivery continues while the independent draw owns its set.
   CHECK_FALSE(pool.Capture(nullptr, {2U, 2U}, 0U, {}, extra.annotations(), extra.classes(), 0, extra.rgb8(), extra.custody(), nullptr, nullptr, {}, true));
@@ -167,8 +181,7 @@ TEST_CASE("validation admits asynchronous selected-path inspection and cancels b
  ApplicationDataFixture fixture{root};
  fixture.PrepareModel(contracts::FeatureId::Validate);
  auto [settings, unused_dataset, model] = fixture.systems();
- auto observation = std::make_shared<DatasetRuntimeObservation>();
- DatasetSystem dataset{settings, [observation] { return std::make_unique<BlockingInspectRuntime>(observation); }};
+ auto [observation, dataset] = BlockingDatasetFixture{settings};
  auto gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::atomic_size_t constructions = 0;
  std::promise<ValidationSystem::event_type> settled;
@@ -339,6 +352,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  CHECK(detail.content_identity != atlas.content_identity);
  CHECK(detail.frame.extent == VisualExtent{2U, 2U});
  auto document = samples.BorrowDocument(detail.frame);
+ // CLEANUP-IGNORE: Distinct retained documents are checked against different snapshot facts before scenario-specific frame and category assertions.
  REQUIRE(document.valid());
  CHECK(document.document->facts() == detail.document);
  CHECK(document.document->scene.frame_index == 3U);
@@ -363,11 +377,13 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  REQUIRE(atlas_reader.valid());
  const auto before = samples.snapshot();
  samples.SetOverlays({false, false, false, false});
+ // CLEANUP-IGNORE: Output pressure and draw failure independently preserve frame and overlay facts before different selection-revision expectations.
  CHECK(samples.snapshot().frame == before.frame);  // Both outputs have physical readers.
  CHECK(samples.snapshot().overlays == before.overlays);
  CHECK(samples.snapshot().overlay_selection.value == ValidationOverlays{false, false, false, false});
  CHECK(samples.snapshot().overlay_selection.revision > before.overlay_selection.revision);
  retained = {};
+ // CLEANUP-IGNORE: The existing retained-atlas oracle is reused after independent release and retry waits.
  await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > before.frame.revision; });
  check_retained_atlas();
  CHECK(samples.snapshot().overlays == ValidationOverlays{false, false, false, false});
@@ -401,7 +417,9 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  }
  fault.partial_semantic = true;
  samples.SetOverlays({true, true, true, true});
+ // CLEANUP-IGNORE: Different failure and refusal scenarios await their own notification receipt before asserting preservation of the explicit incumbent frame.
  await_validation(mutex, changed, [&] { return notifications >= failure_notifications; });
+ // CLEANUP-IGNORE: Output pressure and draw failure independently preserve frame and overlay facts before different selection-revision expectations.
  CHECK(samples.snapshot().frame == preserved.frame);
  CHECK(samples.snapshot().overlays == preserved.overlays);
  CHECK(samples.snapshot().overlay_selection.value == preserved.overlays);
@@ -412,11 +430,13 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
   failure_notifications = notifications + 2U;
  }
  samples.SetDisplay({0.437F});
+ // CLEANUP-IGNORE: Different failure and refusal scenarios await their own notification receipt before asserting preservation of the explicit incumbent frame.
  await_validation(mutex, changed, [&] { return notifications >= failure_notifications; });
  CHECK(samples.snapshot().frame == preserved.frame);
  CHECK(samples.ImageSnapshot(preserved.frame)->display.confidence_threshold == 0.4F);
  fault.partial_semantic = false;
  samples.SetOverlays({true, true, true, true});  // Repeating a refused request is an explicit retry.
+ // CLEANUP-IGNORE: The existing retained-atlas oracle is reused after independent release and retry waits.
  await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > preserved.frame.revision; });
  check_retained_atlas();
  CHECK(samples.ImageSnapshot(samples.snapshot().frame)->display.confidence_threshold == 0.437F);
@@ -438,6 +458,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
  // Failure and cancellation share unsuccessful terminal settlement. Refusal
  // rejects capture independently of an otherwise successful metric result.
  const auto outcome = GENERATE(contracts::ComputeOperationOutcome::Succeeded, contracts::ComputeOperationOutcome::Failed, contracts::ComputeOperationOutcome::Cancelled);
+ // CLEANUP-IGNORE: Refusal and navigation are different generated axes; each validation scenario owns its device execution and notification synchronization.
  const bool refuse = GENERATE(false, true);
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  std::mutex mutex;
@@ -468,17 +489,14 @@ TEST_CASE("validation preview generations settle to retained source custody with
    CHECK(std::ranges::all_of(pixels, [&](const auto& value) { return value == expected; }));
   }
  }
+ // CLEANUP-IGNORE: The class label is an explicit input to independent validation-generation and presentation-refusal scenarios; source allocation and upload are already shared by the red-source
+ // fixture.
  const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"retained"});
- const std::array<float, 12U> red{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
- auto source = PredictionSource::Device(execution, {2U, 2U}, red, {}, classes);
- const auto capture = [&](std::uint64_t generation, std::uint32_t index) {
-  const rfdetr::PredictionRecord record{.dataset_index = index};
-  samples.Capture(generation, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
- };
+ auto source = validation_red_source(execution, classes);
+ const auto capture = [&](std::uint64_t generation, std::uint32_t index) { capture_red_sample(samples, source, generation, index); };
  capture(1U, 3U);
  capture(1U, 7U);
- samples.Settle(1U, true);
- await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0] && samples.snapshot().sample_available[1]; });
+ settle_validation_pair(samples, mutex, changed, 1U);
  const auto original_atlas = samples.snapshot();
  if (detail_open) {
   samples.Select({1U, 3U});
@@ -523,6 +541,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
   CHECK(metadata->samples[0].pixel_extent == incumbent_metadata->samples[0].pixel_extent);
   if (detail_open) {
    auto document = samples.BorrowDocument(after.frame);
+   // CLEANUP-IGNORE: Distinct retained documents are checked against different snapshot facts before scenario-specific frame and category assertions.
    REQUIRE(document.valid());
    CHECK(document.document->facts() == incumbent.document);
    CHECK(document.document->scene.categories[0].value == "retained");
@@ -572,6 +591,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
   samples.Select({generation, 7U});
   await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
   {
+   // CLEANUP-IGNORE: Generation replacement and presentation refusal independently inspect retained document identity before different category and selection checks.
    auto document = samples.BorrowDocument(samples.snapshot().frame);
    REQUIRE(document.valid());
    CHECK(document.document->scene.frame_index == 7U);
@@ -597,6 +617,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
 TEST_CASE("validation presentation refusals preserve settled populations and explicit retry", "[controller][gpu][validation]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;
+ // CLEANUP-IGNORE: Refusal and navigation are different generated axes; each validation scenario owns its device execution and notification synchronization.
  const bool navigate = GENERATE(false, true);
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  std::mutex mutex;
@@ -621,30 +642,30 @@ TEST_CASE("validation presentation refusals preserve settled populations and exp
   draw_gate.Release();
  });
  const std::array<std::uint32_t, 2U> indices{3U, 7U};
+ // CLEANUP-IGNORE: The class label is an explicit input to independent validation-generation and presentation-refusal scenarios; source allocation and upload are already shared by the red-source
+ // fixture.
  const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"retained"});
- const std::array<float, 12U> red{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
- auto source = PredictionSource::Device(execution, {2U, 2U}, red, {}, classes);
+ auto source = validation_red_source(execution, classes);
  const auto capture = [&](std::uint64_t generation) {
-  for (const auto index : indices) {
-   const rfdetr::PredictionRecord record{.dataset_index = index};
-   samples.Capture(generation, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
-  }
+  for (const auto index : indices) { capture_red_sample(samples, source, generation, index); }
  };
  samples.Begin(1U, indices);
  capture(1U);
- samples.Settle(1U, true);
- await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0] && samples.snapshot().sample_available[1]; });
+ settle_validation_pair(samples, mutex, changed, 1U);
  samples.Begin(2U, indices);
  capture(2U);
  await_validation(mutex, changed, [&] {
   const auto state = samples.snapshot();
   return state.sample_identities[0].generation == 2U && state.sample_available[0] && state.sample_available[1];
  });
+ const auto select_detail = [&] {
+  samples.Select({2U, 3U});
+  await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
+ };
  const auto population = samples.snapshot();
  auto atlas_reader = samples.BorrowFrame();
  REQUIRE(atlas_reader.valid());
- samples.Select({2U, 3U});
- await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
+ select_detail();
  samples.Settle(2U, true);
  const auto applied = samples.snapshot();
  auto detail_reader = samples.BorrowFrame();
@@ -667,6 +688,7 @@ TEST_CASE("validation presentation refusals preserve settled populations and exp
  request();
  CHECK(samples.snapshot().frame == applied.frame);
  atlas_reader = {};
+ // CLEANUP-IGNORE: Different failure and refusal scenarios await their own notification receipt before asserting preservation of the explicit incumbent frame.
  await_validation(mutex, changed, [&] { return notifications >= target; });
  CHECK(samples.snapshot().frame == applied.frame);
  CHECK(samples.snapshot().selected == applied.selected);
@@ -678,6 +700,7 @@ TEST_CASE("validation presentation refusals preserve settled populations and exp
  await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > applied.frame.revision; });
  detail_reader = {};
  if (navigate) {
+  // CLEANUP-IGNORE: Generation replacement and presentation refusal independently inspect retained document identity before different category and selection checks.
   auto document = samples.BorrowDocument(samples.snapshot().frame);
   REQUIRE(document.valid());
   CHECK(document.document->scene.frame_index == 7U);
@@ -691,8 +714,7 @@ TEST_CASE("validation presentation refusals preserve settled populations and exp
  // and while its actual semantic composition is executing.
  atlas_reader = samples.BorrowFrame();
  REQUIRE(atlas_reader.valid());
- samples.Select({2U, 3U});
- await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
+ select_detail();
  detail_reader = samples.BorrowFrame();
  REQUIRE(detail_reader.valid());
  const auto before_close = samples.snapshot();
@@ -800,6 +822,7 @@ TEST_CASE("validation requires a nonzero rectangular two by three atlas envelope
 TEST_CASE("validation composition preserves independent nonempty box and mask pixels", "[controller][gpu][validation]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;
+ // CLEANUP-IGNORE: The match spans a type alias, execution input, and unrelated generated scenario axis, with no shared executable algorithm.
  using Composition = detail::PredictionPreviewComposition;
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  const bool complementary = GENERATE(false, true);
@@ -831,8 +854,7 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
   auto candidate = runtime.AcquireOutput();
   Composition::Draw(runtime, candidate, {12U, 12U}, regions, options);
   auto completed = runtime.CommitOutput(std::move(candidate));
-  auto image = completed.Borrow();
-  REQUIRE(image.valid());
+  auto image = mmltk::testsupport::require_borrowed_image(completed);
   std::array<std::uint8_t, 12U * 12U * 4U> rgba{};
   context.Bind();
   const auto semantic = image.plane(1U).plane();
@@ -874,11 +896,11 @@ TEST_CASE("retained validation preparation follows physical storage and changed 
  auto& context = receiver.device.context;
  auto& fault = receiver.fault;
  detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 6U);
+ // CLEANUP-IGNORE: Independent Predict and Validate composition scenarios retain their own runtime, composition and catalog; source and allocation checks differ.
  gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
  Composition retained;
  const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"sample"});
- const std::array<float, 12U> red{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
- auto source = PredictionSource::Device(execution, {2U, 2U}, red, {}, classes);
+ auto source = validation_red_source(execution, classes);
  const std::array truth{rfdetr::Prediction{.class_reference = 0, .bbox_xyxy = {-0.5F, -0.5F, 0.5F, 0.5F}, .mask = {.height = 2U, .width = 2U, .area = 1U, .runs = {{0U, 1U}}}, .has_mask = true}};
  std::array<Composition::Region, 6U> regions;
  std::array<std::uint64_t, 2U> allocations{};
@@ -886,6 +908,7 @@ TEST_CASE("retained validation preparation follows physical storage and changed 
  const auto draw = [&](std::size_t count, Composition::Options options, VisualExtent extent = {12U, 8U}) {
   auto candidate = runtime.AcquireOutput();
   Composition::Draw(runtime, candidate, extent, std::span(regions).first(count), options, &retained);
+  // CLEANUP-IGNORE: The completed output and borrowed view retain separate lifetimes through each scenario-specific device copy and allocation check.
   auto completed = runtime.CommitOutput(std::move(candidate));
   auto image = completed.Borrow();
   context.Bind();
@@ -1002,8 +1025,7 @@ TEST_CASE("validation semantic metrics survive required sample refusal without r
  CAPTURE(failure);
  const auto root = mmltk::testsupport::make_temp_root("validation-preview-refusal");
  ApplicationDataFixture fixture{root};
- fixture.PrepareModel(contracts::FeatureId::Validate);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Validate);
  contracts::SettingsUpdateRequest initial_display;
  initial_display.updates.push_back({.path = "workflows.validate.display.confidence_threshold", .value = mmltk::frameworks::serialization::wire::FlatValue{0.437}});
  static_cast<void>(settings.Update(std::move(initial_display)));
@@ -1056,9 +1078,7 @@ TEST_CASE("validation semantic metrics survive required sample refusal without r
   CHECK_FALSE(std::filesystem::exists(directory / "sample-5.png.partial"));
   CHECK_FALSE(std::filesystem::exists(directory / "sample-3.png.partial"));
   CHECK(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator{}) == 1);
-  int width = 0, height = 0, channels = 0;
-  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load((directory / "sample-3.png").c_str(), &width, &height, &channels, 4), stbi_image_free);
-  REQUIRE(pixels);
+  auto [width, height, pixels] = mmltk::testsupport::read_rgba_image((directory / "sample-3.png"));
   CHECK(width == 32);
   CHECK(height == 24);
   CHECK(pixels.get()[0] == 64U);
@@ -1123,9 +1143,7 @@ TEST_CASE("validation output saves the selected identities without presentation 
  REQUIRE(published.size() == saved_count);
  for (std::size_t index = 0; index < saved_count; ++index) {
   CHECK(published[index] == directory.path() / "samples" / ("sample-" + std::to_string(selected[index]) + ".png"));
-  int width = 0, height = 0, channels = 0;
-  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(published[index].c_str(), &width, &height, &channels, 4), stbi_image_free);
-  REQUIRE(pixels);
+  auto [width, height, pixels] = mmltk::testsupport::read_rgba_image(published[index]);
   REQUIRE(width == 32);
   REQUIRE(height == 24);
   for (int pixel = 0; pixel < width * height; ++pixel) {
@@ -1142,11 +1160,7 @@ TEST_CASE("headless validation receivers follow selected execution while graphic
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;
  using namespace mmltk::controller;
- const auto topology = mmltk::common::system::NumaTopology::Capture();
- const auto first = gpu::resolve_device_execution(0, topology);
- int count = 0;
- REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
- const auto second = count > 1 ? gpu::resolve_device_execution(1, topology) : first;
+ const auto [first, second, count] = gpu::test_support::test_device_pair();
  if (count < 2) WARN("Only one CUDA GPU is visible; headless cross-device output remains unverified");
  const bool graphics = GENERATE(false, true);
  const mmltk::testsupport::ScopedTempDir directory("validation-receiver-switch");
@@ -1161,6 +1175,7 @@ TEST_CASE("headless validation receivers follow selected execution while graphic
  for (const auto& execution : {first, second, second}) {
   const auto run = retained.size();
   output.Begin(directory.path() / std::to_string(run), options, selected, {execution});
+  // CLEANUP-IGNORE: The existing device-source factory creates distinct output-capture and late-custody inputs with separate owner lifetimes.
   auto source = PredictionSource::Device(execution, {32U, 24U}, std::vector<float>(32U * 24U * 3U, .25F), {}, catalog);
   rfdetr::PredictionRecord record{.dataset_index = 0};
   auto captured = output.Capture({record, {.chw = source.pixels(), .width = 32U, .height = 24U, .device = execution.device, .custody = source.custody()}, source.annotations(), {}});
@@ -1192,8 +1207,7 @@ TEST_CASE("validation receiver authority survives group replacement and late bor
  auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(21U);
  const mmltk::testsupport::ScopedTempDir root("validation-late-receiver");
  ApplicationDataFixture fixture(root.path());
- fixture.PrepareModel(contracts::FeatureId::Validate);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Validate);
  unsigned factories = 0;
  ValidationSystem validation(settings, dataset, model, [&](DirectComputeConfiguration) {
   ++factories;
@@ -1205,6 +1219,7 @@ TEST_CASE("validation receiver authority survives group replacement and late bor
  contracts::ValidationRunPreview options;
  options.overlays = {false, false, false, false, false, false};
  auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"retained"});
+ // CLEANUP-IGNORE: The existing device-source factory creates distinct output-capture and late-custody inputs with separate owner lifetimes.
  auto source = PredictionSource::Device(execution, {32U, 24U}, std::vector<float>(32U * 24U * 3U, .25F), {}, catalog);
  rfdetr::PredictionRecord record{.dataset_index = 0};
  const auto sample = [&] {
@@ -1222,9 +1237,7 @@ TEST_CASE("validation receiver authority survives group replacement and late bor
   CHECK(old->receiver_device() == execution.device);
   CHECK(old->classes().front() == "retained");
   // The old image remains usable after its receiver pool has been released.
-  int width = 0, height = 0, channels = 0;
-  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(published.front().c_str(), &width, &height, &channels, 4), stbi_image_free);
-  REQUIRE(pixels);
+  auto [width, height, pixels] = mmltk::testsupport::read_rgba_image(published.front());
   CHECK(width == 32);
   CHECK(height == 24);
   CHECK(pixels.get()[0] == 64U);
@@ -1279,9 +1292,7 @@ TEST_CASE("validation rendered output applies captured layers masks boxes and in
  REQUIRE(output.Capture({record, {.chw = source.pixels(), .width = 32U, .height = 40U, .device = 0, .custody = source.custody()}, source.annotations(), truths}));
  options.overlays = {false, false, false, false, false, false};  // Later viewer policy cannot mutate the admitted save.
  output.Finish(true);
- int width = 0, height = 0, channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(published.c_str(), &width, &height, &channels, 4), stbi_image_free);
- REQUIRE(pixels);
+ auto [width, height, pixels] = mmltk::testsupport::read_rgba_image(published);
  REQUIRE(width == 32);
  REQUIRE(height == 40);
  const bool prediction = choice != 1U && choice != 7U;
@@ -1316,6 +1327,7 @@ TEST_CASE("validation PNG captions preserve names independent flags opaque order
   options.prediction_labels = det;
   auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{std::move(name)});
   rfdetr::Prediction detection{.class_reference = 0, .score = 0.8F, .bbox_xyxy = {x, 26, 64, 40}};
+  // CLEANUP-IGNORE: Caption geometry cases supply distinct detection coordinates while retaining their own source and truth storage through capture.
   auto source = PredictionSource::Device(execution, {64U, 48U}, std::vector<float>(64U * 48U * 3U, 0.25F), {detection}, catalog);
   const std::array truth{detection};
   const std::array<std::uint32_t, 1> selected{33U};
@@ -1323,9 +1335,7 @@ TEST_CASE("validation PNG captions preserve names independent flags opaque order
   const rfdetr::PredictionRecord record{.dataset_index = 33, .detections = {detection}};
   REQUIRE(output.Capture({record, {.chw = source.pixels(), .width = 64U, .height = 48U, .device = 0, .custody = source.custody()}, source.annotations(), truth}));
   output.Finish(true);
-  int width = 0, height = 0, channels = 0;
-  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> decoded(stbi_load(published.c_str(), &width, &height, &channels, 4), stbi_image_free);
-  REQUIRE(decoded);
+  auto [width, height, decoded] = mmltk::testsupport::read_rgba_image(published);
   REQUIRE(width == 64);
   REQUIRE(height == 48);
   CHECK(published.filename() == "sample-33.png");
@@ -1428,9 +1438,9 @@ TEST_CASE("validation public Stop and Shutdown settle an engaged PNG before term
  using namespace mmltk::controller;
  const bool shutdown = GENERATE(false, true);
  const auto root = mmltk::testsupport::make_temp_root("validation-stop-output");
+ // CLEANUP-IGNORE: The application-data fixture and device resolver already own setup; the tests exercise distinct public-stop and exception boundaries.
  ApplicationDataFixture fixture{root};
- fixture.PrepareModel(contracts::FeatureId::Validate);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Validate);
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::testsupport::TestGate encoding("public validation PNG write");
  std::promise<ValidationSnapshot> terminal;
@@ -1471,9 +1481,9 @@ TEST_CASE("validation public Stop and Shutdown settle an engaged PNG before term
 TEST_CASE("validation runtime throw settles selected PNG before failure and restart", "[controller][validation][gpu][output]") {
  using namespace mmltk::controller;
  const auto root = mmltk::testsupport::make_temp_root("validation-throw-output");
+ // CLEANUP-IGNORE: The application-data fixture and device resolver already own setup; the tests exercise distinct public-stop and exception boundaries.
  ApplicationDataFixture fixture{root};
- fixture.PrepareModel(contracts::FeatureId::Validate);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Validate);
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::testsupport::TestGate encoding("throwing validation PNG write");
  std::promise<ValidationSnapshot> failed, restarted;
@@ -1532,6 +1542,7 @@ TEST_CASE("validation caption anchors reject malformed coordinates and retain co
  for (unsigned index = 0; index < 2; ++index) {
   rfdetr::Prediction detection{.class_reference = 0, .score = 0.8F, .bbox_xyxy = {2, 26, 64, 40}};
   if (index == 1) detection.bbox_xyxy[axis] = coordinate;
+  // CLEANUP-IGNORE: Caption geometry cases supply distinct detection coordinates while retaining their own source and truth storage through capture.
   auto source = PredictionSource::Device(execution, {64U, 48U}, std::vector<float>(64U * 48U * 3U, 0.25F), {detection}, catalog);
   const std::array truth{detection};
   const rfdetr::PredictionRecord record{.dataset_index = selected[index], .detections = {detection}};
@@ -1544,9 +1555,7 @@ TEST_CASE("validation caption anchors reject malformed coordinates and retain co
  REQUIRE(published.size() == (valid ? 2U : 1U));
  CHECK(published.front().filename() == "sample-17.png");
  for (const auto& path : published) {
-  int width = 0, height = 0, channels = 0;
-  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
-  REQUIRE(pixels);
+  auto [width, height, pixels] = mmltk::testsupport::read_rgba_image(path);
   CHECK(width == 64);
   CHECK(height == 48);
   CHECK(pixels.get()[(47U * 64U + 63U) * 4U] == 64U);

@@ -334,6 +334,7 @@ int main(const int argument_count, char* const* const arguments) {
    static_cast<unsigned char>(size >> 8U),
    static_cast<unsigned char>(size),
   };
+  // CLEANUP-IGNORE: Tar and WebSocket fixtures independently emit different framing headers and payloads with separate size and failure rules.
   output.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
   output.write(reinterpret_cast<const char*>(encoded.data()), static_cast<std::streamsize>(encoded.size()));
  }

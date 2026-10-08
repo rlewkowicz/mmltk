@@ -9,6 +9,11 @@
 #include <utility>
 #include "src/controller/contracts/application_boundary.h"
 namespace mmltk::controller {
+void VisualDocument::AppendSourceObject(contracts::AnnotationObject object, std::array<float, 4> bounds) {
+ mask_bounds.push_back(bounds);
+ object.shape = object.mask.present ? contracts::AnnotationShape::Mask : contracts::AnnotationShape::Box;
+ scene.objects.push_back(std::move(object));
+}
 std::uint64_t VisualDocument::NextIdentity() {
  static std::atomic_uint64_t next{1U};
  const auto identity = next.fetch_add(1U, std::memory_order_relaxed);

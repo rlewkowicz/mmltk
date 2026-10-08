@@ -372,6 +372,7 @@ struct ImageUpscaler::Impl {
   return ImageUpscalerOutcome::Completed;
  }
  ImageUpscalerOutcome initialize_onnx(Slot& target, ImageUpscalerCurrent current) {
+  // CLEANUP-IGNORE: Cancellation and the canonical descriptor lookup precede distinct ONNX and TensorRT initialization lifetimes.
   if (!current()) return ImageUpscalerOutcome::Cancelled;
   const auto& descriptor = image_upscaler_descriptor(target.kind);
   trace_activation_stage("onnx_checksum_started", target.kind);
@@ -390,6 +391,7 @@ struct ImageUpscaler::Impl {
   return ImageUpscalerOutcome::Completed;
  }
  ImageUpscalerOutcome initialize_tensorrt(Slot& target, ImageUpscalerCurrent current) {
+  // CLEANUP-IGNORE: Cancellation and the canonical descriptor lookup precede distinct ONNX and TensorRT initialization lifetimes.
   if (!current()) return ImageUpscalerOutcome::Cancelled;
   const auto& descriptor = image_upscaler_descriptor(target.kind);
   trace_activation_stage("tensorrt_checksum_started", target.kind);
@@ -526,6 +528,7 @@ struct ImageUpscaler::Resolver final {
   return std::nullopt;
  }
  [[nodiscard]] static bool seal(const std::uint8_t service_slot, const std::uint64_t service_generation, const std::uint64_t core_generation, const std::shared_ptr<Impl>& expected) noexcept {
+  // CLEANUP-IGNORE: The resolver lock protects different seal and removal operations with different return and ownership semantics.
   Resolver& resolver = instance();
   std::lock_guard lock(resolver.mutex);
   if (service_slot >= resolver.slots.size()) return false;
@@ -545,6 +548,7 @@ struct ImageUpscaler::Resolver final {
   return owner;
  }
  static void remove(const std::uint8_t service_slot, const std::uint64_t service_generation, const std::uint64_t core_generation, const std::shared_ptr<Impl>& expected) noexcept {
+  // CLEANUP-IGNORE: The resolver lock protects different seal and removal operations with different return and ownership semantics.
   Resolver& resolver = instance();
   std::lock_guard lock(resolver.mutex);
   if (service_slot >= resolver.slots.size()) return;

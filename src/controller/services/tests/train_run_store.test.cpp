@@ -211,6 +211,7 @@ TEST_CASE("saved training output admits complete selected provenance and rejects
  run.sources = r::training_source_catalog(run.configuration);
  r::TrainingSelection selected;
  selected.artifact.session_id = run.run_id;
+ // CLEANUP-IGNORE: Independent persisted run and telemetry fixtures specify fixed artifact identity bytes before distinct publication checks.
  selected.artifact.path = "selected.pt";
  selected.artifact.initialization = selected.artifact.configuration = selected.artifact.content = selected.artifact.sha256 = selected.artifact.validation = std::string(64, 'a');
  selected.artifact.selection_metric = .5;

@@ -1,4 +1,5 @@
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
+#include "src/common/io/socket_message.h"
 #include "src/controller/presentation/presentation_system.h"
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -103,6 +104,7 @@ void trace_memory_descriptor(const char* event, const Record& record, int peer, 
   static_cast<unsigned long long>(record.size), static_cast<unsigned long long>(record.stride), static_cast<unsigned long long>(record.offset), record.width, record.height, record.dedicated,
   sizeof(record), stat_status, stat_errno, static_cast<unsigned long long>(metadata.st_dev), static_cast<unsigned long long>(metadata.st_ino), static_cast<unsigned long long>(metadata.st_rdev),
   static_cast<unsigned int>(metadata.st_mode), static_cast<long long>(metadata.st_size));
+ // CLEANUP-IGNORE: Separate low-level diagnostic records preserve ambient errno after a bounded stderr write; record format and ownership differ.
  if (bytes > 0 && static_cast<std::size_t>(bytes) < sizeof(output)) mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(bytes)});
  errno = saved_errno;
 }
@@ -389,10 +391,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
      fail("workspace import control message could not be formed");
      return;
     }
-    header->cmsg_level = SOL_SOCKET;
-    header->cmsg_type = SCM_RIGHTS;
-    header->cmsg_len = CMSG_LEN(payload_bytes);
-    std::memcpy(CMSG_DATA(header), descriptor_values.data(), payload_bytes);
+    mmltk::common::io::write_socket_descriptors(*header, std::span{descriptor_values}.first(outbound.descriptor_count));
    }
    const ssize_t sent = ::sendmsg(peer.get(), &message, MSG_NOSIGNAL);
    if (sent < 0 && errno == EINTR) { continue; }

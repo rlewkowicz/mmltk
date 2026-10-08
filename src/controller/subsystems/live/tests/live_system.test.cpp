@@ -154,6 +154,10 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
   kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
   [&](LiveSystem::event_type) { events.Advance(); }
  };
+ const auto stop_and_wait = [&] {
+  static_cast<void>(live.Stop());
+  REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
+ };
  const auto check = [](const auto& read, const std::size_t value) {
   REQUIRE(read.valid());
   const auto plane = read.plane(0U).plane();
@@ -186,8 +190,7 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
  CHECK(third.plane(0U).plane().data == first_pointer);
  second = {};
  third = {};
- static_cast<void>(live.Stop());
- REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
+ stop_and_wait();
  state->Offer();
  static_cast<void>(live.Start({.extent = {3U, 5U}, .frames_per_second = 240U}));
  REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 4U; }));
@@ -196,8 +199,7 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
  CHECK(resized.plane(0U).plane().descriptor.width == 3U);
  CHECK(resized.plane(0U).plane().descriptor.height == 5U);
  resized = {};
- static_cast<void>(live.Stop());
- REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
+ stop_and_wait();
  CHECK(backend->same_copies == 0U);
  CHECK(backend->plane_clears == 0U);
 }
@@ -255,7 +257,9 @@ public:
  void Stop() noexcept override {}
 };
 TEST_CASE("Live queued discrete cancellation settles without running obsolete work") {
+ // CLEANUP-IGNORE: Independent visual scenarios use the same backend, counter, and promise primitives; ordering and cancellation stay with their different runtime owners.
  auto backend = std::make_shared<FakeImageBackend>();
+ // CLEANUP-IGNORE: These independent ordering and cancellation tests use separate counters and promise receipts; only fixture construction is repeated.
  auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
  std::promise<void> latest_entered;
  std::promise<void> release_latest;

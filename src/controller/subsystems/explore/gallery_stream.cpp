@@ -130,6 +130,11 @@ public:
  void Retire(cudaError_t) noexcept;
  void CheckSettlement(cudaError_t, const char*);
  [[nodiscard]] mmltk::frameworks::gpu::SystemImageModel::Release TerminalRelease() const noexcept { return {.all_released = false, .failure = terminal_failure_}; }
+ [[nodiscard]] std::optional<mmltk::frameworks::gpu::SystemImageModel::Release> RetiredRelease() noexcept {
+  if (retirement_.admission_open()) return std::nullopt;
+  Retire(retirement_.fact().first_failure);
+  return TerminalRelease();
+ }
  void SetStreamSettlement(decltype(&cudaStreamSynchronize) operation) { stream_wait_ = operation; }
  void BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext& context, std::shared_ptr<mmltk::frameworks::gpu::ImageStream> stream) {
   retained_context_ = context;
@@ -215,6 +220,7 @@ private:
  [[nodiscard]] explore::ExploreRenderScratchView Scratch() const;
  [[nodiscard]] explore::ExploreRenderSemanticView Semantics(const ExploreOverlay&, bool) const;
  void UploadDescriptors(cudaStream_t, bool);
+ void UploadPendingDescriptors(cudaStream_t, std::span<const explore::ExploreRenderClassDescriptor>);
  void SettleDescriptors();
  static void Clear(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
  std::optional<mmltk::frameworks::gpu::DeviceContext> retained_context_;
@@ -905,6 +911,7 @@ mmltk::frameworks::gpu::ImagePlaneView GalleryStream::Impl::CachePlane(const boo
 void GalleryStream::Impl::PlaceTile(
  const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uint32_t slot, const std::uintptr_t stream, const bool semantic_only) {
  const auto side = State().cache.identity().extent;
+ // CLEANUP-IGNORE: Viewport position and retained-tile lookup feed different placement and semantic-refresh algorithms.
  const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
  const auto* entry = State().cache.Retained(State().visible_indices[slot]);
  if (!entry) throw std::logic_error("Explore atlas placement requires a completed cache tile");
@@ -1029,6 +1036,7 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
   SettleDescriptors();
   for (const auto slot : slots) {
    if (!scheduler_.Current(State().plan.generation)) return;
+   // CLEANUP-IGNORE: Viewport position and retained-tile lookup feed different placement and semantic-refresh algorithms.
    const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
    const auto* incumbent = State().cache.Retained(State().visible_indices[slot]);
    if (!incumbent) throw std::logic_error("Explore semantic refresh lost its clean tile");
@@ -1464,9 +1472,7 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.cards.offset, meaning.card);
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.annotations.offset, std::span{meaning.annotations});
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.rle.offset, std::span{meaning.runs});
-  store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.classes.offset, classes);
-  UploadDescriptors(reinterpret_cast<cudaStream_t>(stream), true);
-  descriptors_.descriptors_pending_ = true;
+  UploadPendingDescriptors(reinterpret_cast<cudaStream_t>(stream), classes);
   if (!scheduler_.current_demand_(plan.generation)) return;
   RenderDetailPlane(State().detail_view, plan.overlay, semantic, stream, true);
   CheckSettlement(stream_wait_(reinterpret_cast<cudaStream_t>(stream)), "Explore semantic update failed");
@@ -1548,9 +1554,7 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
   object.category = annotation.class_id;
   object.box = {{annotation.box_xyxy[0] * document_width, annotation.box_xyxy[1] * document_height}, {annotation.box_xyxy[2] * document_width, annotation.box_xyxy[3] * document_height}};
   object.mask.present = annotation.mask_present;
-  document->mask_bounds.push_back({annotation.mask_bounds[0], annotation.mask_bounds[1], annotation.mask_bounds[2], annotation.mask_bounds[3]});
-  object.shape = object.mask.present ? contracts::AnnotationShape::Mask : contracts::AnnotationShape::Box;
-  document->scene.objects.push_back(std::move(object));
+  document->AppendSourceObject(std::move(object), {annotation.mask_bounds[0], annotation.mask_bounds[1], annotation.mask_bounds[2], annotation.mask_bounds[3]});
  }
  document->mask_contains = [meaning = State().detail_meaning, width = detail.source_width, height = detail.source_height, erasure = detail.erasure](std::size_t index, float x, float y) {
   const auto& annotations = meaning->annotations;
@@ -1615,9 +1619,7 @@ void GalleryStream::Impl::SeedPlaceholders(const std::span<const explore::Explor
   };
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.tiles.offset + index * sizeof(tile), tile);
  }
- store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.classes.offset, classes);
- UploadDescriptors(reinterpret_cast<cudaStream_t>(stream), true);
- descriptors_.descriptors_pending_ = true;
+ UploadPendingDescriptors(reinterpret_cast<cudaStream_t>(stream), classes);
  if (RenderAtlasBatch(clean, semantic, stream, static_cast<std::uint32_t>(placeholders.size()), State().plan.generation, AtlasBatch::Placeholders) == BatchSubmission::Complete)
   for (const auto physical : placeholders) atlas_.Stage(physical, {}, 0U, true);
 }
@@ -1699,6 +1701,11 @@ explore::ExploreRenderSemanticView GalleryStream::Impl::Semantics(const ExploreO
   .show_boxes = static_cast<std::uint8_t>(semantic && overlay.show_boxes),
   .show_masks = static_cast<std::uint8_t>(semantic && overlay.show_masks),
  };
+}
+void GalleryStream::Impl::UploadPendingDescriptors(cudaStream_t stream, std::span<const explore::ExploreRenderClassDescriptor> classes) {
+ store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.classes.offset, classes);
+ UploadDescriptors(stream, true);
+ descriptors_.descriptors_pending_ = true;
 }
 void GalleryStream::Impl::UploadDescriptors(cudaStream_t stream, bool upload_classes) {
  descriptors_.UploadDescriptors(stream, upload_classes, scheduler_.current_demand_, State().plan.generation);
@@ -1784,10 +1791,8 @@ void GalleryStream::Impl::ClearReadinessState() {
  State().reused_tiles = 0U;
 }
 auto GalleryStream::Impl::ReleaseAfterRuntimeSettlement() noexcept -> mmltk::frameworks::gpu::SystemImageModel::Release {
- if (!retirement_.admission_open()) {
-  Retire(retirement_.fact().first_failure);
-  return TerminalRelease();
- }
+ // CLEANUP-IGNORE: The common retirement verdict is already owned by RetiredRelease; this idempotency guard precedes distinct runtime settlement and buffer-release work.
+ if (const auto retired = RetiredRelease()) return *retired;
  if (resources_released_) return {};
  try {
   Quiesce();
@@ -1796,10 +1801,7 @@ auto GalleryStream::Impl::ReleaseAfterRuntimeSettlement() noexcept -> mmltk::fra
   const auto failure = std::current_exception();
   // Failed completion retains the complete physical owner. Do not retry
   // resource release after its settlement authority has become terminal.
-  if (!retirement_.admission_open()) {
-   Retire(retirement_.fact().first_failure);
-   return TerminalRelease();
-  }
+  if (const auto retired = RetiredRelease()) return *retired;
   try {
    scheduler_.image_stream_.close();
   } catch (...) {}
@@ -1808,10 +1810,8 @@ auto GalleryStream::Impl::ReleaseAfterRuntimeSettlement() noexcept -> mmltk::fra
  return ResetBuffersChecked();
 }
 auto GalleryStream::Impl::ResetBuffersChecked() noexcept -> mmltk::frameworks::gpu::SystemImageModel::Release {
- if (!retirement_.admission_open()) {
-  Retire(retirement_.fact().first_failure);
-  return TerminalRelease();
- }
+ // CLEANUP-IGNORE: The common retirement verdict is already owned by RetiredRelease; this idempotency guard precedes distinct runtime settlement and buffer-release work.
+ if (const auto retired = RetiredRelease()) return *retired;
  if (resources_released_) return {};
  cudaError_t unsettled = cudaSuccess;
  const auto probes = probe_ ? probe_->ReleaseProbesChecked(stream_wait_, unsettled) : mmltk::frameworks::gpu::SystemImageModel::Release{};

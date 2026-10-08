@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
 #include "src/backend/models/rfdetr/training/detail/model_merging.h"
@@ -11,7 +12,6 @@
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/frameworks/serialization/reflected_json.h"
-#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -162,8 +162,7 @@ using ParameterValues = std::unordered_map<std::string, torch::Tensor>;
 torch::Tensor capture_update_parameter(const TrainingParameters& parameters, const rfdetr::NativeOptimizer& optimizer, const std::string& name, bool active) {
  const auto* parameter = parameters.find(name);
  REQUIRE(parameter);
- REQUIRE(parameter->grad().defined());
- REQUIRE(torch::isfinite(parameter->grad()).all().item<bool>());
+ mmltk::backend::ml::testsupport::require_finite_gradient(*parameter);
  REQUIRE((parameter->grad().abs().sum().item<float>() > 0.F) == active);
  REQUIRE(std::find(optimizer.parameter_names().begin(), optimizer.parameter_names().end(), name) != optimizer.parameter_names().end());
  return parameter->detach().clone();
@@ -248,9 +247,8 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
  rfdetr::detail::write_training_supervision_config(output, config);
  rfdetr::detail::write_state_archive(output, "state", entries, readback, 0);
  readback.Complete();
- output.save_to(path.string());
- torch::serialize::InputArchive input;
- input.load_from(path.string());
+ // CLEANUP-IGNORE: The archive reload helper is shared; active and inactive configurations retain independent round-trip equality assertions.
+ auto input = mmltk::backend::models::rfdetr::testsupport::reload_archive(output, path);
  REQUIRE((rfdetr::detail::read_training_supervision_config(input) == config));
  torch::serialize::InputArchive resume_archive;
  resume_archive.load_from(path.string(), torch::Device(torch::kCPU));
@@ -262,17 +260,14 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
  torch::serialize::OutputArchive legacy_output;
  rfdetr::detail::write_training_supervision_config(legacy_output, {});
  rfdetr::detail::write_state_archive(legacy_output, "state", {}, readback, 0);
- legacy_output.save_to(path.string());
- torch::serialize::InputArchive legacy_input;
- legacy_input.load_from(path.string());
+ auto legacy_input = mmltk::backend::models::rfdetr::testsupport::reload_archive(legacy_output, path);
  REQUIRE((rfdetr::detail::read_training_supervision_config(legacy_input) == rfdetr::TrainingSupervisionConfig{}));
  rfdetr::TrainingSupervisionConfig inactive_nondefault;
  inactive_nondefault.match_free.rho = 0.75F;
  torch::serialize::OutputArchive inactive_output;
  rfdetr::detail::write_training_supervision_config(inactive_output, inactive_nondefault);
- inactive_output.save_to(path.string());
- torch::serialize::InputArchive inactive_input;
- inactive_input.load_from(path.string());
+ // CLEANUP-IGNORE: The archive reload helper is shared; active and inactive configurations retain independent round-trip equality assertions.
+ auto inactive_input = mmltk::backend::models::rfdetr::testsupport::reload_archive(inactive_output, path);
  REQUIRE((rfdetr::detail::read_training_supervision_config(inactive_input) == inactive_nondefault));
  std::error_code ignored;
  std::filesystem::remove(path, ignored);
@@ -592,16 +587,17 @@ void test_target_scratch_retires_cross_device_events_on_their_owner() {
  scratch->ensure_batch(1, 8, 8, 0);
  scratch->ensure_instance_capacity(1);
  scratch->ensure_copy_resources(0);
- static_cast<void>(scratch->acquire_staging_slot(1, 1, false, 8, 8));
- scratch->record_staging_copy_on_stream(scratch->copy_stream_handle());
- scratch->record_pending_copy_on_stream(scratch->copy_stream_handle());
+ const auto stage_pending_copy = [&] {
+  static_cast<void>(scratch->acquire_staging_slot(1, 1, false, 8, 8));
+  scratch->record_staging_copy_on_stream(scratch->copy_stream_handle());
+  scratch->record_pending_copy_on_stream(scratch->copy_stream_handle());
+ };
+ stage_pending_copy();
  scratch->ensure_batch(1, 8, 8, 1);
  scratch->ensure_instance_capacity(1);
  scratch->ensure_copy_resources(1);
  REQUIRE(scratch->copy_stream_handle() != 0U);
- static_cast<void>(scratch->acquire_staging_slot(1, 1, false, 8, 8));
- scratch->record_staging_copy_on_stream(scratch->copy_stream_handle());
- scratch->record_pending_copy_on_stream(scratch->copy_stream_handle());
+ stage_pending_copy();
  scratch->retire_consumer_on_stream(scratch->copy_stream_handle());
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  scratch.reset();
@@ -659,6 +655,7 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
  }
 }
 void test_copy_paste_cache_publication_recovers_without_targets() {
+ // CLEANUP-IGNORE: Aliases add no work to the CUDA availability and stream-fixture prefix of independent training cases.
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
  using mmltk::backend::data::PackedInstance;
@@ -784,12 +781,17 @@ void test_training_adapter_matches_raw_augmentation_executor() {
    rfdetr::TargetScratch scratch(1);
    auto supervision = rfdetr::TrainingSupervisionConfig{};
    supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
-   auto targets = rfdetr::build_targets(donor_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision, 3, &adapter.batch_plan());
-   REQUIRE(adapter.prepare_batch_consumer() != nullptr);
-   REQUIRE(adapter.finish_batch(donor_batch) != nullptr);
+   const auto prepare_targets = [&](const mmltk::backend::data::Batch& batch) {
+    auto targets = rfdetr::build_targets(batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision, 3, &adapter.batch_plan());
+    REQUIRE(adapter.prepare_batch_consumer() != nullptr);
+    REQUIRE(adapter.finish_batch(batch) != nullptr);
+    return targets;
+   };
+   auto targets = prepare_targets(donor_batch);
    {
     rfdetr::TargetConsumerLease lease(scratch, targets, device_id);
     lease.handoff();
+    // CLEANUP-IGNORE: The CPU tensor must outlive its borrowed accessor; each block inspects a different independent numeric box oracle.
     const auto identity_boxes = targets.all_boxes.cpu();
     const auto box = identity_boxes.accessor<float, 2>();
     CHECK(box[0][0] == 0.5F);
@@ -859,9 +861,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
    CHECK(adapted_plan.images.front().paste_masked);
    std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
    rfdetr::build_augmentation_preview_annotations({}, &donor_labels.front(), &adapted_plan.images.front(), width, height, preview);
-   auto pasted_targets = rfdetr::build_targets(source_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision, 3, &adapter.batch_plan());
-   REQUIRE(adapter.prepare_batch_consumer() != nullptr);
-   REQUIRE(adapter.finish_batch(source_batch) != nullptr);
+   auto pasted_targets = prepare_targets(source_batch);
    rfdetr::TargetConsumerLease pasted_lease(scratch, pasted_targets, device_id);
    pasted_lease.handoff();
    REQUIRE(pasted_targets.all_boxes.size(0) == 1);
@@ -884,6 +884,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
     const std::array<float, 4> footprint{static_cast<float>(xmin) / width, static_cast<float>(ymin) / height, static_cast<float>(xmax + 1) / width, static_cast<float>(ymax + 1) / height};
     CHECK(preview[0].box_xyxy == footprint);
     CHECK(preview[0].visible_area_pixels == static_cast<float>(count));
+    // CLEANUP-IGNORE: The CPU tensor must outlive its borrowed accessor; each block inspects a different independent numeric box oracle.
     const auto target_boxes = pasted_targets.all_boxes.cpu();
     const auto box = target_boxes.accessor<float, 2>();
     CHECK(box[0][0] == (footprint[0] + footprint[2]) / 2);
@@ -934,6 +935,7 @@ void check_copy_paste_targets(
  }
 }
 void test_copy_paste_ring_support_and_cache_cycles() {
+ // CLEANUP-IGNORE: CUDA availability and the shared stream fixture guard independent training cases; no training algorithm is duplicated in this prefix.
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
  using namespace rfdetr::test_support;
@@ -1036,6 +1038,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
     lease.handoff();
     check_copy_paste_targets(targets, expected, preview, points);
    }
+   // CLEANUP-IGNORE: The consumer lease must remain in each caller scope through target inspection; extracting the matched completion and handoff would shorten its lifetime.
    (void)augmenter.prepare_batch_consumer();
    (void)augmenter.finish_batch(batch);
    rfdetr::TargetConsumerLease lease(scratch, targets, 0);
@@ -1090,6 +1093,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
    auto targets = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
    std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
    rfdetr::build_augmentation_preview_annotations({}, &labels.back(), &box_plan, 8, 8, preview);
+   // CLEANUP-IGNORE: The consumer lease must remain in each caller scope through target inspection; extracting the matched completion and handoff would shorten its lifetime.
    (void)augmenter.prepare_batch_consumer();
    (void)augmenter.finish_batch(batch);
    rfdetr::TargetConsumerLease lease(scratch, targets, 0);
@@ -1139,6 +1143,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
  }
 }
 void test_native_augmentation_preview_target_support_parity() {
+ // CLEANUP-IGNORE: Aliases add no work to the CUDA availability and stream-fixture prefix of independent training cases.
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
  using mmltk::backend::data::PackedInstance;
@@ -1194,6 +1199,7 @@ void test_native_augmentation_preview_target_support_parity() {
   }
 }
 void test_tiny_mask_training_outer_edges() {
+ // CLEANUP-IGNORE: Aliases add no work to the CUDA availability and stream-fixture prefix of independent training cases.
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
  using mmltk::backend::data::PackedInstance;
@@ -1437,10 +1443,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
   std::ofstream clear_annotations(second_annotated, std::ios::trunc);
   REQUIRE(clear_annotations.good());
  }
- mmltk::backend::data::CompilerConfig compiler;
- compiler.source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture);
- compiler.output_dir = mmltk::backend::data::testsupport::compiled_dir(fixture);
- compiler.split = fixture.split;
+ auto compiler = mmltk::backend::data::testsupport::compiler_config(fixture);
  compiler.target_width = 64;
  compiler.target_height = 64;
  const auto compile_plan = mmltk::backend::data::DatasetCompiler::prepare(compiler, {fixture.split});
@@ -1453,13 +1456,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
  config.segmentation = false;
  rfdetr::NativeRfDetrModel seed_model(config, rfdetr::native_training_class_layout(compile_plan.class_catalog));
  rfdetr::DecodedNativeModelState checkpoint;
- checkpoint.metadata.preset_name = config.preset_name;
- checkpoint.metadata.source_kind = "training-route-test";
- checkpoint.metadata.source_path = (root / "seed.pt").string();
- checkpoint.metadata.num_classes = config.num_classes;
- checkpoint.metadata.class_layout = seed_model.class_layout()->record();
- checkpoint.metadata.num_queries = config.num_queries;
- checkpoint.metadata.num_select = config.num_select;
+ checkpoint.metadata = rfdetr::testsupport::model_checkpoint_metadata(seed_model, "training-route-test", (root / "seed.pt").string());
  const auto& seed_module = (seed_model);
  rfdetr::testsupport::set_synthetic_model_state(checkpoint, rfdetr::testsupport::clone_normalized_model_state(seed_module));
  const auto weights = root / "seed.pt";
@@ -1581,6 +1578,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     auto failed_publication = request;
     failed_publication.output_dir = root / "failed-session-publication";
     std::filesystem::create_directories(failed_publication.output_dir / "session.json.staging");
+    // CLEANUP-IGNORE: Session publication and selected-model publication independently verify error terminals with different retained checkpoint requirements.
     REQUIRE_THROWS(rfdetr::run_training(failed_publication));
     const auto failed_document = read_training_progress(failed_publication.output_dir);
     CHECK(failed_document.record.progress.phase == rfdetr::TrainingPhase::Error);
@@ -1821,6 +1819,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    // complete session generations remain usable and the terminal names them.
    const auto previous_descriptor = no_op.output_dir / "selected.json";
    std::filesystem::create_directory(no_op.output_dir / "selected.json.staging");
+   // CLEANUP-IGNORE: Session publication and selected-model publication independently verify error terminals with different retained checkpoint requirements.
    REQUIRE_THROWS(rfdetr::run_training(no_op));
    const auto terminal = read_training_progress(no_op.output_dir);
    CHECK(terminal.record.progress.phase == rfdetr::TrainingPhase::Error);
@@ -2070,6 +2069,7 @@ TEST_CASE("training excludes crowds and retains continuous targets with known em
   REQUIRE(targets.counts == std::vector<std::int64_t>{1});
   CHECK(targets.all_labels.cpu().item<std::int64_t>() == 1);
   CHECK(targets.all_iscrowd.cpu().item<std::int64_t>() == 0);
+  // CLEANUP-IGNORE: The CPU tensor must outlive its borrowed accessor; each block inspects a different independent numeric box oracle.
   const auto values = targets.all_boxes.cpu();
   const auto boxes = values.accessor<float, 2>();
   CHECK(boxes[0][0] == (flipped ? 4.25F : 3.75F) / 8);
@@ -2099,6 +2099,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  rfdetr::testsupport::MatcherExecutionFixture fixture;
  rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &fixture.workspace);
+ // CLEANUP-IGNORE: Tensor options are explicit numeric inputs to distinct AMP and compiled-training oracles.
  const auto floats = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
  const auto integers = floats.dtype(torch::kInt64);
  for (const int mode : {0, 1, 2, 3, 4})
@@ -2111,13 +2112,12 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
     config.mask_ce_loss_coef = mode == 2 || mode == 4 ? 1.7 : 0.0;
     config.mask_dice_loss_coef = mode == 3 || mode == 4 ? 2.3 : 0.0;
     config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
+    // CLEANUP-IGNORE: AMP and compiled-training scenarios explicitly configure their independent denoising inputs and model owners.
     config.training_supervision.denoising.enabled = dn;
     config.training_supervision.denoising.groups = 2;
     rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(2));
     model.initialize_training_supervision(910);
-    model.to(torch::Device(torch::kCUDA));
-    model.train(true);
-    model.set_force_pytorch_deformable_attn(true);
+    rfdetr::testsupport::configure_cuda_training_model(model);
     model.configure_supervision_timing({torch::Device(torch::kCUDA), 2, false});
     model.optimize_for_inference(2, true, mode == 1 || mode == 4 ? rfdetr::CompilationMode::kSelective : rfdetr::CompilationMode::kNone);
     rfdetr::PreparedTargets targets;
@@ -2155,8 +2155,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
     for (const auto& loss : retained) step.backward(loss.total);
     for (const auto& layer_queries : dn_mask_queries)
      for (const auto& query : layer_queries) {
-      REQUIRE(query.grad().defined());
-      REQUIRE(torch::isfinite(query.grad()).all().item<bool>());
+      mmltk::backend::ml::testsupport::require_finite_gradient(query);
       REQUIRE(query.grad()[1].count_nonzero().item<int64_t>() == 0);
       REQUIRE((query.grad()[0].abs().sum().item<float>() > 0.0F) == (mode >= 2));
      }
@@ -2217,6 +2216,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
 }
 TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated training updates", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; Hungarian DN mask training remains unverified");
+ // CLEANUP-IGNORE: Precision, matcher and runtime owners are shared fixtures with independent lifetimes for different numerical training oracles.
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  rfdetr::testsupport::MatcherExecutionFixture fixture;
  auto& workspace = fixture.workspace;
@@ -2231,9 +2231,7 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
   config.training_supervision.denoising.groups = 2;
   rfdetr::NativeRfDetrModel active(config, rfdetr::testsupport::synthetic_training_layout(2));
   active.initialize_training_supervision(815);
-  active.to(torch::Device(torch::kCUDA));
-  active.train(true);
-  active.set_force_pytorch_deformable_attn(true);
+  rfdetr::testsupport::configure_cuda_training_model(active);
   auto stock_config = config;
   stock_config.training_supervision = {};
   rfdetr::NativeRfDetrModel stock(stock_config, rfdetr::testsupport::synthetic_training_layout(2));
@@ -2241,9 +2239,7 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
   for (const auto& entry : rfdetr::testsupport::clone_normalized_model_state(active))
    if (!entry.name.starts_with("training_supervision.")) state.push_back(entry);
   static_cast<void>(stock.load_normalized_state(state, true));
-  stock.to(torch::Device(torch::kCUDA));
-  stock.train(true);
-  stock.set_force_pytorch_deformable_attn(true);
+  rfdetr::testsupport::configure_cuda_training_model(stock);
   auto detection = training_detection_fixture(config);
   rfdetr::PreparedTargets targets;
   targets.all_boxes = torch::tensor({{0.3F, 0.3F, 0.2F, 0.2F}, {0.7F, 0.6F, 0.2F, 0.3F}, {0.2F, 0.7F, 0.1F, 0.2F}, {0.5F, 0.4F, 0.3F, 0.1F}}, options);
@@ -2252,11 +2248,7 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
   targets.offsets = {0, 4};
   targets.target_counts = torch::tensor(targets.counts, options.dtype(torch::kInt64));
   targets.target_offsets = torch::tensor(targets.offsets, options.dtype(torch::kInt64));
-  targets.targets.resize(2);
-  for (size_t image = 0; image < targets.targets.size(); ++image) {
-   targets.targets[image].boxes = targets.all_boxes.narrow(0, targets.offsets[image], targets.counts[image]);
-   targets.targets[image].labels = targets.all_labels.narrow(0, targets.offsets[image], targets.counts[image]);
-  }
+  rfdetr::testsupport::populate_target_views(targets);
   targets.packed_masks = rfdetr::PackedTargetMasks{torch::tensor({{int64_t{0x3333}}, {int64_t{0xcccc}}, {int64_t{0xffff}}, {int64_t{0}}}, options.dtype(torch::kInt64)), 4, 4};
   const auto image = torch::rand({2, 3, 64, 64}, options);
   const rfdetr::TrainingStep step(2, 1.0, dtype != torch::kFloat32, dtype);
@@ -2331,10 +2323,12 @@ TEST_CASE("Native compiled training retains routed objectives gradients optimize
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; compiled production training remains unverified");
  // Match the production runtime's matrix and convolution precision. Otherwise
  // this standalone fixture inherits cuDNN TF32 and test-order-dependent RNG.
+ // CLEANUP-IGNORE: Precision, matcher and runtime owners are shared fixtures with independent lifetimes for different numerical training oracles.
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  rfdetr::testsupport::MatcherExecutionFixture fixture;
  auto& workspace = fixture.workspace;
  rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &workspace);
+ // CLEANUP-IGNORE: Tensor options are explicit numeric inputs to distinct AMP and compiled-training oracles.
  const auto floats = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
  const auto integers = floats.dtype(torch::kInt64);
  for (const bool reference_attention : {true, false})
@@ -2350,6 +2344,7 @@ TEST_CASE("Native compiled training retains routed objectives gradients optimize
        auto config = tiny_native_training_config();
        config.segmentation = segmentation;
        config.training_supervision.assignment = match_free ? rfdetr::TrainAssignmentKind::MatchFree : rfdetr::TrainAssignmentKind::Hungarian;
+       // CLEANUP-IGNORE: AMP and compiled-training scenarios explicitly configure their independent denoising inputs and model owners.
        config.training_supervision.denoising.enabled = denoising;
        config.training_supervision.denoising.groups = 2;
        rfdetr::NativeRfDetrModel eager(config, rfdetr::testsupport::synthetic_training_layout(2));
@@ -2379,14 +2374,11 @@ TEST_CASE("Native compiled training retains routed objectives gradients optimize
        targets.resolved_query_count = 3;
        targets.target_counts = torch::tensor(targets.counts, integers);
        targets.target_offsets = torch::tensor(targets.offsets, integers);
-       targets.targets.resize(2);
-       for (size_t image = 0; image < targets.targets.size(); ++image) {
-        targets.targets[image].boxes = targets.all_boxes.narrow(0, targets.offsets[image], targets.counts[image]);
-        targets.targets[image].labels = targets.all_labels.narrow(0, targets.offsets[image], targets.counts[image]);
-       }
+       rfdetr::testsupport::populate_target_views(targets);
        if (segmentation) targets.packed_masks = rfdetr::PackedTargetMasks{torch::tensor({{int64_t{0x3333}}, {int64_t{0xcccc}}}, integers), 4, 4};
        auto input = torch::rand({2, 3, 64, 64}, floats).set_requires_grad(true);
        auto compiled_input = input.detach().clone().set_requires_grad(true);
+       // CLEANUP-IGNORE: Independent eager and compiled optimizers must keep separate model parameters and state for numerical parity oracles.
        auto optimizer_request = gradient_update_request(1e-4);
        auto eager_optimizer = rfdetr::build_optimizer(eager.named_parameters(true), optimizer_request);
        auto selective_optimizer = rfdetr::build_optimizer(selective.named_parameters(true), optimizer_request);
@@ -2524,6 +2516,7 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
  const auto requested = rfdetr::testsupport::UpstreamOracle::requested();
  if (!requested) SKIP("optional official pretrained oracle artifacts not requested; representative recipe remains unexecuted");
  const rfdetr::testsupport::UpstreamOracle oracle(*requested);
+ // CLEANUP-IGNORE: CUDA availability, device scope, and precision scope are separate prerequisites; model, training, and optimizer oracles retain independent setup.
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  c10::cuda::CUDAGuard device_guard(0);
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
@@ -2557,6 +2550,7 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
     targets.microbatch_key = 731;
     const auto input = archive.tensor("input", torch::kCUDA);
     const auto mask = archive.tensor("input_mask", torch::kCUDA);
+    // CLEANUP-IGNORE: Independent eager and compiled optimizers must keep separate model parameters and state for numerical parity oracles.
     auto request = gradient_update_request(1e-4);
     auto eager_optimizer = rfdetr::build_optimizer(eager.named_parameters(true), request);
     auto compiled_optimizer = rfdetr::build_optimizer(compiled.named_parameters(true), request);

@@ -55,6 +55,7 @@ void GpuBatchAugmenter::Retire(const cudaError_t status) noexcept {
  executor_.reset();
 }
 void GpuBatchAugmenter::CheckSettlement(const cudaError_t status, const char* detail) {
+ // CLEANUP-IGNORE: These executors retire different resource owners before the common CUDA error check; an adapter would only hide their lifetime boundary.
  if (status == cudaSuccess) return;
  Retire(status);
  ensure_cuda_ok(status, detail);

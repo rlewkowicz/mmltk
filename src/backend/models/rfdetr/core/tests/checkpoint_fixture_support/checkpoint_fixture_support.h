@@ -9,8 +9,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <torch/serialize.h>
 #include "src/backend/models/rfdetr/core/class_layout.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
+[[nodiscard]] torch::serialize::InputArchive reload_archive(torch::serialize::OutputArchive& output, const std::filesystem::path& path);
 inline void set_synthetic_model_state(DecodedNativeModelState& state, std::vector<NormalizedModelStateEntry> entries) { state.replace_entries(std::move(entries)); }
 struct ParityFixtureCase;
 // Synthetic fixture vocabulary is explicit test data, never artifact inference.

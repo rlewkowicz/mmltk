@@ -207,10 +207,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  CompilerConfig effective_config = plan.config;
  effective_config.split = plan.splits[split_index].split;
  if (const auto valid = validate_compiler_config(effective_config); !valid) { throw std::runtime_error(std::string(compiler_config_validation_message(valid.error()))); }
- const auto throw_if_cancelled = [&] {
-  if (cancellation.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
- };
- throw_if_cancelled();
+ compiler_internal::check_compilation_cancelled(cancellation);
  const std::filesystem::path split_dir = std::filesystem::path(effective_config.source_dir) / effective_config.split;
  const std::filesystem::path out_dir = effective_config.output_dir;
  std::filesystem::create_directories(out_dir);
@@ -268,7 +265,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  auto label_blocks = compiler_internal::compile_directory_images(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, storage, execution, files,
   telemetry ? &label_progress : nullptr, telemetry ? &pixel_progress : nullptr, cancellation);
  if (telemetry) telemetry->set_dropped_instances(label_blocks.dropped_instances);
- throw_if_cancelled();
+ compiler_internal::check_compilation_cancelled(cancellation);
  files.join();
  storage.quiesce();
  auto compaction = execution.reserve(
@@ -303,24 +300,24 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
    },
    class_catalog.names(), layout);
   validate_compiled_header(header);
-  throw_if_cancelled();
+  compiler_internal::check_compilation_cancelled(cancellation);
   compiler_internal::write_metadata_blocks(fd, layout, header, label_blocks, cancellation);
-  throw_if_cancelled();
+  compiler_internal::check_compilation_cancelled(cancellation);
   if (telemetry != nullptr) { telemetry->enter_syncing(); }
   fd.sync_data();
-  throw_if_cancelled();
+  compiler_internal::check_compilation_cancelled(cancellation);
   const FileHeader staged_header = read_compiled_header(fd);
   (void)validate_compiled_file_sections(staged_header, fd.size());
   staged.close();
  }})
   .wait();
  compaction = {};
- throw_if_cancelled();
+ compiler_internal::check_compilation_cancelled(cancellation);
  if (telemetry != nullptr) {
   telemetry->enter_publishing();
   telemetry->flush();
  }
- throw_if_cancelled();
+ compiler_internal::check_compilation_cancelled(cancellation);
  staged.publish(out_path, cancellation);
  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Written {} ({:.2f} GB)", out_path.string(), static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
 }

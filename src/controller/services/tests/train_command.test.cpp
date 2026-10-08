@@ -19,6 +19,11 @@ r::TrainRequest request() {
  value.output_dir = "/tmp/output";
  return value;
 }
+void independent_lanes(r::TrainRequest& value) {
+ value.lanes = 2;
+ value.lane_configuration.mode = r::TrainLaneMode::Independent;
+ r::resize_training_models(value.lane_configuration, 2, value.recipe, value.seed);
+}
 r::TrainRequest child_request(const r::TrainRequest& value) {
  const auto arguments = mmltk::controller::services::build_train_command_arguments(value);
  REQUIRE(arguments.size() == 4);
@@ -39,9 +44,7 @@ TEST_CASE("training child carries the complete canonical request including topol
  value.progress_bar = false;
  value.recipe.optimizer = r::TrainOptimizerKind::SGD;
  r::reset_train_recipe(value.recipe);
- value.lanes = 2;
- value.lane_configuration.mode = r::TrainLaneMode::Independent;
- r::resize_training_models(value.lane_configuration, 2, value.recipe, value.seed);
+ independent_lanes(value);
  value.lane_configuration.models[1].seed = 9001;
  value.lane_configuration.models[1].recipe.lr = .012345678901234;
  using Relation = mmltk::frameworks::reflection::catalog_provider_relation<r::TrainRecipeCatalog>;
@@ -74,9 +77,7 @@ TEST_CASE("every optimizer recipe retains complete JSON command and checkpoint c
   CHECK(static_cast<const r::TrainRecipeValues&>(value.recipe) == static_cast<const r::TrainRecipeValues&>(catalog));
   CHECK(r::train_recipe_valid(value.recipe));
   Relation::VisitMembers([&]<class Entry>() { Relation::set_override<Entry::destination>(value.recipe.overrides); });
-  value.lanes = 2;
-  value.lane_configuration.mode = r::TrainLaneMode::Independent;
-  r::resize_training_models(value.lane_configuration, 2, value.recipe, value.seed);
+  independent_lanes(value);
   auto& detached = value.lane_configuration.models.back().recipe;
   detached.optimizer = r::TrainOptimizerKind::SGD;
   r::reset_train_recipe(detached);
@@ -86,6 +87,7 @@ TEST_CASE("every optimizer recipe retains complete JSON command and checkpoint c
   const auto size = serialization::encode(value, std::span(encoded), limits);
   REQUIRE(size.has_value());
   const auto decoded = serialization::decode<r::TrainRequest>({std::span(encoded).first(*size), {}}, limits);
+  // CLEANUP-IGNORE: Separate reflected request schemas have independent round-trip assertions; their encoding and decoding are already shared.
   REQUIRE(decoded.has_value());
   CHECK(*decoded == value);
   CHECK_NOTHROW(r::validate_train_request(*decoded));

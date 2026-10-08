@@ -66,6 +66,7 @@ ImageProductPool::Product& ImageProductPool::Product::operator=(const Product& o
 }
 ImageProductPool::Product::Product(Product&& other) noexcept : slot_(std::move(other.slot_)), revision_(std::exchange(other.revision_, 0U)) {}
 ImageProductPool::Product& ImageProductPool::Product::operator=(Product&& other) noexcept {
+ // CLEANUP-IGNORE: This is a partial move-assignment prefix for distinct candidate and completed-product lifetimes and release contracts.
  if (this == &other) return *this;
  Release();
  slot_ = std::move(other.slot_);
@@ -133,6 +134,7 @@ ImageProductPool::Candidate::Candidate(Candidate&& other) noexcept
 // CLEANUP-IGNORE: Candidate move assignment transfers reservation and rollback state; Product move assignment
 // transfers a retained completion and has different release semantics.
 ImageProductPool::Candidate& ImageProductPool::Candidate::operator=(Candidate&& other) noexcept {
+ // CLEANUP-IGNORE: This is a partial move-assignment prefix for distinct candidate and completed-product lifetimes and release contracts.
  if (this == &other) return *this;
  Release();
  slot_ = std::move(other.slot_);

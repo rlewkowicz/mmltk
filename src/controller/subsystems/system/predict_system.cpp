@@ -379,6 +379,7 @@ public:
   return state_;
  }
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const {
+  // CLEANUP-IGNORE: Each system snapshots its own locked frame before using the shared matching-product borrow API outside the lock.
   VisualFrame committed;
   {
    std::scoped_lock lock(mutex_);
@@ -523,6 +524,7 @@ private:
   {
    std::scoped_lock lock(mutex_);
    if (!state_.operation.active || !contracts::compute_progress_follows(progress, state_.operation.progress.sequence)) return;
+   // CLEANUP-IGNORE: The canonical revision transition is shared; these guarded callers publish different progress and preview-failure changes.
    const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
    if (!revision) return;
    state_.revision = *revision;
@@ -536,6 +538,7 @@ private:
   {
    std::scoped_lock lock(mutex_);
    if (preview_failure_ == detail) return;
+   // CLEANUP-IGNORE: The canonical revision transition is shared; these guarded callers publish different progress and preview-failure changes.
    const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
    if (!revision) return;
    preview_failure_ = detail;

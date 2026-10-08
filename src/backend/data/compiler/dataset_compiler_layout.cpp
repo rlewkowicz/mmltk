@@ -40,7 +40,7 @@ void write_metadata_blocks(
   const auto* source_bytes = static_cast<const std::uint8_t*>(source);
   size_t written = 0U;
   while (written < bytes) {
-   if (cancel_requested.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
+   compiler_internal::check_compilation_cancelled(cancel_requested);
    const size_t chunk = std::min(kWriteChunkBytes, bytes - written);
    fd.pwrite_all(source_bytes + written, chunk, offset + written);
    written += chunk;

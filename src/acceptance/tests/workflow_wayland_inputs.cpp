@@ -79,13 +79,7 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
  rfdetr::NativeRfDetrModel model{config, rfdetr::native_training_class_layout(*compiled.class_catalog())};
  prepare_caption_model(model, *compiled.class_catalog());
  rfdetr::DecodedNativeModelState checkpoint;
- checkpoint.metadata.preset_name = config.preset_name;
- checkpoint.metadata.source_kind = "wayland-workflow-fixture";
- checkpoint.metadata.source_path = weights_.string();
- checkpoint.metadata.num_classes = config.num_classes;
- checkpoint.metadata.class_layout = model.class_layout()->record();
- checkpoint.metadata.num_queries = config.num_queries;
- checkpoint.metadata.num_select = config.num_select;
+ checkpoint.metadata = rfdetr::testsupport::model_checkpoint_metadata(model, "wayland-workflow-fixture", weights_.string());
  checkpoint.replace_entries(rfdetr::testsupport::clone_normalized_model_state(model));
  rfdetr::save_native_checkpoint(weights_, checkpoint);
  std::ofstream video{video_, std::ios::binary};

@@ -90,6 +90,7 @@ private:
  void record_failure(mmltk::backend::media::capture::Status failure) noexcept;
  void record_failure_locked(mmltk::backend::media::capture::Status failure) noexcept;
  void wake() noexcept;
+ [[nodiscard]] RawReadbackDelivery cancel_pending_raw_readback() noexcept;
  [[nodiscard]] std::optional<RawReadbackDelivery> finish_raw_readback(LiveRawFrameReadbackResult result) noexcept;
  void deliver(std::optional<RawReadbackDelivery> raw) noexcept;
  void run(std::stop_token stop) noexcept;

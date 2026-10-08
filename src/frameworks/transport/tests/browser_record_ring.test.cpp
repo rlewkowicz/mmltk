@@ -13,20 +13,17 @@ TEST_CASE("browser output ring has exactly sixty-four FIFO records", "[framework
  CHECK(ring.size() == kBrowserRecordRingCapacity);
  CHECK(ring.push(record()) == BrowserRecordPush::Dropped);
  CHECK(ring.push(record(BrowserRecordPriority::Critical)) == BrowserRecordPush::ClosePeer);
- // Drain half, refill beyond the physical end, then check every identity.
- for (std::size_t index = 0U; index < kBrowserRecordRingCapacity / 2U; ++index) {
+ const auto check_next = [&](std::size_t index) {
   const auto popped = ring.pop();
   REQUIRE(popped);
   CHECK(popped->bytes == std::vector<std::byte>{static_cast<std::byte>(index)});
- }
+ };
+ // Drain half, refill beyond the physical end, then check every identity.
+ for (std::size_t index = 0U; index < kBrowserRecordRingCapacity / 2U; ++index) { check_next(index); }
  for (std::size_t index = 0U; index < kBrowserRecordRingCapacity / 2U; ++index)
   REQUIRE(ring.push({.bytes = {static_cast<std::byte>(kBrowserRecordRingCapacity + index)}}) == BrowserRecordPush::Enqueued);
  CHECK(ring.size() == kBrowserRecordRingCapacity);
- for (std::size_t index = kBrowserRecordRingCapacity / 2U; index < kBrowserRecordRingCapacity * 3U / 2U; ++index) {
-  const auto popped = ring.pop();
-  REQUIRE(popped);
-  CHECK(popped->bytes == std::vector<std::byte>{static_cast<std::byte>(index)});
- }
+ for (std::size_t index = kBrowserRecordRingCapacity / 2U; index < kBrowserRecordRingCapacity * 3U / 2U; ++index) { check_next(index); }
  CHECK(ring.empty());
 }
 TEST_CASE("latest complete state replaces pending state after ordered edges", "[frameworks][transport][browser]") {

@@ -12,6 +12,10 @@
 namespace {
 using namespace mmltk::testsupport;
 SubprocessResult run_train_options(std::initializer_list<const char*> options);
+void require_missing_training_input(const SubprocessResult& result) {
+ REQUIRE(result.exit_code == 1);
+ REQUIRE(result.output_text.find("requires --train-compiled") != std::string::npos);
+}
 void test_evaluate_aliases_require_compiled() {
  const std::string cli_path = mmltk_cli_path();
  for (const char* alias : {"evaluate", "eval", "val"}) {
@@ -169,11 +173,9 @@ void test_train_supervision_values_parse_as_one_nested_configuration() {
   "--dn-size-noise-scale",
   "0.99999994",
  });
- REQUIRE((enabled.exit_code == 1));
- REQUIRE((enabled.output_text.find("requires --train-compiled") != std::string::npos));
+ require_missing_training_input(enabled);
  const auto disabled = run_train_options({"--assignment", "hungarian", "--no-dn"});
- REQUIRE((disabled.exit_code == 1));
- REQUIRE((disabled.output_text.find("requires --train-compiled") != std::string::npos));
+ require_missing_training_input(disabled);
 }
 SubprocessResult run_train_options(std::initializer_list<const char*> options) {
  std::vector<std::string> arguments{mmltk_cli_path(), "rfdetr", "train"};
@@ -185,6 +187,7 @@ void test_train_device_grammar_and_conflicts_are_preserved() {
        std::initializer_list<const char*>{"--device-id", "0"},
        std::initializer_list<const char*>{"--device-ids", "0,2"},
       }) {
+  // CLEANUP-IGNORE: The normalized blocks assert different required CLI errors, preserving independent option-validation oracles.
   const auto result = run_train_options(options);
   REQUIRE((result.exit_code == 1));
   REQUIRE((result.output_text.find("requires --train-compiled") != std::string::npos));
@@ -193,6 +196,7 @@ void test_train_device_grammar_and_conflicts_are_preserved() {
        std::initializer_list<const char*>{"--device-id", "0", "--device-ids", "0,2"},
        std::initializer_list<const char*>{"--device-ids", "0,2", "--device-id", "0"},
       }) {
+  // CLEANUP-IGNORE: The normalized blocks assert different required CLI errors, preserving independent option-validation oracles.
   const auto result = run_train_options(options);
   REQUIRE((result.exit_code == 1));
   REQUIRE((result.output_text.find("accepts only one of --device-id or --device-ids") != std::string::npos));

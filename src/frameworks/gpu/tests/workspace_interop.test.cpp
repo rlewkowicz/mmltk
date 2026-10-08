@@ -59,8 +59,8 @@ TEST_CASE("Display context rebinding shares same-device custody and cleans parti
 TEST_CASE("Display import failure retains independent backing and reports cleanup failure", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
  using test_support::ImportedImageBufferTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ // CLEANUP-IGNORE: The shared fake-backend reset factory precedes independent runtime construction-failure lifetimes.
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  SystemImageRuntime runtime({.device = 0, .backend = backend});
  const auto initiating = std::make_exception_ptr(std::invalid_argument("rejected workspace initialization"));
  ImageWorkspaceTestAccess::initialize_failure = initiating;
@@ -83,8 +83,8 @@ TEST_CASE("Display import failure retains independent backing and reports cleanu
 }
 TEST_CASE("Partial display stream construction retains its context and both failures", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ // CLEANUP-IGNORE: The shared fake-backend reset factory precedes independent runtime construction-failure lifetimes.
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  SystemImageRuntime runtime({.device = 0, .backend = backend});
  const auto initiating = std::make_exception_ptr(std::runtime_error("display stream creation failed"));
  const auto cleanup = std::make_exception_ptr(std::runtime_error("display context unavailable during cleanup"));
@@ -105,8 +105,7 @@ TEST_CASE("Partial display stream construction retains its context and both fail
 // CLEANUP-IGNORE: Admission rejection and partial display construction need different failure injection and cleanup expectations.
 TEST_CASE("Safe workspace rejection releases candidates and permits a fresh admission", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  SystemImageRuntime runtime({.device = 0, .backend = backend});
  auto layout = ImageWorkspaceTestAccess::Layout();
  layout.pitch_bytes = 1U;
@@ -302,8 +301,7 @@ TEST_CASE("Display producer detachment waits for actual raw readers and preserve
 }
 TEST_CASE("Exact external acquisition races replacement without reusing a held fallback", "[gpu][workspace][acquisition]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  auto config = test_support::WorkspaceRuntimeConfig(backend);
  config.output_buffer_count = 2U;
  SystemImageRuntime runtime(std::move(config));
@@ -475,8 +473,7 @@ TEST_CASE("Lost acquisition notification requires the exact terminal completion 
 }
 TEST_CASE("Completed producer alias failure clears the old mapping and permits a fresh context retry", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  const auto finalize = [](auto clean, auto, auto destination, auto, auto) { test_support::CopyImagePlane(destination, clean); };
  auto first = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend, .workspace_finalize = finalize});
  auto second = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend, .workspace_finalize = finalize});
@@ -599,6 +596,7 @@ TEST_CASE("Allocation responsibility transfer is durable across detachment in ei
  const auto result = observation.TakeResult();
  REQUIRE(result.complete);
  CHECK(result.claimed == !transfer_first);
+ // CLEANUP-IGNORE: Independent allocation-transfer and late-notification scenarios require explicit exactly-once physical cleanup evidence.
  CHECK(test_support::ContainsImageFailure(result.settlement.failure, failure) == fail_release);
  CHECK_FALSE(observation.TakeResult().claimed);
  if (!fail_release) {
@@ -607,6 +605,7 @@ TEST_CASE("Allocation responsibility transfer is durable across detachment in ei
  }
  if (transfer_first) {
   CHECK(notifications.load() == 1U);
+  // CLEANUP-IGNORE: Independent workspace and presentation tests exercise FinishRetirement before different custody, notification and failure assertions.
   const auto settled = retirement.custody.FinishRetirement();
   CHECK(settled.completion_reached == !fail_release);
   CHECK(test_support::ContainsImageFailure(settled.failure, failure) == fail_release);
@@ -664,10 +663,11 @@ TEST_CASE("Replaced display attachment cannot accept responsibility from an alre
 }
 TEST_CASE("Allocation retirement publishes cleanup before waking and closes late registration", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
+ // CLEANUP-IGNORE: These independent failure and lifetime parameter axes merely precede the shared backend factory.
  const bool register_late = GENERATE(false, true);
+ // CLEANUP-IGNORE: These generated booleans have different test meanings; the shared backend factory already owns backend reset and construction.
  const bool fail_release = GENERATE(false, true);
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout());
  auto observation = workspace->ObserveRetirement();
  const auto cleanup = std::make_exception_ptr(std::runtime_error("allocation release binding"));
@@ -687,6 +687,7 @@ TEST_CASE("Allocation retirement publishes cleanup before waking and closes late
  REQUIRE(released.complete);
  CHECK(released.claimed);
  CHECK(released.settlement.completion_reached == !fail_release);
+ // CLEANUP-IGNORE: Independent allocation-transfer and late-notification scenarios require explicit exactly-once physical cleanup evidence.
  CHECK(test_support::ContainsImageFailure(released.settlement.failure, cleanup) == fail_release);
  CHECK_FALSE(observation.TakeResult().claimed);
  if (!fail_release) {
@@ -742,8 +743,7 @@ TEST_CASE("Workspace observation does not manufacture product availability edges
 }
 TEST_CASE("Healthy external workspace products retain exact raw aliases through deferred retirement", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
  auto candidate = runtime->AcquireOutput();
@@ -760,6 +760,7 @@ TEST_CASE("Healthy external workspace products retain exact raw aliases through 
  REQUIRE(retirement.custody.deferred());
  CHECK_FALSE(retirement.failure);
  runtime.reset();
+ // CLEANUP-IGNORE: Raw allocation identity is independently checked through external-workspace retirement and cross-device finalization.
  CHECK(product.revision() == revision);
  CHECK(product.Borrow().plane(0U).plane().data == address);
  CHECK(product.BorrowWorkspace().plane().data == address);
@@ -797,8 +798,7 @@ TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA
 }
 TEST_CASE("Failed display finalization closes admission and retains complete transfer custody", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  const auto initiating = std::make_exception_ptr(std::runtime_error("display finalizer failed after transfer"));
  const auto cleanup = std::make_exception_ptr(std::runtime_error("display completion unavailable"));
  SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = [&](auto, auto, auto, auto, auto) {
@@ -807,6 +807,7 @@ TEST_CASE("Failed display finalization closes admission and retains complete tra
  }});
  runtime.Publish(4U, 3U, [](auto, auto, auto) {});
  auto completed = runtime.Completed();
+ // CLEANUP-IGNORE: Raw-address capture and the existing workspace fixture create separate observations and owners for distinct finalization paths.
  const auto raw = completed.Borrow().plane(0U).plane().data;
  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout());
  std::exception_ptr failure;
@@ -832,8 +833,8 @@ TEST_CASE("Failed display finalization closes admission and retains complete tra
 TEST_CASE("Workspace retirement retains cross-device transfer and raw custody through real finalization", "[gpu][workspace][copy]") {
  using test_support::ImageWorkspaceTestAccess;
  for (const bool peer : {false, true}) {
-  ImageWorkspaceTestAccess::Reset();
-  auto backend = std::make_shared<FakeImageBackend>();
+  // CLEANUP-IGNORE: Explicit peer-access selection is a test input to distinct cross-device transfer and partial-copy scenarios.
+  auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
   backend->peer_access = peer;
   SystemImageRuntime runtime(
    {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = [](auto clean, auto semantic, auto destination, auto, auto) {
@@ -846,9 +847,11 @@ TEST_CASE("Workspace retirement retains cross-device transfer and raw custody th
   });
   auto completed = runtime.Completed();
   const auto revision = completed.revision();
+  // CLEANUP-IGNORE: Raw-address capture and the existing workspace fixture create separate observations and owners for distinct finalization paths.
   const auto raw = completed.Borrow().plane(0U).plane().data;
   auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout());
   REQUIRE(runtime.PrepareDisplay(completed.revision(), workspace));
+  // CLEANUP-IGNORE: Raw allocation identity is independently checked through external-workspace retirement and cross-device finalization.
   CHECK(completed.revision() == revision);
   CHECK(completed.Borrow().plane(0U).plane().data == raw);
   CHECK(completed.BorrowWorkspace().revision() == revision);
@@ -872,8 +875,7 @@ TEST_CASE("Shared display content rotates independent producer owners and layout
   for (const bool peer : {false, true}) {
    for (const bool semantic_first : {false, true}) {
     CAPTURE(display_device, peer, semantic_first);
-    ImageWorkspaceTestAccess::Reset();
-    auto backend = std::make_shared<FakeImageBackend>();
+    auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
     backend->peer_access = peer;
     DeviceContext display(display_device, backend);
     auto workspace = ImageWorkspaceTestAccess::Create(display, ImageWorkspaceTestAccess::Layout(display_device));
@@ -953,11 +955,9 @@ TEST_CASE("Shared display content rotates independent producer owners and layout
 }
 TEST_CASE("Display partial coverage requires exact initialized prior content and recovers after failure", "[gpu][workspace][display]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  DeviceContext display(0, backend);
- auto workspace = ImageWorkspaceTestAccess::Create(display, ImageWorkspaceTestAccess::Layout(0));
- workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+ auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(display, ImageWorkspaceTestAccess::Layout(0));
  bool expected_full = true;
  bool fail = false;
  const auto finalize = [&](auto clean, auto, auto destination, auto coverage, auto) {
@@ -981,9 +981,12 @@ TEST_CASE("Display partial coverage requires exact initialized prior content and
  auto candidate = runtime.AcquireOutput();
  runtime.PublishRetained(candidate, 2U, 2U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 73, 4U); });
  CHECK_FALSE(workspace->Contains({previous.product_owner, previous.product_revision}));
+ const auto commit_partial = [&] {
+  runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
+  return runtime.CommitOutput(std::move(candidate));
+ };
  expected_full = false;
- runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
- auto completed = runtime.CommitOutput(std::move(candidate));
+ auto completed = commit_partial();
  auto pixels = workspace->plane(2U, 2U);
  CHECK(*reinterpret_cast<const std::byte*>(pixels.data) == std::byte{73});
  CHECK(*(reinterpret_cast<const std::byte*>(pixels.data) + 4U) == std::byte{37});
@@ -996,14 +999,12 @@ TEST_CASE("Display partial coverage requires exact initialized prior content and
  CHECK_FALSE(workspace->Contains({previous.product_owner, candidate.revision()}));
  fail = false;
  expected_full = true;
- runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
- completed = runtime.CommitOutput(std::move(candidate));
+ completed = commit_partial();
  previous = runtime.ObserveWorkspace();
  completed = {};
  candidate = runtime.AcquireOutput();
  runtime.PublishRetained(candidate, 4U, 3U, fill);
- runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
- completed = runtime.CommitOutput(std::move(candidate));
+ completed = commit_partial();
  CHECK(workspace->Contains({previous.product_owner, completed.revision()}));
  previous = runtime.ObserveWorkspace();
  completed = {};
@@ -1013,8 +1014,7 @@ TEST_CASE("Display partial coverage requires exact initialized prior content and
  CHECK_FALSE(workspace->Contains({previous.product_owner, previous.product_revision}));
  candidate = runtime.AcquireOutput();
  runtime.PublishRetained(candidate, 4U, 3U, fill);
- runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
- completed = runtime.CommitOutput(std::move(candidate));
+ completed = commit_partial();
  REQUIRE(runtime.DetachDisplay(workspace));
  SystemImageRuntime replacement({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = finalize});
  replacement.Publish(4U, 3U, fill);
@@ -1027,12 +1027,10 @@ TEST_CASE("Display remapping retries preserve raw products through partial const
  using test_support::ImageWorkspaceTestAccess;
  for (const auto point : {FakeImageBackend::FailurePoint::None, FakeImageBackend::FailurePoint::CreateStream, FakeImageBackend::FailurePoint::CreateEvent}) {
   CAPTURE(point);
-  ImageWorkspaceTestAccess::Reset();
-  auto backend = std::make_shared<FakeImageBackend>();
+  auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
   {
    DeviceContext display(0, backend);
-   auto workspace = ImageWorkspaceTestAccess::Create(display, ImageWorkspaceTestAccess::Layout(0));
-   workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+   auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(display, ImageWorkspaceTestAccess::Layout(0));
    SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto coverage, auto) {
     CHECK(coverage.full_image);
     test_support::CopyImagePlane(destination, clean);
@@ -1131,12 +1129,12 @@ TEST_CASE("Workspace transfer routes preserve independent source and receiver pi
 }
 TEST_CASE("Cross-device display damage copies cropped planes and matches complete raw composition", "[gpu][workspace][copy]") {
  using test_support::ImageWorkspaceTestAccess;
+ // CLEANUP-IGNORE: These generated Boolean axes describe different scenario dimensions; their names and subsequent state transitions are part of each test.
  const bool peer = GENERATE(false, true);
  const bool semantic = GENERATE(false, true);
  const bool capability_copy = GENERATE(false, true);
  CAPTURE(peer, semantic, capability_copy);
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  backend->peer_access = peer;
  backend->pitch_padding_bytes = 13U;
  DeviceContext producer(0, backend), receiver(1, backend);
@@ -1319,10 +1317,10 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
  CHECK(workspace->Settle().completion_reached);
 }
 TEST_CASE("Alternating displays accumulate skipped damage and recover from history overflow", "[gpu][workspace][copy]") {
+ // CLEANUP-IGNORE: The shared backend reset precedes an explicit peer-access input to independent damage-history and transfer-settlement tests.
  using test_support::ImageWorkspaceTestAccess;
  const bool peer = GENERATE(false, true);
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  backend->peer_access = peer;
  DeviceContext producer(0, backend), display(1, backend);
  ImageStream stream(producer);
@@ -1375,10 +1373,11 @@ TEST_CASE("Alternating displays accumulate skipped damage and recover from histo
  present(1U, false);
 }
 TEST_CASE("Partial display copies retain raw reads until transfer settlement and scratch until finalization", "[gpu][workspace][copy]") {
+ // CLEANUP-IGNORE: The shared backend reset precedes an explicit peer-access input to independent damage-history and transfer-settlement tests.
  using test_support::ImageWorkspaceTestAccess;
  const bool peer = GENERATE(false, true);
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ // CLEANUP-IGNORE: Explicit peer-access selection is a test input to distinct cross-device transfer and partial-copy scenarios.
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  backend->peer_access = peer;
  SystemImageRuntime source({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic});
  auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(backend, ImageWorkspaceTestAccess::Layout());
@@ -1640,8 +1639,7 @@ TEST_CASE("Display damage transfers preserve complete pixels in both physical de
 }
 TEST_CASE("Asynchronous workspace finalization retains raw custody until the owner settles its notification", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  SystemImageRuntime runtime(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend));
  runtime.Publish(4U, 3U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 37, clean.descriptor.pitch_bytes * clean.descriptor.height); });
  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
@@ -1706,8 +1704,7 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
 }
 TEST_CASE("Cross-device display detachment preserves pending finalization settlement", "[gpu][workspace][display]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  SystemImageRuntime runtime(test_support::WorkspaceRuntimeConfig(backend));
  runtime.Publish(4U, 3U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 37, clean.descriptor.pitch_bytes * clean.descriptor.height); });
  auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(backend, ImageWorkspaceTestAccess::Layout(1));
@@ -1730,8 +1727,7 @@ TEST_CASE("Cross-device display detachment preserves pending finalization settle
 }
 TEST_CASE("Workspace cancellation publishes availability before ordered product and display wakes", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(backend, ImageWorkspaceTestAccess::Layout(0));
  const bool throwing_sinks = GENERATE(false, true);
  struct Observation {
@@ -1785,9 +1781,9 @@ TEST_CASE("Workspace cancellation publishes availability before ordered product 
 }
 TEST_CASE("Shutdown settles pending workspace finalization with allocation-local cleanup custody", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
  // CLEANUP-IGNORE: Workspace admission already uses its shared factory; each test owns its separate retirement observation.
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
+ // CLEANUP-IGNORE: Workspace creation already uses the shared admission factory; each test retains its own retirement observation for distinct lifetime checks.
  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
  auto observation = workspace->ObserveRetirement();
  {
@@ -1895,8 +1891,7 @@ auto prepare_delayed_workspace(SystemImageRuntime& runtime, const std::shared_pt
 }
 TEST_CASE("Output admission drains its completed workspace read without another render cycle", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = test_support::FakeWorkspaceFinalizer(backend)});
  runtime.Publish(4U, 3U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 83, clean.descriptor.pitch_bytes * clean.descriptor.height); });
  auto [workspace, stream] = prepare_delayed_workspace(runtime, backend);
@@ -1950,8 +1945,7 @@ TEST_CASE("Output admission drains its completed workspace read without another 
 }
 TEST_CASE("Workspace terminal notification propagates exact failure while preserving retained raw pixels", "[gpu][workspace]") {
  using test_support::ImageWorkspaceTestAccess;
- ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  const auto failure = std::make_exception_ptr(std::runtime_error("display execution failed"));
  {
   SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = test_support::FakeWorkspaceFinalizer(backend)});

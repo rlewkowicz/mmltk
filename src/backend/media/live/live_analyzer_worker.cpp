@@ -76,6 +76,7 @@ void LiveAnalyzerWorker::publish_slot(AnalysisSlot& slot, const SlotState publis
  publish_latest_live_owner_slot(latest_, slot.index, slot.state, published, [&slot] noexcept { ScrubProduct(slot); });
 }
 void LiveAnalyzerWorker::stop() noexcept {
+ // CLEANUP-IGNORE: Admission closure precedes distinct analysis-slot and overlay-generation retirement; the partial prefix is not a shared shutdown owner.
  close_admission();
  if (slots_ == nullptr) return;
  latest_.store(-1, std::memory_order_release);
@@ -235,6 +236,7 @@ void LiveAnalyzerWorker::release(const std::uint32_t index) noexcept {
 }
 void LiveAnalyzerWorker::terminalize(const std::uint32_t index) noexcept {
  AnalysisSlot* const slot = index < slot_count_ ? &slots_[index] : nullptr;
+ // CLEANUP-IGNORE: Slot claiming is already shared; analysis and manual-overlay owners retain their distinct terminal publication and notification effects.
  if (!claim_acquired_live_slot(slot == nullptr ? nullptr : &slot->state, cuda_)) return;
  publish_slot(*slot, SlotState::Terminal);
 }

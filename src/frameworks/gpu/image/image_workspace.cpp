@@ -200,6 +200,12 @@ struct ImageWorkspace::State final {
   if (producer_context) producer_context->DestroyEvent(producer_completion);
   if (access_signal) static_cast<void>(::munmap(access_signal, sizeof(ImageWorkspaceAccessSignal)));
  }
+ void InvalidateContent() noexcept {
+  write_invalidated = true;
+  content_valid = false;
+  revision = 0U;
+  std::atomic_ref{access_signal->generation}.store(0U, std::memory_order_relaxed);
+ }
  bool ReservePhysicalWrite() {
   auto gate = std::atomic_ref{access_signal->access};
   auto expected = gate.load(std::memory_order_acquire);
@@ -487,10 +493,7 @@ bool ImageWorkspace::ReserveWrite() {
 void ImageWorkspace::InvalidateWrite() noexcept {
  std::scoped_lock lock(state_->access);
  if (!state_->write_reserved) return;
- state_->write_invalidated = true;
- state_->content_valid = false;
- state_->revision = 0U;
- std::atomic_ref{state_->access_signal->generation}.store(0U, std::memory_order_relaxed);
+ state_->InvalidateContent();
 }
 void ImageWorkspace::CancelWrite() noexcept {
  {
@@ -640,10 +643,7 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
  if (!coverage.baseline.valid() || coverage.baseline != state_->content || coverage.baseline.owner != content.owner || expands_initialized || coverage.allocation_identity != identity())
   coverage.full_image = true;
  if (!state_->write_reserved && !state_->ReservePhysicalWrite()) throw std::runtime_error("workspace physical generation is acquired");
- state_->write_invalidated = true;
- state_->content_valid = false;
- state_->revision = 0U;
- std::atomic_ref{state_->access_signal->generation}.store(0U, std::memory_order_relaxed);
+ state_->InvalidateContent();
  ImageStream* execution = &*state_->stream;
  std::uintptr_t completion = state_->completion;
  try {

@@ -195,6 +195,7 @@ void CaptureSession::Impl::ZeroFillShortFrame(HostSlotRuntime& slot, const std::
  std::memset(bytes + valid, 0, size_image_ - valid);
 }
 Status CaptureSession::Impl::RequeueCompletedSlots(CaptureTeardownDisposition* const teardown) {
+ // CLEANUP-IGNORE: The shared argument guard and empty status precede distinct requeue and teardown settlement algorithms.
  if (teardown == nullptr) return MakeStatus(StatusCode::kInvalidArgument, "capture teardown disposition is null");
  Status first_failure = Status::Ok();
  for (auto& slot : host_slots_) {
@@ -212,6 +213,7 @@ Status CaptureSession::Impl::RequeueCompletedSlots(CaptureTeardownDisposition* c
  return first_failure;
 }
 Status CaptureSession::Impl::SettleSlotsBeforeTeardown(CaptureTeardownDisposition* const teardown) {
+ // CLEANUP-IGNORE: The shared argument guard and empty status precede distinct requeue and teardown settlement algorithms.
  if (teardown == nullptr) return MakeStatus(StatusCode::kInvalidArgument, "capture teardown disposition is null");
  Status first_failure = Status::Ok();
  {

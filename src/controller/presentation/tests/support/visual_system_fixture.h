@@ -52,9 +52,17 @@ struct TestPresentationWriterState final {
   const std::uint64_t value = 1U;
   REQUIRE(::write(readiness.get(), &value, sizeof(value)) == sizeof(value));
  }
+ void AllowPublication(std::memory_order order = std::memory_order_release) {
+  allow_publication.store(true, order);
+  SignalReadiness();
+ }
  void AcknowledgeAllocationRetirement(const std::uint64_t generation) {
   retirement_acknowledgement.store(generation, std::memory_order_release);
   SignalReadiness();
+ }
+ void AwaitAllocationRetirement(const std::uint64_t generation, const std::uint64_t prior_pump) {
+  AcknowledgeAllocationRetirement(generation);
+  REQUIRE(WaitForPumpAfter(prior_pump));
  }
  void RecordPump() {
   {
@@ -70,6 +78,10 @@ struct TestPresentationWriterState final {
  [[nodiscard]] bool WaitForPumpAfter(const std::uint64_t prior) {
   std::unique_lock lock(pump_mutex);
   return pump_changed.wait_for(lock, 2s, [&] { return pump_count > prior; });
+ }
+ void CheckRetired() const {
+  CHECK(browser_terminals.load(std::memory_order_acquire) == 1U);
+  CHECK(retirements.load(std::memory_order_acquire) == 1U);
  }
  // CLEANUP-IGNORE: This descriptor begins presentation-writer readiness and lifecycle evidence, not fake GPU
  // synchronization and transfer counters.
@@ -107,15 +119,18 @@ struct TestPresentationWriterState final {
 };
 // Declared immediately after the system, before assertions. Event/callback
 // storage precedes the system and therefore outlives terminal settlement.
+inline PresentationShutdownResult shutdown_presentation(PresentationSystem& system) {
+ system.CloseAdmission();
+ system.BrowserPeerLost();
+ return system.Shutdown();
+}
 class PresentationScenario final {
 public:
  PresentationScenario(PresentationSystem& system, std::shared_ptr<TestPresentationWriterState> state) : system_(system), state_(std::move(state)) {}
  ~PresentationScenario() {
   mmltk::testsupport::release_test_promise(state_->release_pump);
   if (system_.stopped()) return;
-  system_.CloseAdmission();
-  system_.BrowserPeerLost();
-  static_cast<void>(system_.Shutdown());
+  static_cast<void>(shutdown_presentation(system_));
  }
  PresentationScenario(const PresentationScenario&) = delete;
  PresentationScenario& operator=(const PresentationScenario&) = delete;

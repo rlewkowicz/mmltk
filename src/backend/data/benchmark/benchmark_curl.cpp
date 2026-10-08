@@ -692,22 +692,21 @@ BenchmarkCurl::Channel::Channel(std::shared_ptr<Impl> owner, Class kind, mmltk::
   if (owner_->failure) std::rethrow_exception(owner_->failure);
  } catch (...) {
   if (!lock.owns_lock()) lock.lock();
-  state_->registered = false;
-  owner_->declarations_changed = true;
-  --owner_->channels;
-  owner_->wake_locked();
-  if (!owner_->channels) owner_->changed.wait(lock, [&] { return owner_->channels || owner_->settled || owner_->failure; });
+  unregister(lock);
   throw;
  }
 }
-BenchmarkCurl::Channel::~Channel() {
- remove_all();
- std::unique_lock lock(owner_->mutex);
+void BenchmarkCurl::Channel::unregister(std::unique_lock<std::mutex>& lock) {
  state_->registered = false;
  owner_->declarations_changed = true;
  --owner_->channels;
  owner_->wake_locked();
  if (!owner_->channels) owner_->changed.wait(lock, [&] { return owner_->channels || owner_->settled || owner_->failure; });
+}
+BenchmarkCurl::Channel::~Channel() {
+ remove_all();
+ std::unique_lock lock(owner_->mutex);
+ unregister(lock);
 }
 std::unique_ptr<BenchmarkCurl::Channel> BenchmarkCurl::channel(Class kind, mmltk::common::concurrency::CancellationObservation cancellation, CompileResources source) {
  return std::unique_ptr<Channel>(new Channel(impl_, kind, cancellation, source));

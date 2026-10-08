@@ -229,6 +229,8 @@ private:
  [[nodiscard]] std::expected<std::byte, DecodeError> peek_byte() const;
  [[nodiscard]] std::expected<std::byte, DecodeError> byte();
  [[nodiscard]] std::expected<std::uint64_t, DecodeError> argument(std::uint8_t additional);
+ [[nodiscard]] std::expected<std::uint64_t, DecodeError> big_endian(std::size_t byte_count);
+ [[nodiscard]] std::expected<ByteSegments, DecodeError> validated_payload_ranges(std::size_t count) const;
  [[nodiscard]] std::expected<std::size_t, DecodeError> size_argument(std::uint8_t additional);
  // Only called after the whole payload passes EOF and byte-budget admission.
  [[nodiscard]] ByteSegments payload_ranges(std::size_t count) const noexcept;

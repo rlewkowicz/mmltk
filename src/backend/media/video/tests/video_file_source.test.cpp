@@ -1,6 +1,8 @@
+#include "src/frameworks/gpu/tests/terminal_retirement_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <algorithm>
 #include <array>
+#include <span>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <cmath>
@@ -42,6 +44,39 @@ struct VideoFileSourceTestAccess final {
  }
 };
 }  // namespace mmltk::backend::media::video::test_support
+namespace {
+struct CodecFixture {
+ AVCodecContext* codec;
+ AVFrame* frame;
+ AVPacket* packet;
+ explicit CodecFixture(const AVCodec* selected) : codec(avcodec_alloc_context3(selected)), frame(av_frame_alloc()), packet(av_packet_alloc()) {
+  try {
+   REQUIRE(codec);
+   REQUIRE(frame);
+   REQUIRE(packet);
+  } catch (...) {
+   Release();
+   throw;
+  }
+ }
+ ~CodecFixture() { Release(); }
+ CodecFixture(const CodecFixture&) = delete;
+ CodecFixture& operator=(const CodecFixture&) = delete;
+
+private:
+ void Release() noexcept {
+  av_packet_free(&packet);
+  av_frame_free(&frame);
+  avcodec_free_context(&codec);
+ }
+};
+}  // namespace
+namespace {
+void read_video_pixels(const float* source, std::span<float> destination, cudaStream_t stream) {
+ REQUIRE(cudaMemcpyAsync(destination.data(), source, destination.size_bytes(), cudaMemcpyDeviceToHost, stream) == cudaSuccess);
+ REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+}
+}  // namespace
 TEST_CASE("video file source rejects remote and absent inputs", "[video]") {
  using mmltk::backend::media::video::VideoFileSource;
  REQUIRE_THROWS_AS(VideoFileSource("https://example.invalid/video.mp4", {4U}, 0, 1U, {}), std::invalid_argument);
@@ -92,8 +127,7 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
  }
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-test", 0, execution.placement.numa_node, -10, false});
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  auto retirement = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(1U);
  REQUIRE_THROWS_AS(mmltk::backend::media::video::VideoFileSource("/nonexistent/predict-video", {4U}, 0, 1U, {}, retirement), std::invalid_argument);
@@ -118,8 +152,7 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
    REQUIRE(frame->presentation_seconds.has_value());
    CHECK(*frame->presentation_seconds == static_cast<double>(index) / 4.0);
    std::array<float, 12U> pixels{};
-   REQUIRE(cudaMemcpyAsync(pixels.data(), frame->chw, sizeof(pixels), cudaMemcpyDeviceToHost, stream) == cudaSuccess);
-   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+   read_video_pixels(frame->chw, pixels, stream);
    for (float value : pixels) CHECK(std::abs(value - static_cast<float>(index)) < 0.02F);
   }
   CHECK_FALSE(source->Next().has_value());
@@ -169,17 +202,7 @@ void write_rotated_video(const std::filesystem::path& path, double rotation, int
  }};
  const auto* encoder = avcodec_find_encoder(codec_id);
  REQUIRE(encoder);
- auto* codec = avcodec_alloc_context3(encoder);
- auto* frame = av_frame_alloc();
- auto* packet = av_packet_alloc();
- const mmltk::testsupport::ScopedTestCleanup release_codec{[&] {
-  av_packet_free(&packet);
-  av_frame_free(&frame);
-  avcodec_free_context(&codec);
- }};
- REQUIRE(codec);
- REQUIRE(frame);
- REQUIRE(packet);
+ auto [codec, frame, packet] = CodecFixture{encoder};
  const bool rgb = codec_id == AV_CODEC_ID_PNG;
  codec->width = width;
  codec->height = height;
@@ -320,8 +343,7 @@ TEST_CASE("video logging disables callback dispatch and preserves independent pr
  CHECK(av_log_get_level() == original_ffmpeg);
 }
 TEST_CASE("local video display rotations preserve decoded pixels and delayed frame drain", "[video][gpu]") {
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  for (int rotation : {0, 90, 180, 270}) {
   const auto path = std::filesystem::temp_directory_path() / ("mmltk-rotated-" + std::to_string(::getpid()) + ".mp4");
@@ -339,8 +361,7 @@ TEST_CASE("local video display rotations preserve decoded pixels and delayed fra
    if (previous) CHECK(*frame->presentation_seconds > *previous);
    previous = frame->presentation_seconds;
    std::array<float, 64U * 32U * 3U> pixels{};
-   REQUIRE(cudaMemcpyAsync(pixels.data(), frame->chw, sizeof(pixels), cudaMemcpyDeviceToHost, stream) == cudaSuccess);
-   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+   read_video_pixels(frame->chw, pixels, stream);
    const auto low = rotation == 0 ? 8U * 64U + 8U : rotation == 90 ? 8U * 32U + 8U : rotation == 180 ? 8U * 64U + 56U : 56U * 32U + 8U;
    const auto high = rotation == 0 ? 8U * 64U + 56U : rotation == 90 ? 56U * 32U + 8U : rotation == 180 ? 8U * 64U + 8U : 8U * 32U + 8U;
    CHECK(pixels[low] < 0.1F);
@@ -381,8 +402,7 @@ TEST_CASE("video resolution growth stays bounded and failed admission preserves 
  }
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-growth", 0, execution.placement.numa_node, -10, false});
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  unsigned context_calls = 0U;
  gpu::CudaContextApi api{&context_calls, [](void* count, CUcontext* context) noexcept {
@@ -408,8 +428,7 @@ TEST_CASE("video resolution growth stays bounded and failed admission preserves 
    if (count == 5U) high_water = frame->chw;
    if (count > 5U) CHECK(frame->chw == high_water);
    completed.resize(static_cast<std::size_t>(frame->width) * frame->height * 3U);
-   REQUIRE(cudaMemcpyAsync(completed.data(), frame->chw, completed.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess);
-   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+   read_video_pixels(frame->chw, completed, stream);
    CHECK(completed[8U * frame->width + 8U] < 0.01F);
    CHECK(completed[8U * frame->width + frame->width - 8U] > 0.99F);
    previous = frame;
@@ -427,8 +446,7 @@ TEST_CASE("video resolution growth stays bounded and failed admission preserves 
  for (unsigned attempt = 0; attempt < 4U; ++attempt) CHECK_THROWS_AS(source->Next(), std::runtime_error);
  CHECK(context_calls == calls_after_failure);
  std::vector<float> retained(completed.size());
- REQUIRE(cudaMemcpyAsync(retained.data(), previous->chw, retained.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess);
- REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+ read_video_pixels(previous->chw, retained, stream);
  CHECK(retained == completed);
  source.reset();
  CHECK(retirement->admission_open());
@@ -452,17 +470,7 @@ TEST_CASE("video probing discovers late streams and preserves decoded timing fac
  double rate = av_q2d(track->avg_frame_rate);
  if (!std::isfinite(rate) || rate <= 0.0) rate = av_q2d(track->r_frame_rate);
  REQUIRE(rate > 0.0);
- auto* codec = avcodec_alloc_context3(decoder);
- auto* decoded = av_frame_alloc();
- auto* packet = av_packet_alloc();
- const mmltk::testsupport::ScopedTestCleanup release_reference{[&] {
-  av_packet_free(&packet);
-  av_frame_free(&decoded);
-  avcodec_free_context(&codec);
- }};
- REQUIRE(codec);
- REQUIRE(decoded);
- REQUIRE(packet);
+ auto [codec, decoded, packet] = CodecFixture{decoder};
  REQUIRE(avcodec_parameters_to_context(codec, track->codecpar) >= 0);
  REQUIRE(avcodec_open2(codec, decoder, nullptr) >= 0);
  std::vector<std::optional<double>> timestamps;
@@ -483,6 +491,8 @@ TEST_CASE("video probing discovers late streams and preserves decoded timing fac
   const auto status = av_read_frame(reference, packet);
   if (status == AVERROR_EOF) break;
   REQUIRE(status >= 0);
+  // CLEANUP-IGNORE: These independent FFmpeg decoder oracles enforce different demux and frame-receive error policies; the matched suffix omits those policies and their separate pixel/timestamp
+  // checks.
   if (packet->stream_index == selected) {
    REQUIRE(avcodec_send_packet(codec, packet) >= 0);
    receive();
@@ -495,8 +505,7 @@ TEST_CASE("video probing discovers late streams and preserves decoded timing fac
  REQUIRE(timestamps.front());
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-discovery", 0, execution.placement.numa_node, -10, false});
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  mmltk::backend::media::video::VideoFileSource source(path, {64U * 32U}, 0, reinterpret_cast<std::uintptr_t>(stream), {});
  CHECK(source.frame_count() == static_cast<std::uint64_t>(std::max<std::int64_t>(0, track->nb_frames)));
@@ -589,8 +598,7 @@ TEST_CASE("video exact context transitions seal the existing owner before furthe
  }
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-context", 0, execution.placement.numa_node, -10, false});
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  struct Driver final {
   bool armed;
@@ -647,8 +655,7 @@ TEST_CASE("video exact context transitions seal the existing owner before furthe
   REQUIRE(cuCtxGetCurrent(&restored) == CUDA_SUCCESS);
   CHECK(restored == driver.caller);
  }
- CHECK(authority->admission_open() == !terminal);
- CHECK(authority->fact().occupancy == (terminal ? 1U : 0U));
+ mmltk::frameworks::gpu::test_support::check_terminal_occupancy(*authority, terminal);
  CHECK(authority->fact().reservations == 0U);
 }
 TEST_CASE("cancelled video context admission publishes no metadata and releases reservations", "[video][gpu][context]") {
@@ -665,8 +672,7 @@ TEST_CASE("cancelled video context admission publishes no metadata and releases 
  }
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-stop-entry", 0, execution.placement.numa_node, -10, false});
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream;
+ const mmltk::testsupport::ScopedTestStream stream(0);
  struct Driver final {
   std::stop_source stop;
   bool at_entry;

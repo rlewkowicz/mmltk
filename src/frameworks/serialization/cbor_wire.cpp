@@ -289,6 +289,15 @@ std::expected<std::byte, DecodeError> Reader::byte() {
  ++offset_;
  return *result;
 }
+std::expected<std::uint64_t, DecodeError> Reader::big_endian(const std::size_t byte_count) {
+ std::uint64_t value = 0U;
+ for (std::size_t index = 0U; index < byte_count; ++index) {
+  auto next = byte();
+  if (!next) { return std::unexpected(next.error()); }
+  value = (value << 8U) | std::to_integer<std::uint8_t>(*next);
+ }
+ return value;
+}
 std::expected<std::uint64_t, DecodeError> Reader::argument(const std::uint8_t additional) {
  if (additional < 24U) { return additional; }
  if (additional == 31U) { return std::unexpected(error(ErrorCode::IndefiniteContainer)); }
@@ -301,13 +310,9 @@ std::expected<std::uint64_t, DecodeError> Reader::argument(const std::uint8_t ad
   default: break;
  }
  if (byte_count == 0U) { return std::unexpected(error(ErrorCode::InvalidAdditionalInfo)); }
- std::uint64_t value = 0U;
- for (std::size_t index = 0U; index < byte_count; ++index) {
-  auto next = byte();
-  if (!next) { return std::unexpected(next.error()); }
-  value = (value << 8U) | std::to_integer<std::uint8_t>(*next);
- }
- if (head_size(value) != byte_count + 1U) { return std::unexpected(error(ErrorCode::NonMinimal)); }
+ auto value = big_endian(byte_count);
+ if (!value) return std::unexpected(value.error());
+ if (head_size(*value) != byte_count + 1U) { return std::unexpected(error(ErrorCode::NonMinimal)); }
  return value;
 }
 std::expected<std::size_t, DecodeError> Reader::size_argument(const std::uint8_t additional) {
@@ -316,30 +321,33 @@ std::expected<std::size_t, DecodeError> Reader::size_argument(const std::uint8_t
  if (*encoded > std::numeric_limits<std::size_t>::max()) { return std::unexpected(error(ErrorCode::Overflow)); }
  return static_cast<std::size_t>(*encoded);
 }
+std::expected<ByteSegments, DecodeError> Reader::validated_payload_ranges(const std::size_t count) const {
+ if (count > input_.size() - offset_) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
+ if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
+ return payload_ranges(count);
+}
 ByteSegments Reader::payload_ranges(const std::size_t count) const noexcept {
  if (offset_ >= input_.first.size()) return {.first = input_.second.subspan(offset_ - input_.first.size(), count)};
  const auto first_count = std::min(count, input_.first.size() - offset_);
  return {.first = input_.first.subspan(offset_, first_count), .second = input_.second.first(count - first_count)};
 }
 std::expected<ByteBuffer, DecodeError> Reader::bytes(const std::size_t count) {
- if (count > input_.size() - offset_) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
- if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
- const auto ranges = payload_ranges(count);
+ const auto ranges = validated_payload_ranges(count);
+ if (!ranges) return std::unexpected(ranges.error());
  ByteBuffer result;
  result.reserve(count);
- if (!ranges.first.empty()) result.insert(result.end(), ranges.first.begin(), ranges.first.end());
- if (!ranges.second.empty()) result.insert(result.end(), ranges.second.begin(), ranges.second.end());
+ if (!ranges->first.empty()) result.insert(result.end(), ranges->first.begin(), ranges->first.end());
+ if (!ranges->second.empty()) result.insert(result.end(), ranges->second.begin(), ranges->second.end());
  offset_ += count;
  return result;
 }
 std::expected<std::string, DecodeError> Reader::text(const std::size_t count) {
- if (count > input_.size() - offset_) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
- if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
- const auto ranges = payload_ranges(count);
+ const auto ranges = validated_payload_ranges(count);
+ if (!ranges) return std::unexpected(ranges.error());
  std::string result;
  result.reserve(count);
- if (!ranges.first.empty()) result.append(reinterpret_cast<const char*>(ranges.first.data()), ranges.first.size());
- if (!ranges.second.empty()) result.append(reinterpret_cast<const char*>(ranges.second.data()), ranges.second.size());
+ if (!ranges->first.empty()) result.append(reinterpret_cast<const char*>(ranges->first.data()), ranges->first.size());
+ if (!ranges->second.empty()) result.append(reinterpret_cast<const char*>(ranges->second.data()), ranges->second.size());
  offset_ += count;
  if (!mmltk::common::types::valid_utf8(result)) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
  return result;
@@ -365,35 +373,24 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_scalar(const ItemHead he
    case 0xf5U: return FlatValue(true);
    case 0xf6U: return FlatValue();
    case 0xf9U: {
-    auto first = byte();
-    if (!first) { return std::unexpected(first.error()); }
-    auto second = byte();
-    if (!second) { return std::unexpected(second.error()); }
-    const auto bits = static_cast<std::uint16_t>((std::to_integer<std::uint8_t>(*first) << 8U) | std::to_integer<std::uint8_t>(*second));
-    const double value = half_to_float(bits);
+    auto bits = big_endian(2U);
+    if (!bits) return std::unexpected(bits.error());
+    const double value = half_to_float(static_cast<std::uint16_t>(*bits));
     if (!std::isfinite(value)) { return std::unexpected(error(ErrorCode::InvalidFloat)); }
     return FlatValue(value);
    }
    case 0xfaU: {
-    std::uint32_t bits = 0U;
-    for (std::size_t index = 0U; index < 4U; ++index) {
-     auto next = byte();
-     if (!next) { return std::unexpected(next.error()); }
-     bits = (bits << 8U) | std::to_integer<std::uint8_t>(*next);
-    }
-    const float narrowed = std::bit_cast<float>(bits);
+    auto bits = big_endian(4U);
+    if (!bits) return std::unexpected(bits.error());
+    const float narrowed = std::bit_cast<float>(static_cast<std::uint32_t>(*bits));
     if (!std::isfinite(narrowed)) { return std::unexpected(error(ErrorCode::InvalidFloat)); }
     if (half_to_float(float_to_half(narrowed)) == narrowed) { return std::unexpected(error(ErrorCode::NonMinimal)); }
     return FlatValue(static_cast<double>(narrowed));
    }
    case 0xfbU: {
-    std::uint64_t bits = 0U;
-    for (std::size_t index = 0U; index < 8U; ++index) {
-     auto next = byte();
-     if (!next) { return std::unexpected(next.error()); }
-     bits = (bits << 8U) | std::to_integer<std::uint8_t>(*next);
-    }
-    const double value = std::bit_cast<double>(bits);
+    auto bits = big_endian(8U);
+    if (!bits) return std::unexpected(bits.error());
+    const double value = std::bit_cast<double>(*bits);
     if (!std::isfinite(value)) { return std::unexpected(error(ErrorCode::InvalidFloat)); }
     if (static_cast<double>(static_cast<float>(value)) == value) { return std::unexpected(error(ErrorCode::NonMinimal)); }
     return FlatValue(value);
@@ -413,8 +410,7 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_scalar(const ItemHead he
  if (*encoded_argument > std::numeric_limits<std::size_t>::max()) { return std::unexpected(error(ErrorCode::Overflow)); }
  const std::size_t count = static_cast<std::size_t>(*encoded_argument);
  if (!materialize) {
-  if (count > input_.size() - offset_) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
-  if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
+  if (auto checked = validated_payload_ranges(count); !checked) return std::unexpected(checked.error());
   if (head.major == 3U) {
    const auto* data = reinterpret_cast<const char*>(input_.first.data() + offset_);
    if (!mmltk::common::types::valid_utf8(std::string_view{data, count})) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }

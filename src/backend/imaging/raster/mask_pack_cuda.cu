@@ -5,6 +5,7 @@ constexpr int kCudaThreads = 256;
 __global__ void pack_bool_masks_kernel(const bool* masks, std::uint8_t* packed_masks, std::int64_t mask_count, std::int64_t pixels_per_mask, std::int64_t bytes_per_mask) {
  const std::int64_t output_index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  const std::int64_t total_bytes = mask_count * bytes_per_mask;
+ // CLEANUP-IGNORE: Mask-byte addressing and RGBA batch addressing use different storage units and bounds; this quotient/remainder prefix has no shared storage policy.
  if (output_index >= total_bytes) { return; }
  const std::int64_t mask_index = output_index / bytes_per_mask;
  const std::int64_t byte_index = output_index - mask_index * bytes_per_mask;

@@ -151,6 +151,7 @@ private:
   constexpr std::size_t sign_bytes = std::numeric_limits<Integer>::is_signed ? 3U : 2U;
   std::array<char, std::numeric_limits<Integer>::digits10 + sign_bytes> buffer{};
   const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+  // CLEANUP-IGNORE: This scalar-formatting result check appends either integer or floating output; the two encoders have distinct formats and range handling.
   return result.ec == std::errc{} && append({buffer.data(), static_cast<std::size_t>(result.ptr - buffer.data())});
  }
  [[nodiscard]] bool integer(const std::int64_t value) noexcept { return integer_value(value); }
@@ -159,6 +160,7 @@ private:
   if (!std::isfinite(value)) return append("null");
   std::array<char, 64U> buffer{};
   const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::general, std::numeric_limits<double>::max_digits10);
+  // CLEANUP-IGNORE: This scalar-formatting result check appends either integer or floating output; the two encoders have distinct formats and range handling.
   return result.ec == std::errc{} && append({buffer.data(), static_cast<std::size_t>(result.ptr - buffer.data())});
  }
  [[nodiscard]] bool bytes(const wire::Value::Bytes& value) noexcept {
@@ -334,6 +336,7 @@ void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDi
  } catch (...) { fail_delivery(); }
 }
 void RuntimeDiagnosticTarget::State::write_browser_event(const std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) const noexcept {
+ // CLEANUP-IGNORE: Operation admission precedes different typed browser-event and benchmark-JSON encoders; disabled logging must return before either.
  const DiagnosticsProducer::Operation operation = complete ? producer.acquire_complete() : producer.acquire();
  if (!operation.enabled()) return;
  if (!valid_event_name(event)) {
@@ -354,6 +357,7 @@ void RuntimeDiagnosticTarget::State::write_browser_event(const std::string_view 
  submitted(operation.submit_encoded({.json = writer.view()}, complete));
 }
 void RuntimeDiagnosticTarget::State::write_benchmark_trace(const std::string_view event, const std::string_view json_fields) const noexcept {
+ // CLEANUP-IGNORE: Operation admission precedes different typed browser-event and benchmark-JSON encoders; disabled logging must return before either.
  const DiagnosticsProducer::Operation operation = complete ? producer.acquire_complete() : producer.acquire();
  if (!operation.enabled()) return;
  if (!valid_event_name(event) || json_fields.empty() || json_fields.size() > DiagnosticsClient::kRecordCapacity || json_fields.find_first_of("\r\n") != std::string_view::npos) {

@@ -102,8 +102,9 @@ struct ImageWorkspaceTestAccess final {
  static std::shared_ptr<ImageWorkspace> Create(std::shared_ptr<ImageCopyBackend> backend, ImageWorkspaceLayout layout) {
   return Create(DeviceContext(layout.device, std::move(backend)), std::move(layout));
  }
- static std::shared_ptr<ImageWorkspace> CreateAdmitted(std::shared_ptr<ImageCopyBackend> backend, ImageWorkspaceLayout layout) {
-  auto workspace = Create(std::move(backend), std::move(layout));
+ template <class Display>
+ static std::shared_ptr<ImageWorkspace> CreateAdmitted(Display display, ImageWorkspaceLayout layout) {
+  auto workspace = Create(std::move(display), std::move(layout));
   workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
   return workspace;
  }
@@ -506,14 +507,17 @@ private:
  int failed_binding_device_ = -1;
  std::exception_ptr device_binding_failure_;
 };
+[[nodiscard]] inline std::shared_ptr<FakeImageBackend> ResetImageBackend() {
+ ImageWorkspaceTestAccess::Reset();
+ return std::make_shared<FakeImageBackend>();
+}
 struct WorkspaceTestFixture final {
  std::shared_ptr<FakeImageBackend> backend;
  std::unique_ptr<SystemImageRuntime> runtime;
  std::shared_ptr<ImageWorkspace> workspace;
  bool prepared = false;
  explicit WorkspaceTestFixture(const bool publish_product = false) {
-  ImageWorkspaceTestAccess::Reset();
-  backend = std::make_shared<FakeImageBackend>();
+  backend = ResetImageBackend();
   if (publish_product) {
    runtime = std::make_unique<SystemImageRuntime>(WorkspaceRuntimeConfig(backend));
    auto publication = PublishTestWorkspace(*runtime, backend);

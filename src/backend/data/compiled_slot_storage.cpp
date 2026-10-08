@@ -87,6 +87,7 @@ CompiledSlotStorage::PixelLease::PixelLease(PixelLease&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), slot_(std::exchange(other.slot_, nullptr)), data_(std::exchange(other.data_, nullptr)) {}
 CompiledSlotStorage::PixelLease& CompiledSlotStorage::PixelLease::operator=(PixelLease&& other) noexcept {
  if (this != &other) {
+  // CLEANUP-IGNORE: Pixel-storage and terminal-retirement leases release different owners and transfer different identity fields.
   release();
   owner_ = std::exchange(other.owner_, nullptr);
   slot_ = std::exchange(other.slot_, nullptr);

@@ -1,5 +1,5 @@
-#include "src/backend/models/rfdetr/core/inference_lanes.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/models/rfdetr/core/inference_lanes.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <cuda_runtime_api.h>
 #include <array>
@@ -51,8 +51,7 @@ TEST_CASE("Inference lanes retain stable distinct streams and bounded ordered sl
  CHECK_THROWS_AS(rf::InferenceLanes(-1, 2), std::invalid_argument);
 }
 TEST_CASE("Inference source copies retire before delayed forward and next frame mutation", "[rfdetr][inference][gpu][custody]") {
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream producer;
+ const mmltk::testsupport::ScopedTestStream producer(0);
  const auto device = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32);
  auto source = torch::empty({1}, device);
  auto copies = torch::empty({2}, device);

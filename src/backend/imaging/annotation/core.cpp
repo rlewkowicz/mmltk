@@ -207,6 +207,7 @@ std::vector<std::uint8_t> decode_annotation_mask_rle(const std::string_view enco
  if (dense.empty() || encoded_mask.empty()) { return dense; }
  const auto parse_size = [](const std::string_view token, std::size_t* value) {
   if (value == nullptr || token.empty()) { return false; }
+  // CLEANUP-IGNORE: Unrelated CPU and mask parsers form a from_chars range before distinct validation and error policies.
   const char* begin = token.data();
   const char* end = token.data() + token.size();
   const auto [ptr, error] = std::from_chars(begin, end, *value);

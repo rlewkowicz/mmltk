@@ -1,10 +1,11 @@
+#include "src/frameworks/gpu/cuda/cuda_launch.cuh"
 #include "chw_image.h"
 #include <cuda_runtime.h>
 namespace mmltk::backend::imaging::raster {
 namespace {
 __global__ void convert_chw(const float* source, std::uint32_t width, std::uint32_t height, std::uint8_t* destination, std::size_t pitch) {
- const auto x = blockIdx.x * blockDim.x + threadIdx.x;
- const auto y = blockIdx.y * blockDim.y + threadIdx.y;
+ // CLEANUP-IGNORE: Thread coordinates already come from the common CUDA primitive; this bounds guard precedes different source-format conversions.
+ const auto [x, y] = mmltk::frameworks::gpu::launch::global_pixel();
  if (x >= width || y >= height) return;
  const auto plane = static_cast<std::size_t>(width) * height;
  const auto offset = static_cast<std::size_t>(y) * width + x;
@@ -14,8 +15,8 @@ __global__ void convert_chw(const float* source, std::uint32_t width, std::uint3
 }
 // CLEANUP-IGNORE: These distinct format-conversion kernels retain ordinary thread admission; a shared pixel-address helper adds more code than its two callers remove.
 __global__ void convert_rgb8(const std::uint8_t* source, std::uint32_t width, std::uint32_t height, std::uint8_t* destination, std::size_t pitch) {
- const auto x = blockIdx.x * blockDim.x + threadIdx.x;
- const auto y = blockIdx.y * blockDim.y + threadIdx.y;
+ // CLEANUP-IGNORE: Thread coordinates already come from the common CUDA primitive; this bounds guard precedes different source-format conversions.
+ const auto [x, y] = mmltk::frameworks::gpu::launch::global_pixel();
  if (x >= width || y >= height) return;
  const auto offset = (static_cast<std::size_t>(y) * width + x) * 3U;
  auto* pixel = destination + y * pitch + static_cast<std::size_t>(x) * 4U;

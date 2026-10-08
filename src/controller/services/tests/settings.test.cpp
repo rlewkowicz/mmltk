@@ -1,3 +1,4 @@
+#include "src/controller/services/tests/support/settings_test_fixture.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include <algorithm>
 #include <array>
@@ -45,6 +46,12 @@ GuiSettingsState& make_snapshot(SettingsViewStates& states) {
 }
 bool load_settings(const std::filesystem::path& path, GuiSettingsState& snapshot, nlohmann::json* const normalized_document = nullptr, bool* const repair_required = nullptr) {
  return load_gui_settings_file(path.string(), snapshot, normalized_document, repair_required);
+}
+GuiSettingsState roundtrip_settings(const std::filesystem::path& path, const GuiSettingsState& state) {
+ mmltk::testsupport::write_text_file(path, snapshot_gui_settings(state).dump());
+ auto loaded = default_gui_settings_state();
+ REQUIRE(load_settings(path, loaded));
+ return loaded;
 }
 [[nodiscard]] auto mutable_settings_views(SettingsViewStates& states) noexcept {
  return std::tie(states.ui, states.workflows.train, states.workflows.validate, states.workflows.predict, states.workflows.annotate, states.workflows.export_state, states.workflows.explore);
@@ -642,9 +649,7 @@ TEST_CASE("optional test selection and persistence are independent of inferred t
  CHECK(state.workflows.train.request.test_compiled_path == "/independent/evaluation.bin");
  mmltk::testsupport::ScopedTempDir temp{"optional-test-settings"};
  const auto path = temp.path() / "gui.json";
- mmltk::testsupport::write_text_file(path, snapshot_gui_settings(state).dump());
- auto loaded = default_gui_settings_state();
- REQUIRE(load_settings(path, loaded));
+ auto loaded = roundtrip_settings(path, state);
  CHECK(loaded.workflows.train.use_compiled_directory_defaults);
  CHECK(loaded.workflows.train.request.test_compiled_path == state.workflows.train.request.test_compiled_path);
  edit("workflows.train.request.test_compiled_path", "");
@@ -748,6 +753,7 @@ void test_persistence_repairs_catalog_and_compiled_directory_defaults() {
  REQUIRE(load_settings(settings_path, state, nullptr, &repair_required));
  CHECK(repair_required);
  CHECK(state.workflows.predict.request.preset_name == kDefaultModelPresetName);
+ // CLEANUP-IGNORE: Initial load and canonical-source reselection independently require the same source kind before different retained engine paths.
  CHECK(state.workflows.predict.model_source == ModelSelectionSource::Canonical);
  CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
  CHECK(state.workflows.predict.request.tensorrt_path.empty());
@@ -851,6 +857,7 @@ void test_catalog_source_transition_normalizes_model_input_at_the_native_boundar
  CHECK(state.workflows.validate.model_input == ModelArtifactInputKind::Weights);
  CHECK(state.workflows.validate.request.onnx_path == "/tmp/validate.onnx");
  select_catalog_source("workflows.predict.model_source");
+ // CLEANUP-IGNORE: Initial load and canonical-source reselection independently require the same source kind before different retained engine paths.
  CHECK(state.workflows.predict.model_source == ModelSelectionSource::Canonical);
  CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
  CHECK(state.workflows.predict.request.tensorrt_path == "/tmp/predict.engine");
@@ -1138,6 +1145,7 @@ void test_training_supervision_relation_is_enforced_by_generic_settings_validity
  const std::array second_zero{
   SettingsValueUpdate{.path = "workflows.train.request.training_supervision.match_free.query_weight", .value = zero},
  };
+ // CLEANUP-IGNORE: Distinct invalid edits independently assert atomic rejection of their own settings candidates.
  CHECK_FALSE(apply_gui_settings_values(valid_ablation, second_zero));
  CHECK(valid_ablation == before_rejected_edit);
  GuiSettingsState rejected_batch = default_gui_settings_state();
@@ -1147,6 +1155,7 @@ void test_training_supervision_relation_is_enforced_by_generic_settings_validity
   SettingsValueUpdate{.path = "workflows.train.request.training_supervision.match_free.correspondence_weight", .value = zero},
   SettingsValueUpdate{.path = "workflows.train.request.training_supervision.match_free.query_weight", .value = zero},
  };
+ // CLEANUP-IGNORE: Distinct invalid edits independently assert atomic rejection of their own settings candidates.
  CHECK_FALSE(apply_gui_settings_values(rejected_batch, both_zero_updates));
  CHECK(rejected_batch == before_rejected_batch);
  GuiSettingsState invalid_persistence_candidate = default_gui_settings_state();
@@ -1155,9 +1164,7 @@ void test_training_supervision_relation_is_enforced_by_generic_settings_validity
  invalid_persistence_candidate.workflows.train.request.training_supervision.match_free.query_weight = 0.0F;
  CHECK_FALSE(gui_settings_valid(invalid_persistence_candidate));
  mmltk::testsupport::ScopedTempDir persistence_root{"mmltk-training-supervision-settings"};
- const SettingsLocation location{(persistence_root.path() / "gui.json").string()};
- mmltk::controller::SettingsSystem settings;
- REQUIRE(settings.Load(location).applied());
+ auto [location, settings] = mmltk::controller::test_support::LoadedSettingsFixture{SettingsLocation{(persistence_root.path() / "gui.json").string()}};
  SettingsUpdateRequest persisted_ablation;
  persisted_ablation.updates.assign(one_zero_updates.begin(), one_zero_updates.end());
  const auto persisted = settings.Update(std::move(persisted_ablation));
@@ -1252,9 +1259,7 @@ void test_startup_transport_override_is_session_local_in_both_directions() {
 }
 void test_explore_preview_candidate_is_atomic_and_persists_native_modes() {
  mmltk::testsupport::ScopedTempDir persistence_root{"mmltk-explore-preview-settings"};
- const SettingsLocation location{(persistence_root.path() / "gui.json").string()};
- mmltk::controller::SettingsSystem settings;
- REQUIRE(settings.Load(location).applied());
+ auto [location, settings] = mmltk::controller::test_support::LoadedSettingsFixture{SettingsLocation{(persistence_root.path() / "gui.json").string()}};
  const auto initial = settings.explore_settings_candidate();
  CHECK_FALSE(initial.augmentation_preview_enabled);
  CHECK_FALSE(initial.show_original_dimensions);
@@ -1283,9 +1288,7 @@ void test_explore_preview_candidate_is_atomic_and_persists_native_modes() {
 }
 void test_copy_paste_default_and_persisted_overrides() {
  mmltk::testsupport::ScopedTempDir root{"mmltk-copy-paste-settings"};
- const SettingsLocation location{(root.path() / "gui.json").string()};
- mmltk::controller::SettingsSystem settings;
- REQUIRE(settings.Load(location).applied());
+ auto [location, settings] = mmltk::controller::test_support::LoadedSettingsFixture{SettingsLocation{(root.path() / "gui.json").string()}};
  CHECK(settings.explore_settings_candidate().augmentation.copy_paste_probability == .80F);
  for (const float probability : {0.F, .30F, .50F, 1.F}) {
   SettingsUpdateRequest request;
@@ -1557,9 +1560,7 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
     apply_gui_settings(snapshot_gui_settings(state), restored);
     CHECK(restored.workflows.train.benchmark_selection == state.workflows.train.benchmark_selection);
     CHECK(restored.workflows.train.compile_benchmark_dataset_override == enabled);
-    mmltk::testsupport::write_text_file(path, snapshot_gui_settings(state).dump());
-    auto reloaded = default_gui_settings_state();
-    REQUIRE(load_settings(path, reloaded));
+    auto reloaded = roundtrip_settings(path, state);
     CHECK(reloaded.workflows.train.benchmark_selection == state.workflows.train.benchmark_selection);
     const nlohmann::json flat = state.workflows.train;
     auto flat_restored = flat.get<TrainViewState>();

@@ -17,6 +17,7 @@ __device__ std::uint32_t reference_phase(float coordinate) {
 __global__ void fixture_pixels(HalfRgba* scaled, Configuration config, unsigned pattern) {
  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  if (index >= static_cast<std::uint64_t>(config.output_width) * config.output_height) return;
+ // CLEANUP-IGNORE: Pattern generation and the independent NIS reference each derive pixel coordinates at their own CUDA kernel boundary.
  const auto x = static_cast<std::uint32_t>(index % config.output_width);
  const auto y = static_cast<std::uint32_t>(index / config.output_width);
  float value = 0.5F;
@@ -30,6 +31,7 @@ __global__ void fixture_pixels(HalfRgba* scaled, Configuration config, unsigned 
 // evaluated before gradient selection. Do not share production sharpening.
 // CLEANUP-IGNORE: Independent numerical oracle retains original alpha-coordinate arithmetic; sharing production code would invalidate the comparison.
 __device__ __forceinline__ std::uint32_t nearest_source_coordinate(const std::uint32_t output_coordinate, const std::uint32_t crop_extent, const std::uint32_t output_extent) {
+ // CLEANUP-IGNORE: Independent alpha-coordinate oracle preserves the original rounding and clamping arithmetic.
  const std::uint64_t centered = static_cast<std::uint64_t>(output_coordinate) * crop_extent + crop_extent / 2U;
  return min(crop_extent - 1U, static_cast<std::uint32_t>(centered / output_extent));
 }
@@ -41,6 +43,7 @@ __device__ __forceinline__ std::uint8_t source_alpha_byte(const void* source, co
  return row[static_cast<std::size_t>(source_x) * 4U + 3U];
 }
 __device__ __forceinline__ HalfRgba load_clamped(const HalfRgba* pixels, const Configuration config, const int x, const int y) {
+ // CLEANUP-IGNORE: The reference sharpener independently clamps each sampled coordinate before comparing production output.
  const auto clamped_x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_width) - 1, x)));
  const auto clamped_y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_height) - 1, y)));
  return pixels[static_cast<std::size_t>(clamped_y) * config.output_width + clamped_x];
@@ -50,6 +53,7 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
  // CLEANUP-IGNORE: Independent dual-direction oracle retains original pixel and neighbor selection; do not share production sharpening.
  const std::uint64_t total = static_cast<std::uint64_t>(config.output_width) * config.output_height;
  if (index >= total) return;
+ // CLEANUP-IGNORE: Pattern generation and the independent NIS reference each derive pixel coordinates at their own CUDA kernel boundary.
  const auto x = static_cast<std::uint32_t>(index % config.output_width);
  const auto y = static_cast<std::uint32_t>(index / config.output_width);
  const HalfRgba center = load_clamped(scaled, config, static_cast<int>(x), static_cast<int>(y));
@@ -61,6 +65,7 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
  const float source_y = (static_cast<float>(y) + 0.5F) * static_cast<float>(config.crop_height) / static_cast<float>(config.output_height) - 0.5F;
  const std::uint32_t phase_x = reference_phase(source_x);
  const std::uint32_t phase_y = reference_phase(source_y);
+ // CLEANUP-IGNORE: Independent horizontal and vertical reference accumulators deliberately start at zero.
  float3 horizontal = make_float3(0.0F, 0.0F, 0.0F);
  float3 vertical = make_float3(0.0F, 0.0F, 0.0F);
 #pragma unroll
@@ -70,6 +75,7 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
   const HalfRgba vertical_sample = load_clamped(scaled, config, static_cast<int>(x), static_cast<int>(y) + offset);
   const float horizontal_coefficient = kReferenceUsm.values[phase_x][tap];
   const float vertical_coefficient = kReferenceUsm.values[phase_y][tap];
+  // CLEANUP-IGNORE: The independent dual-direction sharpening oracle retains its own FMA chain; sharing production arithmetic would invalidate parity evidence.
   horizontal.x = fmaf(horizontal_coefficient, __half2float(horizontal_sample.red), horizontal.x);
   horizontal.y = fmaf(horizontal_coefficient, __half2float(horizontal_sample.green), horizontal.y);
   horizontal.z = fmaf(horizontal_coefficient, __half2float(horizontal_sample.blue), horizontal.z);
@@ -78,6 +84,7 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
   vertical.y = fmaf(vertical_coefficient, __half2float(vertical_sample.green), vertical.y);
   vertical.z = fmaf(vertical_coefficient, __half2float(vertical_sample.blue), vertical.z);
  }
+ // CLEANUP-IGNORE: Independent sharpening gradients are the numerical reference for production direction selection.
  const float horizontal_gradient = fabsf(
   0.2126F * (__half2float(left.red) - __half2float(right.red)) + 0.7152F * (__half2float(left.green) - __half2float(right.green)) + 0.0722F * (__half2float(left.blue) - __half2float(right.blue)));
  const float vertical_gradient = fabsf(
@@ -88,6 +95,7 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
  const float strength = 0.18F + 0.16F * fminf(1.0F, magnitude * 8.0F);
  const float4 color = make_float4(fmaf(strength, detail.x, __half2float(center.red)), fmaf(strength, detail.y, __half2float(center.green)), fmaf(strength, detail.z, __half2float(center.blue)), 0.0F);
  auto* output = target + static_cast<std::size_t>(y) * target_pitch + static_cast<std::size_t>(x) * 4U;
+ // CLEANUP-IGNORE: The independent reference preserves clamping and byte rounding instead of calling the production output conversion.
  output[0] = static_cast<std::uint8_t>(__float2int_rn(fminf(1.0F, fmaxf(0.0F, color.x)) * 255.0F));
  output[1] = static_cast<std::uint8_t>(__float2int_rn(fminf(1.0F, fmaxf(0.0F, color.y)) * 255.0F));
  output[2] = static_cast<std::uint8_t>(__float2int_rn(fminf(1.0F, fmaxf(0.0F, color.z)) * 255.0F));

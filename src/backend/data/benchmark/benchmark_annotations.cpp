@@ -118,8 +118,7 @@ void parallel_object_array(const PaddedMappedFile& file, std::span<const ByteRan
  const auto workers = execution ? execution->workers() : static_cast<std::size_t>(effective_worker_count(requested_workers, rows.size()));
  std::vector<ByteRange> chunks;
  for (std::size_t begin = 0; begin < rows.size();) {
-  auto end = begin + 1;
-  while (end < rows.size() && rows[end].end - rows[begin].begin <= (256U << 10)) ++end;
+  const auto end = annotation_json_chunk_end(rows, begin);
   chunks.push_back({begin, end});
   begin = end;
  }

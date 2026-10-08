@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <memory_resource>
+#include <span>
 #include <vector>
 namespace mmltk::common::system {
 struct MemoryPolicy final {
@@ -29,6 +30,11 @@ public:
  NumaMemory(NumaMemory&&) noexcept;
  NumaMemory& operator=(NumaMemory&&) noexcept;
  void ensure_bytes(std::size_t);
+ // Grow transactionally if needed and borrow the complete retained extent.
+ [[nodiscard]] std::span<std::byte> ensure_storage(std::size_t bytes) {
+  ensure_bytes(bytes);
+  return {static_cast<std::byte*>(data_), bytes_};
+ }
  void reset() noexcept;
  void verify() const;
  [[nodiscard]] void* data() const noexcept { return data_; }

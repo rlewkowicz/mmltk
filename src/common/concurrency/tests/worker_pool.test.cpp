@@ -240,6 +240,7 @@ TEST_CASE("Prepared worker continuations yield through the same FIFO and report 
  CHECK_THROWS_WITH(pool.wait_idle(), "prepared task failed");
  CHECK_THROWS_WITH(pool.enqueue_borrowed(task), "prepared task failed");
 }
+// CLEANUP-IGNORE: Independent NUMA tests inspect the host topology and use the existing permitted-CPU fixture before different resource admission.
 TEST_CASE("Child pools use immutable placement after the creator is pinned", "[common][concurrency][worker_pool]") {
  using namespace mmltk::common::system;
  const auto topology = NumaTopology::Capture();

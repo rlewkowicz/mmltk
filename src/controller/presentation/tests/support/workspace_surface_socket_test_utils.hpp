@@ -1,4 +1,5 @@
 #pragma once
+#include "src/common/io/socket_message.h"
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -40,6 +41,7 @@ struct WorkspaceSurfaceDescriptors final {
 [[nodiscard]] inline WorkspaceSurfaceDescriptors receive_message_with_descriptors(const int socket, const std::span<std::byte> record, const char* const failure_message) {
  WorkspaceSurfaceDescriptors received;
  iovec payload{.iov_base = record.data(), .iov_len = record.size()};
+ // CLEANUP-IGNORE: Receive and send own separate ancillary buffers with different sizing, mutability, flags, and descriptor ownership; only POSIX header setup matches.
  std::array<std::byte, CMSG_SPACE(sizeof(int) * kMaxWorkspaceSurfaceDescriptors)> control{};
  msghdr header{};
  header.msg_iov = &payload;
@@ -64,6 +66,7 @@ struct WorkspaceSurfaceDescriptors final {
 [[nodiscard]] inline bool send_message_with_descriptors(const int socket, const std::span<const std::byte> message, const std::span<const int> descriptors, const char* const failure_message) {
  if (descriptors.size() > kMaxWorkspaceSurfaceDescriptors) { throw std::runtime_error("workspace protocol message carries too many descriptors"); }
  iovec payload{const_cast<std::byte*>(message.data()), message.size()};
+ // CLEANUP-IGNORE: Receive and send own separate ancillary buffers with different sizing, mutability, flags, and descriptor ownership; only POSIX header setup matches.
  std::array<std::byte, CMSG_SPACE(sizeof(int) * kMaxWorkspaceSurfaceDescriptors)> control{};
  msghdr header{};
  header.msg_iov = &payload;
@@ -73,10 +76,7 @@ struct WorkspaceSurfaceDescriptors final {
   header.msg_controllen = CMSG_SPACE(descriptors.size_bytes());
   cmsghdr* const ancillary = CMSG_FIRSTHDR(&header);
   if (ancillary == nullptr) { throw std::runtime_error("workspace protocol control message header is missing"); }
-  ancillary->cmsg_level = SOL_SOCKET;
-  ancillary->cmsg_type = SCM_RIGHTS;
-  ancillary->cmsg_len = CMSG_LEN(descriptors.size_bytes());
-  std::memcpy(CMSG_DATA(ancillary), descriptors.data(), descriptors.size_bytes());
+  mmltk::common::io::write_socket_descriptors(*ancillary, descriptors);
  }
  const ssize_t sent = ::sendmsg(socket, &header, MSG_NOSIGNAL | MSG_DONTWAIT);
  if (sent == static_cast<ssize_t>(message.size())) { return true; }

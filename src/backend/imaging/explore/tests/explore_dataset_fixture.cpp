@@ -103,6 +103,7 @@ std::filesystem::path compile_explore_sparse_fixture(const std::filesystem::path
  for (std::uint32_t slot = 0U; slot != slot_count; ++slot)
   if (slot != 0U && slot != 65U) entries[slot] = {};
  header.num_images = 2U;
+ // CLEANUP-IGNORE: These fixtures rewrite the common file header before different index/label mutations; failure policy and persisted edits remain local.
  file.seekp(0);
  file.write(reinterpret_cast<const char*>(&header), sizeof(header));
  file.seekp(static_cast<std::streamoff>(header.index_offset));

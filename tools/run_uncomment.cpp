@@ -42,6 +42,7 @@ module;
 export module mmltk.tools.run_uncomment;
 import mmltk.tools.cpp_digest;
 import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_linux;
 import mmltk.tools.cpp_text;
 namespace {
 namespace support = mmltk::tools;
@@ -96,8 +97,7 @@ const json& file_entries(const json& data) {
  return *found;
 }
 void replace_manifest(const fs::path& path, std::string_view rendered) {
- struct stat metadata{};
- if (::stat(path.c_str(), &metadata) != 0) throw std::system_error(errno, std::generic_category(), "stat " + path.string());
+ const auto metadata = support::file_metadata(path);
  std::string pattern = (path.parent_path() / ".cargo-checksum.json.XXXXXX").string();
  support::FileDescriptor output(::mkstemp(pattern.data()));
  if (output.get() < 0) throw std::system_error(errno, std::generic_category(), "mkstemp " + path.string());

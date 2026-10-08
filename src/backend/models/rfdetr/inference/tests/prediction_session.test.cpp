@@ -1,6 +1,7 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/frameworks/gpu/tests/terminal_retirement_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/frameworks/gpu/tests/pinned_host_fault.h"
-#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -23,6 +24,7 @@
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/training/detail/model_merging.h"
+#include "src/backend/models/rfdetr/training/detail/training_snapshot.h"
 #include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
 #include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/backend/models/rfdetr/inference/evaluation.h"
@@ -384,9 +386,8 @@ private:
 };
 }  // namespace
 TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned pixels", "[model][rfdetr][prediction][gpu]") {
- const auto root = std::filesystem::temp_directory_path() / ("prediction-delivery-" + std::to_string(::getpid()));
- std::filesystem::create_directories(root);
- const mmltk::testsupport::ScopedTestCleanup files{[&] { std::filesystem::remove_all(root); }};
+ const mmltk::testsupport::ScopedTempDir files{"prediction-delivery"};
+ const auto& root = files.path();
  write_prediction_model(root / "rf-detr-nano.onnx");
  const auto image = root / "red.ppm";
  {
@@ -435,8 +436,8 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
   CHECK(record.at("dataset_index") == index);
   CHECK(record.at("source_name") == expected_names[index]);
  }
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ // CLEANUP-IGNORE: The CUDA stream and prediction request are independent owners with scenario-specific lifetimes; the match spans their unrelated setup.
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  rfdetr::PredictRequest request;
  request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
@@ -619,6 +620,7 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
  }}).processed_images;
  CHECK(preview_images == 2U);
  CHECK_FALSE(session.HasUnsafeCustody());
+ // CLEANUP-IGNORE: An empty two-slot layout is an explicit shared input to distinct delivery and mask-demand cases, which retain separate artifact lifetimes.
  auto empty_layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog{});
  empty_layout.slots.resize(2, {rfdetr::ClassSlotRole::Unused, {}});
  auto empty_request = request;
@@ -690,9 +692,12 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
  CHECK_THROWS_AS(context_poisoned.Run(request, command, {.completed = [](const auto&, auto, const auto&) { throw mmltk::frameworks::gpu::CudaContextFailure(true); }}),
   mmltk::backend::ml::runtime::CudaOperationError);
  CHECK(context_poisoned.HasUnsafeCustody());
- bool context_rebound = false;
- CHECK_THROWS_AS(context_poisoned.Run(request, command, {.begin = [&](const auto&) { context_rebound = true; }}), mmltk::backend::ml::runtime::CudaOperationError);
- CHECK_FALSE(context_rebound);
+ const auto check_rebind_refused = [&](auto& refused_session) {
+  bool rebound = false;
+  CHECK_THROWS_AS(refused_session.Run(request, command, {.begin = [&](const auto&) { rebound = true; }}), mmltk::backend::ml::runtime::CudaOperationError);
+  CHECK_FALSE(rebound);
+ };
+ check_rebind_refused(context_poisoned);
  rfdetr::PredictionSession poisoned;
  CHECK_FALSE(poisoned.HasUnsafeCustody());
  std::ifstream prior_file(request.output_path);
@@ -702,9 +707,7 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
   mmltk::backend::ml::runtime::CudaOperationError);
  std::ifstream after_failure(request.output_path);
  CHECK(nlohmann::json::parse(after_failure) == prior);
- bool rebound = false;
- CHECK_THROWS_AS(poisoned.Run(request, command, {.begin = [&](const auto&) { rebound = true; }}), mmltk::backend::ml::runtime::CudaOperationError);
- CHECK_FALSE(rebound);
+ check_rebind_refused(poisoned);
  CHECK(poisoned.HasUnsafeCustody());
  CHECK(poisoned.Close() != mmltk::backend::ml::runtime::kRuntimeSuccess);
  CHECK(poisoned.HasUnsafeCustody());
@@ -764,9 +767,8 @@ TEST_CASE("validation timing counts accepted executions independently of planned
  CHECK(result.backends.at("onnx").timing.images == 7U);
 }
 TEST_CASE("full HD prediction materializes masks only for threshold survivors", "[model][rfdetr][prediction][gpu]") {
- const auto root = std::filesystem::temp_directory_path() / ("prediction-hd-" + std::to_string(::getpid()));
- std::filesystem::create_directories(root);
- const mmltk::testsupport::ScopedTestCleanup files{[&] { std::filesystem::remove_all(root); }};
+ const mmltk::testsupport::ScopedTempDir files{"prediction-hd"};
+ const auto& root = files.path();
  const auto image = root / "frame.ppm";
  {
   std::ofstream file(image, std::ios::binary);
@@ -907,12 +909,10 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
 }
 TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "[model][rfdetr][prediction][gpu]") {
  namespace runtime = mmltk::backend::ml::runtime;
- const auto root = std::filesystem::temp_directory_path() / ("prediction-bbox-consumer-" + std::to_string(::getpid()));
- std::filesystem::create_directories(root);
- const mmltk::testsupport::ScopedTestCleanup files{[&] { std::filesystem::remove_all(root); }};
+ const mmltk::testsupport::ScopedTempDir files{"prediction-bbox-consumer"};
+ const auto& root = files.path();
  write_prediction_model(root / "rf-detr-nano.onnx");
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, 0));
  const auto cuda = torch::TensorOptions().device(torch::kCUDA).dtype(at::kFloat);
@@ -979,6 +979,7 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
  run(*bbox_backend, false);
  CHECK_FALSE(annotations[0].masks_available);
  CHECK(torch::equal(masks, produced));
+ // CLEANUP-IGNORE: An empty two-slot layout is an explicit shared input to distinct delivery and mask-demand cases, which retain separate artifact lifetimes.
  auto empty_layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog{});
  empty_layout.slots.resize(2, {rfdetr::ClassSlotRole::Unused, {}});
  artifacts.onnx_path = root / "empty.onnx";
@@ -1168,8 +1169,7 @@ TEST_CASE("compiled prediction batch unwind closes shared source custody without
  const FixtureSpec fixture{root.path().string(), "train", 4, 4, 2};
  data::testsupport::create_synthetic_dataset(fixture);
  data::testsupport::compile_existing_fixture(fixture);
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  const data::DatasetLoader::Config loading{
   .compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1U, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)
@@ -1208,8 +1208,7 @@ TEST_CASE("compiled prediction batch unwind closes shared source custody without
     throw PrimaryFailure{};
    } catch (const PrimaryFailure&) { primary_preserved = true; }
    REQUIRE(primary_preserved);
-   CHECK(authority->admission_open() == !unsafe);
-   CHECK(authority->fact().occupancy == (unsafe ? 1U : 0U));
+   mmltk::frameworks::gpu::test_support::check_terminal_occupancy(*authority, unsafe);
    CHECK(authority->fact().reservations == 1U);         // exact compiled stream still belongs to loader
    if (unsafe) CHECK_FALSE(loader->next_batch(batch));  // failed release stopped/joined the live source
    loader->stop_workers();                              // idempotent after failed cleanup; settles normal asynchronous release
@@ -1242,8 +1241,8 @@ TEST_CASE("ONNX metadata survives simplification and same-path prediction rebind
   file.put(0);
  }
  write_prediction_model(model);
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
+ // CLEANUP-IGNORE: The CUDA stream and prediction request are independent owners with scenario-specific lifetimes; the match spans their unrelated setup.
+ const mmltk::testsupport::ScopedTestStream stream_owner(0);
  const auto stream = stream_owner.get();
  rfdetr::PredictRequest request;
  request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
@@ -1315,18 +1314,14 @@ TEST_CASE("ONNX output roles accept explicit producer names without shape guessi
  CHECK(admitted.num_queries == 2);
  CHECK_FALSE(admitted.has_masks);
  CHECK_FALSE(admitted.class_layout);
+ // CLEANUP-IGNORE: Two foreground slots are explicit inputs to distinct output-role mapping and retained descriptor identity cases.
  auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}));
  layout.slots.pop_back();
  const auto companion = std::filesystem::path(path.string() + ".classes.json");
  namespace io = mmltk::common::io;
- {
-  std::ofstream output(companion);
-  output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout, std::vector<rfdetr::RfdetrNamedOutputRole>(roles.begin(), roles.end())});
- }
+ rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout, std::vector<rfdetr::RfdetrNamedOutputRole>(roles.begin(), roles.end())});
  rfdetr::simplify_onnx_model_file(path);
- const auto descriptor = rfdetr::detail::read_class_descriptor(companion);
- CHECK(descriptor.artifact_sha256 == io::sha256_hex(io::sha256_file(path)));
- CHECK(descriptor.layout == layout);
+ const auto descriptor = rfdetr::test_support::checked_class_descriptor_fixture(path, companion, layout);
  CHECK((rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path, descriptor.output_roles)) == descriptor.output_roles));
 }
 TEST_CASE("Same-path ONNX simplification rebinds authoritative companion layout and roles", "[model][rfdetr][layout][onnx]") {
@@ -1340,14 +1335,9 @@ TEST_CASE("Same-path ONNX simplification rebinds authoritative companion layout 
  layout.slots[0].foreground_index = 1;
  layout.slots[1].foreground_index = 0;
  const auto roles = rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path));
- {
-  std::ofstream output(companion);
-  output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout, roles});
- }
+ rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout, roles});
  rfdetr::simplify_onnx_model_file(path);
- const auto descriptor = rfdetr::detail::read_class_descriptor(companion);
- CHECK(descriptor.artifact_sha256 == io::sha256_hex(io::sha256_file(path)));
- CHECK(descriptor.layout == layout);
+ const auto descriptor = rfdetr::test_support::checked_class_descriptor_fixture(path, companion, layout);
  CHECK((descriptor.output_roles == roles));
  const auto info = rfdetr::load_onnx_model_info(path, descriptor.output_roles);
  CHECK(rfdetr::ClassArtifactAdmission(path).Resolve(info.num_classes, info.class_layout) == layout);
@@ -1357,10 +1347,7 @@ TEST_CASE("Same-path ONNX simplification rebinds authoritative companion layout 
   std::ofstream output(path, std::ios::trunc);
   output << "not a protobuf";
  }
- {
-  std::ofstream output(companion);
-  output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout, roles});
- }
+ rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout, roles});
  const auto old_artifact = io::sha256_file(path), old_companion = io::sha256_file(companion);
  CHECK_THROWS(rfdetr::simplify_onnx_model_file(path));
  CHECK(io::sha256_file(path) == old_artifact);
@@ -1404,11 +1391,7 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
  auto layout = rfdetr::native_training_class_layout(data::catalog::ClassCatalog({"person", "ret"}));
  layout.slots.pop_back();
  const auto descriptor = root.path() / "selected.classes.json";
- const auto encoded = rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(source)), layout});
- {
-  std::ofstream output(descriptor);
-  output << encoded;
- }
+ const auto encoded = rfdetr::test_support::write_class_descriptor_fixture(descriptor, {1, io::sha256_hex(io::sha256_file(source)), layout});
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  const auto stream = c10::cuda::getCurrentCUDAStream(0).stream();
  const mmltk::backend::ml::runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream), true};
@@ -1525,10 +1508,7 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
  const auto preserved = io::sha256_file(request.save_engine_path);
  auto unrelated = rfdetr::decode_class_descriptor(encoded);
  unrelated.artifact_sha256 = std::string(64, '0');
- {
-  std::ofstream output(descriptor);
-  output << rfdetr::encode_class_descriptor(unrelated);
- }
+ rfdetr::test_support::write_class_descriptor_fixture(descriptor, unrelated);
  CHECK_THROWS_AS(session.Run(request, command), std::invalid_argument);
  CHECK(io::sha256_file(request.save_engine_path) == preserved);
  CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
@@ -1568,13 +1548,10 @@ TEST_CASE("ONNX inspection completes against its retained descriptor proof", "[m
  const auto path = root.path() / "model.onnx";
  const auto companion = std::filesystem::path(path.string() + ".classes.json");
  write_prediction_model(path, 2, false);
+ // CLEANUP-IGNORE: Two foreground slots are explicit inputs to distinct output-role mapping and retained descriptor identity cases.
  auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}));
  layout.slots.pop_back();
- const auto encoded = rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout});
- {
-  std::ofstream output(companion);
-  output << encoded;
- }
+ const auto encoded = rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout});
  const rfdetr::ClassArtifactAdmission admission(path);
  const auto info = rfdetr::load_onnx_model_info(path, admission.output_roles());
  CHECK(admission.Resolve(info.num_classes, info.class_layout) == layout);
@@ -1925,9 +1902,7 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
  config.num_select = 3;
  const auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"}));
  rfdetr::NativeRfDetrModel model(config, layout);
- std::vector<rfdetr::NormalizedModelStateEntry> entries;
- for (const auto& item : model.named_parameters(true)) entries.push_back({item.key(), item.value().detach()});
- for (const auto& item : model.named_buffers(true)) entries.push_back({item.key(), item.value().detach()});
+ auto entries = rfdetr::collect_module_state(model);
  rfdetr::DecodedNativeModelState checkpoint(std::move(entries));
  rfdetr::ResolvedModelArtifacts artifacts;
  artifacts.config = config;
@@ -1942,8 +1917,7 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
   const std::string pixels(4 * 4 * 3, char{81});
   output.write(pixels.data(), pixels.size());
  }
- REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream;
+ const mmltk::testsupport::ScopedTestStream stream(0);
  rfdetr::PredictRequest request;
  request.weights_path = weights;
  request.preset_name = config.preset_name;
@@ -2072,9 +2046,7 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
   config.num_queries = 3;
   config.num_select = 3;
   rfdetr::NativeRfDetrModel model(config, layout);
-  std::vector<rfdetr::NormalizedModelStateEntry> entries;
-  for (const auto& item : model.named_parameters(true)) entries.push_back({item.key(), item.value().detach()});
-  for (const auto& item : model.named_buffers(true)) entries.push_back({item.key(), item.value().detach()});
+  auto entries = rfdetr::collect_module_state(model);
   const auto initialization = rfdetr::native_state_fingerprint(entries);
   rfdetr::ResolvedModelArtifacts artifacts;
   artifacts.config = config;

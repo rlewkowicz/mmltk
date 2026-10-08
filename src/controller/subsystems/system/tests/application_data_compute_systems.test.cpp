@@ -54,6 +54,15 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
+std::ifstream finish_training_diagnostics(services::DiagnosticsClient& diagnostics, const std::filesystem::path& path, bool enabled) {
+ diagnostics.close();
+ diagnostics.wait_closed();
+ if (!enabled) {
+  CHECK_FALSE(std::filesystem::exists(path));
+  return {};
+ }
+ return std::ifstream{path};
+}
 TEST_CASE("production direct adapters reject unavailable physical dependencies", "[controller][systems][production-adapters]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-production-adapters");
  SettingsSystem settings;
@@ -85,6 +94,7 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
   script << "#!/bin/sh\nMMLTK_TRAIN_FIXTURE_FAILURE=" << (multiple ? "oom-multiple" : "oom-single") << " exec \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\"\n";
  }
  std::filesystem::permissions(executable, std::filesystem::perms::owner_all);
+ // CLEANUP-IGNORE: Diagnostic client and runtime lifetimes are explicit inputs to distinct child-OOM and preparation-failure reporting scenarios.
  const auto diagnostic_path = root / "training.jsonl";
  services::DiagnosticsClient diagnostics = enabled ? services::DiagnosticsClient{diagnostic_path} : services::DiagnosticsClient{};
  services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer()};
@@ -113,18 +123,12 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  CHECK(terminal.detail.find("Reduce batch size or training lanes") != std::string::npos);
  CHECK(terminal.output.empty());
  CHECK(diagnostics.counters().accepted == (enabled ? (multiple ? 4U : 3U) : 0U));
- diagnostics.close();
- diagnostics.wait_closed();
- if (!enabled) {
-  CHECK_FALSE(std::filesystem::exists(diagnostic_path));
-  return;
- }
- std::ifstream input{diagnostic_path};
+ auto input = finish_training_diagnostics(diagnostics, diagnostic_path, enabled);
+ if (!enabled) return;
  std::string line;
  const auto devices = multiple ? std::vector<int>{3, 1} : std::vector<int>{7};
  for (std::size_t rank = 0U; rank < devices.size(); ++rank) {
-  REQUIRE(static_cast<bool>(std::getline(input, line)));
-  const auto record = nlohmann::json::parse(line);
+  const auto record = mmltk::testsupport::read_json_line(input);
   CHECK(record["event"] == "workflow.gpu_execution");
   CHECK(record["participant"] == "train");
   CHECK(record["sequence"] == 42U);
@@ -150,6 +154,7 @@ TEST_CASE("training operation reports preparation and native failures exactly on
  if (failure_stage != 0) fixture.PrepareModel();
  auto [settings, dataset, model] = fixture.systems();
  DatasetSystem physical_dataset{settings, [] { return std::make_unique<ArtifactDatasetRuntime>(); }};
+ // CLEANUP-IGNORE: Diagnostic client and runtime lifetimes are explicit inputs to distinct child-OOM and preparation-failure reporting scenarios.
  const auto diagnostic_path = root / "training.jsonl";
  services::DiagnosticsClient diagnostics = tracing ? services::DiagnosticsClient{diagnostic_path} : services::DiagnosticsClient{};
  services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer()};
@@ -190,22 +195,15 @@ TEST_CASE("training operation reports preparation and native failures exactly on
  REQUIRE(decoded);
  CHECK(*decoded == event.value);
  CHECK(diagnostics.counters().accepted == (tracing ? 2U : 0U));
- diagnostics.close();
- diagnostics.wait_closed();
- if (!tracing) {
-  CHECK_FALSE(std::filesystem::exists(diagnostic_path));
-  return;
- }
- std::ifstream input{diagnostic_path};
+ auto input = finish_training_diagnostics(diagnostics, diagnostic_path, tracing);
+ if (!tracing) return;
  std::string line;
- REQUIRE(static_cast<bool>(std::getline(input, line)));
- const auto inspected = nlohmann::json::parse(line);
+ const auto inspected = mmltk::testsupport::read_json_line(input);
  CHECK(inspected["event"] == "training.inputs");
  CHECK(inspected["sequence"] == terminal.generation);
  CHECK(inspected["message"].get<std::string>().find("requested_resolution=") != std::string::npos);
  CHECK(inspected["message"].get<std::string>().find("prepared_resolution=") != std::string::npos);
- REQUIRE(static_cast<bool>(std::getline(input, line)));
- const auto failure = nlohmann::json::parse(line);
+ const auto failure = mmltk::testsupport::read_json_line(input);
  CHECK(failure["event"] == "training.operation.failed");
  CHECK(failure["sequence"] == terminal.generation);
  CHECK(failure["value"] == snapshot.revision);
@@ -215,8 +213,7 @@ TEST_CASE("training operation reports preparation and native failures exactly on
 TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and lazy runtime reconstruction", "[controller][systems][compute]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-compute");
  ApplicationDataFixture fixture{root};
- fixture.PrepareModel(contracts::FeatureId::Validate);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Validate);
  auto gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::atomic_size_t constructions = 0U;
  TerminalSequence<ValidationSystem::event_type> terminals;
@@ -230,6 +227,7 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
   else if (!std::get<ValidationChanged>(event).snapshot.operation.active)
    terminals.Publish(std::move(event));
  }, [](int, int) { return DirectComputeConfiguration{}; }};
+ // CLEANUP-IGNORE: These are different systems and failure lifetimes; each must independently demonstrate rejection of concurrent Start.
  static_cast<void>(validation.Start({}));
  // CLEANUP-IGNORE: Validation Busy evidence is independent from file-dialog and dataset admission evidence.
  CHECK_THROWS_AS(validation.Start({}), contracts::BusyError);
@@ -331,8 +329,7 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
  CAPTURE(invalid_first, kind);
  const auto root = mmltk::testsupport::make_temp_root("predict-materialized-routing");
  ApplicationDataFixture fixture{root};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
  const auto field = kind == contracts::SourceKind::CompiledDataset ? "workflows.predict.source.compiled_path"
                     : kind == contracts::SourceKind::SingleImage   ? "workflows.predict.source.single_image_path"
                                                                    : "workflows.predict.source.video_file_path";
@@ -347,8 +344,7 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
   static_cast<void>(settings.Update(std::move(update)));
  };
  select((root / "first.input").string());
- auto gate = std::make_shared<mmltk::testsupport::StopGate>();
- gate->Release();
+ auto gate = std::make_shared<mmltk::testsupport::StopGate>(true);
  auto index = std::make_shared<std::atomic_int64_t>(0);
  std::atomic_size_t constructions = 0U;
  std::atomic<PresentationSystem*> route = nullptr;
@@ -428,10 +424,9 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
 }
 TEST_CASE("Predict compact publication and source observation do not reread retained labels", "[controller][systems][predict][presentation]") {
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-compact-progress")};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
- auto begin = std::make_shared<mmltk::testsupport::StopGate>();
- begin->Release();
+ // CLEANUP-IGNORE: Model preparation and the existing StopGate fixture precede different prediction-custody and publication scenarios.
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
+ auto begin = std::make_shared<mmltk::testsupport::StopGate>(true);
  auto after_image = std::make_shared<mmltk::testsupport::StopGate>();
  std::atomic<PresentationSystem*> route = nullptr;
  std::atomic_bool scalar_sent = false;
@@ -493,8 +488,7 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
 TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "[controller][systems][compute]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-export-predict");
  ApplicationDataFixture fixture{root};
- fixture.PrepareModel(contracts::FeatureId::Export);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Export);
  auto export_gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::promise<ComputeSystemEvent> export_terminal;
  ExportSystem export_system{settings, dataset, model, [export_gate](DirectComputeConfiguration) {
@@ -502,6 +496,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
  }, [&](ComputeSystemEvent event) {
   if (const auto* changed = std::get_if<ComputeChanged>(&event); changed && !changed->snapshot.active) export_terminal.set_value(std::move(event));
  }, [](int, int) { return DirectComputeConfiguration{}; }};
+ // CLEANUP-IGNORE: These are different systems and failure lifetimes; each must independently demonstrate rejection of concurrent Start.
  static_cast<void>(export_system.Start({}));
  CHECK_THROWS_AS(export_system.Start({}), contracts::BusyError);
  static_cast<void>(export_system.Stop());
@@ -666,8 +661,7 @@ private:
 TEST_CASE("validation reserves after admission and retains the captured directory through settings edits and cancellation", "[controller][systems][output]") {
  mmltk::testsupport::ScopedTempDir root{"validation-output-capture"};
  ApplicationDataFixture fixture{root.path()};
- fixture.PrepareModel(contracts::FeatureId::Validate);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Validate);
  const auto initial = settings.snapshot().settings_state.workflows.validate.output.directory;
  CHECK_FALSE(std::filesystem::exists(initial));
  std::promise<std::filesystem::path> admitted;
@@ -676,6 +670,7 @@ TEST_CASE("validation reserves after admission and retains the captured director
  ValidationSystem validation{settings, dataset, model, [&](DirectComputeConfiguration) { return std::make_unique<CapturedOutputValidation>(admitted, gate); }, [&](ValidationSystem::event_type event) {
   if (const auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active) mmltk::testsupport::release_test_promise(settled);
  }, [](int, int) { return DirectComputeConfiguration{}; }};
+ // CLEANUP-IGNORE: The match only spans an operation start and future binding from unrelated validation and export workflows.
  static_cast<void>(validation.Start({}));
  auto future = admitted.get_future();
  const auto report = mmltk::testsupport::await_test_future(future, "admitted validation output");
@@ -709,13 +704,14 @@ public:
 };
 TEST_CASE("export keeps committed artifacts visible when later settlement fails", "[controller][systems][output]") {
  mmltk::testsupport::ScopedTempDir root{"export-published-output"};
+ // CLEANUP-IGNORE: The shared application-data fixture establishes independent export owners for committed and unpublished output failure paths.
  ApplicationDataFixture fixture{root.path()};
- fixture.PrepareModel(contracts::FeatureId::Export);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Export);
  std::promise<contracts::ComputeUiState> settled;
  ExportSystem exporter{settings, dataset, model, [](DirectComputeConfiguration) { return std::make_unique<PublishedThenFailedExport>(); }, [&](ComputeSystemEvent event) {
   if (const auto* changed = std::get_if<ComputeChanged>(&event); changed && !changed->snapshot.active) settled.set_value(changed->snapshot);
  }, [](int, int) { return DirectComputeConfiguration{}; }};
+ // CLEANUP-IGNORE: The match only spans an operation start and future binding from unrelated validation and export workflows.
  static_cast<void>(exporter.Start({}));
  auto future = settled.get_future();
  const auto result = mmltk::testsupport::await_test_future(future, "export output settlement");
@@ -746,9 +742,9 @@ private:
 };
 TEST_CASE("export stopped during native work does not advertise an uncommitted artifact", "[controller][systems][output]") {
  mmltk::testsupport::ScopedTempDir root{"export-unpublished-output"};
+ // CLEANUP-IGNORE: The shared application-data fixture establishes independent export owners for committed and unpublished output failure paths.
  ApplicationDataFixture fixture{root.path()};
- fixture.PrepareModel(contracts::FeatureId::Export);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Export);
  std::promise<void> started;
  std::promise<contracts::ComputeUiState> settled;
  ExportSystem exporter{settings, dataset, model, [&](DirectComputeConfiguration) { return std::make_unique<CancelBeforePublicationExport>(started); }, [&](ComputeSystemEvent event) {
@@ -859,6 +855,7 @@ TEST_CASE("export dependency chain publishes selected formats and settles tempor
 }
 TEST_CASE("export rejects empty format selection before native preparation or output reservation", "[controller][systems][export]") {
  mmltk::testsupport::ScopedTempDir root{"export-empty-formats"};
+ // CLEANUP-IGNORE: Application fixture construction and systems access already have one owner; each scenario configures distinct downstream behavior.
  ApplicationDataFixture fixture{root.path()};
  auto [settings, dataset, model] = fixture.systems();
  const auto generation = model.snapshot().generation;

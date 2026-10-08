@@ -1,10 +1,19 @@
 #pragma once
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/numa_topology.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
+inline void move_required_output_tensors(OutputLayer& layer, const torch::Device& device) {
+ layer.for_each_required_tensor([&](torch::Tensor& tensor) { tensor = tensor.to(device); });
+}
+inline void configure_cuda_training_model(NativeRfDetrModel& model) {
+ model.to(torch::Device(torch::kCUDA));
+ model.train(true);
+ model.set_force_pytorch_deformable_attn(true);
+}
 class MatcherExecutionFixture final {
 private:
  static mmltk::common::system::ExecutionPlacement Placement() {

@@ -1,3 +1,4 @@
+#include "src/common/io/poll.h"
 #include "src/controller/presentation/annotation_palette.h"
 #include "src/common/math/deterministic_sampling.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
@@ -302,8 +303,7 @@ private:
    {.fd = command_.get(), .events = POLLIN | POLLHUP | POLLERR, .revents = 0},
    {.fd = stop_.get(), .events = POLLIN | POLLHUP | POLLERR, .revents = 0},
   }};
-  int ready = -1;
-  do { ready = ::poll(descriptors.data(), descriptors.size(), -1); } while (ready < 0 && errno == EINTR);
+  const int ready = mmltk::common::io::poll_descriptors(descriptors);
   if (ready <= 0 || descriptors[1].revents != 0) return {};
   if ((descriptors[0].revents & POLLIN) == 0) return {};
   std::uint8_t command = 0U;

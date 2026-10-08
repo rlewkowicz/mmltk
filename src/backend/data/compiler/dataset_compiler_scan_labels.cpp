@@ -24,6 +24,9 @@ using mmltk::common::math::checked_add;
 using mmltk::common::math::checked_cast;
 using mmltk::common::math::checked_multiply;
 using json = nlohmann::json;
+void check_compilation_cancelled(mmltk::common::concurrency::CancellationObservation cancellation) {
+ if (cancellation.requested()) throw std::runtime_error("dataset compilation cancelled");
+}
 namespace {
 std::filesystem::path numbered_path(const std::filesystem::path& dir, uint32_t one_based_index, const char* extension) { return dir / std::format("{:06}{}", one_based_index, extension); }
 uint32_t count_sequential_images(const std::filesystem::path& split_dir, mmltk::common::concurrency::CancellationObservation cancel_requested) {
@@ -34,7 +37,7 @@ uint32_t count_sequential_images(const std::filesystem::path& split_dir, mmltk::
  uint32_t max_png_index = 0U;
  uint32_t max_jsonl_index = 0U;
  for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(split_dir)) {
-  if (cancel_requested.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
+  compiler_internal::check_compilation_cancelled(cancel_requested);
   const std::string extension = entry.path().extension().string();
   if (extension != ".png" && extension != ".jsonl") { continue; }
   const std::string stem = entry.path().stem().string();
@@ -62,10 +65,7 @@ uint32_t count_sequential_images(const std::filesystem::path& split_dir, mmltk::
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".png"); }
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".jsonl"); }
 DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits, const mmltk::common::concurrency::CancellationObservation cancellation) {
- const auto check_cancelled = [&] {
-  if (cancellation.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
- };
- check_cancelled();
+ compiler_internal::check_compilation_cancelled(cancellation);
  const std::filesystem::path categories_path = std::filesystem::path(config.source_dir) / "categories.json";
  std::ifstream file(categories_path);
  if (!file.is_open()) { throw std::runtime_error("cannot open categories file: " + categories_path.string()); }
@@ -79,7 +79,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  parsed_categories.reserve(categories["classes"].size());
  int min_raw_id = std::numeric_limits<int>::max();
  for (const auto& category : categories["classes"]) {
-  check_cancelled();
+  compiler_internal::check_compilation_cancelled(cancellation);
   ParsedCategory parsed;
   parsed.name = category["name"].get<std::string>();
   const auto& id = category["id"];
@@ -96,7 +96,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  std::vector<std::string> ordered_names(parsed_categories.size());
  std::array<bool, MAX_CLASSES> seen_ids{};
  for (const auto& category : parsed_categories) {
-  check_cancelled();
+  compiler_internal::check_compilation_cancelled(cancellation);
   const int normalized_id = category.raw_id - class_id_base;
   if (normalized_id < 0 || normalized_id >= static_cast<int>(ordered_names.size())) { throw std::runtime_error("class id out of supported range in categories.json"); }
   const auto class_id = static_cast<uint8_t>(normalized_id);
@@ -107,7 +107,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  scan.class_catalog = catalog::ClassCatalog(std::move(ordered_names), COMPILED_CLASS_NAME_CAPACITY);
  scan.splits.reserve(splits.size());
  for (const std::string& split : splits) {
-  check_cancelled();
+  compiler_internal::check_compilation_cancelled(cancellation);
   if (split.empty()) { throw std::runtime_error("dataset split name must not be empty"); }
   uint32_t num_images = 0U;
   if (categories.contains("splits") && categories["splits"].contains(split)) {
@@ -119,7 +119,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
   }
   scan.splits.push_back(DatasetCompileSplitPlan{split, num_images});
  }
- check_cancelled();
+ compiler_internal::check_compilation_cancelled(cancellation);
  return scan;
 }
 namespace {
@@ -432,7 +432,7 @@ void DirectoryLabels::begin(std::uint32_t image_index, detail::CompileAllowance 
 bool DirectoryLabels::step(mmltk::common::concurrency::CancellationObservation cancellation) {
  auto& value = *impl_;
  for (std::size_t records = 0; records < 32; ++records) {
-  if (cancellation.requested()) throw std::runtime_error("dataset compilation cancelled");
+  compiler_internal::check_compilation_cancelled(cancellation);
   if (!value.record_active) {
    if (value.cursor == value.input.size()) {
     set_annotation_extent(value.result, value.labels, value.required_runs, value.image.string(), value.output.capacity());

@@ -572,12 +572,15 @@ struct CompileExecution::Impl {
   job->completion = std::move(completion);
   return job;
  }
+ void index_demand(Job& job) {
+  job.demand = Demand{.resources = job.task.resources, .parent = job.task.parent, .finite_consumer = job.task.finite_consumer};
+  if (!job.task.allowance && admission->oversized(job.task.resources)) exceptional.append(job);
+ }
  void enqueue(const std::shared_ptr<Job>& job) {
   ready[static_cast<std::size_t>(job->task.kind)].jobs.append(*job);
   if (observer.demand().aggregates) job->ready_at = std::chrono::steady_clock::now();
   park(*job, CompileParkReason::None);
-  job->demand = Demand{.resources = job->task.resources, .parent = job->task.parent, .finite_consumer = job->task.finite_consumer};
-  if (!job->task.allowance && admission->oversized(job->task.resources)) exceptional.append(*job);
+  index_demand(*job);
  }
  void recycle(const std::shared_ptr<Job>& job) noexcept {
   unindex(*job);
@@ -1228,6 +1231,7 @@ CompileExecution::Producer& CompileExecution::Producer::operator=(Producer&& oth
  return *this;
 }
 void CompileExecution::Producer::close() noexcept {
+ // CLEANUP-IGNORE: This release prefix transfers three different resource owners; producer, service-lane, and file-record retirement have distinct locked state transitions.
  if (!owner_) return;
  auto owner = std::move(owner_);
  const std::lock_guard lock(owner->admission->mutex);
@@ -1356,6 +1360,7 @@ CompileExecution::Continuation::~Continuation() { release(); }
 CompileExecution::Continuation::Continuation(Continuation&& other) noexcept : owner_(std::move(other.owner_)), completion_(std::move(other.completion_)), allowance_(std::move(other.allowance_)) {}
 CompileExecution::Continuation& CompileExecution::Continuation::operator=(Continuation&& other) noexcept {
  if (this != &other) {
+  // CLEANUP-IGNORE: These move assignments retire different resources and transfer different remaining members; the shared prefix is not a common ownership algorithm.
   release();
   owner_ = std::move(other.owner_);
   completion_ = std::move(other.completion_);
@@ -1483,8 +1488,7 @@ std::optional<CompileExecution::Completion> CompileExecution::Continuation::try_
  job->completion = completion;
  job->retained = false;
  owner->ready[static_cast<std::size_t>(job->task.kind)].jobs.append(*job);
- job->demand = Demand{.resources = job->task.resources, .parent = job->task.parent, .finite_consumer = job->task.finite_consumer};
- if (!job->task.allowance && owner->admission->oversized(job->task.resources)) owner->exceptional.append(*job);
+ owner->index_demand(*job);
  owner->park(*job, CompileParkReason::None);
  if (owner->observer.demand().aggregates) {
   job->ready_at = std::chrono::steady_clock::now();
@@ -2171,6 +2175,7 @@ CompileExecution::ServiceGrant::~ServiceGrant() { release(); }
 CompileExecution::ServiceGrant::ServiceGrant(ServiceGrant&& other) noexcept : owner_(std::move(other.owner_)), class_(other.class_), lane_(other.lane_) {}
 CompileExecution::ServiceGrant& CompileExecution::ServiceGrant::operator=(ServiceGrant&& other) noexcept {
  if (this != &other) {
+  // CLEANUP-IGNORE: These move assignments retire different resources and transfer different remaining members; the shared prefix is not a common ownership algorithm.
   release();
   owner_ = std::move(other.owner_);
   class_ = other.class_;
@@ -2179,6 +2184,7 @@ CompileExecution::ServiceGrant& CompileExecution::ServiceGrant::operator=(Servic
  return *this;
 }
 void CompileExecution::ServiceGrant::release() noexcept {
+ // CLEANUP-IGNORE: This release prefix transfers three different resource owners; producer, service-lane, and file-record retirement have distinct locked state transitions.
  if (!owner_) return;
  auto owner = std::move(owner_);
  const std::lock_guard lock(owner->admission->mutex);

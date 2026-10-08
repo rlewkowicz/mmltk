@@ -130,6 +130,12 @@ int64_t checked_output_targets(const torch::Tensor& output, const torch::Tensor&
  TORCH_CHECK(output_targets <= checked_extent({batch, max_targets}, std::numeric_limits<int64_t>::max(), "matcher target extent"), "matcher compact target extent exceeds padded layout");
  return output_targets;
 }
+void check_matcher_offsets(const torch::Tensor& output, const torch::Tensor& target_offsets, const torch::Tensor& target_counts, const torch::Tensor& output_offsets) {
+ check_matcher_tensor(target_offsets, torch::kInt64, 1, "matcher target offsets");
+ check_matcher_tensor(target_counts, torch::kInt64, 1, "matcher target counts");
+ check_matcher_tensor(output_offsets, torch::kInt64, 1, "matcher output offsets");
+ TORCH_CHECK(output_offsets.device() == output.device(), "matcher output offsets must share the output device");
+}
 }  // namespace
 float checked_cost_coefficient(const double value, const char* name) {
  TORCH_CHECK(std::isfinite(value) && std::abs(value) <= static_cast<double>(std::numeric_limits<float>::max()), name, " must be finite and representable as float32");
@@ -143,10 +149,7 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
  check_matcher_floating_tensor(pred_boxes, 3, "matcher boxes");
  check_matcher_tensor(target_labels, torch::kInt64, 1, "matcher target labels");
  check_matcher_tensor(target_boxes, torch::kFloat32, 2, "matcher target boxes");
- check_matcher_tensor(target_offsets, torch::kInt64, 1, "matcher target offsets");
- check_matcher_tensor(target_counts, torch::kInt64, 1, "matcher target counts");
- check_matcher_tensor(output_offsets, torch::kInt64, 1, "matcher output offsets");
- TORCH_CHECK(output_offsets.device() == output.device(), "matcher output offsets must share the output device");
+ check_matcher_offsets(output, target_offsets, target_counts, output_offsets);
  TORCH_CHECK(output.device() == pred_logits.device() && output.device() == pred_boxes.device() && output.device() == target_labels.device() && output.device() == target_boxes.device() &&
               output.device() == target_offsets.device() && output.device() == target_counts.device(),
   "matcher CUDA tensors must share one device");
@@ -189,10 +192,7 @@ void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tens
  check_matcher_tensor(output, torch::kFloat32, 1, "matcher mask cost output");
  check_matcher_floating_tensor(pred_mask_logits, 3, "matcher sampled mask logits");
  check_matcher_tensor(target_masks, torch::kFloat32, 2, "matcher sampled target masks");
- check_matcher_tensor(target_offsets, torch::kInt64, 1, "matcher target offsets");
- check_matcher_tensor(target_counts, torch::kInt64, 1, "matcher target counts");
- check_matcher_tensor(output_offsets, torch::kInt64, 1, "matcher output offsets");
- TORCH_CHECK(output_offsets.device() == output.device(), "matcher output offsets must share the output device");
+ check_matcher_offsets(output, target_offsets, target_counts, output_offsets);
  TORCH_CHECK(output.device() == pred_mask_logits.device() && output.device() == target_masks.device() && output.device() == target_offsets.device() && output.device() == target_counts.device(),
   "matcher mask CUDA tensors must share one device");
  TORCH_CHECK(padded_queries >= pred_mask_logits.size(1), "matcher mask output shape does not cover predictions");

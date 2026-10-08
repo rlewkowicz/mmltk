@@ -26,7 +26,9 @@ extern char** environ;
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <span>
 #include "cuda_vulkan_fill.h"
+#include "../../common/io/socket_message.h"
 static void check(CUresult result, const char* operation) {
  if (result == CUDA_SUCCESS) return;
  const char* text = "unknown";
@@ -57,6 +59,14 @@ struct Fd {
  Fd(const Fd&) = delete;
  Fd& operator=(const Fd&) = delete;
 };
+static msghdr descriptor_message(iovec& io, std::span<char> control = {}) {
+ msghdr message{};
+ message.msg_iov = &io;
+ message.msg_iovlen = 1;
+ message.msg_control = control.empty() ? nullptr : control.data();
+ message.msg_controllen = control.size();
+ return message;
+}
 // Exercise dup/SCM_RIGHTS with an actual receiving descriptor.
 static void transfer_fd(int original, Fd& received) {
  Fd sender, receiver, duplicate;
@@ -69,20 +79,12 @@ static void transfer_fd(int original, Fd& received) {
  char byte = 0;
  iovec io{&byte, 1};
  alignas(cmsghdr) std::array<char, CMSG_SPACE(sizeof(int))> control{};
- msghdr message{};
- message.msg_iov = &io;
- message.msg_iovlen = 1;
- message.msg_control = control.data();
- message.msg_controllen = control.size();
- auto* header = CMSG_FIRSTHDR(&message);
- header->cmsg_level = SOL_SOCKET;
- header->cmsg_type = SCM_RIGHTS;
- header->cmsg_len = CMSG_LEN(sizeof(int));
- std::memcpy(CMSG_DATA(header), &duplicate.value, sizeof(int));
+ auto message = descriptor_message(io, control);
+ mmltk::common::io::write_socket_descriptors(*CMSG_FIRSTHDR(&message), std::span{&duplicate.value, 1U});
  if (sendmsg(sender.value, &message, MSG_NOSIGNAL) != 1) throw std::runtime_error("sendmsg");
  control.fill(0);
  if (recvmsg(receiver.value, &message, MSG_CMSG_CLOEXEC) != 1) throw std::runtime_error("recvmsg");
- header = CMSG_FIRSTHDR(&message);
+ auto* header = CMSG_FIRSTHDR(&message);
  if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(sizeof(int)) || message.msg_flags & (MSG_CTRUNC | MSG_TRUNC))
   throw std::runtime_error("invalid SCM_RIGHTS receipt");
  std::memcpy(&received.value, CMSG_DATA(header), sizeof(int));
@@ -615,18 +617,10 @@ struct Packet {
 static void send_packet(int socket, const Packet& packet, int memory = -1, int semaphore = -1) {
  iovec io{const_cast<Packet*>(&packet), sizeof(packet)};
  alignas(cmsghdr) std::array<char, CMSG_SPACE(2 * sizeof(int))> control{};
- msghdr message{};
- message.msg_iov = &io;
- message.msg_iovlen = 1;
+ auto message = descriptor_message(io, memory >= 0 ? std::span<char>{control} : std::span<char>{});
  if (memory >= 0) {
-  message.msg_control = control.data();
-  message.msg_controllen = control.size();
-  auto* header = CMSG_FIRSTHDR(&message);
-  header->cmsg_level = SOL_SOCKET;
-  header->cmsg_type = SCM_RIGHTS;
-  header->cmsg_len = CMSG_LEN(2 * sizeof(int));
   const int descriptors[]{memory, semaphore};
-  std::memcpy(CMSG_DATA(header), descriptors, sizeof(descriptors));
+  mmltk::common::io::write_socket_descriptors(*CMSG_FIRSTHDR(&message), descriptors);
  }
  ssize_t sent;
  do { sent = sendmsg(socket, &message, MSG_NOSIGNAL); } while (sent < 0 && errno == EINTR);
@@ -636,11 +630,7 @@ static Packet receive_packet(int socket, Operation expected, Fd* memory = nullpt
  Packet packet{};
  iovec io{&packet, sizeof(packet)};
  alignas(cmsghdr) std::array<char, CMSG_SPACE(2 * sizeof(int))> control{};
- msghdr message{};
- message.msg_iov = &io;
- message.msg_iovlen = 1;
- message.msg_control = control.data();
- message.msg_controllen = control.size();
+ auto message = descriptor_message(io, control);
  ssize_t received;
  do { received = recvmsg(socket, &message, MSG_CMSG_CLOEXEC); } while (received < 0 && errno == EINTR);
  Fd first, second;

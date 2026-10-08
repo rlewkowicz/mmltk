@@ -378,6 +378,11 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
 }
 // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
 namespace {
+void record_profile_duration(EvaluationProfileRecord* profile, std::atomic<std::uint64_t> EvaluationProfileRecord::* counter, const std::chrono::steady_clock::time_point started) {
+ if (profile == nullptr) return;
+ const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
+ (profile->*counter).fetch_add(static_cast<std::uint64_t>(elapsed.count()), std::memory_order_relaxed);
+}
 void synchronize_staged_prediction_batch(StagedPredictionBatch& staged, EvaluationProfileRecord* profile) {
  if (!staged.lease.buffers || staged.lease.buffers->ready_event == nullptr) { throw std::runtime_error("encoded prediction batch is missing its staging event"); }
  PinnedPredictionBuffers& buffers = *staged.lease.buffers;
@@ -387,10 +392,7 @@ void synchronize_staged_prediction_batch(StagedPredictionBatch& staged, Evaluati
  const auto started = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
  ensure_cuda_ok(cudaEventSynchronize(buffers.ready_event), "cudaEventSynchronize for prediction staging slot");
  buffers.transition(PredictionSlotState::D2HPending, PredictionSlotState::CpuMatching, "prediction CPU consumption");
- if (profile != nullptr) {
-  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
-  profile->d2h_wait_nanoseconds.fetch_add(static_cast<uint64_t>(elapsed.count()), std::memory_order_relaxed);
- }
+ record_profile_duration(profile, &EvaluationProfileRecord::d2h_wait_nanoseconds, started);
  staged.pending_gpu = {};
 }
 PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged, const size_t image_index, EvaluationProfileRecord* profile, const EvaluationDatasetOwner* evaluation_dataset) {
@@ -428,8 +430,7 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
   const auto match_started = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   result.evaluation_matches = evaluation_dataset->match_predictions(result.dataset_index, bbox_view, mask_view, staged.max_dets_per_image);
   if (profile != nullptr) {
-   const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - match_started);
-   profile->cpu_match_nanoseconds.fetch_add(static_cast<std::uint64_t>(elapsed.count()), std::memory_order_relaxed);
+   record_profile_duration(profile, &EvaluationProfileRecord::cpu_match_nanoseconds, match_started);
    profile->iou_candidate_count.fetch_add(result.evaluation_matches->bbox_iou_candidate_count + result.evaluation_matches->mask_iou_candidate_count, std::memory_order_relaxed);
    profile->mask_iou_candidate_count.fetch_add(result.evaluation_matches->mask_iou_candidate_count, std::memory_order_relaxed);
    if (mask_view) profile->mask_task_count.fetch_add(1U, std::memory_order_relaxed);
@@ -453,10 +454,7 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
   }
  }
  result.predictions = std::move(selected.predictions);
- if (profile != nullptr) {
-  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
-  profile->cpu_encode_nanoseconds.fetch_add(static_cast<uint64_t>(elapsed.count()), std::memory_order_relaxed);
- }
+ record_profile_duration(profile, &EvaluationProfileRecord::cpu_encode_nanoseconds, started);
  return result;
 }
 }  // namespace

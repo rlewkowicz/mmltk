@@ -16,6 +16,7 @@ namespace {
 }
 [[nodiscard]] bool publish_entry(const int descriptor) noexcept {
  const std::uint64_t one = 1U;
+ // CLEANUP-IGNORE: The external fixture requires a physical eventfd write; production wakeup separately accepts an already saturated counter.
  ssize_t written = -1;
  do { written = ::write(descriptor, &one, sizeof(one)); } while (written < 0 && errno == EINTR);
  return written == static_cast<ssize_t>(sizeof(one));

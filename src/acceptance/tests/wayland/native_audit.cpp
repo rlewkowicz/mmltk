@@ -602,8 +602,7 @@ auto NativeAudit::failure_blocker() const noexcept -> std::string_view {
   std::pair{interaction_rejected, std::string_view{"browser interaction rejected"}},
   std::pair{causal_inconsistent, causal_failure.empty() ? std::string_view{"causal evidence inconsistency"} : causal_failure},
  };
- const auto blocker = std::ranges::find_if(checks, [](const auto& check) { return check.first; });
- return blocker == checks.end() ? std::string_view{} : blocker->second;
+ return first_blocker(checks);
 }
 auto NativeAudit::active_peer() const noexcept -> bool { return peer_open_count == peer_close_count + 1U; }
 }  // namespace mmltk::acceptance::wayland

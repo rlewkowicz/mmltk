@@ -57,6 +57,11 @@ torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& reque
                                                                                     .training_attempt_id = "attempt",
                                                                                     .training_original_descriptor = "original.json"}));
 }
+torch::serialize::InputArchive weights_only_fixture() {
+ torch::serialize::OutputArchive weights;
+ mmltk::backend::ml::serialization::write_string(weights, "source_kind", "weights-only");
+ return r::testsupport::checkpoint_input(weights);
+}
 void test_current_continuation_required_fields() {
  auto source = continuation_fixture(saved_request());
  const auto loaded = r::detail::read_training_continuation(source);
@@ -87,10 +92,16 @@ void test_current_continuation_required_fields() {
   auto input = r::testsupport::checkpoint_input(malformed);
   REQUIRE_THROWS(r::detail::read_training_continuation(input));
  }
- torch::serialize::OutputArchive weights;
- mmltk::backend::ml::serialization::write_string(weights, "source_kind", "weights-only");
- auto input = r::testsupport::checkpoint_input(weights);
+ auto input = weights_only_fixture();
  REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
+}
+template <class Value>
+auto corrupted_continuation(const std::string& key, Value value) {
+ auto source = continuation_fixture(saved_request());
+ torch::serialize::OutputArchive output;
+ r::testsupport::copy_checkpoint_archive(source, output, key);
+ output.write(key, std::move(value));
+ return r::testsupport::checkpoint_input(output);
 }
 void test_current_continuation_scalar_boundaries() {
  const auto invalid = std::to_array<std::pair<std::string, c10::IValue>>(
@@ -99,20 +110,12 @@ void test_current_continuation_scalar_boundaries() {
    {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}}, {"training_attempt_id", std::string{}}, {"training_attempt_id", std::string(65, 'a')},
    {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}});
  for (const auto& [key, value] : invalid) {
-  auto source = continuation_fixture(saved_request());
-  torch::serialize::OutputArchive output;
-  r::testsupport::copy_checkpoint_archive(source, output, key);
-  output.write(key, value);
-  auto input = r::testsupport::checkpoint_input(output);
+  auto input = corrupted_continuation(key, value);
   INFO(key);
   REQUIRE_THROWS(r::detail::read_training_continuation(input));
  }
  for (const auto* key : {"training_configuration_cbor", "training_supervision_config_cbor"}) {
-  auto source = continuation_fixture(saved_request());
-  torch::serialize::OutputArchive output;
-  r::testsupport::copy_checkpoint_archive(source, output, key);
-  output.write(key, torch::zeros({1024 * 1024}, torch::kUInt8));
-  auto input = r::testsupport::checkpoint_input(output);
+  auto input = corrupted_continuation(key, torch::zeros({1024 * 1024}, torch::kUInt8));
   REQUIRE_THROWS(r::detail::read_training_continuation(input));
  }
  auto supervised = saved_request();
@@ -210,6 +213,7 @@ TEST_CASE("Continuation preserves held SGD values logical offsets donor identiti
  auto base = continuation_fixture(request);
  auto values = r::detail::read_training_continuation(base)->values;
  r::TrainingSchedule schedule(request.recipe, {.01, .01}, {r::TrainingGroupRole::Bias, r::TrainingGroupRole::Ordinary}, 4, 4, 2);
+ // CLEANUP-IGNORE: Schedule and continuation tests independently exercise the first epoch/microbatch boundary before different progression and restore checks.
  schedule.begin_epoch(0);
  schedule.consume_microbatch();
  schedule.consume_microbatch();
@@ -360,9 +364,7 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  invalid.recipe.warmup_epochs = 2.0;
  REQUIRE_THROWS(r::detail::require_active_training_continuation(*continuation, invalid));
  REQUIRE(admitted.artifacts.config.cls_loss_coef == 7.3);
- torch::serialize::OutputArchive weights_only;
- mmltk::backend::ml::serialization::write_string(weights_only, "source_kind", "weights-only");
- auto input = r::testsupport::checkpoint_input(weights_only);
+ auto input = weights_only_fixture();
  REQUIRE_FALSE(r::detail::read_training_continuation(input));
  REQUIRE(admitted.artifacts.config.mask_ce_loss_coef == 8.2);
  // Starting a new run from this full archive deliberately ignores continuation.
@@ -405,6 +407,7 @@ TEST_CASE("Continuation donor admission validates every descriptor before changi
  const auto accepted = history.state();
  const std::array<std::uint64_t, 2> keys{41, 42};
  const std::array<std::uint32_t, 2> images{0, 1};
+ // CLEANUP-IGNORE: Schedule and continuation tests copy a borrowed donor plan for different later mutation and restore assertions.
  const auto planned = history.plan(0, keys, images);
  const std::vector<r::TrainingDonorDescriptor> expected(planned.begin(), planned.end());
  auto valid_archive = continuation_fixture(request, values);

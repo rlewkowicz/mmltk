@@ -145,6 +145,7 @@ struct BackwardGate {
  void release(std::exception_ptr error = {}) {
   std::lock_guard lock(mutex);
   if (error && !failure) failure = error;
+  // CLEANUP-IGNORE: These two release receipts synchronize different CUDA boundaries: event-recorded autograd work and entered collective callbacks; neither shares the other gate state.
   released = true;
   changed.notify_all();
  }
@@ -202,6 +203,7 @@ private:
 };
 void mixed_early_bucket_overlap(const DistributedContext& distributed, int device) {
  const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
+ // CLEANUP-IGNORE: These are explicit strided tensor inputs to different optimizer ordering and staging tests.
  const auto options = torch::TensorOptions().device(tc::cuda_device(device));
  auto late = torch::ones({3, 2}, options).transpose(0, 1).detach().set_requires_grad(true);
  auto wide = torch::ones({2, 3}, options.dtype(torch::kFloat64)).set_requires_grad(true);
@@ -338,6 +340,7 @@ void exercise_early_bucket_overlap(const DistributedContext& distributed, int de
 void exercise_bounded_gradient_buckets(int device) {
  tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
  const DistributedContext distributed;
+ // CLEANUP-IGNORE: These are explicit strided tensor inputs to different optimizer ordering and staging tests.
  const auto options = torch::TensorOptions().device(tc::cuda_device(device));
  auto first = torch::ones({3, 2}, options).transpose(0, 1).detach().set_requires_grad(true);
  auto second = torch::ones_like(first).set_requires_grad(true);
@@ -718,6 +721,7 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
 }
 void exercise_target_count_handoff(const DistributedContext& distributed, int device) {
  tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
+ // CLEANUP-IGNORE: Three pooled streams have distinct count, metric, consumer, and handoff roles whose guard lifetimes remain local.
  const auto count_stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
  const auto metric_stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
  const auto consumer = tc::getStreamFromPool(false, tc::checked_device_index(device));
@@ -768,6 +772,7 @@ struct CollectiveGate final {
  }
  void release() {
   std::lock_guard lock(mutex);
+  // CLEANUP-IGNORE: These two release receipts synchronize different CUDA boundaries: event-recorded autograd work and entered collective callbacks; neither shares the other gate state.
   released = true;
   changed.notify_all();
  }
@@ -1046,6 +1051,7 @@ void exercise_collective_custody(int device) {
    group.enabled = false;
    group.world_size = 1;
   }
+  // CLEANUP-IGNORE: Three pooled streams have distinct count, metric, consumer, and handoff roles whose guard lifetimes remain local.
   const auto launch = tc::getStreamFromPool(false, tc::checked_device_index(device));
   const auto consumer = tc::getStreamFromPool(false, tc::checked_device_index(device));
   const auto handoff = tc::getStreamFromPool(false, tc::checked_device_index(device));

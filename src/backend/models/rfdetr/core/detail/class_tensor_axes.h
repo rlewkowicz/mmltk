@@ -5,6 +5,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
+namespace torch::nn {
+class Module;
+}
 namespace mmltk::backend::models::rfdetr::detail {
 enum class ClassTensorCoordinates { OutputSlots, Foreground, ForegroundWithBoxes };
 struct ClassTensorAxis final {
@@ -22,6 +26,7 @@ class ClassTensorFamily final {
 public:
  constexpr ClassTensorFamily(std::string_view owner, std::string_view module, std::string_view tensor, bool indexed, std::int64_t dimension, ClassTensorCoordinates coordinates)
      : owner_(owner), module_(module), tensor_(tensor), indexed_(indexed), dimension_(dimension), coordinates_(coordinates) {}
+ void AppendParameters(std::vector<ClassTensorAxis>& axes, const torch::nn::Module& module) const;
  [[nodiscard]] constexpr std::string_view module_name() const noexcept { return module_; }
  [[nodiscard]] std::string prefix() const { return (owner_.empty() ? std::string{} : std::string(owner_) + ".") + std::string(module_) + "."; }
  [[nodiscard]] constexpr std::optional<ClassTensorShape> Match(std::string_view name) const noexcept {

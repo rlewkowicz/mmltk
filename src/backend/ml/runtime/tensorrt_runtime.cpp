@@ -360,13 +360,16 @@ struct TensorRtEngine::Impl {
  void emit(const std::string& message) const {
   if (options.log) { options.log(message); }
  }
- void load_engine(const std::vector<char>& bytes) {
-  if (bytes.empty()) throw TensorRtCacheIntegrityError(options.context + " empty TensorRT engine");
-  if (!admitted()) return;
+ bool create_runtime() {
+  if (!admitted()) return false;
   runtime.reset(nvinfer1::createInferRuntime(logger));
   if (runtime == nullptr) { throw std::runtime_error(options.context + " failed to create TensorRT runtime"); }
   runtime->setErrorRecorder(&errors);
-  if (!admitted()) return;
+  return admitted();
+ }
+ void load_engine(const std::vector<char>& bytes) {
+  if (bytes.empty()) throw TensorRtCacheIntegrityError(options.context + " empty TensorRT engine");
+  if (!create_runtime()) return;
   engine.reset(runtime->deserializeCudaEngine(bytes.data(), bytes.size()));
   errors.Check(engine != nullptr, options.context + " deserialize TensorRT engine", true);
  }
@@ -434,11 +437,7 @@ struct TensorRtEngine::Impl {
   if (serialized == nullptr) { throw std::runtime_error(options.context + " TensorRT buildSerializedNetwork failed"); }
   emit("[trt:build] serialized bytes=" + std::to_string(serialized->size()));
   if (!options.save_engine_path.empty()) { write_binary(options.save_engine_path, serialized->data(), serialized->size(), options.context); }
-  if (!admitted()) return;
-  runtime.reset(nvinfer1::createInferRuntime(logger));
-  if (runtime == nullptr) { throw std::runtime_error(options.context + " failed to create TensorRT runtime"); }
-  runtime->setErrorRecorder(&errors);
-  if (!admitted()) return;
+  if (!create_runtime()) return;
   engine.reset(runtime->deserializeCudaEngine(serialized->data(), serialized->size()));
   errors.Check(engine != nullptr, options.context + " deserialize built TensorRT engine");
   emit("[trt:build] engine ready");

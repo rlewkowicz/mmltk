@@ -1,6 +1,6 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "checkpoint_fixture_support/upstream_oracle_fixture.h"
 #include "src/backend/imaging/resample/image_resize.h"
-#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -279,6 +279,7 @@ TEST_CASE("Actual pinned upstream Nano and SegNano forward and fixed cotangent V
  const auto requested = rf::testsupport::UpstreamOracle::requested();
  if (!requested) SKIP("optional upstream evidence not requested; generate with --diagnose-rfdetr-upstream for independent acceptance");
  const rf::testsupport::UpstreamOracle oracle(*requested);
+ // CLEANUP-IGNORE: CUDA availability, device scope, and precision scope are separate prerequisites; model, training, and optimizer oracles retain independent setup.
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  c10::cuda::CUDAGuard guard(0);
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;

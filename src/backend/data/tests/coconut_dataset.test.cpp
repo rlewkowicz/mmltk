@@ -1,3 +1,4 @@
+#include "src/backend/data/tests/benchmark_writer_fixture.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h"
@@ -85,6 +86,12 @@ using mmltk::backend::data::detail::CompileTaskKind;
 using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 namespace {
+std::vector<CoconutComponent> merge_one_component_fixture(
+ std::span<const CoconutComponentPart> parts, std::string_view identity, const CoconutPhysicalMembership& physical, const std::filesystem::path& root) {
+ auto result = merge_coconut_components(parts, identity, physical, root);
+ REQUIRE(result.size() == 1);
+ return result;
+}
 using mmltk::backend::data::testsupport::arrow_ok;
 using mmltk::backend::data::testsupport::benchmark_entry;
 using mmltk::backend::data::testsupport::benchmark_semantics;
@@ -131,6 +138,12 @@ std::string png(int width, int height, std::span<const std::uint32_t> ids) {
           [](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); }, &encoded, width, height, 3, pixels.data(), width * 3) != 0);
  return encoded;
 }
+auto open_pax_archive(const std::filesystem::path& path) {
+ std::unique_ptr<archive, decltype(&archive_write_free)> output(archive_write_new(), archive_write_free);
+ REQUIRE(archive_write_set_format_pax(output.get()) == ARCHIVE_OK);
+ REQUIRE(archive_write_open_filename(output.get(), path.c_str()) == ARCHIVE_OK);
+ return output;
+}
 void tar(const std::filesystem::path& path, std::span<const std::pair<std::string, std::string>> members, bool symlink = false, int format = ARCHIVE_FORMAT_TAR_PAX_RESTRICTED) {
  std::unique_ptr<archive, decltype(&archive_write_free)> writer(archive_write_new(), archive_write_free);
  REQUIRE(archive_write_set_format(writer.get(), format) == ARCHIVE_OK);
@@ -172,6 +185,13 @@ void json_file(const std::filesystem::path& path, Json value) {
  mmltk::testsupport::write_text_file(path, value.dump());
 }
 Json segment(unsigned id = 1, unsigned category = 1, bool thing = true) { return {{"id", id}, {"category_id", category}, {"isthing", thing ? 1 : 0}, {"iscrowd", 0}, {"area", nullptr}}; }
+std::array<Json, 2> crowd_and_area_segments() {
+ auto first = segment();
+ first["iscrowd"] = 1;
+ auto second = segment(2, 2);
+ second["area"] = 17;
+ return {std::move(first), std::move(second)};
+}
 Json hf_row(unsigned id, std::string encoded, Json segments, int width = 3, int height = 3, std::string_view physical_source = "train2017") {
  const auto digits = std::to_string(id);
  const auto stem = std::string(12U - digits.size(), '0') + digits;
@@ -214,11 +234,58 @@ struct LocalCoconutImportRequest : CoconutImportRequest {
  }
 };
 LocalCoconutImportRequest request(std::span<const CoconutPhysicalImage> physical, CoconutEdition edition = CoconutEdition::Base) { return LocalCoconutImportRequest(physical, edition); }
+LocalCoconutImportRequest json_import_request(
+ std::span<const CoconutPhysicalImage> physical, const std::filesystem::path& root, CoconutEdition edition, const std::string& stem, bool metadata_only = false) {
+ auto input = request(physical, edition);
+ input.annotation_json = root / (stem + ".json");
+ input.metadata_only = metadata_only;
+ if (!metadata_only) input.mask_archive = root / (stem + ".tar");
+ return input;
+}
+struct NativeCoconutBacking {
+ detail::StorageReservationPool storage;
+ CoconutStaging staging;
+ CoconutNativeWorkspace workspace{CoconutImportLimits{}};
+ explicit NativeCoconutBacking(const std::filesystem::path& root) : storage(root, {}), staging(root, &storage) {}
+};
+void decode_unit_record(CoconutNativeWorkspace& workspace, CoconutRecord& record) {
+ record.width = record.height = 1;
+ record.segments = {{.id = 1, .category_id = 1, .isthing = true}};
+ // CLEANUP-IGNORE: This literal one-pixel PNG feeds independent native-image and Parquet-normalizer boundaries; the byte view must remain tied to each local encoded owner.
+ const std::array<std::uint32_t, 1> pixel{1};
+ const auto encoded = png(1, 1, pixel);
+ const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
+ workspace.decode(record, bytes, workspace.admit_png(record, bytes));
+}
+void consume_admitted_archive(CoconutPhysicalMembership& physical, AdmittedRecipeArchive& source) {
+ physical.admitted(source, source.download);
+ REQUIRE(physical.consume(source));
+}
+std::vector<CoconutComponent> checked_single_import(CoconutImportRequest& input, bool valid = true) {
+ if (!valid) {
+  CHECK_THROWS(import_coconut_annotations(input));
+  return {};
+ }
+ auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ return components;
+}
+std::optional<CoconutComponent> reload_coconut_component(const std::filesystem::path& path, const CoconutComponent& component) {
+ store_coconut_component(path, component);
+ auto loaded = load_coconut_component(path, component.edition(), component.source(), component.input_identity());
+ REQUIRE(loaded);
+ return loaded;
+}
 void check_rejected_coconut_labels(CoconutImportRequest& input) {
  input.accept_partial = true;
- const auto result = import_coconut_annotations(input);
- REQUIRE(result.size() == 1);
+ const auto result = checked_single_import(input);
  CHECK_FALSE(result.front().required_labels_valid(0));
+}
+auto checked_original_indexes(CocoAnnotationCache& cache) {
+ auto indexes = cache.finish();
+ REQUIRE(indexes.train);
+ REQUIRE(indexes.validation);
+ return indexes;
 }
 void reversed_coco_parquet(const std::filesystem::path& path) {
  const std::array<std::uint32_t, 1> ids{1};
@@ -233,6 +300,20 @@ struct PollCancellation {
 std::string file_bytes(const std::filesystem::path& path) {
  std::ifstream input(path, std::ios::binary);
  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+void match_artifact_bytes(CatalogArtifact& artifact, const std::filesystem::path& path) {
+ artifact.expected_size = std::filesystem::file_size(path);
+ artifact.expected_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+}
+auto settle_coconut_import_on_exit(const mmltk::testsupport::TestGate& gate, BenchmarkCompilePipeline& pipeline) {
+ return mmltk::testsupport::ScopedTestCleanup([&] {
+  gate.Release();
+  pipeline.execution().cancel();
+ });
+}
+std::string tar_bytes(const std::filesystem::path& path, std::span<const std::pair<std::string, std::string>> members) {
+ tar(path, members);
+ return file_bytes(path);
 }
 // Independent fixture encodings: stored blocks provide ordinary compressed
 // partitions; one fixed-Huffman block exceeds the decoder's expanded slot.
@@ -402,10 +483,7 @@ TEST_CASE("COCONut release selection and fixed catalog are pinned", "[coconut]")
 TEST_CASE("COCONut Parquet shards preserve exact holes singleton crowd null area and empty images", "[coconut]") {
  ScopedTempDir root("coconut-parquet");
  const std::array<std::uint32_t, 9> ids{1, 1, 1, 1, 2, 1, 1, 0, 1};
- auto first = segment();
- first["iscrowd"] = 1;
- auto second = segment(2, 2);
- second["area"] = 17;
+ auto [first, second] = crowd_and_area_segments();
  const auto mask = png(3, 3, ids);
  auto row = hf_row(7, mask, Json::array({first, second}));
  const std::array<std::uint32_t, 9> void_ids{};
@@ -423,6 +501,7 @@ TEST_CASE("COCONut Parquet shards preserve exact holes singleton crowd null area
  auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 2);
  const auto& train = components[0];
+ // CLEANUP-IGNORE: Parquet and XL archive readers independently require their fixture-specific row cardinality before distinct image-identity checks.
  REQUIRE(train.index().image_count() == 2);
  REQUIRE(train.index().box_count() == 2);
  CHECK(train.index().images()[0].source_image_id == 7);
@@ -466,6 +545,7 @@ TEST_CASE("COCONut Parquet shards preserve exact holes singleton crowd null area
 }
 TEST_CASE("COCONut Parquet rejects malformed nested records missing membership and bounded overflows", "[coconut]") {
  ScopedTempDir root("coconut-malformed");
+ // CLEANUP-IGNORE: The existing PNG and row factories build explicit independent malformed-input fixtures before distinct mutations.
  const std::array<std::uint32_t, 9> ids{1, 1, 1, 1, 1, 1, 1, 1, 1};
  auto row = hf_row(7, png(3, 3, ids), Json::array({segment()}));
  const std::array physical{coco(7)};
@@ -565,9 +645,7 @@ TEST_CASE("COCONut JSON joins retain heterogeneous Large rows and validation phy
  const std::array<std::uint32_t, 4> ids{1, 0, 0, 1};
  const auto mask = png(2, 2, ids);
  const std::array physical{objects(91105, CoconutImageNamespace::Objects365V1), objects(91105)};
- auto input = request(physical, CoconutEdition::ObjectsValidation);
- input.annotation_json = root.path() / "val.json";
- input.mask_archive = root.path() / "val.tar";
+ auto input = json_import_request(physical, root.path(), CoconutEdition::ObjectsValidation, "val");
  input.expected_rows = 2;
  auto supported = segment();
  supported["ignore"] = 1;
@@ -626,11 +704,12 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
                                                     {{{"image_id", 900}, {"file_name", "900.png"}, {"segments_info", Json::array({segment()})}},
                                                      {{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}}})}});
  const std::array<std::pair<std::string, std::string>, 2> members{{{"panoptic_object365/objects365_v2_00000001.png", mask}, {"panoptic_object365/objects365_v2_00000002.png", mask}}};
+ // CLEANUP-IGNORE: Large and XL imports deliberately use independent archives and verify separate ordering oracles; their common cardinality is an explicit expected result.
  tar(input.mask_archive, members);
- auto components = import_coconut_annotations(input);
- REQUIRE(components.size() == 1);
+ auto components = checked_single_import(input);
  REQUIRE(components[0].index().image_count() == 2);
  CHECK(components[0].inventory()[1].release_image_id == 900);
+ // CLEANUP-IGNORE: Large JSON and compact Parquet inventory separately verify canonical source ordinals for different images.
  CHECK(components[0].index().storage().boxes[0].source_ordinal == 1);
  CHECK(components[0].index().storage().boxes[1].source_ordinal == 0);
  input.edition = CoconutEdition::XLarge;
@@ -640,9 +719,9 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
   {{"coconuts_xlarge/panseg/objects365_v2_00000003.png", mask}, {"coconuts_xlarge/panseg_info/objects365_v2_00000003.json", Json::array({segment()}).dump()},
    {"coconuts_xlarge/panseg_info/objects365_v2_00000002.json", Json::array({segment()}).dump()}, {"coconuts_xlarge/panseg/objects365_v2_00000002.png", mask}}
  };
+ // CLEANUP-IGNORE: Large and XL imports deliberately use independent archives and verify separate ordering oracles; their common cardinality is an explicit expected result.
  tar(input.mask_archive, xl_members);
- auto xl = import_coconut_annotations(input);
- REQUIRE(xl.size() == 1);
+ auto xl = checked_single_import(input);
  REQUIRE(xl[0].index().image_count() == 2);
  CHECK(xl[0].index().images()[0].source_image_id == 2);
  CHECK(xl[0].index().images()[0].width == 1);
@@ -651,9 +730,7 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
  CHECK(xl[0].index().storage().boxes[1].source_ordinal == 1);
  components.push_back(std::move(xl[0]));
  const auto full_path = root.path() / "full-xl.bin";
- store_coconut_component(full_path, components[1]);
- const auto full_component = load_coconut_component(full_path, components[1].edition(), components[1].source(), components[1].input_identity());
- REQUIRE(full_component);
+ const auto full_component = reload_coconut_component(full_path, components[1]);
  components[1] = *full_component;
  const auto original = components;
  const auto* retained_boxes = components[1].index().storage().boxes.data();
@@ -690,9 +767,7 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
  CHECK(components[1].index().box_count() == 1);
  CHECK(components[1].index().run_count() == 1);
  const auto selected_path = root.path() / "selected.bin";
- store_coconut_component(selected_path, components[1]);
- const auto persisted_selection = load_coconut_component(selected_path, components[1].edition(), components[1].source(), components[1].input_identity());
- REQUIRE(persisted_selection);
+ const auto persisted_selection = reload_coconut_component(selected_path, components[1]);
  CHECK(persisted_selection->index().image_count() == 1);
  CHECK(persisted_selection->index().image(0).first_box == 0);
  CHECK(persisted_selection->index().storage().boxes[0].mask_rle_offset == 0);
@@ -722,9 +797,7 @@ TEST_CASE("COCONut archives reject invalid consumed members and ignore unused ta
  const std::array<std::uint32_t, 1> ids{1};
  const auto mask = png(1, 1, ids);
  const std::array physical{objects(1)};
- auto input = request(physical, CoconutEdition::Large);
- input.annotation_json = root.path() / "large.json";
- input.mask_archive = root.path() / "large.tar";
+ auto input = json_import_request(physical, root.path(), CoconutEdition::Large, "large");
  Json annotation{{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}};
  Json document{{"images", Json::array()}, {"annotations", Json::array({annotation})}};
  std::vector<std::pair<std::string, std::string>> members{{"panoptic_object365/objects365_v2_00000001.png", mask}};
@@ -795,8 +868,7 @@ TEST_CASE("COCONut version-1 physical inventory has fixed bytes and admits exist
  detail::StorageReservationPool storage(root.path(), {});
  CHECK(fixture_physical_inventory(archive, emitted, CoconutImageNamespace::Objects365V1, 0x1234, "a", {}, &storage) == wanted);
  CHECK(storage.outstanding() == 0);
- struct stat status{};
- REQUIRE(::stat(emitted.c_str(), &status) == 0);
+ auto status = mmltk::testsupport::file_status(emitted);
  CHECK((status.st_mode & 0777) == 0644);
  CHECK(file_bytes(emitted) == expected);
  CHECK(expected.size() == 114 + 32);
@@ -885,6 +957,7 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
  mmltk::testsupport::write_text_file(inventory_path, expected);
  const auto loaded = load_coconut_component(path, component.edition(), component.source(), "i");
  REQUIRE(loaded);
+ // CLEANUP-IGNORE: Persisted format and recovery admission independently compare their own canonical inventory and annotation identities.
  CHECK(loaded->index().annotation_sha256 == component.index().annotation_sha256);
  CHECK(std::ranges::equal(loaded->inventory(), component.inventory()));
  REQUIRE(loaded->index().image_count() == 1);
@@ -967,8 +1040,7 @@ TEST_CASE("COCONut preserves RGB24 IDs across compressed Parquet batches and rel
  input.parquet_shards = {root.path() / "val.parquet"};
  input.expected_rows = 18;
  write_coconut_parquet(input.parquet_shards[0], rows, coconut_parquet_schema(true), 1, {}, parquet::WriterProperties::Builder().compression(parquet::Compression::GZIP)->build());
- auto components = import_coconut_annotations(input);
- REQUIRE(components.size() == 1);
+ auto components = checked_single_import(input);
  REQUIRE(components[0].index().image_count() == 18);
  REQUIRE(components[0].index().box_count() == 18);
  for (std::size_t i = 0; i < 18; ++i) {
@@ -1040,9 +1112,7 @@ TEST_CASE("COCONut authoritative box retains an empty supplied mask and rejects 
  ScopedTempDir root("coconut-authoritative-box");
  const std::array<std::uint32_t, 1> ids{0};
  const std::array physical{objects(1)};
- auto input = request(physical, CoconutEdition::Large);
- input.annotation_json = root.path() / "large.json";
- input.mask_archive = root.path() / "large.tar";
+ auto input = json_import_request(physical, root.path(), CoconutEdition::Large, "large");
  auto seg = segment();
  seg["bbox"] = Json::array({-1, 0, 3, 1});
  seg["area"] = 23;
@@ -1059,8 +1129,7 @@ TEST_CASE("COCONut authoritative box retains an empty supplied mask and rejects 
   check_rejected_coconut_labels(input);
   return;
  }
- const auto components = import_coconut_annotations(input);
- REQUIRE(components.size() == 1);
+ const auto components = checked_single_import(input);
  REQUIRE(components[0].index().box_count() == 1);
  const auto& box = components[0].index().storage().boxes[0];
  CHECK(box.x1 == -1.0F);
@@ -1072,9 +1141,7 @@ TEST_CASE("COCONut authoritative box retains an empty supplied mask and rejects 
 TEST_CASE("COCONut JSON requires canonical categories and exact validation image joins", "[coconut]") {
  ScopedTempDir root("coconut-semantic-joins");
  const std::array physical{objects(1, CoconutImageNamespace::Objects365V1), objects(2, CoconutImageNamespace::Objects365V1)};
- auto input = request(physical, CoconutEdition::ObjectsValidation);
- input.annotation_json = root.path() / "val.json";
- input.mask_archive = root.path() / "val.tar";
+ auto input = json_import_request(physical, root.path(), CoconutEdition::ObjectsValidation, "val");
  Json annotation{{"image_id", 11}, {"file_name", "11.png"}, {"object365_file_name", "objects365_v1_00000001"}, {"segments_info", Json::array({segment()})}};
  Json document{{"categories", category_catalog()}, {"images", Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 1}, {"height", 1}}})}, {"annotations", Json::array({annotation})}};
  bool valid = false;
@@ -1093,24 +1160,19 @@ TEST_CASE("COCONut JSON requires canonical categories and exact validation image
  const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_o365val_v3/objects365_v1_00000001.png", png(1, 1, ids)}}};
  // CLEANUP-IGNORE: These independent malformed-input matrices assert admission around the shared importer; their valid records and expected category mappings differ.
  tar(input.mask_archive, members);
- if (!valid) {
-  CHECK_THROWS(import_coconut_annotations(input));
-  return;
- }
- const auto components = import_coconut_annotations(input);
- REQUIRE(components.size() == 1);
+ const auto components = checked_single_import(input, valid);
+ if (!valid) return;
  REQUIRE(components[0].index().box_count() == 1);
  CHECK(components[0].index().storage().boxes[0].class_id == 0);
  CHECK(components[0].index().storage().boxes[0].source_category_id == 1);
+ // CLEANUP-IGNORE: Separate semantic-join and envelope-order tests assert their own explicit release/source identity mapping.
  CHECK(components[0].inventory()[0].release_image_id == 11);
  CHECK(components[0].index().images()[0].source_image_id == 1);
 }
 TEST_CASE("COCONut preparatory arrays accept either order and reject duplicate arrays", "[coconut]") {
  ScopedTempDir root("coconut-envelope-order");
  const std::array physical{objects(1, CoconutImageNamespace::Objects365V1)};
- auto input = request(physical, CoconutEdition::ObjectsValidation);
- input.annotation_json = root.path() / "val.json";
- input.mask_archive = root.path() / "val.tar";
+ auto input = json_import_request(physical, root.path(), CoconutEdition::ObjectsValidation, "val");
  const auto categories = category_catalog().dump();
  const auto images = Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 3}, {"height", 1}}}).dump();
  const auto annotations =
@@ -1131,12 +1193,8 @@ TEST_CASE("COCONut preparatory arrays accept either order and reject duplicate a
  const std::array<std::uint32_t, 3> ids{1, 2, 3};
  const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_o365val_v3/objects365_v1_00000001.png", png(3, 1, ids)}}};
  tar(input.mask_archive, members);
- if (!valid) {
-  CHECK_THROWS(import_coconut_annotations(input));
-  return;
- }
- const auto components = import_coconut_annotations(input);
- REQUIRE(components.size() == 1);
+ const auto components = checked_single_import(input, valid);
+ if (!valid) return;
  REQUIRE(components[0].index().box_count() == 3);
  const auto& boxes = components[0].index().storage().boxes;
  CHECK(boxes[0].source_category_id == 1);
@@ -1145,15 +1203,22 @@ TEST_CASE("COCONut preparatory arrays accept either order and reject duplicate a
  CHECK(boxes[1].class_id == 11);
  CHECK(boxes[2].source_category_id == 90);
  CHECK(boxes[2].class_id == 79);
+ // CLEANUP-IGNORE: Separate semantic-join and envelope-order tests assert their own explicit release/source identity mapping.
  CHECK(components[0].inventory()[0].release_image_id == 11);
  CHECK(components[0].index().images()[0].source_image_id == 1);
 }
+namespace {
+LocalCoconutImportRequest reversed_import_request(std::span<const CoconutPhysicalImage> physical, const std::filesystem::path& root) {
+ auto input = request(physical);
+ input.parquet_shards = {root / "base.parquet"};
+ reversed_coco_parquet(input.parquet_shards[0]);
+ return input;
+}
+}  // namespace
 TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under corruption and cancellation", "[coconut]") {
  ScopedTempDir root("coconut-compact-inventory");
  const std::array physical{coco(7), coco(8)};
- auto input = request(physical);
- input.parquet_shards = {root.path() / "base.parquet"};
- reversed_coco_parquet(input.parquet_shards[0]);
+ auto input = reversed_import_request(physical, root.path());
  const auto first = import_coconut_annotations(input);
  const auto rebuilt = import_coconut_annotations(input);
  REQUIRE(first.size() == 1);
@@ -1165,6 +1230,7 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
  CHECK(first[0].index().images()[1].source_image_id == 8);
  CHECK(first[0].index().images()[0].first_box == 0);
  CHECK(first[0].index().images()[1].first_box == 1);
+ // CLEANUP-IGNORE: Large JSON and compact Parquet inventory separately verify canonical source ordinals for different images.
  CHECK(first[0].index().storage().boxes[0].source_ordinal == 1);
  CHECK(first[0].index().storage().boxes[1].source_ordinal == 0);
  CHECK(first[0].inventory()[0].release_image_id == 7);
@@ -1194,6 +1260,7 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
  SECTION("reordered inventory cannot replace an admitted index") {
   auto reordered = component_builder(first[0]);
   std::swap(reordered.inventory[0], reordered.inventory[1]);
+  // CLEANUP-IGNORE: Distinct malformed inventory builders must each reject publication and preserve the prior persisted bytes.
   CHECK_THROWS(std::move(reordered).finish({}, root.path()));
   CHECK(file_bytes(path.string() + ".inventory") == original);
  }
@@ -1250,6 +1317,7 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
   SECTION("unreferenced box") { malformed.index.images.back().box_count = 0; }
   SECTION("malformed run") { malformed.index.mask_rle_pairs.front().length = 0; }
   SECTION("changed header cannot reuse identity") { malformed.input_identity = "different-generation"; }
+  // CLEANUP-IGNORE: Distinct malformed inventory builders must each reject publication and preserve the prior persisted bytes.
   CHECK_THROWS(std::move(malformed).finish({}, root.path()));
   CHECK(file_bytes(path.string() + ".inventory") == original);
  }
@@ -1293,9 +1361,7 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
 TEST_CASE("COCONut cancellation after the last record covers consolidation and identity encoding", "[coconut]") {
  ScopedTempDir root("coconut-finalization-cancel");
  const std::array physical{coco(7), coco(8)};
- auto input = request(physical);
- input.parquet_shards = {root.path() / "base.parquet"};
- reversed_coco_parquet(input.parquet_shards[0]);
+ auto input = reversed_import_request(physical, root.path());
  struct FinalRecordCancellation {
   mutable PollCancellation counter;
   bool armed = false;
@@ -1382,10 +1448,7 @@ struct LocalCoconutRecipe {
   physical_archive(CoconutImageNamespace::Objects365V2, BenchmarkDatasetSource::kObjects365V2, "patch-32", 32, {objects(1).member, objects(2).member});
   physical_archive(CoconutImageNamespace::Objects365V1, BenchmarkDatasetSource::kObjects365V1, "validation", 0, {objects(1, CoconutImageNamespace::Objects365V1).member});
   const std::array<std::uint32_t, 9> support{1, 1, 1, 1, 2, 1, 1, 0, 1}, empty{};
-  auto first = segment();
-  first["iscrowd"] = 1;
-  auto second = segment(2, 2);
-  second["area"] = 17;
+  auto [first, second] = crowd_and_area_segments();
   const auto mask = png(3, 3, support);
   const auto release = [&](CoconutEdition edition, std::string_view name, std::uint64_t count) -> CoconutReleaseComponent& {
    catalog.releases.push_back({edition, name, "local-release-v1", count, {}});
@@ -1439,6 +1502,16 @@ struct LocalCoconutRecipe {
   tar(stock_path, stock_members);
   catalog.stock_annotations = {"fixture-stock", "http://127.0.0.1:1/stock", "stock.tar", std::filesystem::file_size(stock_path), "", BenchmarkDatasetSource::kCoco2017};
  }
+ auto cached_annotation(CoconutReleaseComponent& release, std::size_t index = 0) const {
+  auto& artifact = release.annotations[index];
+  return std::pair<decltype(artifact), std::filesystem::path>{artifact, cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename};
+ }
+ CoconutRecipeCatalog base_training_catalog() const {
+  auto selected_catalog = selected(CoconutValidation::Stock);
+  std::erase_if(selected_catalog.releases, [](const auto& release) { return release.edition != CoconutEdition::Base; });
+  std::erase_if(selected_catalog.images, [](const auto& image) { return image.source != CoconutImageNamespace::CocoTrain; });
+  return selected_catalog;
+ }
  BenchmarkCompilerConfig compiler_config(BenchmarkDatasetSelection selection = {}, bool overwrite = false) const {
   BenchmarkCompilerConfig config;
   config.output_dir = output;
@@ -1460,7 +1533,43 @@ struct LocalCoconutRecipe {
   if (choice != CoconutValidation::Coconut) std::erase_if(result.images, [](const auto& image) { return image.source == CoconutImageNamespace::Objects365V1; });
   return result;
  }
+ auto compiled_warm(BenchmarkDatasetSelection selection) const {
+  auto config = compiler_config(selection, true);
+  auto selected_catalog = selected(selection.validation);
+  compile_benchmark_recipe(config, &selected_catalog);
+  compile_benchmark_recipe(config, &selected_catalog);
+  return std::pair{std::move(config), std::move(selected_catalog)};
+ }
+ auto configured(BenchmarkDatasetSelection selection = {}, bool overwrite = false) const {
+  auto config = compiler_config(selection, overwrite);
+  auto selected_catalog = selected(config.selection.validation);
+  return std::pair{std::move(config), std::move(selected_catalog)};
+ }
 };
+void invalidate_cached_member(const std::filesystem::path& images, std::uint64_t id) {
+ invalidate_cached_image_proofs(images);
+ std::filesystem::remove(cached_image_path(images, id));
+}
+void check_retained_file_identity(const std::filesystem::path& path, const struct stat& before, std::filesystem::file_time_type time) {
+ const auto after = mmltk::testsupport::file_status(path);
+ CHECK(after.st_ino == before.st_ino);
+ CHECK(std::filesystem::last_write_time(path) == time);
+}
+void check_component_roundtrip(const std::filesystem::path& source, const std::filesystem::path& destination, const CoconutComponent& component) {
+ store_coconut_component(destination, component);
+ for (const auto suffix : {"", ".inventory", ".complete.json"}) CHECK(file_bytes(source.string() + suffix) == file_bytes(destination.string() + suffix));
+}
+Json compile_recipe_manifest(const BenchmarkCompilerConfig& config, const CoconutRecipeCatalog& catalog) {
+ compile_benchmark_recipe(config, &catalog);
+ return Json::parse(file_bytes(config.output_dir / "benchmark_manifest.json")).at("recipe");
+}
+auto white_objects_archive(const BenchmarkCacheLayout& cache) {
+ const auto path = cache.source_downloads("objects365") / "physical.tar";
+ const auto jpeg = white_jpeg();
+ const std::array<std::pair<std::string, std::string>, 1> members{{{objects(3).member, jpeg}}};
+ tar(path, members);
+ return std::pair{path, jpeg};
+}
 void add_ready_parquet_part(LocalCoconutRecipe& local, CoconutRecipeCatalog& catalog) {
  auto& release = catalog.releases.front();
  const std::array<std::uint32_t, 9> support{1, 1, 1, 1, 1, 1, 1, 1, 1};
@@ -1641,8 +1750,7 @@ TEST_CASE("COCONut private catalog compiles all validation choices through the p
   CHECK_FALSE(manifest["mappings"].contains("objects365"));
   CHECK(manifest["recipe"]["duplicate_xl_images"] == 1);
   CHECK(manifest["train"]["images"] == (mismatched_geometry ? 2U : 4U));
-  struct stat status{};
-  REQUIRE(::stat(jpeg_path.c_str(), &status) == 0);
+  auto status = mmltk::testsupport::file_status(jpeg_path);
   if (original_train.empty()) {
    original_train = benchmark_semantics(config.output_dir / "train.bin");
    jpeg_time = std::filesystem::last_write_time(jpeg_path);
@@ -1687,8 +1795,7 @@ TEST_CASE("COCONut private catalog compiles all validation choices through the p
 TEST_CASE("COCONut fully covered XL keeps Large rows and rebuilds without an empty index", "[coconut][benchmark]") {
  ScopedTempDir root("coconut-covered");
  LocalCoconutRecipe local(root.path(), true);
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
- const auto catalog = local.selected(CoconutValidation::Coconut);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
  compile_benchmark_recipe(config, &catalog);
  CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 3);
  const auto previous = benchmark_semantics(config.output_dir / "train.bin");
@@ -1705,8 +1812,7 @@ TEST_CASE("COCONut fully covered XL keeps Large rows and rebuilds without an emp
 TEST_CASE("shared root repair invalidates all proofs and preserves valid JPEG allocations", "[coconut][benchmark][cache]") {
  ScopedTempDir root("coconut-shared-repair");
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
- const auto catalog = local.selected(CoconutValidation::Coconut);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
  compile_benchmark_recipe(config, &catalog);
  const auto images = local.cache.source_images("objects365") / "patch-32";
  const std::array<std::uint64_t, 2> ids{1, 2};
@@ -1825,13 +1931,12 @@ TEST_CASE("physical archive structural repair retains one admitted acquisition t
  compile_benchmark_recipe(config, &catalog);
  REQUIRE(served.server.requests() == 0);
  const auto before = benchmark_semantics(config.output_dir / "train.bin");
+ // CLEANUP-IGNORE: The existing checked-stat helper observes unrelated retained JPEGs before distinct archive-repair operations.
  const auto unaffected = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
- struct stat inode{};
- REQUIRE(::stat(unaffected.c_str(), &inode) == 0);
+ auto inode = mmltk::testsupport::file_status(unaffected);
  const auto proof = local.cache.source_images("objects365") / "patch-32/.recipe-proofs";
  const auto proof_count = std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{});
- invalidate_cached_image_proofs(local.cache.source_images("coco") / "train2017");
- std::filesystem::remove(cached_image_path(local.cache.source_images("coco") / "train2017", 7));
+ invalidate_cached_member(local.cache.source_images("coco") / "train2017", 7);
  mmltk::testsupport::write_text_file(served.path, std::string(served.payload.size(), 'x'));
  unsigned physical_settlements = 0, failure_hashes = 0, cached_admissions = 0;
  if (diagnostics)
@@ -1842,27 +1947,29 @@ TEST_CASE("physical archive structural repair retains one admitted acquisition t
    if (event == "benchmark.download.cache_hit" || event == "benchmark.download.preseeded") ++cached_admissions;
    if (event == "benchmark.download.failure_sha256") ++failure_hashes;
   };
+ // CLEANUP-IGNORE: Cold repair and warm replay intentionally repeat compilation while requiring unchanged network and settlement counts.
  compile_benchmark_recipe(config, &catalog);
  CHECK(served.server.requests() == 1);
  CHECK(physical_settlements == (diagnostics ? 1 : 0));
  CHECK(failure_hashes == (diagnostics ? 1 : 0));
  CHECK(benchmark_semantics(config.output_dir / "train.bin") == before);
- struct stat after{};
- REQUIRE(::stat(unaffected.c_str(), &after) == 0);
+ auto after = mmltk::testsupport::file_status(unaffected);
+ // CLEANUP-IGNORE: The same inode and proof-count observations bracket distinct repairs to prove repeated recovery never replaces the unaffected allocation.
  CHECK(after.st_ino == inode.st_ino);
  CHECK(std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{}) == proof_count);
  const auto admissions_before = cached_admissions;
+ // CLEANUP-IGNORE: Cold repair and warm replay intentionally repeat compilation while requiring unchanged network and settlement counts.
  compile_benchmark_recipe(config, &catalog);
  CHECK(served.server.requests() == 1);
  CHECK(physical_settlements == (diagnostics ? 1 : 0));
  CHECK(cached_admissions == admissions_before);
  std::ranges::fill(served.payload, 'x');
  mmltk::testsupport::write_text_file(served.path, std::string(served.payload.size(), 'x'));
- invalidate_cached_image_proofs(local.cache.source_images("coco") / "train2017");
- std::filesystem::remove(cached_image_path(local.cache.source_images("coco") / "train2017", 7));
+ invalidate_cached_member(local.cache.source_images("coco") / "train2017", 7);
  compile_benchmark_recipe(config, &catalog);
  CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 3);
  REQUIRE(::stat(unaffected.c_str(), &after) == 0);
+ // CLEANUP-IGNORE: The same inode and proof-count observations bracket distinct repairs to prove repeated recovery never replaces the unaffected allocation.
  CHECK(after.st_ino == inode.st_ino);
  CHECK(std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{}) == proof_count);
  served.server.Check();
@@ -1877,8 +1984,7 @@ TEST_CASE("additional download storage counts allocated retained bytes once", "[
  std::filesystem::rename(path, path.string() + ".part");
  CHECK(additional_download_bytes(path, target) == 0);
  std::filesystem::resize_file(path.string() + ".part", 4096);
- struct stat partial{};
- REQUIRE(::stat((path.string() + ".part").c_str(), &partial) == 0);
+ auto partial = mmltk::testsupport::file_status((path.string() + ".part"));
  CHECK(additional_download_bytes(path, target) == target - std::min(target, static_cast<std::uint64_t>(partial.st_blocks) * 512U));
 }
 TEST_CASE("missing physical membership repairs its archive without replacing annotation inputs", "[coconut][benchmark][download]") {
@@ -1891,6 +1997,7 @@ TEST_CASE("missing physical membership repairs its archive without replacing ann
  ServedPhysicalArchive served(local.cache, catalog, CoconutImageNamespace::CocoTrain, "membership");
  if (checksum == "matching repaired source") served.source.artifact.expected_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(served.path));
  const std::array<std::pair<std::string, std::string>, 1> wrong{{{coco(6).member, white_jpeg()}}};
+ // CLEANUP-IGNORE: Different damaged archives intentionally retain their advertised byte extent before independent checksum and missing-membership recovery paths.
  tar(served.path, wrong);
  REQUIRE(std::filesystem::file_size(served.path) == served.payload.size());
  const bool verified = checksum == "matching damaged source";
@@ -1914,6 +2021,7 @@ TEST_CASE("late shared archive repair rebinds completed Coconut releases", "[ben
  auto catalog = local.selected(CoconutValidation::CoconutStock);
  ServedPhysicalArchive served(local.cache, catalog, CoconutImageNamespace::Objects365V2, "late-shared-repair");
  const std::array<std::pair<std::string, std::string>, 2> incomplete{{{objects(1).member, white_jpeg()}, {objects(3).member, white_jpeg()}}};
+ // CLEANUP-IGNORE: Different damaged archives intentionally retain their advertised byte extent before independent checksum and missing-membership recovery paths.
  tar(served.path, incomplete);
  REQUIRE(std::filesystem::file_size(served.path) == served.payload.size());
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, false);
@@ -1930,20 +2038,18 @@ TEST_CASE("late shared archive repair rebinds completed Coconut releases", "[ben
   if (edition == CoconutEdition::XLarge && boundary == CoconutReleaseBoundary::MasksStarted) xl.receipt().ArriveAndWait();
  };
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
- const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled = true;
-  xl.Release();
- });
- REQUIRE(xl.WaitEntered(5s));
+ const mmltk::testsupport::AwaitedTestGate release(xl, 5s, 1, &cancelled);
  mmltk::testsupport::await_test_promise(large, "Large completes before the shared archive is repaired", 5s);
  CHECK(served.server.requests() == 0);
  xl.Release();
  mmltk::testsupport::await_test_future(compiling, "shared physical generation repair settles all releases", 15s);
  CHECK(served.server.requests() == 1);
+ // CLEANUP-IGNORE: Physical archive and original-annotation repairs independently open the published training output before different label oracles.
  const auto train = CompiledDataset::open(local.output / "train.bin");
  CHECK(train.header().num_images == 4);
  CHECK(train.image_labels(compiled_slot(train, 1, AnnotationSource::CoconutObjects365V2)).size() == 2);
  CHECK(train.image_labels(compiled_slot(train, 2, AnnotationSource::CoconutObjects365V2)).size() == 2);
+ // CLEANUP-IGNORE: Physical-archive repair and original-annotation repair independently verify validation counts and complete label progress after their distinct recovery paths.
  CHECK(CompiledDataset::open(local.output / "val.bin").header().num_images == 1);
  CHECK(settled.tracks.labels.complete);
  CHECK(settled.tracks.labels.completed == settled.tracks.labels.total);
@@ -2088,6 +2194,10 @@ CustomRecipeCatalog local_custom_catalog(LocalCoconutRecipe& local, std::span<co
  mmltk::testsupport::write_text_file(open_path, white_jpeg());
  return catalog;
 }
+std::pair<CustomRecipeCatalog, BenchmarkCompilerConfig> custom_configuration(LocalCoconutRecipe& local) {
+ auto catalog = local_custom_catalog(local);
+ return {std::move(catalog), local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock})};
+}
 std::pair<CustomRecipeCatalog, std::vector<unsigned>> custom_training_window(LocalCoconutRecipe& local) {
  // Seventy images cross both ready-window and pixel-progress boundaries.
  std::vector<unsigned> ids;
@@ -2182,15 +2292,17 @@ TEST_CASE("custom and COCONut production transactions preserve output and shared
  std::string custom_train, custom_val, coconut_train, custom_train_semantics, custom_val_semantics;
  ino_t inode = 0;
  std::filesystem::file_time_type mtime;
+ const auto compile_selected = [&](bool enhanced) {
+  config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
+  REQUIRE_NOTHROW(compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom));
+  CHECK(server.requests() == 0);
+ };
  for (unsigned step = 0; step < 5; ++step) {
   const bool enhanced = step % 2 == 0;
   CAPTURE(step, enhanced);
   config.num_workers = 1 + step % 2;
-  config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
-  REQUIRE_NOTHROW(compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom));
-  CHECK(server.requests() == 0);
-  struct stat status{};
-  REQUIRE(::stat(jpeg.c_str(), &status) == 0);
+  compile_selected(enhanced);
+  auto status = mmltk::testsupport::file_status(jpeg);
   if (step == 0) {
    inode = status.st_ino;
    mtime = std::filesystem::last_write_time(jpeg);
@@ -2225,9 +2337,7 @@ TEST_CASE("custom and COCONut production transactions preserve output and shared
   CAPTURE(enhanced);
   const auto bad = std::string(std::filesystem::file_size(jpeg), 'x');
   mmltk::testsupport::write_text_file(jpeg, bad);
-  config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
-  REQUIRE_NOTHROW(compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom));
-  CHECK(server.requests() == 0);
+  compile_selected(enhanced);
   if (enhanced) {
    CHECK_FALSE(std::filesystem::exists(image_root / ".complete.json"));
    CHECK(benchmark_semantics(config.output_dir / "train.bin") == coconut_train);
@@ -2290,8 +2400,7 @@ TEST_CASE("custom archive structural recovery preserves JPEGs from other selecti
  const auto images = local.cache.source_images("objects365") / "patch-32";
  const auto retained = cached_image_path(images, 2);
  const auto retained_bytes = file_bytes(retained);
- struct stat before{};
- REQUIRE(::stat(retained.c_str(), &before) == 0);
+ auto before = mmltk::testsupport::file_status(retained);
  const auto retained_time = std::filesystem::last_write_time(retained);
  REQUIRE_FALSE(std::filesystem::is_empty(images / ".recipe-proofs"));
  bool exhausted = false, cancelled = false;
@@ -2328,10 +2437,7 @@ TEST_CASE("custom archive structural recovery preserves JPEGs from other selecti
  CHECK(server.requests() == (cancelled ? 0U : exhausted ? 2U : 1U));
  CHECK(std::filesystem::is_empty(images / ".recipe-proofs"));
  CHECK(file_bytes(retained) == retained_bytes);
- struct stat after{};
- REQUIRE(::stat(retained.c_str(), &after) == 0);
- CHECK(after.st_ino == before.st_ino);
- CHECK(std::filesystem::last_write_time(retained) == retained_time);
+ check_retained_file_identity(retained, before, retained_time);
  if (exhausted || cancelled) {
   CHECK(file_bytes(config.output_dir / "train.bin") == train);
   CHECK(file_bytes(config.output_dir / "val.bin") == val);
@@ -2354,9 +2460,9 @@ TEST_CASE("one physical admission budget governs membership extraction and write
  const auto component_path = local.cache.source_indexes("coconut-fixture-base") / "coco-train2017.normalized.bin";
  const auto old_component = read_json_file(component_path.string() + ".complete.json");
  const auto old_input = old_component["coconut"]["input_identity"].get<std::string>();
+ // CLEANUP-IGNORE: The existing checked-stat helper observes unrelated retained JPEGs before distinct archive-repair operations.
  const auto unrelated = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
- struct stat before{};
- REQUIRE(::stat(unrelated.c_str(), &before) == 0);
+ auto before = mmltk::testsupport::file_status(unrelated);
  const auto unrelated_time = std::filesystem::last_write_time(unrelated);
  const auto unrelated_proofs = local.cache.source_images("objects365") / "patch-32/.recipe-proofs";
  std::vector<std::pair<std::filesystem::path, std::string>> proofs;
@@ -2427,10 +2533,7 @@ TEST_CASE("one physical admission budget governs membership extraction and write
  }
  if (!exhausted) CHECK(benchmark_semantics(config.output_dir / "train.bin") == old_train);
  CHECK(benchmark_semantics(config.output_dir / "val.bin") == old_val);
- struct stat after{};
- REQUIRE(::stat(unrelated.c_str(), &after) == 0);
- CHECK(after.st_ino == before.st_ino);
- CHECK(std::filesystem::last_write_time(unrelated) == unrelated_time);
+ check_retained_file_identity(unrelated, before, unrelated_time);
  for (const auto& [path, bytes] : proofs) CHECK(file_bytes(path) == bytes);
  served.server.Check();
 }
@@ -2568,17 +2671,17 @@ TEST_CASE("stock annotation owner repairs only missing splits with bounded sourc
  };
  ProgressReporter progress({}, trace);
  CocoAnnotationCache annotations(local.cache, artifact, {CocoSplitAdmission::Required, CocoSplitAdmission::Required}, 2, 1, 1, {}, trace);
+ // CLEANUP-IGNORE: Independent annotation cache discoveries require pending work before different warm-acquisition and split-settlement checks.
  annotations.discover(progress);
  REQUIRE(annotations.pending_download());
  CHECK(annotations.completed_indexes() == 1);
+ // CLEANUP-IGNORE: Independent split-repair scenarios require warm artifact acquisition to avoid a network request before different settlement counts.
  auto acquired = download_artifacts({*annotations.pending_download()}, 1, {}).front();
  CHECK(server.requests() == 0);
  std::uint64_t completed = 1;
  if (succeeds) {
   annotations.settle(std::move(acquired), progress, 1, completed, 2);
-  auto indexes = annotations.finish();
-  REQUIRE(indexes.train);
-  REQUIRE(indexes.validation);
+  auto indexes = checked_original_indexes(annotations);
   CHECK(indexes.train->images.size() == 2);
   CHECK(indexes.validation->images.size() == 1);
   CHECK_FALSE(indexes.cache_hit);
@@ -2644,6 +2747,7 @@ TEST_CASE("both stock recipes repair malformed admitted archives through their p
 }
 TEST_CASE("one stock request builds both splits and rebinds newly settled train after validation repair", "[benchmark][coconut][download]") {
  ScopedTempDir root("stock-both-splits");
+ // CLEANUP-IGNORE: The custom catalog factory owns setup; independent split-admission tests retain explicit train/validation cache paths for different mutations.
  LocalCoconutRecipe local(root.path());
  auto custom = local_custom_catalog(local);
  const auto train = local.cache.source_indexes("coco") / "train2017.normalized.bin";
@@ -2654,8 +2758,7 @@ TEST_CASE("one stock request builds both splits and rebinds newly settled train 
  const auto training_json = file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json");
  const auto validation_json = file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json");
  const std::array<std::pair<std::string, std::string>, 2> valid{{{"annotations/instances_train2017.json", training_json}, {"annotations/instances_val2017.json", validation_json}}};
- tar(raw, valid);
- const auto served = file_bytes(raw);
+ const auto served = tar_bytes(raw, valid);
  mmltk::backend::data::testsupport::HttpServer server(served);
  auto malformed = valid;
  malformed[1].second = "not JSON";
@@ -2664,6 +2767,7 @@ TEST_CASE("one stock request builds both splits and rebinds newly settled train 
  custom.coco_annotations.url = server.url("both-stock-splits");
  BenchmarkTraceSink trace;
  std::optional<NormalizedAnnotationIndex> settled_train;
+ // CLEANUP-IGNORE: Progress and annotation-cache owners remain scoped to separate split-observation and extracted-member tests.
  ProgressReporter progress({}, trace);
  CocoAnnotationCache cache(local.cache, custom.coco_annotations, {CocoSplitAdmission::Required, CocoSplitAdmission::Required}, 2, 1, 1, {}, trace);
  cache.observe_splits([&](CocoAnnotationSplit split) {
@@ -2672,13 +2776,12 @@ TEST_CASE("one stock request builds both splits and rebinds newly settled train 
  cache.discover(progress);
  CHECK(cache.completed_indexes() == 0);
  REQUIRE(cache.pending_download());
+ // CLEANUP-IGNORE: Independent split-repair scenarios require warm artifact acquisition to avoid a network request before different settlement counts.
  auto acquired = download_artifacts({*cache.pending_download()}, 1, {}).front();
  CHECK(server.requests() == 0);
  std::uint64_t completed = 0;
  cache.settle(std::move(acquired), progress, 1, completed, 2);
- auto indexes = cache.finish();
- REQUIRE(indexes.train);
- REQUIRE(indexes.validation);
+ auto indexes = checked_original_indexes(cache);
  REQUIRE(settled_train);
  CHECK(indexes.train->annotation_sha256 != settled_train->annotation_sha256);
  CHECK(std::ranges::equal(std::as_bytes(indexes.train->images), std::as_bytes(settled_train->images)));
@@ -2701,13 +2804,13 @@ TEST_CASE("late original repair settles completed Coconut recovery without retai
  for (const auto split : {"train2017", "val2017"}) remove_normalized_annotation_index(indexes / (std::string(split) + ".normalized.bin"));
  const auto path = local.cache.source_downloads("coco") / originals.filename;
  const auto first_train = file_bytes(indexes / "train2017.fixture.json");
+ // CLEANUP-IGNORE: Changing the original annotation ID is an explicit input to independent late-repair and failed-source-withdrawal scenarios.
  auto replacement_train = Json::parse(first_train);
  replacement_train["annotations"][0]["id"] = 71;
  std::array<std::pair<std::string, std::string>, 2> members{
   {{"annotations/instances_train2017.json", replacement_train.dump()}, {"annotations/instances_val2017.json", file_bytes(indexes / "val2017.fixture.json")}}
  };
- tar(path, members);
- const auto payload = file_bytes(path);
+ const auto payload = tar_bytes(path, members);
  mmltk::backend::data::testsupport::HttpServer server(payload);
  originals.url = server.url("late-original-repair");
  originals.expected_size = payload.size();
@@ -2779,10 +2882,12 @@ TEST_CASE("late original repair settles completed Coconut recovery without retai
  validation.Release();
  mmltk::testsupport::await_test_future(compiling, "late original generation replacement releases all lifecycle leases", 15s);
  CHECK(server.requests() == 1);
+ // CLEANUP-IGNORE: Physical archive and original-annotation repairs independently open the published training output before different label oracles.
  const auto train = CompiledDataset::open(local.output / "train.bin");
  CHECK(train.header().num_images == 4);
  CHECK(train.image_labels(compiled_slot(train, 7, AnnotationSource::CoconutCoco)).size() == 2);
  CHECK(train.image_labels(compiled_slot(train, 8, AnnotationSource::CoconutCoco)).empty());
+ // CLEANUP-IGNORE: Physical-archive repair and original-annotation repair independently verify validation counts and complete label progress after their distinct recovery paths.
  CHECK(CompiledDataset::open(local.output / "val.bin").header().num_images == 1);
  CHECK(settled.tracks.labels.complete);
  CHECK(settled.tracks.labels.completed == settled.tracks.labels.total);
@@ -2814,8 +2919,10 @@ TEST_CASE("a retained extracted stock member shares the remaining sibling walk",
  tar(raw, members);
  catalog.coco_annotations.expected_size = std::filesystem::file_size(raw);
  BenchmarkTraceSink trace;
+ // CLEANUP-IGNORE: Progress and annotation-cache owners remain scoped to separate split-observation and extracted-member tests.
  ProgressReporter progress({}, trace);
  CocoAnnotationCache cache(local.cache, catalog.coco_annotations, {CocoSplitAdmission::Required, CocoSplitAdmission::Required}, 2, 1, 1, {}, trace);
+ // CLEANUP-IGNORE: Independent annotation cache discoveries require pending work before different warm-acquisition and split-settlement checks.
  cache.discover(progress);
  REQUIRE(cache.pending_download());
  auto acquired = download_artifacts({*cache.pending_download()}, 1, {}).front();
@@ -2824,10 +2931,9 @@ TEST_CASE("a retained extracted stock member shares the remaining sibling walk",
  struct stat before{}, after{};
  REQUIRE(::stat(extracted.c_str(), &before) == 0);
  std::uint64_t completed = 0;
+ // CLEANUP-IGNORE: The existing checked-index helper follows separate source settlements whose extracted-inode and event-order assertions differ.
  cache.settle(std::move(acquired), progress, 1, completed, 2);
- const auto admitted = cache.finish();
- REQUIRE(admitted.train);
- REQUIRE(admitted.validation);
+ const auto admitted = checked_original_indexes(cache);
  CHECK(completed == 2);
  REQUIRE(::stat(extracted.c_str(), &after) == 0);
  CHECK(before.st_ino == after.st_ino);
@@ -2898,8 +3004,7 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
   CoconutMaskRecovery replacement_recovery(*replacement_originals);
   input.recovery = &replacement_recovery;
   input.originals = [replacement_originals](CoconutImageNamespace, bool, std::stop_token) { return CoconutOriginalReadiness{replacement_originals, true, 12}; };
-  const auto replacement = import_coconut_annotations(input);
-  REQUIRE(replacement.size() == 1);
+  const auto replacement = checked_single_import(input);
   REQUIRE(native);
   CHECK(native->input_identity() != previous->input_identity());
   CHECK(previous->input_identity() == "293304b221de8f6d6984ad2998e7ec88701087a77e3eb3efb34520a1fbaf51d4");
@@ -2912,6 +3017,7 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
   CHECK(std::memcmp(native->runs().data(), previous->runs().data(), native->runs().size_bytes()) == 0);
   const auto replacement_path = root.path() / "replacement.bin";
   store_coconut_component(replacement_path, replacement.front());
+  // CLEANUP-IGNORE: Reloads use distinct recovery identities and independently guard their result before generation and lineage checks.
   const auto reloaded = load_coconut_component(replacement_path, component.edition(), component.source(), input.input_identity, {}, false, input.physical_membership, &replacement_recovery);
   REQUIRE(reloaded);
   CHECK(reloaded->image_input_identity(0) == native->input_identity());
@@ -2971,19 +3077,22 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  CHECK_THROWS(cached->with_original({indexed_originals, false, 11}));
  CHECK(cached->recovery().front().unresolved == facts.unresolved);
  CHECK(cached->recovery().front().omissions.size() == facts.unresolved);
+ // CLEANUP-IGNORE: Persisted format and recovery admission independently compare their own canonical inventory and annotation identities.
  CHECK(cached->index().annotation_sha256 == component.index().annotation_sha256);
  CHECK(std::ranges::equal(cached->inventory(), component.inventory()));
  const auto roundtrip = root.path() / "recovery-roundtrip.normalized.bin";
- store_coconut_component(roundtrip, *cached);
- for (const auto suffix : {"", ".inventory", ".complete.json"}) CHECK(file_bytes(cache.string() + suffix) == file_bytes(roundtrip.string() + suffix));
+ check_component_roundtrip(cache, roundtrip, *cached);
  for (const auto& previous : {component, *cached}) {
   const auto generation = previous.original_generation();
   CAPTURE(generation);
   const auto bound = previous.with_original({indexed_originals, true, 12});
   std::array parts{CoconutComponentPart{{bound.select_images({0})}, 0, 0}};
-  const auto composed = merge_coconut_components(parts, input.input_identity, *input.physical_membership, root.path());
-  REQUIRE(composed.size() == 1);
-  CHECK(composed.front().original_generation() == 12);
+  const auto merge_generation = [&] {
+   auto merged = merge_one_component_fixture(parts, input.input_identity, *input.physical_membership, root.path());
+   CHECK(merged.front().original_generation() == 12);
+   return merged;
+  };
+  const auto composed = merge_generation();
   CHECK(composed.front().select_images({0}).original_generation() == 12);
   CHECK(previous.original_generation() == generation);
   CHECK(previous.select_images({0}).original_generation() == generation);
@@ -2991,9 +3100,7 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
   CHECK(component.original_generation() == 11);
   CHECK(cached->original_generation() == 0);
   parts.front().components = composed;
-  const auto repeated = merge_coconut_components(parts, input.input_identity, *input.physical_membership, root.path());
-  REQUIRE(repeated.size() == 1);
-  CHECK(repeated.front().original_generation() == 12);
+  const auto repeated = merge_generation();
   CHECK(repeated.front().image_input_identity(0) == component.image_input_identity(0));
   CHECK(repeated.front().matches_inputs(input.input_identity, *input.physical_membership, &recovery));
   CHECK(repeated.front().compiled_ordinal_base(0) == component.compiled_ordinal_base(0));
@@ -3002,22 +3109,19 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
   unsigned publication = 0;
   for (const auto& value : {bound, composed.front(), repeated.front()}) {
    const auto path = root.path() / ("bound-" + std::to_string(generation) + "-" + std::to_string(publication++) + ".normalized.bin");
-   store_coconut_component(path, value);
-   for (const auto suffix : {"", ".inventory", ".complete.json"}) CHECK(file_bytes(cache.string() + suffix) == file_bytes(path.string() + suffix));
+   check_component_roundtrip(cache, path, value);
+   // CLEANUP-IGNORE: Reloads use distinct recovery identities and independently guard their result before generation and lineage checks.
    const auto loaded = load_coconut_component(path, component.edition(), component.source(), input.input_identity, {}, false, input.physical_membership, &recovery);
    REQUIRE(loaded);
    CHECK(loaded->original_generation() == 0);
   }
   // Empty older views contribute no rows or generation to the composition.
   parts.front().components = {previous.select_images({}), bound};
-  const auto with_empty = merge_coconut_components(parts, input.input_identity, *input.physical_membership, root.path());
-  REQUIRE(with_empty.size() == 1);
-  CHECK(with_empty.front().original_generation() == 12);
+  const auto with_empty = merge_generation();
   CHECK(with_empty.front().index().image_count() == 1);
  }
  const std::array unbound{CoconutComponentPart{{*cached}, 0, 0}};
- const auto merged_unbound = merge_coconut_components(unbound, input.input_identity, *input.physical_membership, root.path());
- REQUIRE(merged_unbound.size() == 1);
+ const auto merged_unbound = merge_one_component_fixture(unbound, input.input_identity, *input.physical_membership, root.path());
  CHECK(merged_unbound.front().original_generation() == 0);
  CHECK(merge_coconut_components({}, input.input_identity, *input.physical_membership, root.path()).empty());
  const std::array empty{CoconutComponentPart{{admitted.select_images({})}, 0, 0}};
@@ -3056,6 +3160,11 @@ TEST_CASE("COCONut recovery requires a unique represented match and exact remain
  bool accepted = false;
  bool unavailable = false;
  bool wrong_split = false;
+ const auto append_original = [&] {
+  originals.boxes.push_back(originals.boxes.back());
+  originals.boxes.back().annotation_id = 300;
+  ++originals.images[0].box_count;
+ };
  SECTION("represented dog excludes its original and boxed couch is carved") { accepted = true; }
  SECTION("one survivor intersects both originals") { support[0] = recovery_support(std::array<RLEPair, 1>{{{0, 5}}}); }
  SECTION("survivor has no positive match") { support[0] = recovery_support(std::array<RLEPair, 1>{{{6, 1}}}); }
@@ -3066,15 +3175,9 @@ TEST_CASE("COCONut recovery requires a unique represented match and exact remain
  SECTION("two survivors claim one original") {
   record.segments.push_back({.id = 40, .category_id = 18, .isthing = true});
   support.push_back(support[0]);
-  originals.boxes.push_back(originals.boxes.back());
-  originals.boxes.back().annotation_id = 300;
-  ++originals.images[0].box_count;
+  append_original();
  }
- SECTION("unrelated extra original is not recovered") {
-  originals.boxes.push_back(originals.boxes.back());
-  originals.boxes.back().annotation_id = 300;
-  ++originals.images[0].box_count;
- }
+ SECTION("unrelated extra original is not recovered") { append_original(); }
  SECTION("duplicate original identity") { originals.boxes[1].annotation_id = originals.boxes[0].annotation_id; }
  SECTION("invalid candidate mask") { originals.mask_rle_pairs[1].length = 100; }
  SECTION("candidate without mask presence") { originals.boxes[1].flags &= ~kAnnotationMask; }
@@ -3157,8 +3260,10 @@ TEST_CASE("COCONut recovery propagates cancellation before mutating masks", "[co
  const std::array<RLEPair, 1> masks{{{0, 2}}};
  const auto originals = recovery_originals(7, masks);
  const auto indexed_originals_view = fixture_index(originals);
+ // CLEANUP-IGNORE: These identical segment literals are explicit inputs to separate recovery cancellation and immutable-custody tests.
  CoconutRecoveryOriginals indexed_originals(&indexed_originals_view, nullptr);
  CoconutMaskRecovery recovery(indexed_originals);
+ // CLEANUP-IGNORE: The repeated segment literals are independent inputs to cancellation and multi-batch lookup-custody tests, with different recovery-state ownership.
  CoconutRecord record;
  record.image_id = 7;
  record.segments = {{.id = 10, .category_id = 18, .isthing = true}};
@@ -3326,8 +3431,7 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
   input.recovery = &recovery;
   input.parquet_shards = {root.path() / "source.parquet"};
   write_coconut_parquet(input.parquet_shards[0], Json::array({hf_row(id, file_bytes(fixtures / (std::to_string(id) + ".mask.png")), source.at("segments"), width, height)}));
-  const auto result = import_coconut_annotations(input);
-  REQUIRE(result.size() == 1);
+  const auto result = checked_single_import(input);
   const auto& component = result.front();
   REQUIRE(component.recovery().size() == 1);
   REQUIRE(component.recovery().front().objects.size() == (id == 2212 ? 2 : 1));
@@ -3362,14 +3466,12 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
    }
   }
   const auto path = root.path() / "recovered.normalized.bin";
-  store_coconut_component(path, component);
-  const auto cached = load_coconut_component(path, component.edition(), component.source(), component.input_identity());
-  REQUIRE(cached);
+  const auto cached = reload_coconut_component(path, component);
   CHECK(cached->index().annotation_sha256 == component.index().annotation_sha256);
   CHECK(cached->recovery().front().objects.size() == component.recovery().front().objects.size());
   const std::array parts{CoconutComponentPart{{component}, 0, 0}};
-  const auto merged = merge_coconut_components(parts, input.input_identity, *input.physical_membership, root.path());
-  REQUIRE(merged.size() == 1);
+  const auto merged = merge_one_component_fixture(parts, input.input_identity, *input.physical_membership, root.path());
+  // CLEANUP-IGNORE: Source-dog recovery and consumed-artifact admission independently verify canonical identities after their own merge operations.
   CHECK(merged.front().input_identity() == component.input_identity());
   CHECK(merged.front().index().annotation_sha256 == component.index().annotation_sha256);
   const auto merged_path = root.path() / "recovered-merged.normalized.bin";
@@ -3390,6 +3492,7 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
 }
 TEST_CASE("optional COCO split admission is independent and never conceals output failures", "[coconut][benchmark][cache]") {
  ScopedTempDir root("coco-optional-admission");
+ // CLEANUP-IGNORE: The custom catalog factory owns setup; independent split-admission tests retain explicit train/validation cache paths for different mutations.
  LocalCoconutRecipe local(root.path());
  auto catalog = local_custom_catalog(local);
  const auto train = local.cache.source_indexes("coco") / "train2017.normalized.bin";
@@ -3543,8 +3646,7 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
  LocalCoconutRecipe local(root.path());
  for (auto& release : local.catalog.releases) {
   if (release.edition != CoconutEdition::Base && release.edition != CoconutEdition::RelabeledValidation) continue;
-  auto& artifact = release.annotations.front();
-  const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+  auto [artifact, path] = local.cached_annotation(release);
   const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1}, empty{};
   auto rows = Json::array({hf_row(release.edition == CoconutEdition::Base ? 7 : 9, png(3, 3, pixels), Json::array({segment(1, 63), segment(2, 18)}))});
   if (release.edition == CoconutEdition::Base) rows.push_back(hf_row(8, png(3, 3, empty), Json::array(), 3, 3, "unlabeled2017"));
@@ -3568,8 +3670,7 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
   const auto catalog = local.selected(choice);
   for (const bool enabled : {false, true, true, false, true}) {
    config.selection.recover_dropped_masks = enabled;
-   compile_benchmark_recipe(config, &catalog);
-   const auto manifest = Json::parse(file_bytes(config.output_dir / "benchmark_manifest.json")).at("recipe");
+   const auto manifest = compile_recipe_manifest(config, catalog);
    CHECK(manifest.at("recovered_objects") == (enabled ? (choice == CoconutValidation::Stock ? 1 : 2) : 0));
    CHECK(manifest.at("unresolved_objects") == 0);
    const auto train_bytes = benchmark_semantics(config.output_dir / "train.bin");
@@ -3607,8 +3708,7 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
  // required Stock validation beside an unavailable optional train original.
  const auto archive_path = local.cache.source_downloads("coco") / local.catalog.stock_annotations.filename;
  const std::array<std::pair<std::string, std::string>, 1> unavailable{{{"annotations/unrelated.json", "{}"}}};
- tar(archive_path, unavailable);
- const auto server_payload = file_bytes(archive_path);
+ const auto server_payload = tar_bytes(archive_path, unavailable);
  mmltk::backend::data::testsupport::HttpServer server(server_payload);
  local.catalog.stock_annotations.url = server.url("unavailable-originals");
  local.catalog.stock_annotations.expected_size = std::filesystem::file_size(archive_path);
@@ -3618,8 +3718,7 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
   remove_normalized_annotation_index(path);
   config.selection.validation = missing_train ? CoconutValidation::Stock : CoconutValidation::CoconutStock;
   const auto selected = local.selected(config.selection.validation);
-  compile_benchmark_recipe(config, &selected);
-  const auto manifest = Json::parse(file_bytes(config.output_dir / "benchmark_manifest.json")).at("recipe");
+  const auto manifest = compile_recipe_manifest(config, selected);
   CHECK(manifest.at("recovered_objects") == (missing_train ? 0 : 1));
   CHECK(manifest.at("unresolved_objects") == 1);
   CHECK(manifest.at("original_annotations").at(missing_train ? "train" : "validation").is_null());
@@ -3629,8 +3728,7 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
   restored.split = split;
   restored.annotation_sha256 = std::string(64, missing_train ? 'c' : 'b');
   store_normalized_annotation_index(path, fixture_index(restored), {});
-  compile_benchmark_recipe(config, &selected);
-  const auto retried = Json::parse(file_bytes(config.output_dir / "benchmark_manifest.json")).at("recipe");
+  const auto retried = compile_recipe_manifest(config, selected);
   CHECK(retried.at("recovered_objects") == (missing_train ? 1 : 2));
   CHECK(retried.at("unresolved_objects") == 0);
   CHECK(file_bytes(base_path) == base_bytes);
@@ -3638,6 +3736,7 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
  }
  server.Check();
  const auto published_before_cancel = file_bytes(config.output_dir / "train.bin");
+ // CLEANUP-IGNORE: Cancellation is injected independently into different publication scenarios, which preserve different sets of incumbent outputs.
  std::atomic<bool> stop{true};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(stop);
  CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
@@ -3683,9 +3782,7 @@ TEST_CASE("COCONut recovery facts follow physical images when import rows are re
  REQUIRE(components.size() == 1);
  const auto& component = components.front();
  const auto path = root.path() / "ordered.normalized.bin";
- store_coconut_component(path, component);
- const auto cached = load_coconut_component(path, component.edition(), component.source(), component.input_identity());
- REQUIRE(cached);
+ const auto cached = reload_coconut_component(path, component);
  for (const auto* product : {&component, &*cached}) {
   REQUIRE(product->recovery().size() == physical.size());
   REQUIRE(product->inventory().size() == physical.size());
@@ -3746,17 +3843,13 @@ TEST_CASE("COCONut recovery facts follow physical images when import rows are re
  CHECK(membership.index().annotation_sha256 == selected.index().annotation_sha256);
  CHECK(membership.completion() == selected.completion());
  const auto selected_path = root.path() / "selected-recovery.normalized.bin";
- store_coconut_component(selected_path, selected);
- const auto selected_cache = load_coconut_component(selected_path, selected.edition(), selected.source(), selected.input_identity());
- REQUIRE(selected_cache);
+ const auto selected_cache = reload_coconut_component(selected_path, selected);
  CHECK(selected_cache->index().image_count() == 2);
  CHECK(selected_cache->recovery_image(1).objects.front().source_ordinal == selected.recovery_image(1).objects.front().source_ordinal);
  CHECK(selected.completion()->images == physical.size());
  const auto roundtrip = root.path() / "roundtrip.normalized.bin";
- store_coconut_component(roundtrip, *cached);
- for (const auto suffix : {"", ".inventory", ".complete.json"}) CHECK(file_bytes(path.string() + suffix) == file_bytes(roundtrip.string() + suffix));
- const auto rebuilt = import_coconut_annotations(input);
- REQUIRE(rebuilt.size() == 1);
+ check_component_roundtrip(path, roundtrip, *cached);
+ const auto rebuilt = checked_single_import(input);
  CHECK(rebuilt.front().source_ordinals_complete(0));
  CHECK((rebuilt.front().index().storage().boxes.front().flags & kAnnotationOrdinalIncomplete) == 0);
  CHECK(rebuilt.front().index().annotation_sha256 == component.index().annotation_sha256);
@@ -3793,11 +3886,13 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
  SECTION("same training population labels overlap later pixel progress") {}
  SECTION("cancellation drains the held reader and retains the old generation") { cancel_reader = true; }
  ScopedTempDir root("custom-label-overlap");
+ // CLEANUP-IGNORE: The shared training-window and compiler-config factories prepare independent overlap and readiness-window scenarios with different worker policies.
  LocalCoconutRecipe local(root.path());
  auto [custom, ids] = custom_training_window(local);
  auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock}, true);
  compile_benchmark_recipe(config, nullptr, &custom);
  compile_benchmark_recipe(config, nullptr, &custom);
+ // CLEANUP-IGNORE: Shared publication capture and semantic readers independently preserve train/validation oracles before different concurrency mutations.
  const auto [train, validation, manifest] = capture_publication_bytes(local.output);
  const auto train_semantics = benchmark_semantics(local.output / "train.bin");
  const auto validation_semantics = benchmark_semantics(local.output / "val.bin");
@@ -3900,8 +3995,7 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
  ServedPhysicalArchive physical(local.cache, catalog, CoconutImageNamespace::CocoTrain, "physical");
  std::filesystem::remove(physical.path);
  auto& release = catalog.releases.front();
- auto& artifact = release.annotations.front();
- const auto annotation_path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+ auto [artifact, annotation_path] = local.cached_annotation(release);
  const auto annotation_bytes = file_bytes(annotation_path);
  const std::vector<std::uint8_t> annotation_payload(annotation_bytes.begin(), annotation_bytes.end());
  mmltk::backend::data::testsupport::HttpServer annotation_server(annotation_payload);
@@ -3941,8 +4035,10 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
 }
 TEST_CASE("COCONut contradictory annotation geometry remains excluded across pixel cache repair", "[benchmark][coconut][pipeline]") {
  ScopedTempDir root("coconut-header-repair");
+ // CLEANUP-IGNORE: The existing local-recipe owner and catalog selector are shared fixture APIs; geometry and checksum cases mutate different artifacts.
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::CoconutStock);
+ // CLEANUP-IGNORE: Each scenario selects the same fixture archive through existing catalog ownership before different member mutations.
  auto& physical = *std::ranges::find(catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
  const auto archive = local.cache.source_downloads("objects365") / physical.artifact.filename;
  const std::array<std::pair<std::string, std::string>, 2> members{{{objects(1).member, white_jpeg(6, 4)}, {objects(2).member, white_jpeg(6, 4)}}};
@@ -3975,6 +4071,7 @@ TEST_CASE("COCONut contradictory annotation geometry remains excluded across pix
 }
 TEST_CASE("production output admission counts only unsettled occupied extents", "[benchmark][coconut][storage]") {
  ScopedTempDir root("output-additional-storage");
+ // CLEANUP-IGNORE: The recipe owner and selected catalog precede distinct storage-budget and immutable-admission behavior.
  LocalCoconutRecipe local(root.path());
  const auto catalog = local.selected(CoconutValidation::CoconutStock);
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock});
@@ -3987,9 +4084,9 @@ TEST_CASE("production output admission counts only unsettled occupied extents", 
 }
 TEST_CASE("COCONut cold partial and warm preparation admit each immutable product once", "[benchmark][coconut][pipeline]") {
  ScopedTempDir root("coconut-retained-admission");
+ // CLEANUP-IGNORE: The recipe owner and selected catalog precede distinct storage-budget and immutable-admission behavior.
  LocalCoconutRecipe local(root.path());
- const auto catalog = local.selected(CoconutValidation::CoconutStock);
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  std::vector<std::string> annotation_ids;
  for (const auto& release : catalog.releases)
   for (const auto& artifact : release.annotations) annotation_ids.push_back(artifact.artifact_id);
@@ -4062,10 +4159,7 @@ TEST_CASE("COCONut consumes ready releases while an unrelated lifecycle lease is
  SECTION("an unreadable later release retains healthy independent images") { fail_blocked_release = true; }
  ScopedTempDir root("coconut-release-readiness");
  LocalCoconutRecipe local(root.path());
- auto catalog = local.selected(CoconutValidation::CoconutStock);
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
- compile_benchmark_recipe(config, &catalog);
- compile_benchmark_recipe(config, &catalog);
+ auto [config, catalog] = local.compiled_warm({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock});
  const auto train = file_bytes(local.output / "train.bin");
  const auto validation = file_bytes(local.output / "val.bin");
  const auto manifest = file_bytes(local.output / "benchmark_manifest.json");
@@ -4084,8 +4178,7 @@ TEST_CASE("COCONut consumes ready releases while an unrelated lifecycle lease is
   auto& artifact = catalog.releases.front().annotations.front();
   const auto path = local.cache.source_downloads("coconut-" + std::string(blocked_release.name)) / artifact.filename;
   mmltk::testsupport::write_text_file(path, "invalid required Parquet release");
-  artifact.expected_size = std::filesystem::file_size(path);
-  artifact.expected_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+  match_artifact_bytes(artifact, path);
   // The poisoned catalog-matching artifact fails structurally without retrying
   // an unrelated network endpoint. Its former normalized products are stale.
  }
@@ -4144,8 +4237,7 @@ TEST_CASE("concurrent recovery workspaces share immutable physical lookups", "[b
  };
  auto left = std::async(std::launch::async, [&] { return recover(first); });
  auto right = std::async(std::launch::async, [&] { return recover(second); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { readers.Release(); });
- REQUIRE(readers.WaitEntered(2s, 2));
+ const mmltk::testsupport::AwaitedTestGate release(readers, 2s, 2);
  readers.Release();
  const auto a = mmltk::testsupport::await_test_future(left, "first recovery workspace");
  const auto b = mmltk::testsupport::await_test_future(right, "second recovery workspace");
@@ -4163,9 +4255,9 @@ TEST_CASE("cancellation retires release work while original annotations are lock
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPU lanes");
  ScopedTempDir root("coconut-originals-cancellation");
+ // CLEANUP-IGNORE: Shared recipe configuration and publication fixtures establish separate cancellation and local-rejection scenarios.
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  compile_benchmark_recipe(config, &catalog);
  const auto [train, validation, manifest] = capture_publication_bytes(local.output);
  auto originals = ArtifactLease::acquire(local.cache.locks / "coco-annotations.lifecycle.lock", {});
@@ -4190,10 +4282,8 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
  using namespace std::chrono_literals;
  ScopedTempDir root("coconut-metadata-receiver");
  LocalCoconutRecipe local(root.path());
- auto catalog = local.selected(CoconutValidation::CoconutStock);
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
- compile_benchmark_recipe(config, &catalog);
- compile_benchmark_recipe(config, &catalog);
+ auto [config, catalog] = local.compiled_warm({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock});
+ // CLEANUP-IGNORE: Shared publication capture and semantic readers independently preserve train/validation oracles before different concurrency mutations.
  const auto [train, validation, manifest] = capture_publication_bytes(local.output);
  const auto train_semantics = benchmark_semantics(local.output / "train.bin");
  const auto validation_semantics = benchmark_semantics(local.output / "val.bin");
@@ -4272,6 +4362,7 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
   auto& release = *std::ranges::find(catalog.releases, CoconutEdition::Base, &CoconutReleaseComponent::edition);
   auto& physical = *std::ranges::find(catalog.images, CoconutImageNamespace::CocoTrain, &RecipeImageArchive::source);
   const auto archive = local.cache.source_downloads("coco") / physical.artifact.filename;
+  // CLEANUP-IGNORE: The PNG generator is shared; empty row and member containers belong to independent cold-progress and warm-membership fixtures.
   const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1};
   const auto mask = png(3, 3, pixels);
   Json rows = Json::array();
@@ -4283,8 +4374,7 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
   tar(archive, members);
   physical.artifact.expected_size = std::filesystem::file_size(archive);
   release.expected_rows = rows.size();
-  auto& artifact = release.annotations.front();
-  const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+  auto [artifact, path] = local.cached_annotation(release);
   write_coconut_parquet(path, rows, coconut_parquet_schema(), 1, {}, parquet::WriterProperties::Builder().compression(parquet::Compression::UNCOMPRESSED)->build());
   annotation_payload = file_bytes(path);
   annotation_server = std::make_unique<mmltk::backend::data::testsupport::HttpServer>(annotation_payload);
@@ -4427,6 +4517,7 @@ TEST_CASE("cold benchmark readers finish oversized grants with retained release 
  auto work = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup cancel([&] { cancelled.store(true); });
  const auto result = mmltk::testsupport::await_test_future(work, "cold annotation shared grant");
+ // CLEANUP-IGNORE: Independent import scenarios explicitly require one component and one image before checking different resource and notification outcomes.
  REQUIRE(result.size() == 1);
  CHECK(result.front().index().image_count() == 1);
  CHECK(execution.execution().try_reserve({65537, 0, true}).has_value());
@@ -4441,9 +4532,7 @@ TEST_CASE("one archive controller selects independent or prefetched work from re
  SECTION("source failure releases an admission waiter with both prefetches held") { release_capacity = fail_wait = true; }
  ScopedTempDir root("custom-controller-descriptor-dependency");
  LocalCoconutRecipe local(root.path());
- auto catalog = local_custom_catalog(local);
- auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
- config.num_workers = 1;
+ auto [catalog, config] = custom_configuration(local);
  std::atomic<bool> cancelled{false}, first_selection{true};
  mmltk::testsupport::TestGate selection("metadata finished before archive selection"), prefetch("prefetch owns its source envelope"), denied("independent source has no admission"),
   independent("Objects365 pixel before COCO prefetch settlement"), archive_selection("archive controller before source choice"), pixel("last Open Images reader owns group custody"),
@@ -4607,6 +4696,7 @@ TEST_CASE("custom preparation retains its prerequisite beside prefetched archive
  BenchmarkTraceSink trace;
  CHECK(download_artifacts({make_download_request(local.cache, "coco", catalog.coco_train_images)}, 1, cancellation, {}, trace, {}, &execution, train).size() == 1);
  CHECK(download_artifacts({make_download_request(local.cache, "coco", catalog.coco_val_images)}, 1, cancellation, {}, trace, {}, &execution, validation).size() == 1);
+ // CLEANUP-IGNORE: The progress owner and existing recipe factory precede different retained-lease and HTTP admission lifetimes.
  ProgressReporter progress({}, trace);
  const auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
  auto work = std::async(std::launch::async, [&] { return prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, trace, {}, &execution, std::move(preparation)); });
@@ -4690,19 +4780,19 @@ TEST_CASE("COCONut JSON source rejection leaves shared CPU admission usable", "[
  json_file(input.annotation_json, {{"images", Json::array({image, image})}, {"annotations", Json::array({annotation})}});
  CHECK_THROWS(import_coconut_annotations(input));
  json_file(input.annotation_json, {{"images", Json::array({image})}, {"annotations", Json::array({annotation})}});
- const auto result = import_coconut_annotations(input);
- REQUIRE(result.size() == 1);
+ const auto result = checked_single_import(input);
  CHECK(result.front().index().image_count() == 1);
 }
 TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass finishes", "[benchmark][coconut][pipeline]") {
  ScopedTempDir root("shared-json-fairness");
  BenchmarkCompilePipeline execution(1);
+ // CLEANUP-IGNORE: The cached mask factory already owns generation; each scenario supplies its own path and keeps the resulting input alive.
  const auto images = root.path() / "images";
  auto [split, encoded] = cached_mask_pixel_fixture(images);
- BenchmarkWriteRequest pixels{.split = split, .output_path = root.path() / "result.bin", .resolution = 1, .num_workers = 1, .execution = &execution};
- BenchmarkSplitWriter writer(pixels);
- BenchmarkCompilePipeline::Attempt attempt(execution);
- bind_benchmark_slots(execution, writer, split);
+ BenchmarkWriteRequest writer_input{.split = split, .output_path = root.path() / "result.bin", .resolution = 1, .num_workers = 1, .execution = &execution};
+ // CLEANUP-IGNORE: The shared bound writer owns request, attempt, and resource ordering; independent JSON and Parquet scenarios retain their own pixel task and owner lifetimes.
+ mmltk::backend::data::testsupport::BoundBenchmarkWriter bound_writer(execution, std::move(writer_input));
+ auto& writer = bound_writer.writer;
  // Measure yielding to ready CPU work; asynchronous input/output preparation
  // has its own scheduling and must not race the parser's bounded checkpoint.
  auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
@@ -4784,6 +4874,7 @@ TEST_CASE("custom annotation sources preserve independent HTTP and lifecycle adm
   } else if (event == "benchmark.annotations.cache_hit" && fields.at("source") != "coco" && completed.fetch_add(1) == 1)
    independent.set_value();
  };
+ // CLEANUP-IGNORE: The progress owner and existing recipe factory precede different retained-lease and HTTP admission lifetimes.
  ProgressReporter progress({}, trace);
  const auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
  auto work = std::async(std::launch::async, [&] { return prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, trace, {}, &execution); });
@@ -4866,9 +4957,7 @@ TEST_CASE("a contended archive lock leaves the sole controller available to read
  SECTION("cancellation retires prefetched leases while the unrelated lock stays held") { cancel_wait = true; }
  ScopedTempDir root("contended-archive-selector");
  LocalCoconutRecipe local(root.path());
- auto catalog = local_custom_catalog(local);
- auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
- config.num_workers = 1;
+ auto [catalog, config] = custom_configuration(local);
  auto blocked = ArtifactLease::acquire(local.cache.locks / "objects365-patch-32.images.lock", {});
  mmltk::testsupport::TestGate train("train prefetch before cache admission"), validation("validation prefetch before cache admission"), waiting("selector returned failed lock custody");
  std::atomic<bool> cancelled{false}, observed_wait{false};
@@ -4961,9 +5050,7 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
   for (const auto& [member, bytes] : members) {
    std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
    archive_entry_set_pathname(entry.get(), member.c_str());
-   archive_entry_set_filetype(entry.get(), AE_IFREG);
-   archive_entry_set_perm(entry.get(), 0600);
-   archive_entry_set_size(entry.get(), bytes.size());
+   mmltk::backend::data::testsupport::set_private_archive_entry(entry.get(), bytes.size());
    REQUIRE(archive_write_header(output.get(), entry.get()) == ARCHIVE_OK);
    REQUIRE(archive_write_data(output.get(), bytes.data(), bytes.size()) == static_cast<la_ssize_t>(bytes.size()));
   }
@@ -4995,6 +5082,7 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
  }
  REQUIRE(input.next());
  CHECK(input.member() == members[1].first);
+ // CLEANUP-IGNORE: Forward and resumed reads independently prove the same original archive generation remains visible.
  const auto second = input.read(1024);
  CHECK(std::string(second.begin(), second.end()) == members[1].second);
  const auto replacement = root.path() / "replacement.tar";
@@ -5009,6 +5097,7 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
  // Admission itself does not consume the saved member; resuspending before a
  // read must keep its metadata even though the fresh decoder starts at zero.
  input.suspend();
+ // CLEANUP-IGNORE: Forward and resumed reads independently prove the same original archive generation remains visible.
  const auto resumed_second = input.read(1024);
  CHECK(std::string(resumed_second.begin(), resumed_second.end()) == members[1].second);
  REQUIRE(input.seek(first_position));
@@ -5123,14 +5212,10 @@ TEST_CASE("archive consumed-member checks retain sparse payloads and reject requ
   std::string bytes((2U << 20) + 8192, '\0');
   bytes.replace(0, 4, "head");
   bytes.replace(bytes.size() - 4, 4, "tail");
-  std::unique_ptr<archive, decltype(&archive_write_free)> output(archive_write_new(), archive_write_free);
-  REQUIRE(archive_write_set_format_pax(output.get()) == ARCHIVE_OK);
-  REQUIRE(archive_write_open_filename(output.get(), path.c_str()) == ARCHIVE_OK);
+  auto output = open_pax_archive(path);
   std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
   archive_entry_set_pathname(entry.get(), "sparse.bin");
-  archive_entry_set_filetype(entry.get(), AE_IFREG);
-  archive_entry_set_perm(entry.get(), 0600);
-  archive_entry_set_size(entry.get(), bytes.size());
+  mmltk::backend::data::testsupport::set_private_archive_entry(entry.get(), bytes.size());
   archive_entry_sparse_add_entry(entry.get(), 0, 4);
   archive_entry_sparse_add_entry(entry.get(), bytes.size() - 4, 4);
   REQUIRE(archive_write_header(output.get(), entry.get()) == ARCHIVE_OK);
@@ -5139,11 +5224,13 @@ TEST_CASE("archive consumed-member checks retain sparse payloads and reject requ
   BenchmarkArchive input(path);
   REQUIRE(input.next());
   auto actual = input.read(bytes.size());
+  // CLEANUP-IGNORE: Identical sparse payload checks intentionally bracket pause and resume of the held archive generation.
   CHECK(std::string(actual.begin(), actual.end()) == bytes);
   input.pause();
   input.resume(bytes.size());
   REQUIRE(input.seek("sparse.bin"));
   actual = input.read(bytes.size());
+  // CLEANUP-IGNORE: Identical sparse payload checks intentionally bracket pause and resume of the held archive generation.
   CHECK(std::string(actual.begin(), actual.end()) == bytes);
   input.pause();
   const std::array required{std::string("sparse.bin")};
@@ -5177,9 +5264,7 @@ TEST_CASE("archive consumed-member checks retain sparse payloads and reject requ
   CHECK_THROWS_AS(input.visit_known(required, [](std::size_t) {}), BenchmarkArchiveError);
  }
  SECTION("a consumed symbolic link is rejected") {
-  std::unique_ptr<archive, decltype(&archive_write_free)> output(archive_write_new(), archive_write_free);
-  REQUIRE(archive_write_set_format_pax(output.get()) == ARCHIVE_OK);
-  REQUIRE(archive_write_open_filename(output.get(), path.c_str()) == ARCHIVE_OK);
+  auto output = open_pax_archive(path);
   std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
   archive_entry_set_pathname(entry.get(), "image.jpg");
   archive_entry_set_filetype(entry.get(), AE_IFLNK);
@@ -5196,6 +5281,7 @@ TEST_CASE("COCONut physical consumers keep healthy members around malformed arch
  ScopedTempDir root("physical-request-routing");
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::Coconut);
+ // CLEANUP-IGNORE: Each scenario selects the same fixture archive through existing catalog ownership before different member mutations.
  auto& physical = *std::ranges::find(catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
  const auto path = local.cache.source_downloads("objects365") / physical.artifact.filename;
  // Healthy members become useful before the malformed tail is rejected by
@@ -5204,8 +5290,7 @@ TEST_CASE("COCONut physical consumers keep healthy members around malformed arch
  tar(path, members);
  physical.artifact.expected_size = std::filesystem::file_size(path);
  auto& base = *std::ranges::find(catalog.releases, CoconutEdition::Base, &CoconutReleaseComponent::edition);
- auto& artifact = base.annotations.front();
- const auto parquet = local.cache.source_downloads("coconut-" + std::string(base.name)) / artifact.filename;
+ auto [artifact, parquet] = local.cached_annotation(base);
  const std::array<std::uint32_t, 9> empty{};
  // An incorrect recognized hint and an unknown hint both retain identity until
  // a real eligible source supplies the requested member.
@@ -5330,9 +5415,7 @@ TEST_CASE("consumed ZIP checksums and truncated gzip filters remain source failu
   REQUIRE(archive_write_open_filename(output.get(), path.c_str()) == ARCHIVE_OK);
   std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
   archive_entry_set_pathname(entry.get(), "payload.bin");
-  archive_entry_set_filetype(entry.get(), AE_IFREG);
-  archive_entry_set_perm(entry.get(), 0600);
-  archive_entry_set_size(entry.get(), payload.size());
+  mmltk::backend::data::testsupport::set_private_archive_entry(entry.get(), payload.size());
   REQUIRE(archive_write_header(output.get(), entry.get()) == ARCHIVE_OK);
   REQUIRE(archive_write_data(output.get(), payload.data(), payload.size()) == static_cast<la_ssize_t>(payload.size()));
   REQUIRE(archive_write_close(output.get()) == ARCHIVE_OK);
@@ -5448,6 +5531,7 @@ TEST_CASE("gzip dictionary eviction preserves parallel forward work and bounded 
  {
   BenchmarkArchive input(path, &execution.execution(), 1024, {}, 2, true, {}, control_limit ? 1024 : 2, 0, control_limit ? 1 : 32768);
   REQUIRE(input.next());
+  // CLEANUP-IGNORE: The two saved stream positions precede distinct forward-read and dictionary-eviction behavior.
   const auto first = input.member_position();
   const auto initial = input.read(1024);
   CHECK(std::string(initial.begin(), initial.end()) == "first");
@@ -5472,6 +5556,7 @@ TEST_CASE("gzip dictionary eviction preserves parallel forward work and bounded 
    CHECK(consumed == payload_bytes);
    REQUIRE(input.next());
    REQUIRE(input.member() == "last.bin");
+   // CLEANUP-IGNORE: The two saved stream positions precede distinct forward-read and dictionary-eviction behavior.
    const auto last = input.member_position();
    const auto bytes = input.read(1024);
    CHECK(std::string(bytes.begin(), bytes.end()) == "last");
@@ -5515,8 +5600,7 @@ TEST_CASE("physical metadata and pixels progress while stock originals are held"
  using namespace std::chrono_literals;
  ScopedTempDir root("coconut-independent-originals");
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut, true});
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut, true});
  std::atomic<bool> cancelled{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  std::optional<ArtifactLease> originals(ArtifactLease::acquire(local.cache.locks / "coco-annotations.lifecycle.lock", {}));
@@ -5553,8 +5637,7 @@ TEST_CASE("independent physical archives resolve while one image source is held"
  using namespace std::chrono_literals;
  ScopedTempDir root("coconut-independent-physical-archives");
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut});
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut});
  std::optional<ArtifactLease> source(ArtifactLease::acquire(local.cache.locks / "coco-train2017.images.lock", {}));
  std::atomic<bool> cancelled{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
@@ -5586,10 +5669,7 @@ TEST_CASE("XL discovery normalizes ready labels before later JSON parsing", "[be
  };
  tar(path, members);
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
- const auto images = cache.source_downloads("objects365") / "physical.tar";
- const auto jpeg = white_jpeg();
- const std::array<std::pair<std::string, std::string>, 1> image_members{{{objects(3).member, jpeg}}};
- tar(images, image_members);
+ const auto [images, jpeg] = white_objects_archive(cache);
  CoconutRecipeCatalog catalog;
  catalog.releases.push_back({CoconutEdition::XLarge, "fixture-xl", "fixture-v1", 1, {}});
  catalog.images.push_back(
@@ -5649,8 +5729,7 @@ TEST_CASE("failed XL generations retire oversized backing before source repair",
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::Coconut);
  auto& release = *std::ranges::find(catalog.releases, CoconutEdition::XLarge, &CoconutReleaseComponent::edition);
- auto& artifact = release.annotations.front();
- const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+ auto [artifact, path] = local.cached_annotation(release);
  const auto payload = file_bytes(path);
  const std::array<std::uint32_t, 9> support{1, 1, 1, 1, 1, 1, 1, 1, 1};
  const std::array<std::pair<std::string, std::string>, 4> malformed{
@@ -5702,11 +5781,11 @@ TEST_CASE("required release checksum read failures remain fatal independently of
  SECTION("without tracing") {}
  SECTION("with tracing") { diagnostics = true; }
  ScopedTempDir root("coconut-required-checksum");
+ // CLEANUP-IGNORE: The existing local-recipe owner and catalog selector are shared fixture APIs; geometry and checksum cases mutate different artifacts.
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::CoconutStock);
  auto& release = *std::ranges::find(catalog.releases, CoconutEdition::Large, &CoconutReleaseComponent::edition);
- auto& artifact = release.annotations.front();
- const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+ auto [artifact, path] = local.cached_annotation(release);
  const auto mask_path = local.cache.source_downloads("coconut-" + std::string(release.name)) / release.annotations.back().filename;
  const auto original = file_bytes(path);
  mmltk::backend::data::testsupport::HttpServer server(original);
@@ -5775,16 +5854,15 @@ TEST_CASE("known XL masks preserve canonical ordinals across physical archive or
   if (format == ARCHIVE_FORMAT_TAR_USTAR) contents[2].first = "unused/payload.bin";
   tar(input.mask_archive, contents, false, format);
   input.metadata_only = true;
-  const auto metadata = import_coconut_annotations(input);
-  REQUIRE(metadata.size() == 1);
+  const auto metadata = checked_single_import(input);
   REQUIRE(input.records->size() == 2);
   CHECK(input.records->record(0).image_id == 2);
   CHECK(input.records->record(0).first_segment_ordinal == 0);
   CHECK(input.records->record(1).first_segment_ordinal == 2);
   input.metadata_only = false;
-  auto result = import_coconut_annotations(input);
-  REQUIRE(result.size() == 1);
+  auto result = checked_single_import(input);
   const auto& component = result.front();
+  // CLEANUP-IGNORE: Parquet and XL archive readers independently require their fixture-specific row cardinality before distinct image-identity checks.
   REQUIRE(component.index().image_count() == 2);
   REQUIRE(component.index().box_count() == 2);
   CHECK(component.index().images()[0].source_image_id == 2);
@@ -5819,8 +5897,7 @@ TEST_CASE("known XL masks preserve canonical ordinals across physical archive or
     CHECK_THROWS(import_coconut_annotations(input));
    else {
     input.accept_partial = true;
-    const auto partial = import_coconut_annotations(input);
-    REQUIRE(partial.size() == 1);
+    const auto partial = checked_single_import(input);
     CHECK(std::ranges::any_of(std::views::iota(std::size_t{0}, partial.front().index().image_count()), [&](std::size_t row) { return !partial.front().required_labels_valid(row); }));
    }
   }
@@ -5828,7 +5905,9 @@ TEST_CASE("known XL masks preserve canonical ordinals across physical archive or
 }
 TEST_CASE("physical owner withdraws only affected routes and refreshes their consumer envelope", "[benchmark][coconut][archive]") {
  ScopedTempDir root("physical-owner-withdrawal");
+ // CLEANUP-IGNORE: The shared recipe and archive factories precede separate physical owners for route withdrawal and readiness-registration lifetime tests.
  LocalCoconutRecipe local(root.path());
+ // CLEANUP-IGNORE: The admitted-archive factory and physical owner are shared; different route and readiness tests require distinct catalog data and subscription lifetimes.
  auto admitted = local_physical_archives(local.cache, local.catalog);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 16});
  CoconutPhysicalMembership physical(admitted, local.catalog, true, local.cache, execution.storage(), execution);
@@ -5894,6 +5973,7 @@ TEST_CASE("physical readiness captures each generation before reentrant and late
  LocalCoconutRecipe local(root.path());
  const std::array conflicting{std::pair{coco(7, CoconutImageNamespace::CocoUnlabeled).member, white_jpeg()}};
  replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoUnlabeled, conflicting);
+ // CLEANUP-IGNORE: The admitted-archive factory and physical owner are shared; different route and readiness tests require distinct catalog data and subscription lifetimes.
  auto admitted = local_physical_archives(local.cache, local.catalog);
  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 16});
  CoconutPhysicalMembership physical(admitted, local.catalog, true, local.cache, pipeline.storage(), pipeline);
@@ -5974,6 +6054,7 @@ TEST_CASE("physical readiness captures each generation before reentrant and late
 }
 TEST_CASE("physical readiness registrations release callbacks without cancelling same-image peers", "[benchmark][coconut][pipeline][recovery]") {
  ScopedTempDir root("physical-registration-custody");
+ // CLEANUP-IGNORE: The shared recipe and archive factories precede separate physical owners for route withdrawal and readiness-registration lifetime tests.
  LocalCoconutRecipe local(root.path());
  auto admitted = local_physical_archives(local.cache, local.catalog);
  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 16});
@@ -6028,6 +6109,7 @@ TEST_CASE("physical repair shares source selection admission bounds and rejectio
  CAPTURE(blocking, scenario);
  const bool unreadable = scenario == 3;
  ScopedTempDir root("physical-repair-decisions");
+ // CLEANUP-IGNORE: Train and unlabeled archive paths are explicit inputs to independent physical-repair and subscription scenarios.
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
  const auto train = cache.source_downloads("coco") / "train.tar";
  const auto unlabeled = cache.source_downloads("coco") / "unlabeled.tar";
@@ -6096,6 +6178,7 @@ TEST_CASE("one physical repair claim survives racing joins and completion subscr
  using namespace std::chrono_literals;
  const bool blocking = GENERATE(false, true);
  ScopedTempDir root("physical-repair-claim");
+ // CLEANUP-IGNORE: Separate cache roots and archive paths feed different physical membership and recovery scenarios.
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
  const auto archive = cache.source_downloads("coco") / "train.tar";
  tar(archive, std::array{std::pair{coco(1).member, white_jpeg(1, 1)}});
@@ -6113,8 +6196,7 @@ TEST_CASE("one physical repair claim survives racing joins and completion subscr
   owner->unavailable(source);
  });
  owner = &physical;
- physical.admitted(admitted.front(), admitted.front().download);
- REQUIRE(physical.consume(admitted.front()));
+ consume_admitted_archive(physical, admitted.front());
  CoconutRecord record;
  record.image_id = 0;
  record.file_name = "000000000000.jpg";
@@ -6162,6 +6244,7 @@ TEST_CASE("one physical repair claim survives racing joins and completion subscr
 TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibility", "[benchmark][coconut][archive][recovery]") {
  const bool conflict = GENERATE(false, true);
  ScopedTempDir root("physical-excluded-shard");
+ // CLEANUP-IGNORE: Large and XL release selections are independent catalog inputs to ambiguity and consumed-artifact identity tests.
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
  CoconutRecipeCatalog catalog;
  catalog.releases = {coconut_release_component(CoconutEdition::Large), coconut_release_component(CoconutEdition::XLarge)};
@@ -6184,8 +6267,7 @@ TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibili
   owner->unavailable(archive);
  });
  owner = &physical;
- physical.admitted(admitted.front(), admitted.front().download);
- REQUIRE(physical.consume(admitted.front()));
+ consume_admitted_archive(physical, admitted.front());
  CoconutRecord record;
  record.image_id = 601;
  record.file_name = "601.jpg";
@@ -6449,6 +6531,7 @@ TEST_CASE("panoptic JSON keeps decoded metadata and one unchanged inventory seal
  std::filesystem::remove(input.annotation_json);
  input.metadata_only = false;
  auto full = import_coconut_annotations(input);
+ // CLEANUP-IGNORE: The component and box cardinalities are explicit input-dependent assertions in separate JSON, cache-seal and workspace-loan scenarios.
  REQUIRE(full.size() == 1);
  REQUIRE(full[0].index().box_count() == 1);
  CHECK((&full[0].inventory_image(0) == &metadata[0].inventory_image(0)) == !changed);
@@ -6486,6 +6569,7 @@ TEST_CASE("blocking controller local notices leave pipeline and native output ow
   if (expect_pipeline) mmltk::testsupport::release_test_promise(pipeline_ready);
  };
  BenchmarkCompilePipeline pipeline(1, {}, {}, {}, trace);
+ // CLEANUP-IGNORE: The request and staging preparation already use shared fixtures; separate notification and physical-file-queue scenarios install different gates.
  const std::array physical{coco(7)};
  auto input = request(physical);
  input.prepare_partial_staging(pipeline, root.path() / "staging");
@@ -6531,6 +6615,7 @@ TEST_CASE("blocking controller local notices leave pipeline and native output ow
  mmltk::testsupport::await_test_promise(pipeline_ready, "targeted pipeline source publication still dispatches", 5s);
  initialized.Release();
  const auto result = mmltk::testsupport::await_test_future(importing, "targeted native output completion still settles its import", 10s);
+ // CLEANUP-IGNORE: Independent import scenarios explicitly require one component and one image before checking different resource and notification outcomes.
  REQUIRE(result.size() == 1);
  CHECK(result.front().index().image_count() == 1);
  CHECK(result.front().index().box_count() == 1);
@@ -6540,12 +6625,13 @@ TEST_CASE("a live Parquet normalizer lends actual workspace to pixels on one CPU
  using namespace std::chrono_literals;
  ScopedTempDir root("parquet-normalizer-pixels");
  BenchmarkCompilePipeline execution(1, {}, {.descriptors = 13}, {}, mmltk::backend::data::testsupport::benchmark_trace());
+ // CLEANUP-IGNORE: The cached mask factory already owns generation; each scenario supplies its own path and keeps the resulting input alive.
  const auto images = root.path() / "images";
  auto [split, encoded] = cached_mask_pixel_fixture(images);
- BenchmarkWriteRequest output{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 1, .num_workers = 1, .execution = &execution};
- BenchmarkSplitWriter writer(output);
- BenchmarkCompilePipeline::Attempt attempt(execution);
- bind_benchmark_slots(execution, writer, split);
+ BenchmarkWriteRequest writer_input{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 1, .num_workers = 1, .execution = &execution};
+ // CLEANUP-IGNORE: The shared bound writer owns request, attempt, and resource ordering; independent JSON and Parquet scenarios retain their own pixel task and owner lifetimes.
+ mmltk::backend::data::testsupport::BoundBenchmarkWriter bound_writer(execution, std::move(writer_input));
+ auto& writer = bound_writer.writer;
  auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
  const std::array physical{coco(7)};
  auto input = request(physical);
@@ -6560,13 +6646,14 @@ TEST_CASE("a live Parquet normalizer lends actual workspace to pixels on one CPU
   completed_inside_normalizer = writer.image_complete(0);
  };
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { normalizing.Release(); });
- REQUIRE(normalizing.WaitEntered(5s));
+ const mmltk::testsupport::AwaitedTestGate settle(normalizing, 5s);
  CHECK(execution.execution().snapshot().leased > 0);
+ // CLEANUP-IGNORE: These independent parsing scenarios submit a prepared pixel task before releasing different parser gates to prove overlap.
  auto pixel_completion = execution.execution().submit(std::move(pixel));
  normalizing.Release();
  const auto result = mmltk::testsupport::await_test_future(importing, "Arrow reader resumes after pixel loan retirement", 10s);
  CHECK(completed_inside_normalizer);
+ // CLEANUP-IGNORE: The component and box cardinalities are explicit input-dependent assertions in separate JSON, cache-seal and workspace-loan scenarios.
  REQUIRE(result.size() == 1);
  REQUIRE(result[0].index().box_count() == 1);
  CHECK(result[0].index().rejected.degenerate_boxes == 1);
@@ -6574,10 +6661,9 @@ TEST_CASE("a live Parquet normalizer lends actual workspace to pixels on one CPU
 }
 TEST_CASE("panoptic projection preserves document and consumed-row admission limits", "[benchmark][coconut][annotations]") {
  ScopedTempDir root("panoptic-row-limits");
+ // CLEANUP-IGNORE: One physical image and the shared JSON request factory are explicit inputs to independent panoptic-limit and duplicate-value admission tests.
  const std::array physical{objects(7)};
- auto input = request(physical, CoconutEdition::Large);
- input.metadata_only = true;
- input.annotation_json = root.path() / "annotations.json";
+ auto input = json_import_request(physical, root.path(), CoconutEdition::Large, "annotations", true);
  input.limits.max_segments = 1;
  Json annotation{{"image_id", 7}, {"file_name", "objects365_v2_00000007.png"}, {"segments_info", Json::array({segment()})}};
  Json document{
@@ -6624,10 +6710,9 @@ TEST_CASE("panoptic projection preserves document and consumed-row admission lim
 }
 TEST_CASE("panoptic rows consume unknown values and retain exact last-value semantics", "[benchmark][coconut][annotations]") {
  ScopedTempDir root("panoptic-value-admission");
+ // CLEANUP-IGNORE: One physical image and the shared JSON request factory are explicit inputs to independent panoptic-limit and duplicate-value admission tests.
  const std::array physical{objects(7)};
- auto input = request(physical, CoconutEdition::Large);
- input.metadata_only = true;
- input.annotation_json = root.path() / "annotations.json";
+ auto input = json_import_request(physical, root.path(), CoconutEdition::Large, "annotations", true);
  input.records = std::make_shared<CoconutAnnotationRecords>();
  std::string extra;
  bool valid = false;
@@ -6664,12 +6749,8 @@ TEST_CASE("panoptic rows consume unknown values and retain exact last-value sema
   "{" + extra +
   R"("image_id":7,"file_name":"objects365_v2_00000007.png","segments_info":[{"id":false,"\u0069d":1,"category_id":1,"isthing":null,"isthing":true,"iscrowd":{},"iscrowd":1,"ignore":[],"ignore":false,"bbox":{},"bbox":[0,0,2,1,99],"bbox":[0,0,2,1],"area":18446744073709551616}]})";
  mmltk::testsupport::write_text_file(input.annotation_json, "{\"categories\":" + category_catalog().dump() + ",\"images\":[" + image + "],\"annotations\":[" + annotation + "]}");
- if (!valid) {
-  CHECK_THROWS(import_coconut_annotations(input));
-  return;
- }
- const auto components = import_coconut_annotations(input);
- REQUIRE(components.size() == 1);
+ const auto components = checked_single_import(input, valid);
+ if (!valid) return;
  REQUIRE(input.records->size() == 1);
  const auto& record = input.records->record(0);
  CHECK(record.image_id == 7);
@@ -6701,8 +6782,7 @@ TEST_CASE("XL segment projection retains its distinct text and nesting policy", 
  value["unknown"] = std::move(ignored);
  const std::array<std::pair<std::string, std::string>, 1> entries{{{"coconuts_xlarge/panseg_info/objects365_v2_00000007.json", Json::array({value}).dump()}}};
  tar(input.mask_archive, entries);
- const auto components = import_coconut_annotations(input);
- REQUIRE(components.size() == 1);
+ const auto components = checked_single_import(input);
  REQUIRE(input.records->size() == 1);
  REQUIRE(input.records->record(0).segments.size() == 1);
  CHECK(input.records->record(0).segments[0].id == 1);
@@ -6846,8 +6926,7 @@ TEST_CASE("independent Parquet groups seal identical artifacts across shared CPU
   auto input = request(physical);
   input.execution = &execution;
   input.parquet_shards = {path};
-  auto result = import_coconut_annotations(input);
-  REQUIRE(result.size() == 1);
+  auto result = checked_single_import(input);
   CHECK(result[0].index().storage().boxes[0].source_ordinal == 4);
   CHECK(result[0].index().storage().boxes[1].source_ordinal == 7);
   CHECK(result[0].index().storage().boxes[2].source_ordinal == 1);
@@ -6894,10 +6973,7 @@ TEST_CASE("panoptic JSON publishes physical facts before unrelated envelope tail
  SECTION("pixel completion cancels unread tail") { cancel = true; }
  ScopedTempDir root("json-incremental-physical");
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
- const auto archive = cache.source_downloads("objects365") / "physical.tar";
- const auto jpeg = white_jpeg();
- const std::array<std::pair<std::string, std::string>, 1> members{{{objects(3).member, jpeg}}};
- tar(archive, members);
+ const auto [archive, jpeg] = white_objects_archive(cache);
  CoconutRecipeCatalog catalog;
  catalog.releases.push_back({CoconutEdition::Large, "fixture-large", "fixture-v1", 1, {}});
  catalog.images.push_back(
@@ -6910,11 +6986,11 @@ TEST_CASE("panoptic JSON publishes physical facts before unrelated envelope tail
  split.class_names = {"person"};
  split.sources = {{image_root}};
  split.images = {{3, 3, 3, 0, 0}};
- BenchmarkWriteRequest output{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 3, .num_workers = 1, .execution = &execution};
- if (cancel) output.progress = {.context = &cancelled, .image_completed = [](void* state) { static_cast<std::atomic<bool>*>(state)->store(true); }};
- BenchmarkSplitWriter writer(output);
- BenchmarkCompilePipeline::Attempt attempt(execution);
- bind_benchmark_slots(execution, writer, split);
+ BenchmarkWriteRequest writer_input{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 3, .num_workers = 1, .execution = &execution};
+ if (cancel) writer_input.progress = {.context = &cancelled, .image_completed = [](void* state) { static_cast<std::atomic<bool>*>(state)->store(true); }};
+ mmltk::backend::data::testsupport::BoundBenchmarkWriter bound_writer(execution, std::move(writer_input));
+ auto& output = bound_writer.request;
+ auto& writer = bound_writer.writer;
  if (!cancel)
   writer.write_remaining(output);
  else {
@@ -6943,8 +7019,7 @@ TEST_CASE("panoptic JSON publishes physical facts before unrelated envelope tail
  if (malformed || duplicate || cancel || malformed_row)
   CHECK_THROWS(import_coconut_annotations(input));
  else {
-  const auto result = import_coconut_annotations(input);
-  REQUIRE(result.size() == 1);
+  const auto result = checked_single_import(input);
   REQUIRE(result[0].inventory().size() == 1);
   CHECK(result[0].inventory()[0].source_ordinal == 0);
  }
@@ -6966,6 +7041,7 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
  SECTION("independent retained capacity releases at the group boundary") { pressure = true; }
  CAPTURE(cancel, fail, pressure, warm);
  ScopedTempDir root("parquet-forward-physical");
+ // CLEANUP-IGNORE: Cache, archive path, and JPEG are explicit inputs to distinct forward-progress and warm-membership tests.
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
  const auto archive = cache.source_downloads("coco") / "physical.tar.gz";
  const auto jpeg = white_jpeg();
@@ -6988,10 +7064,10 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
  split.class_names = {"person"};
  split.sources = {{images}};
  for (unsigned id = 1; id <= 4; ++id) split.images.push_back({id, 3, 3, 0, 0});
- BenchmarkWriteRequest output{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 3, .num_workers = 1, .execution = &execution};
- BenchmarkSplitWriter writer(output);
- BenchmarkCompilePipeline::Attempt attempt(execution);
- bind_benchmark_slots(execution, writer, split);
+ BenchmarkWriteRequest writer_input{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 3, .num_workers = 1, .execution = &execution};
+ mmltk::backend::data::testsupport::BoundBenchmarkWriter bound_writer(execution, std::move(writer_input));
+ auto& output = bound_writer.request;
+ auto& writer = bound_writer.writer;
  if (!cancel)
   writer.write_remaining(output);
  else {
@@ -7104,9 +7180,11 @@ TEST_CASE("repeated warm Parquet membership needs no physical workspace or Arrow
  SECTION("cancellation retains the cached opened generation") { cancel = true; }
  SECTION("consumer failure releases temporary source custody") { fail = true; }
  ScopedTempDir root("parquet-warm-membership");
+ // CLEANUP-IGNORE: Cache, archive path, and JPEG are explicit inputs to distinct forward-progress and warm-membership tests.
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
  const auto archive = cache.source_downloads("coco") / "physical.tar.gz";
  const auto jpeg = white_jpeg();
+ // CLEANUP-IGNORE: The PNG generator is shared; empty row and member containers belong to independent cold-progress and warm-membership fixtures.
  const std::array<std::uint32_t, 9> mask{1, 1, 1, 1, 1, 1, 1, 1, 1};
  const auto encoded = png(3, 3, mask);
  Json rows = Json::array();
@@ -7184,8 +7262,7 @@ TEST_CASE("repeated warm Parquet membership needs no physical workspace or Arrow
   input.physical_membership = &physical;
   input.expected_rows = 4;
   input.cancellation = cancellation;
-  const auto components = import_coconut_annotations(input);
-  REQUIRE(components.size() == 1);
+  const auto components = checked_single_import(input);
   CHECK(components[0].index().image_count() == 4);
   REQUIRE(components[0].inventory().size() == 4);
   for (std::size_t i = 0; i < 4; ++i) {
@@ -7204,6 +7281,7 @@ TEST_CASE("recovered support keeps immutable original custody after readers reti
  {
   auto original = fixture_index(recovery_originals(7, original_mask));
   backing = original.backing;
+  // CLEANUP-IGNORE: These identical segment literals are explicit inputs to separate recovery cancellation and immutable-custody tests.
   CoconutRecoveryOriginals indexed(&original, nullptr);
   CoconutMaskRecovery recovery(indexed);
   CoconutRecord record;
@@ -7307,6 +7385,7 @@ TEST_CASE("pending train originals leave mixed Base unlabeled rows runnable", "[
   return CoconutOriginalReadiness{{}, terminal.load(), 1, originals.completion()};
  };
  std::promise<void> independent;
+ // CLEANUP-IGNORE: The progress callbacks identify separate admission milestones before independent asynchronous imports; promise identities and cancellation owners differ.
  input.progress = [&](std::uint64_t count) {
   if (count == 64) independent.set_value();
  };
@@ -7324,6 +7403,7 @@ TEST_CASE("pending train originals leave mixed Base unlabeled rows runnable", "[
  terminal.store(true);
  originals.settle();
  const auto result = mmltk::testsupport::await_test_future(importing, "optional originals settle and native recovery completes");
+ // CLEANUP-IGNORE: Parked originals and generation delivery independently require their own ordered component counts before different tail cardinalities.
  REQUIRE(result.size() == 2);
  CHECK(result[0].index().image_count() == 1);
  CHECK(result[1].index().image_count() == 64);
@@ -7375,8 +7455,7 @@ TEST_CASE("COCO original split publication is independent for warm and cold admi
   }
   return cache.finish();
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
- REQUIRE(held.WaitEntered(5s));
+ const mmltk::testsupport::AwaitedTestGate release(held, 5s);
  const auto independent = mmltk::testsupport::await_test_promise(ready, "independently ready original split");
  CHECK(independent.training != hold_train);
  CHECK(independent.terminal);
@@ -7404,11 +7483,12 @@ TEST_CASE("new original split admission is withdrawn with its failed source atte
  const auto path = local.cache.source_downloads("coco") / artifact.filename;
  const auto train = file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json");
  const auto validation = file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json") + std::string(100000, ' ');
+ // CLEANUP-IGNORE: Changing the original annotation ID is an explicit input to independent late-repair and failed-source-withdrawal scenarios.
  auto replacement_train = Json::parse(train);
  replacement_train["annotations"][0]["id"] = 71;
  std::array<std::pair<std::string, std::string>, 2> members{{{"annotations/instances_train2017.json", replacement_train.dump()}, {"annotations/instances_val2017.json", validation}}};
- tar(path, members);
- const auto complete = file_bytes(path);
+ // CLEANUP-IGNORE: The archive serializer and HTTP server are shared owners; each scenario retains its own replacement bytes and changes different original-split admission facts.
+ const auto complete = tar_bytes(path, members);
  mmltk::backend::data::testsupport::HttpServer server(complete);
  artifact.url = server.url("repaired-originals");
  artifact.expected_size = 0;
@@ -7439,10 +7519,9 @@ TEST_CASE("new original split admission is withdrawn with its failed source atte
  cache.discover(progress);
  auto downloaded = download_artifacts({*cache.pending_download()}, 1, {}).front();
  auto completed = cache.completed_indexes();
+ // CLEANUP-IGNORE: The existing checked-index helper follows separate source settlements whose extracted-inode and event-order assertions differ.
  cache.settle(std::move(downloaded), progress, 1, completed, 2);
- const auto originals = cache.finish();
- REQUIRE(originals.train);
- REQUIRE(originals.validation);
+ const auto originals = checked_original_indexes(cache);
  CHECK(completed == 2);
  REQUIRE(train_events.size() == (warm_train ? 1 : 3));
  CHECK(train_events[0].terminal);
@@ -7486,8 +7565,8 @@ TEST_CASE("late original withdrawal retains physical work and remaps changed sto
  replacement["annotations"][0]["id"] = 901;
  replacement["annotations"][0]["category_id"] = 4;
  std::array<std::pair<std::string, std::string>, 2> members{{{"annotations/instances_val2017.json", replacement.dump()}, {"annotations/instances_train2017.json", train}}};
- tar(path, members);
- const auto replacement_archive = file_bytes(path);
+ // CLEANUP-IGNORE: The archive serializer and HTTP server are shared owners; each scenario retains its own replacement bytes and changes different original-split admission facts.
+ const auto replacement_archive = tar_bytes(path, members);
  mmltk::backend::data::testsupport::HttpServer server(replacement_archive);
  originals.url = server.url("replacement-stock-membership");
  originals.expected_size = 0;
@@ -7498,8 +7577,7 @@ TEST_CASE("late original withdrawal retains physical work and remaps changed sto
   {{coco(9, CoconutImageNamespace::CocoValidation).member, white_jpeg()}, {coco(10, CoconutImageNamespace::CocoValidation).member, white_jpeg()}}
  };
  replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoValidation, physical);
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock, true});
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock, true});
  catalog.stock_annotations = originals;
  mmltk::testsupport::TestGate incomplete_train("original source awaits its failing second member");
  std::atomic<bool> held{false}, opened{false}, cancelled{false};
@@ -7596,9 +7674,7 @@ TEST_CASE("a Parquet group joins native recovery before JPEG geometry", "[benchm
  SECTION("shared execution failure settles recovery while originals remain pending") { fail_execution = true; }
  ScopedTempDir root("coconut-native-recovery-boundary");
  LocalCoconutRecipe local(root.path());
- auto catalog = local.selected(CoconutValidation::Stock);
- std::erase_if(catalog.releases, [](const auto& release) { return release.edition != CoconutEdition::Base; });
- std::erase_if(catalog.images, [](const auto& image) { return image.source != CoconutImageNamespace::CocoTrain; });
+ auto catalog = local.base_training_catalog();
  const std::array<std::pair<std::string, std::string>, 3> members{{{coco(7).member, white_jpeg(1, 1)}, {coco(10).member, white_jpeg(1, 1)}, {coco(11).member, white_jpeg(1, 1)}}};
  // CLEANUP-IGNORE: Only calls to existing archive/RAII fixture helpers and a structured binding match; the scenarios own different input generation and assertions.
  replace_physical_images(local.cache, catalog, CoconutImageNamespace::CocoTrain, members);
@@ -7677,6 +7753,7 @@ TEST_CASE("a Parquet group joins native recovery before JPEG geometry", "[benchm
 }
 TEST_CASE("Large and XL component identities retain only their consumed physical artifacts", "[benchmark][coconut][cache][recovery]") {
  ScopedTempDir root("coconut-artifact-dependencies");
+ // CLEANUP-IGNORE: Large and XL release selections are independent catalog inputs to ambiguity and consumed-artifact identity tests.
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
  CoconutRecipeCatalog catalog;
  catalog.releases = {coconut_release_component(CoconutEdition::Large), coconut_release_component(CoconutEdition::XLarge)};
@@ -7711,8 +7788,8 @@ TEST_CASE("Large and XL component identities retain only their consumed physical
  CHECK(large.input_identity() == "85e14b83bcc3edd56806c20c1b01d76ca95a74708bd4e2eb944cd77d1e670de2");
  CHECK(xl.input_identity() == "e00877b60b7d5207b6d618da3dece3a828d8408ce674e17122ac57d1cae5c55e");
  const std::array parts{CoconutComponentPart{{large}, 0, 0}};
- const auto merged = merge_coconut_components(parts, "annotations", physical, root.path());
- REQUIRE(merged.size() == 1);
+ const auto merged = merge_one_component_fixture(parts, "annotations", physical, root.path());
+ // CLEANUP-IGNORE: Source-dog recovery and consumed-artifact admission independently verify canonical identities after their own merge operations.
  CHECK(merged.front().input_identity() == large.input_identity());
  CHECK(merged.front().index().annotation_sha256 == large.index().annotation_sha256);
  CHECK(physical.eligible(CoconutEdition::Large, admitted[0]));
@@ -7729,8 +7806,7 @@ TEST_CASE("Large and XL component identities retain only their consumed physical
  physical.admitted(admitted[0], admitted[0].download);
  CHECK_FALSE(large.matches_inputs("annotations", physical, nullptr));
  CHECK(large.matches_inputs("annotations", physical, nullptr, false));
- const auto current = merge_coconut_components(parts, "annotations", physical, root.path());
- REQUIRE(current.size() == 1);
+ const auto current = merge_one_component_fixture(parts, "annotations", physical, root.path());
  CHECK(current.front().input_identity() == "c47f90f4b81841b04982901f3606d0923b5e9d66bdcb3b7d31b38dca2c3a56b1");
  CHECK(current.front().matches_inputs("annotations", physical, nullptr));
  CHECK_FALSE(current.front().matches_inputs("annotations", physical, nullptr, false));
@@ -7837,6 +7913,7 @@ TEST_CASE("native RGB segment runs preserve exact IDs across dense prefixes unal
    first = end;
   }
   const auto encoded = png(static_cast<int>(width), height, pixels);
+  // CLEANUP-IGNORE: The byte view retains its local PNG owner through independent geometric admission and mapped-custody tests.
   const auto input = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
   const auto dimensions = workspace.admit_png(record, input);
   const auto started = std::chrono::steady_clock::now();
@@ -7871,9 +7948,7 @@ TEST_CASE("native RGB segment runs preserve exact IDs across dense prefixes unal
 TEST_CASE("native image custody survives workspace reuse and physical retirement", "[benchmark][coconut][annotations][resources]") {
  const bool staged = GENERATE(false, true);
  ScopedTempDir root("native-image-mapped-custody");
- detail::StorageReservationPool storage(root.path(), {});
- CoconutStaging staging(root.path(), &storage);
- CoconutNativeWorkspace workspace(CoconutImportLimits{});
+ auto [storage, staging, workspace] = NativeCoconutBacking(root.path());
  CoconutRecord wide;
  wide.image_id = 7;
  wide.width = 64;
@@ -7883,6 +7958,7 @@ TEST_CASE("native image custody survives workspace reuse and physical retirement
  std::array<std::uint32_t, 64> pixels{};
  for (std::size_t i = 0; i < pixels.size(); ++i) pixels[i] = 1 + i % 2;
  const auto encoded = png(64, 1, pixels);
+ // CLEANUP-IGNORE: The byte view retains its local PNG owner through independent geometric admission and mapped-custody tests.
  const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
  const auto dimensions = workspace.admit_png(wide, bytes);
  workspace.decode(wide, bytes, dimensions);
@@ -7990,12 +8066,7 @@ TEST_CASE("native image custody survives workspace reuse and physical retirement
   product.reset();
   CoconutRecord small;
   small.image_id = 8;
-  small.width = small.height = 1;
-  small.segments = {{.id = 1, .category_id = 1, .isthing = true}};
-  const std::array<std::uint32_t, 1> pixel{1};
-  const auto tiny = png(1, 1, pixel);
-  const auto input = std::span(reinterpret_cast<const std::uint8_t*>(tiny.data()), tiny.size());
-  workspace.decode(small, input, workspace.admit_png(small, input));
+  decode_unit_record(workspace, small);
   CHECK(workspace.retained_bytes() == capacity);  // Inactive second-segment capacity remains owned and charged.
   auto next = workspace.finish(small, coco(8), {1, 1}, lineage, {});
   CHECK(next->runs().size() == 1);
@@ -8075,6 +8146,7 @@ TEST_CASE("compact staged support populates supplied native scratch without inte
  record.height = 1;
  record.segments = {{.id = 1, .category_id = 1, .isthing = true}, {.id = 2, .category_id = 1, .isthing = true}};
  const std::array<std::uint32_t, 3> pixels{1, 2, 1};
+ // CLEANUP-IGNORE: The encoded PNG and borrowed byte view retain scenario-local storage; independent lineage owners carry different staged-support proofs.
  const auto encoded = png(3, 1, pixels);
  const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
  auto lineage = std::make_shared<CoconutNativeLineage>();
@@ -8230,6 +8302,7 @@ TEST_CASE("recovery workspaces retain their immutable original lookup across bat
   worker = first.make_workspace();
  }
  CHECK_FALSE(backing.expired());
+ // CLEANUP-IGNORE: The repeated segment literals are independent inputs to cancellation and multi-batch lookup-custody tests, with different recovery-state ownership.
  CoconutRecord record;
  record.image_id = 7;
  record.segments = {{.id = 10, .category_id = 18, .isthing = true}};
@@ -8293,6 +8366,7 @@ TEST_CASE("ready recovery that fits retains its forward Parquet reader on one CP
   }
  };
  input.input_finished = [&] { later_group.set_value(); };
+ // CLEANUP-IGNORE: The progress callbacks identify separate admission milestones before independent asynchronous imports; promise identities and cancellation owners differ.
  input.progress = [&](std::uint64_t count) {
   if (count == 64) completed_native.set_value();
  };
@@ -8353,8 +8427,7 @@ TEST_CASE("parallel JSON rows preserve joins and all declared segment prefixes",
   input.records = std::make_shared<CoconutAnnotationRecords>();
   input.annotation_json = json;
   input.mask_archive = archive;
-  auto result = import_coconut_annotations(input);
-  REQUIRE(result.size() == 1);
+  auto result = checked_single_import(input);
   const auto& component = result.front();
   REQUIRE(component.index().box_count() == 16);
   CHECK(component.index().rejected.raw_records == prefix);
@@ -8397,8 +8470,7 @@ TEST_CASE("JSON physical failure retains successfully parsed immutable rows", "[
  retry.annotation_json = path;
  retry.records = retained;
  retry.limits.max_segments = 0;
- const auto result = import_coconut_annotations(retry);
- REQUIRE(result.size() == 1);
+ const auto result = checked_single_import(retry);
  CHECK(result.front().index().image_count() == 2);
  CHECK(retained->record(0).segments.data() == segments);
  CHECK(retained->row(1).segment_ordinal() == 1);
@@ -8407,9 +8479,7 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
  using namespace std::chrono_literals;
  ScopedTempDir root("coconut-label-recovery-batches");
  LocalCoconutRecipe local(root.path());
- auto catalog = local.selected(CoconutValidation::Stock);
- std::erase_if(catalog.releases, [](const auto& release) { return release.edition != CoconutEdition::Base; });
- std::erase_if(catalog.images, [](const auto& image) { return image.source != CoconutImageNamespace::CocoTrain; });
+ auto catalog = local.base_training_catalog();
  const std::array<std::uint32_t, 5> ids{7, 10, 11, 12, 13};
  std::vector<std::pair<std::string, std::string>> members;
  Json rows = Json::array();
@@ -8508,13 +8578,13 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
  *warm = warm->with_original({original_owner, true, 1});
  CHECK(warm->select_images({0}).original_generation() == 1);
  std::array parts{CoconutComponentPart{{warm->select_images({0, 2, 4}), warm->select_images({1, 3})}, 0, 0}};
- const auto composed = merge_coconut_components(parts, input.input_identity, physical, root.path());
- REQUIRE(composed.size() == 1);
+ const auto composed = merge_one_component_fixture(parts, input.input_identity, physical, root.path());
  CHECK(composed.front().original_generation() == 1);
  execution.retire_attempt();
  // The preparation-captured warm input cannot become current merely because
  // fallback obtains a fresh physical publication after original withdrawal.
  execution.original_generation(images, 2, true);
+ // CLEANUP-IGNORE: The old generation must remain unavailable both before and after a separate rebound component is installed.
  CHECK_FALSE(fallback(composed.front(), 0));
  CHECK_FALSE(execution.wait_image_labels(images, ids[0], composed.front().image_input_identity(0), composed.front().original_generation()));
  const auto rebound = warm->with_original({original_owner, true, 2});
@@ -8523,11 +8593,11 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
  parts.front().components = {composed.front().select_images({0}), rebound.select_images({1})};
  CHECK_THROWS_AS(merge_coconut_components(parts, input.input_identity, physical, root.path()), CoconutOriginalChanged);
  parts.front().components = {rebound};
- const auto current = merge_coconut_components(parts, input.input_identity, physical, root.path());
- REQUIRE(current.size() == 1);
+ const auto current = merge_one_component_fixture(parts, input.input_identity, physical, root.path());
  CHECK(current.front().original_generation() == 2);
  execution.original_generation(images, 2, false);
  CHECK_FALSE(execution.has_image_labels(images, ids[0], composed.front().image_input_identity(0), composed.front().original_generation()));
+ // CLEANUP-IGNORE: The old generation must remain unavailable both before and after a separate rebound component is installed.
  CHECK_FALSE(fallback(composed.front(), 0));
  CHECK_FALSE(execution.wait_image_labels(images, ids[0], composed.front().image_input_identity(0), composed.front().original_generation()));
  fallbacks = 0;
@@ -8545,17 +8615,10 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
 TEST_CASE("asynchronous native labels retain their sealed image until conversion settles", "[benchmark][coconut][pipeline][labels][resources]") {
  using namespace std::chrono_literals;
  ScopedTempDir backing_root("asynchronous-native-backing");
- detail::StorageReservationPool storage(backing_root.path(), {});
- CoconutStaging staging(backing_root.path(), &storage);
- CoconutNativeWorkspace workspace(CoconutImportLimits{});
+ auto [storage, staging, workspace] = NativeCoconutBacking(backing_root.path());
  CoconutRecord record;
  record.image_id = 7;
- record.width = record.height = 1;
- record.segments = {{.id = 1, .category_id = 1, .isthing = true}};
- const std::array<std::uint32_t, 1> pixel{1};
- const auto encoded = png(1, 1, pixel);
- const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
- workspace.decode(record, bytes, workspace.admit_png(record, bytes));
+ decode_unit_record(workspace, record);
  auto lineage = std::make_shared<CoconutNativeLineage>();
  lineage->component.source = CoconutImageNamespace::CocoTrain;
  auto native = workspace.finish(record, coco(7), {1, 1}, lineage, {});
@@ -8810,6 +8873,7 @@ TEST_CASE("validation places its final metadata while a training release remains
  LocalCoconutRecipe local(root.path());
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, choice}, true);
  auto catalog = local.selected(choice);
+ // CLEANUP-IGNORE: Byte and semantic snapshots intentionally remain separate independent output oracles across distinct asynchronous publication boundaries.
  compile_benchmark_recipe(config, &catalog);
  const auto [train, validation, manifest] = capture_publication_bytes(local.output);
  const auto train_semantics = benchmark_semantics(local.output / "train.bin"), validation_semantics = benchmark_semantics(local.output / "val.bin");
@@ -8852,12 +8916,10 @@ TEST_CASE("final XL selection restores labels after a preferred release withdraw
  const bool warm = GENERATE(false, true);
  ScopedTempDir root("coconut-final-xl-restoration");
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  auto& large = *std::ranges::find(catalog.releases, CoconutEdition::Large, &CoconutReleaseComponent::edition);
  auto& xl = *std::ranges::find(catalog.releases, CoconutEdition::XLarge, &CoconutReleaseComponent::edition);
- auto& metadata = large.annotations.front();
- const auto metadata_path = local.cache.source_downloads("coconut-" + std::string(large.name)) / metadata.filename;
+ auto [metadata, metadata_path] = local.cached_annotation(large);
  auto document = Json::parse(file_bytes(metadata_path));
  document["annotations"][0]["object365_file_name"] = "objects365_v2_00000002";
  json_file(metadata_path, document);
@@ -8889,6 +8951,7 @@ TEST_CASE("final XL selection restores labels after a preferred release withdraw
   compile_benchmark_recipe(config, &catalog);
   previous = capture_publication_bytes(local.output);
   const auto compiled = CompiledDataset::open(local.output / "train.bin");
+  // CLEANUP-IGNORE: Preferred-release withdrawal compares labels before and after the transition with intentionally different category expectations.
   const auto labels = compiled.image_labels(compiled_slot(compiled, 2, AnnotationSource::CoconutObjects365V2));
   REQUIRE(labels.size() == 1);
   CHECK(labels.front().source_category_id == 2);
@@ -8940,6 +9003,7 @@ TEST_CASE("final XL selection restores labels after a preferred release withdraw
  }
  REQUIRE(terminal.WaitEntered(5s));
  mmltk::testsupport::await_test_promise(placements[warm ? 2 : 1], "native Large is physically written before local withdrawal", 5s);
+ // CLEANUP-IGNORE: Each asynchronous publication case must independently prove the old output persists while its different final input is held.
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  if (previous) check_publication_bytes(local.output, (*previous)[0], (*previous)[1], (*previous)[2]);
  terminal.Release();
@@ -8951,6 +9015,7 @@ TEST_CASE("final XL selection restores labels after a preferred release withdraw
  const auto train = CompiledDataset::open(local.output / "train.bin");
  CHECK(train.header().num_images == 4);
  CHECK(train.header().num_slots == 4);
+ // CLEANUP-IGNORE: Preferred-release withdrawal compares labels before and after the transition with intentionally different category expectations.
  const auto labels = train.image_labels(compiled_slot(train, 2, AnnotationSource::CoconutObjects365V2));
  REQUIRE(labels.size() == 1);
  CHECK(labels.front().annotation_id == 11);
@@ -8965,6 +9030,7 @@ TEST_CASE("COCONut independently writes pixels and labels while every opposite i
  ScopedTempDir root("coconut-independent-first-work");
  LocalCoconutRecipe local(root.path());
  const auto validation = GENERATE(CoconutValidation::Coconut, CoconutValidation::Stock, CoconutValidation::CoconutStock);
+ // CLEANUP-IGNORE: Generated Boolean axes and their diagnostic capture belong to independent scheduling and dataset scenarios.
  const bool warm = GENERATE(false, true);
  const bool hold_annotations = GENERATE(false, true);
  const bool recover = GENERATE(false, true);
@@ -9044,8 +9110,7 @@ TEST_CASE("ready Parquet artifact labels precede a held sibling and settle canon
  const bool partial_prefix = prefix == "damaged later group";
  ScopedTempDir root("coconut-ready-parquet-artifact");
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock, true}, true);
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock, true}, true);
  auto& release = catalog.releases.front();
  add_ready_parquet_part(local, catalog);
  std::vector<std::pair<std::filesystem::path, std::string>> retained_cache_bytes;
@@ -9169,15 +9234,14 @@ TEST_CASE("ready Parquet artifact labels precede a held sibling and settle canon
 TEST_CASE("COCONut distinguishes partial labels valid backgrounds corrupt foreground and empty required splits", "[benchmark][coconut][publication]") {
  const std::string_view outcome = GENERATE("partial labels", "corrupt foreground", "background without PNG", "unlisted mask labels", "empty validation");
  ScopedTempDir root("coconut-local-rejection-outcomes");
+ // CLEANUP-IGNORE: Shared recipe configuration and publication fixtures establish separate cancellation and local-rejection scenarios.
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  compile_benchmark_recipe(config, &catalog);
  const auto [previous_train, previous_validation, previous_manifest] = capture_publication_bytes(local.output);
  const auto edition = outcome == "empty validation" ? CoconutEdition::RelabeledValidation : CoconutEdition::Base;
  auto& release = *std::ranges::find(catalog.releases, edition, &CoconutReleaseComponent::edition);
- auto& artifact = release.annotations.front();
- const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+ auto [artifact, path] = local.cached_annotation(release);
  if (outcome == "empty validation")
   mmltk::testsupport::write_text_file(path, "unreadable required validation artifact");
  else {
@@ -9187,8 +9251,7 @@ TEST_CASE("COCONut distinguishes partial labels valid backgrounds corrupt foregr
   const auto background = outcome == "background without PNG" ? std::string("invalid PNG") : png(3, 3, outcome == "unlisted mask labels" ? support : empty);
   write_coconut_parquet(path, Json::array({hf_row(7, png(3, 3, support), Json::array({first, second})), hf_row(8, background, Json::array(), 3, 3, "unlabeled2017")}));
  }
- artifact.expected_size = std::filesystem::file_size(path);
- artifact.expected_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+ match_artifact_bytes(artifact, path);
  if (outcome == "empty validation") {
   CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog), "required COCONut split contains no healthy samples");
   check_publication_bytes(local.output, previous_train, previous_validation, previous_manifest);
@@ -9225,6 +9288,7 @@ TEST_CASE("COCONut local identity rejection retains later archive and annotation
   };
  auto catalog = local.selected(config.selection.validation);
  auto& release = catalog.releases.front();
+ // CLEANUP-IGNORE: The existing PNG and row factories build explicit independent malformed-input fixtures before distinct mutations.
  const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1};
  auto bad = hf_row(7, png(3, 3, pixels), Json::array({segment()}));
  if (issue == "malformed identity" || issue == "unsafe identity") {
@@ -9240,8 +9304,7 @@ TEST_CASE("COCONut local identity rejection retains later archive and annotation
  write_coconut_parquet(path, rows);
  release.expected_rows = rows.size();
  auto& artifact = release.annotations.front();
- artifact.expected_size = std::filesystem::file_size(path);
- artifact.expected_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+ match_artifact_bytes(artifact, path);
  std::vector<std::filesystem::path> strict_shards{path};
  if (cross_artifact) {
   auto second = artifact;
@@ -9250,8 +9313,7 @@ TEST_CASE("COCONut local identity rejection retains later archive and annotation
   second.url += "/duplicate";
   const auto second_path = path.parent_path() / second.filename;
   write_coconut_parquet(second_path, Json::array({bad, hf_row(12, png(3, 3, pixels), Json::array({segment()}))}));
-  second.expected_size = std::filesystem::file_size(second_path);
-  second.expected_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(second_path));
+  match_artifact_bytes(second, second_path);
   release.annotations.push_back(second);
   release.expected_rows += 2;
   strict_shards.push_back(second_path);
@@ -9292,6 +9354,7 @@ TEST_CASE("COCONut local identity rejection retains later archive and annotation
    });
    mmltk::testsupport::await_test_promise(first_labels, "first duplicate's real labels before its sibling artifact", 5s);
    mmltk::testsupport::await_test_promise(validation_labels, "healthy validation labels beside pending duplicate input", 5s);
+   // CLEANUP-IGNORE: Each asynchronous publication case must independently prove the old output persists while its different final input is held.
    CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
    if (previous) check_publication_bytes(local.output, (*previous)[0], (*previous)[1], (*previous)[2]);
    held = {};
@@ -9336,6 +9399,7 @@ TEST_CASE("COCONut local identity rejection retains later archive and annotation
   }
   CHECK(rejected == 4);  // Both offered rows, once for cold and once for warm.
   const auto previous = capture_publication_bytes(local.output);
+  // CLEANUP-IGNORE: Cancellation is injected independently into different publication scenarios, which preserve different sets of incumbent outputs.
   std::atomic<bool> cancelled{true};
   config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
   CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
@@ -9442,8 +9506,7 @@ TEST_CASE("final COCONut caches retain optional v3 extents and supersede modern 
  const auto edition = GENERATE(CoconutEdition::Large, CoconutEdition::Base, CoconutEdition::RelabeledValidation);
  ScopedTempDir root("coconut-version-three-reuse");
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  if (edition == CoconutEdition::Base) add_ready_parquet_part(local, catalog);
  compile_benchmark_recipe(config, &catalog);
  const auto expected = benchmark_semantics(local.output / "train.bin"), expected_validation = benchmark_semantics(local.output / "val.bin");
@@ -9505,8 +9568,7 @@ TEST_CASE("failed part cache retracts its indexing while independent sibling lab
  using namespace std::chrono_literals;
  ScopedTempDir root("coconut-part-cache-withdrawal");
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock}, true);
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock}, true);
  add_ready_parquet_part(local, catalog);
  compile_benchmark_recipe(config, &catalog);
  const auto expected = benchmark_semantics(local.output / "train.bin");
@@ -9667,6 +9729,7 @@ TEST_CASE("custom source admission keeps ready label peers useful while its firs
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPU lanes");
  ScopedTempDir root("custom-label-ready-window");
+ // CLEANUP-IGNORE: The shared training-window and compiler-config factories prepare independent overlap and readiness-window scenarios with different worker policies.
  LocalCoconutRecipe local(root.path());
  auto [custom, ids] = custom_training_window(local);
  auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock}, true);
@@ -9698,11 +9761,7 @@ TEST_CASE("custom source admission keeps ready label peers useful while its firs
   }
  };
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, nullptr, &custom); });
- const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled = true;
-  first.Release();
- });
- REQUIRE(first.WaitEntered(5s));
+ const mmltk::testsupport::AwaitedTestGate release(first, 5s, 1, &cancelled);
  mmltk::testsupport::await_test_promise(peer_written, "every independent label refills the window before the first selected result", 5s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  {
@@ -9773,6 +9832,7 @@ TEST_CASE("native PNG normalization borrows the pinned compile context with reta
 }
 TEST_CASE("archive publication retains its forward decoder through ordinary backpressure", "[benchmark][coconut][archive][resources]") {
  using namespace std::chrono_literals;
+ // CLEANUP-IGNORE: CPU eligibility and generated Boolean axes set up distinct fairness and archive-backpressure scenarios.
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  const bool files = GENERATE(false, true);
  const bool pressure = GENERATE(false, true);
@@ -9857,6 +9917,7 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
  const auto archive = cache.source_downloads("coco") / "physical.tar";
  std::vector<std::pair<std::string, std::string>> members;
  for (unsigned id = 1; id <= 12; ++id) members.emplace_back(coco(id).member, white_jpeg());
+ // CLEANUP-IGNORE: The archive builder and catalog factory already own the behavior; separate callers supply distinct ordered members and runtime policies.
  tar(archive, members);
  const auto catalog = base_physical_catalog(archive, static_cast<std::uint32_t>(members.size()));
  bool warm = false, mixed = false, hold_write = false, cancel_write = false;
@@ -9919,8 +9980,7 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
  pipeline.bind_source(physical.identity_root(CoconutImageNamespace::CocoTrain), writer, AnnotationSource::CoconutCoco);
  physical.admitted(admitted.front(), admitted.front().download);
  auto consuming = std::async(std::launch::async, [&] { return physical.consume(admitted.front(), {}, warm && !mixed); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { observed.held.Release(); });
- REQUIRE(observed.held.WaitEntered(5s));
+ const mmltk::testsupport::AwaitedTestGate release(observed.held, 5s);
  mmltk::testsupport::await_test_promise(observed.independent, "same-artifact pixels refill past a held first completion", 5s);
  CHECK(consuming.wait_for(0ms) == std::future_status::timeout);
  CHECK_FALSE(physical.discovery_complete());
@@ -9956,9 +10016,7 @@ TEST_CASE("custom COCO labels and pixels progress before unrelated metadata and 
  SECTION("canvas labels precede their held JPEG source") { hold_images = true; }
  ScopedTempDir directory("custom-independent-canvas-labels");
  LocalCoconutRecipe local(directory.path());
- auto catalog = local_custom_catalog(local);
- auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
- config.num_workers = 1;
+ auto [catalog, config] = custom_configuration(local);
  std::atomic<bool> cancelled{false}, label_seen{false}, image_seen{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  auto metadata = ArtifactLease::acquire(local.cache.locks / "objects365-annotations.lifecycle.lock", {});
@@ -10001,10 +10059,10 @@ TEST_CASE("physical cached failures share bounded ordered repair on the retained
  { PhysicalMembershipFixture cached(cache, catalog); }
  const auto images = cache.source_images("coco") / "train2017";
  const auto peer = cached_image_path(images, 3);
- struct stat before{};
- REQUIRE(::stat(peer.c_str(), &before) == 0);
+ auto before = mmltk::testsupport::file_status(peer);
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(1);
+ // CLEANUP-IGNORE: These explicit one-class split inputs precede independent physical-repair writers with different observer and scheduling contracts.
  CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
  PreparedBenchmarkSplit split;
  split.name = "train";
@@ -10027,16 +10085,16 @@ TEST_CASE("physical cached failures share bounded ordered repair on the retained
  },
                               .execution = &pipeline},
   true);
+ // CLEANUP-IGNORE: The attempt remains in caller scope across subsequent repair; binding and admission precede different checked-consume and deferred-repair paths.
  BenchmarkCompilePipeline::Attempt attempt(pipeline);
  pipeline.bind_source(physical.identity_root(CoconutImageNamespace::CocoTrain), writer, AnnotationSource::CoconutCoco);
- physical.admitted(admitted.front(), admitted.front().download);
- REQUIRE(physical.consume(admitted.front()));
+ consume_admitted_archive(physical, admitted.front());
  CHECK(opens == std::array<unsigned, 3>{3, 3, 1});
+ // CLEANUP-IGNORE: Ordered physical repair and unrelated pixel progress independently require their own completed writer and membership counts.
  CHECK(writer.completed() == members.size());
  CHECK(physical.summary(admitted.front()).image_count == members.size());
  CHECK(physical.summary(admitted.front()).image_bytes == members.size() * jpeg.size());
- struct stat after{};
- REQUIRE(::stat(peer.c_str(), &after) == 0);
+ auto after = mmltk::testsupport::file_status(peer);
  CHECK(after.st_ino == before.st_ino);
  CHECK(file_bytes(peer) == jpeg);
  CHECK(physical.discovery_complete());
@@ -10051,11 +10109,13 @@ TEST_CASE("continuing physical repair advances beside an unrelated accepted pixe
  constexpr unsigned held_id = 18;
  std::vector<std::pair<std::string, std::string>> members{{coco(held_id).member, white_jpeg()}};
  for (unsigned id = 1; id < held_id; ++id) members.emplace_back(coco(id).member, white_jpeg());
+ // CLEANUP-IGNORE: The archive builder and catalog factory already own the behavior; separate callers supply distinct ordered members and runtime policies.
  tar(archive, members);
  const auto catalog = base_physical_catalog(archive, static_cast<std::uint32_t>(members.size()));
  { PhysicalMembershipFixture cached(cache, catalog); }
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(4);
+ // CLEANUP-IGNORE: These explicit one-class split inputs precede independent physical-repair writers with different observer and scheduling contracts.
  CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
  PreparedBenchmarkSplit split;
  split.name = "train";
@@ -10085,6 +10145,7 @@ TEST_CASE("continuing physical repair advances beside an unrelated accepted pixe
  },
                               .execution = &pipeline},
   true);
+ // CLEANUP-IGNORE: The attempt remains in caller scope across subsequent repair; binding and admission precede different checked-consume and deferred-repair paths.
  BenchmarkCompilePipeline::Attempt attempt(pipeline);
  pipeline.bind_source(physical.identity_root(CoconutImageNamespace::CocoTrain), writer, AnnotationSource::CoconutCoco);
  physical.admitted(admitted.front(), admitted.front().download);
@@ -10092,13 +10153,13 @@ TEST_CASE("continuing physical repair advances beside an unrelated accepted pixe
  // pixels need repair. The continuing pass then keeps one unrelated peer held.
  REQUIRE_FALSE(physical.consume(admitted.front(), {}, true));
  auto consuming = std::async(std::launch::async, [&] { return physical.consume(admitted.front()); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
- REQUIRE(held.WaitEntered(5s));
+ const mmltk::testsupport::AwaitedTestGate release(held, 5s);
  mmltk::testsupport::await_test_promise(observed.repaired, "a continuing repair compiles before its unrelated peer settles", 5s);
  CHECK(consuming.wait_for(0ms) == std::future_status::timeout);
  CHECK_FALSE(physical.discovery_complete());
  held.Release();
  REQUIRE(mmltk::testsupport::await_test_future(consuming, "forward repair reconciles its exact source generation", 5s));
+ // CLEANUP-IGNORE: Ordered physical repair and unrelated pixel progress independently require their own completed writer and membership counts.
  CHECK(writer.completed() == members.size());
  CHECK(physical.summary(admitted.front()).image_count == members.size());
  CHECK(opens.back() == 2);
@@ -10138,10 +10199,7 @@ TEST_CASE("Parquet artifact readiness bypasses a held batch borrower", "[benchma
     mmltk::testsupport::release_test_promise(sibling);
   }, false, &pipeline.execution(), &pipeline.files());
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] {
-  held.Release();
-  pipeline.execution().cancel();
- });
+ const auto release = settle_coconut_import_on_exit(held, pipeline);
  REQUIRE(held.WaitEntered(5s));
  mmltk::testsupport::await_test_promise(sibling, "ready artifact projects while its sibling retains a normal batch", 5s);
  const auto snapshot = pipeline.execution().snapshot();
@@ -10170,14 +10228,12 @@ TEST_CASE("independent native normalization enters shared annotation lanes", "[b
  mmltk::testsupport::TestGate entered("independent native support normalization");
  input.rejected_object = [&](const auto&, const auto&, const auto&, auto, auto) { entered.receipt().ArriveAndWait(); };
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
- const mmltk::testsupport::ScopedTestCleanup release([&] {
-  entered.Release();
-  pipeline.execution().cancel();
- });
+ const auto release = settle_coconut_import_on_exit(entered, pipeline);
  REQUIRE(entered.WaitEntered(5s, 2));
  CHECK(pipeline.execution().snapshot().running[static_cast<std::size_t>(CompileWorkClass::Annotations)] == 2);
  entered.Release();
  const auto result = mmltk::testsupport::await_test_future(importing, "independent native products gather in source order", 5s);
+ // CLEANUP-IGNORE: Parallel normalization and staging retirement independently guard result cardinality before different rejection and mask assertions.
  REQUIRE(result.size() == 1);
  CHECK(result.front().index().image_count() == 2);
  CHECK(result.front().index().rejected.degenerate_boxes == 2);
@@ -10214,25 +10270,22 @@ TEST_CASE("a legal exceptional native row releases its own pinned Parquet batch"
   if (count == 1) completed.receipt().ArriveAndWait();
  };
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
- const mmltk::testsupport::ScopedTestCleanup release([&] {
-  completed.Release();
-  pipeline.execution().cancel();
- });
+ const auto release = settle_coconut_import_on_exit(completed, pipeline);
  REQUIRE(completed.WaitEntered(5s));
  CHECK(transferred.load());
- CHECK(pipeline.execution().snapshot().exceptional == 0);
- CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ mmltk::backend::data::testsupport::check_normal_compile_storage(pipeline.execution(), locked);
  completed.Release();
  const auto result = mmltk::testsupport::await_test_future(importing, "oversized row returns to the retained source generation", 5s);
+ // CLEANUP-IGNORE: Exceptional-row and pending-output cases independently assert component cardinality before different mask extents and resource checks.
  REQUIRE(result.size() == 1);
  REQUIRE(result.front().index().box_count() == 1);
  CHECK(result.front().index().storage().mask_rle_pairs.front().length == pixels.size());
- CHECK(pipeline.execution().snapshot().exceptional == 0);
- CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ mmltk::backend::data::testsupport::check_normal_compile_storage(pipeline.execution(), locked);
 }
 TEST_CASE("one pinned normalizer context drains every row of a shared Parquet batch", "[benchmark][coconut][parquet][annotations][resources]") {
  using namespace mmltk::backend::data::detail;
  ScopedTempDir root("coconut-single-normal-context");
+ // CLEANUP-IGNORE: This literal one-pixel PNG feeds independent native-image and Parquet-normalizer boundaries; the byte view must remain tied to each local encoded owner.
  const std::array<std::uint32_t, 1> pixel{1};
  const auto encoded = png(1, 1, pixel);
  const auto png_bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
@@ -10277,8 +10330,7 @@ TEST_CASE("one pinned normalizer context drains every row of a shared Parquet ba
  CHECK(components.front().index().box_count() == 8);
  CHECK(observation.projected.load());
  CHECK(observation.normalized.load());
- CHECK(pipeline.execution().snapshot().exceptional == 0);
- CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ mmltk::backend::data::testsupport::check_normal_compile_storage(pipeline.execution(), locked);
 }
 TEST_CASE("physical and original recovery subscriptions bypass a parked first row", "[benchmark][coconut][pipeline][recovery]") {
  using namespace std::chrono_literals;
@@ -10286,6 +10338,7 @@ TEST_CASE("physical and original recovery subscriptions bypass a parked first ro
  SECTION("a ready physical sibling settles before train originals") {}
  SECTION("cancellation wakes the parked physical and original dependencies") { cancel_parked = true; }
  ScopedTempDir root("coconut-recovery-readiness");
+ // CLEANUP-IGNORE: Train and unlabeled archive paths are explicit inputs to independent physical-repair and subscription scenarios.
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
  const auto train = cache.source_downloads("coco") / "train.tar";
  const auto unlabeled = cache.source_downloads("coco") / "unlabeled.tar";
@@ -10355,6 +10408,7 @@ TEST_CASE("physical and original recovery subscriptions bypass a parked first ro
   CHECK(train_observations.load() <= initial_observations + 2);
   CHECK(settled_peers.load() == peers);
   CHECK_FALSE(input.records->row(0).native());
+  // CLEANUP-IGNORE: Different recovery notifications independently prove that the unlabelled row is already available before releasing their own parked dependency.
   REQUIRE(input.records->row(1).native());
   CHECK(input.records->row(1).native()->inventory().physical.source == CoconutImageNamespace::CocoUnlabeled);
   CHECK(importing.wait_for(0ms) == std::future_status::timeout);
@@ -10411,6 +10465,7 @@ TEST_CASE("original readiness delivers a generation settled before subscription"
  CHECK(notifications.load() == 0);
  observed.Release();
  const auto result = mmltk::testsupport::await_test_future(importing, "already settled original generation immediately delivers its live row");
+ // CLEANUP-IGNORE: Independent import scenarios explicitly require one component and one image before checking different resource and notification outcomes.
  REQUIRE(result.size() == 1);
  CHECK(result.front().index().image_count() == 1);
  CHECK(subscriptions.load() == 1);
@@ -10497,6 +10552,7 @@ TEST_CASE("original generation delivery visits only live recovery rows after phy
  REQUIRE(physical.consume(unlabeled));
  mmltk::testsupport::await_test_promise(peers_retired, "rebound peers retire while first image still waits for originals");
  CHECK(subscriptions.load() == 1);
+ // CLEANUP-IGNORE: Different recovery notifications independently prove that the unlabelled row is already available before releasing their own parked dependency.
  REQUIRE(input.records->row(1).native());
  CHECK(input.records->row(1).native()->inventory().physical.source == CoconutImageNamespace::CocoUnlabeled);
  std::array<unsigned, count> before{};
@@ -10519,6 +10575,7 @@ TEST_CASE("original generation delivery visits only live recovery rows after phy
   terminal = true;
   originals.settle();
   const auto result = mmltk::testsupport::await_test_future(importing, "one live original row completes after its rebound peers");
+  // CLEANUP-IGNORE: Parked originals and generation delivery independently require their own ordered component counts before different tail cardinalities.
   REQUIRE(result.size() == 2);
   CHECK(result[0].index().image_count() == 1);
   CHECK(result[1].index().image_count() == count - 1);
@@ -10852,6 +10909,7 @@ TEST_CASE("native staging and arena retirement precede controller settlement", "
  CHECK(std::distance(std::filesystem::directory_iterator(input.inventory_directory), std::filesystem::directory_iterator{}) == 1);
  settlement.Release();
  const auto components = mmltk::testsupport::await_test_future(importing, "staged native products gather after publication resumes", 5s);
+ // CLEANUP-IGNORE: Parallel normalization and staging retirement independently guard result cardinality before different rejection and mask assertions.
  REQUIRE(components.size() == 1);
  CHECK(components.front().index().image_count() == 2);
  CHECK(components.front().index().box_count() == 2);
@@ -10871,6 +10929,7 @@ TEST_CASE("native pending output keeps its arena while a full file queue leaves 
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3, profiles, kParquetPoolBytes, 0, kParquetPoolBytes + (1U << 20)));
  REQUIRE(plan->contexts == 1);
  BenchmarkCompilePipeline pipeline(3, {}, {.descriptors = 13, .workspace_plan = plan});
+ // CLEANUP-IGNORE: The request and staging preparation already use shared fixtures; separate notification and physical-file-queue scenarios install different gates.
  const std::array physical{coco(7)};
  auto input = request(physical);
  input.prepare_partial_staging(pipeline, root.path() / "staging");
@@ -10886,10 +10945,7 @@ TEST_CASE("native pending output keeps its arena while a full file queue leaves 
   mmltk::testsupport::release_test_promise(full);
  };
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
- const mmltk::testsupport::ScopedTestCleanup release([&] {
-  physical_call.Release();
-  pipeline.execution().cancel();
- });
+ const auto release = settle_coconut_import_on_exit(physical_call, pipeline);
  mmltk::testsupport::await_test_promise(full, "normalization fills the bounded physical queue", 5s);
  REQUIRE(physical_call.WaitEntered(5s));
  CHECK(accepted.load() == 6);
@@ -10908,6 +10964,7 @@ TEST_CASE("native pending output keeps its arena while a full file queue leaves 
   CHECK_THROWS(mmltk::testsupport::await_test_future(importing, "cancelled or rejected preparation settles its native owner", 5s));
  else {
   const auto components = mmltk::testsupport::await_test_future(importing, "pending preparation resumes and publishes immutable output", 5s);
+  // CLEANUP-IGNORE: Exceptional-row and pending-output cases independently assert component cardinality before different mask extents and resource checks.
   REQUIRE(components.size() == 1);
   REQUIRE(components.front().index().box_count() == 1);
   CHECK(components.front().index().storage().mask_rle_pairs.front().length == 1);
@@ -10915,8 +10972,7 @@ TEST_CASE("native pending output keeps its arena while a full file queue leaves 
  pipeline.files().join();
  CHECK(settled.load() == accepted.load());
  input.records->discard();  // Failure retains the independently valid source generation until its owner retires it.
- CHECK(pipeline.execution().snapshot().leased == 0);
- CHECK(pipeline.execution().resource_usage().descriptors == 0);
+ mmltk::backend::data::testsupport::check_compile_inputs_drained(pipeline.execution());
 }
 TEST_CASE("accepted staging preparation retains charged custody through physical cancellation drain", "[benchmark][coconut][resources]") {
  using namespace mmltk::backend::data::detail;
@@ -11207,8 +11263,7 @@ TEST_CASE("native staging retains its record while an image uses another slice o
  CHECK(components.front().index().box_count() == 1);
  CHECK(writer.completed() == 1);
  pipeline.drain();
- CHECK(pipeline.execution().snapshot().records == 0);
- CHECK(pipeline.execution().snapshot().leased == 0);
+ mmltk::backend::data::testsupport::check_compile_records_drained(pipeline.execution());
  CHECK(bounded);
 }
 TEST_CASE("Coconut cost spans preserve disabled and unwinding diagnostic behavior", "[benchmark][coconut][trace]") {
@@ -11254,6 +11309,7 @@ TEST_CASE("admitted physical headers recover labels before the same image finish
  SECTION("unchanged generation retains its recovered admission until pixels finish") {}
  SECTION("original replacement before physical settlement rejects the stale recovery") { replace_original = true; }
  ScopedTempDir root("coconut-header-ready-recovery");
+ // CLEANUP-IGNORE: Separate cache roots and archive paths feed different physical membership and recovery scenarios.
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
  const auto archive = cache.source_downloads("coco") / "train.tar";
  tar(archive, std::array{std::pair{coco(7).member, white_jpeg(3, 3)}});
@@ -11381,8 +11437,7 @@ TEST_CASE("bounded gzip read turns preserve members and yield one CPU to a peer"
  } boundary{[&] { copying.receipt().ArriveAndWait(); }};
  std::vector<std::uint8_t> bytes(inputs[0].encoded.size());
  auto reading = std::async(std::launch::async, [&] { input.read_into(bytes, CancellationObservation::Borrow(boundary)); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { copying.Release(); });
- REQUIRE(copying.WaitEntered(5s));
+ const mmltk::testsupport::AwaitedTestGate release(copying, 5s);
  std::uint64_t peer_turn = 0;
  auto peer = execution.submit({.kind = CompileTaskKind::Pixels, .work = [&](std::size_t, const CompileAllowance&) { peer_turn = input.observation().read_turns; }});
  copying.Release();
@@ -11499,6 +11554,7 @@ TEST_CASE("unchanged native finalization requires a staged clean payload and reb
  }
  const bool foreground = kind == Input::Mask || kind == Input::Malformed || kind == Input::Degenerate || kind == Input::InvalidStuff;
  const std::array<std::uint32_t, 3> pixels{foreground ? 1U : kind == Input::Unlisted ? 2U : 0U, 0, 0};
+ // CLEANUP-IGNORE: The encoded PNG and borrowed byte view retain scenario-local storage; independent lineage owners carry different staged-support proofs.
  const auto encoded = png(3, 1, pixels);
  const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
  auto lineage = std::make_shared<CoconutNativeLineage>();
@@ -11606,8 +11662,7 @@ TEST_CASE("modern final caches leave held original snapshots to independent part
  CAPTURE(training);
  ScopedTempDir root("modern-cache-held-original");
  LocalCoconutRecipe local(root.path());
- auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock, true}, true);
- auto catalog = local.selected(config.selection.validation);
+ auto [config, catalog] = local.configured({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock, true}, true);
  catalog.stock_annotations = local_custom_catalog(local).coco_annotations;
  const auto originals = local.cache.source_downloads("coco") / catalog.stock_annotations.filename;
  const std::array<std::pair<std::string, std::string>, 2> original_members{
@@ -11640,11 +11695,7 @@ TEST_CASE("modern final caches leave held original snapshots to independent part
    if (current_training == training && boundary == CocoAnnotationInputBoundary::Parsing && !entered.exchange(true)) held.receipt().ArriveAndWait();
   });
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled = true;
-  held.Release();
- });
- REQUIRE(held.WaitEntered(5s));
+ const mmltk::testsupport::AwaitedTestGate release(held, 5s, 1, &cancelled);
  mmltk::testsupport::await_test_promise(labels, "part labels publish before their full-cache original prerequisite", 5s);
  CHECK(full_routes == 0);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);

@@ -145,12 +145,7 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
   throw;
  }
 }
-[[nodiscard]] std::string native_output(const std::filesystem::path& directory) {
- const auto file = FileHandle::open_readonly((directory / "native-output.txt").string());
- std::string text(file.size(), '\0');
- if (!text.empty()) file.pread_all(text.data(), text.size(), 0U);
- return text;
-}
+[[nodiscard]] std::string native_output(const std::filesystem::path& directory) { return mmltk::testsupport::read_text_file(directory / "native-output.txt"); }
 void check_fatal_output(const std::filesystem::path& directory, const std::string_view expected) {
  const auto text = native_output(directory);
  CHECK(text.starts_with("fatal: "));
@@ -195,9 +190,7 @@ TEST_CASE("desktop pixel probes require explicit opt-in beyond lifecycle tracing
   const auto result = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, output.path(), output.directory(), MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, tracing);
   REQUIRE(result.exited());
   REQUIRE(result.exit_code() == 0);
-  const auto log = FileHandle::open_readonly(output.path().string());
-  std::string text(log.size(), '\0');
-  if (!text.empty()) log.pread_all(text.data(), text.size(), 0U);
+  const auto text = mmltk::testsupport::read_text_file(output.path());
   const std::string expected = "mmltk fake Firefox tracing lifecycle=" + std::to_string(tracing != 0) + " pixels=" + std::to_string(tracing == 2) + " environment=" + std::to_string(tracing == 2);
   CHECK(text.find(expected) != std::string::npos);
  }
@@ -261,11 +254,7 @@ TEST_CASE("desktop startup reports exact errno without changing its exit status"
    firefox_root = output.directory() / "non-executable";
    std::filesystem::create_directory(firefox_root);
    const auto executable = firefox_root / "firefox";
-   {
-    std::ofstream file{executable};
-    file << "fixture without execute permission\n";
-   }
-   std::filesystem::permissions(executable, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+   mmltk::testsupport::write_text_file(executable, "fixture without execute permission\n", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
   }
   const auto result = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, output.path(), output.directory(), firefox_root, 0, false, "healthy", "off");
   REQUIRE(result.exited());

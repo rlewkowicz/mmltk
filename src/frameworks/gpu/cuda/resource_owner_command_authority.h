@@ -147,15 +147,6 @@ public:
  [[nodiscard]] ResourceOwnerCommandBinding binding() const noexcept { return ResourceOwnerCommandBinding{identity_}; }
  [[nodiscard]] bool valid() const noexcept { return identity_ != nullptr && identity_->worker.valid(); }
  [[nodiscard]] ResourceOwnerCommandScope EnterWorker() const noexcept { return binding().EnterWorker(); }
- // Called only by the physical owner at its hardware-mandated owner-thread
- // boundary. The returned scope authorizes this identity and no other.
- [[nodiscard]] ResourceOwnerCommandScope EnterMandatedOwnerThread() const noexcept {
-  if (resource_owner_delivery_active()) return {};
-  const auto binding = this->binding();
-  if (binding.authorized()) return ResourceOwnerCommandScope{identity_.get(), false};
-  if (!valid() || identity_->mandated_owner_thread != std::this_thread::get_id()) return {};
-  return ResourceOwnerCommandScope{identity_.get(), false};
- }
 
 private:
  std::shared_ptr<const detail::ResourceOwnerCommandIdentity> identity_{};

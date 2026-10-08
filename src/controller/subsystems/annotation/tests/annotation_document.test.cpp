@@ -231,6 +231,7 @@ TEST_CASE("Annotation private document owns pointer history and peer cancellatio
  REQUIRE(editor.Pointer(pointer).outcome == document::DocumentOutcome::Applied);
  CHECK(editor.ui().interaction_revision == pointer_revision + 1U);
  REQUIRE(editor.ui().scene.objects.size() == 1U);
+ // CLEANUP-IGNORE: Pointer history and indexed-object history independently undo their own creation before different handle and redo assertions.
  REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
  CHECK(editor.ui().scene.objects.empty());
  REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
@@ -277,6 +278,7 @@ TEST_CASE("Native annotation target identities survive index shifts and journal 
   .identity = {.object = displayed.identities->at(1).object, .element = 1U},
   .point = {12.0F, 14.0F},
  };
+ // CLEANUP-IGNORE: The same object-selection and deletion actions are deliberately repeated after redo to prove identity survives history reversal.
  REQUIRE(editor.Edit({.value = AnnotationObjectEdit{0U}}).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = AnnotationSidebarEdit{contracts::AnnotationSidebarCommand::Delete}}).outcome == document::DocumentOutcome::Applied);
  auto current_target = target;
@@ -286,6 +288,7 @@ TEST_CASE("Native annotation target identities survive index shifts and journal 
  begin.phase = contracts::AnnotationPointerPhase::Begin;
  REQUIRE(editor.ResolveTarget(begin));
  CHECK(begin.identity == current_target.identity);
+ // CLEANUP-IGNORE: Existing-target and preview-created identities exercise separate peer-close rollback paths and different subsequent resolution outcomes.
  REQUIRE(editor.Pointer(begin).outcome == document::DocumentOutcome::Applied);
  editor.PeerClosed();
  REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
@@ -293,8 +296,10 @@ TEST_CASE("Native annotation target identities survive index shifts and journal 
  REQUIRE(editor.ResolveTarget(current_target));
  CHECK(current_target.target.object == 1U);
  REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
+ // CLEANUP-IGNORE: The same object-selection and deletion actions are deliberately repeated after redo to prove identity survives history reversal.
  REQUIRE(editor.Edit({.value = AnnotationObjectEdit{0U}}).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = AnnotationSidebarEdit{contracts::AnnotationSidebarCommand::Delete}}).outcome == document::DocumentOutcome::Applied);
+ // CLEANUP-IGNORE: Undo is the operation under test for distinct object and spline identity histories, following independent failed-resolution assertions.
  CHECK_FALSE(editor.ResolveTarget(target));
  REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.ResolveTarget(target));
@@ -332,8 +337,10 @@ TEST_CASE("Native spline knot identities retain surviving elements across delete
  REQUIRE(editor.Edit({.value = AnnotationObjectEdit{0U}}).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = AnnotationSplineEdit{1U}}).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = AnnotationSidebarEdit{contracts::AnnotationSidebarCommand::SplineDeleteKnot}}).outcome == document::DocumentOutcome::Applied);
+ // CLEANUP-IGNORE: The same surviving knot and removed-handle assertions intentionally bracket undo and redo of one deletion.
  REQUIRE(editor.ResolveTarget(survivor));
  CHECK(survivor.target.element == 1U);
+ // CLEANUP-IGNORE: Undo is the operation under test for distinct object and spline identity histories, following independent failed-resolution assertions.
  CHECK_FALSE(editor.ResolveTarget(removed));
  REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.ResolveTarget(removed));
@@ -341,6 +348,7 @@ TEST_CASE("Native spline knot identities retain surviving elements across delete
  REQUIRE(editor.ResolveTarget(survivor));
  CHECK(survivor.target.element == 2U);
  REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
+ // CLEANUP-IGNORE: The same surviving knot and removed-handle assertions intentionally bracket undo and redo of one deletion.
  REQUIRE(editor.ResolveTarget(survivor));
  CHECK(survivor.target.element == 1U);
  CHECK_FALSE(editor.ResolveTarget(removed));
@@ -377,6 +385,7 @@ TEST_CASE("Creation preview identities become document identities at commit") {
  begin.phase = contracts::AnnotationPointerPhase::Begin;
  REQUIRE(editor.ResolveTarget(begin));
  CHECK(begin.identity.object == displayed.identity.object);
+ // CLEANUP-IGNORE: Existing-target and preview-created identities exercise separate peer-close rollback paths and different subsequent resolution outcomes.
  REQUIRE(editor.Pointer(begin).outcome == document::DocumentOutcome::Applied);
  editor.PeerClosed();
  REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
@@ -422,7 +431,9 @@ TEST_CASE("New indexed Annotation objects keep initial element identities throug
   CHECK_FALSE(editor.ResolveTarget(absent));
   auto stale = handle;
   stale.identity.element = identity.object;
+  // CLEANUP-IGNORE: Undo is the operation under test for distinct object and spline identity histories, following independent failed-resolution assertions.
   CHECK_FALSE(editor.ResolveTarget(stale));
+  // CLEANUP-IGNORE: Pointer history and indexed-object history independently undo their own creation before different handle and redo assertions.
   REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
   CHECK(editor.ui().scene.objects.empty());
   CHECK_FALSE(editor.ResolveTarget(handle));
@@ -591,6 +602,7 @@ TEST_CASE("Annotation valid repeated edits do not consume history and editing ou
   .frame_height = 64,
   .frame_ready = true
  };
+ // CLEANUP-IGNORE: Open and object selection are explicit editor actions before independent history-idempotency and mask-cleanup operations.
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0}}).outcome == d::DocumentOutcome::Applied);
  const auto revision = editor.ui().document_revision;
@@ -718,8 +730,10 @@ TEST_CASE("Annotation brush follows every segment as one cancelable transaction"
  const auto painted = editor.ui().scene.objects.front();
  CHECK(painted.shape == c::contracts::AnnotationShape::Mask);
  CHECK(std::ranges::any_of(painted.mask.runs, [](auto run) { return run.row == 10 && run.first <= 20 && run.last >= 20; }));
+ // CLEANUP-IGNORE: Brush transactions and shape creation independently undo their own content before different identity and redo checks.
  REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
  CHECK(editor.ui().scene.objects.empty());
+ // CLEANUP-IGNORE: Different edit transactions independently require redo to restore their own exact painted or transformed object.
  REQUIRE(editor.Edit({.value = c::AnnotationRedoEdit{}}).outcome == d::DocumentOutcome::Applied);
  CHECK(editor.ui().scene.objects.front() == painted);
  pointer = {.interaction_id = 2, .sequence = 1, .target = {.object = 0}, .point = {50, 50}, .brush_radius = 2};
@@ -845,6 +859,7 @@ TEST_CASE("Annotation four immutable backings admit editor facts while document 
  d::AnnotationDocument editor;
  auto scene = c::test_scene("test://four-backings");
  scene.objects.push_back({.name = c::contracts::AnnotationText::From("box"), .box = {{4, 4}, {20, 20}}});
+ // CLEANUP-IGNORE: Distinct annotation scenes are opened and selected before different custody and mask-cleanup mutations.
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
  std::array<c::AnnotationRenderState, 4U> held;
@@ -958,6 +973,7 @@ TEST_CASE("Annotation creates each supported shape in the selected native class"
   REQUIRE(editor.ui().scene.objects.size() == 1);
   CHECK(editor.ui().scene.objects.front().category == 1);
   CHECK(editor.ui().scene.valid());
+  // CLEANUP-IGNORE: Brush transactions and shape creation independently undo their own content before different identity and redo checks.
   REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
   CHECK(editor.ui().scene.objects.empty());
  }
@@ -975,6 +991,7 @@ TEST_CASE("Annotation mask fill and cleanup modify support and preserve tight pi
  c::contracts::AnnotationSceneContent scene{
   .document = c::contracts::WorkspaceResource::From("test://cleanup", 1U), .categories = {{.value = "mask"}}, .objects = {object}, .frame_width = 64, .frame_height = 64, .frame_ready = true
  };
+ // CLEANUP-IGNORE: Open and object selection are explicit editor actions before independent history-idempotency and mask-cleanup operations.
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0}}).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationMaskCleanupEdit{c::contracts::AnnotationMaskCleanup::LargestComponent, 1}}).outcome == d::DocumentOutcome::Applied);
@@ -1101,6 +1118,7 @@ TEST_CASE("Annotation cleanup preserves component ties and transient run admissi
  d::AnnotationDocument editor;
  auto scene = c::test_scene("test://cleanup-radius-admission");
  scene.objects = {{.name = c::contracts::AnnotationText::From("mask"), .shape = c::contracts::AnnotationShape::Mask, .mask = {.runs = {{32, 32, 32}}, .present = true}}};
+ // CLEANUP-IGNORE: Distinct annotation scenes are opened and selected before different custody and mask-cleanup mutations.
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
  const auto before = editor.ui();
@@ -1265,6 +1283,7 @@ TEST_CASE("Mask drag descriptions retain base intervals and commit exact transfo
  CHECK(editor.ui().scene.objects.front() == transformed);
  REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
  CHECK(editor.ui().scene.objects.front() == scene.objects.front());
+ // CLEANUP-IGNORE: Different edit transactions independently require redo to restore their own exact painted or transformed object.
  REQUIRE(editor.Edit({.value = c::AnnotationRedoEdit{}}).outcome == d::DocumentOutcome::Applied);
  CHECK(editor.ui().scene.objects.front() == transformed);
 }
@@ -1538,10 +1557,12 @@ TEST_CASE("Annotation class admission preserves CBOR non-box content and journal
  REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
  const auto before = editor.ui();
  CHECK(editor.Edit({.value = AnnotationCategoryEdit{contracts::AnnotationText::From("background")}}).outcome == document::DocumentOutcome::Rejected);
+ // CLEANUP-IGNORE: Atomic rejection and subsequent undo independently restore their own prior category and object state.
  CHECK(editor.ui().scene.categories == before.scene.categories);
  CHECK(editor.ui().scene.objects == before.scene.objects);
  REQUIRE(editor.Edit({.value = AnnotationCategoryEdit{contracts::AnnotationText::From("new-class")}}).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
+ // CLEANUP-IGNORE: Atomic rejection and subsequent undo independently restore their own prior category and object state.
  CHECK(editor.ui().scene.categories == before.scene.categories);
  CHECK(editor.ui().scene.objects == before.scene.objects);
  REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);

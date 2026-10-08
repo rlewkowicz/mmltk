@@ -160,6 +160,7 @@ private:
   std::uint32_t id = 0;
   std::size_t index = 0;
  };
+ [[nodiscard]] std::shared_ptr<CoconutNativeImage> begin_product(const CoconutRecord&, std::shared_ptr<const CoconutNativeLineage>);
  void materialize(const std::shared_ptr<CoconutNativeImage>&, CoconutNativeOutput*);
  SegmentEntry& segment_entry(std::uint32_t);
  mutable detail::CompileImageDecoder decoder_;

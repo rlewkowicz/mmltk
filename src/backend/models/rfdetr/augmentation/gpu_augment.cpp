@@ -433,6 +433,7 @@ void GpuAugmentationExecutor::Retire(const cudaError_t status) noexcept {
  if (impl_) std::move(retirement_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
 }
 void GpuAugmentationExecutor::CheckSettlement(const cudaError_t status, const char* detail) {
+ // CLEANUP-IGNORE: These executors retire different resource owners before the common CUDA error check; an adapter would only hide their lifetime boundary.
  if (status == cudaSuccess) return;
  Retire(status);
  ensure_cuda_ok(status, detail);
@@ -480,12 +481,14 @@ void GpuAugmentationExecutor::Reconfigure(const GpuAugmentationConfig& config) {
 const AugmentationBatchPlan& GpuAugmentationExecutor::Run(const GpuAugmentationBatchView& batch, const std::span<const std::uint64_t> image_keys, const std::span<const GpuAugmentationDonor> donors,
  const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, const std::size_t staging_slot) {
  (void)Prepare(batch, image_keys, donors, donor_batch.selection, staging_slot);
+ // CLEANUP-IGNORE: Both entrypoints invoke the shared prepared executor and expose its plan; preparation and training admission remain distinct.
  RunPrepared(batch, donor_batch, stream);
  return plan();
 }
 const AugmentationBatchPlan& GpuAugmentationExecutor::RunTraining(const GpuAugmentationBatchView& batch, const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence,
  const std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, const std::size_t staging_slot) {
  (void)PrepareTraining(batch, seed, epoch, rank, sequence, donors, donor_batch.selection, staging_slot);
+ // CLEANUP-IGNORE: Both entrypoints invoke the shared prepared executor and expose its plan; preparation and training admission remain distinct.
  RunPrepared(batch, donor_batch, stream);
  return plan();
 }

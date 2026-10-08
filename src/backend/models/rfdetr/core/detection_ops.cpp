@@ -48,6 +48,10 @@ using namespace torch::indexing;
 namespace mmltk::backend::models::rfdetr {
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 namespace {
+bool has_nonfinite_values(const torch::Tensor& matrix) {
+ const auto* data = matrix.data_ptr<float>();
+ return matrix.numel() != 0 && std::any_of(data, data + matrix.numel(), [](float value) { return !std::isfinite(value); });
+}
 constexpr double kSanitizedCostMargin = 1.0;
 using MatchIndices = std::vector<std::pair<torch::Tensor, torch::Tensor>>;
 class MatcherAccess final {
@@ -463,13 +467,11 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
   if (device.is_cuda()) {
    for (int64_t image = 0; image < bs && !exceptional; ++image) {
     const auto matrix = workspace.cpu_matrix(static_cast<int64_t>(layer_index), image);
-    const auto* data = matrix.data_ptr<float>();
-    exceptional = matrix.numel() != 0 && std::any_of(data, data + matrix.numel(), [](float value) { return !std::isfinite(value); });
+    exceptional = has_nonfinite_values(matrix);
    }
   } else {
    const auto& matrix = dense_cpu_costs[layer_index];
-   const auto* data = matrix.data_ptr<float>();
-   exceptional = matrix.numel() != 0 && std::any_of(data, data + matrix.numel(), [](float value) { return !std::isfinite(value); });
+   exceptional = has_nonfinite_values(matrix);
   }
   if (!exceptional) continue;
   auto full = device.is_cuda() ? build_dense_matcher_cost(*layers[layer_index], targets, config, retained_coords[layer_index]).to(torch::kCPU) : dense_cpu_costs[layer_index];

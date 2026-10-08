@@ -39,6 +39,7 @@ export module mmltk.tools.format_declarations;
 import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cleanup.declaration_patterns;
 import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_linux;
 import mmltk.tools.cpp_text;
 import mmltk.tools.generate_cleanup_json;
 export {
@@ -125,8 +126,7 @@ int runFormatter(const Json& options) {
    if (!file.contains("after")) continue;
    const auto path = file.at("path").get<std::string>();
    if (read_text(path) != sources.at(path)) throw std::runtime_error("source changed while formatting: " + path);
-   struct stat status{};
-   if (::stat(path.c_str(), &status) != 0) throw std::system_error(errno, std::generic_category(), "stat " + path);
+   const auto status = file_metadata(path);
    cleanup::writeAtomic(path, file.at("after").get_ref<const std::string&>());
    if (::chmod(path.c_str(), status.st_mode) != 0) throw std::system_error(errno, std::generic_category(), "chmod " + path);
   }

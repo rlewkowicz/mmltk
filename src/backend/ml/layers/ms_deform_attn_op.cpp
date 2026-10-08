@@ -29,6 +29,7 @@ torch::Tensor ms_deform_attn_reference(const torch::Tensor& value, const torch::
  sampled_values.reserve(static_cast<size_t>(num_levels));
  int64_t start = 0;
  for (int64_t level = 0; level < num_levels; ++level) {
+  // CLEANUP-IGNORE: Independent attention sampling and proposal generation read the canonical spatial-shape tensor before different tensor algorithms.
   const auto height = spatial_shapes.index({level, 0}).item<int64_t>();
   const auto width = spatial_shapes.index({level, 1}).item<int64_t>();
   const auto value_level = value.narrow(1, start, height * width).flatten(2).transpose(1, 2).reshape({batch * num_heads, head_dim, height, width});

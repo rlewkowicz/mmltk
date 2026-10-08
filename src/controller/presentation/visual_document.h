@@ -29,6 +29,7 @@ struct VisualDocument final {
  // Object-indexed normalized support bounds, checked on import.
  // Every present mask has an entry; empty masks use {0,0,0,0}.
  std::vector<std::array<float, 4>> mask_bounds{};
+ void AppendSourceObject(contracts::AnnotationObject object, std::array<float, 4> bounds);
  [[nodiscard]] VisualDocumentFacts facts() const { return {scene.document, meaning_identity_}; }
 
 private:

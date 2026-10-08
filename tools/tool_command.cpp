@@ -77,6 +77,7 @@ consteval auto descriptors() {
 export namespace mmltk::tools::command {
 inline constexpr auto commands = descriptors();
 constexpr std::string_view name(Command selected) { return commands.at(static_cast<std::size_t>(selected)).name; }
+constexpr bool fixture(Command selected) { return name(selected).starts_with("test-"); }
 constexpr std::string_view program(Command selected) { return commands.at(static_cast<std::size_t>(selected)).program; }
 inline std::optional<Command> parse(std::string_view spelling) {
  for (const auto& item : commands)

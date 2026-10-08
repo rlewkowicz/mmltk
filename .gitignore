@@ -18,6 +18,8 @@
 /engines/
 
 # Native and CMake build outputs
+/mmltk
+/.mmltk-next-*
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake

@@ -118,6 +118,7 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  const auto first_host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - first_read_started).count();
  const auto restored_policy = capture_execution_policy_snapshot();
  CHECK(restored_policy.affinity == caller_policy.affinity);
+ // CLEANUP-IGNORE: Dataset-reader restoration independently verifies NUMA policy against the execution-policy unit oracle.
  CHECK(restored_policy.memory_policy.mode == caller_policy.memory_policy.mode);
  CHECK(restored_policy.memory_policy.mask == caller_policy.memory_policy.mask);
  CHECK(restored_policy.nice_value == caller_policy.nice_value);
@@ -144,10 +145,13 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
   state.failure = error;
   state.done.store(true, std::memory_order_release);
  }};
- stream.release(0U, nullptr, completed);
- stream.synchronize();
- REQUIRE(completion.done.load(std::memory_order_acquire));
- REQUIRE_FALSE(completion.failure);
+ const auto release_stream = [&] {
+  stream.release(0U, nullptr, completed);
+  stream.synchronize();
+  REQUIRE(completion.done.load(std::memory_order_acquire));
+  REQUIRE_FALSE(completion.failure);
+ };
+ release_stream();
  REQUIRE(std::memcmp(received.data(), host, received.size()) == 0);
  Batch training_batch{};
  std::size_t training_images = 0U;
@@ -222,10 +226,7 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  stream.handoff(0U, nullptr);
  ensure_cuda_ok(cudaMemcpyAsync(received.data(), device, received.size(), cudaMemcpyDeviceToHost, nullptr), "compiled stream reused consumer read");
  completion.done.store(false, std::memory_order_release);
- stream.release(0U, nullptr, completed);
- stream.synchronize();
- REQUIRE(completion.done.load(std::memory_order_acquire));
- REQUIRE_FALSE(completion.failure);
+ release_stream();
  CHECK(std::memcmp(received.data(), source.image_pixels(13U), stride) == 0);
  CHECK(std::memcmp(received.data() + stride, source.image_pixels(1U), stride) == 0);
  REQUIRE(stream.reset_storage() == cudaSuccess);
@@ -289,6 +290,7 @@ void exercise_schedule_capacity(const std::string& path, const bool h2d) {
      CHECK(batch.num_images == std::min(schedule.batch, count - starts[ordinal]));
      CHECK(batch.image_capacity_bytes == batch.num_images * source.header().image_stride);
      CHECK(batch.slot_index < std::min<std::size_t>(schedule.prefetch, starts.size()));
+     // CLEANUP-IGNORE: Loader wait, host view and destination allocation belong to independent scheduled-batch and explicit-order copy oracles.
      loader.wait_batch(batch);
      const auto host = loader.host_images(batch);
      std::vector<float> received(host.size());
@@ -545,6 +547,7 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
  for (const auto& read : reads) CHECK(std::memcmp(received + read.destination_offset, source.image_pixels(read.index), stride) == 0);
 }
 void exercise_used_ranges(const std::string& path) {
+ // CLEANUP-IGNORE: The shared dataset owner is opened independently so each range, gather and prefault scenario retains its own mapped storage and borrowed header stride.
  const auto source = CompiledDataset::open(path);
  const auto stride = static_cast<std::size_t>(source.header().image_stride);
  const auto pitch = source.header().max_label_bytes;
@@ -589,6 +592,7 @@ void exercise_used_ranges(const std::string& path) {
  CHECK(CompiledDataset::gather_chunks(3, CompiledDataset::read_chunk_bytes, pitch) == 4);
  CHECK_THROWS_AS(cursor.next(0), std::invalid_argument);
 }
+// CLEANUP-IGNORE: The shared dataset owner is opened independently so each range, gather and prefault scenario retains its own mapped storage and borrowed header stride.
 void exercise_bounded_gathers(const std::string& path, bool h2d) {
  const auto source = CompiledDataset::open(path);
  const auto stride = static_cast<std::size_t>(source.header().image_stride);
@@ -663,6 +667,7 @@ void exercise_bounded_gathers(const std::string& path, bool h2d) {
  CHECK(std::memcmp(stream.host_images(0).data(), source.image_pixels(13), stride) == 0);
 }
 void exercise_prefault_custody(const std::string& path) {
+ // CLEANUP-IGNORE: The shared dataset owner is opened independently so each range, gather and prefault scenario retains its own mapped storage and borrowed header stride.
  const auto source = CompiledDataset::open(path);
  const auto stride = static_cast<std::size_t>(source.header().image_stride);
  const std::array reads{CompiledImageRead{13, 0}, CompiledImageRead{1, stride}};
@@ -857,6 +862,10 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  DatasetLoader shuffled_loader(shuffled_cfg);
  shuffled_loader.begin_epoch();
  std::vector<uint32_t> seen_indices;
+ const auto check_permutation = [&] {
+  std::sort(seen_indices.begin(), seen_indices.end());
+  for (uint32_t i = 0; i < static_cast<uint32_t>(seen_indices.size()); ++i) { REQUIRE(seen_indices[i] == i); }
+ };
  total = 0;
  while (shuffled_loader.next_batch(batch)) {
   CHECK_THROWS_AS(direct_loader.host_images(batch), std::runtime_error);
@@ -875,8 +884,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  ensure_cuda_ok(cudaStreamSynchronize(compute_stream), "cudaStreamSynchronize");
  shuffled_loader.synchronize();
  REQUIRE(total == static_cast<size_t>(NUM_IMAGES));
- std::sort(seen_indices.begin(), seen_indices.end());
- for (uint32_t i = 0; i < static_cast<uint32_t>(seen_indices.size()); ++i) { REQUIRE(seen_indices[i] == i); }
+ check_permutation();
  printf("Shuffled iteration: %zu images with prefetch_factor=%d\n", total, shuffled_cfg.prefetch_factor);
  shuffled_loader.begin_epoch();
  seen_indices.clear();
@@ -885,8 +893,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
   shuffled_loader.release_batch(batch);
  }
  shuffled_loader.synchronize();
- std::sort(seen_indices.begin(), seen_indices.end());
- for (uint32_t i = 0; i < static_cast<uint32_t>(seen_indices.size()); ++i) { REQUIRE(seen_indices[i] == i); }
+ check_permutation();
  const std::vector<int> cpu_set = allowed_cpu_set();
  DatasetLoader::Config budgeted_cfg = shuffled_cfg;
  budgeted_cfg.prefetch_factor = 2;
@@ -1016,6 +1023,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  CHECK(std::vector<std::uint32_t>(batch.image_indices, batch.image_indices + batch.num_images) == std::vector<std::uint32_t>{2, 4, 2, 6});
  CHECK(std::vector<std::uint64_t>(batch.draw_keys.begin(), batch.draw_keys.end()) == std::vector<std::uint64_t>{15, 16, 17, 18});
  CHECK(batch.microbatch_key == 102);
+ // CLEANUP-IGNORE: Loader wait, host view and destination allocation belong to independent scheduled-batch and explicit-order copy oracles.
  planned_loader.wait_batch(batch);
  const auto planned_pixels = planned_loader.host_images(batch);
  std::vector<float> delivered_pixels(planned_pixels.size());
@@ -1423,14 +1431,15 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
  config.target_width = 31;
  config.target_height = 31;
  config.num_workers = 1;
- const auto ordinary_plan = DatasetCompiler::prepare(config, {"train"});
- DatasetCompiler::compile(ordinary_plan, 0U);
- const auto ordinary = CompiledDataset::open(fs::path(config.output_dir) / "train.bin");
+ const auto compile_selected = [&] {
+  const auto plan = DatasetCompiler::prepare(config, {"train"});
+  DatasetCompiler::compile(plan, 0U);
+  return CompiledDataset::open(fs::path(config.output_dir) / "train.bin");
+ };
+ const auto ordinary = compile_selected();
  config.output_dir = (root.path() / "perceptual").string();
  config.perceptual_downscale = true;
- const auto selected_plan = DatasetCompiler::prepare(config, {"train"});
- DatasetCompiler::compile(selected_plan, 0U);
- const auto selected = CompiledDataset::open(fs::path(config.output_dir) / "train.bin");
+ const auto selected = compile_selected();
  REQUIRE(ordinary.header().version == selected.header().version);
  REQUIRE(std::ranges::equal(ordinary.class_names(), selected.class_names()));
  for (const auto slot : ordinary.eligible_slots()) {
@@ -1534,6 +1543,7 @@ TEST_CASE("compiled opening trusts recorded sample metadata and payloads", "[bac
  if (bad == "unaligned maximum") ++header.max_label_bytes;
  if (bad == "population") --header.num_images;
  if (bad == "unused maximum") header.max_label_bytes += 8;
+ // CLEANUP-IGNORE: The common file creator writes an explicit header before distinct sparse-layout and cancellation admission payloads.
  const auto file = mmltk::common::io::FileHandle::create_output(path.string(), layout.total_size);
  file.pwrite_all(&header, sizeof(header), 0);
  file.pwrite_all(images.data(), sizeof(images), layout.index_offset);
@@ -1573,6 +1583,7 @@ TEST_CASE("compiled opening cancels within admission and reuses its workers", "[
  const std::array<std::string, 1> names{"background"};
  const auto header = make_file_header({count, 1, 1, 3, 0, 12}, names, layout);
  const std::vector<ImageEntry> entries(count, {.status = ImageStatus::Eligible, .original_width = 1, .original_height = 1});
+ // CLEANUP-IGNORE: The common file creator writes an explicit header before distinct sparse-layout and cancellation admission payloads.
  const auto file = mmltk::common::io::FileHandle::create_output(path.string(), layout.total_size);
  file.pwrite_all(&header, sizeof(header), 0);
  file.pwrite_all(entries.data(), entries.size() * sizeof(ImageEntry), layout.index_offset);

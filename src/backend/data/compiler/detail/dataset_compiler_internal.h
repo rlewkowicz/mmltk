@@ -17,6 +17,7 @@
 #include "src/backend/data/detail/compiled_slot_storage.h"
 #include "src/backend/data/detail/file_work_queue.h"
 namespace mmltk::backend::data::compiler_internal {
+void check_compilation_cancelled(mmltk::common::concurrency::CancellationObservation);
 struct DatasetScan {
  catalog::ClassCatalog class_catalog;
  std::uint8_t source_category_base = 0;

@@ -166,10 +166,7 @@ void require_float32(const std::initializer_list<torch::Tensor> tensors) {
  for (const auto& tensor : tensors) { REQUIRE(tensor.scalar_type() == torch::kFloat32); }
 }
 void require_finite_gradients(const std::initializer_list<torch::Tensor> tensors) {
- for (const auto& tensor : tensors) {
-  REQUIRE(tensor.grad().defined());
-  REQUIRE(torch::isfinite(tensor.grad()).all().item<bool>());
- }
+ for (const auto& tensor : tensors) { mmltk::backend::ml::testsupport::require_finite_gradient(tensor); }
 }
 void retain_captured_layer_gradients(rfdetr::OutputLayer& layer) {
  REQUIRE(layer.query_features.has_value());
@@ -191,8 +188,7 @@ void retain_captured_output_gradients(rfdetr::ModelOutputs& outputs) {
 }
 void append_layer_gradient_evidence(const rfdetr::OutputLayer& layer, const std::string& prefix, const bool require_zero, std::vector<std::string>& names) {
  const auto append = [&](const torch::Tensor& tensor, const std::string& suffix) {
-  REQUIRE(tensor.grad().defined());
-  REQUIRE(torch::isfinite(tensor.grad()).all().item<bool>());
+  mmltk::backend::ml::testsupport::require_finite_gradient(tensor);
   if (require_zero && suffix != ".pred_logits") {
    REQUIRE(tensor.grad().abs().sum().item<float>() == 0.0F);
   } else {
@@ -374,8 +370,7 @@ void test_complete_focal_cost_and_both_objectives_keep_prediction_and_probe_grad
  REQUIRE(features.grad().abs().sum().item<float>() > 0.0F);
  const auto supervision_parameters = supervision.named_parameters(true);
  for (const auto& parameter : supervision_parameters) {
-  REQUIRE(parameter.value().grad().defined());
-  REQUIRE(torch::isfinite(parameter.value().grad()).all().item<bool>());
+  mmltk::backend::ml::testsupport::require_finite_gradient(parameter.value());
   REQUIRE(parameter.value().grad().abs().sum().item<float>() > 0.0F);
  }
  REQUIRE(supervision_parameters.find("value_projection.weight") == nullptr);
@@ -430,6 +425,7 @@ void test_layer_group_and_device_target_reductions_follow_declared_gating() {
  auto layered_config = one_group_config;
  layered_config.aux_loss = true;
  layered_config.two_stage = true;
+ // CLEANUP-IGNORE: Layered and grouped numerical oracles require separate initialized supervision owners before shared oracle-projection installation.
  rfdetr::TrainingSupervisionImpl layered(layered_config, layered_config.num_classes - 1);
  layered.initialize(41);
  install_oracle_projections(layered);
@@ -450,6 +446,7 @@ void test_layer_group_and_device_target_reductions_follow_declared_gating() {
  REQUIRE(layered_outputs.enc_outputs->pred_boxes.grad().defined());
  auto grouped_config = one_group_config;
  grouped_config.group_detr = 2;
+ // CLEANUP-IGNORE: Layered and grouped numerical oracles require separate initialized supervision owners before shared oracle-projection installation.
  rfdetr::TrainingSupervisionImpl grouped(grouped_config, grouped_config.num_classes - 1);
  grouped.initialize(41);
  install_oracle_projections(grouped);
@@ -473,10 +470,12 @@ void test_layer_group_and_device_target_reductions_follow_declared_gating() {
  REQUIRE(torch::allclose(validation_loss, baseline, 1.0e-5, 1.0e-5));
 }
 void test_complete_match_free_loss_is_fp32_inside_cuda_autocast() {
+ // CLEANUP-IGNORE: CUDA eligibility and model construction establish separate autocast and timing-owner tests with different seeds.
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  auto config = match_free_config();
  rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
  supervision.initialize(43);
+ // CLEANUP-IGNORE: The shared oracle projection and CUDA placement operations apply to independent numerical and timing fixtures.
  install_oracle_projections(supervision);
  supervision.to(torch::Device(torch::kCUDA));
  const auto labels = torch::tensor({{1}}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
@@ -506,10 +505,7 @@ void test_complete_match_free_loss_is_fp32_inside_cuda_autocast() {
  autocast.reset();
  loss.total.backward();
  require_finite_gradients({layer.pred_logits, layer.pred_boxes, features});
- for (const auto& parameter : supervision.named_parameters(true)) {
-  REQUIRE(parameter.value().grad().defined());
-  REQUIRE(torch::isfinite(parameter.value().grad()).all().item<bool>());
- }
+ for (const auto& parameter : supervision.named_parameters(true)) { mmltk::backend::ml::testsupport::require_finite_gradient(parameter.value()); }
 }
 void test_timing_leases_are_explicit_bounded_and_harvested_once() {
  auto disabled_config = match_free_config();
@@ -525,17 +521,18 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
  const auto disabled_handoff = disabled.harvest_timing();
  REQUIRE(disabled_handoff.completed_leases == 0);
  REQUIRE(disabled_handoff.outstanding_leases == 0);
+ // CLEANUP-IGNORE: CUDA eligibility and model construction establish separate autocast and timing-owner tests with different seeds.
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  auto config = match_free_config();
  rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
  supervision.initialize(45);
+ // CLEANUP-IGNORE: The shared oracle projection and CUDA placement operations apply to independent numerical and timing fixtures.
  install_oracle_projections(supervision);
  supervision.to(torch::Device(torch::kCUDA));
  const auto features = torch::ones({1, 1, 3, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
  rfdetr::ModelOutputs outputs;
  outputs.main = oracle_layer(features);
- outputs.main.pred_logits = outputs.main.pred_logits.to(torch::kCUDA);
- outputs.main.pred_boxes = outputs.main.pred_boxes.to(torch::kCUDA);
+ mmltk::backend::models::rfdetr::testsupport::move_required_output_tensors(outputs.main, torch::Device(torch::kCUDA));
  const auto labels = torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
  const auto boxes = torch::tensor({{0.5F, 0.5F, 0.2F, 0.25F}}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
  const auto targets = one_image_targets(boxes, labels);
@@ -607,52 +604,47 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
  rfdetr::NativeRfDetrModel dn_model(dn_config, rfdetr::testsupport::synthetic_training_layout(dn_config.num_classes - 1));
  auto& dn_owner = (dn_model);
  dn_owner.initialize_training_supervision(46);
- dn_owner.to(torch::Device(torch::kCUDA));
- dn_owner.train(true);
- dn_owner.set_force_pytorch_deformable_attn(true);
+ rfdetr::testsupport::configure_cuda_training_model(dn_owner);
  dn_owner.configure_supervision_timing({torch::Device(torch::kCUDA), 1, true});
  const auto dn_float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
  const auto dn_integer_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
  const auto dn_targets = batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.25F}}, dn_float_options)}, {torch::tensor({1}, dn_integer_options)}, dn_config.num_queries);
  const auto dn_image = torch::zeros({3, 64, 64}, dn_float_options);
+ const auto finish_timed_dn_loss = [&](auto& owner, const auto& step_outputs) {
+  owner.begin_criterion_timing();
+  static_cast<void>(owner.supervision_loss(step_outputs, dn_targets, {torch::tensor(1.0F, dn_float_options)}, true));
+  owner.end_criterion_timing();
+  owner.end_supervised_step_timing();
+ };
  const auto record_dn_step = [&](const std::uint64_t batch_sequence) {
   dn_owner.begin_supervised_step_timing();
   const auto dn_outputs = dn_owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({dn_image}), dn_targets, {46, 1, 0, batch_sequence});
   REQUIRE(dn_outputs.denoising.has_value());
   REQUIRE(dn_outputs.denoising->aux_outputs.size() == 1);
   REQUIRE(dn_outputs.enc_outputs.has_value());
-  dn_owner.begin_criterion_timing();
-  static_cast<void>(dn_owner.supervision_loss(dn_outputs, dn_targets, {torch::tensor(1.0F, dn_float_options)}, true));
-  dn_owner.end_criterion_timing();
-  dn_owner.end_supervised_step_timing();
+  finish_timed_dn_loss(dn_owner, dn_outputs);
  };
  record_dn_step(1);
- REQUIRE_THROWS(dn_owner.begin_supervised_step_timing());
- static_cast<void>(cudaDeviceSynchronize());
- const auto dn_completed_handoff = dn_owner.harvest_supervision_timing();
- REQUIRE(dn_completed_handoff.completed_leases == 5);
- REQUIRE(dn_completed_handoff.outstanding_leases == 0);
+ const auto complete_dn_handoff = [&] {
+  REQUIRE_THROWS(dn_owner.begin_supervised_step_timing());
+  static_cast<void>(cudaDeviceSynchronize());
+  const auto handoff = dn_owner.harvest_supervision_timing();
+  REQUIRE(handoff.completed_leases == 5);
+  REQUIRE(handoff.outstanding_leases == 0);
+ };
+ complete_dn_handoff();
  record_dn_step(2);
- REQUIRE_THROWS(dn_owner.begin_supervised_step_timing());
- static_cast<void>(cudaDeviceSynchronize());
- const auto dn_reused_handoff = dn_owner.harvest_supervision_timing();
- REQUIRE(dn_reused_handoff.completed_leases == 5);
- REQUIRE(dn_reused_handoff.outstanding_leases == 0);
+ complete_dn_handoff();
  auto combined_config = production_denoising_config(rfdetr::TrainAssignmentKind::MatchFree, true);
  torch::manual_seed(47);
  rfdetr::NativeRfDetrModel combined_model(combined_config, rfdetr::testsupport::synthetic_training_layout(combined_config.num_classes - 1));
  auto& combined_owner = (combined_model);
  combined_owner.initialize_training_supervision(47);
- combined_owner.to(torch::Device(torch::kCUDA));
- combined_owner.train(true);
- combined_owner.set_force_pytorch_deformable_attn(true);
+ rfdetr::testsupport::configure_cuda_training_model(combined_owner);
  combined_owner.configure_supervision_timing({torch::Device(torch::kCUDA), 1, true});
  combined_owner.begin_supervised_step_timing();
  const auto combined_outputs = combined_owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({dn_image.clone()}), dn_targets, {47, 1, 0, 1});
- combined_owner.begin_criterion_timing();
- static_cast<void>(combined_owner.supervision_loss(combined_outputs, dn_targets, {torch::tensor(1.0F, dn_float_options)}, true));
- combined_owner.end_criterion_timing();
- combined_owner.end_supervised_step_timing();
+ finish_timed_dn_loss(combined_owner, combined_outputs);
  REQUIRE_THROWS(combined_owner.begin_supervised_step_timing());
  static_cast<void>(cudaDeviceSynchronize());
  const auto combined_handoff = combined_owner.harvest_supervision_timing();
@@ -692,7 +684,9 @@ void test_empty_and_retained_graphs_are_finite_and_independent() {
  second.main.query_features = second_features.narrow(2, 0, 2);
  second.main.query_layout = rfdetr::SupervisedQueryLayout{1, 2};
  auto second_loss = supervision.loss(second, targets, {torch::tensor(1.0F)}, true).total;
+ // CLEANUP-IGNORE: Distinct empty-target supervision paths independently construct their expected batch and exercise their own loss owner.
  const auto empty_targets = batched_targets({torch::zeros({0, 4})}, {torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
+ // CLEANUP-IGNORE: Different empty-target contracts explicitly require finite loss before opposite zero and positive-value expectations.
  const auto empty = supervision.loss(second, empty_targets, {torch::tensor(0.0F)}, true);
  REQUIRE(torch::isfinite(empty.total).item<bool>());
  REQUIRE(empty.total.item<float>() > 0.0F);
@@ -714,6 +708,7 @@ void test_production_match_free_boundary_captures_layers_and_empty_gradient_anch
   config.two_stage = include_auxiliary_and_encoder;
   config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
   torch::manual_seed(include_auxiliary_and_encoder ? 71 : 67);
+  // CLEANUP-IGNORE: Each test constructs and trains its own model with a different denoising configuration and seed; the alias is only a local name for that owner.
   rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
   auto& owner = (model);
   owner.train(true);
@@ -732,6 +727,7 @@ void test_production_match_free_boundary_captures_layers_and_empty_gradient_anch
   const auto nonempty_optimizer_inventory = ordered_defined_trainable_gradients(owner);
   for (auto& parameter : owner.parameters(true)) { parameter.mutable_grad() = torch::Tensor(); }
   auto empty_outputs = owner.forward_for_match_free(rfdetr::nested_tensor_from_tensor_list({image.clone()}));
+  // CLEANUP-IGNORE: Empty-target execution and inactive supervision independently compare auxiliary output shape before different gradient and feature checks.
   REQUIRE(empty_outputs.aux_outputs.size() == nonempty_outputs.aux_outputs.size());
   REQUIRE(empty_outputs.enc_outputs.has_value() == nonempty_outputs.enc_outputs.has_value());
   retain_captured_output_gradients(empty_outputs);
@@ -842,9 +838,11 @@ void test_conditional_model_construction_preserves_rng_and_default_state_topolog
  active_owner.eval();
  torch::NoGradGuard no_grad;
  const auto image = torch::zeros({3, 64, 64});
+ // CLEANUP-IGNORE: Separate denoising configurations independently compare their forward results with the existing layer oracle; the matched prefix omits distinct output-contract assertions.
  const auto inactive_outputs = inactive_owner.forward(rfdetr::nested_tensor_from_tensor_list({image}), false);
  const auto active_outputs = active_owner.forward(rfdetr::nested_tensor_from_tensor_list({image.clone()}), false);
  require_layer_equal(inactive_outputs.main, active_outputs.main);
+ // CLEANUP-IGNORE: Empty-target execution and inactive supervision independently compare auxiliary output shape before different gradient and feature checks.
  REQUIRE(inactive_outputs.aux_outputs.size() == active_outputs.aux_outputs.size());
  REQUIRE(inactive_outputs.enc_outputs.has_value() == active_outputs.enc_outputs.has_value());
  REQUIRE_FALSE(inactive_outputs.main.query_features.has_value());
@@ -928,6 +926,7 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  REQUIRE(prepared->original_labels.index({0, 0, 1}).item<int64_t>() == 2);
  auto open_upper = variates;
  open_upper.label_flip = torch::ones(slot_shape);
+ // CLEANUP-IGNORE: Open-interval and zero-ratio label-noise cases require explicit distinct transform inputs and their own unchanged-label oracle.
  const auto open_upper_unflipped =
   rfdetr::transform_denoising_targets(prepared->original_labels, prepared->original_boxes, prepared->valid_slots, config.num_classes - 1, config.training_supervision.denoising, open_upper);
  REQUIRE(torch::equal(open_upper_unflipped.labels, prepared->original_labels));
@@ -963,6 +962,7 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  REQUIRE((one_transformed.labels == 0).all().item<bool>());
  auto zero_flip_config = config;
  zero_flip_config.training_supervision.denoising.label_noise_ratio = 0.0F;
+ // CLEANUP-IGNORE: Open-interval and zero-ratio label-noise cases require explicit distinct transform inputs and their own unchanged-label oracle.
  const auto zero_ratio_unflipped = rfdetr::transform_denoising_targets(
   prepared->original_labels, prepared->original_boxes, prepared->valid_slots, zero_flip_config.num_classes - 1, zero_flip_config.training_supervision.denoising, variates);
  REQUIRE(torch::equal(zero_ratio_unflipped.labels, prepared->original_labels));
@@ -1106,6 +1106,7 @@ void test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs() {
   outputs.enc_outputs = std::move(encoder);
   return outputs;
  };
+ // CLEANUP-IGNORE: The existing output factory and loss API are exercised with different supervision owners and expected auxiliary contributions.
  auto first_outputs = make_outputs(*prepared, 0.05F);
  const auto first = supervision.loss(first_outputs, targets, {torch::tensor(1.0F)}, true);
  REQUIRE(torch::allclose(first.total, first.classification + first.box + first.giou));
@@ -1122,6 +1123,7 @@ void test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs() {
  auxiliary_config.aux_loss = true;
  rfdetr::TrainingSupervisionImpl auxiliary_supervision(auxiliary_config, auxiliary_config.num_classes - 1);
  auxiliary_supervision.initialize(106);
+ // CLEANUP-IGNORE: The existing output factory and loss API are exercised with different supervision owners and expected auxiliary contributions.
  auto auxiliary_outputs = make_outputs(*prepared, 0.05F);
  const auto auxiliary_loss = auxiliary_supervision.loss(auxiliary_outputs, targets, {torch::tensor(1.0F)}, true);
  REQUIRE(auxiliary_loss.total.item<float>() > first.total.item<float>());
@@ -1149,6 +1151,7 @@ void test_production_dn_forward_preserves_reference_and_output_boundaries() {
   auto config = production_denoising_config(assignment, bbox_reparam, segmentation);
   config.dec_layers = segmentation ? 4 : 2;
   torch::manual_seed(seed);
+  // CLEANUP-IGNORE: Each test constructs and trains its own model with a different denoising configuration and seed; the alias is only a local name for that owner.
   rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
   auto& owner = (model);
   owner.train(true);
@@ -1248,6 +1251,7 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
  config.aux_loss = true;
  config.dec_layers = 2;
  torch::manual_seed(114);
+ // CLEANUP-IGNORE: Each test constructs and trains its own model with a different denoising configuration and seed; the alias is only a local name for that owner.
  rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
  auto& owner = (model);
  owner.train(true);
@@ -1290,8 +1294,7 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
   const auto parameters = owner.named_parameters(true);
   const auto* parameter = parameters.find(name);
   REQUIRE(parameter != nullptr);
-  REQUIRE(parameter->grad().defined());
-  REQUIRE(torch::isfinite(parameter->grad()).all().item<bool>());
+  mmltk::backend::ml::testsupport::require_finite_gradient(*parameter);
   REQUIRE(parameter->grad().abs().sum().item<float>() > 0.0F);
  }
  for (auto& parameter : owner.parameters(true)) { parameter.mutable_grad() = torch::Tensor(); }
@@ -1367,6 +1370,7 @@ void test_dn_reference_conventions_inference_removal_and_disabled_exact_path() {
  active_owner.eval();
  const auto image = torch::zeros({3, 64, 64});
  torch::NoGradGuard no_grad;
+ // CLEANUP-IGNORE: Separate denoising configurations independently compare their forward results with the existing layer oracle; the matched prefix omits distinct output-contract assertions.
  const auto inactive_output = inactive_owner.forward(rfdetr::nested_tensor_from_tensor_list({image}), false);
  const auto active_output = active_owner.forward(rfdetr::nested_tensor_from_tensor_list({image.clone()}), false);
  require_layer_equal(inactive_output.main, active_output.main);
@@ -1389,6 +1393,7 @@ void test_dn_all_empty_loss_is_finite_and_parameter_anchored() {
  const auto targets = batched_targets({torch::zeros({0, 4}), torch::zeros({0, 4})}, {torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64)),
                                                                                      // CLEANUP-IGNORE: Two empty rows specifically exercise the zero-target path.
                                                                                      torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
+ // CLEANUP-IGNORE: Different empty-target contracts explicitly require finite loss before opposite zero and positive-value expectations.
  const auto loss = supervision.loss(outputs, targets, {torch::tensor(0.0F)}, true);
  REQUIRE(torch::isfinite(loss.total).item<bool>());
  REQUIRE(loss.total.item<float>() == 0.0F);
@@ -1425,6 +1430,7 @@ void test_active_empty_loss_anchors_every_selected_mask_operand() {
    outputs.aux_outputs.push_back(make_layer(true));
    outputs.enc_outputs = make_layer(false);
   }
+  // CLEANUP-IGNORE: Distinct empty-target supervision paths independently construct their expected batch and exercise their own loss owner.
   const auto targets = batched_targets({torch::zeros({0, 4})}, {torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
   const auto loss = supervision.loss(outputs, targets, {torch::tensor(0.0F)}, true);
   REQUIRE(loss.total.item<float>() == 0.0F);
@@ -1886,6 +1892,7 @@ TEST_CASE("Inactive mask scalars retain full correspondence nonfinite and gradie
   outputs.main.pred_boxes = outputs.main.pred_boxes.detach().repeat({2, 1, 1}).set_requires_grad(true);
   const auto targets = batched_targets({torch::full({1, 4}, 0.25F), torch::full({1, 4}, 0.25F)}, {torch::zeros({1}, torch::kInt64), torch::zeros({1}, torch::kInt64)});
   const auto loss = owner.loss(outputs, targets, {torch::tensor(2.F)}, true);
+  // CLEANUP-IGNORE: Inactive-mask and private-sampling tests independently check both scalar nonfinite contracts before different backward paths.
   REQUIRE(torch::isnan(loss.mask_ce).item<bool>() == nonfinite);
   REQUIRE(torch::isnan(loss.mask_dice).item<bool>() == nonfinite);
   if (!nonfinite) {
@@ -2035,6 +2042,7 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
  // for coordinates or uses the supervision owner's seed helper.
  const auto tag_seed = [](std::uint64_t value, std::uint64_t tag) {
   value ^= tag + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+  // CLEANUP-IGNORE: This explicit test seed derivation is independent of the production sampling helper and must continue to detect changes to it.
   value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
   value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
   return value ^ (value >> 31U);
@@ -2087,6 +2095,7 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
  ++next_identity.batch_sequence;
  auto next = make_outputs(owner, next_identity);
  const auto next_loss = owner.loss(next, targets, {torch::tensor(3.F)}, true);
+ // CLEANUP-IGNORE: Repeated draws and a restarted owner independently prove exact replay of retained denoising outputs.
  const auto repeated = owner.loss(first, targets, {torch::tensor(3.F)}, true);
  REQUIRE(torch::equal(original.total, repeated.total));
  const std::array<rfdetr::LayerMaskSamples, 2> unspecified;
@@ -2100,16 +2109,20 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
  REQUIRE(torch::equal(ordinary_after, ordinary_without));
  rfdetr::TrainingSupervisionImpl restarted(config, config.num_classes - 1);
  restarted.initialize(701);
+ // CLEANUP-IGNORE: Restart, lane and epoch replay use independently named stochastic inputs and losses; explicit output ownership keeps each numerical oracle independent.
  auto replay = make_outputs(restarted, identity);
+ // CLEANUP-IGNORE: Repeated draws and a restarted owner independently prove exact replay of retained denoising outputs.
  const auto replay_loss = restarted.loss(replay, targets, {torch::tensor(3.F)}, true);
  REQUIRE(torch::equal(original.total, replay_loss.total));
  auto lane_identity = identity;
  lane_identity.rank = 1;
+ // CLEANUP-IGNORE: Restart, lane and epoch replay use independently named stochastic inputs and losses; explicit output ownership keeps each numerical oracle independent.
  auto lane = make_outputs(restarted, lane_identity);
  const auto lane_loss = restarted.loss(lane, targets, {torch::tensor(3.F)}, true);
  REQUIRE(torch::equal(lane_loss.total, restarted.loss(lane, targets, {torch::tensor(3.F)}, true, explicit_samples(lane)).total));
  auto epoch_identity = identity;
  ++epoch_identity.epoch;
+ // CLEANUP-IGNORE: Restart, lane and epoch replay use independently named stochastic inputs and losses; explicit output ownership keeps each numerical oracle independent.
  auto epoch = make_outputs(owner, epoch_identity);
  const auto epoch_loss = owner.loss(epoch, targets, {torch::tensor(3.F)}, true);
  REQUIRE_FALSE(torch::equal(original.mask_ce, epoch_loss.mask_ce));
@@ -2162,6 +2175,7 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
   const auto state = at::detail::getDefaultCPUGenerator().get_state();
   const auto loss = owner.loss(empty, empty_targets, {torch::tensor(0.F)}, true);
   REQUIRE(torch::equal(state, at::detail::getDefaultCPUGenerator().get_state()));
+  // CLEANUP-IGNORE: Inactive-mask and private-sampling tests independently check both scalar nonfinite contracts before different backward paths.
   REQUIRE(torch::isnan(loss.mask_ce).item<bool>() == nonfinite);
   REQUIRE(torch::isnan(loss.mask_dice).item<bool>() == nonfinite);
   if (!nonfinite) {

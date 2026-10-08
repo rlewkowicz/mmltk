@@ -1,7 +1,9 @@
 #pragma once
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/common/io/file_digest.h"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <cstdint>
@@ -13,6 +15,17 @@
 namespace mmltk::backend::models::rfdetr::test_support {
 void write_prediction_model(const std::filesystem::path&, std::int64_t queries = 2, bool include_masks = true, std::optional<ModelClassLayout> layout = {});
 [[nodiscard]] PredictRequest prediction_image_fixture(const std::filesystem::path& directory);
+inline std::string write_class_descriptor_fixture(const std::filesystem::path& path, const ModelClassDescriptor& descriptor) {
+ auto encoded = encode_class_descriptor(descriptor);
+ mmltk::testsupport::write_text_file(path, encoded);
+ return encoded;
+}
+inline ModelClassDescriptor checked_class_descriptor_fixture(const std::filesystem::path& artifact, const std::filesystem::path& companion, const ModelClassLayout& layout) {
+ auto descriptor = detail::read_class_descriptor(companion);
+ CHECK(descriptor.artifact_sha256 == mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(artifact)));
+ CHECK(descriptor.layout == layout);
+ return descriptor;
+}
 class ClassArtifactFixture final {
 public:
  ClassArtifactFixture(std::filesystem::path artifact, std::string_view bytes, const ModelClassLayout& layout) : artifact_(std::move(artifact)), companion_(artifact_.string() + ".classes.json") {
@@ -21,10 +34,7 @@ public:
    output << bytes;
   }
   artifact_digest_ = mmltk::common::io::sha256_file(artifact_);
-  {
-   std::ofstream output(companion_);
-   output << encode_class_descriptor({1, mmltk::common::io::sha256_hex(artifact_digest_), layout});
-  }
+  write_class_descriptor_fixture(companion_, {1, mmltk::common::io::sha256_hex(artifact_digest_), layout});
   companion_digest_ = mmltk::common::io::sha256_file(companion_);
  }
  void CheckPreserved() const {

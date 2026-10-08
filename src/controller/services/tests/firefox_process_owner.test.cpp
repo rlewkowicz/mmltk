@@ -82,8 +82,7 @@ public:
   std::ifstream input{path_};
   std::string line;
   const auto check_event = [&](const std::string_view event, const int value) {
-   REQUIRE(static_cast<bool>(std::getline(input, line)));
-   const auto record = nlohmann::json::parse(line);
+   const auto record = mmltk::testsupport::read_json_line(input);
    CHECK(record["owner"] == "firefox_process");
    CHECK(record["sequence"] == observations.process_group);
    CHECK(record["event"] == event);
@@ -133,6 +132,7 @@ TEST_CASE("Firefox process owner reaps a normal pidfd terminal") {
  diagnostics.check(observations, {"child.spawned"});
 }
 TEST_CASE("Firefox process owner stops and joins through its eventfd") {
+ // CLEANUP-IGNORE: Signal admission, shared owner factory and diagnostics precede distinct eventfd and retained-PID settlement paths.
  REQUIRE(services::block_browser_runtime_signals());
  ProcessDiagnostics diagnostics{GENERATE(false, true)};
  FirefoxObservations observations;
@@ -189,6 +189,7 @@ TEST_CASE("Firefox process owner settles a rejected child installation") {
  CHECK(errno == ESRCH);
 }
 TEST_CASE("Firefox process custody settles through its retained PID") {
+ // CLEANUP-IGNORE: Signal admission, shared owner factory and diagnostics precede distinct eventfd and retained-PID settlement paths.
  REQUIRE(services::block_browser_runtime_signals());
  ProcessDiagnostics diagnostics{GENERATE(false, true)};
  FirefoxObservations observations;
@@ -234,11 +235,7 @@ TEST_CASE("Firefox startup cause is retained separately from its mapped status")
  for (const bool refused_log : {false, true}) {
   mmltk::testsupport::ScopedTempDir root{"mmltk-firefox-startup-error"};
   const auto non_executable = root.path() / "firefox";
-  {
-   std::ofstream file{non_executable};
-   file << "fixture without execute permission\n";
-  }
-  std::filesystem::permissions(non_executable, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+  mmltk::testsupport::write_text_file(non_executable, "fixture without execute permission\n", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
   FirefoxObservations observations;
   services::FirefoxProcessOwner owner{
    "/tmp/mmltk-test-import.sock",

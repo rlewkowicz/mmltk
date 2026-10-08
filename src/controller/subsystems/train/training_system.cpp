@@ -778,6 +778,7 @@ TrainingSnapshot TrainingSystem::Clear(contracts::ProviderClearIntent) {
  return result;
 }
 TrainingSnapshot TrainingSystem::StartRemote(contracts::ProviderStartIntent) {
+ // CLEANUP-IGNORE: Idle snapshot admission precedes opposite remote start and stop operations with different state requirements.
  const auto current = impl_->snapshot();
  if (current.activity != TrainingActivity::Idle) throw contracts::BusyError("training operation is active");
  if (current.remote.phase == contracts::RemoteSessionPhase::Running) throw contracts::InvalidIntentError("remote training is already running");
@@ -796,6 +797,7 @@ TrainingSnapshot TrainingSystem::StartRemote(contracts::ProviderStartIntent) {
   false);
 }
 TrainingSnapshot TrainingSystem::StopRemote(contracts::ProviderStopIntent) {
+ // CLEANUP-IGNORE: Idle snapshot admission precedes opposite remote start and stop operations with different state requirements.
  const auto snapshot = impl_->snapshot();
  if (snapshot.activity != TrainingActivity::Idle) throw contracts::BusyError("training operation is active");
  const auto& current = snapshot.remote;

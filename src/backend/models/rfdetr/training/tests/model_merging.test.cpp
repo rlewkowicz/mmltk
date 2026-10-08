@@ -1,5 +1,5 @@
-#include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/backend/models/rfdetr/training/detail/model_merging.h"
 #include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
 #include "src/backend/models/rfdetr/training/detail/checkpoint_private.h"
@@ -73,6 +73,12 @@ struct SessionFixture final {
    manifest.models.push_back({model.model_id, {}, {}, 0, {}});
    plan.shards.push_back({model.model_id, model.seed, {static_cast<std::uint32_t>(model.model_id - 1)}, {1}, {}});
   }
+ }
+ auto candidate(const std::filesystem::path& path) const {
+  auto artifact = ingredient(path, 1, 3, .5).artifact;
+  artifact.configuration = manifest.configuration;
+  artifact.validation = manifest.validation;
+  return artifact;
  }
  void publish(std::function_ref<void(r::TrainingPublicationStep)> observe = [](r::TrainingPublicationStep) {}) {
   checkpoint.publish(manifest, plan, [&](const std::filesystem::path& destination, std::size_t index) {
@@ -186,6 +192,7 @@ TEST_CASE("final selection keeps explicit and uniform outcomes even when validat
  CHECK(std::filesystem::exists(explicit_result.artifact.path));
  CHECK(r::read_training_selection(temp.path() / "selected.json") == uniform);
  candidates[1].coefficient = 0;
+ // CLEANUP-IGNORE: Invalid coefficient tests independently require rejection to preserve distinct previously selected artifacts.
  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, false, temp.path(), evaluate));
  CHECK(r::read_training_selection(temp.path() / "selected.json") == uniform);
 }
@@ -287,6 +294,7 @@ TEST_CASE("final selection rejects incomplete coefficients and failures preserve
  CHECK(old.artifact.model_id == 2);
  const auto reject = [&](double coefficient) {
   candidates[1].coefficient = coefficient;
+  // CLEANUP-IGNORE: Invalid coefficient tests independently require rejection to preserve distinct previously selected artifacts.
   REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, false, temp.path(), evaluate));
   CHECK(r::read_training_selection(temp.path() / "selected.json") == old);
  };
@@ -308,14 +316,19 @@ TEST_CASE("final selection rejects incomplete coefficients and failures preserve
 }
 TEST_CASE("identical native content is one greedy ingredient even through separate saved files", "[model][rfdetr][training][merge]") {
  mmltk::testsupport::ScopedTempDir temp("native-content-identity");
+ // CLEANUP-IGNORE: Different selection policies independently assert equal content across separately named artifact inputs before distinct publication behavior.
  std::array candidates{ingredient(temp.path(), 1, 3, .5), ingredient(temp.path(), 2, 3, .5)};
  CHECK(candidates[0].artifact.content == candidates[1].artifact.content);
  std::size_t calls = 0;
- const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), [&](const auto&) {
-  ++calls;
-  return evaluation(.9);
- });
- CHECK(calls == 0);
+ const auto select_without_evaluation = [&] {
+  auto result = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), [&](const auto&) {
+   ++calls;
+   return evaluation(.9);
+  });
+  CHECK(calls == 0);
+  return result;
+ };
+ const auto selected = select_without_evaluation();
  CHECK(selected.ingredients.size() == 1);
  CHECK(selected.artifact.model_id == 1);
  for (auto& candidate : candidates) {
@@ -323,11 +336,7 @@ TEST_CASE("identical native content is one greedy ingredient even through separa
   proof->release_decoded_state();
   candidate.admission = std::move(proof);
  }
- const auto retained = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), [&](const auto&) {
-  ++calls;
-  return evaluation(.9);
- });
- CHECK(calls == 0);
+ const auto retained = select_without_evaluation();
  CHECK(retained == selected);
 }
 TEST_CASE("session admission rejects a partial or mixed model set before replacing its pointer", "[model][rfdetr][training][checkpoint]") {
@@ -510,9 +519,7 @@ TEST_CASE("session publication retains only its unchanged current candidate evid
 TEST_CASE("session shared candidate paths preserve logical IDs and reject conflicting facts", "[model][rfdetr][training][checkpoint]") {
  mmltk::testsupport::ScopedTempDir temp("session-shared-candidate");
  SessionFixture fixture(temp.path());
- auto shared = ingredient(temp.path(), 1, 3, .5).artifact;
- shared.configuration = fixture.manifest.configuration;
- shared.validation = fixture.manifest.validation;
+ auto shared = fixture.candidate(temp.path());
  for (auto& model : fixture.manifest.models) {
   model.best = shared;
   model.best->model_id = model.model_id;
@@ -533,6 +540,7 @@ TEST_CASE("session shared candidate paths preserve logical IDs and reject confli
 }
 TEST_CASE("each named equal-content artifact and late companion is checked before selection publication", "[model][rfdetr][training][merge]") {
  mmltk::testsupport::ScopedTempDir temp("selection-named-evidence");
+ // CLEANUP-IGNORE: Different selection policies independently assert equal content across separately named artifact inputs before distinct publication behavior.
  std::array candidates{ingredient(temp.path(), 1, 3, .5), ingredient(temp.path(), 2, 3, .5)};
  CHECK(candidates[0].artifact.content == candidates[1].artifact.content);
  const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) { return evaluation(.5); });
@@ -556,9 +564,7 @@ TEST_CASE("last session publication checks include retained candidates and all g
  for (const auto target : {0, 1, 2}) {
   mmltk::testsupport::ScopedTempDir temp("session-late-evidence");
   SessionFixture fixture(temp.path());
-  auto candidate = ingredient(temp.path(), 1, 3, .5).artifact;
-  candidate.configuration = fixture.manifest.configuration;
-  candidate.validation = fixture.manifest.validation;
+  auto candidate = fixture.candidate(temp.path());
   fixture.manifest.models.front().best = candidate;
   fixture.publish();
   const auto previous = fixture.manifest;

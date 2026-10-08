@@ -37,6 +37,11 @@ bool contains_operation(const torch::jit::Block* block, std::string_view operati
  }
  return false;
 }
+void require_native_operations(const std::shared_ptr<torch::jit::Graph>& graph, bool masks) {
+ REQUIRE(graph);
+ REQUIRE(contains_operation(graph->block(), "mmltk::ms_deform_attn"));
+ if (masks) REQUIRE(contains_operation(graph->block(), "mmltk::segmentation_depthwise"));
+}
 std::vector<torch::Tensor> prediction_tensors(const rf::ModelOutputs& outputs) {
  std::vector<torch::Tensor> result;
  const auto append = [&](const rf::OutputLayer& layer) {
@@ -120,14 +125,10 @@ TEST_CASE("Full CUDA traces preserve every prediction head and fixed-vector deri
     eager_losses.push_back(prediction_vjp(actual, expected, dtype, false));
     compiled_losses.push_back(prediction_vjp(actual, expected, dtype, true));
     const auto graph = Access::graph(compiled, true);
-    REQUIRE(graph);
-    REQUIRE(contains_operation(graph->block(), "mmltk::ms_deform_attn"));
-    if (masks) REQUIRE(contains_operation(graph->block(), "mmltk::segmentation_depthwise"));
+    require_native_operations(graph, masks);
     if (invocation == 4) {
      const auto executed = torch::jit::lastExecutedOptimizedGraph();
-     REQUIRE(executed);
-     REQUIRE(contains_operation(executed->block(), "mmltk::ms_deform_attn"));
-     if (masks) REQUIRE(contains_operation(executed->block(), "mmltk::segmentation_depthwise"));
+     require_native_operations(executed, masks);
     }
     if (retained_graph) CHECK(graph == retained_graph);
     retained_graph = graph;
@@ -206,10 +207,12 @@ TEST_CASE("Full model admission retains mode tails live weights and ordinary geo
  for (auto& parameter : model.parameters()) parameter.set_requires_grad(false);
  const auto frozen = model.forward({input, {}}, true);
  CHECK_FALSE(frozen.main.pred_logits.requires_grad());
+ // CLEANUP-IGNORE: The graph identity is checked and recaptured after separate live-gradient admission changes.
  CHECK(Access::graph(model, true) != graph);
  graph = Access::graph(model, true);
  model.named_parameters()["class_embed.weight"].set_requires_grad(true);
  CHECK(model.forward({input, {}}, true).main.pred_logits.requires_grad());
+ // CLEANUP-IGNORE: The graph identity is checked and recaptured after separate live-gradient admission changes.
  CHECK(Access::graph(model, true) != graph);
  graph = Access::graph(model, true);
  model.optimize_for_inference(3, true, rf::CompilationMode::kFullTrace);

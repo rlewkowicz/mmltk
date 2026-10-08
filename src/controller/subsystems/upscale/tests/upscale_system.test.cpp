@@ -1,3 +1,5 @@
+#include "src/test_support/image_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/validate/detail/validation_samples.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 #include <algorithm>
@@ -8,7 +10,6 @@
 #include "src/controller/presentation/tests/support/visual_system_fixture.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"
-#include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "src/backend/imaging/upscale/upscale_execution.h"
@@ -263,8 +264,7 @@ TEST_CASE("Upscale equal extent source changes replace actual receiver pixels") 
   source.Publish({16U, 8U}, static_cast<std::uint8_t>(value));
   const auto input = source.frame();
   const auto clears = backend->plane_clears.load();
-  static_cast<void>(upscale.Start(test_upscale_request({.source = input})));
-  REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == input; }));
+  start_upscale_and_wait(upscale, events, {.source = input}, true);
   const auto output = upscale.BorrowDocument(upscale.snapshot().frame);
   REQUIRE(output.valid());
   const auto plane = output.pixels.plane(0U).plane();
@@ -288,6 +288,7 @@ TEST_CASE("Upscale complete fake writers replace poisoned retained planes", "[up
  backend->pitch_padding_bytes = 23U;
  auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
  auto runtime = TestUpscaleAlgorithm::CreateRuntime(backend, kernel, {})(std::make_shared<ImageProductRevisionSequence>());
+ // CLEANUP-IGNORE: Each test starts work and inspects the model of its independently configured runtime before different input publications.
  runtime->BeginWork();
  auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
  REQUIRE(model != nullptr);
@@ -305,8 +306,7 @@ TEST_CASE("Upscale complete fake writers replace poisoned retained planes", "[up
   model->Semantics(warm ? ImagePlaneView{} : input.plane(1U).plane(), semantic, stream);
  });
  const auto product = runtime->CommitOutput(std::move(candidate));
- const auto read = product.Borrow();
- REQUIRE(read.valid());
+ const auto read = mmltk::testsupport::require_borrowed_image(product);
  for (std::size_t index = 0U; index < 2U; ++index) {
   const auto plane = read.plane(index).plane();
   const auto expected = index == 0U ? static_cast<std::uint8_t>(method) + 1U : warm ? 0U : 77U;
@@ -369,8 +369,7 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
  auto cropped = source.frame();
  cropped.content = {1U, 1U, 4U, 3U};
  cropped.source_extent = {4000U, 2000U};
- static_cast<void>(upscale.Start(test_upscale_request({.source = cropped})));
- REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == cropped; }));
+ start_upscale_and_wait(upscale, events, {.source = cropped}, true);
  CHECK(runs->load() == 5U);
  CHECK(upscale.snapshot().frame.source_extent == cropped.source_extent);
 }
@@ -409,11 +408,15 @@ TEST_CASE("Validation clean identity reuses native Upscale while replacing paire
  const auto clean_launches = runs.load();
  REQUIRE(clean_launches > 0U);
  const auto output = upscale.snapshot().frame;
+ const auto check_metadata = [&](const auto& actual, const auto& frame) {
+  REQUIRE(actual);
+  const auto expected = mmltk::frameworks::serialization::reflected_transport_value(*samples.ImageSnapshot(frame));
+  REQUIRE(expected);
+  CHECK(*actual == *expected);
+  return expected;
+ };
  const auto original_metadata = upscale.ImageSourceMetadata(output);
- REQUIRE(original_metadata);
- const auto expected_initial = mmltk::frameworks::serialization::reflected_transport_value(*samples.ImageSnapshot(initial.frame));
- REQUIRE(expected_initial);
- CHECK(*original_metadata == *expected_initial);
+ const auto expected_initial = check_metadata(original_metadata, initial.frame);
  samples.SetDisplay({0.437F});
  REQUIRE(source_events.Wait([&] { return samples.snapshot().frame.revision != initial.frame.revision; }, 20s));
  const auto confidence_frame = samples.snapshot().frame;
@@ -433,10 +436,7 @@ TEST_CASE("Validation clean identity reuses native Upscale while replacing paire
  CHECK(runs.load() == clean_launches);
  CHECK(upscale.snapshot().frame.clean_revision == output.clean_revision);
  const auto current_metadata = upscale.ImageSourceMetadata(upscale.snapshot().frame);
- REQUIRE(current_metadata);
- const auto expected_current = mmltk::frameworks::serialization::reflected_transport_value(*samples.ImageSnapshot(changed.frame));
- REQUIRE(expected_current);
- CHECK(*current_metadata == *expected_current);
+ const auto expected_current = check_metadata(current_metadata, changed.frame);
  CHECK(*original_metadata == *expected_initial);
  auto result = upscale.BorrowDocument(upscale.snapshot().frame);
  REQUIRE(result.valid());
@@ -470,8 +470,7 @@ TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input 
   return result;
  }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
  const auto initial = displayed(source.frame());
- static_cast<void>(upscale.Start(test_upscale_request({.source = initial})));
- REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+ start_upscale_and_wait(upscale, events, {.source = initial});
  const auto completed_frame = upscale.snapshot().frame;
  const auto retained_metadata = upscale.ImageSourceMetadata(completed_frame);
  REQUIRE(retained_metadata);
@@ -487,8 +486,7 @@ TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input 
  REQUIRE(current.revision != initial.revision);
  CHECK(upscale.ImageSourceMetadata(completed_frame) == retained_metadata);
  const auto copies = backend->same_copies.load(std::memory_order_acquire);
- static_cast<void>(upscale.Start(test_upscale_request({.source = current})));
- REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == current; }));
+ start_upscale_and_wait(upscale, events, {.source = current}, true);
  CHECK(runs->load(std::memory_order_acquire) == 1U);
  const auto next_metadata = upscale.ImageSourceMetadata(upscale.snapshot().frame);
  REQUIRE(next_metadata);
@@ -550,6 +548,7 @@ TEST_CASE("Upscale cached selection cannot redirect an active candidate and all 
  const auto read = upscale.BorrowDocument(selected.frame);
  REQUIRE(read.valid());
  CHECK(*reinterpret_cast<const std::uint8_t*>(read.pixels.plane(0U).plane().data) == 1U);
+ // CLEANUP-IGNORE: Separate cancellation windows release different algorithm gates before inspecting domain-specific settled state.
  gate->release.set_value();
  REQUIRE(events.Wait([&] { return !upscale.snapshot().busy; }));
  CHECK(upscale.snapshot().frame == cached[0U]);
@@ -561,6 +560,7 @@ TEST_CASE("Upscale cached selection cannot redirect an active candidate and all 
  CHECK(backend->same_copies.load() == copies);
 }
 TEST_CASE("Held output readers prevent obsolete foreground and warm work from preparing a candidate") {
+ // CLEANUP-IGNORE: Generated booleans have different meanings; separate source, kernel and run counters observe different upscale admission boundaries.
  const bool preempt_warm = GENERATE(false, true);
  auto backend = std::make_shared<FakeImageBackend>();
  MutableVisualSource source{backend, {16U, 8U}};
@@ -608,8 +608,7 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
   source.Publish({16U, 8U}, 5U);
   static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
  }
- REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
- blocked.get();
+ mmltk::testsupport::await_test_future(blocked, "blocked", 2s);
  const auto copied = backend->same_copies.load();
  const auto allocated = backend->planes_allocated.load();
  const auto prepared = admissions.prepared.load();
@@ -617,8 +616,7 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
  const auto latest = test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::ShiftLut});
  static_cast<void>(upscale.Start(latest));
  readers[0U] = {};
- REQUIRE(returned.wait_for(2s) == std::future_status::ready);
- returned.get();
+ mmltk::testsupport::await_test_future(returned, "returned", 2s);
  REQUIRE(events.Wait([&] { return !upscale.snapshot().busy && upscale.snapshot().kernel == latest.kernel && upscale.snapshot().input == latest.source; }));
  CHECK(runs->load() == 5U);
  CHECK(admissions.prepared.load() == prepared + 1U);
@@ -648,8 +646,7 @@ TEST_CASE("Upscale publishes only the newest selected kernel after obsolete devi
  };
  auto settle_upscale = settle_upscale_on_exit(upscale, gate->release);
  static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
- REQUIRE(entered.wait_for(2s) == std::future_status::ready);
- entered.get();
+ mmltk::testsupport::await_test_future(entered, "entered", 2s);
  static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::ShiftLut})));
  static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::RealPlksr})));
  CHECK_FALSE(upscale.snapshot().ready);
@@ -690,6 +687,7 @@ TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settl
  CHECK_FALSE(upscale.snapshot().ready);
  gate.release.set_value();
  static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
+ // CLEANUP-IGNORE: Different systems wait for readiness then check different counters: construction failures versus actual upscale runs.
  REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
  CHECK(runs->load(std::memory_order_acquire) == 1U);
  CHECK(upscale.snapshot().input == source.frame());
@@ -697,6 +695,7 @@ TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settl
 // CLEANUP-IGNORE: This cancellation-at-borrow test has a two-window source-custody gate, unlike held-output
 // admission pressure even though both begin with an Upscale fixture.
 TEST_CASE("Superseded Upscale demand releases source custody without copying at both borrow windows") {
+ // CLEANUP-IGNORE: Generated booleans have different meanings; separate source, kernel and run counters observe different upscale admission boundaries.
  const bool after_borrow = GENERATE(false, true);
  auto backend = std::make_shared<FakeImageBackend>();
  MutableVisualSource source{backend, {16U, 8U}};
@@ -781,8 +780,7 @@ TEST_CASE("Upscale warm activates every mode once and repeated ready signals are
  };
  upscale.Warm(extent);
  upscale.Warm(extent);
- REQUIRE(completed.wait_for(2s) == std::future_status::ready);
- completed.get();
+ mmltk::testsupport::await_test_future(completed, "completed", 2s);
  upscale.Warm(extent);
  REQUIRE(events.Wait([&] { return std::ranges::all_of(upscale.snapshot().methods, [](const auto& method) { return method.warm; }); }));
  CHECK(activation->warms.load(std::memory_order_acquire) == 1U);
@@ -949,10 +947,14 @@ void run_native_upscale(mmltk::frameworks::gpu::SystemImageRuntime& runtime, Ups
  });
  static_cast<void>(runtime.CommitOutput(std::move(candidate)));
 }
+void seed_native_upscale_cache() {
+ auto seed = make_native_upscale_runtime_factory(kDevice)(std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>());
+ run_native_upscale(*seed, UpscaleKernel::RealPlksr);
+ REQUIRE(seed->Retire().safe_to_destroy);
+}
 [[nodiscard]] std::array<std::vector<std::uint8_t>, 2U> native_upscale_pixels(mmltk::frameworks::gpu::SystemImageRuntime& runtime) {
  runtime.CompleteWork();
- const auto read = runtime.Borrow();
- REQUIRE(read.valid());
+ const auto read = mmltk::testsupport::require_borrowed_image(runtime);
  std::array<std::vector<std::uint8_t>, 2U> pixels;
  for (std::size_t index = 0U; index < pixels.size(); ++index) {
   const auto plane = read.plane(index).plane();
@@ -973,6 +975,7 @@ TEST_CASE("Native warm purpose retains full extent and provider readiness with o
  ReferenceEnvironment environment{reference_run};
  std::array<unsigned, static_cast<std::size_t>(Stage::Count)> counts{};
  auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) { ++counts[static_cast<std::size_t>(stage)]; })(std::make_shared<ImageProductRevisionSequence>());
+ // CLEANUP-IGNORE: Warm readiness and warm cancellation each retain their runtime retirement guard through distinct subsequent operations.
  const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};
  run_native_upscale(*runtime, method, {}, UpscalePurpose::Warm, extent);
  const auto expected = native_upscale_pixels(*runtime);
@@ -1037,6 +1040,7 @@ TEST_CASE("Native warm cancellation joins touched tile lanes and retries residen
    armed = false;
   }
  })(std::make_shared<ImageProductRevisionSequence>());
+ // CLEANUP-IGNORE: Warm readiness and warm cancellation each retain their runtime retirement guard through distinct subsequent operations.
  const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};
  run_native_upscale(*runtime, method, {}, UpscalePurpose::Warm, extent);
  const auto expected = native_upscale_pixels(*runtime);
@@ -1233,8 +1237,7 @@ TEST_CASE("Native CUDA failure scope reaches Upscale quarantine or isolated retr
  REQUIRE(scenario.events.Wait([&] { return scenario.upscale.snapshot().ready; }));
  static_cast<void>(scenario.upscale.Start(test_upscale_request({scenario.source.frame, UpscaleKernel::ShiftLut})));
  auto failure = scenario.failed.get_future();
- REQUIRE(failure.wait_for(120s) == std::future_status::ready);
- const auto result = failure.get();
+ const auto result = mmltk::testsupport::await_test_future(failure, "failure", 120s);
  CHECK((result.kind == UpscaleFailureKind::Physical) == cuda_shared_failure(status));
  if (cuda_shared_failure(status)) {
   CHECK_FALSE(result.snapshot.ready);
@@ -1301,8 +1304,7 @@ TEST_CASE("Native method failures are classified at the actual activation comple
  const auto request = test_upscale_request({scenario.source.frame, UpscaleKernel::ShiftLut});
  static_cast<void>(scenario.upscale.Start(request));
  auto failure = scenario.failed.get_future();
- REQUIRE(failure.wait_for(120s) == std::future_status::ready);
- const auto result = failure.get();
+ const auto result = mmltk::testsupport::await_test_future(failure, "failure", 120s);
  CHECK(result.kind == UpscaleFailureKind::Failed);
  CHECK(result.request == request);
  CHECK(result.snapshot.methods[1U].failed);
@@ -1336,11 +1338,7 @@ TEST_CASE("Native cache lock admission remains cancellable while another process
  if (!has_cuda_device()) SKIP("CUDA device unavailable");
  using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
  using namespace mmltk::frameworks::gpu;
- {
-  auto seed = make_native_upscale_runtime_factory(kDevice)(std::make_shared<ImageProductRevisionSequence>());
-  run_native_upscale(*seed, UpscaleKernel::RealPlksr);
-  REQUIRE(seed->Retire().safe_to_destroy);
- }
+ seed_native_upscale_cache();
  const auto cache = mmltk::common::system::runtime_paths::repository_root() / ".cache" / "mmltk" / "upscalers";
  std::vector<mmltk::common::io::ScopedFd> locks;
  for (const auto& entry : std::filesystem::directory_iterator(cache)) {
@@ -1495,11 +1493,7 @@ TEST_CASE("Valid TensorRT cache survives activation allocation and shared-contex
  using namespace mmltk::frameworks::gpu;
  using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
  const bool physical = GENERATE(false, true);
- {
-  auto seed = make_native_upscale_runtime_factory(kDevice)(std::make_shared<ImageProductRevisionSequence>());
-  run_native_upscale(*seed, UpscaleKernel::RealPlksr);
-  REQUIRE(seed->Retire().safe_to_destroy);
- }
+ seed_native_upscale_cache();
  std::vector<std::pair<std::filesystem::path, std::filesystem::file_time_type>> cache;
  const auto directory = mmltk::common::system::runtime_paths::repository_root() / ".cache" / "mmltk" / "upscalers";
  for (const auto& entry : std::filesystem::directory_iterator(directory))
@@ -1532,8 +1526,7 @@ TEST_CASE("Warmed Upscale retains physical custody when model release fails") {
   [](const VisualFrame&) { return VisualDocumentRead{}; }
  };
  upscale.Warm({32U, 32U});
- REQUIRE(warmed.wait_for(2s) == std::future_status::ready);
- warmed.get();
+ mmltk::testsupport::await_test_future(warmed, "warmed", 2s);
  upscale.Shutdown();
  CHECK(upscale.stopped());
  CHECK(release->releases.load(std::memory_order_acquire) == 1U);
@@ -1571,10 +1564,10 @@ TEST_CASE("Upscale requests behind warmup retain identities without queued sourc
  CHECK(activation->runs.load(std::memory_order_acquire) == 0U);
  source.Publish({20U, 12U}, 19U);
  activation->warm_release.set_value();
+ // CLEANUP-IGNORE: Different visual owners report different failures; the wait and readiness assertion are independent system outcomes.
  REQUIRE(events.Wait([&] { return failures.load() == 1U; }));
  CHECK_FALSE(upscale.snapshot().ready);
- static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
- REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+ start_upscale_and_wait(upscale, events, {.source = source.frame()});
  CHECK(upscale.snapshot().input == source.frame());
  CHECK(borrows.load() == 2U);
  CHECK(activation->fallback_activations.load(std::memory_order_acquire) == 0U);
@@ -1601,8 +1594,7 @@ TEST_CASE("Upscale warm failure is isolated and Start retains first-use activati
  CHECK_FALSE(upscale.snapshot().ready);
  REQUIRE(events.Wait([&] { return upscale.snapshot().methods[1U].warm && upscale.snapshot().methods[2U].warm; }));
  CHECK(activation->runs.load(std::memory_order_acquire) == 2U);
- static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::RealPlksr})));
- REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+ start_upscale_and_wait(upscale, events, {.source = source.frame(), .kernel = UpscaleKernel::RealPlksr});
  REQUIRE(events.Wait([&] { return activation->runs.load(std::memory_order_acquire) == 3U; }));
  CHECK(activation->fallback_activations.load(std::memory_order_acquire) == 1U);
  for (const auto& ready : activation->ready) CHECK(ready.load(std::memory_order_acquire));
@@ -1636,8 +1628,7 @@ TEST_CASE("A preempted warm failure remains method-local through another method 
  REQUIRE(waiting == std::future_status::ready);
  static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::RealPlksr})));
  activation->warm_release.set_value();
- REQUIRE(result.wait_for(2s) == std::future_status::ready);
- const auto snapshot = result.get();
+ const auto snapshot = mmltk::testsupport::await_test_future(result, "result", 2s);
  CHECK(snapshot.methods[0U].initialization_failed);
  CHECK_FALSE(snapshot.methods[0U].warm);
  CHECK(snapshot.methods[2U].warm);
@@ -1710,14 +1701,14 @@ TEST_CASE("Upscale copies the admitted exact revision before a source update can
  auto replacement = std::async(std::launch::async, [&source] { source.Publish({24U, 15U}, 29U); });
  mmltk::testsupport::ScopedTestCleanup release_replacement{[&] { copy_gate->Release(); }};
  copy_gate->Release();
- REQUIRE(replacement.wait_for(2s) == std::future_status::ready);
- replacement.get();
+ mmltk::testsupport::await_test_future(replacement, "replacement", 2s);
  CHECK(source.frame().revision > admitted_frame.revision);
  REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
  CHECK(backend->same_copies.load(std::memory_order_acquire) == 2U);
  CHECK(race->received_value.load(std::memory_order_acquire) == 11U);
  CHECK(race->received_width.load(std::memory_order_acquire) == admitted_frame.extent.width);
  CHECK(race->received_height.load(std::memory_order_acquire) == admitted_frame.extent.height);
+ // CLEANUP-IGNORE: Different systems borrow their retained products before independent pixel, extent and semantic assertions.
  auto product = upscale.BorrowFrame();
  REQUIRE(product.valid());
  CHECK(*reinterpret_cast<const std::uint8_t*>(product.plane(0U).plane().data) == 11U);
@@ -1767,8 +1758,7 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
    [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }, 4U),
   borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }
  };
- static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
- REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+ start_upscale_and_wait(upscale, events, {.source = explore.snapshot().frame});
  CHECK((upscale.snapshot().frame.extent == VisualExtent{256U, 256U}));
  REQUIRE(upscale.BorrowFrame().valid());
  CHECK(upscale.BorrowFrame().plane(0U).plane().descriptor.width == 256U);
@@ -1795,21 +1785,18 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
  CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == initial_generation);
  writer_state->AcknowledgeAllocationRetirement(initial_generation);
- REQUIRE(allocation_retired.wait_for(2s) == std::future_status::ready);
- allocation_retired.get();
+ mmltk::testsupport::await_test_future(allocation_retired, "allocation retired", 2s);
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
  CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == 0U);
  const auto pump_count = writer_state->PumpCount();
- writer_state->AcknowledgeAllocationRetirement(initial_generation);
- REQUIRE(writer_state->WaitForPumpAfter(pump_count));
+ writer_state->AwaitAllocationRetirement(initial_generation, pump_count);
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
- presentation.CloseAdmission();
- presentation.BrowserPeerLost();
- CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+ CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
  upscale.Shutdown();
  CHECK(upscale.stopped());
 }
 TEST_CASE("Upscale invalid exact-source admission preserves the active operation snapshot") {
+ // CLEANUP-IGNORE: The existing opened-Explore fixture and fake backend establish separate isolated upscale scenarios.
  auto backend = std::make_shared<FakeImageBackend>();
  OpenedExplore opened_explore{backend, {32U, 32U}};
  auto& explore = opened_explore.system();
@@ -1827,8 +1814,7 @@ TEST_CASE("Upscale invalid exact-source admission preserves the active operation
   .source = explore.snapshot().frame,
   .kernel = UpscaleKernel::ShiftLut,
  }));
- REQUIRE(entered.wait_for(2s) == std::future_status::ready);
- entered.get();
+ mmltk::testsupport::await_test_future(entered, "entered", 2s);
  CHECK_FALSE(upscale.BorrowFrame().valid());
  CHECK_THROWS_AS(upscale.Start(test_upscale_request({
                   .source = {},
@@ -1843,6 +1829,7 @@ TEST_CASE("Upscale invalid exact-source admission preserves the active operation
  REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
 }
 TEST_CASE("Upscale method failure preserves healthy resident products and permits isolated retry") {
+ // CLEANUP-IGNORE: The existing opened-Explore fixture and fake backend establish separate isolated upscale scenarios.
  auto backend = std::make_shared<FakeImageBackend>();
  OpenedExplore opened_explore{backend, {32U, 32U}};
  auto& explore = opened_explore.system();
@@ -1856,13 +1843,11 @@ TEST_CASE("Upscale method failure preserves healthy resident products and permit
   if (auto* failed = std::get_if<UpscaleFailed>(&event)) failure.set_value(std::move(*failed));
  }
  };
- static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
- REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+ start_upscale_and_wait(upscale, events, {.source = explore.snapshot().frame});
  REQUIRE(upscale.BorrowFrame().valid());
  static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame, .kernel = UpscaleKernel::ShiftLut})));
  auto failed_event = failure.get_future();
- REQUIRE(failed_event.wait_for(2s) == std::future_status::ready);
- const auto failed = failed_event.get();
+ const auto failed = mmltk::testsupport::await_test_future(failed_event, "failed event", 2s);
  CHECK(failed.snapshot.ready);
  CHECK(failed.snapshot.frame.valid());
  CHECK(upscale.BorrowFrame().valid());
@@ -1889,13 +1874,11 @@ TEST_CASE("Shared Upscale execution failure invalidates every resident product a
   events.Advance();
  }
  };
- static_cast<void>(upscale.Start(test_upscale_request({source.frame()})));
- REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+ start_upscale_and_wait(upscale, events, {source.frame()});
  const auto request = test_upscale_request({source.frame(), UpscaleKernel::ShiftLut});
  static_cast<void>(upscale.Start(request));
  auto failure = failed.get_future();
- REQUIRE(failure.wait_for(2s) == std::future_status::ready);
- const auto result = failure.get();
+ const auto result = mmltk::testsupport::await_test_future(failure, "failure", 2s);
  CHECK(result.kind == UpscaleFailureKind::Physical);
  CHECK(result.request == request);
  CHECK_FALSE(result.snapshot.ready);

@@ -77,6 +77,10 @@ struct WorkerPool::Impl final {
  std::size_t started_workers = 0U;
  bool shutdown = false;
  std::exception_ptr startup_error;
+ void check_borrowed_admission() const {
+  if (startup_error) std::rethrow_exception(startup_error);
+  if (shutdown) throw std::runtime_error("worker pool is shut down");
+ }
 };
 namespace {
 thread_local const WorkerPool* current_worker_pool = nullptr;
@@ -225,8 +229,7 @@ void WorkerPool::enqueue_borrowed(void* context, std::size_t index, void (*call)
  if (!call) throw std::invalid_argument("borrowed worker task is empty");
  {
   std::lock_guard lock(impl_->mutex);
-  if (impl_->startup_error) std::rethrow_exception(impl_->startup_error);
-  if (impl_->shutdown) throw std::runtime_error("worker pool is shut down");
+  impl_->check_borrowed_admission();
   impl_->push({.context = context, .index = index, .borrowed = call});
   ++impl_->pending_tasks;
  }
@@ -236,8 +239,7 @@ void WorkerPool::enqueue_borrowed(BorrowedTask& record) {
  if (!record.call_) throw std::invalid_argument("borrowed worker task is empty");
  {
   const std::lock_guard lock(impl_->mutex);
-  if (impl_->startup_error) std::rethrow_exception(impl_->startup_error);
-  if (impl_->shutdown) throw std::runtime_error("worker pool is shut down");
+  impl_->check_borrowed_admission();
   if (record.queued_) throw std::logic_error("borrowed worker task is already queued");
   record.sequence_ = impl_->submitted++;
   record.queued_ = true;

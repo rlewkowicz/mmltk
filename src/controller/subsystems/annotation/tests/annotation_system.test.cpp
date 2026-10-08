@@ -48,8 +48,7 @@ auto settle_annotation_on_exit(AnnotationSystem& annotation, std::promise<void>&
 }
 void complete_annotation_box_drag(AnnotationSystem& annotation, EventGate& events, std::uint64_t peer) {
  // CLEANUP-IGNORE: The box-drag oracle owns its edit receipt; browser-host gesture routing has a separate interaction boundary.
- const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
- mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
+ const auto edit = mmltk::testsupport::edit_annotation(annotation, events, {.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
  const auto before = annotation.snapshot().ui;
  annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, WorkspaceMouseKind::Press, {1.25F, 2.5F}));
  annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, WorkspaceMouseKind::Motion, {10.75F, 12.125F}));
@@ -94,6 +93,7 @@ TEST_CASE("Annotation imports Validation ground truth and retains receiver pixel
  CHECK(scene.objects[0].mask.runs.front() == contracts::AnnotationMaskRun{4U, 4U, 7U});
  source.reset();
  document.reset();
+ // CLEANUP-IGNORE: Different systems borrow their retained products before independent pixel, extent and semantic assertions.
  auto owned = annotation.BorrowFrame();
  REQUIRE(owned.valid());
  CHECK(*reinterpret_cast<const std::uint8_t*>(owned.plane(0U).plane().data) == 37U);
@@ -133,15 +133,13 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
  }, mmltk::testsupport::annotation_render_evidence()};
  probe->fail_open = true;
  static_cast<void>(annotation.Open(mmltk::testsupport::test_annotation_open(source.system().snapshot().frame)));
+ // CLEANUP-IGNORE: Different visual owners report different failures; the wait and readiness assertion are independent system outcomes.
  REQUIRE(events.Wait([&] { return failures.load() == 1U; }));
  CHECK_FALSE(annotation.snapshot().ready);
  CHECK_FALSE(annotation.BorrowFrame().valid());
  mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
  const auto committed = annotation.snapshot().ui;
- annotation.SetInputPeer(1U);
- auto right = mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Press, {3, 4});
- right.button = WorkspaceMouseButton::Right;
- annotation.Input(right);
+ mmltk::testsupport::press_annotation_right(annotation, 1U, {3, 4});
  probe->fail_render = true;
  static_cast<void>(annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}}));
  REQUIRE(events.Wait([&] { return failures.load() == 2U; }));
@@ -227,8 +225,7 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
  retained = {};
  complete_annotation_box_drag(annotation, events, 1U);
  command = annotation.Save({.destination = destination.string()});
- mmltk::testsupport::await_annotation_command(annotation, events, command.revision);
- CHECK(annotation.snapshot().ui.save_status == contracts::AnnotationSaveStatus::Saved);
+ mmltk::testsupport::await_annotation_saved(annotation, events, command.revision);
  CHECK(annotation.snapshot().ui.save_generation > 0U);
  CHECK(std::filesystem::exists(destination));
 }
@@ -285,6 +282,7 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
  AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type) {
   events.Advance();
  }, mmltk::testsupport::annotation_render_evidence()};
+ // CLEANUP-IGNORE: The existing cancellation guard and opening helper retain independent renderer lifetimes for different annotation scenarios.
  auto release = settle_annotation_on_exit(annotation, render.hold->release);
  mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
  const auto initial = annotation.snapshot();
@@ -303,8 +301,7 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
  REQUIRE(events.Wait([&] { return annotation.snapshot().ui.document_revision > initial.ui.document_revision; }));
  CHECK(annotation.snapshot().frame == initial.frame);
  const auto committed = annotation.snapshot().ui.document_revision;
- const auto command = annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}});
- mmltk::testsupport::await_annotation_command(annotation, events, command.revision);
+ const auto command = mmltk::testsupport::edit_annotation(annotation, events, {.edit = {.value = AnnotationUndoEdit{}}});
  CHECK(annotation.snapshot().ui.document_revision > committed);
  const auto document_epoch = annotation.snapshot().input_document_epoch;
  static_cast<void>(annotation.Open(mmltk::testsupport::test_annotation_open(source.system().snapshot().frame)));
@@ -333,12 +330,10 @@ TEST_CASE("Annotation Open consumes retained prior-document input and accepts th
   }
   events.Advance();
  }};
+ // CLEANUP-IGNORE: The existing cancellation guard and opening helper retain independent renderer lifetimes for different annotation scenarios.
  auto release = settle_annotation_on_exit(annotation, render.hold->release);
  mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
- annotation.SetInputPeer(1U);
- auto right = mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Press, {3, 4});
- right.button = WorkspaceMouseButton::Right;
- annotation.Input(right);
+ auto right = mmltk::testsupport::press_annotation_right(annotation, 1U, {3, 4});
  {
   std::scoped_lock lock(render.probe->mutex);
   render.probe->open_hold = render.hold;

@@ -384,6 +384,7 @@ TEST_CASE("test_cuda_constants_stage_once_and_retain_nested_graph_readers", "[mo
  auto source = torch::arange(8, torch::TensorOptions().device(torch::kCUDA)).narrow(0, 2, 3);
  auto* original_storage = source.const_data_ptr();
  auto graph = std::make_shared<torch::jit::Graph>();
+ // CLEANUP-IGNORE: Different nested graphs own constants with distinct tensor and IValue payloads; only node allocation matches.
  auto nested = std::make_shared<torch::jit::Graph>();
  auto* first = nested->create(c10::Symbol::fromQualString("onnx::Constant"), 1);
  first->t_(c10::attr::value, source);
@@ -412,6 +413,7 @@ TEST_CASE("test_cuda_constants_stage_once_and_retain_nested_graph_readers", "[mo
  };
  append_dead(*graph);
  append_dead(*nested);
+ // CLEANUP-IGNORE: Different nested graphs own constants with distinct tensor and IValue payloads; only node allocation matches.
  auto graph_list = std::make_shared<torch::jit::Graph>();
  auto* list_constant = graph_list->create(c10::Symbol::fromQualString("onnx::Constant"), 1);
  list_constant->ival_(payload, first->ival(payload));

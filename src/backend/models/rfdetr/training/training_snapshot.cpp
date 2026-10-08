@@ -16,18 +16,16 @@ std::vector<NormalizedModelStateEntry> collect_module_state(const NativeRfDetrMo
  std::vector<NormalizedModelStateEntry> state;
  const auto parameters = module.named_parameters(true);
  state.reserve(parameters.size() + module.named_buffers(true).size());
- for (const auto& item : parameters) {
-  NormalizedModelStateEntry entry;
-  entry.name = item.key();
-  entry.tensor = item.value().detach();
-  state.push_back(std::move(entry));
- }
- for (const auto& item : module.named_buffers(true)) {
-  NormalizedModelStateEntry entry;
-  entry.name = item.key();
-  entry.tensor = item.value().detach();
-  state.push_back(std::move(entry));
- }
+ const auto append = [&](const auto& entries) {
+  for (const auto& item : entries) {
+   NormalizedModelStateEntry entry;
+   entry.name = item.key();
+   entry.tensor = item.value().detach();
+   state.push_back(std::move(entry));
+  }
+ };
+ append(parameters);
+ append(module.named_buffers(true));
  return state;
 }
 ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel& model, const DecodedNativeModelState& checkpoint, const TrainingSupervisionRoute route) {

@@ -266,6 +266,7 @@ TEST_CASE("CUDA perceptual settled preparation survives admission failure and re
   auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(shape.layout), expected = std::make_shared<DeviceImage>(shape.layout);
   cuda_check(cudaMemsetAsync(output->pixels, 0xCD, output->layout.capacity_bytes, fixture.stream));
   cuda_check(cudaMemsetAsync(expected->pixels, 0xCD, expected->layout.capacity_bytes, fixture.stream));
+  // CLEANUP-IGNORE: The matched construction and first submission establish different resizer destruction and failed-admission lifetimes; the subsequent custody operations are intentionally local.
   GpuPerceptualDownscaler retained(*fixture.context_owner, fixture.retirement);
   retained.downscale(input->read(), output->write(), fixture.stream, input, output);
   // Complete the recorded byte-table submission externally. The owner
@@ -305,6 +306,7 @@ TEST_CASE("CUDA perceptual resampling agrees with independent CPU geometry and c
     Image source(dims[0], dims[1], format, 3), expected(dims[2], dims[3], format, 5);
     source.fill(pattern);
     auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(expected.layout);
+    // CLEANUP-IGNORE: General resampling and identity copies deliberately poison their own output before exercising distinct numerical expectations.
     cuda_check(cudaMemsetAsync(output->pixels, 0xCD, output->layout.capacity_bytes, fixture.stream));
     resizer.downscale(input->read(), output->write(), fixture.stream, input, output);
     auto actual = fixture.download(output, fixture.stream);
@@ -329,6 +331,7 @@ TEST_CASE("CUDA perceptual custody survives caller release and teardown", "[back
  auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(shape.layout);
  std::weak_ptr<DeviceImage> weak = input;
  {
+  // CLEANUP-IGNORE: The matched construction and first submission establish different resizer destruction and failed-admission lifetimes; the subsequent custody operations are intentionally local.
   GpuPerceptualDownscaler resizer(*fixture.context_owner, fixture.retirement);
   resizer.downscale(input->read(), output->write(), fixture.stream, input, output);
   input.reset();
@@ -350,6 +353,7 @@ TEST_CASE("CUDA perceptual identity preserves aliases and padded copies in every
   resizer.downscale(input->read(), input->write(), fixture.stream, input, input);
   const auto alias = fixture.download(input, fixture.stream);
   REQUIRE(std::memcmp(alias.storage.data(), source.storage.data(), source.layout.capacity_bytes) == 0);
+  // CLEANUP-IGNORE: General resampling and identity copies deliberately poison their own output before exercising distinct numerical expectations.
   cuda_check(cudaMemsetAsync(output->pixels, 0xCD, output->layout.capacity_bytes, fixture.stream));
   resizer.downscale(input->read(), output->write(), fixture.stream, input, output);
   const auto actual = fixture.download(output, fixture.stream);
@@ -377,6 +381,7 @@ TEST_CASE("CUDA perceptual finish settles admitted work after external admission
  auto independent = gpu::ReserveTerminalCudaLease(fixture.retirement);
  GpuPerceptualDownscaler resizer(*fixture.context_owner, fixture.retirement);
  Image source(129, 127, RgbPixelFormat::RGB8), shape(9, 7, RgbPixelFormat::RGB8);
+ // CLEANUP-IGNORE: The existing fill/upload helpers establish distinct local device-custody lifetimes and admission conditions.
  source.fill(5);
  auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(shape.layout);
  std::weak_ptr<DeviceImage> source_weak = input;
@@ -399,6 +404,7 @@ TEST_CASE("CUDA perceptual extent refusal leaves output and owner reusable", "[b
  CudaFixture fixture;
  Image source(17, 13, RgbPixelFormat::RGB8), shape(7, 5, RgbPixelFormat::RGB8);
  source.fill(1);
+ // CLEANUP-IGNORE: The shared upload helper and resizer constructor create independent owners for extent-refusal and device-identity admission tests.
  auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(shape.layout);
  GpuPerceptualDownscaler resizer(*fixture.context_owner, fixture.retirement);
  auto bad = output->write();
@@ -413,7 +419,9 @@ TEST_CASE("CUDA perceptual admission proves device intervals and stream identity
  if (!has_cuda()) SKIP("CUDA unavailable; range admission is not established");
  CudaFixture fixture;
  Image source(19, 15, RgbPixelFormat::RGB8), shape(9, 7, RgbPixelFormat::RGB8);
+ // CLEANUP-IGNORE: The existing fill/upload helpers establish distinct local device-custody lifetimes and admission conditions.
  source.fill(5);
+ // CLEANUP-IGNORE: The shared upload helper and resizer constructor create independent owners for extent-refusal and device-identity admission tests.
  auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(shape.layout);
  GpuPerceptualDownscaler resizer(*fixture.context_owner, fixture.retirement);
  cuda_check(cudaMemsetAsync(output->pixels, 0xCD, output->layout.capacity_bytes, fixture.stream));

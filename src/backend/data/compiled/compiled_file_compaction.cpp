@@ -72,8 +72,7 @@ FileLayout compact_compiled_file(const common::io::FileHandle& file, const FileL
  std::optional<common::system::NumaMemory> owned;
  if (prior_window && supplied_scratch.empty()) {
   owned.emplace(common::system::NumaTopology::Capture().permitted_nodes.front(), common::system::NumaMemory::Lock::Pages);
-  owned->ensure_bytes(prior_window);
-  supplied_scratch = {static_cast<std::byte*>(owned->data()), owned->capacity_bytes()};
+  supplied_scratch = owned->ensure_storage(prior_window);
  }
  // Existing callers' smaller legal scratch remains sufficient. An admitted
  // larger lease is a maximum capture window, never a new resource minimum.

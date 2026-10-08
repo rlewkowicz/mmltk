@@ -11,17 +11,15 @@
 #include "box_geometry.cuh"
 namespace mmltk::backend::ml::ops {
 namespace {
-template <typename T>
-__global__ void box_iou_kernel(const T* boxes1, const T* boxes2, T* iou, const int pair_count, const int second_count) {
+template <bool Generalized, typename T>
+__global__ void box_iou_kernel(const T* boxes1, const T* boxes2, T* output, const int pair_count, const int second_count) {
  const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
  if (index >= pair_count) return;
- iou[index] = box_geometry::pair(boxes1 + (index / second_count) * 4, boxes2 + (index % second_count) * 4).iou();
-}
-template <typename T>
-__global__ void generalized_box_iou_kernel(const T* boxes1, const T* boxes2, T* giou, const int pair_count, const int second_count) {
- const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
- if (index >= pair_count) return;
- giou[index] = box_geometry::pair(boxes1 + (index / second_count) * 4, boxes2 + (index % second_count) * 4).giou();
+ const auto geometry = box_geometry::pair(boxes1 + (index / second_count) * 4, boxes2 + (index % second_count) * 4);
+ if constexpr (Generalized)
+  output[index] = geometry.giou();
+ else
+  output[index] = geometry.iou();
 }
 enum class BoxIouKind : std::uint8_t {
  Standard,
@@ -52,10 +50,9 @@ torch::Tensor pairwise_box_iou_cuda(const torch::Tensor& boxes1, const torch::Te
  AT_DISPATCH_FLOATING_TYPES(boxes1.scalar_type(), "pairwise_box_iou_cuda", [&] {
   // NOLINTNEXTLINE(bugprone-branch-clone): each branch launches a different CUDA kernel.
   if (kind == BoxIouKind::Generalized) {
-   generalized_box_iou_kernel<scalar_t>
-    <<<blocks, threads, 0, stream>>>(boxes1.data_ptr<scalar_t>(), boxes2.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), static_cast<int>(pair_count), second_count);
+   box_iou_kernel<true, scalar_t><<<blocks, threads, 0, stream>>>(boxes1.data_ptr<scalar_t>(), boxes2.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), static_cast<int>(pair_count), second_count);
   } else {
-   box_iou_kernel<scalar_t><<<blocks, threads, 0, stream>>>(boxes1.data_ptr<scalar_t>(), boxes2.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), static_cast<int>(pair_count), second_count);
+   box_iou_kernel<false, scalar_t><<<blocks, threads, 0, stream>>>(boxes1.data_ptr<scalar_t>(), boxes2.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), static_cast<int>(pair_count), second_count);
   }
  });
  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "box IoU CUDA kernel launch failed");

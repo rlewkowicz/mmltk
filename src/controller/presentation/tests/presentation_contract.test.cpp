@@ -1,3 +1,5 @@
+#include "src/test_support/image_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/backend/imaging/upscale/upscale_execution.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/types/generation.h"
@@ -15,7 +17,6 @@
 #include "src/frameworks/gpu/cuda/cuda_error.h"
 #include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
-#include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -50,6 +51,16 @@ using namespace visual_test_support;
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
+auto require_submitted_release(presentation::WorkspaceSurfaceImportChannel& channel) {
+ auto release = channel.take_source_transition();
+ REQUIRE(release.has_value());
+ CHECK(release->opcode == presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted);
+ return release;
+}
+PresentationSnapshot await_completed_presentation(PresentationSystem& presentation, EventGate& events, std::uint64_t revision) {
+ REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == revision; }));
+ return presentation.snapshot();
+}
 TEST_CASE("Graphics signal publishes exact bounded image metadata with its physical transfer", "[presentation][metadata]") {
  namespace graphics = presentation::detail;
  auto owned = presentation::WorkspaceSurfaceFrameSignal::create();
@@ -78,8 +89,7 @@ TEST_CASE("Committed visual frames exactly authorize one- and two-plane products
  auto backend = std::make_shared<FakeImageBackend>();
  mmltk::frameworks::gpu::SystemImageRuntime clean{{.device = 0, .backend = backend, .output_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean}};
  clean.Publish(8U, 6U, [](auto, auto, auto) {});
- auto clean_product = clean.Borrow();
- REQUIRE(clean_product.valid());
+ auto clean_product = mmltk::testsupport::require_borrowed_image(clean);
  const auto clean_frame = visual_frame({PresentationSourceKind::Explore, 1U}, {8U, 6U}, clean_product.plane(0U).revision());
  CHECK(visual_product_matches_frame(clean_frame, clean_product));
  CHECK_FALSE(visual_product_matches_frame({}, clean_product));
@@ -88,8 +98,7 @@ TEST_CASE("Committed visual frames exactly authorize one- and two-plane products
  CHECK_FALSE(visual_product_matches_frame(clean_frame, {}));
  mmltk::frameworks::gpu::SystemImageRuntime layered{{.device = 0, .backend = backend, .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic}};
  layered.Publish(9U, 7U, [](auto, auto, auto) {});
- auto layered_product = layered.Borrow();
- REQUIRE(layered_product.valid());
+ auto layered_product = mmltk::testsupport::require_borrowed_image(layered);
  REQUIRE(layered_product.plane_count() == 2U);
  const auto layered_frame = visual_frame({PresentationSourceKind::Annotation, 1U}, {9U, 7U}, layered_product.plane(0U).revision());
  CHECK(visual_product_matches_frame(layered_frame, layered_product));
@@ -233,6 +242,7 @@ TEST_CASE("Native Basic settled allocation and launch failures permit neural wor
    throw CudaError(allocation_failure ? cudaErrorMemoryAllocation : cudaErrorInvalidPitchValue, "injected settled Basic operation failure");
   }
  })(std::make_shared<ImageProductRevisionSequence>());
+ // CLEANUP-IGNORE: Each test starts work and inspects the model of its independently configured runtime before different input publications.
  runtime->BeginWork();
  auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
  REQUIRE(model != nullptr);
@@ -270,9 +280,8 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
  auto writer_state = std::make_shared<TestPresentationWriterState>();
  auto third_submission = writer_state->third_submission.get_future();
  EventGate events;
- PresentationSystem presentation{kDevice, [backend = products.backend(), writer_state] {
-  return std::make_unique<TestPresentationWriter>(0, backend, writer_state);
- }, sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+ // CLEANUP-IGNORE: The shared writer factory and PresentationScenario already own setup and settlement; these tests retain different source and publication scenarios.
+ PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(products.backend(), writer_state), sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
  PresentationScenario scenario{presentation, writer_state};
  const auto source_a = sources[0].source;
  const auto source_b = sources[2].source;
@@ -290,14 +299,12 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
  static_cast<void>(presentation.Select(source_c));
  writer_state->SignalReadiness();
- REQUIRE(third_submission.wait_for(2s) == std::future_status::ready);
- third_submission.get();
+ mmltk::testsupport::await_test_future(third_submission, "third submission", 2s);
  CHECK(presentation.snapshot().completed.source == source_b);
  CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
  auto pump_count = writer_state->PumpCount();
- writer_state->AcknowledgeAllocationRetirement(generation_b);
- REQUIRE(writer_state->WaitForPumpAfter(pump_count));
+ writer_state->AwaitAllocationRetirement(generation_b, pump_count);
  CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
  writer_state->AcknowledgeAllocationRetirement(generation_a);
@@ -307,18 +314,14 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
  CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_b);
  pump_count = writer_state->PumpCount();
- writer_state->AcknowledgeAllocationRetirement(generation_a);
- REQUIRE(writer_state->WaitForPumpAfter(pump_count));
+ writer_state->AwaitAllocationRetirement(generation_a, pump_count);
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
  CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_b);
  pump_count = writer_state->PumpCount();
- writer_state->AcknowledgeAllocationRetirement(generation_b);
- REQUIRE(writer_state->WaitForPumpAfter(pump_count));
+ writer_state->AwaitAllocationRetirement(generation_b, pump_count);
  CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 2U);
  CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == 0U);
- presentation.CloseAdmission();
- presentation.BrowserPeerLost();
- CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+ CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
 }
 TEST_CASE("Source admission writes retain complete packet and frame provenance", "[workspace][protocol]") {
  namespace abi = presentation::detail::workspace_surface_import;
@@ -467,11 +470,14 @@ public:
   acquired.offset = 1U;
   return acquired;
  }
- void ReleaseRead(Record acquired) {
-  acquired.opcode = Opcode::ReleaseSubmitted;
-  REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), acquired));
+ void SubmitTransition(const Record& record) {
+  REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), record));
   channel.pump();
   REQUIRE(channel.take_source_transition());
+ }
+ void ReleaseRead(Record acquired) {
+  acquired.opcode = Opcode::ReleaseSubmitted;
+  SubmitTransition(acquired);
   REQUIRE(channel.read_settled({acquired.id_high, acquired.id_low}, {7U, 8U}, 9U, 1U));
   Record settled{};
   static_cast<void>(mmltk::testsupport::receive_workspace_record(peer.get(), settled));
@@ -565,9 +571,7 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
   REQUIRE(send_workspace_record(peer.get(), release));
   channel.pump();
   CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, transfer));
-  const auto submitted = channel.take_source_transition();
-  REQUIRE(submitted.has_value());
-  CHECK(submitted->opcode == abi::Opcode::ReleaseSubmitted);
+  const auto submitted = require_submitted_release(channel);
   CHECK(submitted->offset == transfer);
   REQUIRE(channel.read_settled(source, {7U, 8U}, 9U, transfer));
   static_cast<void>(receive_workspace_record(peer.get(), received));
@@ -610,9 +614,7 @@ TEST_CASE("Scoped binding retirement preserves a replacement while an old physic
  const auto layout = fixture.AdmitArena(old_arena, 1U, GENERATE(false, true));
  fixture.AdmitSource(source, old_arena, layout, 2U);
  auto acquired = WorkspaceChannelFixture::Acquisition(source);
- REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
- fixture.channel.pump();
- REQUIRE(fixture.channel.take_source_transition());
+ fixture.SubmitTransition(acquired);
  REQUIRE(send_workspace_record(fixture.peer.get(), {.opcode = abi::Opcode::BindingRetired, .id_high = old_arena.high, .id_low = old_arena.low}));
  fixture.channel.pump();
  const auto binding = fixture.channel.take_source_transition();
@@ -640,9 +642,7 @@ TEST_CASE("A completed source can acquire and settle without any presented mailb
  fixture.AdmitSource(newer, arena, layout, 3U);
  for (const auto id : {newer, older}) {
   auto acquired = WorkspaceChannelFixture::Acquisition(id);
-  REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
-  fixture.channel.pump();
-  REQUIRE(fixture.channel.take_source_transition());
+  fixture.SubmitTransition(acquired);
   CHECK_FALSE(fixture.channel.read_settled(id, {7U, 8U}, 9U, 1U));
   fixture.ReleaseRead(acquired);
  }
@@ -749,9 +749,7 @@ TEST_CASE("A blocked acquisition notification retains exact settlement after a r
  REQUIRE(acquisition.has_value());
  CHECK(acquisition->opcode == abi::Opcode::Acquired);
  CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, 1U));
- const auto release = channel.take_source_transition();
- REQUIRE(release.has_value());
- CHECK(release->opcode == abi::Opcode::ReleaseSubmitted);
+ const auto release = require_submitted_release(channel);
  CHECK(release->offset == acquired.offset);
  CHECK_FALSE(channel.take_source_transition());
  CHECK_FALSE(channel.claimable(source));
@@ -777,14 +775,13 @@ TEST_CASE("Source admission rejects duplicate acquisition and retirement before 
  namespace abi = presentation::detail::workspace_surface_import;
  using mmltk::testsupport::send_workspace_record;
  const bool premature_retirement = GENERATE(false, true);
+ // CLEANUP-IGNORE: The arena/source factories are shared; each protocol scenario owns independent custody before injecting different invalid transfer states.
  WorkspaceChannelFixture fixture;
  const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
  const presentation::WorkspaceSurfaceImportId source{3U, 4U};
  fixture.AdmitSource(source, arena, fixture.AdmitArena(arena, 1U), 2U);
  const auto acquired = WorkspaceChannelFixture::Acquisition(source);
- REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
- fixture.channel.pump();
- REQUIRE(fixture.channel.take_source_transition().has_value());
+ fixture.SubmitTransition(acquired);
  if (premature_retirement) {
   fixture.Withdraw(source);
   REQUIRE(send_workspace_record(fixture.peer.get(), {.opcode = abi::Opcode::Retired, .id_high = source.high, .id_low = source.low}));
@@ -800,6 +797,7 @@ TEST_CASE("Source release submission requires one exact acquired transfer", "[wo
  using mmltk::testsupport::send_workspace_record;
  const unsigned invalid = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U);
  CAPTURE(invalid);
+ // CLEANUP-IGNORE: The arena/source factories are shared; each protocol scenario owns independent custody before injecting different invalid transfer states.
  WorkspaceChannelFixture fixture;
  const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
  const presentation::WorkspaceSurfaceImportId source{3U, 4U};
@@ -809,9 +807,7 @@ TEST_CASE("Source release submission requires one exact acquired transfer", "[wo
  release.opcode = abi::Opcode::ReleaseSubmitted;
  if (invalid != 0U) {
   // CLEANUP-IGNORE: This acquisition receipt is an independent protocol precondition for the following malformed or stale release.
-  REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
-  fixture.channel.pump();
-  REQUIRE(fixture.channel.take_source_transition().has_value());
+  fixture.SubmitTransition(acquired);
  }
  switch (invalid) {
   case 0U: break;  // Release before any acquisition.
@@ -858,9 +854,7 @@ TEST_CASE("A release receipt from an earlier transfer cannot settle the next acq
  static_cast<void>(mmltk::testsupport::receive_workspace_record(fixture.peer.get(), settled));
  ++acquired.offset;
  // CLEANUP-IGNORE: This acquisition receipt is an independent protocol precondition for the following malformed or stale release.
- REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
- fixture.channel.pump();
- REQUIRE(fixture.channel.take_source_transition().has_value());
+ fixture.SubmitTransition(acquired);
  // CLEANUP-IGNORE: This error is for a previous-transfer receipt; malformed current releases have separate input assertions.
  REQUIRE(send_workspace_record(fixture.peer.get(), release));
  fixture.channel.pump();
@@ -1035,6 +1029,7 @@ TEST_CASE("Published frames retain their physical allocation while a waiting can
  EventGate events;
  auto writer = std::make_shared<TestPresentationWriterState>();
  writer->advertise_waiting_candidate.store(true);
+ // CLEANUP-IGNORE: The writer factory and presentation lifetime guard are already shared; distinct publication and reselection scenarios retain their own system owners.
  PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
  PresentationScenario scenario{presentation, writer};
  publish_first_presentation(presentation, source, *writer, events);
@@ -1073,10 +1068,8 @@ TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one
  static_cast<void>(presentation.Select(source.identity()));
  REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
  const auto admitted = presentation.snapshot().capability;
- writer->allow_publication.store(true, std::memory_order_release);
- writer->SignalReadiness();
- REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
- const auto completed = presentation.snapshot();
+ writer->AllowPublication();
+ const auto completed = await_completed_presentation(presentation, events, 1U);
  presentation.CloseAdmission();
  presentation.BrowserPeerLost();
  REQUIRE(presentation.Shutdown() == PresentationShutdownResult::Stopped);
@@ -1110,18 +1103,19 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  PresentationScenario scenario{presentation, writer_state};
  publish_first_presentation(presentation, source, *writer_state, events);
  REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 1U; }));
- source.Advance();
- presentation.SourceChanged(source.identity());
- writer_state->SignalReadiness();
+ const auto advance_source = [&] {
+  source.Advance();
+  presentation.SourceChanged(source.identity());
+  writer_state->SignalReadiness();
+ };
+ advance_source();
  REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 2U; }));
  CHECK(presentation.snapshot().completed_source_revision == 2U);
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == 2U);
  CHECK(writer_state->timeline.load(std::memory_order_acquire) == 2U);
  REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 2U; }));
  writer_state->allow_publication.store(false, std::memory_order_release);
- source.Advance();
- presentation.SourceChanged(source.identity());
- writer_state->SignalReadiness();
+ advance_source();
  REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
  // A pending refresh can outlive its wake while the submitted frame waits.
  // The next producer notification must wake that submitted work as well.
@@ -1136,9 +1130,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
  CHECK(writer_state->timeline.load(std::memory_order_acquire) == 3U);
  presentation.SetApplicationPeerConnected(false);
- source.Advance();
- presentation.SourceChanged(source.identity());
- writer_state->SignalReadiness();
+ advance_source();
  REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 5U; }));
  presentation.SetApplicationPeerConnected(true);
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == 5U);
@@ -1148,8 +1140,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  presentation.SourceChanged(source.identity());
  REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
  presentation.SetApplicationPeerConnected(false);
- writer_state->allow_publication.store(true, std::memory_order_release);
- writer_state->SignalReadiness();
+ writer_state->AllowPublication();
  REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 6U; }));
  presentation.SetApplicationPeerConnected(true);
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == 6U);
@@ -1179,26 +1170,24 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  presentation.SourceChanged(source.identity());
  REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
  source.Advance();
- writer_state->allow_publication.store(true, std::memory_order_release);
- writer_state->SignalReadiness();
+ writer_state->AllowPublication();
  REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 10U; }));
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == 10U);
  CHECK(writer_state->timeline.load(std::memory_order_acquire) == 7U);
- presentation.CloseAdmission();
- presentation.BrowserPeerLost();
- CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+ CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
 }
 TEST_CASE("Presentation republishes an unchanged completed product after scoped binding retirement") {
  PresentationSourceFixture source;
  EventGate events;
  // CLEANUP-IGNORE: This publication case starts admitted; the metadata case deliberately blocks publication before selecting its source.
  auto writer = std::make_shared<TestPresentationWriterState>();
+ // CLEANUP-IGNORE: The writer factory and presentation lifetime guard are already shared; distinct publication and reselection scenarios retain their own system owners.
  PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
  PresentationScenario scenario{presentation, writer};
  static_cast<void>(presentation.Select(source.identity()));
- REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
- const auto prior = presentation.snapshot();
+ const auto prior = await_completed_presentation(presentation, events, 1U);
  writer->retire_binding.store(true, std::memory_order_release);
+ // CLEANUP-IGNORE: Binding retirement and source reselection signal different presentation transitions and independently check completed-product continuity.
  writer->SignalReadiness();
  REQUIRE(events.Wait([&] { return presentation.snapshot().presentation_revision > prior.presentation_revision; }));
  CHECK(presentation.snapshot().completed == prior.completed);
@@ -1209,26 +1198,24 @@ TEST_CASE("Presentation carries its submitted observation through metadata chang
  EventGate events;
  auto writer = std::make_shared<TestPresentationWriterState>();
  writer->allow_publication.store(false);
+ // CLEANUP-IGNORE: The writer factory and presentation lifetime guard are already shared; distinct publication and reselection scenarios retain their own system owners.
  PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
  // CLEANUP-IGNORE: Initial source-observation admission is independent of the reconnect/publication scenario.
  PresentationScenario scenario{presentation, writer};
  static_cast<void>(presentation.Select(source.identity()));
  REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
  source.AdvanceObservation();
- writer->allow_publication.store(true);
- writer->SignalReadiness();
- REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
- const auto completed = presentation.snapshot();
+ writer->AllowPublication(std::memory_order_seq_cst);
+ const auto completed = await_completed_presentation(presentation, events, 1U);
  CHECK(completed.completed_source_revision == 1U);
  CHECK(source.sources().front().observe().snapshot_revision == 2U);
  static_cast<void>(presentation.Select(source.identity()));
+ // CLEANUP-IGNORE: Binding retirement and source reselection signal different presentation transitions and independently check completed-product continuity.
  writer->SignalReadiness();
  REQUIRE(events.Wait([&] { return presentation.snapshot().presentation_revision > completed.presentation_revision; }));
  CHECK(presentation.snapshot().completed == completed.completed);
  CHECK(presentation.snapshot().completed_source_revision == 2U);
- presentation.CloseAdmission();
- presentation.BrowserPeerLost();
- CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+ CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
 }
 TEST_CASE("Presentation diagnostics retain exact observations across supersession cache reuse reconnect and reconstruction") {
  PresentationSourceFixture source{2U};
@@ -1300,6 +1287,7 @@ TEST_CASE("Presentation operation projection never combines a new borrow with an
  const PresentationSubmittedSource second{{.frame = {.source = {PresentationSourceKind::Explore, 1U}, .extent = {16U, 16U}, .revision = 12U, .clean_revision = 8U}, .snapshot_revision = 21U}, 31U};
  const PresentationDiagnosticRecord incumbent{first, {.capability = allocation, .timeline_ready = 17U, .presentation_revision = 40U, .transfer_sequence = 9U}};
  const auto released = presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationReleaseWaitCompleted, incumbent, 0, 1U);
+ // CLEANUP-IGNORE: Release and borrow diagnostics intentionally compare against different selection generations and frame identities.
  CHECK(released.context.selection_generation == first.selection_generation);
  CHECK(released.context.frame_revision == released.context.source.source_revision);
  CHECK(released.context.source.source_revision == 9U);
@@ -1307,6 +1295,7 @@ TEST_CASE("Presentation operation projection never combines a new borrow with an
  CHECK(released.value == 40U);
  CHECK(released.context.transfer.transfer_sequence == 9U);
  const auto borrowed = presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationSourceBorrowStarted, {second, {.capability = allocation}}, 0);
+ // CLEANUP-IGNORE: Release and borrow diagnostics intentionally compare against different selection generations and frame identities.
  CHECK(borrowed.context.selection_generation == second.selection_generation);
  CHECK(borrowed.context.frame_revision == borrowed.context.source.source_revision);
  CHECK(borrowed.context.source.source_revision == 12U);
@@ -1321,9 +1310,9 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
  // 0: parked behind raw access; 1: copying before Detach; 2: detached, with
  // the executing request still strong at its completed-service boundary.
  const unsigned ordering = GENERATE(0U, 1U, 2U);
+ // CLEANUP-IGNORE: These generated booleans have different test meanings; the shared backend factory already owns backend reset and construction.
  const bool fail_release = GENERATE(false, true);
- fixture::ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
  auto observation = workspace->ObserveRetirement();
  std::exception_ptr producer_failure;
@@ -1429,10 +1418,11 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
 TEST_CASE("Unretired adopted native sources release before their stream is destroyed", "[presentation][workspace]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace fixture = gpu::test_support;
+ // CLEANUP-IGNORE: These independent failure and lifetime parameter axes merely precede the shared backend factory.
  const bool completed_failure = GENERATE(false, true);
+ // CLEANUP-IGNORE: These generated booleans have different test meanings; the shared backend factory already owns backend reset and construction.
  const bool producer_attached = GENERATE(false, true);
- fixture::ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(1));
  auto observation = workspace->ObserveRetirement();
  std::unique_ptr<gpu::SystemImageRuntime> producer;
@@ -1553,8 +1543,7 @@ TEST_CASE("Stopped visual owners finish released products without waiting for ex
   return detail::VisualRuntimeOwner::Notification{[&] { published.set_value(); }};
  }));
  mmltk::testsupport::await_test_promise(published, "retained product publication");
- auto reader = owner.Borrow();
- REQUIRE(reader.valid());
+ auto reader = mmltk::testsupport::require_borrowed_image(owner);
  owner.StopAndWait();
  owner.FinishStoppedRetirement();
  CHECK(backend->contexts_destroyed == 0U);
@@ -1595,6 +1584,7 @@ TEST_CASE("Native display release hands retained receiver cleanup to producer cu
  CHECK_FALSE(observation.TakeResult().complete);
  completion.reset();
  CHECK(notifications.load() != 0U);
+ // CLEANUP-IGNORE: Independent workspace and presentation tests exercise FinishRetirement before different custody, notification and failure assertions.
  const auto settled = retirement.custody.FinishRetirement();
  CHECK(settled.completion_reached == !fail_release);
  CHECK(fixture::ContainsImageFailure(settled.failure, cleanup) == fail_release);
@@ -1652,8 +1642,9 @@ TEST_CASE("Native terminal retirement observes independently completing detached
 TEST_CASE("Queued workspace requests release expired and displaced destinations without parking allocation custody", "[presentation][workspace]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace fixture = gpu::test_support;
- fixture::ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ // CLEANUP-IGNORE: Independent visual scenarios use the same backend, counter, and promise primitives; ordering and cancellation stay with their different runtime owners.
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
+ // CLEANUP-IGNORE: These independent ordering and cancellation tests use separate counters and promise receipts; only fixture construction is repeated.
  auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
  std::promise<void> entered;
  std::promise<void> release;
@@ -1689,8 +1680,7 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
  namespace gpu = mmltk::frameworks::gpu;
  namespace fixture = gpu::test_support;
  const unsigned outcome = GENERATE(0U, 1U, 2U);
- fixture::ImageWorkspaceTestAccess::Reset();
- auto backend = std::make_shared<FakeImageBackend>();
+ auto backend = mmltk::frameworks::gpu::test_support::ResetImageBackend();
  const auto injected = std::make_exception_ptr(std::runtime_error("workspace finalizer failure"));
  std::promise<void> failed;
  std::exception_ptr failure;
@@ -1709,6 +1699,7 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
   return detail::VisualRuntimeOwner::Notification{[&] { published.set_value(); }};
  }));
  mmltk::testsupport::await_test_promise(published, "workspace source publication");
+ // CLEANUP-IGNORE: Workspace creation already uses the shared admission factory; each test retains its own retirement observation for distinct lifetime checks.
  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
  auto observation = workspace->ObserveRetirement();
  auto raw = outcome == 2U ? gpu::BorrowedImageProductReadView{} : owner.Borrow();
@@ -1753,8 +1744,7 @@ TEST_CASE("Presentation control remains available during a native wait") {
  PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources()};
  PresentationScenario scenario{presentation, writer_state};
  static_cast<void>(presentation.Select(source.identity()));
- REQUIRE(pump_entered.wait_for(2s) == std::future_status::ready);
- pump_entered.get();
+ mmltk::testsupport::await_test_future(pump_entered, "pump entered", 2s);
  auto admission_closed = std::async(std::launch::async, [&presentation] { presentation.CloseAdmission(); });
  mmltk::testsupport::ScopedTestCleanup release_wait{[&] {
   try {
@@ -1771,6 +1761,7 @@ TEST_CASE("Presentation release failure publishes once and still stops") {
  PresentationSourceFixture source;
  auto writer_state = std::make_shared<TestPresentationWriterState>();
  writer_state->terminal_retirement.store(PresentationNativeWriter::Retirement::ReleasedWithFailure, std::memory_order_release);
+ // CLEANUP-IGNORE: The failure-presentation factory and lifetime guard are shared; release failure and worker-pump failure require separate source-selection histories.
  PresentationFailureProbe failures;
  auto presentation = make_failure_presentation(source, writer_state, failures);
  PresentationScenario scenario{presentation, writer_state};
@@ -1782,8 +1773,7 @@ TEST_CASE("Presentation release failure publishes once and still stops") {
  CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
  CHECK(presentation.stopped());
  CHECK(failures.failures() == 1U);
- CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
- CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
+ writer_state->CheckRetired();
 }
 TEST_CASE("Presentation retains an unprovable native source read through terminal shutdown") {
  PresentationSourceFixture source;
@@ -1795,9 +1785,7 @@ TEST_CASE("Presentation retains an unprovable native source read through termina
  {
   auto presentation = make_failure_presentation(source, writer_state, failures);
   PresentationScenario scenario{presentation, writer_state};
-  presentation.CloseAdmission();
-  presentation.BrowserPeerLost();
-  CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+  CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
   CHECK(failures.failures() == (outcome == Retirement::UnsafeFailure ? 1U : 0U));
   CHECK(writer_state->terminal_custody_notifications.load(std::memory_order_acquire) == (outcome == Retirement::RetainedBrowserRead ? 1U : 0U));
   CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
@@ -1809,6 +1797,7 @@ TEST_CASE("Presentation worker failure rejects later direct selection") {
  PresentationSourceFixture source;
  auto writer_state = std::make_shared<TestPresentationWriterState>();
  writer_state->fail_pump.store(true, std::memory_order_release);
+ // CLEANUP-IGNORE: The failure-presentation factory and lifetime guard are shared; release failure and worker-pump failure require separate source-selection histories.
  PresentationFailureProbe failures;
  auto presentation = make_failure_presentation(source, writer_state, failures);
  PresentationScenario scenario{presentation, writer_state};
@@ -1817,11 +1806,8 @@ TEST_CASE("Presentation worker failure rejects later direct selection") {
  CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 0U);
  CHECK(writer_state->retirements.load(std::memory_order_acquire) == 0U);
  CHECK_THROWS_AS(presentation.Select(source.identity()), contracts::FailedError);
- presentation.CloseAdmission();
- presentation.BrowserPeerLost();
- CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
- CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
- CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
+ CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
+ writer_state->CheckRetired();
 }
 }  // namespace
 }  // namespace mmltk::controller

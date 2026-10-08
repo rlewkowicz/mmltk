@@ -1,3 +1,4 @@
+#include "src/test_support/async_test_utils.hpp"
 #include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 #include "src/test_support/async_test_utils.hpp"
@@ -47,6 +48,13 @@ private:
 namespace {
 using test_support::FakeImageBackend;
 using test_support::RuntimeFactory;
+auto retire_with_retained_custody(SystemImageRuntime& runtime) {
+ auto retirement = runtime.Retire();
+ CHECK_FALSE(retirement.safe_to_destroy);
+ CHECK(retirement.failure);
+ CHECK(retirement.custody.valid());
+ return retirement;
+}
 TEST_CASE("failed external timeline import closes its owned descriptor") {
  int descriptors[2]{-1, -1};
  REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
@@ -206,6 +214,7 @@ TEST_CASE("context creation failure retains the adopted model and original typed
  CHECK_FALSE(model_destroyed->load(std::memory_order_acquire));
 }
 TEST_CASE("retained model release reports explicit and fallback failures without releasing custody") {
+ // CLEANUP-IGNORE: Boolean axes, fake backends and destruction flags belong to independent model-retirement scenarios.
  const bool reported = GENERATE(false, true);
  auto backend = std::make_shared<FakeImageBackend>();
  auto model_destroyed = std::make_shared<std::atomic_bool>(false);
@@ -214,10 +223,7 @@ TEST_CASE("retained model release reports explicit and fallback failures without
   .backend = backend,
   .model = std::make_unique<FailingReleaseModel>(model_destroyed, false, reported),
  });
- const auto retirement = runtime->Retire();
- CHECK_FALSE(retirement.safe_to_destroy);
- CHECK(retirement.failure);
- CHECK(retirement.custody.valid());
+ const auto retirement = retire_with_retained_custody(*runtime);
  CHECK(retirement.custody.failure());
  CHECK_FALSE(model_destroyed->load(std::memory_order_acquire));
  CHECK(runtime->device() == -1);
@@ -265,6 +271,7 @@ TEST_CASE("post-release context bind failure retains model stream and context wi
   .backend = backend,
   .model = std::make_unique<RebindingReleaseModel>(backend, destruction, binding_failure, release_failure),
  });
+ // CLEANUP-IGNORE: Each retirement scenario independently checks unsafe custody before exercising its distinct retained-resource failure path.
  const auto retirement = runtime->Retire();
  CHECK_FALSE(retirement.safe_to_destroy);
  REQUIRE(retirement.custody.valid());
@@ -359,15 +366,13 @@ TEST_CASE("image teardown retains its aggregate when context settlement cannot b
  auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
  runtime->Publish(8U, 8U, [](auto, auto, auto) {});
  backend->FailAfter(FakeImageBackend::FailurePoint::Bind);
- const auto retirement = runtime->Retire();
- CHECK_FALSE(retirement.safe_to_destroy);
- CHECK(retirement.failure);
- CHECK(retirement.custody.valid());
+ const auto retirement = retire_with_retained_custody(*runtime);
  CHECK_NOTHROW(runtime.reset());
  CHECK(backend->contexts_destroyed == 0U);
  CHECK(backend->streams_destroyed == 0U);
 }
 TEST_CASE("receiver stream settles before its model and remains valid during model retirement") {
+ // CLEANUP-IGNORE: The destruction-order runtime factory is already shared; its separate flags record normal and failed stream settlement.
  auto backend = std::make_shared<FakeImageBackend>();
  bool stream_settled = false;
  bool context_retained = false;
@@ -380,6 +385,7 @@ TEST_CASE("receiver stream settles before its model and remains valid during mod
  CHECK(backend->contexts_destroyed == 1U);
 }
 TEST_CASE("completed stream execution failure retires once and remains reportable") {
+ // CLEANUP-IGNORE: The destruction-order runtime factory is already shared; its separate flags record normal and failed stream settlement.
  auto backend = std::make_shared<FakeImageBackend>();
  bool stream_settled = false;
  bool context_retained = false;
@@ -443,8 +449,7 @@ TEST_CASE("final borrowed view retires on the owning runtime path") {
  mmltk::testsupport::ScopedTestCleanup release_borrow{[&] { borrowed = {}; }};
  CHECK(backend->contexts_destroyed == 0U);
  borrowed = {};
- REQUIRE(retirement.wait_for(1s) == std::future_status::ready);
- retirement.get();
+ mmltk::testsupport::await_test_future(retirement, "retirement", 1s);
  CHECK(backend->contexts_destroyed == 1U);
 }
 TEST_CASE("adopted image contexts validate complete ownership and retain independent custody") {

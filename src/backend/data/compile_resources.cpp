@@ -13,12 +13,14 @@ CompileAllowance::Credits::~Credits() {
  if (charged) owner->release(*this);
 }
 std::uint64_t CompileAllowance::bytes() const noexcept {
+ // CLEANUP-IGNORE: These independent resource queries share a null guard and owner lock, then read different dimensions of the allowance.
  if (!credits_) return 0;
  const std::lock_guard lock(credits_->owner->mutex);
  return credits_->resources.bytes;
 }
 std::span<const int> CompileAllowance::cpus() const noexcept { return credits_ ? std::span<const int>(credits_->cpus) : std::span<const int>{}; }
 std::size_t CompileAllowance::descriptors() const noexcept {
+ // CLEANUP-IGNORE: These independent resource queries share a null guard and owner lock, then read different dimensions of the allowance.
  if (!credits_) return 0;
  const std::lock_guard lock(credits_->owner->mutex);
  return credits_->resources.descriptors;

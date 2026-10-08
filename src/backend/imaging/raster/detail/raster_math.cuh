@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstddef>
@@ -24,10 +25,9 @@ __host__ __device__ inline RgbaPixelU8 add_layer_rgb(RgbaPixelU8 ground_truth, R
  return {add(ground_truth.r, prediction.r), add(ground_truth.g, prediction.g), add(ground_truth.b, prediction.b), ground_truth.a};
 }
 __device__ __forceinline__ std::uint8_t clamp_to_u8(const float value) { return static_cast<std::uint8_t>(fminf(255.0f, fmaxf(0.0f, value))); }
-__device__ __forceinline__ std::uint8_t* pitched_pixel_ptr(std::uint8_t* base, const std::size_t pitch_bytes, const int x, const int y, const std::size_t channel_count) {
- return base + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * channel_count;
-}
-__device__ __forceinline__ const std::uint8_t* pitched_pixel_ptr(const std::uint8_t* base, const std::size_t pitch_bytes, const int x, const int y, const std::size_t channel_count) {
+template <class Byte>
+__device__ __forceinline__ Byte* pitched_pixel_ptr(Byte* base, const std::size_t pitch_bytes, const int x, const int y, const std::size_t channel_count) {
+ static_assert(std::is_same_v<std::remove_const_t<Byte>, std::uint8_t>);
  return base + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * channel_count;
 }
 enum class RgbByteOrder : std::uint8_t {

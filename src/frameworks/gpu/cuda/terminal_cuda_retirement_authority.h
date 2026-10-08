@@ -116,6 +116,7 @@ inline TerminalCudaRetirementLease::TerminalCudaRetirementLease(TerminalCudaReti
     : owner_(std::exchange(other.owner_, nullptr)), slot_(other.slot_), generation_(other.generation_) {}
 inline TerminalCudaRetirementLease& TerminalCudaRetirementLease::operator=(TerminalCudaRetirementLease&& other) noexcept {
  if (this != &other) {
+  // CLEANUP-IGNORE: Pixel-storage and terminal-retirement leases release different owners and transfer different identity fields.
   release();
   owner_ = std::exchange(other.owner_, nullptr);
   slot_ = other.slot_;

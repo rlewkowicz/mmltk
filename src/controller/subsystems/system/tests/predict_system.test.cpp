@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/tests/terminal_retirement_fixture.h"
 #include "src/controller/subsystems/system/compute_runtime.h"
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
@@ -48,6 +49,11 @@ import mmltk.backend.models.rfdetr.inference.prediction;
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
+std::array<std::uint8_t, 16> read_two_by_two_rgba(mmltk::frameworks::gpu::ImagePlaneView plane) {
+ std::array<std::uint8_t, 16> pixels{};
+ REQUIRE(cudaMemcpy2D(pixels.data(), 8U, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, 8U, 2U, cudaMemcpyDeviceToHost) == cudaSuccess);
+ return pixels;
+}
 class AdmittedPredictRuntime final : public PredictRuntime {
 public:
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest request, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
@@ -61,8 +67,7 @@ public:
 };
 TEST_CASE("Predict retains admission facts with accepted settings and operation ownership", "[controller][systems][predict]") {
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-capacity-facts")};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
  const auto revision = settings.snapshot().revision;
  std::promise<void> settled;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [](DirectComputeConfiguration) {
@@ -73,6 +78,7 @@ TEST_CASE("Predict retains admission facts with accepted settings and operation 
  }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(settled, "prediction admitted capacity");
+ // CLEANUP-IGNORE: Predict and Validate independently verify their public execution-generation handoff; each continues with its own outcome and frame assertions.
  const auto snapshot = prediction.snapshot();
  CHECK(snapshot.execution.admitted_capacity == 1);
  CHECK(snapshot.execution.settings_revision == revision);
@@ -137,8 +143,7 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
  const bool on_close = GENERATE(false, true);
  const bool preview_terminal = GENERATE(false, true);
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-unsafe-admission")};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
  auto custody = std::make_shared<int>(7);
  std::weak_ptr<int> retained = custody;
  std::atomic_size_t constructions = 0U;
@@ -179,8 +184,7 @@ TEST_CASE("Predict observes receiver retirement discovered while releasing a rep
   std::shared_ptr<int> custody_ = std::make_shared<int>(1);
  };
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-release-admission")};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
  unsigned constructions = 0;
  std::array<std::promise<void>, 2> settled;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) {
@@ -208,8 +212,7 @@ TEST_CASE("Predict observes receiver retirement discovered while releasing a rep
 TEST_CASE("Predict distinguishes ordinary from terminal runtime construction failure", "[controller][systems][predict][custody]") {
  const bool terminal = GENERATE(false, true);
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-construction-admission")};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
  unsigned constructions = 0U;
  std::array<std::promise<void>, 2> failed;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) -> std::unique_ptr<PredictRuntime> {
@@ -235,8 +238,7 @@ TEST_CASE("Predict distinguishes ordinary from terminal runtime construction fai
 TEST_CASE("prediction count inspection preserves source identity and revalidates Start before output admission", "[controller][systems][predict][output]") {
  const auto root = mmltk::testsupport::make_temp_root("predict-count-inspection");
  ApplicationDataFixture fixture{root};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
  std::promise<void> inspected, failed;
  std::atomic_size_t constructions = 0U;
  const auto path = (root / "train.bin").string();
@@ -393,6 +395,7 @@ TEST_CASE("impossible compiled saving under inference limit fails before reserva
 }
 TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[controller][gpu][custody]") {
  namespace gpu = mmltk::frameworks::gpu;
+ // CLEANUP-IGNORE: Isolated device context construction and explicit ambient selection are prerequisites for distinct receiver-retirement and allocation-refusal lifetimes.
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
@@ -443,10 +446,9 @@ TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[
 TEST_CASE("late receiver custody seals Predict admission while optional visual failure preserves semantic success", "[controller][systems][predict][custody]") {
  const bool terminal = GENERATE(false, true);
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-late-receiver")};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
- auto gate = std::make_shared<mmltk::testsupport::StopGate>();
- gate->Release();
+ // CLEANUP-IGNORE: Model preparation and the existing StopGate fixture precede different prediction-custody and publication scenarios.
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
+ auto gate = std::make_shared<mmltk::testsupport::StopGate>(true);
  auto fault = std::make_shared<PredictionReceiverFault>();
  fault->terminal = terminal;
  const ScopedPredictionReceiverFault registration{*fault};
@@ -480,12 +482,14 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
   static_cast<void>(prediction.Start({}));
   REQUIRE(fault->upload.WaitEntered(std::chrono::seconds{2}));
   mmltk::testsupport::await_test_promise(second_done, "semantic completion before receiver outcome");
+  // CLEANUP-IGNORE: Semantic success and retained frame identity are intentionally checked before and after a late visual failure.
   CHECK(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
   CHECK(prediction.snapshot().frame == retained);
   REQUIRE(fault->retirement);
   CHECK(fault->retirement->admission_open());
   fault->upload.Release();
   mmltk::testsupport::await_test_promise(visual_failure, "late receiver failure");
+  // CLEANUP-IGNORE: Semantic success and retained frame identity are intentionally checked before and after a late visual failure.
   CHECK(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
   CHECK(prediction.snapshot().frame == retained);
   CHECK(fault->retirement->admission_open() == !terminal);
@@ -512,10 +516,9 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
 TEST_CASE("prediction preview refusal preserves successful inference completion", "[controller][systems][compute]") {
  const auto root = mmltk::testsupport::make_temp_root("prediction-preview-refusal");
  ApplicationDataFixture fixture{root};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
- auto gate = std::make_shared<mmltk::testsupport::StopGate>();
- gate->Release();
+ // CLEANUP-IGNORE: Model preparation and the existing StopGate fixture precede different prediction-custody and publication scenarios.
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
+ auto gate = std::make_shared<mmltk::testsupport::StopGate>(true);
  std::promise<PredictSnapshot> completed;
  std::promise<PredictFailed> preview_failed;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [gate](DirectComputeConfiguration) {
@@ -552,6 +555,7 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
   REQUIRE(reader);
  }
  CHECK_FALSE(pool->Capture(source, {2U, 2U}, 0U, {}, {}, classes, 2, nullptr, custody));
+ // CLEANUP-IGNORE: Runtime construction and output acquisition precede distinct successful and rejected draw operations with different custody expectations.
  gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
  auto candidate = runtime.AcquireOutput();
  readers[0]->Draw(runtime, candidate);
@@ -707,6 +711,7 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
  auto& context = receiver.device.context;
  auto& fault = receiver.fault;
  detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 1U);
+ // CLEANUP-IGNORE: Independent Predict and Validate composition scenarios retain their own runtime, composition and catalog; source and allocation checks differ.
  gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
  Composition retained;
  const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"sample"});
@@ -729,6 +734,7 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
   for (unsigned publication = 0U; publication < 2U; ++publication) {
    auto candidate = runtime.AcquireOutput();
    Composition::Draw(runtime, candidate, {4U, 4U}, regions, {}, &retained);
+   // CLEANUP-IGNORE: The completed output and borrowed view retain separate lifetimes through each scenario-specific device copy and allocation check.
    auto completed = runtime.CommitOutput(std::move(candidate));
    auto image = completed.Borrow();
    context.Bind();
@@ -841,12 +847,14 @@ TEST_CASE("decoded compact preview retains bytes through retry and release witho
 TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact", "[controller][gpu]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace controller = mmltk::controller;
+ // CLEANUP-IGNORE: Isolated device context construction and explicit ambient selection are prerequisites for distinct receiver-retirement and allocation-refusal lifetimes.
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
  const auto operations = RefusePinnedRegistration();
  controller::detail::PredictionPreviewPool pool(execution, context, operations);
  const std::array<std::uint8_t, 12U> pixels{255, 0, 0};
+ // CLEANUP-IGNORE: Decoded pixels, weak custody, and class references remain local to distinct allocation-refusal and context-failure lifetime tests.
  auto input = PredictionSource::Decoded({2U, 2U}, pixels);
  auto& source = input.custody();
  const std::weak_ptr<void> source_lifetime = source;
@@ -855,6 +863,7 @@ TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact"
  REQUIRE(raw);
  source.reset();
  REQUIRE_FALSE(source_lifetime.expired());
+ // CLEANUP-IGNORE: Runtime construction and output acquisition precede distinct successful and rejected draw operations with different custody expectations.
  gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
  auto candidate = runtime.AcquireOutput();
  CHECK_THROWS(raw->Draw(runtime, candidate));
@@ -868,9 +877,7 @@ TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact"
  recovered->Draw(runtime, output);
  const auto completed = runtime.CommitOutput(std::move(output));
  auto view = completed.Borrow();
- const auto plane = view.plane(0U).plane();
- std::array<std::uint8_t, 16> rgba{};
- REQUIRE(cudaMemcpy2D(rgba.data(), 8U, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, 8U, 2U, cudaMemcpyDeviceToHost) == cudaSuccess);
+ const auto rgba = read_two_by_two_rgba(view.plane(0U).plane());
  CHECK(rgba[0] == 255U);
  CHECK(rgba[1] == 0U);
  CHECK(rgba[2] == 0U);
@@ -891,6 +898,7 @@ TEST_CASE("preview context failure retains initialized state and source before r
  operations.context_api = api;
  auto pool = std::make_unique<detail::PredictionPreviewPool>(execution, context, operations, authority);
  const std::array<std::uint8_t, 12U> pixels{};
+ // CLEANUP-IGNORE: Decoded pixels, weak custody, and class references remain local to distinct allocation-refusal and context-failure lifetime tests.
  auto input = PredictionSource::Decoded({2U, 2U}, pixels);
  auto& decoded = input.custody();
  const std::weak_ptr<void> retained = decoded;
@@ -938,8 +946,7 @@ TEST_CASE("preview context failure retains initialized state and source before r
   }
   pool.reset();
  }
- CHECK(authority->admission_open() == !unsafe);
- CHECK(authority->fact().occupancy == (unsafe ? 1U : 0U));
+ mmltk::frameworks::gpu::test_support::check_terminal_occupancy(*authority, unsafe);
  decoded.reset();
  // A destructor restore failure occurs after settled source custody releases.
  if (stage == Stage::Capture || query_failure) CHECK(retained.expired() == !unsafe);
@@ -947,10 +954,9 @@ TEST_CASE("preview context failure retains initialized state and source before r
 }
 TEST_CASE("Predict replacement pressure coalesces without overwriting its selected image", "[controller][systems][predict][gpu]") {
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-replacement-pressure")};
- fixture.PrepareModel(contracts::FeatureId::Predict);
- auto [settings, dataset, model] = fixture.systems();
- auto gate = std::make_shared<mmltk::testsupport::StopGate>();
- gate->Release();
+ // CLEANUP-IGNORE: Model preparation and the existing StopGate fixture precede different prediction-custody and publication scenarios.
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
+ auto gate = std::make_shared<mmltk::testsupport::StopGate>(true);
  auto fault = std::make_shared<PredictionReceiverFault>();
  const ScopedPredictionReceiverFault registration{*fault};
  auto source_index = std::make_shared<std::atomic_int64_t>(0);
@@ -1066,8 +1072,7 @@ TEST_CASE("preview context construction publishes only after exact caller restor
   CHECK_THROWS_AS(create(), gpu::CudaContextFailure);
  const bool terminal = failure == Failure::Query || failure == Failure::RestoreAlways;
  CHECK(published.has_value() == (failure == Failure::None));
- CHECK(authority->admission_open() == !terminal);
- CHECK(authority->fact().occupancy == (terminal ? 1U : 0U));
+ mmltk::frameworks::gpu::test_support::check_terminal_occupancy(*authority, terminal);
  CHECK(authority->fact().reservations == frames.size());
  CUcontext restored{};
  REQUIRE(cuCtxGetCurrent(&restored) == CUDA_SUCCESS);
@@ -1084,11 +1089,7 @@ namespace mmltk::controller {
 TEST_CASE("preview source rebinding preserves borrowed frames through a failed replacement", "[controller][gpu]") {
  namespace gpu = mmltk::frameworks::gpu;
  using Composition = detail::PredictionPreviewComposition;
- const auto topology = mmltk::common::system::NumaTopology::Capture();
- const auto receiver_execution = gpu::resolve_device_execution(0, topology);
- int count = 0;
- REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
- const auto alternate = count > 1 ? gpu::resolve_device_execution(1, topology) : receiver_execution;
+ const auto [receiver_execution, alternate, count] = gpu::test_support::test_device_pair();
  if (count < 2) WARN("Only one CUDA GPU is visible; cross-device borrowed-frame custody remains unverified");
  gpu::DeviceContext receiver(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, receiver_execution.placement.numa_node, receiver_execution);
  gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = receiver});
@@ -1146,12 +1147,11 @@ TEST_CASE("preview source rebinding preserves borrowed frames through a failed r
  const std::array regions{Composition::Region{borrowed, {0U, 0U, 2U, 2U}}};
  auto candidate = runtime.AcquireOutput();
  Composition::Draw(runtime, candidate, {2U, 2U}, regions, {});
+ // CLEANUP-IGNORE: The completed output and borrowed view retain separate lifetimes through each scenario-specific device copy and allocation check.
  auto displayed = runtime.CommitOutput(std::move(candidate));
  auto image = displayed.Borrow();
  receiver.Bind();
- const auto clean = image.plane(0U).plane();
- std::array<std::uint8_t, 16> actual{};
- REQUIRE(cudaMemcpy2D(actual.data(), 8U, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes, 8U, 2U, cudaMemcpyDeviceToHost) == cudaSuccess);
+ const auto actual = read_two_by_two_rgba(image.plane(0U).plane());
  CHECK(actual == std::array<std::uint8_t, 16>{255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255});
  auto retry = capture(second, alternate.device);
  REQUIRE(retry);

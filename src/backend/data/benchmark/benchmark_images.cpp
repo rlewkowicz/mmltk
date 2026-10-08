@@ -286,10 +286,11 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  if (request.progress) { request.progress(completed.size(), selected.size()); }
  trace_benchmark_event(request.trace, "benchmark.images.cache_reuse",
   [&] { return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_images", selected.size()}, {"reused_images", completed.size()}, {"reused_bytes", image_bytes}}; });
- if (completed.size() == selected.size()) {
+ const auto publish_directory = [&] {
   complete_cached_image_group(request.output_root, completion, identity, request.selected_image_ids, image_bytes, request.cancel_requested, request.trace, quarantined, request.storage);
   return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, false, std::move(quarantined));
- }
+ };
+ if (completed.size() == selected.size()) return publish_directory();
  const std::size_t pending_writes = selected.size() - completed.size() - unavailable.size();
  if (request.activity) request.activity("Preparing bounded selected-image cache writes");
  std::unordered_set<std::uint64_t> scheduled;
@@ -391,7 +392,6 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    request.activity("Quarantined " + std::to_string(quarantined.size()) + " unavailable training images; publishing cache status");
   }
  }
- complete_cached_image_group(request.output_root, completion, identity, request.selected_image_ids, image_bytes, request.cancel_requested, request.trace, quarantined, request.storage);
- return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, false, std::move(quarantined));
+ return publish_directory();
 }
 }  // namespace mmltk::backend::data::benchmark_internal

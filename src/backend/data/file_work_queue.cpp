@@ -377,6 +377,7 @@ FileWorkQueue::Reservation::~Reservation() { release(); }
 FileWorkQueue::Reservation::Reservation(Reservation&& other) noexcept : owner_(std::move(other.owner_)), index_(other.index_) {}
 FileWorkQueue::Reservation& FileWorkQueue::Reservation::operator=(Reservation&& other) noexcept {
  if (this != &other) {
+  // CLEANUP-IGNORE: These move assignments retire different resources and transfer different remaining members; the shared prefix is not a common ownership algorithm.
   release();
   owner_ = std::move(other.owner_);
   index_ = other.index_;
@@ -384,6 +385,7 @@ FileWorkQueue::Reservation& FileWorkQueue::Reservation::operator=(Reservation&& 
  return *this;
 }
 void FileWorkQueue::Reservation::release() noexcept {
+ // CLEANUP-IGNORE: This release prefix transfers three different resource owners; producer, service-lane, and file-record retirement have distinct locked state transitions.
  if (!owner_) return;
  auto owner = std::move(owner_);
  {

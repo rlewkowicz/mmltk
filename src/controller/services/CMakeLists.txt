@@ -117,7 +117,8 @@ function(mmltk_add_controller_services_tests)
         mmltk_controller_services_tests
         ${mmltk_controller_services_ordinary_test_sources})
     mmltk_register_private_headers(mmltk_controller_services_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/support/diagnostics_client_test_access.h)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/support/diagnostics_client_test_access.h
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/support/diagnostics_test_fixture.h)
     mmltk_configure_component(
         mmltk_controller_services_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_services_tests PRIVATE

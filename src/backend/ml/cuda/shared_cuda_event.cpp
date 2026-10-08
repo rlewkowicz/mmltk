@@ -19,7 +19,8 @@ CudaEventPool::Lease::~Lease() noexcept {
  static_assert(alignof(RuntimeLease) <= alignof(std::max_align_t));
  if (engaged_) std::destroy_at(std::launder(reinterpret_cast<RuntimeLease*>(storage_.data())));
 }
-CudaEventPool::Lease::Lease(Lease&& other) noexcept {
+CudaEventPool::Lease::Lease(Lease&& other) noexcept { take(other); }
+void CudaEventPool::Lease::take(Lease& other) noexcept {
  auto* const destination = std::launder(reinterpret_cast<RuntimeLease*>(storage_.data()));
  auto* const source = std::launder(reinterpret_cast<RuntimeLease*>(other.storage_.data()));
  if (other.engaged_) {
@@ -32,15 +33,9 @@ CudaEventPool::Lease::Lease(Lease&& other) noexcept {
 CudaEventPool::Lease& CudaEventPool::Lease::operator=(Lease&& other) noexcept {
  if (this == &other) return *this;
  auto* const destination = std::launder(reinterpret_cast<RuntimeLease*>(storage_.data()));
- auto* const source = std::launder(reinterpret_cast<RuntimeLease*>(other.storage_.data()));
  if (engaged_) std::destroy_at(destination);
  engaged_ = false;
- if (other.engaged_) {
-  std::construct_at(destination, std::move(*source));
-  engaged_ = true;
-  std::destroy_at(source);
-  other.engaged_ = false;
- }
+ take(other);
  return *this;
 }
 void CudaEventPool::Lease::wait(const std::uintptr_t stream, const char* context) const {

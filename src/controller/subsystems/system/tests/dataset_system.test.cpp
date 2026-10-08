@@ -1,3 +1,4 @@
+#include "src/controller/services/tests/support/diagnostics_test_fixture.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
@@ -35,6 +36,10 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
+services::RuntimeDiagnosticTarget detached_diagnostic_target(services::DiagnosticsClient& client) {
+ services::RuntimeDiagnostics creator{client.producer()};
+ return creator.target();
+}
 class UnusedWeightOperations final : public services::ArtifactWeightOperations {
 public:
  [[nodiscard]] std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { return std::nullopt; }
@@ -86,14 +91,8 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
  const mmltk::testsupport::ScopedTempDir root{"ordinary-dataset-diagnostics"};
  UnusedWeightOperations weights;
  DiagnosticCompiler compiler;
- const auto log = root.path() / "trace.jsonl";
- services::DiagnosticsClient client{mmltk::common::io::ScopedFd{::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)}, services::DiagnosticsExecutionPolicy::CallerDriven};
- REQUIRE(client.enabled());
- services::RuntimeDiagnosticTarget target;
- {
-  services::RuntimeDiagnostics creator{client.producer()};
-  target = creator.target();
- }
+ auto [log, client] = mmltk::controller::test_support::DiagnosticFileFixture{root.path()};
+ auto target = detached_diagnostic_target(client);
  services::ArtifactCompileRequest request{
   .kind = services::ArtifactCompileKind::Benchmark,
   .source = {},
@@ -188,11 +187,7 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
   mmltk::common::io::ScopedFd{::open((root.path() / "trace.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600)}, services::DiagnosticsExecutionPolicy::CallerDriven
  };
  REQUIRE(client.enabled());
- services::RuntimeDiagnosticTarget target;
- {
-  services::RuntimeDiagnostics creator{client.producer()};
-  target = creator.target();
- }
+ auto target = detached_diagnostic_target(client);
  UnusedWeightOperations weights;
  DiagnosticCompiler compiler;
  std::size_t constructions = 0U;
@@ -354,6 +349,7 @@ TEST_CASE("compilation captures its perceptual selection independently of augmen
  settings.workflows.train.request.gpu_augmentation.perceptual_downscale = false;
  const auto captured = services::materialize_artifact_compile(settings);
  REQUIRE(captured);
+ // CLEANUP-IGNORE: The captured compilation settings are intentionally asserted before and after a later settings edit to prove immutability.
  CHECK(captured->perceptual_downscale);
  CHECK(captured->resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias);
  CHECK(captured->resize_mode == ResizeMode::Letterbox);
@@ -366,6 +362,7 @@ TEST_CASE("compilation captures its perceptual selection independently of augmen
  CHECK_FALSE(next->perceptual_downscale);
  CHECK(next->resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::Native);
  CHECK(next->resize_mode == ResizeMode::Stretch);
+ // CLEANUP-IGNORE: The captured compilation settings are intentionally asserted before and after a later settings edit to prove immutability.
  CHECK(captured->perceptual_downscale);
  CHECK(captured->resize_method == mmltk::backend::imaging::resample::RgbResizeMethod::TorchBilinearAntialias);
  CHECK(captured->resize_mode == ResizeMode::Letterbox);

@@ -26,6 +26,11 @@
 #include <vector>
 namespace mmltk::controller::browser {
 namespace {
+void check_decoded_server_record(const wire::ByteBuffer& encoded, const ServerRecord& expected) {
+ const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
+ REQUIRE(decoded);
+ CHECK(*decoded == expected);
+}
 struct ClientFixture final {
  std::string kind;
  wire::ByteBuffer bytes;
@@ -114,6 +119,7 @@ struct FixtureApplicationSystems final {
  return *found;
 }
 [[nodiscard]] Intent decode_intent_fixture(const ClientFixture& fixture) {
+ // CLEANUP-IGNORE: Intent and interaction codec paths independently guard decoded variants before accessing different typed contracts.
  const auto record = decode_client_record(wire::ByteSegments{.first = fixture.bytes, .second = {}});
  REQUIRE(record);
  REQUIRE(std::holds_alternative<Intent>(*record));
@@ -195,6 +201,7 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
  REQUIRE(std::ranges::count_if(fixtures, [](const auto& fixture) { return !fixture.kind.starts_with("IntegrationControl:"); }) == 6U + annotation_alternatives);
  for (const auto* name : {"IntegrationControl:capacity", "IntegrationControl:visible-arm", "IntegrationControl:visible-release"}) {
   const auto decoded = decode_client_record({.first = fixture_named(fixtures, name).bytes, .second = {}});
+  // CLEANUP-IGNORE: Each decoded protocol alternative is explicitly checked before dereferencing its distinct fixture-specific receipt fields.
   REQUIRE(decoded);
   const auto* receipt = std::get_if<IntegrationControl>(&*decoded);
   REQUIRE(receipt);
@@ -203,6 +210,7 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
  }
  const auto& control_fixture = fixture_named(fixtures, "IntegrationControl");
  const auto control = decode_client_record(wire::ByteSegments{.first = control_fixture.bytes, .second = {}});
+ // CLEANUP-IGNORE: Each decoded protocol alternative is explicitly checked before dereferencing its distinct fixture-specific receipt fields.
  REQUIRE(control);
  const auto* receipt = std::get_if<IntegrationControl>(&*control);
  REQUIRE(receipt);
@@ -256,6 +264,7 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
  REQUIRE(settings.latest.updates.size() == 1U);
  // CLEANUP-IGNORE: Settings and file-dialog fixtures prove separate generated endpoints and native dispatch paths.
  CHECK(mmltk::controller::contracts::gui_settings_valid(settings.state));
+ // CLEANUP-IGNORE: Intent and interaction codec paths independently guard decoded variants before accessing different typed contracts.
  const auto interaction_record = decode_client_record(wire::ByteSegments{.first = interaction_fixture.bytes, .second = {}});
  REQUIRE(interaction_record);
  REQUIRE(std::holds_alternative<Interaction>(*interaction_record));
@@ -342,9 +351,7 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
  };
  wire::ByteBuffer encoded;
  REQUIRE(encode_server_record(failed, encoded));
- const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
- REQUIRE(decoded);
- CHECK(*decoded == failed);
+ check_decoded_server_record(encoded, failed);
  for (const auto delivery :
   {mmltk::controller::contracts::reflection::EventDelivery::Transient, mmltk::controller::contracts::reflection::EventDelivery::Critical,
    mmltk::controller::contracts::reflection::EventDelivery::LatestState}) {
@@ -356,9 +363,7 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
    .value = wire::Value(wire::Value::Object{{"progress", wire::Value(std::uint64_t{3U})}}),
   };
   REQUIRE(encode_server_record(event, encoded));
-  const auto roundtrip = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
-  REQUIRE(roundtrip);
-  CHECK(*roundtrip == event);
+  check_decoded_server_record(encoded, event);
  }
 }
 TEST_CASE("consumed server records retain empty and large nested leaf ownership", "[controller][browser][protocol][limits]") {
@@ -431,9 +436,7 @@ TEST_CASE("output records admit bounded scene collections and complete bootstrap
  const auto event_payload_bytes = cbor::measure(std::get<SystemEvent>(event).value, {.max_bytes = kMaxOutputValueBytes, .max_items = kMaxOutputValueItems, .max_depth = kMaxIntentValueDepth});
  REQUIRE(event_payload_bytes);
  CHECK(encoded.size() <= cbor::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(*event_payload_bytes));
- const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
- REQUIRE(decoded);
- CHECK(*decoded == event);
+ check_decoded_server_record(encoded, event);
  const wire::Value payload(std::string(kMaxOutputValueBytes, 'x'));
  const ServerRecord bootstrap = Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}, {.system_id = 2U, .value = payload}}};
  REQUIRE(encode_server_record(bootstrap, encoded));
@@ -517,9 +520,7 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
       }) {
   // CLEANUP-IGNORE: Interaction rejection round trips are independent wire-variant oracles, not a second codec implementation.
   REQUIRE(encode_server_record(record, encoded));
-  const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
-  REQUIRE(decoded);
-  CHECK(*decoded == record);
+  check_decoded_server_record(encoded, record);
  }
  std::vector<SystemSnapshot> too_many_snapshots;
  too_many_snapshots.reserve(kMaxSnapshotCount + 1U);
