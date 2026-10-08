@@ -50,6 +50,7 @@ module;
 
 export module mmltk.tools.tests.test_headless_compositor;
 import mmltk.tools.tool_command;
+import mmltk.tools.container_commands;
 import mmltk.tools.cpp_linux;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
@@ -300,49 +301,18 @@ void test_fatal_signal_preserves_status_without_an_os_core_dump() {
 }
 
 void test_packaged_enumeration_bypasses_compositor_but_execution_owns_one() {
-    const auto wrapper = native::read_text(SessionFixture::repository() / "mmltk");
-    constexpr std::string_view start = "run_workspace_wayland_test_executable() {";
-    const auto begin = wrapper.find(start);
-    require(begin != std::string::npos, "wrapper executable function is missing");
-    const auto end = wrapper.find("\nrun_tests() {", begin + start.size());
-    require(end != std::string::npos, "wrapper run_tests function is missing");
-    const auto function = wrapper.substr(begin, end - begin);
-    constexpr std::string_view setup = R"shell(
-repo_root=/workspace
-cache_root=/cache
-container_cache_root=/cache
-image_name=packaged
-wayland_validation_image_name=validation
-test_run_container_name=runner
-test_headless_compositor=1
-gui_runtime_dir_container=/runtime
-gui_wayland_socket_container_path=/runtime/wayland-test
-uid=1000
-gid=1000
-common_group_args=()
-bind_mount_specs=()
-docker() { return 0; }
-prepare_owned_dirs() { :; }
-prepare_workspace_wayland_test_mounts() { :; }
-build_common_group_args() { :; }
-gui_runtime_tmpfs_spec() { echo /runtime; }
-append_execution_policy_args() { :; }
-append_native_environment() { :; }
-append_wrapper_labels() { :; }
-append_native_logging_environment() { :; }
-append_explicit_test_environment() { :; }
-run_owned_docker_command() { printf '%s\n' "$@"; }
-)shell";
     for (const std::string argument : {"--list-tests", "workspace_wayland_retained"}) {
-        const auto script = std::string(setup) + function +
-                            "\nrun_workspace_wayland_test_executable /packaged/test " + argument + '\n';
-        const auto result = native::capture({"bash", "-c", script});
-        require(result.exit_code == 0, "wrapper fixture failed: " + result.err);
-        // This inspects the unchanged wrapper; it never executes its Python path.
-        require((result.out.find("/workspace/tools/headless_compositor.py") != std::string::npos) ==
-                    (argument != "--list-tests"), "wrapper compositor ownership differs for enumeration/execution");
-        require(result.out.find("/packaged/test") != std::string::npos, "wrapper lost packaged executable");
-        require(result.out.find(argument) != std::string::npos, "wrapper lost test argument");
+        const auto command = mmltk::container_commands::workspace_test_command(
+            true, "/packaged/test", {argument}, "packaged", "validation");
+        const auto has = [&](std::string_view value) {
+            return std::find(command.begin(), command.end(), value) != command.end();
+        };
+        require(has("headless-compositor") == (argument != "--list-tests"),
+                "wrapper compositor ownership differs for enumeration/execution");
+        require(has("validation") == (argument != "--list-tests"), "wrapper selected the wrong image");
+        require(has("packaged") == (argument == "--list-tests"), "enumeration must use the packaged runtime");
+        require(has("core=1:1") == (argument != "--list-tests"), "private compositor lost its core limit");
+        require(has("/packaged/test") && has(argument), "wrapper lost the executable or its argument");
     }
 }
 

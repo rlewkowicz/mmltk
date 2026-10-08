@@ -9,12 +9,11 @@ ARG MMLTK_RUNTIME_BASE_IDENTITY=unknown
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# The shared inventory admits and copies only production package roots. The
-# source stage and helper are read-only build inputs and are not image layers.
+# The native driver is separate from the production application entrypoint.
+# Its closure also provides read-only process diagnostics in running containers.
+COPY --link --from=mmltk_tools / /opt/mmltk-tools/
 RUN --mount=type=bind,source=.,target=/tmp/mmltk-release \
-    --mount=type=bind,from=mmltk_package,source=runtime_package.sh,target=/tmp/runtime_package.sh \
-    source /tmp/runtime_package.sh \
-    && runtime_package_install /tmp/mmltk-release
+    /opt/mmltk-tools/mmltk --tool runtime-package -- install /tmp/mmltk-release
 
 RUN firefox_root=/opt/mmltk/lib/mmltk/firefox \
     && for firefox_object in firefox-bin libmozgtk.so libxul.so; do \

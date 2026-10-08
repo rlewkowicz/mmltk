@@ -44,7 +44,7 @@ if(MMLTK_TOOLS_BUILD_DRIVER)
     find_path(MMLTK_TOOLS_VULKAN_INCLUDE_DIR vulkan/vulkan_core.h REQUIRED)
     file(READ "${MMLTK_TOOLS_REPOSITORY}/docker/nvidia-payload.json" _payload)
     string(JSON _cuda_root GET "${_payload}" cuda_root)
-    find_path(MMLTK_TOOLS_CUDA_INCLUDE_DIR cuda.h HINTS "${_cuda_root}/include" REQUIRED)
+    find_path(MMLTK_TOOLS_CUDA_INCLUDE_DIR cuda.h HINTS "$ENV{MMLTK_TOOLS_CUDA_INCLUDE_DIR}" "${_cuda_root}/include" REQUIRED)
 
     add_library(mmltk_tool_modules STATIC)
     mmltk_tools_configure_target(mmltk_tool_modules)

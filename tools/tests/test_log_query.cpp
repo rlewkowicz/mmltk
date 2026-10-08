@@ -61,6 +61,7 @@ import mmltk.tools.tool_command;
 import mmltk.tools.cpp_linux;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
+import mmltk.tools.runtime_package;
 
 namespace log_query_test {
 using Json = mmltk::log_query::Json;
@@ -1076,12 +1077,14 @@ struct WrapperFixture : FileFixture {
     fs::path wrapper;
     support::RunOptions options;
     explicit WrapperFixture(const std::string& script) {
-        wrapper = write("mmltk", support::read_text(repository() / "mmltk")); write("tools/runtime_package.sh", support::read_text(repository() / "tools/runtime_package.sh"));
+        wrapper = root / "mmltk"; fs::create_directories(root / "tools");
+        fs::create_symlink(support::executable_path(), wrapper);
         auto docker = write("bin/docker", script); fs::permissions(docker, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read | fs::perms::others_exec);
         for (char** entry = ::environ; entry && *entry; ++entry) { std::string value(*entry); auto name = value.substr(0, value.find('=')); if (name.starts_with("MMLTK_")) options.unset_env.push_back(name); }
+        options.env["MMLTK_DOCKER_CONTAINER"] = "host";
         options.env["PATH"] = docker.parent_path().string() + ":" + support::env("PATH"); options.cwd = root; options.capture_stdout = options.capture_stderr = true; options.timeout = std::chrono::seconds(15);
     }
-    support::ProcessResult invoke(const Strings& args) { return support::run(plus({"bash", wrapper.string()}, args), options); }
+    support::ProcessResult invoke(const Strings& args) { return support::run(plus({wrapper.string()}, args), options); }
 };
 std::string start_ticks(pid_t pid) {
     auto text = support::read_text("/proc/" + std::to_string(pid) + "/stat"); auto fields = support::split(text.substr(text.rfind(')') + 2), ' ', false); return fields.at(19);
@@ -1227,8 +1230,8 @@ struct RuntimeFixture : WrapperFixture {
         options.env["TEST_RUNTIME_STATE"] = state.string(); options.env["TEST_RUNTIME_NOTIFY"] = path; options.env["XDG_RUNTIME_DIR"] = wayland.parent_path().string(); options.env["WAYLAND_DISPLAY"] = wayland.filename().string(); options.env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + write("runtime/bus", "fixture bus").string();
     }
     Launch launch(Strings args, bool preparing = false, bool deferred = false) {
-        auto output = root / ("wrapper-" + std::to_string(children.size()) + ".log"); auto command = plus({"bash", wrapper.string()}, args);
-        if (deferred) command = plus({"bash", "-c", "read -r release; exec bash \"$@\"", "deferred-runtime", wrapper.string()}, args);
+        auto output = root / ("wrapper-" + std::to_string(children.size()) + ".log"); auto command = plus({wrapper.string()}, args);
+        if (deferred) command = plus({"bash", "-c", "read -r release; exec \"$@\"", "deferred-runtime", wrapper.string()}, args);
         auto settings = options; settings.env["TEST_HOLD_CREATION"] = preparing ? "1" : "0"; auto process = std::make_unique<Child>(command, settings, output, deferred, true); auto child = process.get(); children.push_back(std::move(process)); return {child, output};
     }
     Launch replace_gui(const Launch& previous) {
@@ -1256,6 +1259,171 @@ void test_gui_launch_replaces_an_owner_still_preparing_its_container() {
 void test_delayed_older_gui_launch_preserves_the_newer_runtime() {
     RuntimeFixture f; auto earlier = f.launch({"--gui"}, false, true); auto raw = f.launch({"--help"}); f.wait_ready(raw); auto newest = f.launch({"--gui"}); f.wait_ready(newest);
     const std::string release = "continue\n"; EQ(::write(earlier.first->input.get(), release.data(), release.size()), static_cast<ssize_t>(release.size())); NE(earlier.first->wait(), 0); HAS(support::read_text(earlier.second), "superseded by a newer runtime invocation"); FALSE(newest.first->poll()); EQ(matching_files(f.state, "", ".json").size(), 1U);
+}
+
+void test_native_compiler_launcher_preserves_arguments_cache_and_status() {
+    FileFixture f;
+    auto compiler = f.write("compiler with spaces", "#!/bin/sh\nprintf '%s\\0' \"$@\"\nexit \"${TEST_COMPILER_STATUS:-0}\"\n");
+    auto cache = f.write("bin/ccache", "#!/bin/sh\nprintf 'cache\\n' >&2\nexec \"$@\"\n");
+    for (const auto& path : {compiler, cache}) fs::permissions(path, fs::perms::owner_all);
+    support::RunOptions options; options.capture_stdout = options.capture_stderr = true;
+    options.env["PATH"] = cache.parent_path().string() + ':' + support::env("PATH");
+    for (const auto& flag : {"-O2", "-fmodules", "-fmodules-ts", "-fmodule-mapper=path with spaces"}) {
+        Strings args{compiler.string(), flag, "a b.cpp", "literal;$value"};
+        auto result = support::run(support::command::self_invocation(support::command::Command::module_safe_compiler_launcher, args), options);
+        EQ(result.exit_code, 0);
+        EQ(support::split(result.out, '\0', false), Strings({flag, "a b.cpp", "literal;$value"}));
+        EQ(result.err, std::string(flag) == "-O2" ? "cache\n" : "");
+    }
+    options.env["TEST_COMPILER_STATUS"] = "47";
+    EQ(support::run(support::command::self_invocation(support::command::Command::module_safe_compiler_launcher, {compiler.string(), "-fmodules"}), options).exit_code, 47);
+    EQ(support::run(support::command::self_invocation(support::command::Command::module_safe_compiler_launcher), options).exit_code, 2);
+}
+void test_native_package_inventory_completeness_and_stable_archive_identity() {
+    namespace package = mmltk::tools::runtime_package;
+    FileFixture f;
+    const auto root = f.root / "package";
+    for (const auto& row : package::inventory()) {
+        fs::create_directories(root / row.path);
+        for (auto entry : row.entries) if (!entry.starts_with('?'))
+            support::write_text(root / row.path / entry, "payload\n");
+    }
+    CHECK(package::complete(root));
+    const auto initial = package::fingerprint(root);
+    const auto moved = f.root / "moved package";
+    fs::rename(root, moved);
+    EQ(package::fingerprint(moved), initial);
+    support::write_text(moved / "bin/mmltk_unwanted_tests", "test executable");
+    fs::permissions(moved / "bin/mmltk_unwanted_tests", fs::perms::owner_all);
+    FALSE(package::complete(moved));
+    fs::remove(moved / "bin/mmltk_unwanted_tests");
+    support::write_text(moved / "bin/mmltk", "changed payload\n");
+    NE(package::fingerprint(moved), initial);
+    auto result = support::capture(support::command::self_invocation(support::command::Command::runtime_package, {"inventory"}));
+    EQ(result.exit_code, 0);
+    Strings fields;
+    for (const auto& row : package::inventory()) {
+        for (auto value : {row.path, row.destination, row.source_kind, row.source_path}) fields.emplace_back(value);
+        for (auto value : row.entries) fields.emplace_back(value);
+        fields.emplace_back();
+    }
+    std::string expected;
+    for (const auto& field : fields) { expected += field; expected += '\0'; }
+    EQ(result.out, expected);
+    fs::remove(moved / "models/ShiftLUT_fp32.onnx");
+    FALSE(package::complete(moved));
+}
+void test_tools_tidy_grouped_selection_and_module_resume() {
+    FileFixture f;
+    auto calls = f.write("calls", "");
+    for (const auto& file : {"a.cpp", "b.cpp", "c.cpp"}) f.write(std::string("tools/") + file, "export module fixture;\n");
+    const auto build = f.root / ".cache/cmake/tools";
+    J entries = J::array();
+    for (const auto& file : {"a.cpp", "b.cpp", "c.cpp"}) entries.push_back({
+        {"directory", build.string()}, {"file", (f.root / "tools" / file).string()},
+        {"output", std::string("CMakeFiles/fixture.dir/") + file + ".o"},
+        {"arguments", Strings{"/opt/gcc-16.2/bin/g++", "-freflection", "-fmodules"}}});
+    f.write(".cache/cmake/tools/compile_commands.json", entries.dump());
+    const std::map<std::string, std::string> programs{
+        {"git", "case \"$*\" in *--error-unmatch*|*--deleted*) exit 0;; esac\nprintf 'tools/a.cpp\\0tools/b.cpp\\0tools/c.cpp\\0'\n"},
+        {"nproc", "echo 2\n"}, {"clang-format", "exit 0\n"}, {"clang-tidy", "exit 99\n"},
+        {"cmake", "printf '%s\\n' \"$*\" >>\"${TEST_TOOL_CALLS}\"\n"}};
+    for (const auto& [name, script] : programs) {
+        auto path = f.write("bin/" + name, "#!/bin/sh\n" + script);
+        fs::permissions(path, fs::perms::owner_all);
+    }
+    support::RunOptions options; options.capture_stdout = options.capture_stderr = true;
+    options.env = {{"PATH", (f.root / "bin").string() + ':' + support::env("PATH")},
+        {"MMLTK_REPO_ROOT", f.root.string()}, {"MMLTK_TIDY_BUILD_DIR", build.string()},
+        {"MMLTK_TIDY_LOG_FILE", (f.root / "tidy.log").string()}, {"MMLTK_TIDY_TEE_STARTED", "1"},
+        {"LD_LIBRARY_PATH", support::env("LD_LIBRARY_PATH", "/fixture")}, {"TEST_TOOL_CALLS", calls.string()}};
+    auto run_tidy = [&](const Strings& selection) {
+        support::write_text(calls, "");
+        auto arguments = plus({"--tools-only"}, selection);
+        auto result = support::run(support::command::self_invocation(support::command::Command::run_static_analysis, arguments), options);
+        if (result.exit_code) throw Failure(result.err);
+        return support::read_text(calls);
+    };
+    auto grouped = run_tidy({"--file", "tools/a.cpp", "tools/c.cpp"});
+    includes(grouped, {"-S " + (f.root / "tools").string(), "a.cpp.o", "c.cpp.o"});
+    LACKS(grouped, "b.cpp.o"); LACKS(grouped, "--preset");
+    auto resumed = run_tidy({"--start-at", "tools/b.cpp"});
+    includes(resumed, {"b.cpp.o", "c.cpp.o"}); LACKS(resumed, "a.cpp.o");
+}
+void test_bootstrap_atomic_publication_concurrency_and_spaces() {
+    FileFixture f;
+    const auto root = f.root / "checkout with spaces";
+    fs::create_directories(root / "tools"); fs::create_directories(root / "docker");
+    fs::create_directories(root / "third_party/json/include");
+    support::write_text(root / "mmltk", support::read_text(repository() / "mmltk"));
+    support::write_text(root / "tools/bootstrap_mmltk.sh", support::read_text(repository() / "tools/bootstrap_mmltk.sh"));
+    fs::permissions(root / "mmltk", fs::perms::owner_all);
+    fs::permissions(root / "tools/bootstrap_mmltk.sh", fs::perms::owner_all);
+    for (const auto* path : {"docker/Dockerfile.gcc", "docker/Dockerfile.tools", "tools/input.cpp"}) support::write_text(root / path, "fixture\n");
+    support::write_text(root / "docker/nvidia-payload.json", "{\"donor\": \"fixture@sha256:0123456789abcdef\",\n\"cuda_source\": \"/usr/local/cuda-fixture\"}\n");
+    auto docker = f.write("bin/docker", R"SH(#!/bin/bash
+set -euo pipefail
+case "$1" in
+ version|tag|rm) exit 0;;
+ image) if [[ "$*" == *'{{.Id}}'* ]]; then printf 'sha256:%064d\n' 1; fi;;
+ buildx) exit 0;;
+ run)
+  printf 'build\n' >>"${TEST_BOOTSTRAP_CALLS}"
+  [[ "${TEST_BOOTSTRAP_FAILURE:-0}" == 0 ]] || exit 43
+  if [[ -n "${TEST_BOOTSTRAP_READY:-}" ]]; then
+   printf '%s\n' "$$" >"${TEST_BOOTSTRAP_READY}"
+   exec sleep 600
+  fi
+  stage=''
+  for argument in "$@"; do
+   if [[ "${argument}" == MMLTK_TOOLS_STAGE=* ]]; then stage="${argument#MMLTK_TOOLS_STAGE=/workspace}"; fi
+  done
+  [[ -n "${stage}" ]]
+  mkdir -p "${TEST_BOOTSTRAP_ROOT}${stage}"
+  ln -s "${TEST_BOOTSTRAP_BINARY}" "${TEST_BOOTSTRAP_ROOT}${stage}/mmltk"
+  ;;
+ *) exit 99;;
+esac
+)SH");
+    fs::permissions(docker, fs::perms::owner_all);
+    support::RunOptions options; options.cwd = f.root; options.capture_stdout = options.capture_stderr = true; options.timeout = std::chrono::seconds(20);
+    for (char** item = ::environ; item && *item; ++item) { std::string entry(*item); auto key = entry.substr(0, entry.find('=')); if (key.starts_with("MMLTK_")) options.unset_env.push_back(key); }
+    auto calls = f.write("bootstrap-calls", "");
+    options.env = {{"PATH", docker.parent_path().string() + ':' + support::env("PATH")},
+        {"MMLTK_DOCKER_CONTAINER", "host"}, {"MMLTK_BOOTSTRAP_CAPTURED", "1"},
+        {"TEST_BOOTSTRAP_BINARY", support::executable_path().string()}, {"TEST_BOOTSTRAP_ROOT", root.string()}, {"TEST_BOOTSTRAP_CALLS", calls.string()}};
+    Strings command{"bash", (root / "tools/bootstrap_mmltk.sh").string(), "--ensure", root.string()};
+    auto readonly = support::run({(root / "mmltk").string(), "--logs", "--help"}, options);
+    EQ(readonly.exit_code, 1); HAS(readonly.err, "diagnostic did not build or pull");
+    CHECK(support::read_text(calls).empty());
+    auto cold = support::run(command, options); if (cold.exit_code) throw Failure(cold.err);
+    const auto first = fs::read_symlink(root / "build/tools");
+    auto forwarded = support::run({(root / "mmltk").string(), "--tool", "runtime-package", "--", "inventory"}, options);
+    EQ(forwarded.exit_code, 0); HAS(forwarded.out, "lib/gcc-16.2");
+    EQ(support::run(command, options).exit_code, 0);
+    EQ(support::lines(support::read_text(calls)).size(), 1U);
+    support::write_text(root / "tools/input.cpp", "changed\n");
+    options.env["TEST_BOOTSTRAP_FAILURE"] = "1";
+    EQ(support::run(command, options).exit_code, 43);
+    EQ(fs::read_symlink(root / "build/tools"), first);
+    options.env["TEST_BOOTSTRAP_FAILURE"] = "0";
+    Child left(command, options, f.root / "left.log"), right(command, options, f.root / "right.log");
+    EQ(left.wait(20), 0); EQ(right.wait(20), 0);
+    NE(fs::read_symlink(root / "build/tools"), first);
+    CHECK(fs::exists(root / "build" / first / "mmltk"));
+    EQ(support::lines(support::read_text(calls)).size(), 3U);
+    const auto published = fs::read_symlink(root / "build/tools");
+    support::write_text(root / "tools/input.cpp", "interrupted generation\n");
+    const auto ready = f.write("bootstrap-ready", "");
+    options.env["TEST_BOOTSTRAP_READY"] = ready.string();
+    Child cancelled({(root / "mmltk").string(), "--tool", "runtime-package", "--", "inventory"}, options, f.root / "cancelled.log");
+    wait_ready_file(ready);
+    const auto client = static_cast<pid_t>(std::stoi(support::read_text(ready)));
+    EQ(::kill(cancelled.pid(), SIGTERM), 0);
+    EQ(cancelled.wait(10), 143);
+    EQ(fs::read_symlink(root / "build/tools"), published);
+    EQ(::kill(client, 0), -1); EQ(errno, ESRCH);
+    EQ(std::distance(fs::directory_iterator(root / "build/.tools-generations"), fs::directory_iterator{}), 2);
 }
 
 void family_fixture(FileFixture& f) {
@@ -1548,192 +1716,196 @@ void test_triage_parse_damage_is_bounded_evidence_and_strict_remains_strict() {
     FileFixture f; f.write("broken.jsonl", "{\"event\":\n{\"event\":\"worker.completed\",\"span_outcome\":2,\"span_id\":4}\n"); auto result = f.query({"broken.jsonl", "--triage"}); EQ(result.status, 0); HAS(result.out, "parse failure"); HAS(result.err, "parse damage is not itself a product failure"); LACKS(result.out, "failed-span"); EQ(f.query({"broken.jsonl", "--triage", "--strict"}).status, 2); EQ(f.query({"broken.jsonl", "--triage", "--strict", "--where", "span_id=4"}).status, 2);
 }
 constexpr Case cases[]{
-    {"test_boolean_precedence_implicit_and_and_quoted_terms", test_boolean_precedence_implicit_and_and_quoted_terms},
-    {"test_exact_numeric_values_preserve_uint64_and_boolean_type", test_exact_numeric_values_preserve_uint64_and_boolean_type},
-    {"test_presence_null_and_missing_comparisons", test_presence_null_and_missing_comparisons},
-    {"test_substrings_regex_and_nested_fields", test_substrings_regex_and_nested_fields},
-    {"test_invalid_queries_report_errors", test_invalid_queries_report_errors},
-    {"test_intent_request_projection_keeps_exact_uint64_and_rejects_other_counters", test_intent_request_projection_keeps_exact_uint64_and_rejects_other_counters},
-    {"test_training_terminal_errors_keep_run_and_attempt", test_training_terminal_errors_keep_run_and_attempt},
-    {"test_training_session_model_and_first_cause_survive_bounded_triage", test_training_session_model_and_first_cause_survive_bounded_triage},
-    {"test_training_record_near_misses_do_not_project_lifecycle", test_training_record_near_misses_do_not_project_lifecycle},
-    {"test_training_snapshot_reserves_canonical_facts_before_optional_payloads", test_training_snapshot_reserves_canonical_facts_before_optional_payloads},
-    {"test_complete_jsonl_decodes_each_payload_once", test_complete_jsonl_decodes_each_payload_once},
-    {"test_runtime_and_wrapped_json_keep_original_vocabulary", test_runtime_and_wrapped_json_keep_original_vocabulary},
-    {"test_surface_identity_has_one_exact_projection", test_surface_identity_has_one_exact_projection},
-    {"test_workspace_source_is_separate_from_artifact_and_arena", test_workspace_source_is_separate_from_artifact_and_arena},
-    {"test_transfer_correlation_uses_source_and_rejects_arena_counter_aliases", test_transfer_correlation_uses_source_and_rejects_arena_counter_aliases},
-    {"test_memory_provenance_process_ids_never_expand_as_resource_identities", test_memory_provenance_process_ids_never_expand_as_resource_identities},
-    {"test_native_header_and_key_value_messages", test_native_header_and_key_value_messages},
-    {"test_native_fatal_components_and_detail_keep_the_reporter_bounds", test_native_fatal_components_and_detail_keep_the_reporter_bounds},
-    {"test_firefox_fatal_envelopes_preserve_context_and_opaque_status", test_firefox_fatal_envelopes_preserve_context_and_opaque_status},
-    {"test_process_projections_require_exact_consistent_observed_ids", test_process_projections_require_exact_consistent_observed_ids},
-    {"test_vulkan_report_conditions_do_not_become_allocation_or_fd_identity_facts", test_vulkan_report_conditions_do_not_become_allocation_or_fd_identity_facts},
-    {"test_vulkan_object_projection_keeps_types_and_multiple_images_separate", test_vulkan_object_projection_keeps_types_and_multiple_images_separate},
-    {"test_firefox_moz_log_including_optional_timestamp", test_firefox_moz_log_including_optional_timestamp},
-    {"test_embedded_json_and_unstructured_records_keep_provenance", test_embedded_json_and_unstructured_records_keep_provenance},
-    {"test_json_and_plain_failure_candidates", test_json_and_plain_failure_candidates},
-    {"test_malformed_json_remains_searchable", test_malformed_json_remains_searchable},
-    {"test_compiler_progress_and_source_keep_failure_vocabulary_as_context", test_compiler_progress_and_source_keep_failure_vocabulary_as_context},
-    {"test_clock_domains_and_nanosecond_precision", test_clock_domains_and_nanosecond_precision},
-    {"test_non_scalar_event_and_overflowing_json_numbers_do_not_crash", test_non_scalar_event_and_overflowing_json_numbers_do_not_crash},
-    {"test_signal_semantics_preserve_encoded_child_exit_status", test_signal_semantics_preserve_encoded_child_exit_status},
-    {"test_transport_decode_and_allocator_failures_are_searchable_without_a_level", test_transport_decode_and_allocator_failures_are_searchable_without_a_level},
-    {"test_catch_failure_preserves_parent_and_extracts_quoted_json", test_catch_failure_preserves_parent_and_extracts_quoted_json},
-    {"test_wrapped_native_context_and_image_results", test_wrapped_native_context_and_image_results},
-    {"test_catch_console_exception_keeps_location_and_placeholder_without_json_damage", test_catch_console_exception_keeps_location_and_placeholder_without_json_damage},
-    {"test_catch_report_title_recovers_delayed_stderr_test_identity", test_catch_report_title_recovers_delayed_stderr_test_identity},
-    {"test_reservoir_equal_ranks_preserve_insertion_priority_after_updates", test_reservoir_equal_ranks_preserve_insertion_priority_after_updates},
-    {"test_saturated_reservoir_has_logarithmic_comparison_budget", test_saturated_reservoir_has_logarithmic_comparison_budget},
-    {"test_counter_lookup_reads_each_field_once_at_identity_capacity", test_counter_lookup_reads_each_field_once_at_identity_capacity},
-    {"test_counter_lookup_preserves_first_matching_schema_and_origin", test_counter_lookup_preserves_first_matching_schema_and_origin},
-    {"test_automatic_anchor_search_is_logarithmic_and_returns_two_neighbors", test_automatic_anchor_search_is_logarithmic_and_returns_two_neighbors},
-    {"test_pixel_edges_keep_the_same_evidence_for_every_arrival_order", test_pixel_edges_keep_the_same_evidence_for_every_arrival_order},
-    {"test_direct_pixels_join_only_the_acquired_source_in_every_arrival_order", test_direct_pixels_join_only_the_acquired_source_in_every_arrival_order},
-    {"test_direct_pixels_reject_copy_receipts_before_or_after_acquisition", test_direct_pixels_reject_copy_receipts_before_or_after_acquisition},
-    {"test_optional_direct_image_edges_preserve_native_comparison_in_every_arrival_order", test_optional_direct_image_edges_preserve_native_comparison_in_every_arrival_order},
-    {"test_optional_direct_image_requires_completion_marker_and_exact_direct_bridge", test_optional_direct_image_requires_completion_marker_and_exact_direct_bridge},
-    {"test_complete_source_copy_pixels_compare_exact_edges_in_every_group_order", test_complete_source_copy_pixels_compare_exact_edges_in_every_group_order},
-    {"test_optional_source_copy_absence_and_retired_alias_keep_required_native_evidence", test_optional_source_copy_absence_and_retired_alias_keep_required_native_evidence},
-    {"test_optional_native_pixels_without_a_bridge_never_create_missing_required_evidence", test_optional_native_pixels_without_a_bridge_never_create_missing_required_evidence},
-    {"test_source_copy_pixels_reject_conflicting_bridge_facts_in_either_order", test_source_copy_pixels_reject_conflicting_bridge_facts_in_either_order},
-    {"test_source_copy_pixels_never_join_another_transfer_publication_surface_or_run", test_source_copy_pixels_never_join_another_transfer_publication_surface_or_run},
-    {"test_source_copy_edges_reject_contradictory_coordinates_and_iced_source_facts", test_source_copy_edges_reject_contradictory_coordinates_and_iced_source_facts},
-    {"test_source_copy_pixels_with_ambiguous_native_source_spelling_are_not_compared", test_source_copy_pixels_with_ambiguous_native_source_spelling_are_not_compared},
-    {"test_source_copy_pixels_preserve_the_required_copy_mode_chain", test_source_copy_pixels_preserve_the_required_copy_mode_chain},
-    {"test_source_copy_owner_mutation_keeps_the_first_complete_observation", test_source_copy_owner_mutation_keeps_the_first_complete_observation},
-    {"test_native_pixel_timeline_retains_exact_source_copy_facts", test_native_pixel_timeline_retains_exact_source_copy_facts},
-    {"test_bounded_failure_payload_preserves_reason_and_identities_before_large_context", test_bounded_failure_payload_preserves_reason_and_identities_before_large_context},
-    {"test_absent_pixel_bridges_finalize_each_exact_transfer_once", test_absent_pixel_bridges_finalize_each_exact_transfer_once},
-    {"test_exact_pixel_bridge_succeeds_before_or_after_the_pixel", test_exact_pixel_bridge_succeeds_before_or_after_the_pixel},
-    {"test_pending_pixel_capacity_counts_replay_and_finalization_exactly", test_pending_pixel_capacity_counts_replay_and_finalization_exactly},
-    {"test_saturated_bridge_index_reports_incomplete_for_later_pixels", test_saturated_bridge_index_reports_incomplete_for_later_pixels},
-    {"test_saturated_bridge_index_resolves_pending_pixels_directly", test_saturated_bridge_index_resolves_pending_pixels_directly},
-    {"test_saturated_bridge_direct_replay_preserves_corroborating_conflict", test_saturated_bridge_direct_replay_preserves_corroborating_conflict},
-    {"test_full_but_untruncated_bridge_index_preserves_proven_missing", test_full_but_untruncated_bridge_index_preserves_proven_missing},
-    {"test_missing_pixel_finalization_respects_finding_and_anchor_budgets", test_missing_pixel_finalization_respects_finding_and_anchor_budgets},
-    {"test_source_less_pixel_requires_an_exact_forwarded_transfer", test_source_less_pixel_requires_an_exact_forwarded_transfer},
-    {"test_forwarded_source_conflict_is_rejected", test_forwarded_source_conflict_is_rejected},
-    {"test_pixel_owner_mutation_wins_before_cross_stage_comparison", test_pixel_owner_mutation_wins_before_cross_stage_comparison},
-    {"test_pixel_transfer_comparisons_are_linear_in_samples", test_pixel_transfer_comparisons_are_linear_in_samples},
-    {"test_json_documents_preserve_nested_facts_and_line_span", test_json_documents_preserve_nested_facts_and_line_span},
-    {"test_damaged_json_documents_remain_searchable", test_damaged_json_documents_remain_searchable},
-    {"test_statistics_preserve_integer_sums_buckets_and_full_match_counts", test_statistics_preserve_integer_sums_buckets_and_full_match_counts},
-    {"test_statistics_separate_runs_sources_clocks_and_numeric_absence", test_statistics_separate_runs_sources_clocks_and_numeric_absence},
-    {"test_statistics_report_capacity_and_truncated_inputs", test_statistics_report_capacity_and_truncated_inputs},
-    {"test_explicit_intent_correlation_connects_browser_and_native_stages", test_explicit_intent_correlation_connects_browser_and_native_stages},
-    {"test_vulkan_callback_preserves_complete_text_objects_and_physical_lines", test_vulkan_callback_preserves_complete_text_objects_and_physical_lines},
-    {"test_vulkan_representatives_count_distinct_ids_without_shortening_messages", test_vulkan_representatives_count_distinct_ids_without_shortening_messages},
-    {"test_vulkan_assembly_preserves_interruptions_and_reports_bounded_fragments", test_vulkan_assembly_preserves_interruptions_and_reports_bounded_fragments},
-    {"test_vulkan_exact_handles_add_bounded_same_file_provenance_candidates", test_vulkan_exact_handles_add_bounded_same_file_provenance_candidates},
-    {"test_vulkan_recorded_process_joins_files_in_one_run_and_rejects_other_processes", test_vulkan_recorded_process_joins_files_in_one_run_and_rejects_other_processes},
-    {"test_forced_stop_joins_observed_child_records_without_reconstructing_historical_pids", test_forced_stop_joins_observed_child_records_without_reconstructing_historical_pids},
-    {"test_fatal_process_links_distinguish_relationships_and_reject_conflicting_facts", test_fatal_process_links_distinguish_relationships_and_reject_conflicting_facts},
-    {"test_fatal_envelopes_use_the_reader_byte_bound_and_keep_status_opaque", test_fatal_envelopes_use_the_reader_byte_bound_and_keep_status_opaque},
-    {"test_vulkan_ambiguous_handle_owners_are_reported_without_asserted_provenance", test_vulkan_ambiguous_handle_owners_are_reported_without_asserted_provenance},
-    {"test_automatic_timeline_interleaves_exact_frame_snapshot_and_publication", test_automatic_timeline_interleaves_exact_frame_snapshot_and_publication},
-    {"test_upscale_settlement_joins_native_frontier_without_inventing_presentation_match", test_upscale_settlement_joins_native_frontier_without_inventing_presentation_match},
-    {"test_timeline_failure_highlights_show_reason_original_event_and_provenance", test_timeline_failure_highlights_show_reason_original_event_and_provenance},
-    {"test_automatic_machine_formats_require_opt_in_and_preserve_query_rows", test_automatic_machine_formats_require_opt_in_and_preserve_query_rows},
-    {"test_automatic_recent_highlight_keeps_final_reopen_visible_after_phase_volume", test_automatic_recent_highlight_keeps_final_reopen_visible_after_phase_volume},
-    {"test_automatic_scopes_reject_zero_generic_counter_conflicts_and_transitive_links", test_automatic_scopes_reject_zero_generic_counter_conflicts_and_transitive_links},
-    {"test_automatic_ambiguous_projected_source_revisions_do_not_join", test_automatic_ambiguous_projected_source_revisions_do_not_join},
-    {"test_automatic_control_proximity_is_labeled_and_bounded", test_automatic_control_proximity_is_labeled_and_bounded},
-    {"test_automatic_bounds_diversity_global_capacity_and_existing_match_limit", test_automatic_bounds_diversity_global_capacity_and_existing_match_limit},
-    {"test_automatic_respects_where_runs_and_explicit_correlation", test_automatic_respects_where_runs_and_explicit_correlation},
-    {"test_automatic_payloads_and_scan_count_stay_bounded", test_automatic_payloads_and_scan_count_stay_bounded},
-    {"test_discovery_deduplicates_paths_and_excludes_histories_by_default", test_discovery_deduplicates_paths_and_excludes_histories_by_default},
-    {"test_discovery_captures_each_repeated_path_only_once", test_discovery_captures_each_repeated_path_only_once},
-    {"test_directory_discovery_streams_entries_and_releases_handles", test_directory_discovery_streams_entries_and_releases_handles},
-    {"test_empty_missing_and_outside_inputs_fail_clearly", test_empty_missing_and_outside_inputs_fail_clearly},
-    {"test_file_boundaries_blank_lines_and_oversized_records", test_file_boundaries_blank_lines_and_oversized_records},
-    {"test_captured_byte_size_and_correlation_stability", test_captured_byte_size_and_correlation_stability},
-    {"test_recent_input_preserves_physical_lines_and_limits_evidence", test_recent_input_preserves_physical_lines_and_limits_evidence},
-    {"test_retention_is_bounded_deterministic_and_counts_all_matches", test_retention_is_bounded_deterministic_and_counts_all_matches},
-    {"test_clock_order_never_implies_cross_domain_alignment", test_clock_order_never_implies_cross_domain_alignment},
-    {"test_correlation_is_direct_and_never_joins_empty_identities", test_correlation_is_direct_and_never_joins_empty_identities},
-    {"test_composite_identity_keeps_sessions_separate", test_composite_identity_keeps_sessions_separate},
-    {"test_memory_provenance_query_exposes_export_mapping_and_import_without_fd_identity_claim", test_memory_provenance_query_exposes_export_mapping_and_import_without_fd_identity_claim},
-    {"test_descriptor_lineage_joins_exact_source_and_process_scoped_exports", test_descriptor_lineage_joins_exact_source_and_process_scoped_exports},
-    {"test_descriptor_lineage_distinguishes_ofd_mismatch_unsupported_denied_and_unavailable", test_descriptor_lineage_distinguishes_ofd_mismatch_unsupported_denied_and_unavailable},
-    {"test_descriptor_lineage_reports_fd_reuse_closed_fd_process_and_binding_conflicts", test_descriptor_lineage_reports_fd_reuse_closed_fd_process_and_binding_conflicts},
-    {"test_descriptor_lineage_checks_native_export_argument_without_metadata_identity_inference", test_descriptor_lineage_checks_native_export_argument_without_metadata_identity_inference},
-    {"test_descriptor_lineage_rejects_ambiguous_reused_export_reference", test_descriptor_lineage_rejects_ambiguous_reused_export_reference},
-    {"test_descriptor_lineage_limits_and_where_remain_evidence_limits", test_descriptor_lineage_limits_and_where_remain_evidence_limits},
-    {"test_vulkan_export_lineage_preserves_descriptor_roles_and_retry_results", test_vulkan_export_lineage_preserves_descriptor_roles_and_retry_results},
-    {"test_vulkan_export_lineage_missing_success_and_conflicting_import_are_explicit", test_vulkan_export_lineage_missing_success_and_conflicting_import_are_explicit},
-    {"test_vulkan_export_lineage_rejects_ambiguous_source_association", test_vulkan_export_lineage_rejects_ambiguous_source_association},
-    {"test_vulkan_export_lineage_keeps_process_scoped_imports_and_null_success_visible", test_vulkan_export_lineage_keeps_process_scoped_imports_and_null_success_visible},
-    {"test_vulkan_export_lineage_requires_retained_retirement_evidence", test_vulkan_export_lineage_requires_retained_retirement_evidence},
-    {"test_vulkan_export_lineage_retirement_requires_released_handles_and_same_backing", test_vulkan_export_lineage_retirement_requires_released_handles_and_same_backing},
-    {"test_vulkan_export_lineage_compares_every_immutable_retry_observation", test_vulkan_export_lineage_compares_every_immutable_retry_observation},
-    {"test_vulkan_export_lineage_distinguishes_missing_source_association", test_vulkan_export_lineage_distinguishes_missing_source_association},
-    {"test_vulkan_export_lineage_source_query_correlates_process_allocation", test_vulkan_export_lineage_source_query_correlates_process_allocation},
-    {"test_loaded_library_mapping_inventory_preserves_actual_paths_and_limits", test_loaded_library_mapping_inventory_preserves_actual_paths_and_limits},
-    {"test_surface_correlates_native_and_firefox_and_where_scopes_all_rows", test_surface_correlates_native_and_firefox_and_where_scopes_all_rows},
-    {"test_context_is_bounded_deduplicated_and_obeys_where", test_context_is_bounded_deduplicated_and_obeys_where},
-    {"test_dense_context_considers_buffered_rows_only_once", test_dense_context_considers_buffered_rows_only_once},
-    {"test_projection_preserves_provenance_and_uint64", test_projection_preserves_provenance_and_uint64},
-    {"test_error_filter_strict_mode_and_exit_statuses", test_error_filter_strict_mode_and_exit_statuses},
-    {"test_summary_groups_are_deterministic_and_cardinality_is_bounded", test_summary_groups_are_deterministic_and_cardinality_is_bounded},
-    {"test_help_documents_grammar_and_wrapper_shell_syntax_is_valid", test_help_documents_grammar_and_wrapper_shell_syntax_is_valid},
-    {"test_wrapper_retains_both_streams_and_queryable_terminal_status", test_wrapper_retains_both_streams_and_queryable_terminal_status},
-    {"test_fresh_all_stops_registered_tests_and_orphans_but_preserves_other_owners", test_fresh_all_stops_registered_tests_and_orphans_but_preserves_other_owners},
-    {"test_gui_launch_replaces_runtime_sessions_and_preserves_other_owners", test_gui_launch_replaces_runtime_sessions_and_preserves_other_owners},
-    {"test_gui_launch_replaces_an_owner_still_preparing_its_container", test_gui_launch_replaces_an_owner_still_preparing_its_container},
-    {"test_delayed_older_gui_launch_preserves_the_newer_runtime", test_delayed_older_gui_launch_preserves_the_newer_runtime},
-    {"test_family_and_history_pairing_retains_inference_and_archive_identity", test_family_and_history_pairing_retains_inference_and_archive_identity},
-    {"test_family_discovers_separate_acceptance_and_rotating_mozilla_evidence", test_family_discovers_separate_acceptance_and_rotating_mozilla_evidence},
-    {"test_family_inventory_groups_selectors_without_capturing_unrelated_entries", test_family_inventory_groups_selectors_without_capturing_unrelated_entries},
-    {"test_family_symlink_reuses_earlier_target_candidates_and_checks_containment", test_family_symlink_reuses_earlier_target_candidates_and_checks_containment},
-    {"test_child_mozilla_archived_only_family_and_direct_role", test_child_mozilla_archived_only_family_and_direct_role},
-    {"test_mozilla_family_retains_containment_and_discovery_budget", test_mozilla_family_retains_containment_and_discovery_budget},
-    {"test_history_catalog_enumerates_each_archive_directory_once", test_history_catalog_enumerates_each_archive_directory_once},
-    {"test_shared_event_anchors_link_transcript_and_propagate_test_tags", test_shared_event_anchors_link_transcript_and_propagate_test_tags},
-    {"test_related_run_includes_terminal_and_never_crosses_reused_buffer_ids", test_related_run_includes_terminal_and_never_crosses_reused_buffer_ids},
-    {"test_transcript_incident_keeps_buffer_ids_failure_and_catch_context", test_transcript_incident_keeps_buffer_ids_failure_and_catch_context},
-    {"test_pasted_multiline_error_finds_earliest_physical_record_and_nearby_family", test_pasted_multiline_error_finds_earliest_physical_record_and_nearby_family},
-    {"test_pasted_error_uses_phrase_before_unordered_fallback", test_pasted_error_uses_phrase_before_unordered_fallback},
-    {"test_pasted_error_selection_scans_once_with_exact_fallback_and_unicode", test_pasted_error_selection_scans_once_with_exact_fallback_and_unicode},
-    {"test_error_neighborhood_respects_radius_and_machine_output_bounds", test_error_neighborhood_respects_radius_and_machine_output_bounds},
-    {"test_error_lookup_reports_absence_and_rejects_empty_text", test_error_lookup_reports_absence_and_rejects_empty_text},
-    {"test_triage_identity_namespaces_exclude_ambient_empty_and_bare_counters", test_triage_identity_namespaces_exclude_ambient_empty_and_bare_counters},
-    {"test_triage_automatically_correlates_probe_surface_catch_native_and_counter_leaf", test_triage_automatically_correlates_probe_surface_catch_native_and_counter_leaf},
-    {"test_triage_single_file_discovers_current_siblings_without_expanding_explicit_queries", test_triage_single_file_discovers_current_siblings_without_expanding_explicit_queries},
-    {"test_triage_single_archive_discovers_only_its_rotation_batch_without_current_files", test_triage_single_archive_discovers_only_its_rotation_batch_without_current_files},
-    {"test_triage_named_archives_match_exact_names_and_reject_external_history", test_triage_named_archives_match_exact_names_and_reject_external_history},
-    {"test_triage_ranks_explicit_failure_above_error_related_events_without_changing_errors_filter", test_triage_ranks_explicit_failure_above_error_related_events_without_changing_errors_filter},
-    {"test_triage_finds_short_reconnect_lifetimes_without_claiming_their_cause", test_triage_finds_short_reconnect_lifetimes_without_claiming_their_cause},
-    {"test_pasted_transport_error_retains_field_cause_and_reconnect_context", test_pasted_transport_error_retains_field_cause_and_reconnect_context},
-    {"test_triage_pasted_error_retains_earliest_physical_and_timestamp_neighbors", test_triage_pasted_error_retains_earliest_physical_and_timestamp_neighbors},
-    {"test_triage_pasted_error_context_survives_noisy_historical_identity_chain", test_triage_pasted_error_context_survives_noisy_historical_identity_chain},
-    {"test_triage_recognizes_generic_terminal_suffix_without_guessing_numeric_outcome", test_triage_recognizes_generic_terminal_suffix_without_guessing_numeric_outcome},
-    {"test_triage_terminal_summary_survives_failure_volume_and_preserves_unknown_fields", test_triage_terminal_summary_survives_failure_volume_and_preserves_unknown_fields},
-    {"test_triage_untrusted_field_names_cannot_escape_size_or_terminal_output_bounds", test_triage_untrusted_field_names_cannot_escape_size_or_terminal_output_bounds},
-    {"test_triage_handles_unmatched_start_duplicate_end_and_failed_span", test_triage_handles_unmatched_start_duplicate_end_and_failed_span},
-    {"test_triage_request_submit_start_progress_is_not_three_unfinished_operations", test_triage_request_submit_start_progress_is_not_three_unfinished_operations},
-    {"test_triage_secondary_handle_and_identity_handoff_do_not_fake_missing_completion", test_triage_secondary_handle_and_identity_handoff_do_not_fake_missing_completion},
-    {"test_triage_unrelated_completion_is_not_an_identity_handoff", test_triage_unrelated_completion_is_not_an_identity_handoff},
-    {"test_triage_prefers_explicit_divergence_over_earlier_unclosed_start", test_triage_prefers_explicit_divergence_over_earlier_unclosed_start},
-    {"test_triage_retains_native_spans_and_accepted_requests_after_busy_browser_capture", test_triage_retains_native_spans_and_accepted_requests_after_busy_browser_capture},
-    {"test_triage_missing_pixel_bridge_is_a_visible_anchor_and_finding", test_triage_missing_pixel_bridge_is_a_visible_anchor_and_finding},
-    {"test_triage_explicit_pixel_query_does_not_exclude_its_later_bridge", test_triage_explicit_pixel_query_does_not_exclude_its_later_bridge},
-    {"test_triage_pixel_query_keeps_conflicting_bridge_evidence", test_triage_pixel_query_keeps_conflicting_bridge_evidence},
-    {"test_triage_highlights_first_deterministic_pixel_chain_divergence", test_triage_highlights_first_deterministic_pixel_chain_divergence},
-    {"test_tap_outcomes_keep_failed_test_and_diagnostic_context", test_tap_outcomes_keep_failed_test_and_diagnostic_context},
-    {"test_libtest_failures_keep_named_panic_output", test_libtest_failures_keep_named_panic_output},
-    {"test_training_failure_is_an_explicit_triage_anchor", test_training_failure_is_an_explicit_triage_anchor},
-    {"test_training_observations_do_not_invent_generic_begin_end_pairs", test_training_observations_do_not_invent_generic_begin_end_pairs},
-    {"test_triage_missing_events_have_stable_display", test_triage_missing_events_have_stable_display},
-    {"test_triage_groups_repeated_anomalies_without_losing_counts_or_context", test_triage_groups_repeated_anomalies_without_losing_counts_or_context},
-    {"test_triage_first_catch_info_context_recognizes_singular_plural_and_inline_json", test_triage_first_catch_info_context_recognizes_singular_plural_and_inline_json},
-    {"test_triage_zero_hops_still_includes_bounded_counter_refinement", test_triage_zero_hops_still_includes_bounded_counter_refinement},
-    {"test_triage_incomplete_end_is_an_anchor_without_claiming_failure", test_triage_incomplete_end_is_an_anchor_without_claiming_failure},
-    {"test_triage_gaps_use_only_same_source_actual_clock_and_detect_regression", test_triage_gaps_use_only_same_source_actual_clock_and_detect_regression},
-    {"test_triage_hops_are_capped_and_empty_ids_do_not_expand", test_triage_hops_are_capped_and_empty_ids_do_not_expand},
-    {"test_triage_bounds_cardinality_payload_and_default_output_without_related_run", test_triage_bounds_cardinality_payload_and_default_output_without_related_run},
-    {"test_triage_run_reuse_where_and_context_copies_are_not_false_duplicates", test_triage_run_reuse_where_and_context_copies_are_not_false_duplicates},
-    {"test_triage_parse_damage_is_bounded_evidence_and_strict_remains_strict", test_triage_parse_damage_is_bounded_evidence_and_strict_remains_strict},
+    {"NativeToolTests.test_bootstrap_atomic_publication_concurrency_and_spaces", test_bootstrap_atomic_publication_concurrency_and_spaces},
+    {"NativeToolTests.test_tools_tidy_grouped_selection_and_module_resume", test_tools_tidy_grouped_selection_and_module_resume},
+    {"NativeToolTests.test_native_package_inventory_completeness_and_stable_archive_identity", test_native_package_inventory_completeness_and_stable_archive_identity},
+    {"NativeToolTests.test_native_compiler_launcher_preserves_arguments_cache_and_status", test_native_compiler_launcher_preserves_arguments_cache_and_status},
+    {"ParserTests.test_boolean_precedence_implicit_and_and_quoted_terms", test_boolean_precedence_implicit_and_and_quoted_terms},
+    {"ParserTests.test_exact_numeric_values_preserve_uint64_and_boolean_type", test_exact_numeric_values_preserve_uint64_and_boolean_type},
+    {"ParserTests.test_presence_null_and_missing_comparisons", test_presence_null_and_missing_comparisons},
+    {"ParserTests.test_substrings_regex_and_nested_fields", test_substrings_regex_and_nested_fields},
+    {"ParserTests.test_invalid_queries_report_errors", test_invalid_queries_report_errors},
+    {"LogFormatTests.test_intent_request_projection_keeps_exact_uint64_and_rejects_other_counters", test_intent_request_projection_keeps_exact_uint64_and_rejects_other_counters},
+    {"LogFormatTests.test_training_terminal_errors_keep_run_and_attempt", test_training_terminal_errors_keep_run_and_attempt},
+    {"LogFormatTests.test_training_session_model_and_first_cause_survive_bounded_triage", test_training_session_model_and_first_cause_survive_bounded_triage},
+    {"LogFormatTests.test_training_record_near_misses_do_not_project_lifecycle", test_training_record_near_misses_do_not_project_lifecycle},
+    {"LogFormatTests.test_training_snapshot_reserves_canonical_facts_before_optional_payloads", test_training_snapshot_reserves_canonical_facts_before_optional_payloads},
+    {"LogFormatTests.test_complete_jsonl_decodes_each_payload_once", test_complete_jsonl_decodes_each_payload_once},
+    {"LogFormatTests.test_runtime_and_wrapped_json_keep_original_vocabulary", test_runtime_and_wrapped_json_keep_original_vocabulary},
+    {"LogFormatTests.test_surface_identity_has_one_exact_projection", test_surface_identity_has_one_exact_projection},
+    {"LogFormatTests.test_workspace_source_is_separate_from_artifact_and_arena", test_workspace_source_is_separate_from_artifact_and_arena},
+    {"LogFormatTests.test_transfer_correlation_uses_source_and_rejects_arena_counter_aliases", test_transfer_correlation_uses_source_and_rejects_arena_counter_aliases},
+    {"LogFormatTests.test_memory_provenance_process_ids_never_expand_as_resource_identities", test_memory_provenance_process_ids_never_expand_as_resource_identities},
+    {"LogFormatTests.test_native_header_and_key_value_messages", test_native_header_and_key_value_messages},
+    {"LogFormatTests.test_native_fatal_components_and_detail_keep_the_reporter_bounds", test_native_fatal_components_and_detail_keep_the_reporter_bounds},
+    {"LogFormatTests.test_firefox_fatal_envelopes_preserve_context_and_opaque_status", test_firefox_fatal_envelopes_preserve_context_and_opaque_status},
+    {"LogFormatTests.test_process_projections_require_exact_consistent_observed_ids", test_process_projections_require_exact_consistent_observed_ids},
+    {"LogFormatTests.test_vulkan_report_conditions_do_not_become_allocation_or_fd_identity_facts", test_vulkan_report_conditions_do_not_become_allocation_or_fd_identity_facts},
+    {"LogFormatTests.test_vulkan_object_projection_keeps_types_and_multiple_images_separate", test_vulkan_object_projection_keeps_types_and_multiple_images_separate},
+    {"LogFormatTests.test_firefox_moz_log_including_optional_timestamp", test_firefox_moz_log_including_optional_timestamp},
+    {"LogFormatTests.test_embedded_json_and_unstructured_records_keep_provenance", test_embedded_json_and_unstructured_records_keep_provenance},
+    {"LogFormatTests.test_json_and_plain_failure_candidates", test_json_and_plain_failure_candidates},
+    {"LogFormatTests.test_malformed_json_remains_searchable", test_malformed_json_remains_searchable},
+    {"LogFormatTests.test_compiler_progress_and_source_keep_failure_vocabulary_as_context", test_compiler_progress_and_source_keep_failure_vocabulary_as_context},
+    {"LogFormatTests.test_clock_domains_and_nanosecond_precision", test_clock_domains_and_nanosecond_precision},
+    {"LogFormatTests.test_non_scalar_event_and_overflowing_json_numbers_do_not_crash", test_non_scalar_event_and_overflowing_json_numbers_do_not_crash},
+    {"LogFormatTests.test_signal_semantics_preserve_encoded_child_exit_status", test_signal_semantics_preserve_encoded_child_exit_status},
+    {"LogFormatTests.test_transport_decode_and_allocator_failures_are_searchable_without_a_level", test_transport_decode_and_allocator_failures_are_searchable_without_a_level},
+    {"LogFormatTests.test_catch_failure_preserves_parent_and_extracts_quoted_json", test_catch_failure_preserves_parent_and_extracts_quoted_json},
+    {"LogFormatTests.test_wrapped_native_context_and_image_results", test_wrapped_native_context_and_image_results},
+    {"LogFormatTests.test_catch_console_exception_keeps_location_and_placeholder_without_json_damage", test_catch_console_exception_keeps_location_and_placeholder_without_json_damage},
+    {"LogFormatTests.test_catch_report_title_recovers_delayed_stderr_test_identity", test_catch_report_title_recovers_delayed_stderr_test_identity},
+    {"TriageSelectionTests.test_reservoir_equal_ranks_preserve_insertion_priority_after_updates", test_reservoir_equal_ranks_preserve_insertion_priority_after_updates},
+    {"TriageSelectionTests.test_saturated_reservoir_has_logarithmic_comparison_budget", test_saturated_reservoir_has_logarithmic_comparison_budget},
+    {"TriageSelectionTests.test_counter_lookup_reads_each_field_once_at_identity_capacity", test_counter_lookup_reads_each_field_once_at_identity_capacity},
+    {"TriageSelectionTests.test_counter_lookup_preserves_first_matching_schema_and_origin", test_counter_lookup_preserves_first_matching_schema_and_origin},
+    {"TriageSelectionTests.test_automatic_anchor_search_is_logarithmic_and_returns_two_neighbors", test_automatic_anchor_search_is_logarithmic_and_returns_two_neighbors},
+    {"TriageSelectionTests.test_pixel_edges_keep_the_same_evidence_for_every_arrival_order", test_pixel_edges_keep_the_same_evidence_for_every_arrival_order},
+    {"TriageSelectionTests.test_direct_pixels_join_only_the_acquired_source_in_every_arrival_order", test_direct_pixels_join_only_the_acquired_source_in_every_arrival_order},
+    {"TriageSelectionTests.test_direct_pixels_reject_copy_receipts_before_or_after_acquisition", test_direct_pixels_reject_copy_receipts_before_or_after_acquisition},
+    {"TriageSelectionTests.test_optional_direct_image_edges_preserve_native_comparison_in_every_arrival_order", test_optional_direct_image_edges_preserve_native_comparison_in_every_arrival_order},
+    {"TriageSelectionTests.test_optional_direct_image_requires_completion_marker_and_exact_direct_bridge", test_optional_direct_image_requires_completion_marker_and_exact_direct_bridge},
+    {"TriageSelectionTests.test_complete_source_copy_pixels_compare_exact_edges_in_every_group_order", test_complete_source_copy_pixels_compare_exact_edges_in_every_group_order},
+    {"TriageSelectionTests.test_optional_source_copy_absence_and_retired_alias_keep_required_native_evidence", test_optional_source_copy_absence_and_retired_alias_keep_required_native_evidence},
+    {"TriageSelectionTests.test_optional_native_pixels_without_a_bridge_never_create_missing_required_evidence", test_optional_native_pixels_without_a_bridge_never_create_missing_required_evidence},
+    {"TriageSelectionTests.test_source_copy_pixels_reject_conflicting_bridge_facts_in_either_order", test_source_copy_pixels_reject_conflicting_bridge_facts_in_either_order},
+    {"TriageSelectionTests.test_source_copy_pixels_never_join_another_transfer_publication_surface_or_run", test_source_copy_pixels_never_join_another_transfer_publication_surface_or_run},
+    {"TriageSelectionTests.test_source_copy_edges_reject_contradictory_coordinates_and_iced_source_facts", test_source_copy_edges_reject_contradictory_coordinates_and_iced_source_facts},
+    {"TriageSelectionTests.test_source_copy_pixels_with_ambiguous_native_source_spelling_are_not_compared", test_source_copy_pixels_with_ambiguous_native_source_spelling_are_not_compared},
+    {"TriageSelectionTests.test_source_copy_pixels_preserve_the_required_copy_mode_chain", test_source_copy_pixels_preserve_the_required_copy_mode_chain},
+    {"TriageSelectionTests.test_source_copy_owner_mutation_keeps_the_first_complete_observation", test_source_copy_owner_mutation_keeps_the_first_complete_observation},
+    {"TriageSelectionTests.test_native_pixel_timeline_retains_exact_source_copy_facts", test_native_pixel_timeline_retains_exact_source_copy_facts},
+    {"TriageSelectionTests.test_bounded_failure_payload_preserves_reason_and_identities_before_large_context", test_bounded_failure_payload_preserves_reason_and_identities_before_large_context},
+    {"TriageSelectionTests.test_absent_pixel_bridges_finalize_each_exact_transfer_once", test_absent_pixel_bridges_finalize_each_exact_transfer_once},
+    {"TriageSelectionTests.test_exact_pixel_bridge_succeeds_before_or_after_the_pixel", test_exact_pixel_bridge_succeeds_before_or_after_the_pixel},
+    {"TriageSelectionTests.test_pending_pixel_capacity_counts_replay_and_finalization_exactly", test_pending_pixel_capacity_counts_replay_and_finalization_exactly},
+    {"TriageSelectionTests.test_saturated_bridge_index_reports_incomplete_for_later_pixels", test_saturated_bridge_index_reports_incomplete_for_later_pixels},
+    {"TriageSelectionTests.test_saturated_bridge_index_resolves_pending_pixels_directly", test_saturated_bridge_index_resolves_pending_pixels_directly},
+    {"TriageSelectionTests.test_saturated_bridge_direct_replay_preserves_corroborating_conflict", test_saturated_bridge_direct_replay_preserves_corroborating_conflict},
+    {"TriageSelectionTests.test_full_but_untruncated_bridge_index_preserves_proven_missing", test_full_but_untruncated_bridge_index_preserves_proven_missing},
+    {"TriageSelectionTests.test_missing_pixel_finalization_respects_finding_and_anchor_budgets", test_missing_pixel_finalization_respects_finding_and_anchor_budgets},
+    {"TriageSelectionTests.test_source_less_pixel_requires_an_exact_forwarded_transfer", test_source_less_pixel_requires_an_exact_forwarded_transfer},
+    {"TriageSelectionTests.test_forwarded_source_conflict_is_rejected", test_forwarded_source_conflict_is_rejected},
+    {"TriageSelectionTests.test_pixel_owner_mutation_wins_before_cross_stage_comparison", test_pixel_owner_mutation_wins_before_cross_stage_comparison},
+    {"TriageSelectionTests.test_pixel_transfer_comparisons_are_linear_in_samples", test_pixel_transfer_comparisons_are_linear_in_samples},
+    {"FileQueryTests.test_json_documents_preserve_nested_facts_and_line_span", test_json_documents_preserve_nested_facts_and_line_span},
+    {"FileQueryTests.test_damaged_json_documents_remain_searchable", test_damaged_json_documents_remain_searchable},
+    {"FileQueryTests.test_statistics_preserve_integer_sums_buckets_and_full_match_counts", test_statistics_preserve_integer_sums_buckets_and_full_match_counts},
+    {"FileQueryTests.test_statistics_separate_runs_sources_clocks_and_numeric_absence", test_statistics_separate_runs_sources_clocks_and_numeric_absence},
+    {"FileQueryTests.test_statistics_report_capacity_and_truncated_inputs", test_statistics_report_capacity_and_truncated_inputs},
+    {"FileQueryTests.test_explicit_intent_correlation_connects_browser_and_native_stages", test_explicit_intent_correlation_connects_browser_and_native_stages},
+    {"FileQueryTests.test_vulkan_callback_preserves_complete_text_objects_and_physical_lines", test_vulkan_callback_preserves_complete_text_objects_and_physical_lines},
+    {"FileQueryTests.test_vulkan_representatives_count_distinct_ids_without_shortening_messages", test_vulkan_representatives_count_distinct_ids_without_shortening_messages},
+    {"FileQueryTests.test_vulkan_assembly_preserves_interruptions_and_reports_bounded_fragments", test_vulkan_assembly_preserves_interruptions_and_reports_bounded_fragments},
+    {"FileQueryTests.test_vulkan_exact_handles_add_bounded_same_file_provenance_candidates", test_vulkan_exact_handles_add_bounded_same_file_provenance_candidates},
+    {"FileQueryTests.test_vulkan_recorded_process_joins_files_in_one_run_and_rejects_other_processes", test_vulkan_recorded_process_joins_files_in_one_run_and_rejects_other_processes},
+    {"FileQueryTests.test_forced_stop_joins_observed_child_records_without_reconstructing_historical_pids", test_forced_stop_joins_observed_child_records_without_reconstructing_historical_pids},
+    {"FileQueryTests.test_fatal_process_links_distinguish_relationships_and_reject_conflicting_facts", test_fatal_process_links_distinguish_relationships_and_reject_conflicting_facts},
+    {"FileQueryTests.test_fatal_envelopes_use_the_reader_byte_bound_and_keep_status_opaque", test_fatal_envelopes_use_the_reader_byte_bound_and_keep_status_opaque},
+    {"FileQueryTests.test_vulkan_ambiguous_handle_owners_are_reported_without_asserted_provenance", test_vulkan_ambiguous_handle_owners_are_reported_without_asserted_provenance},
+    {"FileQueryTests.test_automatic_timeline_interleaves_exact_frame_snapshot_and_publication", test_automatic_timeline_interleaves_exact_frame_snapshot_and_publication},
+    {"FileQueryTests.test_upscale_settlement_joins_native_frontier_without_inventing_presentation_match", test_upscale_settlement_joins_native_frontier_without_inventing_presentation_match},
+    {"FileQueryTests.test_timeline_failure_highlights_show_reason_original_event_and_provenance", test_timeline_failure_highlights_show_reason_original_event_and_provenance},
+    {"FileQueryTests.test_automatic_machine_formats_require_opt_in_and_preserve_query_rows", test_automatic_machine_formats_require_opt_in_and_preserve_query_rows},
+    {"FileQueryTests.test_automatic_recent_highlight_keeps_final_reopen_visible_after_phase_volume", test_automatic_recent_highlight_keeps_final_reopen_visible_after_phase_volume},
+    {"FileQueryTests.test_automatic_scopes_reject_zero_generic_counter_conflicts_and_transitive_links", test_automatic_scopes_reject_zero_generic_counter_conflicts_and_transitive_links},
+    {"FileQueryTests.test_automatic_ambiguous_projected_source_revisions_do_not_join", test_automatic_ambiguous_projected_source_revisions_do_not_join},
+    {"FileQueryTests.test_automatic_control_proximity_is_labeled_and_bounded", test_automatic_control_proximity_is_labeled_and_bounded},
+    {"FileQueryTests.test_automatic_bounds_diversity_global_capacity_and_existing_match_limit", test_automatic_bounds_diversity_global_capacity_and_existing_match_limit},
+    {"FileQueryTests.test_automatic_respects_where_runs_and_explicit_correlation", test_automatic_respects_where_runs_and_explicit_correlation},
+    {"FileQueryTests.test_automatic_payloads_and_scan_count_stay_bounded", test_automatic_payloads_and_scan_count_stay_bounded},
+    {"FileQueryTests.test_discovery_deduplicates_paths_and_excludes_histories_by_default", test_discovery_deduplicates_paths_and_excludes_histories_by_default},
+    {"FileQueryTests.test_discovery_captures_each_repeated_path_only_once", test_discovery_captures_each_repeated_path_only_once},
+    {"FileQueryTests.test_directory_discovery_streams_entries_and_releases_handles", test_directory_discovery_streams_entries_and_releases_handles},
+    {"FileQueryTests.test_empty_missing_and_outside_inputs_fail_clearly", test_empty_missing_and_outside_inputs_fail_clearly},
+    {"FileQueryTests.test_file_boundaries_blank_lines_and_oversized_records", test_file_boundaries_blank_lines_and_oversized_records},
+    {"FileQueryTests.test_captured_byte_size_and_correlation_stability", test_captured_byte_size_and_correlation_stability},
+    {"FileQueryTests.test_recent_input_preserves_physical_lines_and_limits_evidence", test_recent_input_preserves_physical_lines_and_limits_evidence},
+    {"FileQueryTests.test_retention_is_bounded_deterministic_and_counts_all_matches", test_retention_is_bounded_deterministic_and_counts_all_matches},
+    {"FileQueryTests.test_clock_order_never_implies_cross_domain_alignment", test_clock_order_never_implies_cross_domain_alignment},
+    {"FileQueryTests.test_correlation_is_direct_and_never_joins_empty_identities", test_correlation_is_direct_and_never_joins_empty_identities},
+    {"FileQueryTests.test_composite_identity_keeps_sessions_separate", test_composite_identity_keeps_sessions_separate},
+    {"FileQueryTests.test_memory_provenance_query_exposes_export_mapping_and_import_without_fd_identity_claim", test_memory_provenance_query_exposes_export_mapping_and_import_without_fd_identity_claim},
+    {"FileQueryTests.test_descriptor_lineage_joins_exact_source_and_process_scoped_exports", test_descriptor_lineage_joins_exact_source_and_process_scoped_exports},
+    {"FileQueryTests.test_descriptor_lineage_distinguishes_ofd_mismatch_unsupported_denied_and_unavailable", test_descriptor_lineage_distinguishes_ofd_mismatch_unsupported_denied_and_unavailable},
+    {"FileQueryTests.test_descriptor_lineage_reports_fd_reuse_closed_fd_process_and_binding_conflicts", test_descriptor_lineage_reports_fd_reuse_closed_fd_process_and_binding_conflicts},
+    {"FileQueryTests.test_descriptor_lineage_checks_native_export_argument_without_metadata_identity_inference", test_descriptor_lineage_checks_native_export_argument_without_metadata_identity_inference},
+    {"FileQueryTests.test_descriptor_lineage_rejects_ambiguous_reused_export_reference", test_descriptor_lineage_rejects_ambiguous_reused_export_reference},
+    {"FileQueryTests.test_descriptor_lineage_limits_and_where_remain_evidence_limits", test_descriptor_lineage_limits_and_where_remain_evidence_limits},
+    {"FileQueryTests.test_vulkan_export_lineage_preserves_descriptor_roles_and_retry_results", test_vulkan_export_lineage_preserves_descriptor_roles_and_retry_results},
+    {"FileQueryTests.test_vulkan_export_lineage_missing_success_and_conflicting_import_are_explicit", test_vulkan_export_lineage_missing_success_and_conflicting_import_are_explicit},
+    {"FileQueryTests.test_vulkan_export_lineage_rejects_ambiguous_source_association", test_vulkan_export_lineage_rejects_ambiguous_source_association},
+    {"FileQueryTests.test_vulkan_export_lineage_keeps_process_scoped_imports_and_null_success_visible", test_vulkan_export_lineage_keeps_process_scoped_imports_and_null_success_visible},
+    {"FileQueryTests.test_vulkan_export_lineage_requires_retained_retirement_evidence", test_vulkan_export_lineage_requires_retained_retirement_evidence},
+    {"FileQueryTests.test_vulkan_export_lineage_retirement_requires_released_handles_and_same_backing", test_vulkan_export_lineage_retirement_requires_released_handles_and_same_backing},
+    {"FileQueryTests.test_vulkan_export_lineage_compares_every_immutable_retry_observation", test_vulkan_export_lineage_compares_every_immutable_retry_observation},
+    {"FileQueryTests.test_vulkan_export_lineage_distinguishes_missing_source_association", test_vulkan_export_lineage_distinguishes_missing_source_association},
+    {"FileQueryTests.test_vulkan_export_lineage_source_query_correlates_process_allocation", test_vulkan_export_lineage_source_query_correlates_process_allocation},
+    {"FileQueryTests.test_loaded_library_mapping_inventory_preserves_actual_paths_and_limits", test_loaded_library_mapping_inventory_preserves_actual_paths_and_limits},
+    {"FileQueryTests.test_surface_correlates_native_and_firefox_and_where_scopes_all_rows", test_surface_correlates_native_and_firefox_and_where_scopes_all_rows},
+    {"FileQueryTests.test_context_is_bounded_deduplicated_and_obeys_where", test_context_is_bounded_deduplicated_and_obeys_where},
+    {"FileQueryTests.test_dense_context_considers_buffered_rows_only_once", test_dense_context_considers_buffered_rows_only_once},
+    {"FileQueryTests.test_projection_preserves_provenance_and_uint64", test_projection_preserves_provenance_and_uint64},
+    {"FileQueryTests.test_error_filter_strict_mode_and_exit_statuses", test_error_filter_strict_mode_and_exit_statuses},
+    {"FileQueryTests.test_summary_groups_are_deterministic_and_cardinality_is_bounded", test_summary_groups_are_deterministic_and_cardinality_is_bounded},
+    {"FileQueryTests.test_help_documents_grammar_and_wrapper_shell_syntax_is_valid", test_help_documents_grammar_and_wrapper_shell_syntax_is_valid},
+    {"FileQueryTests.test_wrapper_retains_both_streams_and_queryable_terminal_status", test_wrapper_retains_both_streams_and_queryable_terminal_status},
+    {"FileQueryTests.test_fresh_all_stops_registered_tests_and_orphans_but_preserves_other_owners", test_fresh_all_stops_registered_tests_and_orphans_but_preserves_other_owners},
+    {"FileQueryTests.test_gui_launch_replaces_runtime_sessions_and_preserves_other_owners", test_gui_launch_replaces_runtime_sessions_and_preserves_other_owners},
+    {"FileQueryTests.test_gui_launch_replaces_an_owner_still_preparing_its_container", test_gui_launch_replaces_an_owner_still_preparing_its_container},
+    {"FileQueryTests.test_delayed_older_gui_launch_preserves_the_newer_runtime", test_delayed_older_gui_launch_preserves_the_newer_runtime},
+    {"FileQueryTests.test_family_and_history_pairing_retains_inference_and_archive_identity", test_family_and_history_pairing_retains_inference_and_archive_identity},
+    {"FileQueryTests.test_family_discovers_separate_acceptance_and_rotating_mozilla_evidence", test_family_discovers_separate_acceptance_and_rotating_mozilla_evidence},
+    {"FileQueryTests.test_family_inventory_groups_selectors_without_capturing_unrelated_entries", test_family_inventory_groups_selectors_without_capturing_unrelated_entries},
+    {"FileQueryTests.test_family_symlink_reuses_earlier_target_candidates_and_checks_containment", test_family_symlink_reuses_earlier_target_candidates_and_checks_containment},
+    {"FileQueryTests.test_child_mozilla_archived_only_family_and_direct_role", test_child_mozilla_archived_only_family_and_direct_role},
+    {"FileQueryTests.test_mozilla_family_retains_containment_and_discovery_budget", test_mozilla_family_retains_containment_and_discovery_budget},
+    {"FileQueryTests.test_history_catalog_enumerates_each_archive_directory_once", test_history_catalog_enumerates_each_archive_directory_once},
+    {"FileQueryTests.test_shared_event_anchors_link_transcript_and_propagate_test_tags", test_shared_event_anchors_link_transcript_and_propagate_test_tags},
+    {"FileQueryTests.test_related_run_includes_terminal_and_never_crosses_reused_buffer_ids", test_related_run_includes_terminal_and_never_crosses_reused_buffer_ids},
+    {"FileQueryTests.test_transcript_incident_keeps_buffer_ids_failure_and_catch_context", test_transcript_incident_keeps_buffer_ids_failure_and_catch_context},
+    {"FileQueryTests.test_pasted_multiline_error_finds_earliest_physical_record_and_nearby_family", test_pasted_multiline_error_finds_earliest_physical_record_and_nearby_family},
+    {"FileQueryTests.test_pasted_error_uses_phrase_before_unordered_fallback", test_pasted_error_uses_phrase_before_unordered_fallback},
+    {"FileQueryTests.test_pasted_error_selection_scans_once_with_exact_fallback_and_unicode", test_pasted_error_selection_scans_once_with_exact_fallback_and_unicode},
+    {"FileQueryTests.test_error_neighborhood_respects_radius_and_machine_output_bounds", test_error_neighborhood_respects_radius_and_machine_output_bounds},
+    {"FileQueryTests.test_error_lookup_reports_absence_and_rejects_empty_text", test_error_lookup_reports_absence_and_rejects_empty_text},
+    {"FileQueryTests.test_triage_identity_namespaces_exclude_ambient_empty_and_bare_counters", test_triage_identity_namespaces_exclude_ambient_empty_and_bare_counters},
+    {"FileQueryTests.test_triage_automatically_correlates_probe_surface_catch_native_and_counter_leaf", test_triage_automatically_correlates_probe_surface_catch_native_and_counter_leaf},
+    {"FileQueryTests.test_triage_single_file_discovers_current_siblings_without_expanding_explicit_queries", test_triage_single_file_discovers_current_siblings_without_expanding_explicit_queries},
+    {"FileQueryTests.test_triage_single_archive_discovers_only_its_rotation_batch_without_current_files", test_triage_single_archive_discovers_only_its_rotation_batch_without_current_files},
+    {"FileQueryTests.test_triage_named_archives_match_exact_names_and_reject_external_history", test_triage_named_archives_match_exact_names_and_reject_external_history},
+    {"FileQueryTests.test_triage_ranks_explicit_failure_above_error_related_events_without_changing_errors_filter", test_triage_ranks_explicit_failure_above_error_related_events_without_changing_errors_filter},
+    {"FileQueryTests.test_triage_finds_short_reconnect_lifetimes_without_claiming_their_cause", test_triage_finds_short_reconnect_lifetimes_without_claiming_their_cause},
+    {"FileQueryTests.test_pasted_transport_error_retains_field_cause_and_reconnect_context", test_pasted_transport_error_retains_field_cause_and_reconnect_context},
+    {"FileQueryTests.test_triage_pasted_error_retains_earliest_physical_and_timestamp_neighbors", test_triage_pasted_error_retains_earliest_physical_and_timestamp_neighbors},
+    {"FileQueryTests.test_triage_pasted_error_context_survives_noisy_historical_identity_chain", test_triage_pasted_error_context_survives_noisy_historical_identity_chain},
+    {"FileQueryTests.test_triage_recognizes_generic_terminal_suffix_without_guessing_numeric_outcome", test_triage_recognizes_generic_terminal_suffix_without_guessing_numeric_outcome},
+    {"FileQueryTests.test_triage_terminal_summary_survives_failure_volume_and_preserves_unknown_fields", test_triage_terminal_summary_survives_failure_volume_and_preserves_unknown_fields},
+    {"FileQueryTests.test_triage_untrusted_field_names_cannot_escape_size_or_terminal_output_bounds", test_triage_untrusted_field_names_cannot_escape_size_or_terminal_output_bounds},
+    {"FileQueryTests.test_triage_handles_unmatched_start_duplicate_end_and_failed_span", test_triage_handles_unmatched_start_duplicate_end_and_failed_span},
+    {"FileQueryTests.test_triage_request_submit_start_progress_is_not_three_unfinished_operations", test_triage_request_submit_start_progress_is_not_three_unfinished_operations},
+    {"FileQueryTests.test_triage_secondary_handle_and_identity_handoff_do_not_fake_missing_completion", test_triage_secondary_handle_and_identity_handoff_do_not_fake_missing_completion},
+    {"FileQueryTests.test_triage_unrelated_completion_is_not_an_identity_handoff", test_triage_unrelated_completion_is_not_an_identity_handoff},
+    {"FileQueryTests.test_triage_prefers_explicit_divergence_over_earlier_unclosed_start", test_triage_prefers_explicit_divergence_over_earlier_unclosed_start},
+    {"FileQueryTests.test_triage_retains_native_spans_and_accepted_requests_after_busy_browser_capture", test_triage_retains_native_spans_and_accepted_requests_after_busy_browser_capture},
+    {"FileQueryTests.test_triage_missing_pixel_bridge_is_a_visible_anchor_and_finding", test_triage_missing_pixel_bridge_is_a_visible_anchor_and_finding},
+    {"FileQueryTests.test_triage_explicit_pixel_query_does_not_exclude_its_later_bridge", test_triage_explicit_pixel_query_does_not_exclude_its_later_bridge},
+    {"FileQueryTests.test_triage_pixel_query_keeps_conflicting_bridge_evidence", test_triage_pixel_query_keeps_conflicting_bridge_evidence},
+    {"FileQueryTests.test_triage_highlights_first_deterministic_pixel_chain_divergence", test_triage_highlights_first_deterministic_pixel_chain_divergence},
+    {"FileQueryTests.test_tap_outcomes_keep_failed_test_and_diagnostic_context", test_tap_outcomes_keep_failed_test_and_diagnostic_context},
+    {"FileQueryTests.test_libtest_failures_keep_named_panic_output", test_libtest_failures_keep_named_panic_output},
+    {"FileQueryTests.test_training_failure_is_an_explicit_triage_anchor", test_training_failure_is_an_explicit_triage_anchor},
+    {"FileQueryTests.test_training_observations_do_not_invent_generic_begin_end_pairs", test_training_observations_do_not_invent_generic_begin_end_pairs},
+    {"FileQueryTests.test_triage_missing_events_have_stable_display", test_triage_missing_events_have_stable_display},
+    {"FileQueryTests.test_triage_groups_repeated_anomalies_without_losing_counts_or_context", test_triage_groups_repeated_anomalies_without_losing_counts_or_context},
+    {"FileQueryTests.test_triage_first_catch_info_context_recognizes_singular_plural_and_inline_json", test_triage_first_catch_info_context_recognizes_singular_plural_and_inline_json},
+    {"FileQueryTests.test_triage_zero_hops_still_includes_bounded_counter_refinement", test_triage_zero_hops_still_includes_bounded_counter_refinement},
+    {"FileQueryTests.test_triage_incomplete_end_is_an_anchor_without_claiming_failure", test_triage_incomplete_end_is_an_anchor_without_claiming_failure},
+    {"FileQueryTests.test_triage_gaps_use_only_same_source_actual_clock_and_detect_regression", test_triage_gaps_use_only_same_source_actual_clock_and_detect_regression},
+    {"FileQueryTests.test_triage_hops_are_capped_and_empty_ids_do_not_expand", test_triage_hops_are_capped_and_empty_ids_do_not_expand},
+    {"FileQueryTests.test_triage_bounds_cardinality_payload_and_default_output_without_related_run", test_triage_bounds_cardinality_payload_and_default_output_without_related_run},
+    {"FileQueryTests.test_triage_run_reuse_where_and_context_copies_are_not_false_duplicates", test_triage_run_reuse_where_and_context_copies_are_not_false_duplicates},
+    {"FileQueryTests.test_triage_parse_damage_is_bounded_evidence_and_strict_remains_strict", test_triage_parse_damage_is_bounded_evidence_and_strict_remains_strict},
 };
 
 } // namespace log_query_test
@@ -1750,9 +1922,14 @@ int mmltk::log_query::test_entry(int argc, char** argv) {
             for (const auto& test : cases) std::cout << test.name << '\n';
             return 0;
         }
-        const std::string_view filter = argc > 1 ? argv[1] : ""; std::size_t failed = 0, ran = 0;
+        std::size_t failed = 0, ran = 0;
         for (const auto& test : cases) {
-            if (!contains(test.name, filter)) continue; ++ran;
+            bool selected = argc == 1;
+            for (int index = 1; index < argc; ++index)
+                selected = selected || test.name == argv[index] ||
+                    (std::string_view(argv[index]).find('.') == std::string_view::npos && contains(test.name, argv[index]));
+            if (!selected) continue;
+            ++ran;
             try { test.run(); std::cout << "[ OK ] " << test.name << '\n'; }
             catch (const std::exception& error) { ++failed; std::cerr << "[ FAILED ] " << test.name << ": " << error.what() << '\n'; }
             catch (...) { ++failed; std::cerr << "[ FAILED ] " << test.name << ": unknown exception\n"; }

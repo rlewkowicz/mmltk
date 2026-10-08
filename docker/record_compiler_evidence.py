@@ -14,7 +14,7 @@ import shutil
 import subprocess
 
 EVIDENCE_ROOT = Path("/usr/local/share/mmltk/compiler-evidence")
-LAUNCHERS = {"ccache", "sccache", "module_safe_compiler_launcher.sh"}
+LAUNCHERS = {"ccache", "sccache"}
 
 def require(condition, message):
     if not condition:
@@ -96,9 +96,21 @@ def compiler_command(entry):
             index += 1
         else:
             break
-    while index < len(arguments) and Path(arguments[index]).name in LAUNCHERS:
-        executable(arguments[index], directory, environment)
-        index += 1
+    while index < len(arguments):
+        if Path(arguments[index]).name in LAUNCHERS:
+            executable(arguments[index], directory, environment)
+            index += 1
+        elif arguments[index + 1:index + 3] == ["--tool", "module-safe-compiler-launcher"]:
+            executable(arguments[index], directory, environment)
+            index += 3
+            if index < len(arguments) and arguments[index] == "--argv0":
+                require(index + 1 < len(arguments), "missing launcher logical program name")
+                index += 2
+            require(index < len(arguments) and arguments[index] == "--",
+                    "missing native launcher delimiter")
+            index += 1
+        else:
+            break
     require(index < len(arguments), "missing compiler after launcher")
     compiler = executable(arguments[index], directory, environment)
     return compiler, arguments[index + 1:], directory, environment

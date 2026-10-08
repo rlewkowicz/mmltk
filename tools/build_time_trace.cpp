@@ -60,7 +60,7 @@ void log(std::string_view message) {
 }
 
 void usage() {
-    std::cout << R"(Usage: tools/build_time_trace.sh [--cache-key NAME] [--warm-rebuild|--no-op] [--label LABEL]
+    std::cout << R"(Usage: ./mmltk --tool build-time-trace -- [--cache-key NAME] [--warm-rebuild|--no-op] [--label LABEL]
 
 Runs ./mmltk --build with an isolated repository-local compile cache and
 staged release. Normal .cache/cmake, Cargo, ccache, Firefox, browser, and

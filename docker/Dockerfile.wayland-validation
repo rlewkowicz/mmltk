@@ -9,13 +9,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libweston-13-dev="${WESTON_VERSION}" pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY tools/headless_weston_seat.cpp /tmp/headless_weston_seat.cpp
-RUN test "$(/opt/gcc-16.2/bin/g++ -dumpfullversion)" = 16.2.0 \
-    && /opt/gcc-16.2/bin/g++ -std=c++26 -O2 -fPIC -shared \
-        -Wall -Wextra -Werror -Wl,-z,defs \
-        /tmp/headless_weston_seat.cpp -o /tmp/mmltk-headless-seat.so \
-        $(pkg-config --cflags-only-I libweston-13 wayland-server | sed 's/-I/-isystem /g') \
-        $(pkg-config --cflags-only-other --libs libweston-13 wayland-server)
+COPY tools /tmp/native-tools/tools
+COPY docker/nvidia-payload.json /tmp/native-tools/docker/nvidia-payload.json
+RUN cmake -S /tmp/native-tools/tools -B /tmp/weston-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DMMLTK_TOOLS_BUILD_DRIVER=OFF \
+        -DMMLTK_TOOLS_BUILD_WESTON_SEAT=ON \
+    && cmake --build /tmp/weston-build --target mmltk_headless_weston_seat \
+    && cmake --install /tmp/weston-build --prefix /tmp/weston-stage --component Runtime
 
 FROM mmltk_runtime
 ARG WESTON_VERSION
@@ -24,7 +24,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         weston="${WESTON_VERSION}" libweston-13-0="${WESTON_VERSION}" wayland-utils \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=seat-builder /tmp/mmltk-headless-seat.so /usr/lib/weston/mmltk-headless-seat.so
+COPY --from=seat-builder /tmp/weston-stage/lib/weston/mmltk-headless-seat.so /usr/lib/weston/mmltk-headless-seat.so
 
 ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
 ARG MMLTK_RUNTIME_IDENTITY

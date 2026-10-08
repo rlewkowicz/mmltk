@@ -6,9 +6,9 @@ ARG MMLTK_NVIDIA_DONOR_IMAGE
 ARG MMLTK_DIAGNOSTIC_HEADERS
 ENV MMLTK_DIAGNOSTIC_IMAGE=${MMLTK_NVIDIA_DONOR_IMAGE} \
     PYTHONDONTWRITEBYTECODE=1
-RUN --network=none --mount=type=bind,source=tools/diagnose_nvidia_payload.py,target=/diagnostic.py \
+RUN --network=none --mount=type=bind,from=mmltk_tools,source=.,target=/opt/mmltk-tools \
     --mount=type=bind,source=docker,target=/diagnostic_metadata \
-    python3 /diagnostic.py --header-list "${MMLTK_DIAGNOSTIC_HEADERS}" >/headers.json
+    /opt/mmltk-tools/mmltk --tool diagnose-nvidia-payload -- --header-list "${MMLTK_DIAGNOSTIC_HEADERS}" >/headers.json
 
 FROM scratch
 COPY --from=inventory /headers.json /

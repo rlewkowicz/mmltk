@@ -1481,6 +1481,18 @@ void writeAtomic(const std::filesystem::path& path, std::string_view contents) {
   std::filesystem::rename(temporary, path);
 }
 
+namespace {
+Json nativeProducer() {
+  const auto executable = executable_path();
+  FileHasher digest;
+  Json result{{"executable", executable.string()}, {"executable_sha256", digest(executable)},
+              {"module", "mmltk.tools.generate_cleanup_json"}, {"source", "tools/generate_cleanup_json.cpp"}};
+  const auto inputs = executable.parent_path() / ".inputs.sha256";
+  if (std::filesystem::is_regular_file(inputs)) result["tools_inputs_sha256"] = trim(read_text(inputs));
+  return result;
+}
+}
+
 Json generateReport(const Json& profile, const GenerateReportOptions& options) {
   const auto started = std::chrono::steady_clock::now();
   const auto inputs = options.inventoryInputs ? *options.inventoryInputs : collectInventoryInputs();
@@ -1527,6 +1539,7 @@ Json generateReport(const Json& profile, const GenerateReportOptions& options) {
       {"hits", duploSuppression.at("hits")}, {"structuralHitsAfterSuppression", cpdSuppression.at("hits")},
       {"duploSuppression", duploSuppression}, {"cpdSuppression", cpdSuppression}};
   auto report = buildReport(input, options.clock);
+  report["producer"] = nativeProducer();
   const auto output = profile.at("output").get<std::string>();
   const auto outputPath = repositoryJoin(output);
   const auto rejectedPath = outputPath.parent_path() / "rejected.json";
@@ -1628,6 +1641,7 @@ Json generateRawCpd(const Json& profile, std::string_view output, const Generate
   const auto snapshot = sourceSnapshot(all);
   const auto result = runCpd(profile, paths, snapshot);
   auto report = rawCpdReport(profile, files, result, [&](const std::string& path) { return snapshot.at(path).source; });
+  report["producer"] = nativeProducer();
   if (options.review) {
     Json reviewFiles = Json::array();
     for (const auto& path : authored) {

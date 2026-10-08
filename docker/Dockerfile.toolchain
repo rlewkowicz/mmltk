@@ -24,9 +24,9 @@ ENV CUDA_HOME=${MMLTK_CUDA_ROOT} \
     PYTHONDONTWRITEBYTECODE=1 \
     LD_LIBRARY_PATH=/opt/gcc-16.2/lib64:/opt/onnxruntime/lib:${MMLTK_NVIDIA_LIBRARY_PATH} \
     PATH=${MMLTK_CUDA_ROOT}/bin:${PATH}
-COPY tools/check_toolchain_invariants.py /usr/local/libexec/mmltk/check_toolchain_invariants.py
+COPY --link --from=mmltk_tools / /opt/mmltk-tools/
 RUN ldconfig \
-    && python3 /usr/local/libexec/mmltk/check_toolchain_invariants.py --dependencies-only \
+    && /opt/mmltk-tools/mmltk --tool check-toolchain-invariants -- --dependencies-only \
     && python3 /usr/local/libexec/mmltk/verify_nvidia_payload.py --mode development
 
 ARG MMLTK_IMAGE_FINGERPRINT=unlabeled

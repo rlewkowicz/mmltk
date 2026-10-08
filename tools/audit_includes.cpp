@@ -49,6 +49,7 @@ import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cleanup.declaration_patterns;
 import mmltk.tools.cpp_locale;
 import mmltk.tools.cpp_support;
+import mmltk.tools.tool_command;
 import mmltk.tools.cpp_text;
 import mmltk.tools.generate_cleanup_json;
 
@@ -843,7 +844,7 @@ int main(const std::vector<std::string>& args) {
     // The invariant checker remains the build authority, as in the original
     // audit. No compile-database command is ever executed by this tool.
     if (mode == "fix") {
-      const auto result = run({"python3", "tools/check_toolchain_invariants.py", "--build-dir", build, "--repo-root", root});
+      const auto result = run(mmltk::tools::command::self_invocation(mmltk::tools::command::Command::check_toolchain_invariants, {"--build-dir", build, "--repo-root", root}));
       if (result.exit_code != 0) throw std::runtime_error("toolchain invariant check failed: exit " + std::to_string(result.exit_code));
     }
     const auto contexts = compilationContexts(read_json(database), root);

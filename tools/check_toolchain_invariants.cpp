@@ -47,6 +47,7 @@ module;
 
 export module mmltk.tools.check_toolchain_invariants;
 import mmltk.tools.cpp_support;
+import mmltk.tools.tool_command;
 import mmltk.tools.cpp_text;
 
 namespace {
@@ -209,10 +210,21 @@ CompilerCommand compiler_command(const json& entry) {
             ++index;
         } else break;
     }
-    static const Names launchers{"ccache", "sccache", "module_safe_compiler_launcher.sh"};
-    while (index < arguments.size() && launchers.contains(fs::path(arguments[index]).filename().string())) {
-        executable(arguments[index], result.directory, result.environment);
-        ++index;
+    while (index < arguments.size()) {
+        const auto basename = fs::path(arguments[index]).filename().string();
+        if (basename == "ccache" || basename == "sccache") {
+            executable(arguments[index++], result.directory, result.environment);
+        } else if (index + 2 < arguments.size() && arguments[index + 1] == "--tool" &&
+                   arguments[index + 2] == mmltk::tools::command::name(mmltk::tools::command::Command::module_safe_compiler_launcher)) {
+            executable(arguments[index], result.directory, result.environment);
+            index += 3;
+            if (index < arguments.size() && arguments[index] == "--argv0") {
+                require(index + 1 < arguments.size(), "missing launcher logical program name");
+                index += 2;
+            }
+            require(index < arguments.size() && arguments[index] == "--", "missing native launcher delimiter");
+            ++index;
+        } else break;
     }
     require(index < arguments.size(), "missing compiler after launcher");
     result.compiler = executable(arguments[index], result.directory, result.environment);

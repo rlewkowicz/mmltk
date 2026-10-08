@@ -655,8 +655,7 @@ void prepare_fake_docker_state(const fs::path& temp_dir, const fs::path& state_d
  write_fake_docker_script(temp_dir);
  const fs::path wrapper = locate_repo_wrapper_path();
  fs::create_directories(temp_dir / "tools");
- fs::copy_file(wrapper, temp_dir / "mmltk", fs::copy_options::overwrite_existing);
- fs::copy_file(wrapper.parent_path() / "tools/runtime_package.sh", temp_dir / "tools/runtime_package.sh", fs::copy_options::overwrite_existing);
+ fs::create_symlink(wrapper.parent_path() / "build/tools/mmltk", temp_dir / "mmltk");
 }
 std::vector<std::string> capture_wrapper_logging_arguments(
  const fs::path& temp_dir, const fs::path& state_dir, const std::vector<std::string>& environment, const std::vector<std::string>& arguments) {
@@ -676,6 +675,8 @@ std::vector<std::string> capture_wrapper_logging_arguments(
   "MMLTK_RELEASE_STAGE_ROOT",
   "PATH=" + prepend_path_env(temp_dir / "bin"),
   "MMLTK_FAKE_DOCKER_STATE=" + state_dir.string(),
+  "MMLTK_DOCKER_CONTAINER=host",
+  "MMLTK_REPO_ROOT=" + temp_dir.string(),
   "MMLTK_IMAGE=fake-mmltk",
  };
  command.insert(command.end(), environment.begin(), environment.end());
@@ -786,6 +787,8 @@ void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
   "env",
   "PATH=" + prepend_path_env(temp_dir / "bin"),
   "MMLTK_FAKE_DOCKER_STATE=" + state_dir.string(),
+  "MMLTK_DOCKER_CONTAINER=host",
+  "MMLTK_REPO_ROOT=" + temp_dir.string(),
   "MMLTK_IMAGE=fake-mmltk",
   "MMLTK_USER=root",
   "WAYLAND_DISPLAY=wayland-0",

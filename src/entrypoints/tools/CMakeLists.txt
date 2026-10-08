@@ -1,9 +1,11 @@
 include(MmltkComponent)
+include("${CMAKE_SOURCE_DIR}/tools/cmake/Toolchain.cmake")
 
 add_executable(mmltk_diagnose_compiled_sample EXCLUDE_FROM_ALL)
 mmltk_configure_component(mmltk_diagnose_compiled_sample PRIVATE_DECLARATIONS)
-mmltk_register_ordinary_sources(mmltk_diagnose_compiled_sample
-    ${CMAKE_SOURCE_DIR}/tools/diagnose_compiled_sample.cpp)
+mmltk_tools_register_process(mmltk_diagnose_compiled_sample
+    "${CMAKE_SOURCE_DIR}/tools/diagnose_compiled_sample.cpp"
+    mmltk.tools.diagnose_compiled_sample mmltk_tool_diagnose_compiled_sample)
 target_link_libraries(mmltk_diagnose_compiled_sample PRIVATE
     mmltk::backend::data
     mmltk::backend::data::catalog
@@ -15,8 +17,9 @@ mmltk_enable_native_runtime_rpath(mmltk_diagnose_compiled_sample)
 
 add_executable(mmltk_diagnose_coconut_mask EXCLUDE_FROM_ALL)
 mmltk_configure_component(mmltk_diagnose_coconut_mask PRIVATE_DECLARATIONS)
-mmltk_register_ordinary_sources(mmltk_diagnose_coconut_mask
-    ${CMAKE_SOURCE_DIR}/tools/diagnose_coconut_mask.cpp)
+mmltk_tools_register_process(mmltk_diagnose_coconut_mask
+    "${CMAKE_SOURCE_DIR}/tools/diagnose_coconut_mask.cpp"
+    mmltk.tools.diagnose_coconut_mask mmltk_tool_diagnose_coconut_mask)
 target_link_libraries(mmltk_diagnose_coconut_mask PRIVATE
     Arrow::arrow_static
     Parquet::parquet_static
@@ -75,7 +78,6 @@ if(BUILD_RFDETR_NATIVE)
         mmltk_entrypoints_tools_onnx_simplify)
 
     function(mmltk_add_entrypoints_tools_tests)
-        find_package(Python3 REQUIRED COMPONENTS Interpreter)
         add_executable(mmltk_entrypoints_tools_tests EXCLUDE_FROM_ALL)
         mmltk_register_retained_module_importers(
             mmltk_entrypoints_tools_tests
@@ -98,8 +100,7 @@ if(BUILD_RFDETR_NATIVE)
         target_compile_definitions(mmltk_entrypoints_tools_tests PRIVATE
             MMLTK_TEST_COMPILED_DIAGNOSTIC="$<TARGET_FILE:mmltk_diagnose_compiled_sample>"
             MMLTK_TEST_MASK_DIAGNOSTIC="$<TARGET_FILE:mmltk_diagnose_coconut_mask>"
-            MMLTK_TEST_BENCHMARK_DIAGNOSTIC="${CMAKE_SOURCE_DIR}/tools/diagnose_benchmark_image.py"
-            MMLTK_TEST_PYTHON="${Python3_EXECUTABLE}")
+            MMLTK_TEST_BENCHMARK_DIAGNOSTIC="${MMLTK_NATIVE_TOOLS_EXECUTABLE}")
         add_dependencies(mmltk_entrypoints_tools_tests
             mmltk_diagnose_compiled_sample mmltk_diagnose_coconut_mask)
         catch_discover_tests(mmltk_entrypoints_tools_tests

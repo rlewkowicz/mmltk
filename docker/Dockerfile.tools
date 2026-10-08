@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+FROM ${MMLTK_NVIDIA_DONOR_IMAGE} AS cuda_headers
+FROM mmltk_gcc16 AS gcc16
+FROM ubuntu:24.04
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MMLTK_IMAGE_FINGERPRINT
+ARG MMLTK_CMAKE_VERSION=4.4.3
+ARG MMLTK_CMAKE_SHA256=d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc
+ARG MMLTK_LLVM_APT_KEY_SHA256=8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d
+COPY --from=gcc16 /opt/gcc-16.2 /opt/gcc-16.2
+ARG MMLTK_CUDA_SOURCE
+COPY --from=cuda_headers ${MMLTK_CUDA_SOURCE}/include/ /opt/mmltk-cuda-headers/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl build-essential ninja-build mold git pkg-config \
+        libboost-dev libicu-dev libpcre2-dev libtomlplusplus-dev libssl-dev \
+        libarchive-dev libnuma-dev libvulkan-dev \
+    && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-key \
+    && echo "${MMLTK_LLVM_APT_KEY_SHA256}  /tmp/llvm-key" | sha256sum -c - \
+    && install -Dm0644 /tmp/llvm-key /etc/apt/keyrings/apt.llvm.org.asc \
+    && echo 'deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' >/etc/apt/sources.list.d/llvm.list \
+    && apt-get update && apt-get install -y --no-install-recommends clang-format-22 clang-tidy-22 \
+    && ln -s /usr/bin/clang-format-22 /usr/local/bin/clang-format \
+    && ln -s /usr/bin/clang-tidy-22 /usr/local/bin/clang-tidy \
+    && curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${MMLTK_CMAKE_VERSION}/cmake-${MMLTK_CMAKE_VERSION}-linux-x86_64.tar.gz" -o /tmp/cmake.tar.gz \
+    && echo "${MMLTK_CMAKE_SHA256}  /tmp/cmake.tar.gz" | sha256sum -c - \
+    && mkdir /opt/cmake && tar -xzf /tmp/cmake.tar.gz --strip-components=1 -C /opt/cmake \
+    && rm -rf /var/lib/apt/lists/* /tmp/cmake.tar.gz /tmp/llvm-key
+ENV PATH=/opt/gcc-16.2/bin:/opt/cmake/bin:${PATH} LD_LIBRARY_PATH=/opt/gcc-16.2/lib64 \
+    MMLTK_TOOLS_CUDA_INCLUDE_DIR=/opt/mmltk-cuda-headers
+LABEL com.mmltk.input-fingerprint=${MMLTK_IMAGE_FINGERPRINT}

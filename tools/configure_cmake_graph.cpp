@@ -44,6 +44,7 @@ module;
 export module mmltk.tools.configure_cmake_graph;
 import mmltk.tools.cpp_digest;
 import mmltk.tools.cpp_support;
+import mmltk.tools.tool_command;
 import mmltk.tools.cpp_text;
 
 namespace {
@@ -57,8 +58,9 @@ std::vector<std::string> configuration_inputs(const fs::path& root) {
     // Keep the exact input names and ordering used by existing cache markers.
     std::vector<std::string> result{
         "CMakePresets.json", "CMakeLists.txt", "docker/nvidia-payload.json",
-        "docker/record_compiler_evidence.py", "tools/check_toolchain_invariants.py",
-        "tools/configure_cmake_graph.sh"};
+        "docker/record_compiler_evidence.py", "tools/check_toolchain_invariants.cpp",
+        "tools/configure_cmake_graph.cpp", "tools/tool_command.cpp", "tools/module_safe_compiler_launcher.cpp",
+        "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"};
     std::vector<std::string> discovered;
     for (const auto* directory : {"cmake", "src"}) {
         // Like find's default -P traversal, neither descend into directory
@@ -161,8 +163,8 @@ int configure(int argc, char** argv) {
         for (int index = 3; index < argc; ++index) arguments.emplace_back(argv[index]);
         command(arguments);
     }
-    command({"python3", (root / "tools/check_toolchain_invariants.py").string(),
-             "--repo-root", root.string(), "--build-dir", build_dir});
+    command(support::command::self_invocation(support::command::Command::check_toolchain_invariants,
+             {"--repo-root", root.string(), "--build-dir", build_dir}));
     if (executed) {
         const auto suffix = ".next." + std::to_string(::getpid());
         const auto toolchain_next = toolchain_marker.string() + suffix;

@@ -40,7 +40,7 @@ if [[ -f "${MMLTK_FIREFOX_BUILT_INPUT}" ]] \
     exit 0
 fi
 
-"${MMLTK_TRACED_COMMAND}" firefox_build \
+"${MMLTK_TRACED_COMMAND}" --tool run-traced-command -- firefox_build \
     "${MMLTK_FIREFOX_MACH}" build \
         --jobs "${MMLTK_JOBS}" \
         --priority normal

@@ -26,7 +26,7 @@ using mmltk::testsupport::SubprocessResult;
 SubprocessResult diagnose(const std::vector<std::string>& arguments, bool requirements = false) {
  std::vector<std::string> command{
   "timeout", "--signal=KILL", "120s", "env", "MMLTK_COMPILED_SAMPLE_DIAGNOSTIC=" MMLTK_TEST_COMPILED_DIAGNOSTIC, "MMLTK_COCONUT_MASK_DIAGNOSTIC=" MMLTK_TEST_MASK_DIAGNOSTIC,
-  std::string("MMLTK_BENCHMARK_NATIVE_REQUIREMENTS=") + (requirements ? "1" : "0"), MMLTK_TEST_PYTHON, "-I", "-B", MMLTK_TEST_BENCHMARK_DIAGNOSTIC
+  std::string("MMLTK_BENCHMARK_NATIVE_REQUIREMENTS=") + (requirements ? "1" : "0"), MMLTK_TEST_BENCHMARK_DIAGNOSTIC, "--tool", "diagnose-benchmark-image", "--"
  };
  command.insert(command.end(), arguments.begin(), arguments.end());
  return mmltk::testsupport::run_subprocess_capture_output(command);

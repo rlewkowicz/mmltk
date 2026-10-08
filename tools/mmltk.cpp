@@ -50,11 +50,15 @@ import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 import mmltk.tools.container_commands;
 import mmltk.tools.tool_command;
+import mmltk.tools.runtime_package;
 
 namespace {
 namespace fs = std::filesystem;
 namespace support = mmltk::tools;
 namespace commands = mmltk::container_commands;
+namespace native = mmltk::tools::command;
+namespace package = mmltk::tools::runtime_package;
+using native::Command;
 using Args = std::vector<std::string>;
 std::string env(std::string_view name, std::string_view fallback = {}) {
  const auto value = support::env(name);
@@ -264,6 +268,7 @@ struct Child {
 class Wrapper {
  std::string repo, host_workdir, self, cache, repository_cache, buildkit, cmake, cargo, ccache, firefox, firefox_input, fingerprints, locks, release_stage;
  std::string container_cache, container_stage, sccache_basedirs;
+ std::string tools_image;
  std::string image_name, validation_image, build_image, toolchain_image, gcc_image, payload_image, runtime_base, ubuntu_image, ort_image, dependencies_image,
   analysis_image;
  std::string base_name, container_name, release_container, package_container, gui_container, test_build_container, test_run_container, tidy_container, cleanup_container,
@@ -276,6 +281,7 @@ class Wrapper {
  bool quiet_gui = false, producers_prepared = false, builder_ready = false, default_builder_ready = false, stale_cleaned = false;
  bool cleanup_armed = false, headless_active = false, trace_enabled = false;
  bool gui = false, build = false, build_gui = false, protocol = false, bindings = false, export_shiftlut = false, update_gui = false, update_firefox = false;
+ bool build_tools = false, tidy_tools = false;
  bool tidy = false, third_party = false, prepare_gui = false, test = false, declaration = false, cleanup_report = false, diagnose_io = false, diagnose_nvidia = false,
   diagnose_gpu = false;
  bool test_config_explicit = false, debugger = false, headless = false;
@@ -289,9 +295,20 @@ class Wrapper {
  Fd checkout_lock, cache_lock, runtime_lock, saved_stdout, saved_stderr;
  std::vector<pid_t> log_pids;
  std::vector<Child> processes, build_children;
+ std::vector<std::pair<std::string, std::string>> daemon_mounts;
+ bool mount_mapping_ready = false;
  pid_t active_docker = 0;
  bool done = false;
 
+ static Args tool_arguments(Command selected, const Args& arguments = {}, std::string_view executable = "/workspace/build/tools/mmltk") {
+  return native::self_invocation(selected, arguments, {}, executable);
+ }
+ static std::string tool_shell(Command selected) {
+  return native::shell_invocation(selected, {}, {}, "/workspace/build/tools/mmltk");
+ }
+ void diagnostic_tools(Args& args) {
+  append(args, {"--volume", repo + "/build/tools:/opt/mmltk-tools:ro"});
+ }
  Result run(const Args& args, Run options = {}) {
   interrupted();
   require(!args.empty(), "empty wrapper process invocation");
@@ -366,9 +383,58 @@ class Wrapper {
  bool ok(const Args& args) {
   return run(args, {.quiet = true}).status == 0;
  }
+ void resolve_daemon_mounts() {
+  if (mount_mapping_ready) return;
+  mount_mapping_ready = true;
+  if (!present("/.dockerenv") || env("MMLTK_DOCKER_CONTAINER") == "host") return;
+  const auto container = env("MMLTK_DOCKER_CONTAINER", env("HOSTNAME"));
+  const auto inspection = run({"timeout", "--signal=KILL", "15s", "docker", "inspect", "--format", "{{json .Mounts}}", container},
+                              {.capture = true, .stderr_quiet = true});
+  require(!inspection.status, "cannot resolve invoking container mount mapping");
+  const auto entries = support::json::parse(inspection.out);
+  for (const auto& entry : entries)
+   daemon_mounts.emplace_back(entry.at("Destination").get<std::string>(), entry.at("Source").get<std::string>());
+  std::sort(daemon_mounts.begin(), daemon_mounts.end(), [](const auto& left, const auto& right) { return left.first.size() > right.first.size(); });
+  require(!daemon_mounts.empty(), "invoking container has no daemon-visible bind mounts");
+ }
+ std::string daemon_path(const std::string& path) {
+  for (const auto& [destination, source] : daemon_mounts)
+   if (within(path, destination)) return source + path.substr(destination.size());
+  require(daemon_mounts.empty() || path == "/" || path == "/dev" || starts(path, "/dev/"),
+          "path is not visible through invoking container mounts: " + path);
+  return path;
+ }
  Args docker_args(Args args) {
-  args.insert(args.begin(), "docker");
-  return args;
+  Args mapped;
+  bool container_options = !args.empty() && args.front() == "run";
+  for (std::size_t index = 0; index < args.size(); ++index) {
+   mapped.push_back(args[index]);
+   if (!container_options || index == 0) continue;
+   if (!starts(args[index], "-")) { container_options = false; continue; }
+   if (args[index] != "--volume") {
+    const auto& option = args[index];
+    const bool flag = option == "--rm" || option == "--init" || option == "--privileged" || option == "--read-only" ||
+                      option == "-d" || option == "-i" || option == "-t" || option.find('=') != std::string::npos;
+    if (!flag && index + 1 < args.size()) mapped.push_back(args[++index]);
+    continue;
+   }
+   require(index + 1 < args.size(), "missing bind mount specification");
+   resolve_daemon_mounts();
+   const auto specification = args[++index];
+   const auto separator = specification.find(':');
+   require(separator != std::string::npos, "invalid bind mount specification");
+   const auto source = specification.substr(0, separator);
+   mapped.push_back(daemon_path(source) + specification.substr(separator));
+   if (source == "/" && !daemon_mounts.empty()) {
+    const auto destination_end = specification.find(':', separator + 1);
+    const auto destination = specification.substr(separator + 1, destination_end - separator - 1);
+    const auto mode = destination_end == std::string::npos ? ":rw" : specification.substr(destination_end);
+    for (const auto& [local, host] : daemon_mounts)
+     append(mapped, {"--volume", host + ":" + destination + local + mode});
+   }
+  }
+  mapped.insert(mapped.begin(), "docker");
+  return mapped;
  }
  Result docker(Args args, Run options = {}) {
   return run(docker_args(std::move(args)), std::move(options));
@@ -1063,8 +1129,9 @@ class Wrapper {
     "--build-arg", "MMLTK_DEPENDENCIES_IDENTITY=" + dependency, "--build-arg", "MMLTK_ONNXRUNTIME_IDENTITY=" + ort, "--build-arg", "MMLTK_NVIDIA_PAYLOAD_IDENTITY=" + payload,
     "--build-arg", "MMLTK_NVIDIA_DONOR_IMAGE=" + donor};
   append(args, nvidia_configuration);
-  cached_image("default", "-", build_image, repo + "/docker/Dockerfile.toolchain", "toolchain", fingerprint({"toolchain", base, dependency, payload, ort},
-   {"docker/Dockerfile.toolchain", "docker/patches/gcc16-nvcc-string-substr.patch", "docker/verify_nvidia_payload.py", "docker/nvidia_payload.py", "tools/check_toolchain_invariants.py"}),
+  append(args, {"--build-context", "mmltk_tools=" + repo + "/build/tools"});
+  cached_image("default", "-", build_image, repo + "/docker/Dockerfile.toolchain", "toolchain", fingerprint({"toolchain", base, dependency, payload, ort, trim(read_optional(repo + "/build/tools/.inputs.sha256"))},
+   {"docker/Dockerfile.toolchain", "docker/patches/gcc16-nvcc-string-substr.patch", "docker/verify_nvidia_payload.py", "docker/nvidia_payload.py", "tools/check_toolchain_invariants.cpp"}),
    repo, args);
   verify_alias(da, dependency);
   verify_alias(pa, payload);
@@ -1155,7 +1222,7 @@ class Wrapper {
     expect_cache = true;
     continue;
    }
-   if (tidy && arg == "--file") {
+   if ((tidy || tidy_tools) && arg == "--file") {
     rewritten.push_back(arg);
     expect_files = true;
     continue;
@@ -1345,6 +1412,7 @@ class Wrapper {
   Args args{"run", "-d", "--init", "--privileged", "--name", container_name, "--entrypoint", "/bin/sh", "--gpus", "all", "--network", "host", "--ipc", "host",
     "--user", user(), "--env", "HOME=/tmp/mmltk-home", "--env", "NVIDIA_DRIVER_CAPABILITIES=all", "--label", "com.mmltk.runtime=" + runtime_label, "--volume",
     "/:/host:rw", "--workdir", "/host" + repo};
+  diagnostic_tools(args);
   execution_policy(args);
   labels(args, mode);
   if (gui) append(args, {"--tmpfs", tmpfs()});
@@ -1484,24 +1552,8 @@ class Wrapper {
   else data = "missing\n";
   return sha(std::move(data));
  }
- Result package_tool(const std::string& function, const Args& args = {}, bool inventory = false) {
-  // The current package script is the authoritative package inventory/tar format.
-  Args command{"bash", "-c", inventory ? "set -euo pipefail; source \"$1\"; row() { printf '%s\\0' \"$@\"; printf '\\0'; }; runtime_package_inventory row" : "set -euo pipefail; source \"$1\"; shift; function_name=\"$1\"; shift; \"${function_name}\" \"$@\"",
-    "mmltk-package", repo + "/tools/runtime_package.sh"};
-  if (!inventory) {
-   command.push_back(function);
-   append(command, args);
-  }
-  return capture(command);
- }
- std::string package_hash(const std::string& path) {
-  auto result = package_tool("runtime_package_path_fingerprint", {path});
-  if (result.status) throw Exit{result.status};
-  return trim(result.out);
- }
- bool package_complete(const std::string& path) {
-  return package_tool("runtime_package_complete", {path}).status == 0;
- }
+ std::string package_hash(const std::string& path) { return package::path_fingerprint(path); }
+ bool package_complete(const std::string& path) { return package::complete(path); }
  void firefox_build_input() {
   const auto identity = image_id(toolchain_image);
   require(image_label(build_image, "toolchain-base-identity") == identity, "final toolchain image does not identify its completed dependency image");
@@ -1542,39 +1594,25 @@ class Wrapper {
  }
  std::string package_fingerprint() {
   const auto root = cmake + "/release";
-  std::string data = "mmltk-release-package-v7\n" + image_id(build_image) + "\n" + sha_files({repo + "/tools/runtime_package.sh"});
-  const auto result = package_tool({}, {}, true);
-  if (result.status) throw Exit{result.status};
-  Args row;
-  for (const auto& part : split_zero(result.out)) {
-   if (!part.empty()) {
-    row.push_back(part);
-    continue;
-   }
-   if (row.empty()) continue;
-   require(row.size() >= 4, "invalid runtime package inventory");
-   const auto path = row[0], kind = row[2], source = row[3];
+  std::string data = "mmltk-release-package-v8\n" + image_id(build_image) + "\n" + sha_files({repo + "/tools/runtime_package.cpp"});
+  for (const auto& row : package::inventory()) {
+   const std::string path(row.path), kind(row.source_kind), source(row.source_path);
    std::string source_root;
    if (kind == "release") source_root = root;
    else if (kind == "repository") source_root = repo + "/" + source;
    else if (kind == "firefox") source_root = firefox + "/obj-minimal-opt/dist/firefox";
    else if (kind == "browser") source_root = root + "/frontend/iced/dist";
-   else if (kind == "image") {
-    row.clear();
-    continue;
-   }
+   else if (kind == "image") continue;
    else die("unknown runtime package source '" + kind + "'");
    if (kind == "release" || kind == "repository") {
-    for (auto entry : tail(row, 4)) {
-     if (starts(entry, "?")) entry.erase(0, 1);
-     data += path + "/" + entry + " " + package_hash(source_root + "/" + entry) + "\n";
+    for (auto entry : row.entries) {
+     if (entry.starts_with('?')) entry.remove_prefix(1);
+     data += path + "/" + std::string(entry) + " " + package_hash(source_root + "/" + std::string(entry)) + "\n";
     }
-   }
-   else {
+   } else {
     data += path + " " + package_hash(source_root) + "\n";
     if (kind == "browser") data += source + " " + package_hash(root + "/" + source) + "\n";
    }
-   row.clear();
   }
   Args installation_files;
   if (present(root)) for (const auto& item : fs::recursive_directory_iterator(root)) if (fs::is_regular_file(item.symlink_status()) && item.path().filename() == "cmake_install.cmake") installation_files.push_back(item.path().string());
@@ -1589,11 +1627,10 @@ class Wrapper {
   const auto id = image_id(runtime_base);
   nvidia_inputs();
   verify_nvidia(runtime_base, "runtime");
-  const auto package_result = package_tool("runtime_package_fingerprint", {stage});
-  if (package_result.status) throw Exit{package_result.status};
-  const auto input = sha("mmltk-runtime-image-v5\n" + id + "\n" + sha_files({repo + "/docker/Dockerfile.runtime", repo + "/tools/runtime_package.sh"}) + package_result.out),
+  const auto package_result = package::fingerprint(stage) + "\n";
+  const auto input = sha("mmltk-runtime-image-v6\n" + id + "\n" + sha_files({repo + "/docker/Dockerfile.runtime", repo + "/tools/runtime_package.cpp"}) + package_result + trim(read_optional(repo + "/build/tools/.inputs.sha256"))),
    alias = image_alias("runtime-base", id);
-  cached_image("default", "-", image_name, repo + "/docker/Dockerfile.runtime", "runtime", input, stage, {"--build-context", "mmltk_package=" + repo + "/tools",
+  cached_image("default", "-", image_name, repo + "/docker/Dockerfile.runtime", "runtime", input, stage, {"--build-context", "mmltk_tools=" + repo + "/build/tools",
     "--build-arg", "MMLTK_RUNTIME_BASE_IMAGE=" + alias, "--build-arg", "MMLTK_RELEASE_FINGERPRINT=" + input, "--build-arg", "MMLTK_RUNTIME_BASE_IDENTITY=" + id});
   verify_alias(alias, id);
   require(image_label(image_name, "release-fingerprint") == input, "runtime image release fingerprint label does not match staged outputs");
@@ -1623,8 +1660,18 @@ class Wrapper {
   fs::rename(next, release_stage);
   fs::remove_all(previous);
  }
+ void prepare_tools(bool force) {
+  const auto name = base_name + "-tools-bootstrap-" + std::to_string(wrapper_pid);
+  const auto result = owned_container(name, [&] {
+   return run({"bash", repo + "/tools/bootstrap_mmltk.sh", force ? "--build" : "--ensure", repo},
+       {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}, {"MMLTK_BOOTSTRAP_CONTAINER", name},
+                        {"MMLTK_BOOTSTRAP_OWNER_PID", std::to_string(wrapper_pid)}}});
+  });
+  if (result.status) throw Exit{result.status};
+ }
  void run_build() {
   acquire_mutation();
+  prepare_tools(false);
   initialize_trace();
   trace_event("build", "start");
   if (trace_enabled) {
@@ -1676,7 +1723,7 @@ class Wrapper {
   ensure_build_image();
   if (!application) firefox_build_input();
   quiet_log(application ? "generating typed application bindings" : "generating Protocol-17 cross-language bindings and fixtures");
-  must_toolchain(release_container + (application ? "-application-bindings-generation" : "-protocol-generation"), application ? commands::bindings : std::string_view(commands::protocol));
+  must_toolchain(release_container + (application ? "-application-bindings-generation" : "-protocol-generation"), application ? commands::bindings : commands::protocol);
   release_mutation();
  }
  void gui_build() {
@@ -1703,6 +1750,73 @@ class Wrapper {
   setenv("MMLTK_TIDY_LOG_FILE", operation_log.c_str(), 1);
   setenv("MMLTK_TIDY_TEE_STARTED", "1", 1);
   acquire_mutation();
+  Args common_options, tool_files, product_files;
+  std::string resume;
+  bool files = false, only_product_resume = false;
+  auto relative = [&](std::string path) {
+   if (path.starts_with("/host")) path.erase(0, 5);
+   if (path.starts_with(repo + "/")) path.erase(0, repo.size() + 1);
+   return path;
+  };
+  std::optional<std::set<std::string>> registered_tools;
+  auto standalone_source = [&](const std::string& path) {
+   if (!path.starts_with("tools/")) return false;
+   if (!registered_tools) {
+    registered_tools.emplace();
+    const auto database = cache + "/cmake/tools/compile_commands.json";
+    require(fs::is_regular_file(database), "tools compile database is missing; run ./mmltk --build-tools");
+    for (const auto& entry : support::json::parse(read_text(database))) {
+     auto file = entry.at("file").get<std::string>();
+     if (file.starts_with("/workspace/")) file.erase(0, 11);
+     else file = relative(std::move(file));
+     registered_tools->insert(std::move(file));
+    }
+   }
+   return registered_tools->contains(path);
+  };
+  for (std::size_t index = 0; index < rewritten.size(); ++index) {
+   const auto& argument = rewritten[index];
+   if (argument == "--file") {
+    require(!files && resume.empty(), "--file may occur once and cannot be combined with --start-at");
+    files = true;
+    require(index + 1 < rewritten.size() && !starts(rewritten[index + 1], "--"), "--file requires a source path");
+    while (index + 1 < rewritten.size() && !starts(rewritten[index + 1], "--")) {
+     const auto path = relative(rewritten[++index]);
+     (standalone_source(path) ? tool_files : product_files).push_back(path);
+    }
+   } else if (argument == "--start-at") {
+    require(!files && resume.empty(), "--start-at may occur once and cannot be combined with --file");
+    require(index + 1 < rewritten.size() && !starts(rewritten[index + 1], "--"), "--start-at requires a file path");
+    resume = relative(rewritten[++index]);
+    only_product_resume = !standalone_source(resume);
+   } else common_options.push_back(argument);
+  }
+  require(!tidy_tools || (!only_product_resume && product_files.empty()),
+          "--tidy-tools selects only the standalone driver graph; use --tidy for product-owned units and the oracle/Wayland image build for their isolated units");
+  const bool rust_only = std::find(common_options.begin(), common_options.end(), "--rust-only") != common_options.end();
+  require(!tidy_tools || !rust_only, "--tidy-tools does not select Rust sources");
+  require(!tidy_tools || !third_party, "--tidy-tools does not select third_party sources");
+  auto selection_options = [&](const Args& selected, bool tools) {
+   Args result = common_options;
+   if (!selected.empty()) { result.push_back("--file"); append(result, selected); }
+   if (!resume.empty() && tools != only_product_resume) append(result, {"--start-at", resume});
+   return result;
+  };
+  const auto tool_options = selection_options(tool_files, true), product_options = selection_options(product_files, false);
+  if (!rust_only && !only_product_resume && (!files || !tool_files.empty())) {
+   must({"bash", repo + "/tools/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
+   Args args{"run", "--rm", "--init", "-i", "--name", tidy_container, "--user", user(),
+     "--volume", repo + ":/workspace:rw", "--workdir", "/workspace", "--env", "HOME=/tmp",
+     "--env", "MMLTK_REPO_ROOT=/workspace", "--env", "MMLTK_TIDY_BUILD_DIR=" + container_cache + "/cmake/tools",
+     "--env", "MMLTK_TIDY_LOG_FILE=" + operation_log, "--env", "MMLTK_TIDY_TEE_STARTED=1",
+     "--entrypoint", "/workspace/build/tools/mmltk"};
+   labels(args, mode);
+   args.push_back(tools_image);
+   append(args, tail(tool_arguments(Command::run_static_analysis, {"--tools-only"})));
+   append(args, tool_options);
+   owned_docker_must(tidy_container, args);
+  }
+  if (tidy_tools || (files && product_files.empty())) { release_mutation(); return; }
   ensure_docker();
   ensure_analysis();
   compiler_cache_dirs();
@@ -1717,29 +1831,31 @@ class Wrapper {
     "MMLTK_TIDY_LOG_FILE=/host" + operation_log, "MMLTK_TIDY_TEE_STARTED=1"}) append(args, {"--env", value});
   append(args, {"--volume", "/:/host:rw", "--workdir", "/host" + host_workdir});
   append(args, groups);
-  append(args, {analysis_image, "/bin/bash", "/host" + repo + "/tools/run_static_analysis.sh"});
+  append(args, {"--entrypoint", "/host" + repo + "/build/tools/mmltk", analysis_image});
+  append(args, tail(tool_arguments(Command::run_static_analysis)));
   if (third_party) args.push_back("--third_party");
-  append(args, rewritten);
+  append(args, product_options);
   owned_docker_must(tidy_container, args);
   release_mutation();
  }
  int declaration_tool(std::string operation, Args arguments) {
-  std::string script = "/workspace/tools/generate_cleanup_json.mjs", configure;
+  Command selected = Command::generate_cleanup_json;
+  std::string configure;
   Args args{"--raw-cpd"};
   if (operation == "format") {
-   script = "/workspace/tools/format_declarations.mjs";
+   selected = Command::format_declarations;
    args.clear();
   }
   else if (operation == "includes") {
-   script = "/workspace/tools/audit_includes.mjs";
+   selected = Command::audit_includes;
    args.clear();
    if (first(arguments) == "--refresh") {
     arguments = tail(arguments);
-    configure = "/workspace/tools/configure_cmake_graph.sh release \"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release\" -DBUILD_MMLTK_BROWSER_HOST=ON -DBUILD_MMLTK_FIREFOX_RUNTIME=ON -DMMLTK_BUILD_JOBS=\"${MMLTK_JOBS}\" -DMMLTK_FIREFOX_CACHE_ROOT=\"${MMLTK_FIREFOX_CACHE_ROOT}\"; ";
+    configure = tool_shell(Command::configure_cmake_graph) + " release \"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release\" -DBUILD_MMLTK_BROWSER_HOST=ON -DBUILD_MMLTK_FIREFOX_RUNTIME=ON -DMMLTK_BUILD_JOBS=\"${MMLTK_JOBS}\" -DMMLTK_FIREFOX_CACHE_ROOT=\"${MMLTK_FIREFOX_CACHE_ROOT}\"; ";
    }
   }
   append(args, arguments);
-  args.insert(args.begin(), {"node", script});
+  args = tool_arguments(selected, args);
   acquire_mutation();
   if (operation == "includes") owned_dirs({repo + "/output"});
   ensure_docker();
@@ -1751,16 +1867,17 @@ class Wrapper {
  }
  int cleanup_tool_tests(const Args& arguments) {
   require(arguments.empty() || (arguments.size() == 2 && arguments[0] == "--test-name-pattern" && !arguments[1].empty()), "cleanup-tool accepts only --test-name-pattern PATTERN");
-  Args args{"node", "--test"};
-  append(args, arguments);
-  append(args, {"/workspace/tools/tests/generate_cleanup_json.test.mjs", "/workspace/tools/tests/format_declarations.test.mjs", "/workspace/tools/tests/review_candidates.test.mjs",
-    "/workspace/tools/tests/audit_includes.test.mjs"});
+  std::string command = "set -uo pipefail; status=0; ";
+  for (auto selected : {Command::test_generate_cleanup_json, Command::test_format_declarations,
+                        Command::test_review_candidates, Command::test_audit_includes})
+   command += quoted(tool_arguments(selected, arguments)) + " || status=$?; ";
+  command += "exit ${status}";
   acquire_mutation();
   ensure_docker();
   cache_layout();
   ensure_build_image();
   quiet_log("running cleanup and declaration tooling fixture tests");
-  const int status = owned_toolchain(test_run_container, "set -euo pipefail; " + quoted(args));
+  const int status = owned_toolchain(test_run_container, command);
   release_mutation();
   return status;
  }
@@ -1772,7 +1889,7 @@ class Wrapper {
   ensure_build_image();
   for (const auto& selector : profile == "all" ? Args{"cpp", "frontend"} : Args{profile}) {
    quiet_log("generating " + selector + " cleanup report");
-   must_toolchain(cleanup_container, "set -euo pipefail\nnode /workspace/tools/generate_cleanup_json.mjs --" + selector);
+   must_toolchain(cleanup_container, "set -euo pipefail\n" + tool_shell(Command::generate_cleanup_json) + " --" + selector);
   }
   release_mutation();
  }
@@ -1789,24 +1906,16 @@ class Wrapper {
   const auto name = container_name + "-logs";
   Args args{"run", "--rm", "--init", "--name", name, "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--network", "none", "--user",
     user(), "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "MMLTK_LOG_HOST_ROOT=" + repo, "--volume", repo + ":/workspace:ro", "--workdir", "/workspace",
-    "--entrypoint", "python3"};
+    "--entrypoint", "/workspace/build/tools/mmltk"};
   labels(args, mode);
   if (fixture) {
    append(args, {"--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=32m"});
-   if (arguments.empty()) append(args, {id, "-m", "unittest", "discover", "-s", "/workspace/tools/tests", "-p", "test_log_query.py", "-v"});
-   else {
-    Args cases;
-    for (const auto& item : arguments) {
-     require(matches(item, "[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*"), "--test log-query-tool expects Class.test_method selectors");
-     cases.push_back("test_log_query." + item);
-    }
-    append(args, {"--env", "PYTHONPATH=/workspace/tools/tests", id, "-m", "unittest", "-v"});
-    append(args, cases);
-   }
-  } else {
-   append(args, {id, "/workspace/tools/log_query.py"});
-   append(args, arguments);
+   for (const auto& item : arguments)
+    require(item == "--list-tests" || matches(item, "[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*"), "--test log-query-tool expects Class.test_method selectors");
   }
+  args.push_back(id);
+  auto invocation = tool_arguments(fixture ? Command::test_log_query : Command::log_query, arguments);
+  append(args, tail(invocation));
   return owned_docker(name, args).status;
  }
  int gpu_environment(const std::string& selected) {
@@ -1821,11 +1930,13 @@ class Wrapper {
    name = container_name + "-gpu-environment";
   Args args{"run", "--rm", "--init", "--pull", "never", "--name", name, "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--network",
     "none", "--gpus", "all", "--user", user(), "--env", "NVIDIA_DRIVER_CAPABILITIES=all", "--env", "MMLTK_DIAGNOSTIC_IMAGE=" + image, "--env", "MMLTK_DIAGNOSTIC_IMAGE_ID=" + id,
-    "--volume", repo + "/tools/diagnose_gpu_environment.py:/diagnostic/report.py:ro", "--entrypoint", "/usr/bin/python3"};
+    "--entrypoint", "/opt/mmltk-tools/mmltk"};
   common_groups();
   labels(args, "diagnose-gpu-environment");
   append(args, groups);
-  append(args, {id, "-I", "-B", "/diagnostic/report.py"});
+  diagnostic_tools(args);
+  args.push_back(id);
+  append(args, tail(tool_arguments(Command::diagnose_gpu_environment)));
   return owned_docker(name, args).status;
  }
  int io_diagnostic(const std::string& input) {
@@ -1841,11 +1952,13 @@ class Wrapper {
   quiet_log("read-only I/O capability report in " + build_image + "; no dataset reads or benchmarks");
   Args args{"run", "--rm", "--init", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--network", "none", "--gpus", "all", "--user",
     user(), "--env", "NVIDIA_DRIVER_CAPABILITIES=utility", "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "MMLTK_DIAGNOSTIC_IMAGE=" + build_image, "--env",
-    "MMLTK_DIAGNOSTIC_IMAGE_ID=" + id, "--volume", repo + "/tools/diagnose_dataset_io.py:/diagnostic/report.py:ro", "--volume", path + ":/diagnostic/dataset:ro",
-    "--entrypoint", "python3"};
+    "MMLTK_DIAGNOSTIC_IMAGE_ID=" + id, "--volume", path + ":/diagnostic/dataset:ro",
+    "--entrypoint", "/opt/mmltk-tools/mmltk"};
   common_groups();
   append(args, groups);
-  append(args, {id, "/diagnostic/report.py", "/diagnostic/dataset", "--source-path", path});
+  diagnostic_tools(args);
+  args.push_back(id);
+  append(args, tail(tool_arguments(Command::diagnose_dataset_io, {"/diagnostic/dataset", "--source-path", path})));
   return docker(args).status;
  }
  int nvidia_diagnostic(const Args& arguments) {
@@ -1861,7 +1974,7 @@ class Wrapper {
    ensure_builder();
    owned_dirs({output});
    docker_must({"buildx", "build", "--builder", builder, "--progress=plain", "--file", repo + "/docker/Dockerfile.nvidia-diagnostic", "--build-arg", "MMLTK_NVIDIA_DONOR_IMAGE=" + image,
-     "--build-arg", "MMLTK_DIAGNOSTIC_HEADERS=" + joined(headers, ","), "--output", "type=local,dest=" + output, repo}, {.to_stderr = true});
+     "--build-context", "mmltk_tools=" + repo + "/build/tools", "--build-arg", "MMLTK_DIAGNOSTIC_HEADERS=" + joined(headers, ","), "--output", "type=local,dest=" + output, repo}, {.to_stderr = true});
    std::cout << read_text(output + "/headers.json");
    release_mutation();
    return 0;
@@ -1869,9 +1982,10 @@ class Wrapper {
   const auto id = existing_diagnostic_image(image, "docker daemon is unavailable; diagnostic did not start", "diagnostic requires existing image '" + image + "'; no image was built or pulled");
   quiet_log("read-only NVIDIA header inventory in " + image);
   Args args{"run", "--rm", "--init", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--network", "none", "--user", user(), "--env",
-    "PYTHONDONTWRITEBYTECODE=1", "--env", "MMLTK_DIAGNOSTIC_IMAGE=" + image, "--env", "MMLTK_DIAGNOSTIC_IMAGE_ID=" + id, "--volume", repo + "/tools/diagnose_nvidia_payload.py:/diagnostic/report.py:ro",
-    "--volume", repo + "/docker:/diagnostic_metadata:ro", "--entrypoint", "python3", id, "/diagnostic/report.py"};
-  append(args, headers);
+    "PYTHONDONTWRITEBYTECODE=1", "--env", "MMLTK_DIAGNOSTIC_IMAGE=" + image, "--env", "MMLTK_DIAGNOSTIC_IMAGE_ID=" + id, "--volume", repo + "/docker:/diagnostic_metadata:ro", "--entrypoint", "/opt/mmltk-tools/mmltk"};
+  diagnostic_tools(args);
+  args.push_back(id);
+  append(args, tail(tool_arguments(Command::diagnose_nvidia_payload, headers)));
   return docker(args).status;
  }
  std::string artifact_directory(const std::string& name) {
@@ -1903,7 +2017,8 @@ class Wrapper {
    append(args, {"--volume", artifacts + ":/diagnostic/output:rw", "--volume", repo + ":/host" + repo + ":ro"});
    log("native link diagnostic artifacts: " + artifacts);
   }
-  append(args, {id, "--signal=KILL", "120s", "/usr/bin/python3", "-I", "-B", std::string("/workspace/tools/") + (link ? "diagnose_native_link.py" : "diagnose_native_symbols.py")});
+  append(args, {id, "--signal=KILL", "120s"});
+  append(args, tool_arguments(link ? Command::diagnose_native_link : Command::diagnose_native_symbols));
   append(args, arguments);
   return owned_docker(name, args).status;
  }
@@ -1950,9 +2065,10 @@ class Wrapper {
    require(containers.size() == 1, "process action requires exactly one running wrapper container; select WRAPPER_MODE");
    args = {"docker", "exec", "-i", "--user", action == "--backtrace" ? "0" : user()};
    if (action == "--backtrace") args.push_back("--privileged");
-   append(args, {containers[0], "/usr/bin/python3", "-I", "-B", "-", action, executable});
+   args.push_back(containers[0]);
+   append(args, tool_arguments(Command::diagnose_native_process, {action, executable}, "/opt/mmltk-tools/mmltk"));
    append(args, selector);
-   return run(timeout(args, 45), {.input_file = repo + "/tools/diagnose_native_process.py"}).status;
+   return run(timeout(args, 45)).status;
   }
   for (const auto& id : containers) {
    require(!run(timeout({"docker", "inspect", "--format", "Container {{.Name}} ({{.Id}}), mode={{index .Config.Labels \"com.mmltk.mode\"}}", id}, 15)).status,
@@ -2013,7 +2129,8 @@ class Wrapper {
   auto args = diagnostic_base(name);
   append(args, {"--security-opt", "seccomp=unconfined", "--ulimit", "nice=40:40", "--volume", repo + "/build/validation/benchmark-image:/evidence:rw"});
   auto query = args;
-  append(query, {"--env", "MMLTK_BENCHMARK_NATIVE_REQUIREMENTS=1", id, "--signal=KILL", "600s", "/usr/bin/python3", "-I", "-B", "/workspace/tools/diagnose_benchmark_image.py"});
+  append(query, {"--env", "MMLTK_BENCHMARK_NATIVE_REQUIREMENTS=1", id, "--signal=KILL", "600s"});
+  append(query, tool_arguments(Command::diagnose_benchmark_image));
   append(query, arguments);
   const auto requirements = owned_docker(name, query, {.capture = true});
   if (requirements.status) return requirements.status;
@@ -2031,7 +2148,7 @@ class Wrapper {
    cache_layout();
    const auto old_image = build_image;
    build_image = id;
-   const std::string command = "set -euo pipefail\n/workspace/tools/configure_cmake_graph.sh release \"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/benchmark-image-release\" -DBUILD_MMLTK_BROWSER_HOST=OFF -DBUILD_MMLTK_FIREFOX_RUNTIME=OFF -DMMLTK_BUILD_JOBS=\"${MMLTK_JOBS}\" -DMMLTK_FIREFOX_CACHE_ROOT=\"${MMLTK_FIREFOX_CACHE_ROOT}\"\nfor target in " + joined(targets) + "; do timeout --signal=KILL 120s cmake --build \"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/benchmark-image-release\" --parallel \"${MMLTK_JOBS}\" --target \"${target}\"; done";
+   const std::string command = "set -euo pipefail\n" + tool_shell(Command::configure_cmake_graph) + " release \"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/benchmark-image-release\" -DBUILD_MMLTK_BROWSER_HOST=OFF -DBUILD_MMLTK_FIREFOX_RUNTIME=OFF -DMMLTK_BUILD_JOBS=\"${MMLTK_JOBS}\" -DMMLTK_FIREFOX_CACHE_ROOT=\"${MMLTK_FIREFOX_CACHE_ROOT}\"\nfor target in " + joined(targets) + "; do timeout --signal=KILL 120s cmake --build \"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/benchmark-image-release\" --parallel \"${MMLTK_JOBS}\" --target \"${target}\"; done";
    const auto status = owned_toolchain(name + "-build", command, {}, {.to_stderr = true});
    build_image = old_image;
    if (status) {
@@ -2041,11 +2158,24 @@ class Wrapper {
    }
    append(args, {"--env-file", cmake + "/benchmark-image-release/benchmark-image-diagnostics.env"});
   }
-  append(args, {id, "--signal=KILL", "600s", "/usr/bin/python3", "-I", "-B", "/workspace/tools/diagnose_benchmark_image.py"});
+  append(args, {id, "--signal=KILL", "600s"});
+  append(args, tool_arguments(Command::diagnose_benchmark_image));
   append(args, arguments);
   const auto status = owned_docker(name, args).status;
   release_mutation();
   return status;
+ }
+ std::pair<std::string, std::string> ensure_oracle_image(const std::string& revision) {
+  const auto input = fingerprint({revision, donor, trim(read_optional(repo + "/build/tools/.inputs.sha256"))}, {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/rfdetr_oracle_requirements.txt",
+    "tools/generate_rfdetr_upstream_oracle.cpp", "tools/cpp_support.cpp", "tools/cpp_text.cpp", "tools/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"}), image = image_name + "-rfdetr-oracle";
+  must({"bash", repo + "/tools/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
+  const auto tools_id = image_id(tools_image), tools_alias = image_alias("tools", tools_id);
+  task([&] {
+   cached_image("default", "-", image, repo + "/docker/Dockerfile.rfdetr-oracle", "rfdetr-oracle", input, repo, {"--platform", manifest_value("platform"),
+     "--build-arg", "MMLTK_NVIDIA_DONOR_IMAGE=" + donor, "--build-context", "mmltk_tools_build=docker-image://" + tools_alias});
+  });
+  if (const int image_status = wait_one_task(); image_status) throw Exit{image_status};
+  return {input, image};
  }
  int oracle(Args arguments) {
   if (first(arguments) == "--help" || first(arguments) == "-h") {
@@ -2053,6 +2183,17 @@ class Wrapper {
    return 0;
   }
   const std::string revision = "e9a138f70cc14e3fddca029a0683055e34ab8f35";
+  if (arguments == Args{"--build-only"}) {
+   mode = "build-rfdetr-oracle";
+   prepare_logging(env("MMLTK_BUILD_LOG_FILE"));
+   acquire_mutation();
+   ensure_docker();
+   cache_layout();
+   nvidia_inputs();
+   ensure_oracle_image(revision);
+   release_mutation();
+   return 0;
+  }
   std::string upstream, output, sdpa = "default";
   for (std::size_t i = 0; i < arguments.size(); i += 2) {
    const auto& option = arguments[i];
@@ -2095,13 +2236,8 @@ class Wrapper {
   ensure_docker();
   cache_layout();
   nvidia_inputs();
-  const auto input = fingerprint({revision, donor, tree, sdpa}, {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/rfdetr_oracle_requirements.txt",
-    "tools/generate_rfdetr_upstream_oracle.py"}), image = image_name + "-rfdetr-oracle", name = container_name + "-upstream";
-  task([&] {
-   cached_image("default", "-", image, repo + "/docker/Dockerfile.rfdetr-oracle", "rfdetr-oracle", input, repo, {"--platform", manifest_value("platform"),
-     "--build-arg", "MMLTK_NVIDIA_DONOR_IMAGE=" + donor});
-  });
-  if (const int image_status = wait_one_task(); image_status) return image_status;
+  const auto [image_input, image] = ensure_oracle_image(revision);
+  const auto input = sha(image_input + "\n" + tree + "\n" + sdpa), name = container_name + "-upstream";
   Args args{"run", "--rm", "--init", "--name", name, "--gpus", "all", "--ipc", "host", "--network", "none", "--read-only", "--user", user(), "--cap-drop",
     "ALL", "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=4g", "--env", "HOME=/tmp", "--env", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
     "--env", "GIT_DIR=/upstream-git", "--env", "GIT_COMMON_DIR=/upstream-common", "--env", "GIT_WORK_TREE=/upstream", "--env", "GIT_OPTIONAL_LOCKS=0", "--env",
@@ -2110,7 +2246,7 @@ class Wrapper {
     "/usr/bin/timeout"};
   execution_policy(args);
   labels(args, mode);
-  append(args, {image, "--signal=TERM", "--kill-after=15s", "7200s", "python3", "/opt/rfdetr-oracle/producer.py", "--upstream", "/upstream", "--output",
+  append(args, {image, "--signal=TERM", "--kill-after=15s", "7200s", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "--upstream", "/upstream", "--output",
     "/evidence", "--weights", "/weights", "--fingerprint", input, "--sdpa", sdpa});
   const int status = owned_docker(name, args).status;
   release_mutation();
@@ -2151,7 +2287,7 @@ class Wrapper {
   require(!build_result.status, "headless compositor requires the GCC 16.2 build image; run ./mmltk --build first");
   const auto build_id = trim(build_result.out), build_alias = image_alias("wayland-build", build_id);
   cached_image("default", "-", validation_image, repo + "/docker/Dockerfile.wayland-validation", "wayland-validation", fingerprint({"wayland-validation",
-    runtime_id, build_id}, {"docker/Dockerfile.wayland-validation", "tools/headless_weston_seat.cpp"}), repo, {"--build-context", "mmltk_runtime=docker-image://" + runtime_alias,
+    runtime_id, build_id}, {"docker/Dockerfile.wayland-validation", "tools/headless_weston_seat.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"}), repo, {"--build-context", "mmltk_runtime=docker-image://" + runtime_alias,
     "--build-context", "mmltk_build=docker-image://" + build_alias, "--build-arg", "MMLTK_RUNTIME_IDENTITY=" + runtime_id, "--build-arg", "MMLTK_BUILD_IDENTITY=" + build_id});
   verify_alias(runtime_alias, runtime_id);
   verify_alias(build_alias, build_id);
@@ -2216,23 +2352,21 @@ class Wrapper {
   explicit_test_environment(args);
   append(args, groups);
   for (const auto& mount : mounts) append(args, {"--volume", mount});
-  if (headless && first(arguments) != "--list-tests") append(args, {"--ulimit", "core=1:1", "--entrypoint", "/usr/bin/python3", validation_image, "/workspace/tools/headless_compositor.py",
-    "--", executable_path});
-  else append(args, {"--entrypoint", executable_path, image_name});
-  append(args, arguments);
+  append(args, commands::workspace_test_command(headless, executable_path, arguments, image_name, validation_image));
   headless_active = headless;
   const auto result = owned_docker(test_run_container, args, {.capture = capture_output});
   headless_active = false;
   return result;
  }
- int headless_tool_tests() {
+ int headless_tool_tests(const Args& arguments = {}) {
   const auto id = existing_diagnostic_image(build_image, "docker daemon is unavailable", "headless compositor tooling requires existing image '" + build_image + "'"),
    name = container_name + "-headless-tool";
   Args args{"run", "--rm", "--init", "--name", name, "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--ulimit", "core=1:1",
     "--network", "none", "--user", user(), "--env", "PYTHONDONTWRITEBYTECODE=1", "--volume", repo + ":/workspace:ro", "--tmpfs", "/tmp:rw,nosuid,nodev,size=32m",
-    "--workdir", "/workspace", "--entrypoint", "/bin/bash"};
+    "--workdir", "/workspace", "--entrypoint", "/workspace/build/tools/mmltk"};
   labels(args, mode);
-  append(args, {id, "-c", "bash -n /workspace/mmltk && python3 -m unittest discover -s /workspace/tools/tests -p test_headless_compositor.py -v"});
+  args.push_back(id);
+  append(args, tail(tool_arguments(Command::test_headless_compositor, arguments)));
   return owned_docker(name, args).status;
  }
  int browser_tests(Args arguments) {
@@ -2263,9 +2397,9 @@ if [[ -z "${browser_test_icds}" ]]; then
 fi
 export VK_DRIVER_FILES="${browser_test_icds}"
 export WGPU_BACKEND=vulkan
-/workspace/tools/configure_cmake_graph.sh gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" )MMLTK" + configuration + R"MMLTK(
+)MMLTK" + tool_shell(Command::configure_cmake_graph) + R"MMLTK( gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" )MMLTK" + configuration + R"MMLTK(
 cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_tests
-python3 /workspace/tools/check_toolchain_invariants.py --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"
+)MMLTK" + tool_shell(Command::check_toolchain_invariants) + R"MMLTK( --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"
 )MMLTK";
   const int status = owned_toolchain(test_run_container, command, "graphics,utility");
   release_mutation();
@@ -2403,8 +2537,7 @@ python3 /workspace/tools/check_toolchain_invariants.py --repo-root /workspace --
    require(test_environment.empty(), "--test " + selected + " does not accept --env");
    begin_test(selected);
    if (selected == "headless-compositor-tool") {
-    require(arguments.empty(), "--test " + selected + " does not accept additional arguments");
-    return headless_tool_tests();
+    return headless_tool_tests(arguments);
    }
    if (selected == "cleanup-tool") return cleanup_tool_tests(arguments);
    if (selected == "log-query-tool") {
@@ -2473,10 +2606,10 @@ python3 /workspace/tools/check_toolchain_invariants.py --repo-root /workspace --
   const std::string enabled = test_config == "release" ? "ON" : "OFF";
   if (test_config == "release") firefox_build_input();
   std::string inventory;
-  if (selected == "all" || selected == "build") inventory = "python3 /workspace/tools/audit_test_inventory.py --compile-database \"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/" + test_config + "/compile_commands.json\" --repo-root /workspace --expected-targets " + shell_quote(joined(all_targets()));
+  if (selected == "all" || selected == "build") inventory = tool_shell(Command::audit_test_inventory) + " --compile-database \"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/" + test_config + "/compile_commands.json\" --repo-root /workspace --expected-targets " + shell_quote(joined(all_targets()));
   quiet_log("building cached " + selected + " test graph with " + std::to_string(jobs) + " workers");
   const std::string directory = "\"${MMLTK_CONTAINER_CACHE_ROOT}/cmake/" + test_config + "\"";
-  const std::string command = "set -euo pipefail\n/workspace/tools/configure_cmake_graph.sh " + test_config + " " + directory + " -DBUILD_MMLTK_BROWSER_HOST=" + enabled + " -DBUILD_MMLTK_FIREFOX_RUNTIME=" + enabled + " -DMMLTK_BUILD_JOBS=\"${MMLTK_JOBS}\" -DMMLTK_FIREFOX_CACHE_ROOT=\"${MMLTK_FIREFOX_CACHE_ROOT}\"\n" + inventory + "\ncmake --build " + directory + " --parallel \"${MMLTK_JOBS}\" --target " + quoted(targets) + "\npython3 /workspace/tools/check_toolchain_invariants.py --repo-root /workspace --build-dir " + directory;
+  const std::string command = "set -euo pipefail\n" + tool_shell(Command::configure_cmake_graph) + " " + test_config + " " + directory + " -DBUILD_MMLTK_BROWSER_HOST=" + enabled + " -DBUILD_MMLTK_FIREFOX_RUNTIME=" + enabled + " -DMMLTK_BUILD_JOBS=\"${MMLTK_JOBS}\" -DMMLTK_FIREFOX_CACHE_ROOT=\"${MMLTK_FIREFOX_CACHE_ROOT}\"\n" + inventory + "\ncmake --build " + directory + " --parallel \"${MMLTK_JOBS}\" --target " + quoted(targets) + "\n" + tool_shell(Command::check_toolchain_invariants) + " --repo-root /workspace --build-dir " + directory;
   must_toolchain(test_build_container, command);
   if (cuda_vulkan) {
    ensure_validation_image();
@@ -2535,6 +2668,10 @@ python3 /workspace/tools/check_toolchain_invariants.py --repo-root /workspace --
     log_status = error.status;
    }
    if (!first_failure) first_failure = log_status;
+   int compositor_status = 0;
+   try { compositor_status = headless_tool_tests(); }
+   catch (const Exit& error) { compositor_status = error.status; }
+   if (!first_failure) first_failure = compositor_status;
   }
   return first_failure;
  }
@@ -2579,7 +2716,7 @@ python3 /workspace/tools/check_toolchain_invariants.py --repo-root /workspace --
  }
  void parse() {
   const std::map<std::string, bool*> flags{{"--gui", &gui}, {"--build", &build}, {"--build-gui", &build_gui}, {"--generate-protocol", &protocol}, {"--generate-application-bindings",
-     &bindings}, {"--export-shiftlut", &export_shiftlut}, {"--update-gui-lock", &update_gui}, {"--update-firefox-lock", &update_firefox}, {"--tidy", &tidy},
+     &bindings}, {"--export-shiftlut", &export_shiftlut}, {"--update-gui-lock", &update_gui}, {"--update-firefox-lock", &update_firefox}, {"--tidy", &tidy}, {"--build-tools", &build_tools}, {"--tidy-tools", &tidy_tools},
     {"--third_party", &third_party}};
   for (const auto& argument : original) {
    if (argument == "--prepare-gui-container") {
@@ -2650,16 +2787,17 @@ python3 /workspace/tools/check_toolchain_invariants.py --repo-root /workspace --
      "--diagnose-processes", "--diagnose-benchmark-image", "--diagnose-native-link"}) if (argument == standalone) die(argument + (argument == "--diagnose-rfdetr-upstream" ? " must be first and standalone; use './mmltk " : " must be the standalone operation; use './mmltk ") + argument + " --help'");
   }
   if (test) parse_tests(test_args);
-  const int count = build + build_gui + protocol + bindings + export_shiftlut + update_gui + update_firefox + tidy + test + cleanup_report + declaration + diagnose_io + diagnose_nvidia + diagnose_gpu;
-  require(count <= 1 && !(gui && (build || tidy || test || cleanup_report || declaration || diagnose_io || diagnose_nvidia || diagnose_gpu || export_shiftlut || update_firefox)),
-   "--build, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --update-firefox-lock, --test, --tidy, --cleanup-report, --diagnose-io, --diagnose-nvidia-payload, and --diagnose-gpu-environment are standalone");
+  const int count = build + build_gui + protocol + bindings + export_shiftlut + update_gui + update_firefox + tidy + tidy_tools + build_tools + test + cleanup_report + declaration + diagnose_io + diagnose_nvidia + diagnose_gpu;
+  require(count <= 1 && !(gui && (build || build_tools || tidy || tidy_tools || test || cleanup_report || declaration || diagnose_io || diagnose_nvidia || diagnose_gpu || export_shiftlut || update_firefox)),
+   "--build, --build-tools, --tidy-tools, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --update-firefox-lock, --test, --tidy, --cleanup-report, --diagnose-io, --diagnose-nvidia-payload, and --diagnose-gpu-environment are standalone");
  }
 public:
  Wrapper(int argc, char** argv) {
   original.assign(argv + 1, argv + argc);
-  repo = support::repository_root(argv[0], __FILE__).string();
+  repo = support::repository_root(argv[0]).string();
   self = support::executable_path().string();
   host_workdir = env("PWD", fs::current_path().string());
+  tools_image = env("MMLTK_TOOLS_IMAGE", "mmltk-tools:latest");
   image_name = env("MMLTK_IMAGE", "mmltk");
   validation_image = image_name + "-wayland-validation";
   build_image = env("MMLTK_BUILD_IMAGE", "mmltk-build:latest");
@@ -2816,7 +2954,20 @@ public:
    return 0;
   }
   rewrite_args();
-  if (tidy) {
+  if (build_tools) {
+   if (passthrough == Args{"--help"} || passthrough == Args{"-h"}) {
+    std::cout << "Usage: ./mmltk --build-tools\nBuild the standalone GCC 16.2/C++26 tools graph and publish build/tools/mmltk.\nUse --tidy-tools [--file PATH...] [--start-at PATH] for native tools analysis.\n";
+    return 0;
+   }
+   require(passthrough.empty(), "--build-tools does not accept application arguments");
+   mode = "build-tools";
+   prepare_logging(env("MMLTK_BUILD_LOG_FILE"));
+   acquire_mutation();
+   prepare_tools(true);
+   release_mutation();
+   return 0;
+  }
+  if (tidy || tidy_tools) {
    mode = "tidy";
    run_tidy();
    return 0;

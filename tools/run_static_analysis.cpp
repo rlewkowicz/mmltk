@@ -46,6 +46,7 @@ module;
 
 export module mmltk.tools.run_static_analysis;
 import mmltk.tools.cpp_support;
+import mmltk.tools.tool_command;
 import mmltk.tools.cpp_text;
 
 namespace {
@@ -254,7 +255,7 @@ void parallel(std::size_t count, std::size_t workers, Function operation) {
 }
 
 void usage(Output& output) {
-    output.write(R"(Usage: tools/run_static_analysis.cpp [--third_party] [--file <source>...] [--start-at <translation-unit>] [--rust-only] [--cppcheck-only]
+    output.write(R"(Usage: mmltk --tool run-static-analysis -- [--tools-only] [--third_party] [--file <source>...] [--start-at <translation-unit>] [--rust-only] [--cppcheck-only]
 
 Runs the Docker-backed static-analysis pass for this repo:
 1. Formats tracked first-party C/C++/CUDA files and, on full passes, the owned Rust frontend
@@ -263,6 +264,7 @@ Runs the Docker-backed static-analysis pass for this repo:
 4. Reports cppcheck disabled while its parser lacks C++26 reflection support
 
 Options:
+  --tools-only                  Analyze the standalone native tools graph
   --third_party                 Include tracked third_party sources except Firefox
   --file <source>...            Format a space-delimited set of tracked C/C++/CUDA
                                 sources or modules and analyze their translation units
@@ -289,6 +291,7 @@ struct Options {
     bool cppcheck_only = false;
     bool rust_only = false;
     bool third_party = false;
+    bool tools_only = false;
 };
 
 bool parse(Options& options, int argc, char** argv, Output& output) {
@@ -312,6 +315,8 @@ bool parse(Options& options, int argc, char** argv, Output& output) {
             options.cppcheck_only = true;
         } else if (argument == "--rust-only") {
             options.rust_only = true;
+        } else if (argument == "--tools-only") {
+            options.tools_only = true;
         } else if (argument == "--third_party") {
             options.third_party = true;
         } else {
@@ -322,6 +327,8 @@ bool parse(Options& options, int argc, char** argv, Output& output) {
         throw ToolError("--file and --start-at cannot be combined");
     if (options.cppcheck_only && !cppcheck_enabled)
         throw ToolError("--cppcheck-only is unavailable because cppcheck 2.21 cannot parse C++26 reflection");
+    if (options.tools_only && (options.rust_only || options.third_party))
+        throw ToolError("--tools-only cannot select Rust or third_party sources");
     if (options.rust_only && (!options.files.empty() || options.third_party || !options.start_at.empty()))
         throw ToolError("--rust-only cannot be combined with native analysis selections");
     return true;
@@ -366,6 +373,7 @@ void normalize_targets(Options& options, const Commands& commands) {
         if (std::none_of(format_extensions.begin(), format_extensions.end(),
                          [&](const auto& extension) { return file.ends_with(extension); }))
             throw ToolError("--file requires a C/C++/CUDA source, module, or header");
+        if (options.tools_only && !file.starts_with("tools/")) throw ToolError("--tidy-tools requires a source under tools/");
         if (file.starts_with("third_party/firefox/")) throw ToolError("--file does not support owned Firefox sources");
         if (!options.third_party && file.starts_with("third_party/"))
             throw ToolError("--file requires --third_party for third_party sources");
@@ -385,7 +393,9 @@ Arguments tracked_files(const Options& options, const Commands& commands, bool h
     if (headers) arguments.emplace_back("*.cuh");
     arguments.emplace_back(":(exclude)third_party/firefox/**");
     if (!options.third_party) arguments.emplace_back(":(exclude)third_party/**");
-    return split(commands.require(arguments, {}, Capture::Stdout), '\0', false);
+    auto files = split(commands.require(arguments, {}, Capture::Stdout), '\0', false);
+    if (options.tools_only) std::erase_if(files, [](const auto& path) { return !path.starts_with("tools/"); });
+    return files;
 }
 
 Arguments remove_deleted(Arguments files, const Options& options, const Commands& commands) {
@@ -499,6 +509,7 @@ struct Selection {
     json cppcheck_commands = json::array();
     Arguments reflection_units;
     std::set<std::string> reflection_targets;
+    std::map<std::string, std::string> reflection_objects;
     std::set<std::string> cuda_removed_args;
 };
 
@@ -541,6 +552,7 @@ Selection select_units(const Options& options, const Commands& commands, const f
                     target = rel;
                 }
                 selection.reflection_targets.insert(target.generic_string());
+                selection.reflection_objects.emplace(relative, target.generic_string());
             }
             return;
         }
@@ -614,7 +626,7 @@ int analyze(Options& options, Output& output, const Termination& termination) {
     }
     normalize_targets(options, commands);
     const auto cuda_home = env("CUDA_HOME");
-    if (cuda_home.empty()) throw ToolError("CUDA_HOME: container must provide the canonical CUDA root");
+    if (!options.tools_only && cuda_home.empty()) throw ToolError("CUDA_HOME: container must provide the canonical CUDA root");
     if (env("LD_LIBRARY_PATH").empty())
         throw ToolError("LD_LIBRARY_PATH: container must provide the canonical loader search order");
     const auto formatter = nonempty_env("MMLTK_CLANG_FORMAT", "clang-format");
@@ -622,24 +634,49 @@ int analyze(Options& options, Output& output, const Termination& termination) {
     const auto tidy = nonempty_env("MMLTK_CLANG_TIDY", "clang-tidy");
     if (!executable_available(tidy)) throw ToolError("clang-tidy is unavailable; rebuild the analysis image");
     const auto workers = worker_count(commands);
-    format_native(options, commands, output, formatter, workers);
-    if (options.files.empty()) format_rust(options, commands, output);
+    if (!options.tools_only) {
+        format_native(options, commands, output, formatter, workers);
+        if (options.files.empty()) format_rust(options, commands, output);
+    }
 
     const auto cppcheck_build = options.build_dir + "/cppcheck";
     const auto database = options.build_dir + "/compile_commands.json";
     fs::create_directories(options.build_dir);
     fs::create_directories(cppcheck_build);
     output.log("refreshing cached Ninja analysis build tree at " + options.build_dir);
-    commands.require({"cmake", "--fresh", "--preset", "analysis", "-B", options.build_dir}, options.repo_root);
+    if (options.tools_only)
+        commands.require({"cmake", "-S", options.repo_root + "/tools", "-B", options.build_dir,
+                          "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DMMLTK_TOOLS_BUILD_DRIVER=ON"});
+    else
+        commands.require({"cmake", "--fresh", "--preset", "analysis", "-B", options.build_dir}, options.repo_root);
     if (!fs::is_regular_file(database)) throw ToolError("missing compile_commands.json at " + database);
-    const Arguments invariants{"python3", options.repo_root + "/tools/check_toolchain_invariants.py",
-                               "--repo-root", options.repo_root, "--build-dir", options.build_dir};
-    commands.require(invariants);
+    const auto invariants = command::self_invocation(command::Command::check_toolchain_invariants,
+                               {"--repo-root", options.repo_root, "--build-dir", options.build_dir});
+    if (!options.tools_only) commands.require(invariants);
 
     TemporaryDirectory scratch("mmltk-tidy-");
     output.log("selecting tracked " + std::string(options.third_party ? "first-party and non-Firefox third_party" : "first-party") +
                " translation units from " + database);
     auto selection = select_units(options, commands, database, termination);
+    if (options.tools_only) {
+        auto formatting = options;
+        formatting.files = selection.clang_units;
+        formatting.files.insert(formatting.files.end(), selection.reflection_units.begin(), selection.reflection_units.end());
+        for (const auto& requested : options.files)
+            if (std::find(formatting.files.begin(), formatting.files.end(), requested) == formatting.files.end())
+                throw ToolError("file '" + requested + "' is not registered in the standalone driver graph; use its product or isolated image owner");
+        if (formatting.files.empty()) throw ToolError("no registered tools translation units found in " + database);
+        format_native(formatting, commands, output, formatter, workers);
+    }
+    if (options.tools_only && !options.start_at.empty()) {
+        const auto start = normalize_repo_path(options.start_at, options.repo_root);
+        const auto found = std::find(selection.reflection_units.begin(), selection.reflection_units.end(), start);
+        if (found == selection.reflection_units.end()) throw ToolError("start file '" + start + "' is not a registered tools translation unit");
+        selection.reflection_units.erase(selection.reflection_units.begin(), found);
+        selection.reflection_targets.clear();
+        for (const auto& file : selection.reflection_units)
+            selection.reflection_targets.insert(selection.reflection_objects.at(file));
+    }
     const auto project_path = scratch.path() / "cppcheck-project.json";
     write_json(project_path, selection.cppcheck_commands, -1);
     if (selection.clang_units.empty() && selection.reflection_units.empty())
@@ -658,10 +695,10 @@ int analyze(Options& options, Output& output, const Termination& termination) {
         build.insert(build.end(), selection.reflection_targets.begin(), selection.reflection_targets.end());
         build.insert(build.end(), {"--", "-k", "0"});
         reflection_failed = commands.invoke(build).exit_code != 0;
-        commands.require(invariants);
+        if (!options.tools_only) commands.require(invariants);
     }
 
-    if (!options.start_at.empty()) {
+    if (!options.tools_only && !options.start_at.empty()) {
         const auto start = normalize_repo_path(options.start_at, options.repo_root);
         if (!options.third_party && start.starts_with("third_party/"))
             throw ToolError("--start-at requires --third_party for third_party sources");

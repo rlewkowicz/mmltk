@@ -96,17 +96,19 @@ template<class Visitor> int visit(Command selected, Visitor&& visitor) {
 }
 
 inline std::vector<std::string> self_invocation(Command selected,
-        const std::vector<std::string>& arguments = {}, std::string_view argv0 = {}) {
-    std::vector<std::string> result{executable_path().string(), "--tool", std::string(name(selected))};
+        const std::vector<std::string>& arguments = {}, std::string_view argv0 = {},
+        std::string_view executable = {}) {
+    std::vector<std::string> result{executable.empty() ? executable_path().string() : std::string(executable), "--tool", std::string(name(selected))};
     if (!argv0.empty()) { result.emplace_back("--argv0"); result.emplace_back(argv0); }
     result.emplace_back("--");
     result.insert(result.end(), arguments.begin(), arguments.end());
     return result;
 }
 inline std::string shell_invocation(Command selected,
-        const std::vector<std::string>& arguments = {}, std::string_view argv0 = {}) {
+        const std::vector<std::string>& arguments = {}, std::string_view argv0 = {},
+        std::string_view executable = {}) {
     std::string result;
-    for (const auto& argument : self_invocation(selected, arguments, argv0)) {
+    for (const auto& argument : self_invocation(selected, arguments, argv0, executable)) {
         if (!result.empty()) result += ' ';
         result += shell_quote(argument);
     }

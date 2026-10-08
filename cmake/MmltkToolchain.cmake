@@ -136,15 +136,16 @@ foreach(MMLTK_COMPILER_LAUNCHER_LANGUAGE IN ITEMS C CUDA)
         "${MMLTK_CCACHE_PROGRAM}" CACHE FILEPATH
         "Required ${MMLTK_COMPILER_LAUNCHER_LANGUAGE} compiler launcher for mmltk builds" FORCE)
 endforeach()
-set(MMLTK_CXX_COMPILER_LAUNCHER
-    "${CMAKE_SOURCE_DIR}/tools/module_safe_compiler_launcher.sh")
+set(MMLTK_NATIVE_TOOLS_EXECUTABLE "${CMAKE_SOURCE_DIR}/build/tools/mmltk" CACHE FILEPATH
+    "Container-built native repository tools")
+set(MMLTK_CXX_COMPILER_LAUNCHER "${MMLTK_NATIVE_TOOLS_EXECUTABLE}")
 if(NOT IS_EXECUTABLE "${MMLTK_CXX_COMPILER_LAUNCHER}")
     message(FATAL_ERROR
         "Missing executable module-safe C++ compiler launcher: "
         "${MMLTK_CXX_COMPILER_LAUNCHER}")
 endif()
 set(CMAKE_CXX_COMPILER_LAUNCHER
-    "${MMLTK_CXX_COMPILER_LAUNCHER}" CACHE FILEPATH
+    "${MMLTK_CXX_COMPILER_LAUNCHER};--tool;module-safe-compiler-launcher;--" CACHE STRING
     "C++ compiler launcher that bypasses ccache for named-module compilations" FORCE)
 message(STATUS
     "Using ccache for ordinary compilation and direct compiler execution for C++ module BMIs")

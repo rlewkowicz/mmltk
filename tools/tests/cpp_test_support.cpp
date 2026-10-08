@@ -46,13 +46,15 @@ namespace mmltk::tools::testing {
 struct Case { std::string_view name; void (*run)(); };
 
 inline int run_cases(std::span<const Case> cases, int argc, char** argv) {
-    if (argc > 2) throw std::runtime_error("expected at most one case filter");
-    const std::string_view filter = argc > 1 ? argv[1] : "";
+    const bool pattern = argc == 3 && std::string_view(argv[1]) == "--test-name-pattern";
+    if (argc > 2 && !pattern) throw std::runtime_error("expected a case filter or --test-name-pattern PATTERN");
+    const std::string_view filter = pattern ? argv[2] : argc > 1 ? argv[1] : "";
+    const auto expression = pattern ? std::optional<std::regex>(std::string(filter)) : std::nullopt;
     const bool list = filter == "--list-tests";
     std::size_t selected = 0, failed = 0;
     for (const auto& test : cases) {
         if (list) { std::cout << test.name << '\n'; continue; }
-        if (test.name.find(filter) == std::string_view::npos) continue;
+        if (expression ? !std::regex_search(test.name.begin(), test.name.end(), *expression) : test.name.find(filter) == std::string_view::npos) continue;
         ++selected;
         try { test.run(); }
         catch (const std::exception& error) {
@@ -61,6 +63,7 @@ inline int run_cases(std::span<const Case> cases, int argc, char** argv) {
         }
     }
     if (list) return 0;
+    if (!selected && pattern) { std::cout << "0 cases selected\n"; return 0; }
     if (!selected) { std::cerr << "No matching tool cases\n"; return 2; }
     std::cout << selected - failed << '/' << selected << " cases passed\n";
     return failed == 0 ? 0 : 1;

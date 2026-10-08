@@ -28,7 +28,7 @@ if(BUILD_MMLTK_FIREFOX_RUNTIME)
 
     set(_mmltk_firefox_source_dir "${CMAKE_SOURCE_DIR}/third_party/firefox")
     set(_mmltk_firefox_mach "${_mmltk_firefox_source_dir}/mach")
-    set(_mmltk_traced_command "${CMAKE_SOURCE_DIR}/tools/run_traced_command.sh")
+    set(_mmltk_traced_command "${MMLTK_NATIVE_TOOLS_EXECUTABLE}")
     set(_mmltk_firefox_build_command
         "${CMAKE_CURRENT_SOURCE_DIR}/build_firefox_runtime.sh")
     if(NOT EXISTS "${_mmltk_firefox_mach}")

@@ -1,17 +1,28 @@
 # Validation image: retain the complete compatible NGC Python/CUDA environment.
 ARG MMLTK_NVIDIA_DONOR_IMAGE
+FROM mmltk_tools_build AS tools_build
 FROM ${MMLTK_NVIDIA_DONOR_IMAGE}
 ARG MMLTK_IMAGE_FINGERPRINT
 LABEL com.mmltk.input-fingerprint=${MMLTK_IMAGE_FINGERPRINT}
 COPY docker/nvidia-payload.json /opt/rfdetr-oracle/nvidia-payload.json
 COPY tools/rfdetr_oracle_requirements.txt /opt/rfdetr-oracle/requirements.txt
-COPY tools/generate_rfdetr_upstream_oracle.py /opt/rfdetr-oracle/producer.py
+COPY --from=tools_build /opt/gcc-16.2 /opt/gcc-16.2
+COPY --from=tools_build /opt/cmake /opt/cmake
+ENV PATH=/opt/gcc-16.2/bin:/opt/cmake/bin:${PATH} LD_LIBRARY_PATH=/opt/gcc-16.2/lib64:${LD_LIBRARY_PATH}
+RUN apt-get update && apt-get install -y --no-install-recommends ninja-build mold libssl-dev python3-dev && rm -rf /var/lib/apt/lists/*
+COPY tools /tmp/native-tools/tools
+COPY third_party/json/include /tmp/native-tools/third_party/json/include
+RUN cmake -S /tmp/native-tools/tools -B /tmp/oracle-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DMMLTK_TOOLS_BUILD_DRIVER=OFF -DMMLTK_TOOLS_BUILD_ORACLE=ON \
+    && cmake --build /tmp/oracle-build --target mmltk_rfdetr_upstream_oracle \
+    && cmake --install /tmp/oracle-build --prefix /opt/rfdetr-oracle --component Runtime \
+    && rm -rf /tmp/native-tools /tmp/oracle-build
 # --no-deps is intentional: pip must never resolve a replacement Torch, CUDA,
 # torchvision or Triton. The producer audits versions and genuine import closure.
 # A private overlay leaves donor packages (including distro-owned packages)
 # intact while making the pinned validation dependencies authoritative.
 ENV PYTHONPATH=/opt/rfdetr-oracle/python
-RUN python3 /opt/rfdetr-oracle/producer.py --payload-snapshot /opt/rfdetr-oracle/payload.json \
+RUN /opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle --payload-snapshot /opt/rfdetr-oracle/payload.json \
  && python3 -m pip install --target /opt/rfdetr-oracle/python --no-cache-dir --no-deps --only-binary=:all: -r /opt/rfdetr-oracle/requirements.txt \
- && python3 /opt/rfdetr-oracle/producer.py --check-environment
+ && /opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle --check-environment
 ENV PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
