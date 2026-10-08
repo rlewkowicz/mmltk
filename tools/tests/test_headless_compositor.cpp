@@ -48,7 +48,7 @@ module;
 #include <sys/stat.h>
 #include <sched.h>
 
-export module mmltk.tools.tests_test_headless_compositor;
+export module mmltk.tools.tests.test_headless_compositor;
 import mmltk.tools.tool_command;
 import mmltk.tools.cpp_linux;
 import mmltk.tools.cpp_support;
