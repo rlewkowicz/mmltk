@@ -567,11 +567,18 @@ TEST_CASE("Direct ONNX export replaces an old automatic companion with embedded 
  namespace r = mmltk::backend::models::rfdetr;
  namespace io = mmltk::common::io;
  const mmltk::testsupport::ScopedTempDir root("onnx-export-bundle");
- auto source = make_native_parity_fixture(parity_fixture_cases().front());
- source.metadata.class_layout = synthetic_training_layout(kParityFixtureNumClasses - 1);
  const auto weights = root.path() / "model.native.pt";
  const auto output = root.path() / "model.onnx";
  const auto companion = std::filesystem::path(output.string() + ".classes.json");
+ auto config = r::native_config_from_preset(r::model_presets().front());
+ config.resolution = 64;
+ config.num_classes = kParityFixtureNumClasses;
+ config.num_queries = 2;
+ config.num_select = 2;
+ const r::NativeRfDetrModel model(config, synthetic_training_layout(kParityFixtureNumClasses - 1));
+ r::DecodedNativeModelState source;
+ source.metadata = model_checkpoint_metadata(model, "onnx-export-test", weights.string());
+ source.replace_entries(clone_normalized_model_state(model));
  r::save_native_checkpoint(weights, source);
  {
   std::ofstream old(output);

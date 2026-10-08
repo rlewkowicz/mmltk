@@ -1588,7 +1588,7 @@ class Wrapper {
    data = "missing\n";
   return sha(std::move(data));
  }
- std::string package_hash(const std::string& path) { return get(native::self_invocation(Command::runtime_package, {"path-fingerprint", path})); }
+ std::string package_hash(const std::string& path) { return get(tool_arguments(Command::runtime_package, {"path-fingerprint", path}, self)); }
  bool package_complete(const std::string& path) { return package::complete(path); }
  void firefox_build_input() {
   const auto identity = image_id(toolchain_image);
@@ -1677,7 +1677,7 @@ class Wrapper {
   const auto id = image_id(runtime_base);
   nvidia_inputs();
   verify_nvidia(runtime_base, "runtime");
-  const auto package_result = capture(native::self_invocation(Command::runtime_package, {"fingerprint", stage}));
+  const auto package_result = capture(tool_arguments(Command::runtime_package, {"fingerprint", stage}, self));
   if (package_result.status) throw Exit{package_result.status};
   const auto input = sha("mmltk-runtime-image-v6\n" + id + "\n" + sha_files({repo + "/docker/Dockerfile.runtime", repo + "/tools/runtime_package.cpp"}) + package_result.out +
                          trim(read_optional(repo + "/build/tools/.inputs.sha256"))),

@@ -2854,6 +2854,10 @@ int package_docker(const Strings& args) {
 }
 struct PackageFixture : WrapperFixture {
  PackageFixture() : WrapperFixture("#!/bin/sh\nexec " + support::command::shell_invocation(support::command::Command::test_log_query, {"--fixture-package-docker"}) + " \"$@\"\n") {
+  const auto native = support::executable_path().parent_path();
+  fs::remove(wrapper);
+  fs::copy_file(native / "mmltk", wrapper);
+  fs::create_directory_symlink(native / "lib", root / "lib");
   options.env["TEST_PACKAGE_ROOT"] = root.string();
   options.env["PWD"] = root.string();
   options.env["MMLTK_USER"] = std::to_string(::getuid());
@@ -2861,7 +2865,7 @@ struct PackageFixture : WrapperFixture {
   fs::create_directory_symlink(repository() / "docker", root / "docker");
   for (const auto& entry : fs::directory_iterator(repository() / "tools"))
    if (entry.path().filename() != "bootstrap_mmltk.sh") fs::create_symlink(entry.path(), root / "tools" / entry.path().filename());
-  write("tools/bootstrap_mmltk.sh", "#!/bin/sh\nexit 0\n");
+  write("tools/bootstrap_mmltk.sh", "#!/bin/sh\nset -eu\ncp -p \"$2/mmltk\" \"$2/.mmltk-next\"\nmv -f \"$2/.mmltk-next\" \"$2/mmltk\"\nreadlink \"/proc/$PPID/exe\" >\"$2/replaced-wrapper\"\n");
   write("build/tools/.inputs.sha256", "fixture tools\n");
   fs::create_symlink(support::executable_path().parent_path() / "mmltk", root / "build/tools/mmltk");
   for (const auto* path :
@@ -2957,6 +2961,7 @@ void test_package_callers_preserve_status_output_and_publication() {
  f.options.env.erase("TEST_PACKAGE_FAIL");
  const auto result = f.invoke({"--build"});
  if (result.exit_code) throw Failure(result.err);
+ CHECK(support::read_text(f.root / "replaced-wrapper").ends_with(" (deleted)\n"));
  CHECK(support::runtime_package::complete(f.root / "build/release"));
  FALSE(fs::exists(f.root / "build/release/sentinel"));
  // The input stored in the image includes the command's exact digest newline.

@@ -1917,7 +1917,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
         invalidation.apply(widget);
     }
 
-    if needs_publish {
+    let action = if needs_publish {
         let publication = widget.next_publication.fetch_add(1, Ordering::Relaxed);
         *widget.pending_caption.lock().unwrap() = Some((caption_view, publication, state.cursor_caption.clone()));
         Some(shader::Action::publish(PlotUiMessage::RenderUpdate(
@@ -1940,7 +1940,19 @@ fn update_plot_program<const IS_CANVAS: bool>(
         )))
     } else {
         effects.needs_redraw.then(shader::Action::request_redraw)
-    }
+    };
+    action.map(|action| {
+        // A bound wheel gesture belongs to this plot, including when its
+        // camera update also publishes a new retained view to the application.
+        if matches!(event, iced::Event::Mouse(mouse::Event::WheelScrolled { .. }))
+            && widget.controls.scroll_action(state.modifiers).is_some()
+            && state.available_cursor_is_inside(cursor)
+        {
+            action.and_capture()
+        } else {
+            action
+        }
+    })
 }
 
 fn plot_mouse_interaction(state: &PlotState) -> Interaction {

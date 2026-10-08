@@ -51,6 +51,7 @@
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
@@ -122,13 +123,34 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  CHECK(terminal.detail.find("42.00 MiB") != std::string::npos);
  CHECK(terminal.detail.find("Reduce batch size or training lanes") != std::string::npos);
  CHECK(terminal.output.empty());
- CHECK(diagnostics.counters().accepted == (enabled ? (multiple ? 4U : 3U) : 0U));
+ if (!enabled) CHECK(diagnostics.counters().accepted == 0U);
  auto input = finish_training_diagnostics(diagnostics, diagnostic_path, enabled);
  if (!enabled) return;
  std::string line;
+ std::vector<nlohmann::json> events;
+ std::size_t progress_reads = 0;
+ bool reading_progress = false;
+ while (std::getline(input, line)) {
+  auto record = nlohmann::json::parse(line);
+  const auto event = record.at("event").get<std::string>();
+  if (event == "training.progress.read.begin") {
+   CHECK_FALSE(reading_progress);
+   reading_progress = true;
+  } else if (event == "training.progress.read.end") {
+   CHECK(reading_progress);
+   reading_progress = false;
+   ++progress_reads;
+  } else {
+   events.push_back(std::move(record));
+  }
+ }
+ CHECK_FALSE(reading_progress);
+ CHECK(progress_reads > 0U);
+ CHECK(diagnostics.counters().accepted == events.size() + 2U * progress_reads);
  const auto devices = multiple ? std::vector<int>{3, 1} : std::vector<int>{7};
+ REQUIRE(events.size() == devices.size() + 2U);
  for (std::size_t rank = 0U; rank < devices.size(); ++rank) {
-  const auto record = mmltk::testsupport::read_json_line(input);
+  const auto& record = events[rank];
   CHECK(record["event"] == "workflow.gpu_execution");
   CHECK(record["participant"] == "train");
   CHECK(record["sequence"] == 42U);
@@ -136,15 +158,14 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
   CHECK(record["detail"] == devices.size());
   CHECK(record["device"] == devices[rank]);
  }
- REQUIRE(static_cast<bool>(std::getline(input, line)));
- CHECK(nlohmann::json::parse(line).at("event") == "training.worker_failed");
+ line = events[devices.size()].dump();
+ CHECK(events[devices.size()].at("event") == "training.worker_failed");
  CHECK(line.find("CUDA out of memory") != std::string::npos);
- REQUIRE(static_cast<bool>(std::getline(input, line)));
+ line = events.back().dump();
  CHECK(line.find("training") != std::string::npos);
- CHECK(line.find("child.exited") != std::string::npos);
+ CHECK(events.back().at("event") == "child.exited");
  CHECK(line.find("CUDA out of memory") != std::string::npos);
  CHECK(line.find("batch_size=16 lanes=3") != std::string::npos);
- CHECK_FALSE(static_cast<bool>(std::getline(input, line)));
 }
 TEST_CASE("training operation reports preparation and native failures exactly once", "[controller][systems][training]") {
  const int failure_stage = GENERATE(0, 1, 2, 3, 4);

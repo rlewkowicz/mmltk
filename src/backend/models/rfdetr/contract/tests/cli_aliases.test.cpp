@@ -199,7 +199,7 @@ void test_train_device_grammar_and_conflicts_are_preserved() {
   // CLEANUP-IGNORE: The normalized blocks assert different required CLI errors, preserving independent option-validation oracles.
   const auto result = run_train_options(options);
   REQUIRE((result.exit_code == 1));
-  REQUIRE((result.output_text.find("accepts only one of --device-id or --device-ids") != std::string::npos));
+  REQUIRE((result.output_text.find("accepts only one of --device-id/--gpu or --device-ids") != std::string::npos));
  }
  for (const auto value : {"0,,2", "0,0", "-1", "zero", "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"}) {
   const auto result = run_train_options({"--device-ids", value});

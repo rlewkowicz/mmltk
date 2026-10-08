@@ -27,8 +27,9 @@ public:
  MatcherWorkspace workspace{placement_.numa_node, true};
 };
 inline void populate_target_views(PreparedTargets& result) {
+ result.targets.resize(result.counts.size());
  for (std::size_t image = 0; image < result.counts.size(); ++image) {
-  auto& target = result.targets.emplace_back();
+  auto& target = result.targets[image];
   target.boxes = result.all_boxes.narrow(0, result.offsets[image], result.counts[image]);
   target.labels = result.all_labels.narrow(0, result.offsets[image], result.counts[image]);
  }
