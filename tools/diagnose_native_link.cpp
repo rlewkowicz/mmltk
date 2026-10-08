@@ -1,5 +1,5 @@
+module;
 // Repeat one generated native link into independent diagnostic storage.
-#include "cpp_support.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -13,6 +13,34 @@
 #include <vector>
 
 #include <unistd.h>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <initializer_list>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+export module mmltk.tools.diagnose_native_link;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 using namespace mmltk::tools;
@@ -108,8 +136,6 @@ std::optional<Arguments> parse_arguments(int argc, char** argv) {
     if (!have_target) argument_error("the following arguments are required: target");
     return args;
 }
-
-
 
 std::string checked_output(const std::vector<std::string>& command, const fs::path& cwd = {}) {
     RunOptions options;
@@ -236,7 +262,7 @@ int diagnose(const Arguments& args) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_diagnose_native_link(int argc, char** argv) {
     try {
         const auto args = parse_arguments(argc, argv);
         return args ? diagnose(*args) : 0;

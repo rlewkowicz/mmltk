@@ -1,4 +1,4 @@
-#include "cpp_support.hpp"
+module;
 
 #include <cerrno>
 #include <cinttypes>
@@ -13,6 +13,35 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <array>
+#include <chrono>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <utility>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+export module mmltk.tools.run_traced_command;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 namespace support = mmltk::tools;
@@ -122,7 +151,7 @@ int run(int argc, char** argv) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_run_traced_command(int argc, char** argv) {
     try {
         return run(argc, argv);
     } catch (const support::ToolError& error) {

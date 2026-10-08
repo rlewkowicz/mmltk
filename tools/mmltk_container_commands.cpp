@@ -1,10 +1,10 @@
-#pragma once
-
+module;
 #include <string>
 #include <string_view>
 
-// Existing programs passed into containers. Host orchestration lives in mmltk.cpp.
+export module mmltk.tools.container_commands;
 
+export {
 namespace mmltk::container_commands {
 
 inline const std::string configure_release = R"MMLTK(         /workspace/tools/configure_cmake_graph.sh \
@@ -285,3 +285,5 @@ Compilation and execution each have a 120-second deadline.
 )MMLTK";
 
 } // namespace mmltk::container_commands
+
+}

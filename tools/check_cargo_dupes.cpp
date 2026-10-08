@@ -1,4 +1,4 @@
-#include "cpp_support.hpp"
+module;
 
 #include <algorithm>
 #include <exception>
@@ -6,6 +6,39 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <initializer_list>
+#include <optional>
+#include <string_view>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.check_cargo_dupes;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 
@@ -54,7 +87,7 @@ int check(int argc, char** argv) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_check_cargo_dupes(int argc, char** argv) {
     try {
         return check(argc, argv);
     } catch (const mmltk::tools::ToolError& error) {

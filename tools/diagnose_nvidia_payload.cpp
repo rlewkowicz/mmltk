@@ -1,6 +1,5 @@
+module;
 // Native counterpart of diagnose_nvidia_payload.py; inspect without mutation.
-#include "cpp_linux.hpp"
-#include "cpp_support.hpp"
 
 #include <cstdint>
 #include <dirent.h>
@@ -10,6 +9,46 @@
 #include <sched.h>
 #include <set>
 #include <sstream>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+export module mmltk.tools.diagnose_nvidia_payload;
+import mmltk.tools.cpp_linux;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 using namespace mmltk::tools;
@@ -293,7 +332,7 @@ std::string report_text(const json& report) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_diagnose_nvidia_payload(int argc, char** argv) {
     const std::string program = fs::path(argv[0]).filename().string();
     try {
         const auto wanted = arguments(argc, argv);

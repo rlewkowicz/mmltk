@@ -1,4 +1,4 @@
-#include "cpp_support.hpp"
+module;
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +26,28 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <nlohmann/json.hpp>
+#include <initializer_list>
+#include <optional>
+#include <array>
+#include <chrono>
+#include <climits>
+#include <cstring>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+export module mmltk.tools.run_static_analysis;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+
 namespace {
 
 using namespace mmltk::tools;
@@ -49,8 +71,6 @@ void set_environment(const char* name, const std::string& value) {
     if (::setenv(name, value.c_str(), 1) != 0)
         throw std::system_error(errno, std::generic_category(), "setenv");
 }
-
-
 
 class Output {
 public:
@@ -404,7 +424,6 @@ void format_native(const Options& options, const Commands& commands, Output& out
     if (status.load()) throw ToolError({}, status.load());
 }
 
-
 Arguments command_arguments(const json& entry) {
     if (entry.contains("arguments")) return entry.at("arguments").get<Arguments>();
     return shell_words(entry.at("command").get_ref<const std::string&>());
@@ -728,7 +747,7 @@ void report_failure(Output& output, std::string_view message) noexcept {
 
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_run_static_analysis(int argc, char** argv) {
     Output output;
     try {
         const Termination termination;

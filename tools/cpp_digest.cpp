@@ -1,12 +1,44 @@
-#pragma once
-
-#include "cpp_support.hpp"
-
+module;
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 #include <array>
-#include <memory>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
 #include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <memory>
 #include <openssl/evp.h>
 
+export module mmltk.tools.cpp_digest;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+
+export {
 namespace mmltk::tools {
 
 inline std::string hex_bytes(std::span<const unsigned char> bytes) {
@@ -80,3 +112,5 @@ private:
 };
 
 } // namespace mmltk::tools
+
+}

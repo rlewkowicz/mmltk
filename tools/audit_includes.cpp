@@ -1,11 +1,5 @@
+module;
 // Lexical evidence, not an include-what-you-use or semantic dependency checker.
-#include "audit_includes.hpp"
-
-#include "cleanup/cpd_patterns.hpp"
-#include "cleanup/declaration_patterns.hpp"
-#include "cpp_locale.hpp"
-#include "cpp_support.hpp"
-#include "generate_cleanup_json.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -18,6 +12,76 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+
+#include <functional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <limits>
+#include <unicode/ucol.h>
+#include <unicode/uloc.h>
+#include <unicode/utypes.h>
+#include <initializer_list>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <span>
+#include <system_error>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.audit_includes;
+import mmltk.tools.cleanup.cpd_patterns;
+import mmltk.tools.cleanup.declaration_patterns;
+import mmltk.tools.cpp_locale;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+import mmltk.tools.generate_cleanup_json;
+
+export {
+namespace mmltk::tools::include_audit {
+
+using Json = nlohmann::ordered_json;
+using SourceReader = std::function<std::string(const std::string&)>;
+using PathAvailable = std::function<bool(const std::string&)>;
+
+// Objects retain JavaScript Map insertion order. Contexts map source paths to
+// arrays; sources map paths to UTF-8 text; coverage maps PCH paths to arrays of
+// header names. Source offsets (including scan tokens/regions) count UTF-16
+// code units, matching the shared lexer and original audit reports.
+std::vector<std::string> commandWords(std::string_view command);
+Json compilationContexts(const Json& entries, std::string_view root,
+                         const SourceReader& reader = {}, const PathAvailable& available = {});
+Json scanIncludes(std::string_view source);
+Json attributeInclude(const Json& include, std::string_view path,
+                      const std::set<std::string>& paths, const Json& contexts,
+                      std::string_view root);
+Json repeatedBundles(const Json& files);
+Json pchReplacement(std::string_view path, std::string_view source, const Json& scan,
+                    const Json& contexts, const Json& coverage);
+Json buildIncludeReport(const std::vector<std::string>& paths, const Json& sources,
+                        const Json& contexts, std::string_view root);
+std::string renderIncludeMarkdown(const Json& report);
+Json parseIncludeArgs(const std::vector<std::string>& args);
+int main(const std::vector<std::string>& args);
+
+}  // namespace mmltk::tools::include_audit
+
+}
 
 namespace mmltk::tools::include_audit {
 namespace {
@@ -82,7 +146,6 @@ Json sortedFileRecords(const Json& records) {
   return result;
 }
 
-
 std::string join(const Json& array, std::string_view separator) {
   std::string result;
   bool first = true;
@@ -138,8 +201,6 @@ tgmath.h threads.h time.h uchar.h wchar.h wctype.h
 bool systemCategory(std::string_view category) {
   return category == "standard" || category == "linux-posix";
 }
-
-
 
 // Splicing precedes comment replacement, as in the JavaScript scan. The
 // returned text is solely for recognizing directives; edits retain originals.
@@ -813,8 +874,6 @@ int main(const std::vector<std::string>& args) {
 
 }  // namespace mmltk::tools::include_audit
 
-#if !defined(MMLTK_TOOLS_NO_MAIN) && !defined(MMLTK_AUDIT_INCLUDES_NO_MAIN)
-int main(int argc, char** argv) {
+export int mmltk_tool_audit_includes(int argc, char** argv) {
   return mmltk::tools::include_audit::main(std::vector<std::string>(argv + 1, argv + argc));
 }
-#endif

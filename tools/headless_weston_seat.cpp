@@ -1,3 +1,4 @@
+module;
 // Validation-only input capabilities for Ubuntu Weston 13.0.0-4build3.
 #include <libweston/libweston.h>
 #include <memory>
@@ -13,6 +14,9 @@ int weston_seat_init_pointer(weston_seat*);
 int weston_seat_init_keyboard(weston_seat*, xkb_keymap*);
 void weston_seat_release(weston_seat*);
 }
+
+export module mmltk.tools.headless_weston_seat;
+
 namespace {
 class HeadlessSeat final {
 public:
@@ -43,7 +47,7 @@ private:
  DestroyListener destroy_{};
 };
 }  // namespace
-extern "C" WL_EXPORT int wet_module_init(weston_compositor* compositor, int*, char*[]) {
+export int mmltk_headless_weston_seat(weston_compositor* compositor, int*, char*[]) {
  auto seat = std::unique_ptr<HeadlessSeat>(new (std::nothrow) HeadlessSeat(compositor));
  if (!seat || !seat->Install(compositor)) { return -1; }
  // The compositor's destroy listener now owns the seat and both devices.

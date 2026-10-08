@@ -1,6 +1,6 @@
+module;
 // Native counterpart of run_codex_actionplan.sh. Requires cpp_support.hpp and
 // the existing third_party/json/include headers; invokes only the Codex CLI.
-#include "cpp_support.hpp"
 
 #include <cerrno>
 #include <cstdlib>
@@ -9,6 +9,38 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <array>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.run_codex_actionplan;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 namespace support = mmltk::tools;
@@ -74,7 +106,7 @@ long long run_count(const char* argument) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_run_codex_actionplan(int argc, char** argv) {
     try {
         const long long runs = run_count(argc > 1 ? argv[1] : "");
         const auto root = support::repository_root(argv[0], __FILE__);

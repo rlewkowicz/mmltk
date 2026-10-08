@@ -1,3 +1,4 @@
+module;
 // Native counterpart of test_headless_compositor.py; no GPU is required.
 // Link tools/headless_compositor.cpp with MMLTK_HEADLESS_COMPOSITOR_NO_MAIN
 // and the existing third_party/json/include include directory. The wrapper
@@ -5,10 +6,6 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-
-#include "../cpp_linux.hpp"
-#include "../headless_compositor.hpp"
-#include "../cpp_support.hpp"
 
 #include <algorithm>
 #include <array>
@@ -40,6 +37,23 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <nlohmann/json.hpp>
+#include <climits>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <sys/stat.h>
+#include <sched.h>
+
+export module mmltk.tools.tests_test_headless_compositor;
+import mmltk.tools.tool_command;
+import mmltk.tools.cpp_linux;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+import mmltk.tools.headless_compositor;
 
 namespace {
 namespace native = mmltk::tools;
@@ -87,7 +101,7 @@ std::string replaced(std::string_view text, std::string_view old, std::string_vi
 }
 
 runner::Command fixture_command(std::initializer_list<std::string> arguments) {
-    runner::Command result{native::executable_path().string(), "--fixture"};
+    runner::Command result = native::command::self_invocation(native::command::Command::test_headless_compositor, {"--fixture"});
     result.insert(result.end(), arguments.begin(), arguments.end());
     return result;
 }
@@ -531,7 +545,7 @@ constexpr std::array cases{
 #undef HEADLESS_CASE
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_test_headless_compositor(int argc, char** argv) {
     try {
         if (argc >= 2 && std::string_view(argv[1]) == "--fixture")
             return run_fixture({argv + 2, argv + argc});

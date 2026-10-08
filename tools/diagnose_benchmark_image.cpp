@@ -1,7 +1,7 @@
+module;
 // Native counterpart of diagnose_benchmark_image.py. Link with libarchive and
 // libcrypto; cpp_support.hpp uses the existing third_party/json/include headers.
 // Compiled samples and raw masks retain their existing native helper owners.
-#include "cpp_digest.hpp"
 
 #include <archive.h>
 #include <archive_entry.h>
@@ -28,6 +28,30 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+#include <initializer_list>
+#include <cerrno>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <stdexcept>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.diagnose_benchmark_image;
+import mmltk.tools.cpp_digest;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 using mmltk::tools::ToolError;
@@ -380,8 +404,6 @@ json image_geometry(Bytes data) {
     return result;
 }
 
-
-
 void inspect_image(Bytes data, bool export_image, json identity) {
     if (data.size() > image_limit) throw ToolError("image exceeds diagnostic's 64 MiB bound");
     json record{{"kind", "image"}};
@@ -520,7 +542,7 @@ int run(int argc, char** argv) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_diagnose_benchmark_image(int argc, char** argv) {
     try { return run(argc, argv); }
     catch (const ToolError& error) {
         std::cerr << (error.status == 2 ? "diagnose_benchmark_image: error: " : "benchmark image diagnostic: ")

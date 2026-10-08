@@ -1,6 +1,7 @@
+module;
 // Native counterpart of diagnose_native_symbols.py. Requires PCRE2-8 (-lpcre2-8)
 // and the existing third_party/json/include headers; no Python runtime is used.
-#include "cpp_support.hpp"
+
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 
@@ -10,6 +11,40 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.diagnose_native_symbols;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 namespace support = mmltk::tools;
@@ -270,7 +305,7 @@ int diagnose(const Arguments& args, Pattern& pattern, const std::string& program
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_diagnose_native_symbols(int argc, char** argv) {
     const std::string program = fs::path(argv[0]).filename().string();
     try {
         const auto args = parse(argc, argv, program);

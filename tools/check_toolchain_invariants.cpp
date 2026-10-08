@@ -1,6 +1,6 @@
+module;
 // Native counterpart of check_toolchain_invariants.py. Compiler evidence is
 // consumed directly; no Python runtime or recorder process is required.
-#include "cpp_support.hpp"
 
 // A complete TOML parser preserves Cargo's quoted/dotted keys, inline tables,
 // string escapes and whole-document syntax validation.
@@ -23,6 +23,31 @@
 #include <vector>
 
 #include <unistd.h>
+
+#include <nlohmann/json.hpp>
+#include <initializer_list>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <fstream>
+#include <functional>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+export module mmltk.tools.check_toolchain_invariants;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 using namespace mmltk::tools;
@@ -675,7 +700,7 @@ int check(int argc, char** argv) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_check_toolchain_invariants(int argc, char** argv) {
     try { return check(argc, argv); }
     catch (const std::exception& error) {
         std::cerr << "mmltk: compiler invariant failure: " << error.what() << '\n';

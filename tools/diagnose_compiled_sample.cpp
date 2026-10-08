@@ -1,3 +1,4 @@
+module;
 // Invoked by the container-owned benchmark image diagnostic. Persisted layout
 // and trusted annotation views stay with the Dataset system's ordinary headers.
 #include "src/backend/data/compiled/compiled_file_utils.h"
@@ -17,7 +18,10 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-int main(int argc, char** argv) try {
+
+export module mmltk.tools.diagnose_compiled_sample;
+
+export int mmltk_tool_diagnose_compiled_sample(int argc, char** argv) try {
  if (argc != 3 && argc != 5) throw std::invalid_argument("expected compiled path, physical sample slot and optional opening worker count and cold-cache flag");
  namespace data = mmltk::backend::data;
  const auto parse_number = [](std::string_view text, const char* failure) {

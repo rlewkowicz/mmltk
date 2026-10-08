@@ -1,17 +1,17 @@
-#pragma once
-
-// Shared Linux support for the source-only C++ tool counterparts. JSON users
-// require the existing third_party/json/include directory on the include path.
+module;
 #include <nlohmann/json.hpp>
-#include "cpp_text.hpp"
-
+#include <cstddef>
 #include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 #include <array>
 #include <cerrno>
 #include <chrono>
 #include <climits>
 #include <csignal>
-#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -19,15 +19,10 @@
 #include <functional>
 #include <iterator>
 #include <map>
-#include <optional>
 #include <span>
 #include <stdexcept>
-#include <string>
-#include <string_view>
 #include <system_error>
 #include <utility>
-#include <vector>
-
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
@@ -37,6 +32,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+export module mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+
+export {
 namespace mmltk::tools {
 
 namespace fs = std::filesystem;
@@ -750,3 +749,5 @@ private:
 };
 
 } // namespace mmltk::tools
+
+}

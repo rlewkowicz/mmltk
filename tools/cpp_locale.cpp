@@ -1,19 +1,17 @@
-#pragma once
-
-// ICU's locale comparison is shared by the native cleanup/review reports.
-// Keep this separate from cpp_support.hpp: only collation users need ICU
-// headers and the icui18n/icuuc link dependencies.
+module;
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-
 #include <unicode/ucol.h>
 #include <unicode/uloc.h>
 #include <unicode/utypes.h>
 
+export module mmltk.tools.cpp_locale;
+
+export {
 namespace mmltk::tools {
 
 // Inputs are UTF-8; JSON keys containing isolated UTF-16 surrogates must escape
@@ -47,3 +45,5 @@ inline int locale_compare(std::string_view left, std::string_view right, bool en
 }
 
 }  // namespace mmltk::tools
+
+}

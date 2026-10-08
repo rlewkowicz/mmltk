@@ -1,8 +1,6 @@
+module;
 // Read-only Linux capability inspection, invoked in a container by ./mmltk.
 // CUDA/NUMA headers describe the real ABI; libraries remain optional at runtime.
-#include "cpp_linux.hpp"
-#include "cpp_time.hpp"
-#include "cpp_shared_library.hpp"
 
 #include <cuda.h>
 #include <numaif.h>
@@ -25,6 +23,48 @@
 #include <sys/sysmacros.h>
 #include <sys/utsname.h>
 
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+export module mmltk.tools.diagnose_dataset_io;
+import mmltk.tools.cpp_linux;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+import mmltk.tools.cpp_time;
+import mmltk.tools.cpp_shared_library;
+
 namespace {
 namespace support = mmltk::tools;
 namespace fs = std::filesystem;
@@ -33,8 +73,6 @@ using support::json;
 json unavailable(std::string reason) {
     return {{"status", "unavailable"}, {"reason", std::move(reason)}};
 }
-
-
 
 std::string os_error(int code, const fs::path& path) {
     return "[Errno " + std::to_string(code) + "] " + std::strerror(code) + ": " + mmltk::tools::text::byte_repr(path.string());
@@ -477,7 +515,7 @@ Arguments parse_arguments(int argc, char** argv) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_diagnose_dataset_io(int argc, char** argv) {
     const auto name = fs::path(argv[0]).filename().string();
     try {
         const auto arguments = parse_arguments(argc, argv);

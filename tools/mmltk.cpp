@@ -1,7 +1,5 @@
 // Native Linux host counterpart of ./mmltk. Container-side shell programs and
 // existing repository tools remain their own execution boundaries.
-#include "tools/cpp_support.hpp"
-#include "mmltk_container_commands.hpp"
 
 #include <algorithm>
 #include <array>
@@ -39,6 +37,19 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+#include <initializer_list>
+#include <climits>
+#include <fstream>
+#include <iterator>
+#include <span>
+#include <spawn.h>
+
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+import mmltk.tools.container_commands;
+import mmltk.tools.tool_command;
 
 namespace {
 namespace fs = std::filesystem;
@@ -2946,6 +2957,8 @@ public:
 } // namespace
 
 int main(int argc, char** argv) {
+ if (argc > 1 && std::string_view(argv[1]) == "--tool")
+  return mmltk::tools::command::entry(argc - 2, argv + 2);
  install_signals();
  try {
   Wrapper wrapper(argc, argv);

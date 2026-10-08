@@ -1,5 +1,4 @@
-#pragma once
-
+module;
 #include <cstddef>
 #include <algorithm>
 #include <initializer_list>
@@ -8,6 +7,9 @@
 #include <string_view>
 #include <vector>
 
+export module mmltk.tools.cpp_text;
+
+export {
 namespace mmltk::tools::text {
 
 inline bool oneOf(std::string_view value, std::initializer_list<std::string_view> choices) {
@@ -136,3 +138,5 @@ inline std::optional<std::string> decimal_integer(std::string_view text) {
 }
 
 } // namespace mmltk::tools::text
+
+}

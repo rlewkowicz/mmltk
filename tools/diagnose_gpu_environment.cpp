@@ -1,9 +1,8 @@
+module;
 // Native counterpart of diagnose_gpu_environment.py. Build with the existing
 // third_party/json/include, CUDA toolkit include directory, and Vulkan headers;
 // link libdl. CUDA and Vulkan are resolved only inside bounded child processes,
 // never linked as startup dependencies. No device/context/instance API is used.
-#include "cpp_time.hpp"
-#include "cpp_shared_library.hpp"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -20,6 +19,46 @@
 #include <dlfcn.h>
 #include <glob.h>
 #include <sys/utsname.h>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.diagnose_gpu_environment;
+import mmltk.tools.tool_command;
+import mmltk.tools.cpp_time;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+import mmltk.tools.cpp_shared_library;
 
 namespace {
 using mmltk::tools::json;
@@ -50,7 +89,6 @@ constexpr std::array version_queries{
 
 // Match Python's UTF-8 replacement decoding before parsing manifests or
 // trimming command output, including an incomplete codepoint at the byte cap.
-
 
 std::string bounded_text(std::string_view value, std::size_t characters = text_limit) {
     auto text = support::text::decode_utf8(value);
@@ -283,7 +321,7 @@ json loaded_versions(const json& inventory) {
             }
             if (!exact && candidate) requested = *candidate;
         }
-        const auto receipt = command({support::executable_path().string(), "--library-version", query.name, requested});
+        const auto receipt = command(support::command::self_invocation(support::command::Command::diagnose_gpu_environment, {"--library-version", query.name, requested}));
         if (receipt.at("status") != "observed" || receipt.value("truncated", false)) {
             versions[query.name] = receipt;
             continue;
@@ -487,7 +525,7 @@ void print_json(const json& value, int indent = -1) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_diagnose_gpu_environment(int argc, char** argv) {
     try {
         if (argc == 4 && std::string_view(argv[1]) == "--library-version") {
             for (const auto& query : version_queries) {

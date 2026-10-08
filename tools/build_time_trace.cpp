@@ -1,4 +1,4 @@
-#include "cpp_support.hpp"
+module;
 
 #include <algorithm>
 #include <array>
@@ -26,6 +26,26 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <nlohmann/json.hpp>
+#include <initializer_list>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <functional>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+export module mmltk.tools.build_time_trace;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 
@@ -797,7 +817,7 @@ int execute(int argc, char** argv) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_build_time_trace(int argc, char** argv) {
     try {
         return execute(argc, argv);
     } catch (const ToolError& error) {

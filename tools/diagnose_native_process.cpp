@@ -1,7 +1,44 @@
+module;
 // Inspect or terminate one exact native process inside its wrapper container.
-#include "cpp_support.hpp"
 
 #include <iostream>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.diagnose_native_process;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 namespace support = mmltk::tools;
@@ -222,7 +259,7 @@ int diagnose(const Arguments& args) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_diagnose_native_process(int argc, char** argv) {
     const auto program = fs::path(argv[0]).filename().string();
     try {
         const auto arguments = parse(argc, argv, program);

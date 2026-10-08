@@ -207,11 +207,11 @@ test("frontend inventory unions tracked and untracked-unignored files", () => {
   ]);
   assert.equal(inventory.untrackedCandidateCount, 2);
   const tools = buildInventory(CLEANUP_PROFILES.tools, {
-    tracked: ["mmltk.cpp", "mmltk_container_commands.hpp", "tools/a.cpp", "tools/deleted.cpp", "src/a.cpp", "tools/a.mjs", "tools/build/a.cpp", "tools/generated/a.hpp"],
+    tracked: ["tools/mmltk.cpp", "tools/mmltk_container_commands.cpp", "tools/a.cpp", "tools/module.cppm", "tools/deleted.cpp", "src/a.cpp", "tools/a.mjs", "tools/build/a.cpp", "tools/generated/a.hpp"],
     untracked: ["tools/new.hpp", "tools/tests/new.cpp", "tools/third_party/a.cpp"],
     deleted: ["tools/deleted.cpp"],
   }, () => true);
-  assert.deepEqual(tools.scannedFiles, ["mmltk.cpp", "mmltk_container_commands.hpp", "tools/a.cpp", "tools/new.hpp", "tools/tests/new.cpp"]);
+  assert.deepEqual(tools.scannedFiles, ["tools/a.cpp", "tools/mmltk.cpp", "tools/mmltk_container_commands.cpp", "tools/module.cppm", "tools/new.hpp", "tools/tests/new.cpp"]);
 });
 
 test("inventory rejects unavailable and newline paths", () => {

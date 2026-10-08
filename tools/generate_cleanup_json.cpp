@@ -1,14 +1,5 @@
-// Native cleanup and raw declaration evidence. Link this translation unit with
-// cleanup/{cpd,declaration,review}_patterns.cpp, libcrypto, ICU i18n/uc and threads.
-// Define MMLTK_TOOLS_NO_MAIN (or MMLTK_GENERATE_CLEANUP_JSON_NO_MAIN) for consumers.
-#include "cpp_time.hpp"
-#include "generate_cleanup_json.hpp"
-
-#include "cleanup/cpd_patterns.hpp"
-#include "cleanup/declaration_patterns.hpp"
-#include "cleanup/review_patterns.hpp"
-#include "cpp_locale.hpp"
-#include "cpp_digest.hpp"
+module;
+// Native cleanup and raw declaration evidence.
 
 #include <algorithm>
 #include <cerrno>
@@ -33,6 +24,152 @@
 #include <openssl/evp.h>
 #include <sched.h>
 
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <array>
+#include <climits>
+#include <csignal>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <system_error>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cstdint>
+#include <unicode/ucol.h>
+#include <unicode/uloc.h>
+#include <unicode/utypes.h>
+
+export module mmltk.tools.generate_cleanup_json;
+import mmltk.tools.cpp_time;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+import mmltk.tools.cleanup.cpd_patterns;
+import mmltk.tools.cleanup.declaration_patterns;
+import mmltk.tools.cleanup.review_patterns;
+import mmltk.tools.cpp_locale;
+import mmltk.tools.cpp_digest;
+
+export {
+namespace mmltk::tools::cleanup {
+
+using Json = nlohmann::ordered_json;
+using SourceReader = std::function<std::string(const std::string&)>;
+using PathAvailable = std::function<bool(const std::string&)>;
+using Clock = std::function<std::string()>;
+using Range = std::array<std::int64_t, 2>;
+using RangesByFile = std::map<std::string, std::vector<Range>>;
+using Suppressions = std::map<std::string, Json>;
+
+extern const std::filesystem::path REPO_ROOT;
+extern const Json INVENTORY_COMMANDS;
+extern const Json CLEANUP_PROFILES;
+extern const Json AUTHORED_PROFILE;
+
+std::size_t availableThreads();
+std::string usageText();
+Json rawCpdProfile(double minTokens = 12, std::string_view profileName = "cpp");
+Json parseArgs(const std::vector<std::string>& args);
+std::optional<std::string> authoredLanguage(std::string_view path);
+bool profileIncludesPath(const Json& profile, std::string_view path);
+
+struct DetectorOptions {
+  std::optional<std::size_t> threads;
+  std::optional<std::string> fileList;
+};
+Json detectorArguments(const Json& profile, const DetectorOptions& options = {});
+Json collectInventoryInputs();
+Json buildInventory(const Json& profile, const Json& inputs,
+                    const PathAvailable& pathAvailable = {});
+
+std::string decodeXmlAttribute(std::string_view value);
+Json parseXmlAttributes(std::string_view tag);
+struct ParseXmlOptions {
+  std::optional<std::vector<std::string>> expectedPaths;
+  std::function<std::string(const std::string&)> normalizePath;
+};
+Json parseCpdXml(std::string_view xml, const ParseXmlOptions& options = {});
+
+struct SnapshotEntry {
+  std::string source;
+  std::string sha256;
+};
+using Snapshot = std::map<std::string, SnapshotEntry>;
+Snapshot sourceSnapshot(const std::vector<std::string>& paths);
+void requireUnchangedSources(const Snapshot& snapshot);
+Json runCpd(const Json& profile, const std::vector<std::string>& paths);
+Json runCpd(const Json& profile, const std::vector<std::string>& paths,
+            const Snapshot& snapshot);
+
+std::string repoRelativePath(std::string_view path,
+                             std::string_view repoRoot = REPO_ROOT.native());
+std::vector<Range> mergeOverlappingRanges(std::vector<Range> ranges);
+std::string commonDirectory(const std::vector<std::string>& paths);
+Json makeHit(std::int64_t lineCount, std::optional<std::int64_t> tokenCount,
+             const RangesByFile& rangesByFile, bool mergeRanges);
+Json structuralHits(const Json& profile, const Json& duplications,
+                    const std::vector<std::string>& scannedPaths,
+                    std::string_view repoRoot = REPO_ROOT.native());
+std::int64_t duploLineCount(const Json& hit);
+Json duploOccurrence(const Json& hit, int side);
+std::string stripCommentsAndStrings(std::string_view source);
+Json filterDuploCandidates(const Json& profile, const Json& rawHits,
+                           const SourceReader& sourceReader = {});
+Json compactDuploHits(const Json& profile, const Json& rawHits,
+                      const std::vector<std::string>& scannedPaths);
+int compareHits(const Json& left, const Json& right);
+Json summarize(const Json& hits);
+Suppressions parseInlineSuppressions(std::string_view path, std::string_view source);
+Json applyInlineSuppressions(const Json& hits, const Suppressions& suppressions,
+                              std::string_view detector);
+void requireAtomicSuppressionUse(const Json& suppressedOccurrences);
+Json parseDuploJson(std::string_view text);
+
+// Input contains the original report fields, with an optional integer threads.
+// The injected clock supplies an ISO-8601 timestamp (UTC, millisecond precision).
+Json buildReport(const Json& input, const Clock& clock = {});
+std::string serializeReport(const Json& report);
+Json rejectionReport(const Json& previous, const Json& report,
+                      const Json& filteredCpd);
+void writeAtomic(const std::filesystem::path& path, std::string_view contents);
+
+struct GenerateReportOptions {
+  Clock clock;
+  std::optional<Json> inventoryInputs;
+  PathAvailable pathAvailable;
+};
+Json generateReport(const Json& profile, const GenerateReportOptions& options = {});
+Json rawCpdReport(const Json& profile, const Json& files, const Json& cpd,
+                  const SourceReader& sourceReader = {});
+struct GenerateRawCpdOptions {
+  bool review = false;
+  std::optional<Json> inventoryInputs;
+  // A JSON return value retains validation of non-string renderer results.
+  std::function<Json(const Json&)> renderMarkdown;
+};
+Json generateRawCpd(const Json& profile, std::string_view output,
+                    const GenerateRawCpdOptions& options = {});
+int main(const std::vector<std::string>& args);
+
+}  // namespace mmltk::tools::cleanup
+
+}
+
 namespace mmltk::tools::cleanup {
 namespace {
 
@@ -54,8 +191,6 @@ std::string lowerAscii(std::string value) {
   for (auto& ch : value) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + ('a' - 'A'));
   return value;
 }
-
-
 
 bool startsAny(std::string_view value, const Json& prefixes) {
   return std::any_of(prefixes.begin(), prefixes.end(), [&](const Json& prefix) {
@@ -182,9 +317,9 @@ Json toolsProfile() {
   profile["selector"] = "--tools";
   profile["output"] = "cleanup/tools-code-deduplication.json";
   profile["purpose"] = "Native tool and wrapper duplication cleanup for shared helpers, classes, and factories";
-  profile["includedDescription"] = "Git-tracked and untracked-unignored native sources and headers under tools/, plus mmltk.cpp and mmltk_container_commands.hpp";
+  profile["includedDescription"] = "Git-tracked and untracked-unignored native modules, sources, and headers under tools/, including the driver and fixtures";
   profile["includedPrefix"] = "tools/";
-  profile["includedFiles"] = {"mmltk.cpp", "mmltk_container_commands.hpp"};
+  profile["includedFiles"] = Json::array();
   profile["exclusionRules"] = {"worktree-deleted paths", "Git-ignored paths", "third-party, build, target, dist, and generated output"};
   profile["detectorExcludedPrefixes"] = Json::array();
   profile["retainedGeneratedPaths"] = Json::array();
@@ -259,7 +394,7 @@ std::string usageText() {
       "the corresponding cleanup/*-code-deduplication.json report.\n\n"
       "  --cpp       C/C++/CUDA: Duplo 6 lines; C++ CPD 39 tokens\n"
       "  --frontend  Iced Rust: Duplo 9 lines; Rust CPD 75 tokens\n"
-      "  --tools     Native tools/ sources and headers, mmltk.cpp, and mmltk_container_commands.hpp; C++ detector settings\n"
+      "  --tools     Native tools/ modules, sources, headers, driver, and fixtures; C++ detector settings\n"
       "              Writes cleanup/tools-code-deduplication.json for shared-helper, class, and factory cleanup\n"
       "  --raw-cpd [--tools] [--review] [--min-tokens N] [--output PATH]  Standalone unfiltered C++ CPD (default 12 tokens)\n"
       "  Raw mode retains every match, ignores no literal sequences/blocks or inline suppressions,\n"
@@ -1532,8 +1667,6 @@ int main(const std::vector<std::string>& args) {
 
 }  // namespace mmltk::tools::cleanup
 
-#if !defined(MMLTK_TOOLS_NO_MAIN) && !defined(MMLTK_GENERATE_CLEANUP_JSON_NO_MAIN)
-int main(int argc, char** argv) {
+export int mmltk_tool_generate_cleanup_json(int argc, char** argv) {
   return mmltk::tools::cleanup::main(std::vector<std::string>(argv + 1, argv + argc));
 }
-#endif

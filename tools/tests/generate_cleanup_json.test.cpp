@@ -1,14 +1,9 @@
+module;
+#include "cpp_test_macros.hpp"
 // Native counterpart of generate_cleanup_json.test.mjs: all 40 original cases.
-// Link generate_cleanup_json.cpp with MMLTK_TOOLS_NO_MAIN and
-// cleanup/{cpd,declaration,review}_patterns.cpp, libcrypto, ICU i18n/uc, threads;
-// include third_party/json/include. Run from the repository root. The first
+// Run from the repository root. The first
 // case requires the configured real PMD; the failure fixture reexecutes this
 // native test binary as a fake detector. No JavaScript runtime is used.
-#include "../generate_cleanup_json.hpp"
-#include "../cleanup/cpd_patterns.hpp"
-#include "../cleanup/declaration_patterns.hpp"
-
-#include "cpp_test_support.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -30,18 +25,44 @@
 #include <vector>
 #include <unistd.h>
 
+#include <array>
+#include <cstdint>
+#include <nlohmann/json.hpp>
+#include <set>
+#include <initializer_list>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstring>
+#include <span>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <exception>
+
+export module mmltk.tools.tests.generate_cleanup_json_test;
+import mmltk.tools.generate_cleanup_json;
+import mmltk.tools.cleanup.cpd_patterns;
+import mmltk.tools.cleanup.declaration_patterns;
+import mmltk.tools.tests.cpp_test_support;
+import mmltk.tools.tool_command;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+
 namespace cleanup_test {
 namespace fs = std::filesystem;
 using namespace mmltk::tools::cleanup;
 using mmltk::tools::cpd::filterCpdCandidates;
 using mmltk::tools::declarations::sourceOccurrence;
 
-
-const auto& cpp = CLEANUP_PROFILES.at("cpp");
-const auto& frontend = CLEANUP_PROFILES.at("frontend");
-mmltk::tools::testing::Suite suite;
+const auto& cpp() { return CLEANUP_PROFILES.at("cpp"); }
+const auto& frontend() { return CLEANUP_PROFILES.at("frontend"); }
 using namespace mmltk::tools::testing;
-
 
 using Environment = mmltk::tools::ScopedEnvironment;
 // An external process fixture only: capture argv and emit the prescribed PMD
@@ -102,14 +123,14 @@ void copiesRemoved(const Json& arguments) {
   CHECK(!fs::exists(fs::path(std::next(option)->get<std::string>()).parent_path()));
 }
 
-TEST_CASE("raw CPD includes real PMD-suppressed code with original paths, columns, literals and CRLF", real_pmd) {
+void real_pmd() {
   const mmltk::tools::TemporaryDirectory directory("mmltk-cpd-source-");
   const std::string body = "int repeated(int value) {\r\n  const char* marker = \"CPD-OFF\";\r\n  int result = value * value + 3;\r\n  return result + value + marker[0];\r\n}\r\n";
   const std::vector<std::string> paths{(directory.path() / "suppressed.cpp").string(), (directory.path() / "ordinary.cpp").string()};
   const std::vector<std::string> sources{"// CPD-OFF\r\n" + body + "// CPD-ON\r\n", "// ordinary source\r\n" + body};
   for (std::size_t index = 0; index < paths.size(); ++index) mmltk::tools::write_text(paths[index], sources[index]);
   const auto raw = parseArgs({"--raw-cpd"}).at("profile");
-  auto normal = cpp;
+  auto normal = cpp();
   normal["cpd"]["minTokens"] = 12;
   normal["cpd"]["flags"] = Json::array();
   CHECK(!runCpd(normal, paths).at("duplications").empty());
@@ -146,7 +167,7 @@ TEST_CASE("raw CPD includes real PMD-suppressed code with original paths, column
   throws([&] { runCpd(raw, {invalid.string()}); }, "status 5|could not lex|incomplete raw source coverage");
 }
 
-TEST_CASE("raw CPD rejects partial detector runs without replacing a complete report and removes scan copies", partial_detector) {
+void partial_detector() {
   const mmltk::tools::TemporaryDirectory directory("mmltk-cpd-failure-");
   const auto capture = directory.path() / "arguments.json";
   const auto output = directory.path() / "report.json";
@@ -162,7 +183,9 @@ TEST_CASE("raw CPD rejects partial detector runs without replacing a complete re
     result["capture"] = capture.string();
     const Environment fixture("MMLTK_CLEANUP_TEST_PMD_FIXTURE", result.dump());
     auto profile = parseArgs({"--raw-cpd"}).at("profile");
-    profile["cpd"]["binary"] = fs::read_symlink("/proc/self/exe").string();
+    const auto binary = directory.path() / "pmd";
+    write_fixture_program(binary, mmltk::tools::command::Command::test_generate_cleanup_json);
+    profile["cpd"]["binary"] = binary.string();
     if (result.value("complete", false)) runCpd(profile, {"src/frameworks/reflection/declaration_annotations.h"});
     else throws([&] {
       GenerateRawCpdOptions options;
@@ -174,7 +197,7 @@ TEST_CASE("raw CPD rejects partial detector runs without replacing a complete re
   }
 }
 
-TEST_CASE("empty raw CPD inventories complete without launching a detector", empty_inventory) {
+void empty_inventory() {
   auto profile = parseArgs({"--raw-cpd"}).at("profile");
   profile["cpd"]["binary"] = "/nonexistent/pmd";
   const auto result = runCpd(profile, {});
@@ -182,14 +205,14 @@ TEST_CASE("empty raw CPD inventories complete without launching a detector", emp
   CHECK(result.at("duplications") == Json::array());
 }
 
-TEST_CASE("profiles and arguments select exactly one frozen configuration", profiles) {
-  CHECK(parseArgs({}).at("profile") == cpp);
-  CHECK(parseArgs({"--cpp"}).at("profile") == cpp);
-  CHECK(parseArgs({"--frontend"}).at("profile") == frontend);
+void profiles() {
+  CHECK(parseArgs({}).at("profile") == cpp());
+  CHECK(parseArgs({"--cpp"}).at("profile") == cpp());
+  CHECK(parseArgs({"--frontend"}).at("profile") == frontend());
   CHECK(parseArgs({"--tools"}).at("profile") == CLEANUP_PROFILES.at("tools"));
   CHECK(parseArgs({"--help"}).at("kind") == "help");
   static_assert(std::is_const_v<std::remove_reference_t<decltype(CLEANUP_PROFILES)>>);
-  static_assert(std::is_const_v<std::remove_reference_t<decltype(frontend.at("cpd"))>>);
+  static_assert(std::is_const_v<std::remove_reference_t<decltype(frontend().at("cpd"))>>);
   const auto snapshot = CLEANUP_PROFILES;
   auto selected = parseArgs({"--frontend"});
   selected["profile"]["cpd"]["minTokens"] = 1;
@@ -199,7 +222,7 @@ TEST_CASE("profiles and arguments select exactly one frozen configuration", prof
     throws([&] { parseArgs(args); });
 }
 
-TEST_CASE("inventory commands are exact and frozen", inventory_commands) {
+void inventory_commands() {
   CHECK(INVENTORY_COMMANDS.at("tracked") == Json::array({"git", "ls-files", "-z"}));
   CHECK(INVENTORY_COMMANDS.at("untracked") == Json::array({"git", "ls-files", "--others", "--exclude-standard", "-z"}));
   CHECK(INVENTORY_COMMANDS.at("deleted") == Json::array({"git", "ls-files", "--deleted", "-z"}));
@@ -207,20 +230,20 @@ TEST_CASE("inventory commands are exact and frozen", inventory_commands) {
   static_assert(std::is_const_v<std::remove_reference_t<decltype(INVENTORY_COMMANDS.at("untracked"))>>);
 }
 
-TEST_CASE("detector commands exactly encode each profile", detector_commands) {
-  CHECK(detectorArguments(cpp, {.threads = 3, .fileList = "/f"}) == R"json({
+void detector_commands() {
+  CHECK(detectorArguments(cpp(), {.threads = 3, .fileList = "/f"}) == R"json({
     "duplo":["-j","3","-ml","6","-ip","-json","-","-"],
     "cpd":["cpd","--file-list","/f","--language","cpp","--minimum-tokens","39","--ignore-identifiers","--ignore-literal-sequences","--format","xml","--no-fail-on-violation"]
   })json"_fixture);
-  CHECK(detectorArguments(frontend, {.threads = 4, .fileList = "/rust"}) == R"json({
+  CHECK(detectorArguments(frontend(), {.threads = 4, .fileList = "/rust"}) == R"json({
     "duplo":["-j","4","-ml","9","-json","-","-"],
     "cpd":["cpd","--file-list","/rust","--language","rust","--minimum-tokens","75","--format","xml","--no-fail-on-violation"]
   })json"_fixture);
 }
 
-TEST_CASE("frontend inventory unions tracked and untracked-unignored files", frontend_inventory) {
+void frontend_inventory() {
   // Ignored files are absent from git ls-files --others --exclude-standard.
-  const auto inventory = buildInventory(frontend, R"json({
+  const auto inventory = buildInventory(frontend(), R"json({
     "tracked":["src/frontend/iced/src/app.rs","src/frontend/iced/src/deleted.rs","src/frontend/iced/src/generated.rs","src/frontend/iced/target/debug/generated.rs","src/frontend/iced/third_party/dependency.rs","src/controller/not_frontend.rs"],
     "untracked":["src/frontend/iced/src/new.rs","src/frontend/iced/generated/bindings.rs"],
     "deleted":["src/frontend/iced/src/deleted.rs"]
@@ -231,34 +254,34 @@ TEST_CASE("frontend inventory unions tracked and untracked-unignored files", fro
   CHECK(inventory.at("excludedGeneratedOutput") == Json::array({"src/frontend/iced/generated/bindings.rs"}));
   CHECK(inventory.at("untrackedCandidateCount") == 2);
   const auto tools = buildInventory(CLEANUP_PROFILES.at("tools"), R"json({
-    "tracked":["mmltk.cpp","mmltk_container_commands.hpp","tools/a.cpp","tools/deleted.cpp","src/a.cpp","tools/a.mjs","tools/build/a.cpp","tools/generated/a.hpp"],
+    "tracked":["tools/mmltk.cpp","tools/mmltk_container_commands.cpp","tools/a.cpp","tools/module.cppm","tools/deleted.cpp","src/a.cpp","tools/a.mjs","tools/build/a.cpp","tools/generated/a.hpp"],
     "untracked":["tools/new.hpp","tools/tests/new.cpp","tools/third_party/a.cpp"],
     "deleted":["tools/deleted.cpp"]
   })json"_fixture, [](const std::string&) { return true; });
-  CHECK(tools.at("scannedFiles") == Json::array({"mmltk.cpp", "mmltk_container_commands.hpp", "tools/a.cpp", "tools/new.hpp", "tools/tests/new.cpp"}));
+  CHECK(tools.at("scannedFiles") == Json::array({"tools/a.cpp", "tools/mmltk.cpp", "tools/mmltk_container_commands.cpp", "tools/module.cppm", "tools/new.hpp", "tools/tests/new.cpp"}));
 
 }
 
-TEST_CASE("inventory rejects unavailable and newline paths", invalid_inventory) {
+void invalid_inventory() {
   const auto input = R"json({"tracked":["src/frontend/iced/src/missing.rs"],"untracked":[],"deleted":[]})json"_fixture;
-  throws([&] { buildInventory(frontend, input, [](const std::string&) { return false; }); });
-  throws([&] { buildInventory(frontend,
+  throws([&] { buildInventory(frontend(), input, [](const std::string&) { return false; }); });
+  throws([&] { buildInventory(frontend(),
     R"json({"tracked":["src/frontend/iced/src/bad\nname.rs"],"untracked":[],"deleted":[]})json"_fixture,
     [](const std::string&) { return true; }); });
 }
 
-TEST_CASE("Duplo and CPD fixture parsers preserve source ranges", parsers) {
+void parsers() {
   const auto duplo = parseDuploJson(R"json([{"LineCount":9,"SourceFile1":"src/frontend/iced/src/a.rs","StartLineNumber1":2,"EndLineNumber1":10,"SourceFile2":"src/frontend/iced/src/b.rs","StartLineNumber2":4,"EndLineNumber2":12,"Lines":["x"]}])json");
-  const auto compacted = compactDuploHits(frontend, duplo, {"src/frontend/iced/src/a.rs", "src/frontend/iced/src/b.rs"});
+  const auto compacted = compactDuploHits(frontend(), duplo, {"src/frontend/iced/src/a.rs", "src/frontend/iced/src/b.rs"});
   CHECK(compacted.at(0).at("kind") == "cross-file");
   CHECK(compacted.at(0).at("line_count") == 9);
   const auto cpd = parseCpdXml(R"xml(<?xml version="1.0"?><pmd-cpd><duplication lines="8" tokens="75"><file line="2" endline="9" path="/repo/src/frontend/iced/src/a.rs"/><file line="6" endline="13" path="/repo/src/frontend/iced/src/b.rs"/><codefragment><![CDATA[x]]></codefragment></duplication></pmd-cpd>)xml");
-  const auto structural = structuralHits(frontend, cpd, {"src/frontend/iced/src/a.rs", "src/frontend/iced/src/b.rs"}, "/repo");
+  const auto structural = structuralHits(frontend(), cpd, {"src/frontend/iced/src/a.rs", "src/frontend/iced/src/b.rs"}, "/repo");
   CHECK(structural.at(0).at("token_count") == 75);
   CHECK(structural.at(0).at("files").at(1).at("lines") == Json::array({Json::array({6, 13})}));
 }
 
-TEST_CASE("shared sorting and inline suppression retain two occurrences", sorting_and_suppression) {
+void sorting_and_suppression() {
   const auto within = R"json({"kind":"within-file","line_count":10,"file_count":1,"occurrence_count":2,"files":[{"path":"src/frontend/iced/src/z.rs","lines":[[1,10],[20,29]]}]})json"_fixture;
   const auto cross = R"json({"kind":"cross-file","line_count":9,"file_count":3,"occurrence_count":3,"files":[{"path":"src/frontend/iced/src/a.rs","lines":[[2,10]]},{"path":"src/frontend/iced/src/b.rs","lines":[[2,10]]},{"path":"src/frontend/iced/src/c.rs","lines":[[2,10]]}]})json"_fixture;
   auto sorted = Json::array({within, cross});
@@ -271,14 +294,14 @@ TEST_CASE("shared sorting and inline suppression retain two occurrences", sortin
   CHECK(applied.at("hits").at(0).at("occurrence_count") == 2);
 }
 
-TEST_CASE("cleanup contains only targets while rejected output retains diagnostics by profile", reports) {
-  const auto files = buildInventory(frontend,
+void reports() {
+  const auto files = buildInventory(frontend(),
     R"json({"tracked":["src/frontend/iced/src/generated.rs","src/frontend/iced/third_party/dependency.rs"],"untracked":[],"deleted":[]})json"_fixture,
     [](const std::string&) { return true; });
   const Json input{
-    {"profile", frontend}, {"files", files},
-    {"duplo", {{"arguments", detectorArguments(frontend, {.threads = 2, .fileList = "/unused"}).at("duplo")}, {"status", 0}, {"stderr", ""}}},
-    {"cpd", {{"arguments", detectorArguments(frontend, {.threads = 2, .fileList = "/tmp/cpd-fixture/files.txt"}).at("cpd")}, {"status", 0}, {"stderr", ""}, {"excludedLexerCount", 0}}},
+    {"profile", frontend()}, {"files", files},
+    {"duplo", {{"arguments", detectorArguments(frontend(), {.threads = 2, .fileList = "/unused"}).at("duplo")}, {"status", 0}, {"stderr", ""}}},
+    {"cpd", {{"arguments", detectorArguments(frontend(), {.threads = 2, .fileList = "/tmp/cpd-fixture/files.txt"}).at("cpd")}, {"status", 0}, {"stderr", ""}, {"excludedLexerCount", 0}}},
     {"codeOnlyDuplo", {{"filteredCount", 0}}}, {"hits", Json::array()}, {"structuralHitsAfterSuppression", Json::array()},
     {"duploSuppression", {{"suppressed", Json::array()}}}, {"cpdSuppression", {{"suppressed", Json::array()}}}, {"threads", 2},
   };
@@ -303,7 +326,7 @@ TEST_CASE("cleanup contains only targets while rejected output retains diagnosti
   CHECK(first.find("suppressed_duplo_occurrences") == std::string::npos);
 }
 
-TEST_CASE("context filtering checks every match size and retains repeated implementations", match_sizes) {
+void match_sizes() {
   for (const int tokenCount : {39, 99, 100, 101, 640}) {
     const auto unrelated = classifySources({
       {"a.h", "struct A { int width; int height; };"},
@@ -333,7 +356,7 @@ TEST_CASE("context filtering checks every match size and retains repeated implem
 
 }
 
-TEST_CASE("CPD retains overloaded conversion setup despite distinct enum types and fallbacks", conversion_setup) {
+void conversion_setup() {
   const auto result = classifySources({
     {"a.cpp", R"cpp(void operator()(const char* key, Kind& value) const {
       int index = static_cast<int>(value);
@@ -350,21 +373,21 @@ TEST_CASE("CPD retains overloaded conversion setup despite distinct enum types a
   CHECK(includes(result.at("duplications").at(0).at("patterns"), "same function, first parameter and opening statement"));
 }
 
-TEST_CASE("overload identity includes the complete templated first parameter", overload_identity) {
+void overload_identity() {
   CHECK(classifySources({
     {"a.cpp", "void read(const std::map<int, First>& input, Kind& value) { int index = static_cast<int>(value); first(input, index); }"},
     {"b.cpp", "void read(const std::map<int, Second>& input, Order& value) { int index = static_cast<int>(value); second(input, index); }"},
   }).at("duplications").empty());
 }
 
-TEST_CASE("equal signatures in separate implementations do not manufacture an overload family", equal_signatures) {
+void equal_signatures() {
   CHECK(classifySources({
     {"a.cpp", "void read(const Input& input, Value& value) { auto index = select(input); first(index, value); }"},
     {"b.cpp", "void read(const Input& input, Value& value) { auto index = select(input); second(index, value); }"},
   }).at("duplications").empty());
 }
 
-TEST_CASE("aliases and bare control transfers do not turn one call into a shared algorithm", aliases_and_transfers) {
+void aliases_and_transfers() {
   for (const std::string body : {
     "const int threads = launch::kThreads; const int blocks = blocks_for(count, threads);",
     "PixelThread pixel; if (!locate_pixel(width, height, pixel)) return;",
@@ -388,7 +411,7 @@ TEST_CASE("aliases and bare control transfers do not turn one call into a shared
   }).at("duplications").size() == 1);
 }
 
-TEST_CASE("scalar calculations remain candidates despite different local roles", scalar_calculations) {
+void scalar_calculations() {
   const auto ranges = R"json({"a.cpp":{"start":2,"end":3},"b.cpp":{"start":2,"end":3}})json"_fixture;
   CHECK(classifySources({
     {"a.cpp", "void A() {\nconst float transformed_x = matrix[0] * x + matrix[1] * y;\nconst float transformed_y = matrix[2] * x + matrix[3] * y;\n}"},
@@ -405,7 +428,7 @@ TEST_CASE("scalar calculations remain candidates despite different local roles",
   }
 }
 
-TEST_CASE("repeated admission guards remain candidates despite different input roles", admission_guards) {
+void admission_guards() {
   for (const bool braced : {false, true}) {
     const std::string failure = braced ? "{ return Invalid; }" : "return Invalid;";
     const auto make = [&](std::string name, std::string input) {
@@ -416,7 +439,7 @@ TEST_CASE("repeated admission guards remain candidates despite different input r
   }
 }
 
-TEST_CASE("CUDA setup remains visible alongside complete kernels and numerical work", cuda_setup) {
+void cuda_setup() {
   const auto make = [](std::string name, std::string operation) {
     return "__global__ void " + name + "(int* output, int count) {\n"
       "const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);\n"
@@ -446,27 +469,27 @@ TEST_CASE("CUDA setup remains visible alongside complete kernels and numerical w
   CHECK(classifySources(admissions, R"json({"a.cu":{"end":4},"b.cu":{"end":4}})json"_fixture).at("duplications").size() == 1);
 }
 
-TEST_CASE("Duplo compares complete initializer context and preserves real repeated operations", duplo_context) {
+void duplo_context() {
   const auto hit = R"json({"LineCount":6,"SourceFile1":"a.cpp","StartLineNumber1":2,"EndLineNumber1":7,"SourceFile2":"b.cpp","StartLineNumber2":2,"EndLineNumber2":7})json"_fixture;
   const auto initializer = [](std::string value) {
     return "void publish_fact() {\nconst Fact fact{\n.kind = Kind::Ready,\n.width = width,\n.height = height,\n.epoch = epoch,\n.generation = generation,\n.capacity = " + value + ",\n};\npublish(fact);\n}";
   };
-  const auto rejected = filterDuploCandidates(cpp, Json::array({hit}), [&](const std::string& path) { return initializer(path == "a.cpp" ? "width" : "capacity"); });
+  const auto rejected = filterDuploCandidates(cpp(), Json::array({hit}), [&](const std::string& path) { return initializer(path == "a.cpp" ? "width" : "capacity"); });
   CHECK(rejected.at("hits") == Json::array());
   CHECK(rejected.at("filteredCount") == 0);
   CHECK(rejected.at("contextRejected").size() == 1);
   CHECK(spans(rejected.at("contextRejected").at(0).at("occurrences")) == R"json([[2,7],[2,7]])json"_fixture);
   const std::string body = "void work() {\nauto item = acquire();\ninspect(item);\nprepare(item);\nwrite(item);\npublish(item);\nrelease(item);\n}";
-  CHECK(filterDuploCandidates(cpp, Json::array({hit}), [&](const std::string&) { return body; }).at("hits") == Json::array({hit}));
+  CHECK(filterDuploCandidates(cpp(), Json::array({hit}), [&](const std::string&) { return body; }).at("hits") == Json::array({hit}));
   const std::string embedded = "const auto script = R\"SH(\nconfigure\nvalidate\ninspect\nbuild\npackage\nreport\n)SH\";";
   CHECK(filterDuploCandidates(CLEANUP_PROFILES.at("tools"), Json::array({hit}), [&](const std::string&) { return embedded; }).at("hits") == Json::array({hit}));
-  const auto comments = filterDuploCandidates(cpp, Json::array({hit}), [](const std::string&) { return "// header\n// a\n// b\n// c\n// d\n// e\n// f"; });
+  const auto comments = filterDuploCandidates(cpp(), Json::array({hit}), [](const std::string&) { return "// header\n// a\n// b\n// c\n// d\n// e\n// f"; });
   CHECK(comments.at("hits").empty());
   CHECK(comments.at("nonCodeRejected").size() == 1);
 
 }
 
-TEST_CASE("CPD does not present ordinary declarations or concatenated getters as extraction work", declarations_and_getters) {
+void declarations_and_getters() {
   for (const auto& sources : std::vector<Json>{
     {{"a.h", "struct Input { int width; int height; void Read(int); void Stop(); };"},
      {"b.h", "struct Output { int count; int capacity; void Write(int); void Cancel(); };"}},
@@ -479,7 +502,7 @@ TEST_CASE("CPD does not present ordinary declarations or concatenated getters as
   }
 }
 
-TEST_CASE("CPD keeps repeated executable sequences and separates different operation names", executable_sequences) {
+void executable_sequences() {
   const auto repeated = classifySources({
     {"a.cpp", "void StartA() { auto x = acquire(); inspect(x); publish(x); }"},
     {"b.cpp", "void StartB() { auto y = acquire(); inspect(y); publish(y); }"},
@@ -492,7 +515,7 @@ TEST_CASE("CPD keeps repeated executable sequences and separates different opera
   CHECK(unrelated.at("duplications").empty());
 }
 
-TEST_CASE("CPD retains repeated named fields that may duplicate a canonical declaration", named_fields) {
+void named_fields() {
   const auto result = classifySources({
     {"a.h", "struct A { unsigned width = 0; unsigned height = 0; unsigned stride = 0; };"},
     {"b.h", "struct B { unsigned width = 0; unsigned height = 0; unsigned stride = 0; };"},
@@ -501,7 +524,7 @@ TEST_CASE("CPD retains repeated named fields that may duplicate a canonical decl
   CHECK(includes(result.at("duplications").at(0).at("patterns"), "same complete record declaration"));
 }
 
-TEST_CASE("CPD excludes namespace aliases and records that only share a field prefix", namespace_aliases) {
+void namespace_aliases() {
   for (const auto& sources : std::vector<Json>{
     {{"a.cpp", "namespace runtime = application::runtime;\nnamespace gpu = application::gpu;"},
      {"b.cpp", "namespace runtime = application::runtime;\nnamespace gpu = application::gpu;"}},
@@ -510,7 +533,7 @@ TEST_CASE("CPD excludes namespace aliases and records that only share a field pr
   }) CHECK(classifySources(sources).at("duplications").empty());
 }
 
-TEST_CASE("a lock and one forwarded operation do not manufacture an overload algorithm", lock_and_forward) {
+void lock_and_forward() {
   for (const std::string guard : {"lock(mutex_)", "lock{mutex_}"}) {
     CHECK(classifySources({
       {"a.cpp", "void A::SetPeer(int epoch) { std::scoped_lock " + guard + "; input_.SetPeer(epoch); }"},
@@ -519,7 +542,7 @@ TEST_CASE("a lock and one forwarded operation do not manufacture an overload alg
   }
 }
 
-TEST_CASE("CPD preserves member identities, constants and alias relationships after local renaming", member_identity) {
+void member_identity() {
   for (const std::string changed : {
     "void B(State& value) { inspect(value.height); publish(value, 4); }",
     "void B(State& value) { inspect(value.width); publish(value, 8); }",
@@ -535,7 +558,7 @@ TEST_CASE("CPD preserves member identities, constants and alias relationships af
   }).at("duplications").empty());
 }
 
-TEST_CASE("CPD recognizes executable template and assignment-operator bodies", template_and_assignment) {
+void template_and_assignment() {
   CHECK(classifySources({
     {"a.cpp", "template<class T> void A(T& first) { inspect(first); publish(first); }"},
     {"b.cpp", "template<class T> void B(T& second) { inspect(second); publish(second); }"},
@@ -546,7 +569,7 @@ TEST_CASE("CPD recognizes executable template and assignment-operator bodies", t
   }).at("duplications").size() == 1);
 }
 
-TEST_CASE("partial CPD spans retain the complete operation and initializer context", partial_spans) {
+void partial_spans() {
   const Json sources{
     {"a.cpp", "void A(int fd) { auto count = write(fd, &value, sizeof(value)); check(count); }"},
     {"b.cpp", "void B(int fd) { auto count = read(fd, &value, sizeof(value)); check(count); }"},
@@ -574,14 +597,14 @@ TEST_CASE("partial CPD spans retain the complete operation and initializer conte
   CHECK(classifySources(same, ranges).at("duplications").size() == 1);
 }
 
-TEST_CASE("statement context handles for headers and compact nested blocks", nested_for) {
+void nested_for() {
   CHECK(classifySources({
     {"a.cpp", "void A() { for (int i = 0; i < count; ++i) { inspect(i); publish(i); } }"},
     {"b.cpp", "void B() { for (int n = 0; n < count; ++n) { inspect(n); publish(n); } }"},
   }).at("duplications").size() == 1);
 }
 
-TEST_CASE("loop headers, simple aliases, and contract guards are not shared algorithms", non_algorithm_prefixes) {
+void non_algorithm_prefixes() {
   for (const auto& sources : std::vector<Json>{
     {{"a.cpp", "void A() { for (int i = 0; i < count; ++i) { inspect(i); } }"},
      {"b.cpp", "void B() { for (int i = 0; i < count; ++i) { publish(i); } }"}},
@@ -596,14 +619,14 @@ TEST_CASE("loop headers, simple aliases, and contract guards are not shared algo
   }) CHECK(classifySources(sources).at("duplications").empty());
 }
 
-TEST_CASE("independent tensor dimension reads preserve their distinct local roles", tensor_dimensions) {
+void tensor_dimensions() {
   CHECK(classifySources({
     {"a.cpp", "void A(Tensor& value) { const int batch = value.size(0); const int heads = value.size(2); const int channels = value.size(3); }"},
     {"b.cpp", "void B(Tensor& value) { const int batch = value.size(0); const int height = value.size(2); const int width = value.size(3); }"},
   }).at("duplications").empty());
 }
 
-TEST_CASE("shared arithmetic accepts local or member receiver inputs without losing alias relationships", arithmetic_receivers) {
+void arithmetic_receivers() {
   CHECK(classifySources({
     {"a.cpp", "void A(Tensor& masks) { const auto count = masks.size(-2) * masks.size(-1); auto points = random(count, masks.device()); }"},
     {"b.cpp", "void B(Sparse& sparse) { const auto count = sparse.features.size(-2) * sparse.features.size(-1); auto points = random(count, sparse.features.device()); }"},
@@ -614,7 +637,7 @@ TEST_CASE("shared arithmetic accepts local or member receiver inputs without los
   }).at("duplications").empty());
 }
 
-TEST_CASE("multiple spans of one enclosing declaration are not independent duplicates", enclosing_declaration) {
+void enclosing_declaration() {
   const std::string source = "struct State {\nint width;\nint height;\nint stride;\nint x;\nint y;\nint z;\n};";
   const auto result = filterCpdCandidates(R"json([
     {"lineCount":3,"tokenCount":39,"occurrences":[
@@ -625,7 +648,7 @@ TEST_CASE("multiple spans of one enclosing declaration are not independent dupli
   CHECK(result.at("duplications").empty());
 }
 
-TEST_CASE("independent operation groups stay separate within one CPD candidate", independent_groups) {
+void independent_groups() {
   const auto result = classifySources({
     {"a.cpp", "void A() { prepare(); publish(); }"},
     {"b.cpp", "void B() { prepare(); publish(); }"},
@@ -638,7 +661,7 @@ TEST_CASE("independent operation groups stay separate within one CPD candidate",
   CHECK(paths == R"json([["a.cpp","b.cpp"],["c.cpp","d.cpp"]])json"_fixture);
 }
 
-TEST_CASE("overlapping CPD spans of the same complete statements produce one target", overlapping_spans) {
+void overlapping_spans() {
   const Json sources{
     {"a.cpp", "void A() { inspect(value); publish(value); }"},
     {"b.cpp", "void B() { inspect(value); publish(value); }"},
@@ -658,7 +681,7 @@ TEST_CASE("overlapping CPD spans of the same complete statements produce one tar
   CHECK(result.at("filtered").at(0).at("reason").get<std::string>().find("already represented") != std::string::npos);
 }
 
-TEST_CASE("one overload family consolidates matches without losing distinct function targets", overload_family) {
+void overload_family() {
   const std::string source = R"cpp(void read(const char* key, A& value) {
   int index = static_cast<int>(value); decode(key, index); first(index, value);
 }
@@ -680,7 +703,7 @@ void read(const char* key, C& value) {
   CHECK(spans(result.at("duplications").at(0).at("occurrences")) == R"json([[1,2],[4,5],[7,8]])json"_fixture);
 }
 
-TEST_CASE("CPD preserves assertion facts rather than merging unrelated test expectations", assertion_facts) {
+void assertion_facts() {
   const auto result = classifySources({
     {"a.cpp", "void A() { CHECK(frame.ready); CHECK(frame.width == 3); }"},
     {"b.cpp", "void B() { CHECK(run.active); CHECK(run.epoch == 3); }"},
@@ -693,7 +716,7 @@ TEST_CASE("CPD preserves assertion facts rather than merging unrelated test expe
   CHECK(repeated.at("duplications").size() == 1);
 }
 
-TEST_CASE("CPD skips strings and comments and handles outer code after a nested callback", strings_and_callbacks) {
+void strings_and_callbacks() {
   const auto result = classifySources({
     {"a.cpp", R"cpp(void A() {
       const auto text = R"tag({ void fake() { })tag";
@@ -711,18 +734,18 @@ TEST_CASE("CPD skips strings and comments and handles outer code after a nested 
   CHECK(!includes(result.at("duplications").at(0).at("patterns"), "unclassified syntax requires manual review"));
 }
 
-TEST_CASE("a call in a lambda capture is not a function declaration or overload family", lambda_capture) {
+void lambda_capture() {
   CHECK(classifySources({
     {"a.cpp", "void A(Runtime& runtime) { owner.Defer(runtime, [value = std::move(candidate)]() mutable { runtime.Commit(std::move(value)); first(); }); }"},
     {"b.cpp", "void B(Runtime& runtime) { owner.Defer(runtime, [value = std::move(candidate)]() mutable { runtime.Commit(std::move(value)); second(); }); }"},
   }).at("duplications").empty());
 }
 
-TEST_CASE("raw CPD argument validation cannot alter ordinary profile thresholds", raw_arguments) {
+void raw_arguments() {
   const auto raw = parseArgs({"--raw-cpd", "--min-tokens", "16", "--output", "cleanup/raw.json"});
   CHECK(raw.at("profile").at("cpd").at("minTokens") == 16);
   CHECK(raw.at("output") == "cleanup/raw.json");
-  CHECK(cpp.at("cpd").at("minTokens") == 39);
+  CHECK(cpp().at("cpd").at("minTokens") == 39);
   CHECK(raw.at("profile").at("cpd").at("flags") == Json::array({"--skip-blocks-pattern", ""}));
   const auto tools = parseArgs({"--raw-cpd", "--tools", "--review"});
   CHECK(tools.at("profile").at("name") == "tools");
@@ -735,17 +758,59 @@ TEST_CASE("raw CPD argument validation cannot alter ordinary profile thresholds"
   }) throws([&] { parseArgs(args); });
 }
 
+constexpr mmltk::tools::testing::Case cases[]{
+    {"raw CPD includes real PMD-suppressed code with original paths, columns, literals and CRLF", real_pmd},
+    {"raw CPD rejects partial detector runs without replacing a complete report and removes scan copies", partial_detector},
+    {"empty raw CPD inventories complete without launching a detector", empty_inventory},
+    {"profiles and arguments select exactly one frozen configuration", profiles},
+    {"inventory commands are exact and frozen", inventory_commands},
+    {"detector commands exactly encode each profile", detector_commands},
+    {"frontend inventory unions tracked and untracked-unignored files", frontend_inventory},
+    {"inventory rejects unavailable and newline paths", invalid_inventory},
+    {"Duplo and CPD fixture parsers preserve source ranges", parsers},
+    {"shared sorting and inline suppression retain two occurrences", sorting_and_suppression},
+    {"cleanup contains only targets while rejected output retains diagnostics by profile", reports},
+    {"context filtering checks every match size and retains repeated implementations", match_sizes},
+    {"CPD retains overloaded conversion setup despite distinct enum types and fallbacks", conversion_setup},
+    {"overload identity includes the complete templated first parameter", overload_identity},
+    {"equal signatures in separate implementations do not manufacture an overload family", equal_signatures},
+    {"aliases and bare control transfers do not turn one call into a shared algorithm", aliases_and_transfers},
+    {"scalar calculations remain candidates despite different local roles", scalar_calculations},
+    {"repeated admission guards remain candidates despite different input roles", admission_guards},
+    {"CUDA setup remains visible alongside complete kernels and numerical work", cuda_setup},
+    {"Duplo compares complete initializer context and preserves real repeated operations", duplo_context},
+    {"CPD does not present ordinary declarations or concatenated getters as extraction work", declarations_and_getters},
+    {"CPD keeps repeated executable sequences and separates different operation names", executable_sequences},
+    {"CPD retains repeated named fields that may duplicate a canonical declaration", named_fields},
+    {"CPD excludes namespace aliases and records that only share a field prefix", namespace_aliases},
+    {"a lock and one forwarded operation do not manufacture an overload algorithm", lock_and_forward},
+    {"CPD preserves member identities, constants and alias relationships after local renaming", member_identity},
+    {"CPD recognizes executable template and assignment-operator bodies", template_and_assignment},
+    {"partial CPD spans retain the complete operation and initializer context", partial_spans},
+    {"statement context handles for headers and compact nested blocks", nested_for},
+    {"loop headers, simple aliases, and contract guards are not shared algorithms", non_algorithm_prefixes},
+    {"independent tensor dimension reads preserve their distinct local roles", tensor_dimensions},
+    {"shared arithmetic accepts local or member receiver inputs without losing alias relationships", arithmetic_receivers},
+    {"multiple spans of one enclosing declaration are not independent duplicates", enclosing_declaration},
+    {"independent operation groups stay separate within one CPD candidate", independent_groups},
+    {"overlapping CPD spans of the same complete statements produce one target", overlapping_spans},
+    {"one overload family consolidates matches without losing distinct function targets", overload_family},
+    {"CPD preserves assertion facts rather than merging unrelated test expectations", assertion_facts},
+    {"CPD skips strings and comments and handles outer code after a nested callback", strings_and_callbacks},
+    {"a call in a lambda capture is not a function declaration or overload family", lambda_capture},
+    {"raw CPD argument validation cannot alter ordinary profile thresholds", raw_arguments},
+};
+
 }  // namespace cleanup_test
 
-int main(int argc, char** argv) {
+export int mmltk_tool_generate_cleanup_json_test(int argc, char** argv) {
   try {
     if (argc > 1 && std::string_view(argv[1]) == "cpd") {
       if (const char* fixture = std::getenv("MMLTK_CLEANUP_TEST_PMD_FIXTURE"))
         return cleanup_test::fakeDetector(argc, argv, fixture);
       throw std::runtime_error("fake detector invoked without its fixture configuration");
     }
-    if (argc != 1) throw std::runtime_error("cleanup test executable takes no arguments");
-    return cleanup_test::suite.run();
+    return mmltk::tools::testing::run_cases(cleanup_test::cases, argc, argv);
   } catch (const std::exception& error) {
     std::cerr << "generate_cleanup_json.test: " << error.what() << '\n';
     return 1;

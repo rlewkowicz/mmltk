@@ -1,15 +1,9 @@
+module;
+#include "cpp_test_macros.hpp"
 // Native counterpart of review_candidates.test.mjs: all 15 original cases.
-// Link generate_cleanup_json.cpp with MMLTK_TOOLS_NO_MAIN, plus
-// cleanup/{cpd,declaration,review}_patterns.cpp, libcrypto, ICU i18n/uc, threads;
-// include third_party/json/include. Run from the repository root with real PMD
+// Run from the repository root with real PMD
 // configured for the suffix-copy case. Failure fixtures reexecute this binary;
 // no JavaScript runtime is used.
-#include "../generate_cleanup_json.hpp"
-#include "../cleanup/cpd_patterns.hpp"
-#include "../cleanup/declaration_patterns.hpp"
-#include "../cleanup/review_patterns.hpp"
-
-#include "cpp_test_support.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -30,6 +24,36 @@
 #include <vector>
 #include <unistd.h>
 
+#include <array>
+#include <cstdint>
+#include <map>
+#include <nlohmann/json.hpp>
+#include <utility>
+#include <initializer_list>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstring>
+#include <span>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+export module mmltk.tools.tests.review_candidates_test;
+import mmltk.tools.generate_cleanup_json;
+import mmltk.tools.cleanup.cpd_patterns;
+import mmltk.tools.cleanup.declaration_patterns;
+import mmltk.tools.cleanup.review_patterns;
+import mmltk.tools.tests.cpp_test_support;
+import mmltk.tools.tool_command;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+
 namespace review_test {
 namespace fs = std::filesystem;
 using namespace mmltk::tools::cleanup;
@@ -40,7 +64,6 @@ using mmltk::tools::review::physicalLines;
 using mmltk::tools::review::buildReview;
 using mmltk::tools::review::renderReviewMarkdown;
 
-mmltk::tools::testing::Suite suite;
 using namespace mmltk::tools::testing;
 using mmltk::tools::includes;
 Json select(const Json& values, const std::function<bool(const Json&)>& predicate) {
@@ -60,7 +83,6 @@ std::string repeat(std::string_view value, int count) {
   return result;
 }
 
-
 Json rawProfile() { return parseArgs({"--raw-cpd"}).at("profile"); }
 Json inventory(const Json& tracked) { return {{"tracked", tracked}, {"untracked", Json::array()}, {"deleted", Json::array()}}; }
 struct ReviewResult { Json raw; Json review; };
@@ -77,7 +99,7 @@ ReviewResult reviewOf(const Json& files, const Json& matches = Json::array()) {
   return {raw, buildReview(files, raw)};
 }
 
-TEST_CASE("review is an opt-in raw operation with stable default and selected basenames", raw_selection) {
+void raw_selection() {
   CHECK(parseArgs({"--raw-cpd"}).at("output") == "cleanup/declarations-raw.json");
   CHECK(parseArgs({"--raw-cpd", "--review"}).at("output") == "cleanup/declarations-review.json");
   const auto selection = parseArgs({"--raw-cpd", "--output", "chosen.json", "--review", "--min-tokens", "27"});
@@ -88,7 +110,7 @@ TEST_CASE("review is an opt-in raw operation with stable default and selected ba
     throws([&] { parseArgs(args); });
 }
 
-TEST_CASE("authored inventory covers code languages and preserves Git boundaries", authored_inventory) {
+void authored_inventory() {
   auto retained = R"json(["src/a.cpp","src/template.cppm.in","src/app.rs","tools/check.py","tools/cleanup/patterns.mjs","src/output/value.h","web/a.tsx","web/b.mjs","web/style.css","web/index.html","cmake/A.cmake","CMakeLists.txt","docker/Dockerfile.dependencies","mmltk","tools/run.sh","src/frontend/iced/src/generated.rs"])json"_fixture;
   const auto excluded = R"json(["third_party/a.cpp","src/third_party/a.rs","build/a.cpp",".cache/a.py","web/node_modules/a.ts","src/generated/a.h","compiled/a.h","output/a.py"])json"_fixture;
   auto tracked = retained;
@@ -104,7 +126,7 @@ TEST_CASE("authored inventory covers code languages and preserves Git boundaries
   throws([&] { buildInventory(AUTHORED_PROFILE, inventory({"src/missing.rs"}), [](const std::string&) { return false; }); }, "unavailable");
 }
 
-TEST_CASE("size triage is strictly over 500 physical lines and does not lex non-C++ files", size_triage) {
+void size_triage() {
   auto files = Json::array();
   for (int lines : {499, 500, 501}) files.push_back({{"path", "tools/" + std::to_string(lines) + ".py"}, {"language", "python"}, {"source", repeat("# source\n", lines)}});
   files.push_back({{"path", "src/tests/embedded.rs"}, {"language", "rust"}, {"source", repeat("#[cfg(test)] mod tests {}\n", 501)}});
@@ -119,7 +141,7 @@ TEST_CASE("size triage is strictly over 500 physical lines and does not lex non-
   CHECK(physicalLines(repeat("line\n", 500) + "last") == 501);
 }
 
-TEST_CASE("complete nested CLI bindings and exclusions retain each exceptional argument", nested_bindings) {
+void nested_bindings() {
   const auto expressions = Json::array({
     R"cpp(option<Root, member_path<&Root::inner, &Inner::value>>("--value", "Help", "Group", {}, "--no-value"))cpp",
     R"cpp(custom_option<Root, member_path<&Root::inner, &Inner::items>, Codec<std::pair<int, int>>>("--ids", make_help(1, nested(2, 3)), "Execution"))cpp",
@@ -149,7 +171,7 @@ TEST_CASE("complete nested CLI bindings and exclusions retain each exceptional a
   CHECK(broken.at(0).at("complete") == false);
 }
 
-TEST_CASE("indexed families retain invariant and varying slots, cross-file anchors and unique raw associations", indexed_families) {
+void indexed_families() {
   const std::string path = "src/options.h";
   const std::string source = "option<Root, &Root::first>(\"--first\", \"One\", \"Input\");\noption<Root, &Root::second>(\"--second\", \"Two\", \"Input\");\noption<Root, &Root::third>(\"--third\", \"Three\", \"Input\");";
   auto files = Json::array({{{"path", path}, {"language", "cpp"}, {"source", source}}, {{"path", "src/more.h"}, {"language", "cpp"}, {"source", R"cpp(option<Other, &Other::fourth>("--fourth", "Four", "Output");)cpp"}}});
@@ -173,7 +195,7 @@ TEST_CASE("indexed families retain invariant and varying slots, cross-file ancho
   CHECK(markdown.find("src/options.h:1:1") != std::string::npos);
 }
 
-TEST_CASE("trait and same-name mapping families retain marker, conversion and field differences", trait_mapping) {
+void trait_mapping() {
   const std::vector<std::string> names{"Minimum", "Maximum", "MaxBytes"};
   const std::vector<std::string> conversions{"long double", "unsigned long", "signed short"};
   std::string source;
@@ -197,7 +219,7 @@ TEST_CASE("trait and same-name mapping families retain marker, conversion and fi
   CHECK(review.at("summary").at("covered_lines") == 9);
 }
 
-TEST_CASE("overlapping qualified names and complete bindings count physical evidence lines once", overlapping_names) {
+void overlapping_names() {
   std::string source;
   for (const std::string member : {"first", "second", "third"}) {
     if (!source.empty()) source += '\n';
@@ -212,7 +234,7 @@ TEST_CASE("overlapping qualified names and complete bindings count physical evid
   CHECK(count > 3);
 }
 
-TEST_CASE("raw classification shares whole-inventory conflicts and the default raw shape", raw_conflicts) {
+void raw_conflicts() {
   const auto raw = reviewOf(Json::array({
     {{"path", "src/a.h"}, {"language", "cpp"}, {"source", "[[= ::mmltk::frameworks::reflection::MaxBytes{8}]] int value;"}},
     {{"path", "src/b.h"}, {"language", "cpp"}, {"source", "#define MMLTK_MAX_BYTES(x) unsafe(x)\n"}},
@@ -224,7 +246,7 @@ TEST_CASE("raw classification shares whole-inventory conflicts and the default r
   CHECK(keys == Json::array({"format", "purpose", "inventory", "detector", "raw_matches", "classified_context", "summary"}));
 }
 
-TEST_CASE("CPD completion rejects malformed records, unrelated documents and missing coverage", cpd_completion) {
+void cpd_completion() {
   for (const std::string xml : {
     "", "garbage", "<unrelated/>", "<pmd-cpd>", "<pmd-cpd><duplication></pmd-cpd>",
     R"xml(<pmd-cpd><duplication lines="1" tokens="2"><file line="1" endline="1" path="a"/></duplication></pmd-cpd>)xml",
@@ -240,7 +262,7 @@ TEST_CASE("CPD completion rejects malformed records, unrelated documents and mis
   CHECK(parseCpdXml(R"xml(<pmd-cpd><duplication lines="1" tokens="2">)xml" + files + "<codefragment><![CDATA[<error> is source & text]]></codefragment></duplication></pmd-cpd>").size() == 1);
 }
 
-TEST_CASE("coordinates validate each original line, CRLF, Unicode and the final physical line", coordinates) {
+void coordinates() {
   const std::string source = "ab\r\n😀xy\r\nlast";
   CHECK(sourceOccurrence("file.cpp", source, {{"start", 2}, {"end", 2}, {"column", 1}, {"endColumn", 5}}).at("text") == "😀xy");
   CHECK(sourceOccurrence("file.cpp", source, {{"start", 3}, {"end", 3}}).at("text") == "last");
@@ -251,7 +273,7 @@ TEST_CASE("coordinates validate each original line, CRLF, Unicode and the final 
   throws([] { sourceOccurrence("file.cpp", "a\n", {{"start", 2}, {"end", 2}}); }, "span");
 }
 
-TEST_CASE("suppression accounting admits actual comments and ignores C++ and Rust literal contents", suppression_comments) {
+void suppression_comments() {
   const std::string cpp = "const char* a = \"// CLEANUP-IGNORE: not a comment\";\nconst char* b = R\"tag(\n// CLEANUP-OFF: literal\n// CLEANUP-ON\n)tag\";\n// CLEANUP-IGNORE: inspected occurrence\nwork();\n";
   CHECK(parseInlineSuppressions("a.cpp", cpp).at("a.cpp").size() == 1);
   const std::string rust = "let a = r###\"\n// CLEANUP-OFF: literal\n// CLEANUP-ON\n\"###;\nlet b = br#\"// CLEANUP-IGNORE: bytes\"#;\nlet c = cr\"// CLEANUP-IGNORE: c string\";\n/* nested /* // CLEANUP-OFF: comment content */ // CLEANUP-ON */\nfn borrow<'a>(x: &'a str) {}\n// CLEANUP-IGNORE: inspected occurrence\nwork();\n";
@@ -296,7 +318,7 @@ struct DetectorFixture {
   mmltk::tools::ScopedEnvironment savedEnvironment{variable};
   DetectorFixture() {
     mmltk::tools::write_text(path, "int value = 1;\n");
-    fs::create_symlink(fs::read_symlink("/proc/self/exe"), binary);
+    write_fixture_program(binary, mmltk::tools::command::Command::test_review_candidates);
     profile["cpd"]["binary"] = binary.string();
   }
   DetectorFixture(const DetectorFixture&) = delete;
@@ -315,7 +337,7 @@ Json unlistedDetectorPaths(const std::string& path) {
   return failures;
 }
 
-TEST_CASE("review outputs are prepared before publication and prior outputs survive detector, source and rendering failures", publication) {
+void publication() {
   const DetectorFixture fixture;
   const GenerateRawCpdOptions options{.review = true, .inventoryInputs = inventory({fixture.path})};
   auto failures = R"json([{"status":4},{"status":5},{"stderr":"scanner ERROR"},{"stderr":"LexerException"},{"xml":"<pmd-cpd>"},{"xml":"<pmd-cpd/>"},{"change":true}])json"_fixture;
@@ -346,7 +368,7 @@ TEST_CASE("review outputs are prepared before publication and prior outputs surv
   CHECK(mmltk::tools::read_text(fixture.markdown).find("unreviewed") != std::string::npos);
 }
 
-TEST_CASE("detector copies cover module, CUDA and template suffixes without basename collisions", detector_copies) {
+void detector_copies() {
   const DetectorFixture fixture;
   std::vector<std::string> paths;
   for (const char* name : {"a/same.cppm", "b/same.cppm", "kernel.cu", "detail.cuh", "template.cppm.in", "header.hpp.in"}) {
@@ -368,7 +390,7 @@ TEST_CASE("detector copies cover module, CUDA and template suffixes without base
   }
 }
 
-TEST_CASE("ordinary and raw detector modes share completion and source coverage checks", shared_completion) {
+void shared_completion() {
   const DetectorFixture fixture;
   auto normal = CLEANUP_PROFILES.at("cpp");
   normal["cpd"]["binary"] = fixture.profile.at("cpd").at("binary");
@@ -382,10 +404,10 @@ TEST_CASE("ordinary and raw detector modes share completion and source coverage 
   }
 }
 
-TEST_CASE("failed ordinary completion preserves both prior reports", ordinary_publication) {
+void ordinary_publication() {
   const DetectorFixture fixture;
   const auto duplo = fixture.directory.path() / "duplo.mjs";
-  fs::create_symlink(fs::read_symlink("/proc/self/exe"), duplo);
+  write_fixture_program(duplo, mmltk::tools::command::Command::test_review_candidates);
   const auto output = fs::relative(fixture.directory.path() / "ordinary.json", fs::current_path()).string();
   const auto rejected = fixture.directory.path() / "rejected.json";
   mmltk::tools::write_text(output, "previous ordinary");
@@ -403,16 +425,34 @@ TEST_CASE("failed ordinary completion preserves both prior reports", ordinary_pu
     CHECK(mmltk::tools::read_text(rejected) == "{\"previous\":\"rejected\"}");
   }
 }
+constexpr mmltk::tools::testing::Case cases[]{
+    {"review is an opt-in raw operation with stable default and selected basenames", raw_selection},
+    {"authored inventory covers code languages and preserves Git boundaries", authored_inventory},
+    {"size triage is strictly over 500 physical lines and does not lex non-C++ files", size_triage},
+    {"complete nested CLI bindings and exclusions retain each exceptional argument", nested_bindings},
+    {"indexed families retain invariant and varying slots, cross-file anchors and unique raw associations", indexed_families},
+    {"trait and same-name mapping families retain marker, conversion and field differences", trait_mapping},
+    {"overlapping qualified names and complete bindings count physical evidence lines once", overlapping_names},
+    {"raw classification shares whole-inventory conflicts and the default raw shape", raw_conflicts},
+    {"CPD completion rejects malformed records, unrelated documents and missing coverage", cpd_completion},
+    {"coordinates validate each original line, CRLF, Unicode and the final physical line", coordinates},
+    {"suppression accounting admits actual comments and ignores C++ and Rust literal contents", suppression_comments},
+    {"review outputs are prepared before publication and prior outputs survive detector, source and rendering failures", publication},
+    {"detector copies cover module, CUDA and template suffixes without basename collisions", detector_copies},
+    {"ordinary and raw detector modes share completion and source coverage checks", shared_completion},
+    {"failed ordinary completion preserves both prior reports", ordinary_publication},
+};
+
 }  // namespace review_test
 
-int main(int argc, char** argv) {
+export int mmltk_tool_review_candidates_test(int argc, char** argv) {
   try {
-    if (argc > 1 || std::filesystem::path(argv[0]).filename() == "duplo.mjs") {
+    if ((argc > 1 && std::string_view(argv[1]) == "cpd") || std::filesystem::path(argv[0]).filename() == "duplo.mjs") {
       if (const char* config = std::getenv(review_test::DetectorFixture::variable))
         return review_test::fakeDetector(argc, argv, config);
       throw std::runtime_error("review test executable takes no arguments");
     }
-    return review_test::suite.run();
+    return mmltk::tools::testing::run_cases(review_test::cases, argc, argv);
   } catch (const std::exception& error) {
     std::cerr << "review_candidates.test: " << error.what() << '\n';
     return 1;

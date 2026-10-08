@@ -1,11 +1,7 @@
+module;
+#include "cpp_test_macros.hpp"
 // Native counterpart of audit_includes.test.mjs: all 14 original cases.
-// Link audit_includes.cpp, generate_cleanup_json.cpp, and
-// cleanup/{cpd,declaration,review}_patterns.cpp with MMLTK_TOOLS_NO_MAIN;
-// dependencies: third_party/json/include, libcrypto, ICU i18n/uc, threads.
 // Fixtures are in memory; no JavaScript runtime or external commands are used.
-#include "../audit_includes.hpp"
-
-#include "cpp_test_support.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -17,16 +13,55 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+#include <initializer_list>
+#include <optional>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <span>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <exception>
+#include <regex>
+
+export module mmltk.tools.tests.audit_includes_test;
+import mmltk.tools.audit_includes;
+import mmltk.tools.tests.cpp_test_support;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+
 namespace include_audit_test {
 using namespace mmltk::tools::include_audit;
-mmltk::tools::testing::Suite suite;
 using namespace mmltk::tools::testing;
-const std::string pch = "src/pch_std.h";
-const Json context{{"target", "owner"}, {"modules", false}, {"pch", Json::array({pch})},
-                   {"include_dirs", Json::array()}, {"quote_dirs", Json::array()}};
-const Json coverage{{pch, Json::array({"vector", "string", "memory"})}};
-Json rewrite(std::string_view path, std::string_view source, const Json& contexts = Json::array({context})) {
-  return pchReplacement(path, source, scanIncludes(source), contexts, coverage);
+const std::string& pch() { static const std::string value = "src/pch_std.h"; return value; }
+const Json& context() {
+    static const Json value{{"target", "owner"}, {"modules", false}, {"pch", Json::array({pch()})},
+        {"include_dirs", Json::array()}, {"quote_dirs", Json::array()}};
+    return value;
+}
+const Json& coverage() {
+    static const Json value{{pch(), Json::array({"vector", "string", "memory"})}};
+    return value;
+}
+Json rewrite(std::string_view path, std::string_view source, const Json& contexts = Json::array({context()})) {
+  return pchReplacement(path, source, scanIncludes(source), contexts, coverage());
 }
 Json targetEntry(const std::string& target, const std::string& extra) {
   return {{"directory", "/repo/build"}, {"file", "/repo/src/a.cpp"},
@@ -36,8 +71,11 @@ Json targetEntry(const std::string& target, const std::string& extra) {
 Json targetEntry(const std::string& target) {
   return targetEntry(target, "-include CMakeFiles/" + target + ".dir/cmake_pch.hxx");
 }
-const std::string registeredPolicy = "header\t/repo/src/pch_std.h\nuse\t/repo/src/a.cpp\n";
-Json readContexts(const Json& entries, const std::string& policy = registeredPolicy) {
+const std::string& registeredPolicy() {
+    static const std::string value = "header\t/repo/src/pch_std.h\nuse\t/repo/src/a.cpp\n";
+    return value;
+}
+Json readContexts(const Json& entries, const std::string& policy = registeredPolicy()) {
   return compilationContexts(entries, "/repo", [&](const std::string&) { return policy; },
                              [&](const std::string&) { return !policy.empty(); }).at("src/a.cpp");
 }
@@ -59,7 +97,7 @@ std::vector<std::string> keys(const Json& object) {
 }
 using mmltk::tools::includes;
 
-TEST_CASE("include audit ignores comments and literals, retains branches, macros and continued directives", lexical_includes) {
+void lexical_includes() {
   const std::string source = "// #include <fake>\n/* #include <fake> */\nconst auto s = R\"x(\n#include <fake>\n)x\";\n"
     "# include <vector> // comment\n#if FLAG\n#include \"own.h\"\n#else\n#include HEADER\n#endif\n#include \\\n <string>\n# /* legal */ include <memory>\n";
   const auto scan = scanIncludes(source);
@@ -70,9 +108,9 @@ TEST_CASE("include audit ignores comments and literals, retains branches, macros
   CHECK(scan.at("includes").at(3).at("plain") == false);
 }
 
-TEST_CASE("include audit attributes project paths before system names and exposes ambiguity", attribution) {
+void attribution() {
   const std::set<std::string> paths{"src/a/own.h", "src/a/detail.h", "src/b/detail.h", "third_party/vendor.h"};
-  const auto attr = [&](std::string_view header, std::string_view spelling = "quote", const Json& contexts = Json::array({context})) {
+  const auto attr = [&](std::string_view header, std::string_view spelling = "quote", const Json& contexts = Json::array({context()})) {
     return attributeInclude({{"header", header}, {"spelling", spelling}}, "src/a/file.cpp", paths, contexts, "/repo");
   };
   CHECK(attr("own.h").at("resolved") == "src/a/own.h");
@@ -81,23 +119,23 @@ TEST_CASE("include audit attributes project paths before system names and expose
   CHECK(attr("cuda.h", "angle").at("category") == "external");
   CHECK(attr("HEADER", "macro").at("category") == "macro");
   CHECK(attr("vendor.h").at("category") == "vendored");
-  auto other = context;
+  auto other = context();
   other["include_dirs"] = Json::array({"/repo/src/b"});
   CHECK(attr("detail.h", "quote", Json::array({other})).at("resolution") == "ambiguous");
   CHECK(attr("missing.h").at("category") == "unresolved");
 }
 
-TEST_CASE("include audit verifies target-local forced PCH across every compile environment", compile_environments) {
+void compile_environments() {
   const auto contexts = readContexts(Json::array({targetEntry("one"), targetEntry("two", "-fmodules")}));
   CHECK(contexts.size() == 2);
   CHECK(contexts.at(0).at("include_dirs") == Json::array({"/repo/include dir", "/opt/lib"}));
-  CHECK(contexts.at(0).at("pch") == Json::array({pch}));
+  CHECK(contexts.at(0).at("pch") == Json::array({pch()}));
   CHECK(contexts.at(1).at("modules") == true);
   CHECK(commandWords(R"cmd(g++ -DNAME=\"literal\" "a b.cpp")cmd") == std::vector<std::string>({"g++", "-DNAME=\"literal\"", "a b.cpp"}));
   throws([] { commandWords("'unfinished"); });
 }
 
-TEST_CASE("PCH replacement preserves local includes, comments, conditional branches and line endings", line_endings) {
+void line_endings() {
   const std::string source = "#include \"own.h\"\r\n#include <vector>\r\n// reason\r\n#include <string>\r\n#if FLAG\r\n#include <memory>\r\n#endif\r\nint main() {}\r\n";
   const auto result = rewrite("src/a.cpp", source);
   CHECK(result.at("after") == "#include \"own.h\"\r\n#include \"src/pch_std.h\"\r\n// reason\r\n#if FLAG\r\n#include \"src/pch_std.h\"\r\n#endif\r\nint main() {}\r\n");
@@ -106,43 +144,43 @@ TEST_CASE("PCH replacement preserves local includes, comments, conditional branc
   CHECK(!rewrite("src/a.cpp", result.at("after").get<std::string>()).contains("after"));
 }
 
-TEST_CASE("PCH replacement stays limited to actual compiled PCH consumers", compiled_consumers) {
+void compiled_consumers() {
   const std::string source = "#include <vector>\n#include <string>\n";
   for (const auto* path : {"src/a.h", "src/a.cu", "src/a.c", "src/a.cppm", "src/a.cpp.in"}) CHECK(!rewrite(path, source).contains("after"));
   CHECK(!rewrite("src/a.cpp", source, Json::array()).contains("after"));
-  auto noPch = context;
+  auto noPch = context();
   noPch["pch"] = Json::array();
-  CHECK(!rewrite("src/a.cpp", source, Json::array({context, noPch})).contains("after"));
-  auto module = context;
+  CHECK(!rewrite("src/a.cpp", source, Json::array({context(), noPch})).contains("after"));
+  auto module = context();
   module["modules"] = true;
   CHECK(!rewrite("src/a.cpp", source, Json::array({module})).contains("after"));
-  CHECK(rewrite("src/a.cpp", "#define _GNU_SOURCE\n" + source).at("after") == "#define _GNU_SOURCE\n#include \"" + pch + "\"\n");
-  CHECK(!rewrite(pch, source).contains("after"));
+  CHECK(rewrite("src/a.cpp", "#define _GNU_SOURCE\n" + source).at("after") == "#define _GNU_SOURCE\n#include \"" + pch() + "\"\n");
+  CHECK(!rewrite(pch(), source).contains("after"));
   const std::string json = "nlohmann/json.hpp";
   const auto extendedSource = source + "#include <" + json + ">\n";
-  auto extendedCoverage = coverage;
+  auto extendedCoverage = coverage();
   extendedCoverage["src/pch_json.h"] = Json::array({json});
-  const auto result = pchReplacement("src/a.cpp", extendedSource, scanIncludes(extendedSource), Json::array({context}), extendedCoverage);
-  CHECK(result.at("after") == "#include \"" + pch + "\"\n#include <" + json + ">\n");
+  const auto result = pchReplacement("src/a.cpp", extendedSource, scanIncludes(extendedSource), Json::array({context()}), extendedCoverage);
+  CHECK(result.at("after") == "#include \"" + pch() + "\"\n#include <" + json + ">\n");
 }
 
-TEST_CASE("PCH replacement covers single includes and preserves comments and continuations", continuations) {
-  CHECK(rewrite("src/a.cpp", "#include <vector>\n").at("after") == "#include \"" + pch + "\"\n");
+void continuations() {
+  CHECK(rewrite("src/a.cpp", "#include <vector>\n").at("after") == "#include \"" + pch() + "\"\n");
   const std::string source = "#include \"src/pch_std.h\"\n#include <vector>\n#include <string> // intent\n#include \\\n <memory>\n";
   auto expected = replaceFirst(source, "#include <vector>\n", "");
-  expected = replaceFirst(expected, "<string>", "\"" + pch + "\"");
-  expected = replaceFirst(expected, "<memory>", "\"" + pch + "\"");
+  expected = replaceFirst(expected, "<string>", "\"" + pch() + "\"");
+  expected = replaceFirst(expected, "<memory>", "\"" + pch() + "\"");
   CHECK(rewrite("src/a.cpp", source).at("after") == expected);
 }
 
-TEST_CASE("PCH replacement retains separate branches and include_next lookup semantics", branches) {
+void branches() {
   const std::string source = "# /* legal */ if FIRST\n#include <vector>\n#else\n#include <string>\n#endif\n#include_next <memory>\n";
   const auto result = rewrite("src/a.cpp", source);
-  CHECK(result.at("after") == replaceFirst(replaceFirst(source, "<vector>", "\"" + pch + "\""), "<string>", "\"" + pch + "\""));
+  CHECK(result.at("after") == replaceFirst(replaceFirst(source, "<vector>", "\"" + pch() + "\""), "<string>", "\"" + pch() + "\""));
   CHECK(result.at("retained").at(0).at("reason") == "include_next changes lookup");
 }
 
-TEST_CASE("include bundles count distinct consumers, close repeated pairs into triples and retain outside consumers", bundles) {
+void bundles() {
   const auto file = [](std::string_view path, const std::vector<std::string>& names) {
     auto entries = Json::array();
     for (const auto& name : names) entries.push_back({{"category", "project"}, {"resolved", "src/lib/" + name + ".h"}});
@@ -156,13 +194,13 @@ TEST_CASE("include bundles count distinct consumers, close repeated pairs into t
   CHECK(bundles.at(1).at("outside_folder") == Json::array({"src/a.cpp"}));
 }
 
-TEST_CASE("include frequencies use distinct files, exclude PCH definitions and include inactive evidence", frequencies) {
-  const Json sources{{pch, "#include <vector>\n#include <string>\n"},
+void frequencies() {
+  const Json sources{{pch(), "#include <vector>\n#include <string>\n"},
     {"src/a.cpp", "#include <vector>\n#include <vector>\n#include <string>\n"},
     {"src/b.h", "#include <vector>\n"}, {"src/c.cu", "#if FLAG\n#include <vector>\n#endif\n"}};
   auto paths = keys(sources);
   for (int index = 0; index < 11; ++index) paths.push_back("docs/page" + std::to_string(index) + ".md");
-  const auto report = buildIncludeReport(paths, sources, {{"src/a.cpp", Json::array({context})}}, "/repo");
+  const auto report = buildIncludeReport(paths, sources, {{"src/a.cpp", Json::array({context()})}}, "/repo");
   auto candidates = Json::array();
   for (const auto& entry : report.at("pch_candidates")) candidates.push_back(Json::array({entry.at("header"), entry.at("files").size(), entry.at("occurrences")}));
   CHECK(candidates == R"json([["vector",3,4]])json"_fixture);
@@ -173,7 +211,7 @@ TEST_CASE("include frequencies use distinct files, exclude PCH definitions and i
   CHECK(byPath(report.at("files"), "src/b.h").at("includes").at(0).at("category") == "standard");
 }
 
-TEST_CASE("include audit defaults to reports under output and rejects unknown modes", arguments) {
+void arguments() {
   CHECK(parseIncludeArgs({}).at("mode") == "report");
   CHECK(parseIncludeArgs({}).at("output") == "output/include-audit");
   CHECK(parseIncludeArgs({"fix", "--output", "output/custom"}).at("output") == "output/custom");
@@ -181,7 +219,7 @@ TEST_CASE("include audit defaults to reports under output and rejects unknown mo
   throws([] { parseIncludeArgs({"fix", "--build-dir"}); });
 }
 
-TEST_CASE("PCH evidence distinguishes registered use, exclusion, and contradictory compiler commands", pch_evidence) {
+void pch_evidence() {
   const auto valid = readContexts(Json::array({targetEntry("one")})).at(0);
   CHECK(valid.at("forced_pch") == R"json([{"option":"-include","path":"build/CMakeFiles/one.dir/cmake_pch.hxx"}])json"_fixture);
   CHECK(valid.at("pch_reason") == "target-local forced PCH");
@@ -193,7 +231,7 @@ TEST_CASE("PCH evidence distinguishes registered use, exclusion, and contradicto
     CHECK(found.at("pch_reason") == "inconsistent PCH evidence");
     CHECK(!found.at("pch_issues").empty());
   }
-  const auto skippedPolicy = replaceFirst(registeredPolicy, "use\t", "skip\t");
+  const auto skippedPolicy = replaceFirst(registeredPolicy(), "use\t", "skip\t");
   const auto skipped = readContexts(Json::array({targetEntry("one", "")}), skippedPolicy).at(0);
   CHECK(skipped.at("pch_reason") == "source is excluded by its target PCH policy");
   CHECK(skipped.at("pch_issues") == Json::array());
@@ -208,11 +246,11 @@ TEST_CASE("PCH evidence distinguishes registered use, exclusion, and contradicto
   entry["output"] = "CMakeFiles/two.dir/a.o";
   const auto mismatch = readContexts(Json::array({entry})).at(0);
   CHECK(includes(mismatch.at("pch_issues"), "compile output metadata differs from its compiler argument"));
-  const auto contradictory = readContexts(Json::array({targetEntry("one")}), registeredPolicy + "skip\t/repo/src/a.cpp\n").at(0);
+  const auto contradictory = readContexts(Json::array({targetEntry("one")}), registeredPolicy() + "skip\t/repo/src/a.cpp\n").at(0);
   CHECK(includes(contradictory.at("pch_issues"), "source is both used and excluded by its target policy"));
 }
 
-TEST_CASE("include audit retains unknown and ineligible secondary compile contexts", secondary_contexts) {
+void secondary_contexts() {
   auto unknown = targetEntry("other", "");
   unknown["command"] = replaceFirst(unknown.at("command").get<std::string>(), "CMakeFiles/other.dir/a.o", "objects/a.o");
   const auto contexts = readContexts(Json::array({targetEntry("one"), unknown}));
@@ -229,7 +267,7 @@ TEST_CASE("include audit retains unknown and ineligible secondary compile contex
   CHECK(mixed.at(1).at("pch_reason") == "inconsistent PCH evidence");
 }
 
-TEST_CASE("PCH retention accounts for source kind and actual group coverage", retention) {
+void retention() {
   const Json reasons{{"src/a.h", "declaration header requires direct dependencies"},
     {"src/a.cu", "CUDA source does not consume an ordinary C++ PCH"},
     {"src/a.cppm", "module source does not consume a PCH"}, {"src/a.c", "not an ordinary C++ translation unit"}};
@@ -252,11 +290,11 @@ TEST_CASE("PCH retention accounts for source kind and actual group coverage", re
   CHECK(quoted.at("retained").at(0).at("reason") == "non-angle include retains explicit lookup");
 }
 
-TEST_CASE("include reports expose compiler evidence and every retained standard or Linux directive", report_evidence) {
-  const Json sources{{pch, "#include <vector>\n"}, {"src/a.cpp", "#include <vector>\n#include <unistd.h>\n"},
+void report_evidence() {
+  const Json sources{{pch(), "#include <vector>\n"}, {"src/a.cpp", "#include <vector>\n#include <unistd.h>\n"},
                      {"src/b.h", "#include <vector>\n#include <array>\n"}};
   const auto contexts = compilationContexts(Json::array({targetEntry("one")}), "/repo",
-    [](const std::string&) { return registeredPolicy; }, [](const std::string&) { return true; });
+    [](const std::string&) { return registeredPolicy(); }, [](const std::string&) { return true; });
   const auto report = buildIncludeReport(keys(sources), sources, contexts, "/repo");
   const auto& file = byPath(report.at("files"), "src/a.cpp");
   CHECK(file.at("compile_contexts").size() == 1);
@@ -269,8 +307,25 @@ TEST_CASE("include reports expose compiler evidence and every retained standard 
   CHECK(byPath(report.at("replacements"), "src/a.cpp").at("retained").at(0).at("header") == "unistd.h");
   CHECK(byPath(report.at("replacements"), "src/b.h").at("retained").size() == 2);
 }
+constexpr mmltk::tools::testing::Case cases[]{
+    {"include audit ignores comments and literals, retains branches, macros and continued directives", lexical_includes},
+    {"include audit attributes project paths before system names and exposes ambiguity", attribution},
+    {"include audit verifies target-local forced PCH across every compile environment", compile_environments},
+    {"PCH replacement preserves local includes, comments, conditional branches and line endings", line_endings},
+    {"PCH replacement stays limited to actual compiled PCH consumers", compiled_consumers},
+    {"PCH replacement covers single includes and preserves comments and continuations", continuations},
+    {"PCH replacement retains separate branches and include_next lookup semantics", branches},
+    {"include bundles count distinct consumers, close repeated pairs into triples and retain outside consumers", bundles},
+    {"include frequencies use distinct files, exclude PCH definitions and include inactive evidence", frequencies},
+    {"include audit defaults to reports under output and rejects unknown modes", arguments},
+    {"PCH evidence distinguishes registered use, exclusion, and contradictory compiler commands", pch_evidence},
+    {"include audit retains unknown and ineligible secondary compile contexts", secondary_contexts},
+    {"PCH retention accounts for source kind and actual group coverage", retention},
+    {"include reports expose compiler evidence and every retained standard or Linux directive", report_evidence},
+};
+
 }  // namespace include_audit_test
 
-int main() {
-  return include_audit_test::suite.run();
+export int mmltk_tool_audit_includes_test(int argc, char** argv) {
+  return mmltk::tools::testing::run_cases(include_audit_test::cases, argc, argv);
 }

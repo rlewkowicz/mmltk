@@ -1,10 +1,82 @@
-#include "runtime_package.hpp"
-#include "cpp_support.hpp"
+module;
 
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <iostream>
 #include <sys/socket.h>
+
+#include <filesystem>
+#include <functional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <vector>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.runtime_package;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+
+export {
+namespace mmltk::tools::runtime_package {
+
+enum class Layout { stage, image };
+
+// Entry names retain the shell inventory's '?' optional-entry prefix. Source
+// metadata is available to release fingerprint callers without another table.
+struct Row {
+    std::string_view path;
+    std::string_view destination;
+    std::string_view source_kind;
+    std::string_view source_path;
+    std::span<const std::string_view> entries;
+};
+
+std::span<const Row> inventory() noexcept;
+// Ordered traversal stops at and returns the first nonzero callback status.
+int inventory(const std::function<int(const Row&)>& callback);
+bool check_directory(const std::filesystem::path& root, Layout layout, const Row& row);
+bool complete(const std::filesystem::path& root, Layout layout = Layout::stage);
+
+// Return lowercase SHA-256 without a trailing newline. Operational failures
+// throw ToolError (from mmltk.tools.cpp_support) or a standard filesystem/system error.
+std::string path_fingerprint(const std::filesystem::path& root);
+// The record includes its terminating newline, as in the shell callback.
+std::string hash_directory(const std::filesystem::path& root, const Row& row);
+std::string fingerprint(const std::filesystem::path& root);
+
+// Copy merges the directory into its absolute image destination. No rollback
+// is performed after a failure, matching the original installation library.
+int copy_directory(const std::filesystem::path& root, const Row& row);
+int install(const std::filesystem::path& root);
+
+} // namespace mmltk::tools::runtime_package
+
+}
 
 namespace mmltk::tools::runtime_package {
 namespace {
@@ -216,3 +288,43 @@ int install(const fs::path& root) {
 }
 
 } // namespace mmltk::tools::runtime_package
+
+export int mmltk_tool_runtime_package(int argc, char** argv) {
+    namespace package = mmltk::tools::runtime_package;
+    using mmltk::tools::ToolError;
+    try {
+        if (argc < 2) throw ToolError("runtime-package requires an operation", 2);
+        const std::string_view operation = argv[1];
+        if (operation == "inventory") {
+            if (argc != 2) throw ToolError("inventory takes no arguments", 2);
+            // Preserve the wrapper's NUL-framed row protocol, including the
+            // empty field terminating each row and optional-entry markers.
+            return package::inventory([](const package::Row& row) {
+                for (auto field : {row.path, row.destination, row.source_kind, row.source_path})
+                    std::cout << field << '\0';
+                for (auto field : row.entries) std::cout << field << '\0';
+                std::cout << '\0';
+                return std::cout ? 0 : 1;
+            });
+        }
+        if (argc < 3) throw ToolError("runtime-package operation requires a root", 2);
+        const std::filesystem::path root = argv[2];
+        if (operation == "complete") {
+            if (argc > 4 || (argc == 4 && std::string_view(argv[3]) != "stage" && std::string_view(argv[3]) != "image"))
+                throw ToolError("complete expects ROOT [stage|image]", 2);
+            return package::complete(root, argc == 4 && std::string_view(argv[3]) == "image" ? package::Layout::image : package::Layout::stage) ? 0 : 1;
+        }
+        if (argc != 3) throw ToolError("runtime-package operation expects one root", 2);
+        if (operation == "path-fingerprint") std::cout << package::path_fingerprint(root) << '\n';
+        else if (operation == "fingerprint") std::cout << package::fingerprint(root) << '\n';
+        else if (operation == "install") return package::install(root);
+        else throw ToolError("unknown runtime-package operation: " + std::string(operation), 2);
+        return std::cout ? 0 : 1;
+    } catch (const ToolError& error) {
+        std::cerr << "runtime-package: " << error.what() << '\n';
+        return error.status;
+    } catch (const std::exception& error) {
+        std::cerr << "runtime-package: " << error.what() << '\n';
+        return 1;
+    }
+}

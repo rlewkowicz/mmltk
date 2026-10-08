@@ -1,7 +1,7 @@
+module;
 // Native counterpart of configure_cmake_graph.sh. Requires cpp_support.hpp,
 // vendored nlohmann JSON headers, and OpenSSL libcrypto. CMake and the existing
 // Python invariant checker remain external commands; no shell is involved.
-#include "cpp_digest.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,6 +17,34 @@
 
 #include <openssl/evp.h>
 #include <unistd.h>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <initializer_list>
+#include <optional>
+#include <cerrno>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <utility>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+export module mmltk.tools.configure_cmake_graph;
+import mmltk.tools.cpp_digest;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 namespace support = mmltk::tools;
@@ -163,7 +191,7 @@ int configure(int argc, char** argv) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_configure_cmake_graph(int argc, char** argv) {
     try { return configure(argc, argv); }
     catch (const ToolError& error) {
         std::cerr << "configure_cmake_graph: " << error.what() << '\n';

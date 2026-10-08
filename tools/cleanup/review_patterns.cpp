@@ -1,11 +1,6 @@
+module;
 // Human review evidence only: lexical shapes do not establish semantic
 // equivalence, extraction permission, source registration, or rewrite rules.
-#include "review_patterns.hpp"
-#include "../cpp_support.hpp"
-
-#include "../cpp_locale.hpp"
-#include "cpd_patterns.hpp"
-#include "declaration_patterns.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +13,57 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+#include <initializer_list>
+#include <optional>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <span>
+#include <system_error>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cstdint>
+#include <limits>
+#include <unicode/ucol.h>
+#include <unicode/uloc.h>
+#include <unicode/utypes.h>
+
+export module mmltk.tools.cleanup.review_patterns;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
+import mmltk.tools.cpp_locale;
+import mmltk.tools.cleanup.cpd_patterns;
+import mmltk.tools.cleanup.declaration_patterns;
+
+export {
+namespace mmltk::tools::review {
+
+using Json = nlohmann::ordered_json;
+
+std::size_t physicalLines(std::string_view source);
+// files is an ordered JSON array of {path, source, language, sha256}; rawReport
+// has the raw_matches and classified_context collections from rawCpdReport.
+Json buildReview(const Json& files, const Json& rawReport);
+std::string renderReviewMarkdown(const Json& review);
+
+}  // namespace mmltk::tools::review
+
+}
 
 namespace mmltk::tools::review {
 namespace {

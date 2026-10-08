@@ -1,3 +1,4 @@
+module;
 // Bounded independent RF-DETR evidence. Execute only through ./mmltk.
 //
 // Native counterpart to generate_rfdetr_upstream_oracle.py. The pinned RF-DETR
@@ -21,8 +22,6 @@
 #include <pybind11/embed.h>
 #include <pybind11/stl.h>
 
-#include "cpp_digest.hpp"
-
 #include <openssl/evp.h>
 
 #include <algorithm>
@@ -43,6 +42,33 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <initializer_list>
+#include <optional>
+#include <chrono>
+#include <climits>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iterator>
+#include <span>
+#include <stdexcept>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+export module mmltk.tools.generate_rfdetr_upstream_oracle;
+import mmltk.tools.cpp_digest;
+import mmltk.tools.cpp_support;
+import mmltk.tools.cpp_text;
 
 namespace {
 
@@ -1241,7 +1267,7 @@ int execute(const Arguments& args) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+export int mmltk_tool_generate_rfdetr_upstream_oracle(int argc, char** argv) {
     try {
         const auto args = parse_arguments(argc, argv);
         if (args.help) {
