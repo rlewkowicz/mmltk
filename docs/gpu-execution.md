@@ -527,8 +527,9 @@ and [ShiftLUT tooling](commands.md#shiftlut-model-tooling).
 ./mmltk --diagnose-io ./compiled/train.bin > io-capabilities.json
 ```
 
-This uses the existing `MMLTK_BUILD_IMAGE` (default `mmltk-build:latest`) and a
-read-only dataset mount. It does not build or pull images, read file contents,
+The native [I/O diagnostic](../tools/diagnose_dataset_io.cpp) uses the existing
+`MMLTK_BUILD_IMAGE` (default `mmltk-build:latest`) and a read-only dataset mount.
+It does not build or pull images, read file contents,
 or run a benchmark. JSON includes CPU topology (`lscpu`), GPU/driver and kernel
 details (including GPU UUID and current total/used/free VRAM), NUMA hardware,
 DRM render-node paths resolved to their sysfs PCI devices, filesystem and block
@@ -569,7 +570,10 @@ diagnostic process without creating a CUDA context or Vulkan instance.
 Available library files and that process's loader resolution do not prove
 which libraries the application loaded; use the [runtime provenance records](logging.md#vulkan-diagnostics-and-descriptor-provenance)
 for that evidence. The source is
-[diagnose_gpu_environment.py](../tools/diagnose_gpu_environment.py).
+[diagnose_gpu_environment.cpp](../tools/diagnose_gpu_environment.cpp). The
+wrapper mounts the [published tools closure](build.md#native-tools-and-checkout-bootstrap)
+read-only into the selected image. Library-query child processes own dynamic
+loading; ordinary host-driver startup does not initialize those GPU libraries.
 
 ## Functional GDR checks
 

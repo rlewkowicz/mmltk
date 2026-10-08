@@ -35,7 +35,10 @@ both pointer and keyboard capabilities, then shuts down.
 Only `workspace-wayland` additionally validates application native import,
 WebGPU/Vulkan, swapchain, presentation, and shutdown. The second check exercises
 supervisor ownership, readiness, failure, deadlines, and signals in the existing
-build image without GPU access.
+build image without GPU access. It uses the separate native `mmltk-tests`
+runner and also runs within unfiltered `all`;
+[fixture selection](validation.md#selection-environment-deadlines-and-debugging)
+supports listing or retrying individual cases.
 
 `headless-compositor` also accepts a command after `--`; its default command
 is `/usr/bin/true`. This is the wrapper entrypoint for diagnostics that need
@@ -91,15 +94,20 @@ Ubuntu Weston `13.0.0-4build3` is pinned for both the module builder's
 [headless_weston_seat.cpp](../tools/headless_weston_seat.cpp) uses the packaged
 public structures and four version-scoped exported lifecycle functions:
 `weston_seat_init`, `weston_seat_init_pointer`, `weston_seat_init_keyboard`,
-and `weston_seat_release`. Their declarations are private Weston API, so a
-package update requires rechecking those signatures and lifetimes.
+and `weston_seat_release`. Its named module retains an ordinary shared-library
+C ABI through a CMake-generated `wet_module_init` adapter. Those lifecycle
+declarations are private Weston API, so a package update requires rechecking
+their signatures and lifetimes.
 
 The module installs a `default` seat and releases it through the compositor's
 destroy signal. Partial construction also releases initialized state. It loads
 from `/usr/lib/weston/mmltk-headless-seat.so` before the readiness module.
 [Dockerfile.wayland-validation](../docker/Dockerfile.wayland-validation) owns
-the package pin and module build; [headless_compositor.py](../tools/headless_compositor.py)
-owns session startup, seat/protocol readiness, and teardown.
+the package pin and isolated tools-graph build. The native
+[headless_compositor.cpp](../tools/headless_compositor.cpp) module owns session
+startup, seat/protocol readiness, and teardown in the wrapper-selected child
+process. The seat plugin stays in Weston; its libraries are independent of the
+[standalone driver](build.md#native-tools-and-checkout-bootstrap).
 
 The synthetic seat supplies Firefox/GTK and acceptance capabilities; it certifies
 neither physical input devices nor host-desktop focus. Preflight proves setup

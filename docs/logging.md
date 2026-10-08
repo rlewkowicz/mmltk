@@ -47,22 +47,33 @@ forwards logging overrides to its sibling tool. Ordinary CLI result stdout
 
 ## Wrapper build, test, and tidy transcripts
 
-Explicit `./mmltk --build`, `./mmltk --test ...`, and `./mmltk --tidy` commands
-retain their stdout and stderr automatically. The wrapper prints the selected
-path when capture starts:
+Explicit `./mmltk --build`, `--build-tools`, `--test ...`, `--tidy`, and
+`--tidy-tools` operations retain their stdout and stderr automatically, as does
+`--diagnose-rfdetr-upstream --build-only`.
+The native [driver](../tools/mmltk.cpp) owns capture and prints the selected
+path when it starts:
 
 | Operation | Default path below the repository | Destination override |
 | --- | --- | --- |
 | Build | `build/logs/mmltk-build-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
+| Tools build | `build/logs/mmltk-build-tools-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
+| Oracle image build | `build/logs/mmltk-build-rfdetr-oracle-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
 | Test | `build/logs/mmltk-test-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TEST_LOG_FILE` |
-| Tidy | `build/logs/mmltk-tidy-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TIDY_LOG_FILE` |
+| Tidy / tools tidy | `build/logs/mmltk-tidy-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TIDY_LOG_FILE` |
 
 Relative overrides resolve against the invocation's working directory. Capture
 appends to an existing override path, so choose a new filename to isolate a
-run. Test `list`, `help`, `-h`, and `--help` routes skip capture. Initial wrapper
-startup text emitted before operation selection is outside the transcript.
+run. Test `list`, `help`, `-h`, and `--help` routes skip capture, as does
+`--build-tools --help`. Initial wrapper startup text emitted before operation
+selection is outside the transcript.
 Automatic command capture does not enable GUI traces, pixel probes, or routine
 application diagnostics.
+
+The [cold bootstrap](build.md#native-tools-and-checkout-bootstrap) retains its
+initial build output in
+`build/logs/mmltk-tools-bootstrap-YYYYMMDD-HHMMSS-PID.log`. The native operation
+launched afterward owns its usual separate transcript. Bootstrap work invoked
+by an already-running build or tidy operation uses that operation's capture.
 
 The caller still receives stdout on stdout and stderr on stderr. Separate tees
 retain both streams in one file; this does not establish a total ordering
@@ -73,7 +84,9 @@ printing and appending its terminal line:
 mmltk: test exited with status 0
 ```
 
-Build and tidy use their corresponding operation names. Capture/cleanup failures
+Build, tools build, and tidy use `build`, `build-tools`, and `tidy` respectively;
+tools tidy also uses `tidy`, and oracle image preparation uses
+`build-rfdetr-oracle`. Capture/cleanup failures
 report an error and turn an otherwise successful command into a nonzero result.
 An abrupt termination can leave a transcript without a terminal; EOF alone
 does not establish success. The log parser exposes observed exit lines as
@@ -1160,7 +1173,7 @@ error.
 
 ## Catch selection and terminal evidence
 
-The [log parser](../tools/log_query.py) treats Catch's **No test cases matched**
+The [native log parser](../tools/log_query_internal.cpp) treats Catch's **No test cases matched**
 as `catch.test_selection_failed` with error level. **No tests ran** becomes an
 error `catch.summary` with `tests: 0`. Both appear under `--errors` and in
 terminal context, alongside existing Catch assertion failures. The original
@@ -1593,11 +1606,14 @@ Malformed or oversized records remain searchable with warnings.
 successful output, 1 indicates no matches, and 2 reports invalid queries,
 unreadable/changing inputs, or strict parse failures.
 
-The tool uses the existing build image, no GPU or network, and a read-only
-repository mount. It reads files only up to captured sizes; multi-pass
+The wrapper invokes the native log-query module through the published container
+tool executable in the existing build image, with no GPU or network and a
+read-only repository mount. It reads files only up to captured sizes; multi-pass
 correlation requires unchanged inputs. There is no follow mode or persistent
-index. Implementation and current help live in
-[tools/log_query.py](../tools/log_query.py). Unfiltered `./mmltk --test all`
+index. The [module interface](../tools/log_query.cpp),
+[runtime definitions](../tools/log_query_runtime.cpp), and
+[private implementation/help](../tools/log_query_internal.cpp) share one query
+implementation. Unfiltered `./mmltk --test all`
 includes its fixture suite. The standalone `./mmltk --test log-query-tool`
 route and focused selectors are documented under
 [test selection](validation.md#selection-environment-deadlines-and-debugging).

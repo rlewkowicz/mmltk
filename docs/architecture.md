@@ -9,6 +9,7 @@ architecture, product outcomes, resource lifetime, and shutdown.
 
 | Location | Responsibility |
 | --- | --- |
+| [tools/mmltk.cpp](../tools/mmltk.cpp), [tools/CMakeLists.txt](../tools/CMakeLists.txt) | Native container driver and independent named-module tools graph; [bootstrap and process boundaries](build.md#native-tools-and-checkout-bootstrap) |
 | [src/entrypoints/cli/cli.cpp](../src/entrypoints/cli/cli.cpp) | Dataset compile/info/benchmark commands and root dispatch |
 | [src/entrypoints/cli/rfdetr_cli.cpp](../src/entrypoints/cli/rfdetr_cli.cpp) | RF-DETR command parsing and execution |
 | [src/entrypoints/cli/cli_options.h](../src/entrypoints/cli/cli_options.h), [rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h) | Root and RF-DETR reflected option tables, scopes, explicit codecs, and exposure decisions |
@@ -22,8 +23,9 @@ architecture, product outcomes, resource lifetime, and shutdown.
 
 The root [CMakeLists.txt](../CMakeLists.txt) registers component directories;
 each component's `CMakeLists.txt` declares its sources, ordinary headers,
-retained modules, links, and tests. Native executable targets install as
-`mmltk` and `mmltk-browser-host`. The [build reference](build.md#target-declarations-and-precompiled-headers)
+retained modules, links, and tests. Product executable targets install as
+`/opt/mmltk/bin/mmltk` and `/opt/mmltk/bin/mmltk-browser-host`, independently of
+the root driver and its container copy. The [build reference](build.md#target-declarations-and-precompiled-headers)
 owns declaration-only dependencies, header isolation, and target-local PCHs.
 
 Root CLI startup scans logging overrides once and passes the result through
@@ -643,8 +645,9 @@ register their own tests and domain fixtures. The
 [validation ownership map](validation.md#gui-behavior-and-evidence-ownership)
 locates those suites; [packaged acceptance](validation.md#packaged-wayland-acceptance)
 locates the Wayland session/audit owners. Wrapper suite
-selection is defined in `mmltk`, with native target registration in component
-CMake files.
+selection is defined in [tools/mmltk.cpp](../tools/mmltk.cpp), with native target
+registration in component CMake files. Native tool fixtures use the independent
+[tools runner](validation.md#native-tool-fixtures).
 
 `third_party` is maintained as part of this codebase, including the owned
 Firefox and Iced changes. It retains upstream notices and per-project build

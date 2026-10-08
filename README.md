@@ -36,13 +36,15 @@ Third party contains aggressively modified upstreams. This project would not exi
 
 Use a Linux host with Docker/Buildx and NVIDIA GPU access configured for
 containers. Run commands from the repository root; the wrapper supplies the
-container toolchains.
+container toolchains. A fresh checkout first builds the native wrapper:
 
 ```bash
+./tools/bootstrap_mmltk.sh --launch "$PWD" --build-tools
 ./mmltk --build
 ./mmltk --gui
 ```
 
+After tool-source changes, rebuild the wrapper with `./mmltk --build-tools`.
 The full build packages the native CLI, browser host, owned Firefox runtime,
 and Iced WebAssembly interface. The GUI requires an active Wayland session.
 
@@ -134,7 +136,7 @@ data, or the [command reference](docs/commands.md) for CLI and GUI operations.
 [Validation](docs/validation.md) covers tidy, cleanup, focused tests, and
 hardware acceptance; [logging](docs/logging.md) explains captured evidence.
 `./mmltk --test all` runs the ordinary native suites, browser JavaScript/Rust
-tests, cleanup/declaration-tool fixtures, and log-query fixtures. Packaged
+tests, cleanup/declaration, log-query, and compositor fixtures. Packaged
 Wayland acceptance has its own command in the validation guide.
 CPU compilation/resampling profiles and full Coconut measurements are
 [explicit opt-in operations](docs/validation.md#data-compilation-and-resampling-profiles);
@@ -151,7 +153,8 @@ continues. See [GUI interaction and presentation](docs/gui-interaction.md).
 
 | Start here | Purpose |
 | --- | --- |
-| [mmltk](mmltk) and [CMakeLists.txt](CMakeLists.txt) | Container orchestration and the build graph |
+| [Native driver](tools/mmltk.cpp) and [tools graph](tools/CMakeLists.txt) | Container orchestration and standalone tool modules |
+| [Product graph](CMakeLists.txt) | Native application, browser, and packaged runtime |
 | [CLI entrypoint](src/entrypoints/cli/cli.cpp) | Dataset commands and RF-DETR dispatch |
 | [Desktop entrypoint](src/entrypoints/desktop/browser_runtime_entry.cpp) | Browser-host startup and configuration |
 | [Application shell](src/controller/shell/application_shell.h) | Native system construction and lifetime |

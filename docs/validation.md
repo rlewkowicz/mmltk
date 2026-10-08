@@ -11,10 +11,10 @@ required final full build, both gate commands must pass in this order:
 ./mmltk --test workspace-wayland --headless-compositor
 ```
 
-Unfiltered `all` runs native, browser JavaScript/Rust, cleanup/declaration, and
-log-query fixtures. Resume failed tests and tidy checks with the focused
-selections below; retain successful results and finish checks left unexecuted
-by an interruption. Rebuild changed product code through `./mmltk --build`
+Unfiltered `all` runs native, browser JavaScript/Rust, cleanup/declaration,
+log-query, and compositor fixtures. Resume failed tests and tidy checks with
+the focused selections below; retain successful results and finish checks left
+unexecuted by an interruption. Rebuild changed product code through `./mmltk --build`
 before testing. Once focused retries pass, run the required full completion
 pass. Retries do not restart or reorder validation stages.
 
@@ -24,13 +24,14 @@ pass. Retries do not restart or reorder validation stages.
 ./mmltk --tidy
 ```
 
-The full configured suite formats tracked first-party C/C++/CUDA files and
-runs containerized `cargo fmt` for the first-party `mmltk-browser-app` package.
-It refreshes `.cache/cmake/analysis`, runs clang-tidy where supported, and
-validates reflection translation units through their exact GCC compiler
-objects. Native `--file` selections skip the package-wide Rust formatting;
-`--start-at` retains it. This Rust step is formatting, not a Rust static-analysis
-suite. The [build reference](build.md#target-declarations-and-precompiled-headers)
+The full configured suite first runs the [standalone tools stage](#native-tool-analysis),
+then formats tracked first-party C/C++/CUDA files and runs containerized
+`cargo fmt` for the first-party `mmltk-browser-app` package.
+The product stage refreshes `.cache/cmake/analysis`, runs clang-tidy where
+supported, and validates reflection translation units through their exact GCC
+compiler objects. Native `--file` selections skip the package-wide Rust
+formatting; `--start-at` retains it. This Rust step is formatting, not a Rust
+static-analysis suite. The [build reference](build.md#target-declarations-and-precompiled-headers)
 owns PCH and header-isolation handling in the analysis graph.
 `./mmltk --tidy --rust-only` formats just that Rust package through the same
 containerized owner, without configuring or analyzing native code. It cannot
@@ -64,7 +65,32 @@ full passes required by the workflow. Tidy retains a
 [wrapper transcript](logging.md#wrapper-build-test-and-tidy-transcripts), with
 `MMLTK_TIDY_LOG_FILE` selecting its destination. The implementation and
 available analysis overrides are in
-[run_static_analysis.sh](../tools/run_static_analysis.sh).
+[run_static_analysis.cpp](../tools/run_static_analysis.cpp).
+
+### Native tool analysis
+
+```bash
+./mmltk --tidy-tools
+./mmltk --tidy-tools --file tools/mmltk.cpp tools/tool_command.cpp
+./mmltk --tidy-tools --start-at tools/log_query.cpp
+```
+
+This operation formats and validates only translation units registered in
+[the standalone tools graph](build.md#native-tools-and-checkout-bootstrap),
+using `.cache/cmake/tools` and the tools image. Its C++26/module units are
+validated by building their GCC objects and dependencies; clang-tidy does not
+consume GCC BMIs. Grouped `--file` and `--start-at` use the same selection rules
+as full tidy. The tools resume point uses the ordered registered-unit list.
+Focused selections need the tools compilation database from `--build-tools`.
+
+`--tidy` routes a mixed `--file` selection to the tools and product graphs.
+Product-dependent diagnostic modules belong to product analysis. The full
+formatting pass also formats the isolated oracle and Weston sources, whose
+compilation belongs to their respective images; oracle build/check preparation
+is `--diagnose-rfdetr-upstream --build-only`. `--tidy-tools` rejects those
+foreign-graph selections, Rust, and third-party selections. It shares the
+normal tidy transcript and does not publish a new executable; use
+`--build-tools` before exercising changed tool behavior.
 
 ## PCH include audit
 
@@ -74,7 +100,7 @@ available analysis overrides are in
 ./mmltk --audit-includes fix
 ```
 
-[audit_includes.mjs](../tools/audit_includes.mjs) is a lexical inventory and
+[audit_includes.cpp](../tools/audit_includes.cpp) is a lexical inventory and
 conservative replacement tool for the checked-in PCH groups. It is not semantic
 include-what-you-use analysis. `report` (the default) and `preview` write reports
 without changing sources; `fix` applies admitted replacements. The tool reads
@@ -102,7 +128,7 @@ outside consumed groups retain direct includes. A retained include is not an
 unresolved cleanup finding merely because another target uses that header in a PCH.
 
 Before editing, `fix` runs
-[check_toolchain_invariants.py](../tools/check_toolchain_invariants.py) through
+[check_toolchain_invariants.cpp](../tools/check_toolchain_invariants.cpp) through
 the wrapper, including creation/use compiler-environment equality and exclusion
 checks. It preserves conditional branches and comments, verifies that each
 source still matches its inspected snapshot, and atomically replaces admitted
@@ -118,23 +144,26 @@ establishes build/test success or a measured PCH speedup.
 ./mmltk --cleanup-report all
 ```
 
-These generate the C++ and/or frontend reports under `cleanup/`.
-`cpp-code-deduplication.json` and `frontend-code-deduplication.json` contain
+These select the C++, frontend, and native-tools reports under `cleanup/`;
+`all` runs all three profiles. `cpp-code-deduplication.json`,
+`frontend-code-deduplication.json`, and `tools-code-deduplication.json` contain
 textual `hits` and structural `structural_hits`, ordered with cross-file
 findings before within-file findings. Use the applicable full profiles and
 resolution rules in `AGENTS.md`; reports do not themselves change product code.
 The target files contain only match sizes, source paths/ranges, and applicable
 consolidation patterns. Detector configuration, inventory, rejected candidates,
-and inline-suppression details live separately in `cleanup/rejected.json`,
-under the selected profile. Running one profile preserves the other's rejection
-record. Its `duplo.raw_hits` retains the detector's original hits before source
-filtering. Each output is replaced atomically.
+producer identity, and inline-suppression details live separately in
+`cleanup/rejected.json`, under the selected profile. Running one profile
+preserves the others' rejection records. Its `duplo.raw_hits` retains the
+detector's original hits before source filtering. Each output is replaced atomically.
 
-The standalone `tools` profile writes `cleanup/tools-code-deduplication.json`.
-It covers native sources and headers recursively under `tools/`, plus root
-`mmltk.cpp` and `mmltk_container_commands.hpp`, including untracked, unignored
-files. Build, generated, vendor, and deleted files stay outside that inventory.
-It uses the C++ detector settings; `all` continues to select `cpp` and `frontend`.
+The standalone `tools` profile covers native modules, sources, and headers
+recursively under `tools/`, including the driver and fixtures and untracked,
+unignored files. Build, generated, vendor, and deleted files stay outside that
+inventory. It uses the C++ detector settings. Producer metadata records the
+native module/source identity, executing ELF path and SHA-256, and the tools
+input fingerprint when present beside the executable. Raw CPD reports retain
+that same `producer` object directly.
 
 C++ Duplo uses a six-line minimum; CPD uses a 39-token minimum with identifiers
 anonymized and literal sequences ignored. Frontend minima are nine lines and
@@ -198,7 +227,7 @@ human review of every file.
 ./mmltk --format-declarations fix --file src/backend/models/rfdetr/contract/train_recipe.h
 ```
 
-[generate_cleanup_json.mjs](../tools/generate_cleanup_json.mjs) owns both
+[generate_cleanup_json.cpp](../tools/generate_cleanup_json.cpp) owns both
 ordinary cleanup and raw evidence. Raw CPD defaults to 12 tokens (minimum 2),
 preserves exact identifier/literal spelling, disables block skipping,
 and applies no source-context filter or inline suppression. Its first-party
@@ -239,7 +268,7 @@ analysis, not a failing check.
 
 The review inventory includes first-party authored native, Rust, JavaScript/
 TypeScript, Python, shell, CMake, HTML/CSS, and Dockerfile code, including the
-root wrapper. It uses tracked and untracked-unignored Git inputs and omits
+native wrapper sources. It uses tracked and untracked-unignored Git inputs and omits
 deleted paths, third-party code, and generated/output trees. Each entry records
 language, byte and physical-line counts, SHA-256, dedicated/embedded test
 evidence, family IDs, and `status: "unreviewed"`. Non-C++ languages receive size
@@ -247,7 +276,7 @@ triage only. The queue includes every file **over 500 physical lines** and any
 file with a candidate family. A file with exactly 500 lines needs a candidate
 family to enter the queue.
 
-[review_patterns.mjs](../tools/cleanup/review_patterns.mjs) groups bounded lexical
+[review_patterns.cpp](../tools/cleanup/review_patterns.cpp) groups bounded lexical
 CLI bindings, CLI exclusions, trait declarations, repeated qualifications, and
 same-name mappings with at least three distinct occurrences. Families retain
 original spans and owner evidence, invariant tokens, varying slots and values,
@@ -264,9 +293,9 @@ extraction. File size is an inspection trigger, not a refactoring requirement.
 
 ### Annotation formatter
 
-[format_declarations.mjs](../tools/format_declarations.mjs) shares the lexical
+[format_declarations.cpp](../tools/format_declarations.cpp) shares the lexical
 index and classifiers in
-[declaration_patterns.mjs](../tools/cleanup/declaration_patterns.mjs). It is not
+[declaration_patterns.cpp](../tools/cleanup/declaration_patterns.cpp). It is not
 a semantic C++ parser. By default it examines the complete first-party C++
 inventory; repeat `--file PATH` to narrow it. Files must belong to that
 inventory. Macro-conflict inspection still covers the full inventory.
@@ -355,23 +384,50 @@ outside the permitted test set.
 | `cuda-vulkan` | Standalone CUDA/Vulkan allocation, FD, timeline, pixel, and exporter-exit diagnostic |
 | `headless-compositor` | Real NVIDIA Weston availability and protocol checks |
 | `headless-compositor-tool` | Supervisor ownership/failure fixtures without GPU |
-| `cleanup-tool` | Cleanup/raw-CPD evidence and declaration-formatter fixtures |
+| `cleanup-tool` | Cleanup/raw-CPD evidence, declaration formatter, review-candidate, and include-audit fixtures |
 | `log-query-tool` | Log parser/query/correlation/triage fixtures |
 | `build` | Build the configured native test targets without running them |
-| `all` | Build native test targets; run ordinary native executables, browser JavaScript/Rust tests, cleanup/declaration fixtures, and log-query fixtures |
+| `all` | Build native test targets; run ordinary native executables, browser JavaScript/Rust tests, cleanup/declaration, log-query, and compositor fixtures |
 
 `all` builds `mmltk_workspace_wayland_integration` but excludes it from its run
 list. With no native executable or runner-argument filter, it then executes
-`browser-app`, `cleanup-tool`, and `log-query-tool`, retaining the first nonzero status while
-running the remaining groups. `all --executable TARGET` and `all -- FILTER`
+`browser-app`, `cleanup-tool`, `log-query-tool`, and `headless-compositor-tool`,
+retaining the first nonzero status while running the remaining groups.
+`all --executable TARGET` and `all -- FILTER`
 remain native selections and do not append those fixture groups. `all` does not
-execute `cuda-vulkan`, the compositor tooling suites, or either profile
+execute `cuda-vulkan`, the real `headless-compositor` check, or either profile
 runner. Full Coconut download/compilation is never implicit in `all`.
 `gui` and `tsan` suite names are currently unavailable even though other
 GUI/development build facilities exist.
 Product-build `--no-run` checks prove Rust test compilation only. Execution
 requires unfiltered `all` or standalone `browser-app`, including its JavaScript
 cases.
+
+Some RF-DETR tests download model checkpoints and derive normalized weights,
+ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
+tests may skip when their requirements are unavailable; a skip is not hardware
+acceptance evidence.
+
+### Native tool fixtures
+
+The [separate tools runner](build.md#native-tools-and-checkout-bootstrap),
+`mmltk-tests`, owns these fixtures. The production driver starts that runner
+for internal fixture requests and contains only production code. Public suite
+routing stays containerized:
+
+| Public suite | Native fixture commands |
+| --- | --- |
+| `cleanup-tool` | `test-generate-cleanup-json`, `test-format-declarations`, `test-review-candidates`, `test-audit-includes` |
+| `log-query-tool` | `test-log-query` |
+| `headless-compositor-tool` | `test-headless-compositor` |
+
+The native commands support `--list-tests`; the public log-query and compositor
+suites forward it after `--`. The cleanup suite instead supports the shared
+`--test-name-pattern` selection described [below](#selection-environment-deadlines-and-debugging).
+Rebuild changed fixtures with `./mmltk --build-tools` before running them.
+Standalone log-query and compositor fixture suites require the existing build
+image, use read-only repository mounts without GPU/network access, and build
+or pull no image. The cleanup suite uses the ordinary build-image preparation.
 
 The log-query tooling suite also exercises wrapper capture and process
 ownership with isolated checkouts and a simulated Docker command. Its runtime
@@ -381,10 +437,10 @@ retention of other checkout/test owners; and rejection of a delayed older GUI
 after a newer invocation has started. These checks exercise wrapper admission
 and cleanup without requiring a display or stopping real application sessions.
 
-Some RF-DETR tests download model checkpoints and derive normalized weights,
-ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
-tests may skip when their requirements are unavailable; a skip is not hardware
-acceptance evidence.
+The explicit `./mmltk --test log-query-tool --tools-ownership` selection runs
+the cold-bootstrap ownership/handoff fixture as container root with the
+required UID/GID and ownership capabilities. Ordinary fixture discovery and
+`all` omit that case and retain restricted container permissions.
 
 ### Data compilation and resampling profiles
 
@@ -560,6 +616,9 @@ Put test-runner arguments after `--`:
 ./mmltk --test browser-app -- --rust-package mmltk-browser-app view::workflow::gpu::tests
 ./mmltk --test browser-app -- --rust-package iced_plot --doc
 ./mmltk --test log-query-tool -- FileQueryTests.test_training_failure_is_an_explicit_triage_anchor
+./mmltk --test log-query-tool -- --list-tests
+./mmltk --test headless-compositor-tool -- --list-tests
+./mmltk --test headless-compositor-tool -- test_normal_completion_and_command_status
 ./mmltk --test application-systems --executable mmltk_frameworks_gpu_tests \
   --env MMLTK_GDR_TEST_DEVICE=0 -- '[gdr][hardware]'
 ./mmltk --test all --executable mmltk_backend_imaging_explore_tests
@@ -632,10 +691,14 @@ For example, the JavaScript `probe` command above still runs the ordinary Rust
 suites; the `iced_plot --doc` command selects only that package's doctests.
 `headless-compositor` accepts a command after `--` and owns its runtime.
 `log-query-tool` accepts one or more `Class.test_method` selectors after `--`;
-with none it runs full discovery. It rejects native test options.
-`headless-compositor-tool` rejects extra arguments and native test options.
+with none it runs ordinary discovery. `-- --list-tests` lists its native cases;
+the [tools ownership case](#native-tool-fixtures) has its explicit option.
+`headless-compositor-tool` accepts one exact `test_name` or `--list-tests`
+after `--`. Both reject native test options.
 `cleanup-tool` accepts only `-- --test-name-pattern PATTERN` for filtering and
-rejects native test options.
+rejects native test options. The same regular expression goes to all four
+cleanup fixture commands; each prints its selected count, including zero when
+only another group matches.
 
 ## Native symbol and link diagnostics
 
@@ -677,8 +740,8 @@ executable is not replaced or run.
 `--linker-directory DIR` selects a repository-contained directory with
 `ld.mold`. This performs real linking, so use it only in the permitted
 validation/diagnosis stage. Sources:
-[diagnose_native_symbols.py](../tools/diagnose_native_symbols.py) and
-[diagnose_native_link.py](../tools/diagnose_native_link.py).
+[diagnose_native_symbols.cpp](../tools/diagnose_native_symbols.cpp) and
+[diagnose_native_link.cpp](../tools/diagnose_native_link.cpp).
 
 ## Standalone CUDA/Vulkan diagnostic
 
@@ -1241,14 +1304,16 @@ read-only; the producer runs offline with a two-hour deadline. The
 [validation-only image](build.md#upstream-reference-image) retains the pinned
 donor Torch/CUDA environment.
 
-[The producer](../tools/generate_rfdetr_upstream_oracle.py) imports the actual
-upstream model, matcher, criterion, and PyTorch optimizer. It records original
+[The native producer](../tools/generate_rfdetr_upstream_oracle.cpp) embeds the
+donor's CPython runtime and imports the actual upstream model, matcher,
+criterion, and PyTorch optimizer. It records original
 official weight identities, normalized state, constructor facts, inputs/masks,
 outputs, operator boundaries, fixed cotangents/VJPs, stochastic samples,
 criterion terms, optimizer groups/moments/ages, and held-input outputs.
 `manifest.json` uses `mmltk.rfdetr.upstream-oracle.v1`, with source/payload/
 dependency/producer hashes, effective model and execution policy, and a checked
 tensor inventory for every archive. Unsupported precisions are explicit.
+`producer_sha256` identifies the running native producer executable.
 
 The bounded stock matrix uses Nano 384 and SegNano 312, two Group-DETR groups,
 FP32/FP16/BF16 where available, batches one/two, and train/eval. Nano FP32 batch

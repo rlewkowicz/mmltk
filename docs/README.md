@@ -4,11 +4,12 @@
 
 ## Getting started and reference
 
-- [Build and reusable state](build.md): prerequisites, toolchains, dependencies,
-  packaging, generated artifacts, cache invalidation, and build timing.
-- [Commands](commands.md): wrapper and native CLI entrypoints, process actions,
-  benchmark inspection/cache selection, explicit data profiling, desktop options,
-  and model tooling.
+- [Build and reusable state](build.md): cold-checkout bootstrap, independent
+  native tools graph and immutable runtime closure, product toolchains,
+  dependencies, packaging, generated artifacts, cache invalidation, and timing.
+- [Commands](commands.md): native driver/tool and application CLI entrypoints,
+  process actions, benchmark inspection/cache selection, explicit data profiling,
+  desktop options, and model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
   preprocessing, output reservation, training history/progress, evaluation,
   export, and image/video prediction and saving.
@@ -65,8 +66,9 @@
 
 ## Engineering, validation, and operations
 
-- [Validation](validation.md): required gates, suite/filter selection, tidy,
-  test-run replacement, PCH include audits, cleanup and raw-review tooling,
+- [Validation](validation.md): required gates, native tool fixtures, suite/filter
+  selection, product/tool tidy, test-run replacement, PCH include audits,
+  three cleanup profiles and raw-review tooling,
   declaration formatting, symbol/address and GPU diagnostics, evidence ownership,
   rendered acceptance, numerical coverage, benchmark ownership/recovery and
   Firefox validation records, opt-in CPU/data profiles, complete Coconut and

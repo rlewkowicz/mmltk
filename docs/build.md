@@ -4,7 +4,8 @@
 
 ## Host and container boundary
 
-Build and run through [the repository wrapper](../mmltk). The supported target
+Build and run through the native `./mmltk` wrapper, whose source is
+[tools/mmltk.cpp](../tools/mmltk.cpp). The supported target
 is Linux with NVIDIA CUDA; the desktop additionally requires Wayland. Docker
 must be usable by the invoking account, with Buildx available for image builds
 and NVIDIA GPU access available to runtime/test containers. The wrapper probes
@@ -25,6 +26,88 @@ configured nice limit. CPU compiler arenas use that page-locking capability
 without CUDA registration; failed placement or pinning fails preparation.
 The [compilation reference](compile-execution.md#fixed-pinned-arenas) owns the
 normal and exceptional storage budgets.
+
+## Native tools and checkout bootstrap
+
+The root `./mmltk` is a generated, optimized, stripped Linux ELF executable.
+On a checkout without it, run the narrow bootstrap from the repository root:
+
+```bash
+./tools/bootstrap_mmltk.sh --launch "$PWD" --build-tools
+```
+
+[bootstrap_mmltk.sh](../tools/bootstrap_mmltk.sh) prepares the GCC/tools images,
+builds the tools in a container, publishes the executable and its library
+closure, then executes the requested native operation. It needs no host C++
+compiler. Once published, use the native operations:
+
+```bash
+./mmltk --build-tools
+./mmltk --tidy-tools
+```
+
+`--build-tools` rebuilds and republishes the standalone tools; it does not
+configure the product graph. `--tidy-tools` formats and validates that graph's
+registered translation units; [tool tidy](validation.md#native-tool-analysis)
+owns selection and isolated-owner limits. Rebuild after tool edits, including
+formatter changes, before running their new behavior. The full product
+`--build` also ensures that current tools are published.
+
+[tools/CMakeLists.txt](../tools/CMakeLists.txt) owns the independent Ninja graph
+at `.cache/cmake/tools`. It requires GCC 16.2 and C++26 reflection, exactly
+CMake 4.4.3, explicit CMake module scanning, and mold. Its Release policy adds
+`-Os`, LTO, function/data sections, and dead-section removal; bootstrap
+installation strips the driver and fixture runner.
+[Dockerfile.tools](../docker/Dockerfile.tools) supplies its build
+environment; `MMLTK_TOOLS_IMAGE` defaults to `mmltk-tools:latest`.
+The product presets in [CMakePresets.json](../CMakePresets.json) remain separate.
+
+CMake explicitly registers sources, named module providers/partitions, entry
+adapters, and link dependencies. The driver main imports the
+[container-command module](../tools/mmltk_container_commands.cpp) and the
+[typed tool-command vocabulary](../tools/tool_command.cpp); the latter derives
+external spelling, logical program names, and exhaustive
+[dispatch](../tools/tool_dispatch.cpp). Shared text/process/JSON support and
+narrow digest, locale, library, and time modules supply the utility owners.
+Standard and third-party headers stay in module global fragments. The tools
+graph does not use the product compiler launcher while building that launcher.
+The product graph consumes the published `module-safe-compiler-launcher`
+through [MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake).
+
+Publication creates `build/.tools-generations/<generation>/` containing
+`mmltk`, the separate `mmltk-tests` fixture runner, `lib/`, and
+`.inputs.sha256`. The bootstrap atomically points `build/tools` at that
+completed generation, then atomically replaces the root ELF. The executable's
+RPATH finds the adjacent container libraries or its immutable host generation;
+older generations remain available to already-running processes. Retain the
+closure with the executable. Tools mutations share a lock, and native user
+resolution owns the published/cache paths after the cold-bootstrap handoff.
+[RuntimeClosure.cmake](../tools/cmake/RuntimeClosure.cmake) owns the installed
+shared-library closure. Fixture code is linked only into `mmltk-tests`.
+
+Bootstrap freshness hashes tool inputs and their names, including untracked
+edits, vendored JSON headers, the GCC/tools Dockerfiles, and the NVIDIA payload
+manifest. The published `.inputs.sha256` permits `--build` to reuse current
+tools; `--build-tools` explicitly reruns their configure/build/install operation.
+This freshness inventory does not define CMake target membership.
+
+The host wrapper and `/opt/mmltk-tools/mmltk` container copy remain separate
+from the application's `/opt/mmltk/bin/mmltk`. Driver startup needs neither
+GPU initialization nor a Python runtime. These tools retain separate execution
+owners:
+
+| Owner | Build and execution boundary |
+| --- | --- |
+| Compiled-sample and COCONut mask diagnostics | Product-dependent module executables registered by [src/entrypoints/tools](../src/entrypoints/tools/CMakeLists.txt); [diagnostic graph](#benchmark-diagnostic-builds) |
+| Upstream RF-DETR reference producer | Native module executable embedding the pinned donor's CPython runtime; [oracle image](#upstream-reference-image) |
+| Weston input seat | Named module behind the generated Weston C ABI adapter; [validation image](headless-wayland.md#validation-input-seat) |
+
+[Toolchain.cmake](../tools/cmake/Toolchain.cmake) generates the minimal process
+and C ABI adapters from each owner's registered module and entrypoint. Those
+owners' libraries do not enter the standalone driver. The
+[command reference](commands.md#native-tool-entrypoints) describes the internal
+invocation boundary; ordinary operations retain their container admission,
+mounts, process ownership, and diagnostics.
 
 ## Release builds
 
@@ -96,13 +179,15 @@ The frontend Cargo workspace includes the owned `third_party/iced_plot` and
 in its own manifest, including package-selected tests and doctests.
 
 [CMakeLists.txt](../CMakeLists.txt) requires exactly CMake 4.4.3.
-[MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake) enforces compiler paths
-and versions; [CMakePresets.json](../CMakePresets.json) defines the graphs.
+[MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake) enforces product compiler
+paths and versions; [CMakePresets.json](../CMakePresets.json) defines the product
+graphs. The [standalone tools graph](#native-tools-and-checkout-bootstrap)
+owns its corresponding toolchain settings independently.
 First-party native links and owned Firefox links use mold; the Iced browser
 artifact targets WebAssembly.
-Ordinary host and CUDA host code use function/data sections for the native
-garbage-collecting link. Release C/C++ uses the configured IPO policy.
-Host compilation selects `-march=native` and `-mtune=native`; the x86-64 policy
+Product host and CUDA host code use function/data sections for the native
+garbage-collecting link. Product Release C/C++ uses the configured IPO policy.
+Its host compilation selects `-march=native` and `-mtune=native`; the x86-64 policy
 also enables SSSE3, SSE4.2, AVX2, and FMA. [Image and mask conversion](datasets.md#resize-geometry)
 uses these existing native facilities with bounded tails.
 The [native link diagnostics](validation.md#native-symbol-and-link-diagnostics)
@@ -172,10 +257,17 @@ It is not a production Python training runtime.
 [Pinned validation requirements](../tools/rfdetr_oracle_requirements.txt)
 install as binary wheels into `/opt/rfdetr-oracle/python` using `--no-deps`.
 This private overlay preserves the donor packages; the
-[producer](../tools/generate_rfdetr_upstream_oracle.py) snapshots and verifies
-payload versions and dependency/import closure. The image fingerprint includes
-the upstream revision/tree, donor, payload manifest, Dockerfile, requirements,
-producer, and selected SDPA comparison policy. Reference generation mounts
+[native producer](../tools/generate_rfdetr_upstream_oracle.cpp) embeds CPython
+and imports the actual upstream libraries to snapshot and verify payload
+versions and dependency/import closure. The image builds the separate
+`mmltk-rfdetr-upstream-oracle` executable from the tools graph with the driver
+disabled. `./mmltk --diagnose-rfdetr-upstream --build-only` builds or reuses this
+image, with environment checks during image creation, without generating
+references or running native comparisons.
+The image fingerprint includes the required upstream revision, donor, payload
+manifest, Dockerfile, requirements, selected native tools sources/build rules,
+and published tools-input fingerprint. Each reference run additionally binds
+the upstream tree and selected SDPA comparison policy. Reference generation mounts
 upstream source/Git metadata and cached weights read-only; the selected evidence
 destination is the writable host mount, with temporary storage inside the container.
 [Validation](validation.md#independent-upstream-diagnostic)
@@ -205,7 +297,7 @@ and extraction responsibilities.
 Arrow's licenses/notices and the bundled/transitive source notices install
 under `share/mmltk/licenses/arrow`, including the six selected dependency
 directories and the captured Boost notices. The
-[runtime package inventory](../tools/runtime_package.sh) includes this tree at
+[runtime package inventory](../tools/runtime_package.cpp) includes this tree at
 `/opt/mmltk/share/mmltk/licenses/arrow`; [NOTICE](../NOTICE) records the attribution.
 
 ### Native caption and video assets
@@ -279,7 +371,7 @@ includes disappear after consolidation.
 `CMakeFiles/<target>.dir/mmltk-pch-policy.txt` from the target registration.
 The generated `cmake_pch.hxx` and `.gch` live beside it under that component's
 build directory.
-[check_toolchain_invariants.py](../tools/check_toolchain_invariants.py) checks
+[check_toolchain_invariants.cpp](../tools/check_toolchain_invariants.cpp) checks
 the compilation database against this policy, including creation/use
 environment equality, exclusions, and fatal invalid-PCH diagnostics.
 The include tool checks those generated policies and forced-include paths;
@@ -296,6 +388,8 @@ These are the default repository-local locations:
 
 | Path | Contents |
 | --- | --- |
+| `mmltk`, `build/tools`, `build/.tools-generations` | Root native driver and atomically published [immutable tools closures](#native-tools-and-checkout-bootstrap) |
+| `.cache/cmake/tools` | Independent tools graph and compilation database |
 | `.cache/cmake/release` | Shared Release build/test graph |
 | `.cache/cmake/gui`, `.cache/cmake/dev`, `.cache/cmake/analysis` | Other wrapper-selected graphs |
 | `.cache/cmake/benchmark-image-release` | CMake graph and native helpers for [benchmark image diagnostics](#benchmark-diagnostic-builds) |
@@ -345,8 +439,9 @@ the selected arguments need. `--compiled` selects
 `mmltk_diagnose_compiled_sample`; `--parquet` or `--panoptic` selects
 `mmltk_diagnose_coconut_mask`. Their
 [entrypoint CMake owner](../src/entrypoints/tools/CMakeLists.txt) registers both
-ordinary C++ executables as `EXCLUDE_FROM_ALL`, with explicit links and runtime
-paths. The compiled helper depends on the canonical Dataset layout/admission
+named module implementations behind generated process adapters as
+`EXCLUDE_FROM_ALL` executables, with explicit links and runtime paths.
+The compiled helper depends on the canonical Dataset layout/admission
 owner; the mask helper links Arrow, Parquet, JSON, and stb.
 
 The wrapper reuses the existing development image and configures
@@ -355,8 +450,9 @@ builds disabled. It builds only the requested targets, under the cache mutation
 lock and a 120-second deadline per target build. Generated
 `benchmark-image-diagnostics.env` in that graph supplies their exact executable
 paths to the read-only inspection container. Preparation output goes to stderr;
-the final diagnostic keeps JSONL on stdout. Help and Python-only queries need
-no graph, target build, product package, or Firefox fingerprint. See
+the final diagnostic keeps JSONL on stdout. Help and index/image/archive queries
+use the published native tool without configuring product targets or requiring
+a product package or Firefox fingerprint. See
 [command inputs and outputs](commands.md#benchmark-image-geometry) for inspection
 limits and evidence paths.
 
@@ -434,13 +530,13 @@ Firefox. Its builder and runtime use the same pinned Weston package version.
 
 ## Isolated build timing
 
-[build_time_trace.sh](../tools/build_time_trace.sh) invokes `./mmltk --build`
+[build_time_trace.cpp](../tools/build_time_trace.cpp) invokes `./mmltk --build`
 with isolated cache, image, builder, and staging identities:
 
 ```bash
-./tools/build_time_trace.sh --cache-key comparison --label cold
-./tools/build_time_trace.sh --cache-key comparison --warm-rebuild --label warm
-./tools/build_time_trace.sh --cache-key comparison --no-op --label noop
+./mmltk --tool build-time-trace -- --cache-key comparison --label cold
+./mmltk --tool build-time-trace -- --cache-key comparison --warm-rebuild --label warm
+./mmltk --tool build-time-trace -- --cache-key comparison --no-op --label noop
 ```
 
 Omit `--cache-key` for a fresh cold cache. Warm/no-op modes require a completed

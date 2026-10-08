@@ -2,7 +2,9 @@
 
 [Wiki index](README.md) · [Quick start](../README.md#build) · [Build details](build.md) · [Validation](validation.md)
 
-Run commands from the repository root through `./mmltk`. The wrapper rewrites
+Run commands from the repository root through the native `./mmltk` executable.
+A cold checkout first needs the [tools bootstrap](build.md#native-tools-and-checkout-bootstrap).
+The wrapper rewrites
 supported host paths into container mounts; absolute host paths become
 `/host/...`, with repository paths mapped into `/workspace`. Each runtime
 invocation owns a repository-labeled container and streams application output.
@@ -11,7 +13,9 @@ invocation owns a repository-labeled container and streams application output.
 
 | Invocation | Purpose |
 | --- | --- |
-| `./mmltk --build` | Build and package the Release runtime |
+| `./mmltk --build-tools` | Build and atomically publish the standalone native driver, container copy, fixture runner, and library closure |
+| `./mmltk --tidy-tools [--file PATH...] [--start-at PATH]` | Format and validate the registered standalone tools graph; file and resume selections are mutually exclusive |
+| `./mmltk --build` | Ensure current tools, then build and package the Release runtime |
 | `./mmltk --build-gui` | Format/check Iced and rebuild the canonical browser bundle in the GUI graph |
 | `./mmltk --gui` | Replace the current runtime session and launch the packaged browser host |
 | `./mmltk --prepare-gui-container` | Prepare the GUI runtime container without starting the app |
@@ -19,13 +23,13 @@ invocation owns a repository-labeled container and streams application output.
 | `./mmltk --generate-protocol` | Generate the same artifacts in the shared Release graph |
 | `./mmltk --update-gui-lock` | Refresh the Cargo lock inputs for browser tests |
 | `./mmltk --update-firefox-lock` | Refresh Firefox's Cargo lock from its vendored sources, offline |
-| `./mmltk --tidy` | Format native sources and Iced application Rust; run configured native analysis |
-| `./mmltk --cleanup-report cpp\|frontend\|tools\|all` | Generate the selected deduplication reports; `tools` scans native tool and wrapper sources independently |
+| `./mmltk --tidy` | Run the tools stage, format native sources and Iced application Rust, and run configured product analysis |
+| `./mmltk --cleanup-report cpp\|frontend\|tools\|all` | Generate selected deduplication reports; `all` includes all three profiles |
 | `./mmltk --raw-cpd [--tools] [--review] [--min-tokens N] [--output PATH]` | Save exact-spelling C++ CPD evidence; `--tools` scopes it to native tools, and `--review` adds an authored-file queue and lexical families in JSON/Markdown |
 | `./mmltk --format-declarations check\|preview\|fix [--file PATH] [--report PATH]` | Report or safely shorten canonical reflection annotation syntax |
 | `./mmltk --audit-includes [--refresh] [report\|preview\|fix] [--output PREFIX] [--build-dir PATH]` | Inventory all compiler contexts and include-retention reasons; preview/apply replacements only under verified target-local PCH policy |
 | `./mmltk --test list` | List supported suites and test options |
-| `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, and log-query fixtures |
+| `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, log-query, and compositor fixtures |
 | `./mmltk --test data-profile -- --help` | Prepare the opt-in target and show CPU compile/pipeline/archive/compaction/resample, full Coconut, and CUDA loader options |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
@@ -38,6 +42,7 @@ invocation owns a repository-labeled container and streams application output.
 | `./mmltk --diagnose-nvidia-payload donor\|development HEADER...` | Inspect public NVIDIA headers and payload selection |
 | `./mmltk --diagnose-native-symbols [OPTIONS] ARTIFACT...` | Inspect cached native `.a`/`.o` symbols or resolve `--address HEX` values in one ELF artifact with the existing development image |
 | `./mmltk --diagnose-native-link [OPTIONS] TARGET` | Repeat one generated Release link into separate diagnostic storage |
+| `./mmltk --tool build-time-trace -- [OPTIONS]` | Run an [isolated build measurement](build.md#isolated-build-timing) through the native driver |
 
 The `|` entries above mean choose one value; they are not shell pipelines.
 Build, test, tidy, cleanup, export, and diagnostics are separate operations.
@@ -57,13 +62,31 @@ Detailed references: [CUDA/Vulkan diagnostics](validation.md#standalone-cudavulk
 [PCH include audits](validation.md#pch-include-audit), and
 [log queries/provenance](logging.md).
 
-Build, test, and tidy automatically retain both output streams in
+Build, tool build, test, and both tidy operations automatically retain output in
 [wrapper transcripts](logging.md#wrapper-build-test-and-tidy-transcripts).
 `MMLTK_BUILD_LOG_FILE`, `MMLTK_TEST_LOG_FILE`, and `MMLTK_TIDY_LOG_FILE`
 override their destinations; relative paths use the invocation directory.
 Test help/list routes skip capture. A new `--test all` replaces earlier tests
 owned by this checkout; [replacement scope and failures](validation.md#replacing-an-active-test-run)
 also apply when `all` has filters.
+
+### Native tool entrypoints
+
+The wrapper and CMake invoke compiled tool modules through
+`mmltk --tool COMMAND [--argv0 LOGICAL] -- ARGS...` inside the owning process
+or container. [tool_command.cpp](../tools/tool_command.cpp) owns command
+identities, spelling, and child invocations;
+[tool_dispatch.cpp](../tools/tool_dispatch.cpp) binds them exhaustively to
+module entrypoints. Logical program names may retain an earlier script suffix
+in help or evidence; they identify native commands rather than script files.
+Use the public operations above for their image admission, path rewriting,
+mounts, limits, ownership, and transcripts. The build-timing entrypoint is
+itself an orchestrator that calls `./mmltk --build`.
+
+[Build ownership](build.md#native-tools-and-checkout-bootstrap) describes the
+driver and isolated process/plugin boundaries.
+[Native fixture selection](validation.md#native-tool-fixtures) maps the six
+fixture commands to their public suites and separate runner.
 
 ### GUI session replacement
 
@@ -181,8 +204,9 @@ This inspects the selected retained index; it does not compile or enable
 The inspection runs in the existing development image with networking disabled,
 read-only source mounts, no image build or pull, and a ten-minute deadline.
 Required native-target preparation uses the separate reusable CMake cache and
-writes build output to stderr, preserving JSONL on stdout. Help and Python-only
-index/image/archive queries do not configure or build native targets. Optional
+writes build output to stderr, preserving JSONL on stdout. Help and
+index/image/archive queries use the native tool without configuring or building
+product-dependent targets. Optional
 `--export` copies the matched encoded image to
 `build/validation/benchmark-image/ID.jpg` or `ID.png` for inspection, replacing
 an earlier diagnostic copy. Mask inspection additionally exports the exact

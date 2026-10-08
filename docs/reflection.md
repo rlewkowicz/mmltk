@@ -8,10 +8,12 @@ and product policy; Rust/Iced owns presentation and interaction, as defined by
 [the contract](../CONTRACT.md#model-presentation-model-and-views).
 This page owns authoring syntax; [the application boundary](application-wire.md)
 owns schema admission, generated projections, wire representations and compatibility.
+The independent driver's reflected command vocabulary belongs to its
+[native tools graph](build.md#native-tools-and-checkout-bootstrap).
 
 ## Declare once, project structurally
 
-Declare canonical types beside their systems in self-contained ordinary
+Declare canonical product types beside their systems in self-contained ordinary
 headers with direct dependencies. Materialize reflection there; publish ordinary
 types, functions, constants, or reusable template specializations so consumers
 need neither re-reflection nor include-order assumptions.

@@ -7,7 +7,8 @@ Start with [CONTRACT.md](CONTRACT.md) for architecture and the
 Use [commands](docs/commands.md), [validation](docs/validation.md), and
 [logging](docs/logging.md) for wrapper operations and evidence. GUI work also
 uses [interaction and presentation](docs/gui-interaction.md).
-[Build reference](docs/build.md) owns generated-artifact paths and cache rules;
+[Build reference](docs/build.md) owns native-tool bootstrap, generated-artifact
+paths, and cache rules;
 [GPU execution](docs/gpu-execution.md) owns capability-inspection commands.
 Use [reflected declaration authoring](docs/reflection.md) for canonical schema
 syntax and [declaration tooling](docs/validation.md#raw-cpd-and-declaration-formatting)
@@ -115,6 +116,11 @@ cross-language artifacts may build earlier through `./mmltk`. Run product
 builds with `./mmltk --build`. Generated Rust stays in the build directory;
 never hand-edit it. Fix canonical reflected declarations, generation, or build
 wiring and regenerate through `./mmltk`.
+
+Bootstrap a missing native wrapper using the
+[build reference](docs/build.md#native-tools-and-checkout-bootstrap).
+Standalone tool builds use `./mmltk --build-tools`; their analysis uses
+`./mmltk --tidy-tools`. Full build and tidy operations include tools.
 
 ## Crashes, Logging, and Debugging
 
@@ -523,11 +529,11 @@ unnecessary blocking.
 All validation follows [Final Validation](#final-validation-workflow)'s stage
 order, commands, and completion rules.
 
-The full suite formats first-party C/C++/CUDA and the Iced application Rust
-package, runs clang-tidy on supported native translation units, and validates
-reflection units through GCC compiler objects. Targeted native `--file` runs
-remain scoped. Cppcheck is gated off because its parser lacks C++26 reflection
-support.
+The full suite includes the standalone tools stage, formats first-party
+C/C++/CUDA and the Iced application Rust package, runs clang-tidy on supported
+native translation units, and validates reflection/module units through GCC
+compiler objects. Targeted native `--file` runs remain scoped to their owning
+graphs. Cppcheck is gated off because its parser lacks C++26 reflection support.
 
 For follow-ups, audit the entire prior tidy log, group failures by root cause,
 fix the whole known batch including blocked downstream importers, and rerun

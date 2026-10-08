@@ -567,10 +567,14 @@ validation observations, loss conventions, and saved-history selection.
 Each chart retains its plot, series, camera, and legend interaction through
 expansion, hiding/revealing, and navigation. A remount with unchanged data and
 axis configuration preserves the settled view; actual data, limit, or scale
-changes still follow the plot's autoscale policy. Wheel and trackpad scrolling,
-including modified wheel input over the plot, axes, or legend, belongs to the
-ordinary page scroller and does not zoom or pan the chart. Other plot gestures
-remain available.
+changes still follow the plot's autoscale policy. Grid charts leave wheel and
+trackpad scrolling, including modified input, to the ordinary page scroller.
+An expanded chart binds unmodified and Ctrl-wheel input inside the plot to
+zoom its retained camera and captures those handled gestures so the enclosing
+page stays still. Input outside the plot, or without a matching scroll binding,
+remains available to the page. Returning to the grid clears the zoom bindings.
+The [retained chart controls](../src/frontend/iced/src/view/metrics/chart.rs)
+own those bindings; other plot gestures remain available.
 
 The [metrics component](../src/frontend/iced/src/view/metrics.rs) owns separate
 live and saved histories. Each curve retains at most 128 summary buckets with
