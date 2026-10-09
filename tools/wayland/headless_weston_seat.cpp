@@ -1,5 +1,7 @@
 module;
 // Validation-only input capabilities for Ubuntu Weston 13.0.0-4build3.
+// Weston includes Wayland's math.h inside extern "C"; establish its C++ linkage first.
+#include <cmath>
 #include <libweston/libweston.h>
 export module mmltk.tools.headless_weston_seat;
 import std;

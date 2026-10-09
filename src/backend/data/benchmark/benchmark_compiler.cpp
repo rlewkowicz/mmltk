@@ -666,7 +666,11 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
   cache, catalog, progress, catalog.releases.size(), cancellation, trace, pipeline.curl().limit(BenchmarkCurl::Class::Artifact), pipeline.execution().cpus(), fail, &pipeline);
  for (std::size_t lane = 0; lane < source_count; ++lane)
   sources.emplace_back([&](std::stop_token stop) {
-   const std::stop_callback wake(stop, [&] { source_work_changed.notify_all(); });
+   const std::stop_callback wake(stop, [&] {
+    // Serialize the wake with the predicate check and atomic unlock-and-wait.
+    const std::lock_guard lock(source_work_mutex);
+    source_work_changed.notify_all();
+   });
    try {
     for (;;) {
      std::pair<AdmittedRecipeArchive*, std::string> work;

@@ -3729,7 +3729,7 @@ TEST_CASE("cancelled progressive pixels leave the previously published file inta
  check_preserved_split(output, original);
 }
 TEST_CASE("pipeline failure retires queued custody and drains active readers before reporting", "[backend][data][benchmark][pipeline]") {
- if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires three live class floors and an elastic CPU");
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires two active readers and a held header worker");
  mmltk::testsupport::ScopedTempDir root("exceptional-pixel-drain");
  const auto images = root.path() / "images";
  prepare_cached_image_directory(images);
@@ -3739,6 +3739,7 @@ TEST_CASE("pipeline failure retires queued custody and drains active readers bef
  membership.sources = {{images}};
  membership.images = {{1, 16, 8, 0, 0}, {2, 16, 8, 0, 0}, {3, 16, 8, 0, 0}};
  mmltk::testsupport::TestGate first("first reader failure"), second("second reader drain");
+ mmltk::testsupport::TestGate header("held header worker during pixel failure");
  struct Completion {
   mmltk::testsupport::TestGate::Receipt first, second;
   std::atomic<unsigned> count{0};
@@ -3754,16 +3755,21 @@ TEST_CASE("pipeline failure retires queued custody and drains active readers bef
   state.second.ArriveAndWait();
  }};
  BenchmarkSplitWriter writer(request);
- BenchmarkCompilePipeline pipeline(4, {}, {}, {}, mmltk::backend::data::testsupport::benchmark_trace());
+ BenchmarkCompilePipeline pipeline(3, {}, {}, {}, mmltk::backend::data::testsupport::benchmark_trace());
  bind_benchmark_slots(pipeline, writer, membership);
  const mmltk::testsupport::ScopedTestCleanup release_readers([&] {
   first.Release();
   second.Release();
+  header.Release();
  });
  pipeline.source_publication(images, {})({1});
  REQUIRE(first.WaitEntered(2s));
  pipeline.source_publication(images, {})({2});
  REQUIRE(second.WaitEntered(2s));
+ // Hold every worker before publishing the third image, so its header cannot
+ // race the injected failure and become an active reader instead of queued work.
+ auto held_header = pipeline.execution().submit({.kind = CompileTaskKind::Header, .work = [&](std::size_t, const CompileAllowance&) { header.receipt().ArriveAndWait(); }});
+ REQUIRE(header.WaitEntered(2s));
  auto queued_retired = std::make_shared<std::promise<void>>();
  auto queued = observed_artifact_lease(root.path() / "queued.lock", queued_retired);
  pipeline.source_publication(images, queued)({3});
@@ -3772,11 +3778,13 @@ TEST_CASE("pipeline failure retires queued custody and drains active readers bef
  const mmltk::testsupport::ScopedTestCleanup release_before_join([&] {
   first.Release();
   second.Release();
+  header.Release();
  });
  first.Release();
  mmltk::testsupport::await_test_promise(*queued_retired, "failed attempt queued custody retirement");
  CHECK(drain.wait_for(0ms) == std::future_status::timeout);
  second.Release();
+ header.Release();
  CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(drain, "exceptional reader drain"), "injected pixel completion failure");
  CHECK(writer.completed() == 2);
  CHECK_FALSE(writer.image_complete(2));
