@@ -91,7 +91,7 @@ or the host desktop compositor; retain visible runs when those are required.
 
 Ubuntu Weston `13.0.0-4build3` is pinned for both the module builder's
 `libweston-13-dev` and the validation runtime's `weston`/`libweston-13-0`.
-[headless_weston_seat.cpp](../tools/headless_weston_seat.cpp) uses the packaged
+[headless_weston_seat.cpp](../tools/wayland/headless_weston_seat.cpp) uses the packaged
 public structures and four version-scoped exported lifecycle functions:
 `weston_seat_init`, `weston_seat_init_pointer`, `weston_seat_init_keyboard`,
 and `weston_seat_release`. Its named module retains an ordinary shared-library
@@ -104,7 +104,7 @@ destroy signal. Partial construction also releases initialized state. It loads
 from `/usr/lib/weston/mmltk-headless-seat.so` before the readiness module.
 [Dockerfile.wayland-validation](../docker/Dockerfile.wayland-validation) owns
 the package pin and isolated tools-graph build. The native
-[headless_compositor.cpp](../tools/headless_compositor.cpp) module owns session
+[headless_compositor.cpp](../tools/wayland/headless_compositor.cpp) module owns session
 startup, seat/protocol readiness, and teardown in the wrapper-selected child
 process. The seat plugin stays in Weston; its libraries are independent of the
 [standalone driver](build.md#native-tools-and-checkout-bootstrap).

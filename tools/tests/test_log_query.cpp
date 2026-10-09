@@ -2464,7 +2464,7 @@ void test_help_documents_grammar_and_native_wrapper_is_executable() {
  EQ(support::read_text(repository() / "mmltk").substr(0, 4), std::string("\x7f"
                                                                          "ELF",
                                                               4));
- EQ(support::run({"bash", "-n", (repository() / "tools/bootstrap_mmltk.sh").string()}, options).exit_code, 0);
+ EQ(support::run({"bash", "-n", (repository() / "tools/bootstrap/bootstrap_mmltk.sh").string()}, options).exit_code, 0);
 }
 void test_wrapper_retains_both_streams_and_queryable_terminal_status() {
  WrapperFixture f(R"SH(#!/usr/bin/env bash
@@ -2864,8 +2864,9 @@ struct PackageFixture : WrapperFixture {
   options.timeout = std::chrono::seconds(45);
   fs::create_directory_symlink(repository() / "docker", root / "docker");
   for (const auto& entry : fs::directory_iterator(repository() / "tools"))
-   if (entry.path().filename() != "bootstrap_mmltk.sh") fs::create_symlink(entry.path(), root / "tools" / entry.path().filename());
-  write("tools/bootstrap_mmltk.sh", "#!/bin/sh\nset -eu\ncp -p \"$2/mmltk\" \"$2/.mmltk-next\"\nmv -f \"$2/.mmltk-next\" \"$2/mmltk\"\nreadlink \"/proc/$PPID/exe\" >\"$2/replaced-wrapper\"\n");
+   if (entry.path().filename() != "bootstrap") fs::create_symlink(entry.path(), root / "tools" / entry.path().filename());
+  fs::create_directories(root / "tools/bootstrap");
+  write("tools/bootstrap/bootstrap_mmltk.sh", "#!/bin/sh\nset -eu\ncp -p \"$2/mmltk\" \"$2/.mmltk-next\"\nmv -f \"$2/.mmltk-next\" \"$2/mmltk\"\nreadlink \"/proc/$PPID/exe\" >\"$2/replaced-wrapper\"\n");
   write("build/tools/.inputs.sha256", "fixture tools\n");
   fs::create_symlink(support::executable_path().parent_path() / "mmltk", root / "build/tools/mmltk");
   for (const auto* path :
@@ -2965,7 +2966,7 @@ void test_package_callers_preserve_status_output_and_publication() {
  CHECK(support::runtime_package::complete(f.root / "build/release"));
  FALSE(fs::exists(f.root / "build/release/sentinel"));
  // The input stored in the image includes the command's exact digest newline.
- const auto files = support::capture({"sha256sum", (f.root / "docker/Dockerfile.runtime").string(), (f.root / "tools/runtime_package.cpp").string()});
+ const auto files = support::capture({"sha256sum", (f.root / "docker/Dockerfile.runtime").string(), (f.root / "tools/toolchain/runtime_package.cpp").string()});
  EQ(files.exit_code, 0);
  support::RunOptions hashing;
  hashing.capture_stdout = true;
@@ -3308,14 +3309,14 @@ struct NativeToolsFixture : FileFixture {
  support::RunOptions options;
  NativeToolsFixture() {
   const auto& root = checkout;
-  fs::create_directories(root / "tools");
+  fs::create_directories(root / "tools/bootstrap");
   fs::create_directories(root / "docker");
   fs::create_directories(root / "third_party/json/include");
   fs::create_directory_symlink(support::executable_path().parent_path() / "lib", root / "lib");
   support::write_text(root / "mmltk", support::read_text(repository() / "mmltk"));
-  support::write_text(root / "tools/bootstrap_mmltk.sh", support::read_text(repository() / "tools/bootstrap_mmltk.sh"));
+  support::write_text(root / "tools/bootstrap/bootstrap_mmltk.sh", support::read_text(repository() / "tools/bootstrap/bootstrap_mmltk.sh"));
   fs::permissions(root / "mmltk", fs::perms::owner_all);
-  fs::permissions(root / "tools/bootstrap_mmltk.sh", fs::perms::owner_all);
+  fs::permissions(root / "tools/bootstrap/bootstrap_mmltk.sh", fs::perms::owner_all);
   for (const auto* path : {"docker/Dockerfile.gcc", "docker/Dockerfile.tools", "tools/input.cpp"}) support::write_text(root / path, "fixture\n");
   support::write_text(root / "docker/nvidia-payload.json", "{\"donor\": \"fixture@sha256:0123456789abcdef\",\n\"cuda_source\": \"/usr/local/cuda-fixture\"}\n");
   fs::create_symlink(support::executable_path().parent_path() / "mmltk", root / "native");
@@ -3333,7 +3334,7 @@ struct NativeToolsFixture : FileFixture {
    {"TEST_BOOTSTRAP_CALLS", calls.string()}
   };
  }
- Strings bootstrap(std::string operation = "--ensure") const { return {"bash", (checkout / "tools/bootstrap_mmltk.sh").string(), std::move(operation), checkout.string()}; }
+ Strings bootstrap(std::string operation = "--ensure") const { return {"bash", (checkout / "tools/bootstrap/bootstrap_mmltk.sh").string(), std::move(operation), checkout.string()}; }
  Strings native(Strings arguments) const { return plus({(checkout / "native").string()}, std::move(arguments)); }
  support::ProcessResult run(const Strings& command) const { return support::run(command, options); }
  std::vector<J> invocations() const {
@@ -3537,7 +3538,7 @@ void test_tools_cold_root_ownership_handoff() {
   fs::permissions(f.root, permission);
   EQ(::chown(f.checkout.c_str(), uid, gid), 0);
   fs::permissions(f.checkout / "mmltk", permission);
-  fs::permissions(f.checkout / "tools/bootstrap_mmltk.sh", permission);
+  fs::permissions(f.checkout / "tools/bootstrap/bootstrap_mmltk.sh", permission);
   fs::permissions(f.calls, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read | fs::perms::group_write | fs::perms::others_read | fs::perms::others_write);
   f.options.env["MMLTK_USER"] = internal ? "nobody" : std::to_string(uid);
   f.options.env["MMLTK_CACHE_ROOT"] = ".cache/selected/tools-owner";

@@ -33,10 +33,10 @@ The root `./mmltk` is a generated, optimized, stripped Linux ELF executable.
 On a checkout without it, run the narrow bootstrap from the repository root:
 
 ```bash
-./tools/bootstrap_mmltk.sh --launch "$PWD" --build-tools
+./tools/bootstrap/bootstrap_mmltk.sh --launch "$PWD" --build-tools
 ```
 
-[bootstrap_mmltk.sh](../tools/bootstrap_mmltk.sh) prepares the GCC/tools images,
+[bootstrap_mmltk.sh](../tools/bootstrap/bootstrap_mmltk.sh) prepares the GCC/tools images,
 builds the tools in a container, publishes the executable and its library
 closure, then executes the requested native operation. It needs no host C++
 compiler. Once published, use the native operations:
@@ -64,10 +64,10 @@ The product presets in [CMakePresets.json](../CMakePresets.json) remain separate
 
 CMake explicitly registers sources, named module providers/partitions, entry
 adapters, and link dependencies. The driver main imports the
-[container-command module](../tools/mmltk_container_commands.cpp) and the
-[typed tool-command vocabulary](../tools/tool_command.cpp); the latter derives
+[container-command module](../tools/driver/mmltk_container_commands.cpp) and the
+[typed tool-command vocabulary](../tools/driver/tool_command.cpp); the latter derives
 external spelling, logical program names, and exhaustive
-[dispatch](../tools/tool_dispatch.cpp). Shared text/process/JSON support and
+[dispatch](../tools/driver/tool_dispatch.cpp). Shared text/process/JSON support and
 narrow digest, locale, library, and time modules supply the utility owners.
 Standard and third-party headers stay in module global fragments. The tools
 graph does not use the product compiler launcher while building that launcher.
@@ -254,10 +254,10 @@ diagnostic image starts from the complete pinned NGC donor so the actual
 upstream Python package can execute against its compatible Torch/CUDA payload.
 It is not a production Python training runtime.
 
-[Pinned validation requirements](../tools/rfdetr_oracle_requirements.txt)
+[Pinned validation requirements](../tools/oracle/rfdetr_oracle_requirements.txt)
 install as binary wheels into `/opt/rfdetr-oracle/python` using `--no-deps`.
 This private overlay preserves the donor packages; the
-[native producer](../tools/generate_rfdetr_upstream_oracle.cpp) embeds CPython
+[native producer](../tools/oracle/generate_rfdetr_upstream_oracle.cpp) embeds CPython
 and imports the actual upstream libraries to snapshot and verify payload
 versions and dependency/import closure. The image builds the separate
 `mmltk-rfdetr-upstream-oracle` executable from the tools graph with the driver
@@ -297,7 +297,7 @@ and extraction responsibilities.
 Arrow's licenses/notices and the bundled/transitive source notices install
 under `share/mmltk/licenses/arrow`, including the six selected dependency
 directories and the captured Boost notices. The
-[runtime package inventory](../tools/runtime_package.cpp) includes this tree at
+[runtime package inventory](../tools/toolchain/runtime_package.cpp) includes this tree at
 `/opt/mmltk/share/mmltk/licenses/arrow`; [NOTICE](../NOTICE) records the attribution.
 
 ### Native caption and video assets
@@ -371,7 +371,7 @@ includes disappear after consolidation.
 `CMakeFiles/<target>.dir/mmltk-pch-policy.txt` from the target registration.
 The generated `cmake_pch.hxx` and `.gch` live beside it under that component's
 build directory.
-[check_toolchain_invariants.cpp](../tools/check_toolchain_invariants.cpp) checks
+[check_toolchain_invariants.cpp](../tools/toolchain/check_toolchain_invariants.cpp) checks
 the compilation database against this policy, including creation/use
 environment equality, exclusions, and fatal invalid-PCH diagnostics.
 The include tool checks those generated policies and forced-include paths;
@@ -530,7 +530,7 @@ Firefox. Its builder and runtime use the same pinned Weston package version.
 
 ## Isolated build timing
 
-[build_time_trace.cpp](../tools/build_time_trace.cpp) invokes `./mmltk --build`
+[build_time_trace.cpp](../tools/profiling/build_time_trace.cpp) invokes `./mmltk --build`
 with isolated cache, image, builder, and staging identities:
 
 ```bash

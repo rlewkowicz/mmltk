@@ -245,12 +245,12 @@ void frontend_inventory() {
  CHECK(inventory.at("excludedGeneratedOutput") == Json::array({"src/frontend/iced/generated/bindings.rs"}));
  CHECK(inventory.at("untrackedCandidateCount") == 2);
  const auto tools = buildInventory(CLEANUP_PROFILES.at("tools"), R"json({
-    "tracked":["tools/mmltk.cpp","tools/mmltk_container_commands.cpp","tools/a.cpp","tools/module.cppm","tools/deleted.cpp","src/a.cpp","tools/a.mjs","tools/build/a.cpp","tools/generated/a.hpp"],
+    "tracked":["tools/mmltk.cpp","tools/driver/mmltk_container_commands.cpp","tools/a.cpp","tools/module.cppm","tools/deleted.cpp","src/a.cpp","tools/a.mjs","tools/build/a.cpp","tools/generated/a.hpp"],
     "untracked":["tools/new.hpp","tools/tests/new.cpp","tools/third_party/a.cpp"],
     "deleted":["tools/deleted.cpp"]
   })json"_fixture,
   [](const std::string&) { return true; });
- CHECK(tools.at("scannedFiles") == Json::array({"tools/a.cpp", "tools/mmltk.cpp", "tools/mmltk_container_commands.cpp", "tools/module.cppm", "tools/new.hpp", "tools/tests/new.cpp"}));
+ CHECK(tools.at("scannedFiles") == Json::array({"tools/a.cpp", "tools/driver/mmltk_container_commands.cpp", "tools/mmltk.cpp", "tools/module.cppm", "tools/new.hpp", "tools/tests/new.cpp"}));
 }
 void invalid_inventory() {
  const auto input = R"json({"tracked":["src/frontend/iced/src/missing.rs"],"untracked":[],"deleted":[]})json"_fixture;

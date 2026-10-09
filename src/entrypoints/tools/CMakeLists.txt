@@ -4,7 +4,7 @@ include("${CMAKE_SOURCE_DIR}/tools/cmake/Toolchain.cmake")
 add_executable(mmltk_diagnose_compiled_sample EXCLUDE_FROM_ALL)
 mmltk_configure_component(mmltk_diagnose_compiled_sample PRIVATE_DECLARATIONS)
 mmltk_tools_register_process(mmltk_diagnose_compiled_sample
-    "${CMAKE_SOURCE_DIR}/tools/diagnose_compiled_sample.cpp"
+    "${CMAKE_SOURCE_DIR}/tools/diagnostics/diagnose_compiled_sample.cpp"
     mmltk.tools.diagnose_compiled_sample mmltk_tool_diagnose_compiled_sample)
 target_link_libraries(mmltk_diagnose_compiled_sample PRIVATE
     mmltk::backend::data
@@ -18,7 +18,7 @@ mmltk_enable_native_runtime_rpath(mmltk_diagnose_compiled_sample)
 add_executable(mmltk_diagnose_coconut_mask EXCLUDE_FROM_ALL)
 mmltk_configure_component(mmltk_diagnose_coconut_mask PRIVATE_DECLARATIONS)
 mmltk_tools_register_process(mmltk_diagnose_coconut_mask
-    "${CMAKE_SOURCE_DIR}/tools/diagnose_coconut_mask.cpp"
+    "${CMAKE_SOURCE_DIR}/tools/diagnostics/diagnose_coconut_mask.cpp"
     mmltk.tools.diagnose_coconut_mask mmltk_tool_diagnose_coconut_mask)
 target_link_libraries(mmltk_diagnose_coconut_mask PRIVATE
     Arrow::arrow_static

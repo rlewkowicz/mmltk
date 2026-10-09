@@ -1,6 +1,6 @@
 module;
 // Native counterpart of test_headless_compositor.py; no GPU is required.
-// Link tools/headless_compositor.cpp with MMLTK_HEADLESS_COMPOSITOR_NO_MAIN
+// Link tools/wayland/headless_compositor.cpp with MMLTK_HEADLESS_COMPOSITOR_NO_MAIN
 // and the existing third_party/json/include include directory. The wrapper
 // must retain core=1:1 for this executable and its self-executed fixtures.
 #ifndef _GNU_SOURCE
@@ -190,7 +190,7 @@ public:
   runner::SessionOptions options;
   options.environment["XDG_RUNTIME_DIR"] = temporary.path().string();
   options.runtime_parent = temporary.path();
-  options.weston_config = repository() / "tools/headless-weston.ini";
+  options.weston_config = repository() / "tools/wayland/headless-weston.ini";
   options.weston_command = fixture_command({"compositor", mode, log});
   options.probe_command = fixture_command({"probe", protocols});
   options.startup_timeout = 300ms;

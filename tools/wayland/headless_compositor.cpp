@@ -68,7 +68,7 @@ export {
  struct SessionOptions {
   Environment environment = current_environment();
   // Empty paths use environment[XDG_RUNTIME_DIR] and the repository's
-  // tools/headless-weston.ini respectively.
+  // tools/wayland/headless-weston.ini respectively.
   std::filesystem::path runtime_parent;
   std::filesystem::path weston_config;
   // Weston arguments are appended to this executable/argument prefix.
@@ -148,7 +148,7 @@ fs::path weston_config(const SessionOptions& options) {
  if (!options.weston_config.empty()) return options.weston_config;
  const auto found = options.environment.find("MMLTK_REPO_ROOT");
  const auto root = found != options.environment.end() ? fs::path(found->second) : repository_root({}, __FILE__);
- return root / "tools/headless-weston.ini";
+ return root / "tools/wayland/headless-weston.ini";
 }
 class RuntimeDirectory {
 public:

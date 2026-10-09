@@ -230,10 +230,23 @@ Arguments option_values(const Arguments& arguments, const Names& names) {
  return values;
 }
 json payload_manifest() {
- // The source location supports a counterpart built away from tools/. An
- // installed executable uses the same image manifest as the Python checker.
- for (const auto& base : {resolved(__FILE__).parent_path().parent_path(), executable_path().parent_path().parent_path()}) {
-  const auto path = base / "docker/nvidia-payload.json";
+ // Discover the checkout from the source even when built elsewhere. Installed
+ // tools may have no checkout and use the image manifest instead.
+ fs::path checkout;
+ try {
+  checkout = repository_root({}, __FILE__);
+  // Repository discovery also examines the working directory. An installed
+  // checker must not borrow an unrelated checkout's manifest from there.
+  const auto belongs_to = [&](const fs::path& path) {
+   const auto relative = resolved(path).lexically_relative(checkout);
+   return !relative.empty() && *relative.begin() != fs::path("..");
+  };
+  if (!(fs::path(__FILE__).is_absolute() && belongs_to(__FILE__)) && !belongs_to(executable_path())) checkout.clear();
+ } catch (const ToolError&) {
+ } catch (const std::system_error&) {
+ }
+ if (!checkout.empty()) {
+  const auto path = checkout / "docker/nvidia-payload.json";
   if (fs::is_regular_file(path)) return read_json(path);
  }
  return read_json("/usr/share/mmltk/nvidia-payload.json").at("manifest");

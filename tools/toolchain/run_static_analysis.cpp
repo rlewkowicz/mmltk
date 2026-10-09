@@ -654,7 +654,7 @@ int analyze(Options& options, Output& output, const Termination& termination) {
   output.log("running cppcheck across " + std::to_string(selection.cppcheck_units.size()) + " translation units");
   cppcheck_failed = commands
                      .invoke(
-                      {"cppcheck", "--project=" + project_path.string(), "--cppcheck-build-dir=" + cppcheck_build, "--suppressions-list=" + options.repo_root + "/tools/cppcheck.suppressions",
+                      {"cppcheck", "--project=" + project_path.string(), "--cppcheck-build-dir=" + cppcheck_build,
                        "--suppress=*:/src/workspace/deps/*", "--suppress=*:*/workspace/deps/*", "--inline-suppr", "--quiet", "--enable=warning,performance,portability", "--inconclusive",
                        "--check-level=exhaustive", "--error-exitcode=1", "--platform=unix64", "--relative-paths=" + options.repo_root, "-j", std::to_string(workers)})
                      .exit_code != 0;

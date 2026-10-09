@@ -65,14 +65,14 @@ full passes required by the workflow. Tidy retains a
 [wrapper transcript](logging.md#wrapper-build-test-and-tidy-transcripts), with
 `MMLTK_TIDY_LOG_FILE` selecting its destination. The implementation and
 available analysis overrides are in
-[run_static_analysis.cpp](../tools/run_static_analysis.cpp).
+[run_static_analysis.cpp](../tools/toolchain/run_static_analysis.cpp).
 
 ### Native tool analysis
 
 ```bash
 ./mmltk --tidy-tools
-./mmltk --tidy-tools --file tools/mmltk.cpp tools/tool_command.cpp
-./mmltk --tidy-tools --start-at tools/log_query.cpp
+./mmltk --tidy-tools --file tools/mmltk.cpp tools/driver/tool_command.cpp
+./mmltk --tidy-tools --start-at tools/logging/log_query.cpp
 ```
 
 This operation formats and validates only translation units registered in
@@ -100,7 +100,7 @@ normal tidy transcript and does not publish a new executable; use
 ./mmltk --audit-includes fix
 ```
 
-[audit_includes.cpp](../tools/audit_includes.cpp) is a lexical inventory and
+[audit_includes.cpp](../tools/cleanup/audit_includes.cpp) is a lexical inventory and
 conservative replacement tool for the checked-in PCH groups. It is not semantic
 include-what-you-use analysis. `report` (the default) and `preview` write reports
 without changing sources; `fix` applies admitted replacements. The tool reads
@@ -128,7 +128,7 @@ outside consumed groups retain direct includes. A retained include is not an
 unresolved cleanup finding merely because another target uses that header in a PCH.
 
 Before editing, `fix` runs
-[check_toolchain_invariants.cpp](../tools/check_toolchain_invariants.cpp) through
+[check_toolchain_invariants.cpp](../tools/toolchain/check_toolchain_invariants.cpp) through
 the wrapper, including creation/use compiler-environment equality and exclusion
 checks. It preserves conditional branches and comments, verifies that each
 source still matches its inspected snapshot, and atomically replaces admitted
@@ -227,7 +227,7 @@ human review of every file.
 ./mmltk --format-declarations fix --file src/backend/models/rfdetr/contract/train_recipe.h
 ```
 
-[generate_cleanup_json.cpp](../tools/generate_cleanup_json.cpp) owns both
+[generate_cleanup_json.cpp](../tools/cleanup/generate_cleanup_json.cpp) owns both
 ordinary cleanup and raw evidence. Raw CPD defaults to 12 tokens (minimum 2),
 preserves exact identifier/literal spelling, disables block skipping,
 and applies no source-context filter or inline suppression. Its first-party
@@ -293,7 +293,7 @@ extraction. File size is an inspection trigger, not a refactoring requirement.
 
 ### Annotation formatter
 
-[format_declarations.cpp](../tools/format_declarations.cpp) shares the lexical
+[format_declarations.cpp](../tools/cleanup/format_declarations.cpp) shares the lexical
 index and classifiers in
 [declaration_patterns.cpp](../tools/cleanup/declaration_patterns.cpp). It is not
 a semantic C++ parser. By default it examines the complete first-party C++
@@ -740,8 +740,8 @@ executable is not replaced or run.
 `--linker-directory DIR` selects a repository-contained directory with
 `ld.mold`. This performs real linking, so use it only in the permitted
 validation/diagnosis stage. Sources:
-[diagnose_native_symbols.cpp](../tools/diagnose_native_symbols.cpp) and
-[diagnose_native_link.cpp](../tools/diagnose_native_link.cpp).
+[diagnose_native_symbols.cpp](../tools/diagnostics/diagnose_native_symbols.cpp) and
+[diagnose_native_link.cpp](../tools/diagnostics/diagnose_native_link.cpp).
 
 ## Standalone CUDA/Vulkan diagnostic
 
@@ -1304,7 +1304,7 @@ read-only; the producer runs offline with a two-hour deadline. The
 [validation-only image](build.md#upstream-reference-image) retains the pinned
 donor Torch/CUDA environment.
 
-[The native producer](../tools/generate_rfdetr_upstream_oracle.cpp) embeds the
+[The native producer](../tools/oracle/generate_rfdetr_upstream_oracle.cpp) embeds the
 donor's CPython runtime and imports the actual upstream model, matcher,
 criterion, and PyTorch optimizer. It records original
 official weight identities, normalized state, constructor facts, inputs/masks,

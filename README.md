@@ -39,7 +39,7 @@ containers. Run commands from the repository root; the wrapper supplies the
 container toolchains. A fresh checkout first builds the native wrapper:
 
 ```bash
-./tools/bootstrap_mmltk.sh --launch "$PWD" --build-tools
+./tools/bootstrap/bootstrap_mmltk.sh --launch "$PWD" --build-tools
 ./mmltk --build
 ./mmltk --gui
 ```

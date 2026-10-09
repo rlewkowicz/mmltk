@@ -74,9 +74,9 @@ also apply when `all` has filters.
 
 The wrapper and CMake invoke compiled tool modules through
 `mmltk --tool COMMAND [--argv0 LOGICAL] -- ARGS...` inside the owning process
-or container. [tool_command.cpp](../tools/tool_command.cpp) owns command
+or container. [tool_command.cpp](../tools/driver/tool_command.cpp) owns command
 identities, spelling, and child invocations;
-[tool_dispatch.cpp](../tools/tool_dispatch.cpp) binds them exhaustively to
+[tool_dispatch.cpp](../tools/driver/tool_dispatch.cpp) binds them exhaustively to
 module entrypoints. Logical program names may retain an earlier script suffix
 in help or evidence; they identify native commands rather than script files.
 Use the public operations above for their image admission, path rewriting,

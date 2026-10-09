@@ -1173,7 +1173,7 @@ error.
 
 ## Catch selection and terminal evidence
 
-The [native log parser](../tools/log_query_internal.cpp) treats Catch's **No test cases matched**
+The [native log parser](../tools/logging/log_query_internal.cpp) treats Catch's **No test cases matched**
 as `catch.test_selection_failed` with error level. **No tests ran** becomes an
 error `catch.summary` with `tests: 0`. Both appear under `--errors` and in
 terminal context, alongside existing Catch assertion failures. The original
@@ -1610,9 +1610,9 @@ The wrapper invokes the native log-query module through the published container
 tool executable in the existing build image, with no GPU or network and a
 read-only repository mount. It reads files only up to captured sizes; multi-pass
 correlation requires unchanged inputs. There is no follow mode or persistent
-index. The [module interface](../tools/log_query.cpp),
-[runtime definitions](../tools/log_query_runtime.cpp), and
-[private implementation/help](../tools/log_query_internal.cpp) share one query
+index. The [module interface](../tools/logging/log_query.cpp),
+[runtime definitions](../tools/logging/log_query_runtime.cpp), and
+[private implementation/help](../tools/logging/log_query_internal.cpp) share one query
 implementation. Unfiltered `./mmltk --test all`
 includes its fixture suite. The standalone `./mmltk --test log-query-tool`
 route and focused selectors are documented under

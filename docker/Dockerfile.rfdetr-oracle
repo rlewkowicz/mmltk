@@ -5,7 +5,7 @@ FROM ${MMLTK_NVIDIA_DONOR_IMAGE}
 ARG MMLTK_IMAGE_FINGERPRINT
 LABEL com.mmltk.input-fingerprint=${MMLTK_IMAGE_FINGERPRINT}
 COPY docker/nvidia-payload.json /opt/rfdetr-oracle/nvidia-payload.json
-COPY tools/rfdetr_oracle_requirements.txt /opt/rfdetr-oracle/requirements.txt
+COPY tools/oracle/rfdetr_oracle_requirements.txt /opt/rfdetr-oracle/requirements.txt
 COPY --from=tools_build /opt/gcc-16.2 /opt/gcc-16.2
 COPY --from=tools_build /opt/cmake /opt/cmake
 ENV PATH=/opt/gcc-16.2/bin:/opt/cmake/bin:${PATH} LD_LIBRARY_PATH=/opt/gcc-16.2/lib64:${LD_LIBRARY_PATH}

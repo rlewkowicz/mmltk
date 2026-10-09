@@ -1391,7 +1391,7 @@ namespace {
 Json nativeProducer() {
  const auto executable = executable_path();
  FileHasher digest;
- Json result{{"executable", executable.string()}, {"executable_sha256", digest(executable)}, {"module", "mmltk.tools.generate_cleanup_json"}, {"source", "tools/generate_cleanup_json.cpp"}};
+ Json result{{"executable", executable.string()}, {"executable_sha256", digest(executable)}, {"module", "mmltk.tools.generate_cleanup_json"}, {"source", "tools/cleanup/generate_cleanup_json.cpp"}};
  const auto inputs = executable.parent_path() / ".inputs.sha256";
  if (std::filesystem::is_regular_file(inputs)) result["tools_inputs_sha256"] = trim(read_text(inputs));
  return result;

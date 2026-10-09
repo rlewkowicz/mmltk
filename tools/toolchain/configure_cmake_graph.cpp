@@ -50,8 +50,8 @@ using support::ToolError;
 std::vector<std::string> configuration_inputs(const fs::path& root) {
  // Keep the exact input names and ordering used by existing cache markers.
  std::vector<std::string> result{
-  "CMakePresets.json", "CMakeLists.txt", "docker/nvidia-payload.json", "docker/record_compiler_evidence.py", "tools/check_toolchain_invariants.cpp", "tools/configure_cmake_graph.cpp",
-  "tools/tool_command.cpp", "tools/module_safe_compiler_launcher.cpp", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"
+  "CMakePresets.json", "CMakeLists.txt", "docker/nvidia-payload.json", "docker/record_compiler_evidence.py", "tools/toolchain/check_toolchain_invariants.cpp", "tools/toolchain/configure_cmake_graph.cpp",
+  "tools/driver/tool_command.cpp", "tools/toolchain/module_safe_compiler_launcher.cpp", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"
  };
  std::vector<std::string> discovered;
  for (const auto* directory : {"cmake", "src"}) {

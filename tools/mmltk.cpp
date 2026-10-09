@@ -1145,7 +1145,7 @@ class Wrapper {
   append(args, {"--build-context", "mmltk_tools=" + repo + "/build/tools"});
   cached_image("default", "-", build_image, repo + "/docker/Dockerfile.toolchain", "toolchain",
    fingerprint({"toolchain", base, dependency, payload, ort, trim(read_optional(repo + "/build/tools/.inputs.sha256"))},
-    {"docker/Dockerfile.toolchain", "docker/patches/gcc16-nvcc-string-substr.patch", "docker/verify_nvidia_payload.py", "docker/nvidia_payload.py", "tools/check_toolchain_invariants.cpp"}),
+    {"docker/Dockerfile.toolchain", "docker/patches/gcc16-nvcc-string-substr.patch", "docker/verify_nvidia_payload.py", "docker/nvidia_payload.py", "tools/toolchain/check_toolchain_invariants.cpp"}),
    repo, args);
   verify_alias(da, dependency);
   verify_alias(pa, payload);
@@ -1634,7 +1634,7 @@ class Wrapper {
  }
  std::string package_fingerprint() {
   const auto root = cmake + "/release";
-  std::string data = "mmltk-release-package-v8\n" + image_id(build_image) + "\n" + sha_files({repo + "/tools/runtime_package.cpp"});
+  std::string data = "mmltk-release-package-v8\n" + image_id(build_image) + "\n" + sha_files({repo + "/tools/toolchain/runtime_package.cpp"});
   for (const auto& row : package::inventory()) {
    const std::string path(row.path), kind(row.source_kind), source(row.source_path);
    std::string source_root;
@@ -1679,7 +1679,7 @@ class Wrapper {
   verify_nvidia(runtime_base, "runtime");
   const auto package_result = capture(tool_arguments(Command::runtime_package, {"fingerprint", stage}, self));
   if (package_result.status) throw Exit{package_result.status};
-  const auto input = sha("mmltk-runtime-image-v6\n" + id + "\n" + sha_files({repo + "/docker/Dockerfile.runtime", repo + "/tools/runtime_package.cpp"}) + package_result.out +
+  const auto input = sha("mmltk-runtime-image-v6\n" + id + "\n" + sha_files({repo + "/docker/Dockerfile.runtime", repo + "/tools/toolchain/runtime_package.cpp"}) + package_result.out +
                          trim(read_optional(repo + "/build/tools/.inputs.sha256"))),
              alias = image_alias("runtime-base", id);
   cached_image("default", "-", image_name, repo + "/docker/Dockerfile.runtime", "runtime", input, stage,
@@ -1716,7 +1716,7 @@ class Wrapper {
  void prepare_tools(bool force) {
   const auto name = base_name + "-tools-bootstrap-" + std::to_string(wrapper_pid);
   const auto result = owned_container(name, [&] {
-   return run({"bash", repo + "/tools/bootstrap_mmltk.sh", force ? "--build" : "--ensure", repo},
+   return run({"bash", repo + "/tools/bootstrap/bootstrap_mmltk.sh", force ? "--build" : "--ensure", repo},
     {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}, {"MMLTK_BOOTSTRAP_CONTAINER", name}, {"MMLTK_BOOTSTRAP_OWNER_PID", std::to_string(wrapper_pid)}, {"MMLTK_BOOTSTRAP_USER", user()}}});
   });
   if (result.status) throw Exit{result.status};
@@ -1861,7 +1861,7 @@ class Wrapper {
   };
   const auto tool_options = selection_options(tool_files, true), product_options = selection_options(product_files, false);
   if (!rust_only && !only_product_resume && (!files || !tool_files.empty())) {
-   must({"bash", repo + "/tools/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
+   must({"bash", repo + "/tools/bootstrap/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
    tools_stage_lock = lock_file(repository_cache + "/locks/tools.lock", LOCK_EX);
    owned_dirs({cache, cmake, cmake + "/tools"});
    Args args{
@@ -2256,10 +2256,10 @@ class Wrapper {
  }
  std::pair<std::string, std::string> ensure_oracle_image(const std::string& revision) {
   const auto input = fingerprint({revision, donor, trim(read_optional(repo + "/build/tools/.inputs.sha256"))},
-              {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/rfdetr_oracle_requirements.txt", "tools/generate_rfdetr_upstream_oracle.cpp", "tools/cpp_support.cpp",
-               "tools/cpp_text.cpp", "tools/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"}),
+              {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp", "tools/support/cpp_support.cpp",
+               "tools/support/cpp_text.cpp", "tools/support/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"}),
              image = image_name + "-rfdetr-oracle";
-  must({"bash", repo + "/tools/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
+  must({"bash", repo + "/tools/bootstrap/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
   const auto tools_id = image_id(tools_image), tools_alias = image_alias("tools", tools_id);
   task([&] {
    cached_image("default", "-", image, repo + "/docker/Dockerfile.rfdetr-oracle", "rfdetr-oracle", input, repo,
@@ -2382,7 +2382,7 @@ class Wrapper {
   const auto build_id = trim(build_result.out), build_alias = image_alias("wayland-build", build_id);
   cached_image("default", "-", validation_image, repo + "/docker/Dockerfile.wayland-validation", "wayland-validation",
    fingerprint({"wayland-validation", runtime_id, build_id},
-    {"docker/Dockerfile.wayland-validation", "tools/headless_weston_seat.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"}),
+    {"docker/Dockerfile.wayland-validation", "tools/wayland/headless_weston_seat.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"}),
    repo,
    {"--build-context", "mmltk_runtime=docker-image://" + runtime_alias, "--build-context", "mmltk_build=docker-image://" + build_alias, "--build-arg", "MMLTK_RUNTIME_IDENTITY=" + runtime_id,
     "--build-arg", "MMLTK_BUILD_IDENTITY=" + build_id});
