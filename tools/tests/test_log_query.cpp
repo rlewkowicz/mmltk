@@ -2830,7 +2830,8 @@ struct PackageFixture : WrapperFixture {
   for (const auto& entry : fs::directory_iterator(repository() / "tools"))
    if (entry.path().filename() != "bootstrap") fs::create_symlink(entry.path(), root / "tools" / entry.path().filename());
   fs::create_directories(root / "tools/bootstrap");
-  write("tools/bootstrap/bootstrap_mmltk.sh", "#!/bin/sh\nset -eu\ncp -p \"$2/mmltk\" \"$2/.mmltk-next\"\nmv -f \"$2/.mmltk-next\" \"$2/mmltk\"\nreadlink \"/proc/$PPID/exe\" >\"$2/replaced-wrapper\"\n");
+  write(
+   "tools/bootstrap/bootstrap_mmltk.sh", "#!/bin/sh\nset -eu\ncp -p \"$2/mmltk\" \"$2/.mmltk-next\"\nmv -f \"$2/.mmltk-next\" \"$2/mmltk\"\nreadlink \"/proc/$PPID/exe\" >\"$2/replaced-wrapper\"\n");
   write("build/tools/.inputs.sha256", "fixture tools\n");
   fs::create_symlink(support::executable_path().parent_path() / "mmltk", root / "build/tools/mmltk");
   for (const auto* path :
@@ -4697,8 +4698,8 @@ int mmltk::log_query::test_entry(int argc, char** argv) {
   if (argc > 2 && std::string_view(argv[1]) == "--fixture-package-child") return package_child(Strings(argv + 2, argv + argc));
   if (argc == 3 && std::string_view(argv[1]) == "--fixture-inspector-self")
    return support::command::Invocation{
-    support::command::Command::diagnose_native_process, {"--read-file", support::executable_path().filename().string(), "--pid", std::to_string(::getpid()), "--file", argv[2]}}
-    .call(mmltk_tool_diagnose_native_process);
+    support::command::Command::diagnose_native_process, {"--read-file", support::executable_path().filename().string(), "--pid", std::to_string(::getpid()), "--file", argv[2]}
+   }.call(mmltk_tool_diagnose_native_process);
   if (argc == 2 && std::string_view(argv[1]) == "--fixture-tools-state") return tools_handoff_state();
   if (argc > 3 && std::string_view(argv[1]) == "--fixture-tools-user") {
    tools_fixture_user(argv[2]);

@@ -406,10 +406,12 @@ Json repeatedBundles(const Json& files) {
    addUnique(headers[header], file.at("path"));
   }
  }
- for (const auto& [folder, headers] : folders.items()) {
+ for (const auto& folderItem : folders.items()) {
+  const auto& folder = folderItem.key();
+  const auto& headers = folderItem.value();
   std::vector<std::pair<std::string, Json>> entries;
-  for (const auto& [header, consumers] : headers.items()) {
-   if (consumers.size() >= 2) entries.emplace_back(header, consumers);
+  for (const auto& headerItem : headers.items()) {
+   if (headerItem.value().size() >= 2) entries.emplace_back(headerItem.key(), headerItem.value());
   }
   std::set<std::string> seen;
   for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -567,8 +569,9 @@ Json pchReplacement(std::string_view path, std::string_view source, const Json& 
 Json buildIncludeReport(const std::vector<std::string>& paths, const Json& sources, const Json& contexts, std::string_view root) {
  const std::set<std::string> allPaths(paths.begin(), paths.end());
  Json files = Json::array(), scans = Json::object(), frequency = Json::object(), coverage = Json::object();
- for (const auto& [path, sourceJson] : sources.items()) {
-  const auto& source = string(sourceJson);
+ for (const auto& sourceItem : sources.items()) {
+  const auto& path = sourceItem.key();
+  const auto& source = string(sourceItem.value());
   const auto scan = scanIncludes(source);
   scans[path] = scan;
   if (isPch(path)) {
@@ -617,7 +620,9 @@ Json buildIncludeReport(const std::vector<std::string>& paths, const Json& sourc
  }
  Json directoryReport = Json::array();
  static const std::regex prefixPattern(R"(^([^_.]+)_)");
- for (const auto& [path, entries] : folders.items()) {
+ for (const auto& folderItem : folders.items()) {
+  const auto& path = folderItem.key();
+  const auto& entries = folderItem.value();
   if (entries.size() <= 10) continue;
   Json prefixes = Json::object(), prefixReport = Json::array(), large = Json::array();
   for (const auto& entry : entries) {
@@ -629,8 +634,8 @@ Json buildIncludeReport(const std::vector<std::string>& paths, const Json& sourc
     prefixes[prefix].push_back(entry);
    }
   }
-  for (const auto& [prefix, members] : prefixes.items()) {
-   if (members.size() >= 3) prefixReport.push_back({{"prefix", prefix}, {"files", members}});
+  for (const auto& prefixItem : prefixes.items()) {
+   if (prefixItem.value().size() >= 3) prefixReport.push_back({{"prefix", prefixItem.key()}, {"files", prefixItem.value()}});
   }
   std::stable_sort(prefixReport.begin(), prefixReport.end(), [](const Json& a, const Json& b) { return a.at("files").size() > b.at("files").size(); });
   for (const auto& file : files) {
@@ -670,11 +675,13 @@ Json buildIncludeReport(const std::vector<std::string>& paths, const Json& sourc
  for (auto item : frequencies) {
   if (!systemCategory(string(item.at("category"))) || item.at("files").size() < 3) continue;
   item["covered_by"] = Json::array();
-  for (const auto& [path, headers] : coverage.items())
-   if (has(headers, string(item.at("header")))) item["covered_by"].push_back(path);
+  for (const auto& coverageItem : coverage.items())
+   if (has(coverageItem.value(), string(item.at("header")))) item["covered_by"].push_back(coverageItem.key());
   pchCandidates.push_back(std::move(item));
  }
- for (const auto& [header, includes] : coverage.items()) {
+ for (const auto& coverageItem : coverage.items()) {
+  const auto& header = coverageItem.key();
+  const auto& includes = coverageItem.value();
   Json consumers = Json::array(), compiledConsumers = Json::array();
   for (const auto& file : files) {
    const auto& path = string(file.at("path"));
@@ -808,8 +815,8 @@ int main(const std::vector<std::string>& args) {
   cleanup::writeAtomic(output + ".json", report.dump(2) + "\n");
   cleanup::writeAtomic(output + ".md", renderIncludeMarkdown(report));
   if (mode == "fix") {
-   for (const auto& [path, source] : sources.items()) {
-    if (read_text(path) != string(source)) throw std::runtime_error("source changed during audit: " + path);
+   for (const auto& sourceItem : sources.items()) {
+    if (read_text(sourceItem.key()) != string(sourceItem.value())) throw std::runtime_error("source changed during audit: " + sourceItem.key());
    }
    for (const auto& file : report.at("replacements")) {
     if (!file.contains("after")) continue;

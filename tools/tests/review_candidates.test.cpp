@@ -204,7 +204,7 @@ void raw_conflicts() {
  const auto classified = select(raw.at("classified_context"), [](const Json& value) { return includes(value.at("categories"), "reflection_annotation"); });
  CHECK(classified.at(0).at("reason").get<std::string>().find("conflicting") != std::string::npos);
  auto keys = Json::array();
- for (const auto& [key, value] : raw.items()) keys.push_back(key);
+ for (const auto& item : raw.items()) keys.push_back(item.key());
  CHECK(keys == Json::array({"format", "purpose", "inventory", "detector", "raw_matches", "classified_context", "summary"}));
 }
 void cpd_completion() {

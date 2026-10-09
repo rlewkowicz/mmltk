@@ -95,7 +95,5 @@ int invoke(const command::Invocation& invocation) {
    return invocation.call(implementation<decltype(selected)::value>());
  });
 }
-int entry(int argc, char** argv) {
- return command::run_entry(argc, argv, invoke);
-}
+int entry(int argc, char** argv) { return command::run_entry(argc, argv, invoke); }
 }  // namespace mmltk::tools::dispatch

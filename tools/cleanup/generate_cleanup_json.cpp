@@ -359,11 +359,11 @@ Json detectorArguments(const Json& profile, const DetectorOptions& options) {
 }
 Json collectInventoryInputs() {
  Json inputs = Json::object();
- for (const auto& [kind, command] : INVENTORY_COMMANDS.items()) {
-  auto argv = strings(command);
+ for (const auto& item : INVENTORY_COMMANDS.items()) {
+  auto argv = strings(item.value());
   auto executable = argv.front();
   argv.erase(argv.begin());
-  inputs[kind] = split(runCommand(executable, argv).out, '\0', false);
+  inputs[item.key()] = split(runCommand(executable, argv).out, '\0', false);
  }
  return inputs;
 }

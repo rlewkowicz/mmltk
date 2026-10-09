@@ -209,8 +209,7 @@ json payload_manifest() {
   };
   if (!(fs::path(__FILE__).is_absolute() && belongs_to(__FILE__)) && !belongs_to(executable_path())) checkout.clear();
  } catch (const ToolError&) {
- } catch (const std::system_error&) {
- }
+ } catch (const std::system_error&) {}
  if (!checkout.empty()) {
   const auto path = checkout / "docker/nvidia-payload.json";
   if (fs::is_regular_file(path)) return read_json(path);

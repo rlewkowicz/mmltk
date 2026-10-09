@@ -258,11 +258,13 @@ void real_training_declarations() {
   {"TrainingRun", {{"run_id", "MaxBytes"}, {"attempt_id", "MaxBytes"}, {"checkpoint_attempt_id", "MaxBytes"}, {"source_checkpoint_attempt_id", "MaxBytes"}, {"original_weights", "MaxBytes"},
                    {"original_class_descriptor", "MaxBytes"}}},
  };
- for (const auto& [owner, members] : expected.items()) {
-  for (const auto& [member, policy] : members.items()) {
+ for (const auto& ownerItem : expected.items()) {
+  const auto& owner = ownerItem.key();
+  for (const auto& memberItem : ownerItem.value().items()) {
+   const auto& member = memberItem.key();
    auto matches = Json::array();
    for (const auto& candidate : candidates) {
-    if (candidate.at("context").at("owner") == owner && candidate.at("context").at("member") == member && candidate.value("policy", Json()) == policy) matches.push_back(candidate);
+    if (candidate.at("context").at("owner") == owner && candidate.at("context").at("member") == member && candidate.value("policy", Json()) == memberItem.value()) matches.push_back(candidate);
    }
    require(matches.size() == 1, owner + "." + member, __LINE__);
    CHECK(includes(matches.at(0).at("categories"), "typed_limit"));

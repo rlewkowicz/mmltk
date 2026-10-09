@@ -2228,8 +2228,9 @@ class Wrapper {
  }
  std::pair<std::string, std::string> ensure_oracle_image(const std::string& revision) {
   const auto input = fingerprint({revision, donor, trim(read_optional(repo + "/build/tools/.inputs.sha256"))},
-              {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp", "tools/support/cpp_support.cpp",
-               "tools/support/cpp_text.cpp", "tools/support/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake", "tools/cmake/StdModules.cmake"}),
+              {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp",
+               "tools/support/cpp_support.cpp", "tools/support/cpp_text.cpp", "tools/support/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake",
+               "tools/cmake/StdModules.cmake"}),
              image = image_name + "-rfdetr-oracle";
   must({"bash", repo + "/tools/bootstrap/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
   const auto tools_id = image_id(tools_image), tools_alias = image_alias("tools", tools_id);
@@ -2353,8 +2354,8 @@ class Wrapper {
   require(!build_result.status, "headless compositor requires the GCC 16.2 build image; run ./mmltk --build first");
   const auto build_id = trim(build_result.out), build_alias = image_alias("wayland-build", build_id);
   cached_image("default", "-", validation_image, repo + "/docker/Dockerfile.wayland-validation", "wayland-validation",
-   fingerprint({"wayland-validation", runtime_id, build_id},
-    {"docker/Dockerfile.wayland-validation", "tools/wayland/headless_weston_seat.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake", "tools/cmake/StdModules.cmake"}),
+   fingerprint({"wayland-validation", runtime_id, build_id}, {"docker/Dockerfile.wayland-validation", "tools/wayland/headless_weston_seat.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake",
+                                                              "tools/cmake/RuntimeClosure.cmake", "tools/cmake/StdModules.cmake"}),
    repo,
    {"--build-context", "mmltk_runtime=docker-image://" + runtime_alias, "--build-context", "mmltk_build=docker-image://" + build_alias, "--build-arg", "MMLTK_RUNTIME_IDENTITY=" + runtime_id,
     "--build-arg", "MMLTK_BUILD_IDENTITY=" + build_id});

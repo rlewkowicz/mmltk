@@ -57,8 +57,9 @@ std::string replaceFirst(std::string source, std::string_view from, std::string_
 }
 Json classifySources(const Json& sources, const Json& ranges = Json::object(), int tokenCount = 39) {
  auto occurrences = Json::array();
- for (const auto& [path, value] : sources.items()) {
-  const auto& source = value.get_ref<const std::string&>();
+ for (const auto& item : sources.items()) {
+  const auto& path = item.key();
+  const auto& source = item.value().get_ref<const std::string&>();
   Json occurrence{{"path", path}, {"start", 1}, {"end", 1 + std::count(source.begin(), source.end(), '\n')}};
   if (ranges.contains(path)) occurrence.update(ranges.at(path));
   occurrences.push_back(std::move(occurrence));
@@ -74,7 +75,7 @@ Json classifySources(const Json& sources, const Json& ranges = Json::object(), i
   return sources.at(path).get<std::string>();
  }});
  CHECK(reads.size() == sources.size());
- for (const auto& [path, source] : sources.items()) CHECK(reads.at(path) == 1);
+ for (const auto& item : sources.items()) CHECK(reads.at(item.key()) == 1);
  return result;
 }
 void copiesRemoved(const Json& arguments) {
@@ -567,9 +568,9 @@ void partial_spans() {
   {"b.cpp", "void B(int fd) { auto count = read(fd, &value, sizeof(value)); check(count); }"},
  };
  auto ranges = Json::object();
- for (const auto& [path, value] : sources.items()) {
-  const auto& source = value.get_ref<const std::string&>();
-  ranges[path] = {{"column", source.find("(fd,") + 1}, {"endColumn", source.find("check(count);") + 13}};
+ for (const auto& item : sources.items()) {
+  const auto& source = item.value().get_ref<const std::string&>();
+  ranges[item.key()] = {{"column", source.find("(fd,") + 1}, {"endColumn", source.find("check(count);") + 13}};
  }
  CHECK(classifySources(sources, ranges).at("duplications").empty());
  const Json changed{
@@ -578,9 +579,9 @@ void partial_spans() {
  };
  for (const std::string edge : {"column", "endColumn"}) {
   auto partial = Json::object();
-  for (const auto& [path, value] : changed.items()) {
-   const auto& source = value.get_ref<const std::string&>();
-   partial[path] = {{edge, edge == "column" ? source.find(".device") + 1 : source.find(".count")}};
+  for (const auto& item : changed.items()) {
+   const auto& source = item.value().get_ref<const std::string&>();
+   partial[item.key()] = {{edge, edge == "column" ? source.find(".device") + 1 : source.find(".count")}};
   }
   CHECK(classifySources(changed, partial).at("duplications").empty());
  }
@@ -658,9 +659,9 @@ void overlapping_spans() {
   {"b.cpp", "void B() { inspect(value); publish(value); }"},
  };
  auto occurrences = Json::array();
- for (const auto& [path, value] : sources.items()) {
-  const auto& source = value.get_ref<const std::string&>();
-  occurrences.push_back({{"path", path}, {"start", 1}, {"end", 1}, {"column", source.find("inspect") + 1}, {"endColumn", source.find("; }") + 1}});
+ for (const auto& item : sources.items()) {
+  const auto& source = item.value().get_ref<const std::string&>();
+  occurrences.push_back({{"path", item.key()}, {"start", 1}, {"end", 1}, {"column", source.find("inspect") + 1}, {"endColumn", source.find("; }") + 1}});
  }
  const Json candidate{{"lineCount", 1}, {"tokenCount", 39}, {"occurrences", occurrences}};
  auto larger = candidate;

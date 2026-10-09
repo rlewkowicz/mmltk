@@ -39,7 +39,5 @@ int invoke(const command::Invocation& invocation) {
    return tools::dispatch::invoke(invocation);
  });
 }
-int entry(int argc, char** argv) {
- return command::run_entry(argc, argv, invoke);
-}
+int entry(int argc, char** argv) { return command::run_entry(argc, argv, invoke); }
 }  // namespace mmltk::tools::tests::dispatch

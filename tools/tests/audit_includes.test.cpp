@@ -218,10 +218,10 @@ void retention() {
   {"src/a.h", "declaration header requires direct dependencies"}, {"src/a.cu", "CUDA source does not consume an ordinary C++ PCH"}, {"src/a.cppm", "module source does not consume a PCH"},
   {"src/a.c", "not an ordinary C++ translation unit"}
  };
- for (const auto& [path, reason] : reasons.items()) {
-  const auto result = rewrite(path, "#include <vector>\n");
+ for (const auto& item : reasons.items()) {
+  const auto result = rewrite(item.key(), "#include <vector>\n");
   CHECK(result.at("retained").size() == 1);
-  CHECK(result.at("retained").at(0).at("reason") == reason);
+  CHECK(result.at("retained").at(0).at("reason") == item.value());
  }
  const auto absent = rewrite("src/a.cpp", "#include <vector>\n", Json::array());
  CHECK(absent.at("retained").at(0).at("reason") == "source has no compile command in this build graph");
