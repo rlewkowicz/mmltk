@@ -1,48 +1,11 @@
 module;
-#include "cpp_test_macros.hpp"
 // Native counterpart of generate_cleanup_json.test.mjs: all 40 original cases.
 // Run from the repository root. The first
 // case requires the configured real PMD; the failure fixture reexecutes this
 // native test binary as a fake detector. No JavaScript runtime is used.
-#include <algorithm>
-#include <cstddef>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iostream>
-#include <iterator>
-#include <map>
-#include <optional>
-#include <regex>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <type_traits>
-#include <utility>
-#include <vector>
-#include <unistd.h>
-#include <array>
-#include <cstdint>
-#include <nlohmann/json.hpp>
-#include <set>
-#include <initializer_list>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstring>
-#include <span>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <exception>
+#include "cpp_test_macros.hpp"
 export module mmltk.tools.tests.generate_cleanup_json_test;
+import std;
 import mmltk.tools.generate_cleanup_json;
 import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cleanup.declaration_patterns;

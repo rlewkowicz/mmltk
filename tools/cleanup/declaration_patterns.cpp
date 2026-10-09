@@ -1,27 +1,13 @@
-module;
 // Declaration evidence and syntactic authoring rules. Uncertain C++ lookup or
 // preprocessing remains an explicit manual case, never rewrite authority.
-#include <algorithm>
-#include <initializer_list>
-#include <limits>
-#include <span>
-#include <stdexcept>
-#include <utility>
-#include <cstddef>
-#include <map>
-#include <optional>
-#include <set>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <functional>
-#include <nlohmann/json.hpp>
 export module mmltk.tools.cleanup.declaration_patterns;
+import std;
+import mmltk.tools.cpp_support;
 import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cpp_text;
 export {
  namespace mmltk::tools::declarations {
- using Json = nlohmann::ordered_json;
+ using Json = mmltk::tools::json;
  inline constexpr std::string_view ANNOTATION_HEADER = "src/frameworks/reflection/declaration_annotations.h";
  inline constexpr std::string_view DECLARATION_SURFACE = "src/frameworks/reflection/reflected_declarations.h";
  extern const std::map<std::string, std::string> ANNOTATION_MACROS;

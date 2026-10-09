@@ -7,21 +7,10 @@ module;
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/system/execution_policy.h"
-#include <array>
-#include <charconv>
-#include <chrono>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
 #include <fcntl.h>
-#include <iostream>
-#include <memory>
 #include <nlohmann/json.hpp>
-#include <stdexcept>
-#include <string_view>
-#include <utility>
-#include <vector>
 export module mmltk.tools.diagnose_compiled_sample;
+import std;
 export int mmltk_tool_diagnose_compiled_sample(int argc, char** argv) try {
  if (argc != 3 && argc != 5) throw std::invalid_argument("expected compiled path, physical sample slot and optional opening worker count and cold-cache flag");
  namespace data = mmltk::backend::data;

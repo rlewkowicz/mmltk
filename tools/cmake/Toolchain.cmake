@@ -20,6 +20,13 @@ function(mmltk_tools_configure_target target)
     if(NOT _compiler STREQUAL _pinned)
         message(FATAL_ERROR "Native tools require /opt/gcc-16.2/bin/g++")
     endif()
+    if(NOT 26 IN_LIST CMAKE_CXX_COMPILER_IMPORT_STD)
+        message(FATAL_ERROR
+            "Native tools require C++26 import std support from GCC 16.2's installed "
+            "libstdc++.modules.json; enable StdModules.cmake before project() and "
+            "verify the pinned compiler's module installation. "
+            "${CMAKE_CXX_COMPILER_IMPORT_STD_ERROR_MESSAGE}")
+    endif()
     target_compile_features(${target} PUBLIC cxx_std_26)
     target_compile_options(${target} PRIVATE -freflection -Wall -Wextra -Wpedantic
         "$<$<CONFIG:Debug,RelWithDebInfo,Dev>:-g1>")
@@ -32,7 +39,8 @@ function(mmltk_tools_configure_target target)
     find_program(MMLTK_TOOLS_MOLD_PROGRAM mold REQUIRED)
     target_link_options(${target} PRIVATE -fuse-ld=mold -Wl,--as-needed)
     set_target_properties(${target} PROPERTIES
-        CXX_EXTENSIONS OFF CXX_SCAN_FOR_MODULES ON POSITION_INDEPENDENT_CODE ON)
+        CXX_EXTENSIONS OFF CXX_SCAN_FOR_MODULES ON CXX_MODULE_STD ON
+        POSITION_INDEPENDENT_CODE ON)
 endfunction()
 
 # Owners supply their module and entrypoint once. The generated translation

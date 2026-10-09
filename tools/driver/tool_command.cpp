@@ -1,19 +1,5 @@
-module;
-#include <algorithm>
-#include <array>
-#include <cstddef>
-#include <exception>
-#include <iostream>
-#include <meta>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <type_traits>
-#include <utility>
-#include <vector>
 export module mmltk.tools.tool_command;
+import std;
 import mmltk.tools.cpp_support;
 export namespace mmltk::tools::command {
 // External spelling is projected from the enum identifier. The annotation

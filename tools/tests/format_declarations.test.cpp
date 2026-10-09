@@ -1,46 +1,10 @@
 module;
-#include "cpp_test_macros.hpp"
 // Native counterpart of format_declarations.test.mjs: all 21 original cases.
 // Run from the repository root (REPO_ROOT); the existing text fixtures and real
 // training declaration source are read directly without interpreter execution.
-#include <algorithm>
-#include <cstddef>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iostream>
-#include <iterator>
-#include <map>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <optional>
-#include <utility>
-#include <nlohmann/json.hpp>
-#include <array>
-#include <cstdint>
-#include <initializer_list>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <span>
-#include <system_error>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <regex>
+#include "cpp_test_macros.hpp"
 export module mmltk.tools.tests.format_declarations_test;
+import std;
 import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cleanup.declaration_patterns;
 import mmltk.tools.format_declarations;
@@ -49,7 +13,7 @@ import mmltk.tools.tests.cpp_test_support;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 namespace formatter_test {
-using Json = nlohmann::ordered_json;
+using Json = mmltk::tools::json;
 using namespace mmltk::tools::declarations;
 using mmltk::tools::cleanup::buildInventory;
 using mmltk::tools::cleanup::CLEANUP_PROFILES;

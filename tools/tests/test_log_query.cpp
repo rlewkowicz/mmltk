@@ -1,62 +1,25 @@
 module;
 // The same-module fixture partition observes the one production implementation.
 // Limits and observation sinks are scoped to the selected fixture thread.
-#include <functional>
-#include <iostream>
-#include <sstream>
-#include <algorithm>
-#include <array>
-#include <bit>
-#include <chrono>
-#include <concepts>
-#include <cstddef>
-#include <cstdint>
-#include <cctype>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
-#include <map>
-#include <memory>
-#include <numeric>
-#include <optional>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <tuple>
-#include <type_traits>
-#include <utility>
-#include <vector>
-#include <sys/inotify.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <nlohmann/json.hpp>
-#include <initializer_list>
 #include <cerrno>
-#include <climits>
 #include <csignal>
-#include <cstdlib>
-#include <iterator>
-#include <span>
-#include <system_error>
+#include <cstdint>
 #include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
 #include <pwd.h>
 #include <spawn.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <sched.h>
-#include <boost/multiprecision/cpp_int.hpp>
-#include <compare>
-#include <iosfwd>
 module mmltk.tools.log_query:tests;
+import std;
 import mmltk.tools.log_query;
 import :internal;
 import mmltk.tools.tool_command;
@@ -3186,7 +3149,7 @@ void test_tools_tidy_grouped_selection_and_module_resume() {
  LACKS(resumed, "a.cpp.o");
 }
 void check_tools_handoff_consumed(const fs::path& root) {
- for (const auto* key : {"MMLTK_BOOTSTRAP_LOCK_FD", "MMLTK_BOOTSTRAP_CHECKOUT", "MMLTK_BOOTSTRAP_CACHE", "MMLTK_BOOTSTRAP_STAGE"}) CHECK(::getenv(key) == nullptr);
+ for (const auto* key : {"MMLTK_BOOTSTRAP_LOCK_FD", "MMLTK_BOOTSTRAP_CHECKOUT", "MMLTK_BOOTSTRAP_CACHE", "MMLTK_BOOTSTRAP_STAGE"}) CHECK(std::getenv(key) == nullptr);
  const auto lock = root / ".cache/locks/tools.lock";
  for (const auto& entry : fs::directory_iterator("/proc/self/fd")) {
   std::error_code error;

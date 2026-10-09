@@ -3,6 +3,7 @@ if(NOT CMAKE_VERSION VERSION_EQUAL "4.4.3")
     message(FATAL_ERROR "Native tools require exactly CMake 4.4.3")
 endif()
 
+include(cmake/StdModules.cmake)
 include(cmake/Toolchain.cmake)
 project(mmltk_tools LANGUAGES CXX)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)

@@ -1,13 +1,5 @@
-module;
-#include <cstdint>
-#include <cstddef>
-#include <algorithm>
-#include <initializer_list>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <vector>
 export module mmltk.tools.cpp_text;
+import std;
 export {
  namespace mmltk::tools::text {
  inline bool oneOf(std::string_view value, std::initializer_list<std::string_view> choices) { return std::find(choices.begin(), choices.end(), value) != choices.end(); }

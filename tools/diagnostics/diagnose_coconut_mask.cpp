@@ -5,18 +5,8 @@ module;
 #include <nlohmann/json.hpp>
 #include <stb_image.h>
 #include <stb_image_write.h>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <fstream>
-#include <iostream>
-#include <map>
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <utility>
 export module mmltk.tools.diagnose_coconut_mask;
+import std;
 using Json = nlohmann::json;
 template <class T>
 T take(arrow::Result<T> result) {

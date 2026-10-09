@@ -1,51 +1,12 @@
-module;
 // CPD candidate triage restores names and complete operations; it is not a
 // parser or a proof of semantic equivalence.
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <initializer_list>
-#include <limits>
-#include <stdexcept>
-#include <type_traits>
-#include <unordered_map>
-#include <unordered_set>
-#include <cstddef>
-#include <functional>
-#include <map>
-#include <optional>
-#include <set>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-#include <nlohmann/json.hpp>
-#include <array>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iterator>
-#include <span>
-#include <system_error>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 export module mmltk.tools.cleanup.cpd_patterns;
+import std;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 export {
  namespace mmltk::tools::cpd {
- using Json = nlohmann::ordered_json;
+ using Json = mmltk::tools::json;
  // Text crosses the public boundary as UTF-8. All source offsets and columns,
  // including token offsets and line starts, count UTF-16 code units like PMD.
  // The JavaScript lexer's single-code-unit fallback can split a surrogate pair:

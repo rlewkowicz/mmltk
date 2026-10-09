@@ -1,47 +1,12 @@
 module;
-#include "cpp_test_macros.hpp"
 // Native counterpart of review_candidates.test.mjs: all 15 original cases.
 // Run from the repository root with real PMD
 // configured for the suffix-copy case. Failure fixtures reexecute this binary;
 // no JavaScript runtime is used.
-#include <algorithm>
-#include <cstddef>
+#include "cpp_test_macros.hpp"
 #include <cstdlib>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iostream>
-#include <iterator>
-#include <optional>
-#include <regex>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <vector>
-#include <unistd.h>
-#include <array>
-#include <cstdint>
-#include <map>
-#include <nlohmann/json.hpp>
-#include <utility>
-#include <initializer_list>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstring>
-#include <span>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 export module mmltk.tools.tests.review_candidates_test;
+import std;
 import mmltk.tools.generate_cleanup_json;
 import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cleanup.declaration_patterns;

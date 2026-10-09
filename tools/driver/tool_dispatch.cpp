@@ -1,11 +1,5 @@
-module;
-#include <exception>
-#include <filesystem>
-#include <iostream>
-#include <string>
-#include <string_view>
-#include <vector>
 export module mmltk.tools.tool_dispatch;
+import std;
 import mmltk.tools.tool_command;
 import mmltk.tools.cpp_support;
 import mmltk.tools.audit_includes;

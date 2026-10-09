@@ -1,41 +1,8 @@
 module;
-#include <algorithm>
 #include <cerrno>
-#include <exception>
-#include <iostream>
-#include <set>
-#include <stdexcept>
-#include <system_error>
-#include <utility>
 #include <sys/stat.h>
-#include <map>
-#include <string>
-#include <vector>
-#include <nlohmann/json.hpp>
-#include <cstddef>
-#include <functional>
-#include <optional>
-#include <string_view>
-#include <initializer_list>
-#include <array>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iterator>
-#include <span>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <cstdint>
 export module mmltk.tools.format_declarations;
+import std;
 import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cleanup.declaration_patterns;
 import mmltk.tools.cpp_support;
@@ -44,7 +11,7 @@ import mmltk.tools.cpp_text;
 import mmltk.tools.generate_cleanup_json;
 export {
  namespace mmltk::tools::formatter {
- using Json = nlohmann::ordered_json;
+ using Json = mmltk::tools::json;
  Json parseFormatArgs(const std::vector<std::string>& args);
  Json declarationFormatReport(const std::vector<std::string>& inventory, const std::map<std::string, std::string>& sources, const Json& options = Json::object());
  int runFormatter(const Json& options);

@@ -1,47 +1,6 @@
-module;
 // Lexical evidence, not an include-what-you-use or semantic dependency checker.
-#include <algorithm>
-#include <cstddef>
-#include <cstdint>
-#include <filesystem>
-#include <iostream>
-#include <iterator>
-#include <map>
-#include <regex>
-#include <sstream>
-#include <stdexcept>
-#include <utility>
-#include <functional>
-#include <set>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <nlohmann/json.hpp>
-#include <optional>
-#include <limits>
-#include <unicode/ucol.h>
-#include <unicode/uloc.h>
-#include <unicode/utypes.h>
-#include <initializer_list>
-#include <array>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <span>
-#include <system_error>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 export module mmltk.tools.audit_includes;
+import std;
 import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cleanup.declaration_patterns;
 import mmltk.tools.cpp_locale;
@@ -51,7 +10,7 @@ import mmltk.tools.cpp_text;
 import mmltk.tools.generate_cleanup_json;
 export {
  namespace mmltk::tools::include_audit {
- using Json = nlohmann::ordered_json;
+ using Json = mmltk::tools::json;
  using SourceReader = std::function<std::string(const std::string&)>;
  using PathAvailable = std::function<bool(const std::string&)>;
  // Objects retain JavaScript Map insertion order. Contexts map source paths to

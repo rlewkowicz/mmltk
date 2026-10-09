@@ -1,9 +1,8 @@
 module;
 // Validation-only input capabilities for Ubuntu Weston 13.0.0-4build3.
 #include <libweston/libweston.h>
-#include <memory>
-#include <new>
 export module mmltk.tools.headless_weston_seat;
+import std;
 // These exported functions are private in Weston 13. The builder and runtime
 // packages must retain the identical version pinned in the validation image.
 // Declarations: wayland/weston tag 13.0.0, libweston/libweston-internal.h.

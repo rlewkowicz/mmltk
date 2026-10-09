@@ -1,41 +1,7 @@
-module;
 // Native counterpart of collect_time_traces.sh. Requires cpp_support.hpp,
 // the vendored nlohmann JSON headers, and GNU realpath on PATH.
-#include <algorithm>
-#include <exception>
-#include <filesystem>
-#include <iostream>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <utility>
-#include <vector>
-#include <nlohmann/json.hpp>
-#include <cstddef>
-#include <initializer_list>
-#include <optional>
-#include <array>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <functional>
-#include <iterator>
-#include <map>
-#include <span>
-#include <stdexcept>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 export module mmltk.tools.collect_time_traces;
+import std;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 namespace {

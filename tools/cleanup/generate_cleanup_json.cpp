@@ -1,57 +1,11 @@
 module;
 // Native cleanup and raw declaration evidence.
-#include <algorithm>
 #include <cerrno>
-#include <chrono>
-#include <cmath>
 #include <cstdlib>
-#include <ctime>
-#include <exception>
-#include <future>
-#include <iomanip>
-#include <iostream>
-#include <limits>
-#include <memory>
-#include <regex>
-#include <set>
-#include <sstream>
-#include <stdexcept>
-#include <thread>
-#include <unordered_set>
-#include <utility>
-#include <openssl/evp.h>
 #include <sched.h>
-#include <nlohmann/json.hpp>
-#include <cstddef>
-#include <initializer_list>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <array>
-#include <climits>
-#include <csignal>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iterator>
-#include <map>
-#include <span>
-#include <system_error>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
-#include <cstdint>
-#include <unicode/ucol.h>
-#include <unicode/uloc.h>
-#include <unicode/utypes.h>
 export module mmltk.tools.generate_cleanup_json;
+import std;
 import mmltk.tools.cpp_time;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
@@ -62,7 +16,7 @@ import mmltk.tools.cpp_locale;
 import mmltk.tools.cpp_digest;
 export {
  namespace mmltk::tools::cleanup {
- using Json = nlohmann::ordered_json;
+ using Json = mmltk::tools::json;
  using SourceReader = std::function<std::string(const std::string&)>;
  using PathAvailable = std::function<bool(const std::string&)>;
  using Clock = std::function<std::string()>;

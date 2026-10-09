@@ -2,42 +2,9 @@ module;
 // Native counterpart of configure_cmake_graph.sh. Requires cpp_support.hpp,
 // vendored nlohmann JSON headers, and OpenSSL libcrypto. CMake and the existing
 // Python invariant checker remain external commands; no shell is involved.
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <vector>
-#include <openssl/evp.h>
 #include <unistd.h>
-#include <nlohmann/json.hpp>
-#include <cstddef>
-#include <initializer_list>
-#include <optional>
-#include <cerrno>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <functional>
-#include <iterator>
-#include <map>
-#include <span>
-#include <stdexcept>
-#include <utility>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 export module mmltk.tools.configure_cmake_graph;
+import std;
 import mmltk.tools.cpp_digest;
 import mmltk.tools.cpp_support;
 import mmltk.tools.tool_command;
@@ -51,7 +18,7 @@ std::vector<std::string> configuration_inputs(const fs::path& root) {
  // Keep the exact input names and ordering used by existing cache markers.
  std::vector<std::string> result{
   "CMakePresets.json", "CMakeLists.txt", "docker/nvidia-payload.json", "docker/record_compiler_evidence.py", "tools/toolchain/check_toolchain_invariants.cpp", "tools/toolchain/configure_cmake_graph.cpp",
-  "tools/driver/tool_command.cpp", "tools/toolchain/module_safe_compiler_launcher.cpp", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake"
+  "tools/driver/tool_command.cpp", "tools/toolchain/module_safe_compiler_launcher.cpp", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake", "tools/cmake/StdModules.cmake"
  };
  std::vector<std::string> discovered;
  for (const auto* directory : {"cmake", "src"}) {

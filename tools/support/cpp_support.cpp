@@ -1,38 +1,18 @@
 module;
 #include <nlohmann/json.hpp>
-#include <cstddef>
-#include <algorithm>
-#include <initializer_list>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <array>
 #include <cerrno>
-#include <chrono>
 #include <climits>
 #include <csignal>
 #include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iterator>
-#include <map>
-#include <span>
-#include <stdexcept>
-#include <system_error>
-#include <type_traits>
-#include <utility>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
-#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 export module mmltk.tools.cpp_support;
+import std;
 import mmltk.tools.cpp_text;
 export {
  namespace mmltk::tools {

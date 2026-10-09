@@ -1,43 +1,6 @@
-module;
 // Audit tracked native tests against CMake ownership and the all-suite inventory.
-#include <array>
-#include <exception>
-#include <filesystem>
-#include <iostream>
-#include <map>
-#include <optional>
-#include <regex>
-#include <set>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-#include <nlohmann/json.hpp>
-#include <cstddef>
-#include <algorithm>
-#include <initializer_list>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <functional>
-#include <iterator>
-#include <span>
-#include <stdexcept>
-#include <system_error>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 export module mmltk.tools.audit_test_inventory;
+import std;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 namespace {

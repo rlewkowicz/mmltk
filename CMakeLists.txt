@@ -5,6 +5,7 @@ if(NOT CMAKE_VERSION VERSION_EQUAL "4.4.3")
         "mmltk requires exactly CMake 4.4.3; resolved ${CMAKE_VERSION}")
 endif()
 
+include(tools/cmake/StdModules.cmake)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 if(POLICY CMP0138)
     cmake_policy(SET CMP0138 NEW)

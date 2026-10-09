@@ -1,10 +1,9 @@
 module;
 #include <cerrno>
 #include <cstdio>
-#include <cstring>
-#include <string_view>
 #include <unistd.h>
 export module mmltk.tools.module_safe_compiler_launcher;
+import std;
 export int mmltk_tool_module_safe_compiler_launcher(int argc, char* argv[]) {
  if (argc < 2) {
   std::fputs("mmltk compiler launcher: missing compiler command\n", stderr);

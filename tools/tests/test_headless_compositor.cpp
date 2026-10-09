@@ -6,25 +6,8 @@ module;
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-#include <algorithm>
-#include <array>
 #include <cerrno>
-#include <chrono>
 #include <csignal>
-#include <cstddef>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <initializer_list>
-#include <iostream>
-#include <memory>
-#include <optional>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <utility>
-#include <vector>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
@@ -32,19 +15,10 @@ module;
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
-#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <nlohmann/json.hpp>
-#include <climits>
-#include <fstream>
-#include <functional>
-#include <iterator>
-#include <map>
-#include <span>
-#include <sys/stat.h>
-#include <sched.h>
 export module mmltk.tools.tests.test_headless_compositor;
+import std;
 import mmltk.tools.tool_command;
 import mmltk.tools.container_commands;
 import mmltk.tools.cpp_linux;

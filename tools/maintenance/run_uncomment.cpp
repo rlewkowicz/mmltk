@@ -2,44 +2,12 @@ module;
 // Native counterpart of run_uncomment.sh. Requires cpp_support.hpp, the
 // vendored nlohmann JSON headers, and OpenSSL libcrypto. Only comment removal
 // itself is delegated to the existing uncomment executable.
-#include <algorithm>
-#include <array>
 #include <cerrno>
-#include <cstddef>
 #include <cstdlib>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <memory>
-#include <set>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <utility>
-#include <vector>
-#include <openssl/evp.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <nlohmann/json.hpp>
-#include <initializer_list>
-#include <optional>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstring>
-#include <functional>
-#include <iterator>
-#include <map>
-#include <span>
-#include <stdexcept>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 export module mmltk.tools.run_uncomment;
+import std;
 import mmltk.tools.cpp_digest;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_linux;

@@ -1,14 +1,9 @@
 module;
-#include <cstddef>
-#include <cstdint>
-#include <limits>
-#include <stdexcept>
-#include <string>
-#include <string_view>
 #include <unicode/ucol.h>
 #include <unicode/uloc.h>
 #include <unicode/utypes.h>
 export module mmltk.tools.cpp_locale;
+import std;
 export {
  namespace mmltk::tools {
  // Inputs are UTF-8; JSON keys containing isolated UTF-16 surrogates must escape

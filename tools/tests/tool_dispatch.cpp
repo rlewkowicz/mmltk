@@ -1,4 +1,5 @@
 export module mmltk.tools.tests.tool_dispatch;
+import std;
 import mmltk.tools.tool_command;
 import mmltk.tools.tool_dispatch;
 import mmltk.tools.log_query;

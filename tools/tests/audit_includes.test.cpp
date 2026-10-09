@@ -1,44 +1,9 @@
 module;
-#include "cpp_test_macros.hpp"
 // Native counterpart of audit_includes.test.mjs: all 14 original cases.
 // Fixtures are in memory; no JavaScript runtime or external commands are used.
-#include <algorithm>
-#include <cstddef>
-#include <functional>
-#include <iostream>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <nlohmann/json.hpp>
-#include <initializer_list>
-#include <optional>
-#include <array>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iterator>
-#include <map>
-#include <span>
-#include <system_error>
-#include <utility>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <exception>
-#include <regex>
+#include "cpp_test_macros.hpp"
 export module mmltk.tools.tests.audit_includes_test;
+import std;
 import mmltk.tools.audit_includes;
 import mmltk.tools.tests.cpp_test_support;
 import mmltk.tools.cpp_support;

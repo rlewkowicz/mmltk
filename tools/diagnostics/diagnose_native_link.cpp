@@ -1,40 +1,8 @@
 module;
 // Repeat one generated native link into independent diagnostic storage.
-#include <algorithm>
-#include <filesystem>
-#include <iostream>
-#include <iterator>
-#include <map>
-#include <optional>
-#include <set>
-#include <string>
-#include <string_view>
-#include <vector>
 #include <unistd.h>
-#include <nlohmann/json.hpp>
-#include <cstddef>
-#include <initializer_list>
-#include <array>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <functional>
-#include <span>
-#include <stdexcept>
-#include <system_error>
-#include <utility>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 export module mmltk.tools.diagnose_native_link;
+import std;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 namespace {

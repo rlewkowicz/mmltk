@@ -1,46 +1,7 @@
-module;
 // Human review evidence only: lexical shapes do not establish semantic
 // equivalence, extraction permission, source registration, or rewrite rules.
-#include <algorithm>
-#include <array>
-#include <cstddef>
-#include <map>
-#include <regex>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-#include <nlohmann/json.hpp>
-#include <initializer_list>
-#include <optional>
-#include <cerrno>
-#include <chrono>
-#include <climits>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iterator>
-#include <span>
-#include <system_error>
-#include <fcntl.h>
-#include <poll.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <cstdint>
-#include <limits>
-#include <unicode/ucol.h>
-#include <unicode/uloc.h>
-#include <unicode/utypes.h>
 export module mmltk.tools.cleanup.review_patterns;
+import std;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 import mmltk.tools.cpp_locale;
@@ -48,7 +9,7 @@ import mmltk.tools.cleanup.cpd_patterns;
 import mmltk.tools.cleanup.declaration_patterns;
 export {
  namespace mmltk::tools::review {
- using Json = nlohmann::ordered_json;
+ using Json = mmltk::tools::json;
  std::size_t physicalLines(std::string_view source);
  // files is an ordered JSON array of {path, source, language, sha256}; rawReport
  // has the raw_matches and classified_context collections from rawCpdReport.
