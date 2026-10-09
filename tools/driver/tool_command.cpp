@@ -11,6 +11,7 @@ module;
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 export module mmltk.tools.tool_command;
 import mmltk.tools.cpp_support;
@@ -111,12 +112,48 @@ inline std::string shell_invocation(Command selected, const std::vector<std::str
  }
  return result;
 }
-// Arguments exclude the logical argv[0]. This boundary creates mutable argv
-// storage because compiler launchers deliberately replace argv[0] before exec.
-// Entrypoints retain their process role (including exec and signal setup).
-// Use self_invocation for resource-owning commands; safe owner APIs can be
-// imported and called directly without entering a process entrypoint.
-int invoke(Command selected, const std::vector<std::string>& arguments = {}, std::string_view argv0 = {});
+struct Invocation {
+ Command selected;
+ // Arguments exclude the logical argv[0]; an absent or empty override uses
+ // the canonical program name, matching the --argv0 command-line protocol.
+ std::vector<std::string> arguments;
+ std::optional<std::string> logical_name = {};
+ // Compiler launchers deliberately replace argv[0] before exec, so each call
+ // owns mutable argv storage. The caller selects the concrete entrypoint and
+ // retains its process role, including exec and signal setup.
+ // Use self_invocation for resource-owning commands; a direct call runs in
+ // the caller's existing process.
+ int call(int (*entrypoint)(int, char**)) const {
+  std::vector<std::string> storage;
+  storage.reserve(arguments.size() + 1);
+  storage.emplace_back(logical_name && !logical_name->empty() ? std::string_view(*logical_name) : program(selected));
+  storage.insert(storage.end(), arguments.begin(), arguments.end());
+  auto pointers = tools::detail::argument_pointers(storage);
+  return entrypoint(static_cast<int>(storage.size()), pointers.data());
+ }
+};
 // argc/argv start at command selection, after the wrapper's --tool argument.
-int entry(int argc, char** argv);
+// Parsing and error reporting are shared; composition belongs to the caller.
+template <class Dispatcher>
+int run_entry(int argc, char** argv, Dispatcher&& dispatch) {
+ try {
+  if (argc == 0) throw ToolError("--tool requires a native command", 2);
+  const auto selected = parse(argv[0]);
+  if (!selected) throw ToolError("unknown native tool command: " + std::string(argv[0]), 2);
+  int first = 1;
+  std::optional<std::string> logical_name;
+  if (first < argc && std::string_view(argv[first]) == "--argv0") {
+   if (++first == argc) throw ToolError("--argv0 requires a logical program name", 2);
+   logical_name = argv[first++];
+  }
+  if (first < argc && std::string_view(argv[first]) == "--") ++first;
+  return dispatch(Invocation{*selected, {argv + first, argv + argc}, std::move(logical_name)});
+ } catch (const ToolError& error) {
+  std::cerr << "mmltk tool: " << error.what() << '\n';
+  return error.status;
+ } catch (const std::exception& error) {
+  std::cerr << "mmltk tool: " << error.what() << '\n';
+  return 1;
+ }
+}
 }  // namespace mmltk::tools::command

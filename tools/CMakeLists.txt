@@ -102,17 +102,22 @@ if(MMLTK_TOOLS_BUILD_DRIVER)
         "${MMLTK_TOOLS_CUDA_INCLUDE_DIR}"
         "${MMLTK_TOOLS_NUMA_INCLUDE_DIR}"
         "${MMLTK_TOOLS_VULKAN_INCLUDE_DIR}")
-    add_executable(mmltk mmltk.cpp driver/tool_dispatch.cpp)
+    add_library(mmltk_tool_dispatch STATIC)
+    mmltk_tools_configure_target(mmltk_tool_dispatch)
+    target_sources(mmltk_tool_dispatch PUBLIC FILE_SET CXX_MODULES FILES driver/tool_dispatch.cpp)
+    target_link_libraries(mmltk_tool_dispatch PUBLIC mmltk_tool_modules)
+
+    add_executable(mmltk mmltk.cpp)
     mmltk_tools_configure_target(mmltk)
-    target_link_libraries(mmltk PRIVATE mmltk_tool_modules)
+    target_link_libraries(mmltk PRIVATE mmltk_tool_dispatch)
     mmltk_tools_install_runtime(mmltk)
 
     # Fixture objects share the production module archive but are referenced
     # only by this runner, so the release driver contains no fixture code.
-    add_executable(mmltk_tool_tests tests/tool_main.cpp driver/tool_dispatch.cpp)
+    add_executable(mmltk_tool_tests tests/tool_main.cpp)
     mmltk_tools_configure_target(mmltk_tool_tests)
-    target_compile_definitions(mmltk_tool_tests PRIVATE MMLTK_TOOL_FIXTURES=1)
-    target_link_libraries(mmltk_tool_tests PRIVATE mmltk_tool_modules)
+    target_sources(mmltk_tool_tests PRIVATE FILE_SET CXX_MODULES FILES tests/tool_dispatch.cpp)
+    target_link_libraries(mmltk_tool_tests PRIVATE mmltk_tool_dispatch)
     set_target_properties(mmltk_tool_tests PROPERTIES OUTPUT_NAME mmltk-tests)
     mmltk_tools_install_runtime(mmltk_tool_tests)
 endif()

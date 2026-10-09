@@ -47,6 +47,7 @@ import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
 import mmltk.tools.container_commands;
 import mmltk.tools.tool_command;
+import mmltk.tools.tool_dispatch;
 import mmltk.tools.runtime_package;
 namespace {
 namespace fs = std::filesystem;
@@ -3223,7 +3224,7 @@ public:
 int main(int argc, char** argv) {
  try {
   auto bootstrap_user = consume_bootstrap_handoff();
-  if (argc > 1 && std::string_view(argv[1]) == "--tool") return mmltk::tools::command::entry(argc - 2, argv + 2);
+  if (argc > 1 && std::string_view(argv[1]) == "--tool") return mmltk::tools::dispatch::entry(argc - 2, argv + 2);
   install_signals();
   Wrapper wrapper(argc, argv, std::move(bootstrap_user));
   int status = 0;

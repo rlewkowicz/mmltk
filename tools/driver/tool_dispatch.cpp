@@ -5,7 +5,8 @@ module;
 #include <string>
 #include <string_view>
 #include <vector>
-module mmltk.tools.tool_command;
+export module mmltk.tools.tool_dispatch;
+import mmltk.tools.tool_command;
 import mmltk.tools.cpp_support;
 import mmltk.tools.audit_includes;
 import mmltk.tools.audit_test_inventory;
@@ -31,15 +32,9 @@ import mmltk.tools.run_static_analysis;
 import mmltk.tools.run_traced_command;
 import mmltk.tools.run_uncomment;
 import mmltk.tools.runtime_package;
-#ifdef MMLTK_TOOL_FIXTURES
-import mmltk.tools.tests.audit_includes_test;
-import mmltk.tools.tests.format_declarations_test;
-import mmltk.tools.tests.generate_cleanup_json_test;
-import mmltk.tools.tests.review_candidates_test;
-import mmltk.tools.tests.test_headless_compositor;
-#endif
-namespace mmltk::tools::command {
+namespace mmltk::tools::dispatch {
 namespace {
+using command::Command;
 template <Command Selected>
 constexpr auto implementation() {
  if constexpr (Selected == Command::audit_includes)
@@ -90,60 +85,23 @@ constexpr auto implementation() {
   return &mmltk_tool_run_uncomment;
  else if constexpr (Selected == Command::runtime_package)
   return &mmltk_tool_runtime_package;
-#ifdef MMLTK_TOOL_FIXTURES
- else if constexpr (Selected == Command::test_audit_includes)
-  return &mmltk_tool_audit_includes_test;
- else if constexpr (Selected == Command::test_format_declarations)
-  return &mmltk_tool_format_declarations_test;
- else if constexpr (Selected == Command::test_generate_cleanup_json)
-  return &mmltk_tool_generate_cleanup_json_test;
- else if constexpr (Selected == Command::test_review_candidates)
-  return &mmltk_tool_review_candidates_test;
- else if constexpr (Selected == Command::test_headless_compositor)
-  return &mmltk_tool_test_headless_compositor;
- else if constexpr (Selected == Command::test_log_query)
-  return &mmltk::log_query::test_entry;
-#endif
  else
   static_assert(false, "native command has no implementation");
 }
 }  // namespace
-int invoke(Command selected, const std::vector<std::string>& arguments, std::string_view argv0) {
- std::vector<std::string> storage;
- storage.reserve(arguments.size() + 1);
- storage.emplace_back(argv0.empty() ? program(selected) : argv0);
- storage.insert(storage.end(), arguments.begin(), arguments.end());
- auto pointers = tools::detail::argument_pointers(storage);
- return visit(selected, [&](auto command) -> int {
-#ifndef MMLTK_TOOL_FIXTURES
-  if constexpr (fixture(decltype(command)::value)) {
+}  // namespace mmltk::tools::dispatch
+export namespace mmltk::tools::dispatch {
+int invoke(const command::Invocation& invocation) {
+ return command::visit(invocation.selected, [&](auto selected) -> int {
+  if constexpr (command::fixture(decltype(selected)::value)) {
    auto runner = executable_path().parent_path() / "mmltk-tests";
    if (!fs::exists(runner)) runner = executable_path().parent_path() / "build/tools/mmltk-tests";
-   tools::exec(self_invocation(selected, arguments, argv0, runner.string()));
+   tools::exec(command::self_invocation(invocation.selected, invocation.arguments, invocation.logical_name.value_or(""), runner.string()));
   } else
-#endif
-   return implementation<decltype(command)::value>()(static_cast<int>(storage.size()), pointers.data());
+   return invocation.call(implementation<decltype(selected)::value>());
  });
 }
 int entry(int argc, char** argv) {
- try {
-  if (argc == 0) throw ToolError("--tool requires a native command", 2);
-  const auto selected = parse(argv[0]);
-  if (!selected) throw ToolError("unknown native tool command: " + std::string(argv[0]), 2);
-  int first = 1;
-  std::string_view argv0;
-  if (first < argc && std::string_view(argv[first]) == "--argv0") {
-   if (++first == argc) throw ToolError("--argv0 requires a logical program name", 2);
-   argv0 = argv[first++];
-  }
-  if (first < argc && std::string_view(argv[first]) == "--") ++first;
-  return invoke(*selected, {argv + first, argv + argc}, argv0);
- } catch (const ToolError& error) {
-  std::cerr << "mmltk tool: " << error.what() << '\n';
-  return error.status;
- } catch (const std::exception& error) {
-  std::cerr << "mmltk tool: " << error.what() << '\n';
-  return 1;
- }
+ return command::run_entry(argc, argv, invoke);
 }
-}  // namespace mmltk::tools::command
+}  // namespace mmltk::tools::dispatch

@@ -60,6 +60,7 @@ module mmltk.tools.log_query:tests;
 import mmltk.tools.log_query;
 import :internal;
 import mmltk.tools.tool_command;
+import mmltk.tools.diagnose_native_process;
 import mmltk.tools.cpp_linux;
 import mmltk.tools.cpp_support;
 import mmltk.tools.cpp_text;
@@ -4732,8 +4733,9 @@ int mmltk::log_query::test_entry(int argc, char** argv) {
   if (argc > 1 && std::string_view(argv[1]) == "--fixture-package-docker") return package_docker(Strings(argv + 2, argv + argc));
   if (argc > 2 && std::string_view(argv[1]) == "--fixture-package-child") return package_child(Strings(argv + 2, argv + argc));
   if (argc == 3 && std::string_view(argv[1]) == "--fixture-inspector-self")
-   return support::command::invoke(
-    support::command::Command::diagnose_native_process, {"--read-file", support::executable_path().filename().string(), "--pid", std::to_string(::getpid()), "--file", argv[2]});
+   return support::command::Invocation{
+    support::command::Command::diagnose_native_process, {"--read-file", support::executable_path().filename().string(), "--pid", std::to_string(::getpid()), "--file", argv[2]}}
+    .call(mmltk_tool_diagnose_native_process);
   if (argc == 2 && std::string_view(argv[1]) == "--fixture-tools-state") return tools_handoff_state();
   if (argc > 3 && std::string_view(argv[1]) == "--fixture-tools-user") {
    tools_fixture_user(argv[2]);
