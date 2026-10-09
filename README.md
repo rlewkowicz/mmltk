@@ -49,7 +49,8 @@ The full build packages the native CLI, browser host, owned Firefox runtime,
 and Iced WebAssembly interface. The GUI requires an active Wayland session.
 
 See [build and cache details](docs/build.md) for prerequisites, toolchain
-policy, generated bindings, and build timing.
+policy, [standalone tool ownership](docs/build.md#standalone-tools-module-graph),
+generated bindings, and build timing.
 
 ## Training, validation, and prediction
 

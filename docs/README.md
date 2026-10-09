@@ -5,8 +5,9 @@
 ## Getting started and reference
 
 - [Build and reusable state](build.md): cold-checkout bootstrap, independent
-  native tools graph and immutable runtime closure, product toolchains,
-  dependencies, packaging, generated artifacts, cache invalidation, and timing.
+  native tools layout and module DAG, standard-library provider and fixture
+  isolation, immutable runtime closure, product toolchains, dependencies,
+  packaging, generated artifacts, cache invalidation, and timing.
 - [Commands](commands.md): native driver/tool and application CLI entrypoints,
   process actions, benchmark inspection/cache selection, explicit data profiling,
   desktop options, and model tooling.
@@ -67,8 +68,8 @@
 ## Engineering, validation, and operations
 
 - [Validation](validation.md): required gates, native tool fixtures, suite/filter
-  selection, product/tool tidy, test-run replacement, PCH include audits,
-  three cleanup profiles and raw-review tooling,
+  selection and tools acceptance evidence, product/tool tidy, test-run replacement,
+  PCH include audits, three cleanup profiles and raw-review tooling,
   declaration formatting, symbol/address and GPU diagnostics, evidence ownership,
   rendered acceptance, numerical coverage, benchmark ownership/recovery and
   Firefox validation records, opt-in CPU/data profiles, complete Coconut and

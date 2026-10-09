@@ -9,7 +9,7 @@ architecture, product outcomes, resource lifetime, and shutdown.
 
 | Location | Responsibility |
 | --- | --- |
-| [tools/mmltk.cpp](../tools/mmltk.cpp), [tools/CMakeLists.txt](../tools/CMakeLists.txt) | Native container driver and independent named-module tools graph; [bootstrap and process boundaries](build.md#native-tools-and-checkout-bootstrap) |
+| [tools/mmltk.cpp](../tools/mmltk.cpp), [tools/CMakeLists.txt](../tools/CMakeLists.txt) | Native container driver and independent tools graph; [source ownership, module DAG, and isolated processes](build.md#standalone-tools-module-graph) |
 | [src/entrypoints/cli/cli.cpp](../src/entrypoints/cli/cli.cpp) | Dataset compile/info/benchmark commands and root dispatch |
 | [src/entrypoints/cli/rfdetr_cli.cpp](../src/entrypoints/cli/rfdetr_cli.cpp) | RF-DETR command parsing and execution |
 | [src/entrypoints/cli/cli_options.h](../src/entrypoints/cli/cli_options.h), [rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h) | Root and RF-DETR reflected option tables, scopes, explicit codecs, and exposure decisions |

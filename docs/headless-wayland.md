@@ -55,9 +55,11 @@ The acceptance executable retains its normal artifacts and assertions.
 `./mmltk --logs build/validation --recursive -q headless` includes lifecycle
 records; pass the printed directory to inspect one compositor run.
 
-Weston uses a 1920×1080, scale-one virtual output and the desktop shell, with
-locking, panel and idle blanking disabled. The process owns a private runtime
-directory and socket; it does not connect to the host display or session bus.
+The supervisor selects a 1920×1080, scale-one virtual output, the desktop shell,
+and disabled idle blanking. Its
+[configuration](../tools/wayland/headless-weston.ini) disables Xwayland, locking,
+and the panel. The process owns a private runtime directory and socket; it does
+not connect to the host display or session bus.
 Startup waits up to 30 seconds for Weston's `systemd-notify.so` READY datagram,
 then up to 10 seconds for the protocol roundtrip. The supervised command has
 no whole-executable deadline. The acceptance executable retains its own
@@ -107,7 +109,9 @@ the package pin and isolated tools-graph build. The native
 [headless_compositor.cpp](../tools/wayland/headless_compositor.cpp) module owns session
 startup, seat/protocol readiness, and teardown in the wrapper-selected child
 process. The seat plugin stays in Weston; its libraries are independent of the
-[standalone driver](build.md#native-tools-and-checkout-bootstrap).
+[standalone driver](build.md#isolated-process-and-plugin-owners). The build
+reference also records the plugin's
+[standard-library and vendor-header boundary](build.md#standard-library-provider-and-textual-boundaries).
 
 The synthetic seat supplies Firefox/GTK and acceptance capabilities; it certifies
 neither physical input devices nor host-desktop focus. Preflight proves setup

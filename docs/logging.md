@@ -1612,8 +1612,9 @@ read-only repository mount. It reads files only up to captured sizes; multi-pass
 correlation requires unchanged inputs. There is no follow mode or persistent
 index. The [module interface](../tools/logging/log_query.cpp),
 [runtime definitions](../tools/logging/log_query_runtime.cpp), and
-[private implementation/help](../tools/logging/log_query_internal.cpp) share one query
-implementation. Unfiltered `./mmltk --test all`
+[private implementation/help](../tools/logging/log_query_internal.cpp) share
+[one module family with private fixture access](build.md#composition-and-fixture-isolation).
+Unfiltered `./mmltk --test all`
 includes its fixture suite. The standalone `./mmltk --test log-query-tool`
 route and focused selectors are documented under
 [test selection](validation.md#selection-environment-deadlines-and-debugging).

@@ -74,16 +74,15 @@ also apply when `all` has filters.
 
 The wrapper and CMake invoke compiled tool modules through
 `mmltk --tool COMMAND [--argv0 LOGICAL] -- ARGS...` inside the owning process
-or container. [tool_command.cpp](../tools/driver/tool_command.cpp) owns command
-identities, spelling, and child invocations;
-[tool_dispatch.cpp](../tools/driver/tool_dispatch.cpp) binds them exhaustively to
-module entrypoints. Logical program names may retain an earlier script suffix
+or container. The [canonical command vocabulary and composition](build.md#composition-and-fixture-isolation)
+supply command identities, spelling, child invocations, and exhaustive
+entrypoint selection. Logical program names may retain an earlier script suffix
 in help or evidence; they identify native commands rather than script files.
 Use the public operations above for their image admission, path rewriting,
 mounts, limits, ownership, and transcripts. The build-timing entrypoint is
 itself an orchestrator that calls `./mmltk --build`.
 
-[Build ownership](build.md#native-tools-and-checkout-bootstrap) describes the
+[Build ownership](build.md#standalone-tools-module-graph) describes the
 driver and isolated process/plugin boundaries.
 [Native fixture selection](validation.md#native-tool-fixtures) maps the six
 fixture commands to their public suites and separate runner.

@@ -36,8 +36,8 @@ On a checkout without it, run the narrow bootstrap from the repository root:
 ./tools/bootstrap/bootstrap_mmltk.sh --launch "$PWD" --build-tools
 ```
 
-[bootstrap_mmltk.sh](../tools/bootstrap/bootstrap_mmltk.sh) prepares the GCC/tools images,
-builds the tools in a container, publishes the executable and its library
+[bootstrap_mmltk.sh](../tools/bootstrap/bootstrap_mmltk.sh) prepares the GCC/tools
+images, builds the tools in a container, publishes the executable and its library
 closure, then executes the requested native operation. It needs no host C++
 compiler. Once published, use the native operations:
 
@@ -53,26 +53,11 @@ owns selection and isolated-owner limits. Rebuild after tool edits, including
 formatter changes, before running their new behavior. The full product
 `--build` also ensures that current tools are published.
 
-[tools/CMakeLists.txt](../tools/CMakeLists.txt) owns the independent Ninja graph
-at `.cache/cmake/tools`. It requires GCC 16.2 and C++26 reflection, exactly
-CMake 4.4.3, explicit CMake module scanning, and mold. Its Release policy adds
-`-Os`, LTO, function/data sections, and dead-section removal; bootstrap
-installation strips the driver and fixture runner.
-[Dockerfile.tools](../docker/Dockerfile.tools) supplies its build
-environment; `MMLTK_TOOLS_IMAGE` defaults to `mmltk-tools:latest`.
-The product presets in [CMakePresets.json](../CMakePresets.json) remain separate.
-
-CMake explicitly registers sources, named module providers/partitions, entry
-adapters, and link dependencies. The driver main imports the
-[container-command module](../tools/driver/mmltk_container_commands.cpp) and the
-[typed tool-command vocabulary](../tools/driver/tool_command.cpp); the latter derives
-external spelling, logical program names, and exhaustive
-[dispatch](../tools/driver/tool_dispatch.cpp). Shared text/process/JSON support and
-narrow digest, locale, library, and time modules supply the utility owners.
-Standard and third-party headers stay in module global fragments. The tools
-graph does not use the product compiler launcher while building that launcher.
-The product graph consumes the published `module-safe-compiler-launcher`
-through [MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake).
+The [standalone module graph](#standalone-tools-module-graph) owns its source
+membership and compiler state independently of the product presets in
+[CMakePresets.json](../CMakePresets.json).
+[Dockerfile.tools](../docker/Dockerfile.tools) supplies its build environment;
+`MMLTK_TOOLS_IMAGE` defaults to `mmltk-tools:latest`.
 
 Publication creates `build/.tools-generations/<generation>/` containing
 `mmltk`, the separate `mmltk-tests` fixture runner, `lib/`, and
@@ -83,13 +68,112 @@ older generations remain available to already-running processes. Retain the
 closure with the executable. Tools mutations share a lock, and native user
 resolution owns the published/cache paths after the cold-bootstrap handoff.
 [RuntimeClosure.cmake](../tools/cmake/RuntimeClosure.cmake) owns the installed
-shared-library closure. Fixture code is linked only into `mmltk-tests`.
+shared-library closure; [fixture isolation](#composition-and-fixture-isolation)
+keeps production and test executables separate.
 
 Bootstrap freshness hashes tool inputs and their names, including untracked
 edits, vendored JSON headers, the GCC/tools Dockerfiles, and the NVIDIA payload
 manifest. The published `.inputs.sha256` permits `--build` to reuse current
 tools; `--build-tools` explicitly reruns their configure/build/install operation.
 This freshness inventory does not define CMake target membership.
+
+## Standalone tools module graph
+
+[tools/CMakeLists.txt](../tools/CMakeLists.txt) owns the independent Ninja graph
+at `.cache/cmake/tools`. It requires GCC 16.2, C++26 reflection, exactly
+CMake 4.4.3, CMake module scanning, and mold. Named modules use the C++26
+language mode. Its Release policy adds `-Os`, LTO, function/data sections, and
+dead-section removal; bootstrap installation strips the driver and fixture
+runner. The tools graph builds its own compiler launcher without using it;
+the product graph consumes the published `module-safe-compiler-launcher`
+through [MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake).
+
+The `tools/` root contains only `CMakeLists.txt` and `mmltk.cpp`. The remaining
+sources and build inputs are grouped by owner:
+
+| Directory below `tools/` | Responsibility |
+| --- | --- |
+| `driver/` | Canonical command vocabulary, production dispatch, and container command construction |
+| `support/` | Text, process/JSON, digest, Linux, locale, dynamic-library, and time utilities |
+| `toolchain/`, `bootstrap/`, `cmake/` | Native build/analysis/package operations, cold bootstrap/publication, and explicit CMake registration helpers |
+| `cleanup/` | Deduplication, declaration formatting, include auditing, and their shared lexical patterns |
+| `logging/` | Log-query interface, private partition, and runtime definitions |
+| `diagnostics/` | Capability, process, native-artifact, and data inspection; product-dependent helpers keep their separate targets |
+| `maintenance/`, `profiling/` | Repository maintenance and build/command trace operations |
+| `oracle/` | Upstream reference producer and pinned Python requirements |
+| `wayland/` | Compositor supervision, Weston input-seat plugin, and compositor configuration |
+| `tests/` | Fixture composition, runner, support, and fixture data |
+
+### Composition and fixture isolation
+
+CMake explicitly registers sources, module providers/partitions, generated
+entry adapters, and link dependencies. The target spine is acyclic; arrows
+mean consumer links provider:
+
+```mermaid
+flowchart LR
+    mmltk --> mmltk_tool_dispatch
+    mmltk_tool_tests --> mmltk_tool_dispatch
+    mmltk_tool_dispatch --> mmltk_tool_modules
+    mmltk_tool_modules --> mmltk_tool_support
+```
+
+[tool_command.cpp](../tools/driver/tool_command.cpp) owns one reflected command
+enum, derived spelling and logical program names, parsing, argument storage,
+and exhaustive command visitation. It imports support only.
+[tool_dispatch.cpp](../tools/driver/tool_dispatch.cpp) imports production command
+implementations and binds that vocabulary to their entrypoints. Command and
+support modules consume their actual lower providers directly; they do not
+import a dispatcher or rely on an umbrella re-export.
+
+The fixture runner's private
+[dispatch module](../tools/tests/tool_dispatch.cpp) selects fixtures and delegates
+production commands to production dispatch. Production dispatch starts the
+external `mmltk-tests` runner for a fixture request. Fixture objects share the
+module archive but only the runner references and extracts them; the driver
+neither imports fixture composition nor uses whole-archive linkage.
+
+The log-query `:internal` and `:tests` partitions remain one module family.
+Its primary interface imports neither partition; runtime definitions and the
+fixture partition consume the primary interface and private implementation.
+This keeps observation state private and exercises one compiled production
+implementation. No lower module or fixture partition imports a dispatcher.
+
+### Standard-library provider and textual boundaries
+
+All authored tools C++ units import `std` directly, including the independently
+deployed diagnostic, oracle, and Weston modules.
+[StdModules.cmake](../tools/cmake/StdModules.cmake) sets the feature gate for the
+pinned CMake version before CXX discovery in both CMake entry projects.
+[Toolchain.cmake](../tools/cmake/Toolchain.cmake) enables `CXX_MODULE_STD` on each
+tools-owned target and requires C++26 standard-module availability. The product
+project uses this helper for its two diagnostic targets; product and vendored
+targets do not acquire a global standard-module policy.
+
+CMake reads GCC's installed `libstdc++.modules.json` and builds the provider
+from `bits/std.cc`. It also synthesizes compatible BMIs for the consumers'
+C++26/reflection settings. The generated graph can therefore contain a base
+standard-library target and compatible variants while every first-party named
+module has one provider in its graph. CMake owns compilation and dependency
+ordering; BMIs remain build artifacts, outside the source tree and installed
+runtime closure.
+
+The configured graph's `CMakeFiles/<target>.dir/CXXDependInfo.json`,
+`CXXModules.json`, and scanner `.ddi` files record providers and dependencies;
+`compile_commands.json` records their compiler settings. Source membership
+comes from CMake registration. The standard-module setup is also included in
+product configuration and isolated-image fingerprints.
+
+Remaining textual includes supply C/POSIX and vendor declarations, required
+macros, and canonical ordinary product headers for isolated diagnostics.
+The Weston module and its generated C ABI adapter include `<cmath>` before
+`libweston.h`: Weston's headers reach `math.h` inside `extern "C"`, so that
+ordering avoids a linkage conflict with imported standard declarations.
+Application declaration headers retain their ordinary self-contained include
+policy; [header isolation and PCH ownership](#target-declarations-and-precompiled-headers)
+remain separate from this tools graph.
+
+### Isolated process and plugin owners
 
 The host wrapper and `/opt/mmltk-tools/mmltk` container copy remain separate
 from the application's `/opt/mmltk/bin/mmltk`. Driver startup needs neither
@@ -348,10 +432,12 @@ The JSON group contains nlohmann JSON; the Torch group contains only C10 CUDA
 stream/guard declarations. C++26-only standard headers are language-gated;
 reflection also requires the compiler's reflection feature macro.
 
-Declaration headers, CUDA, module global fragments and targets without a compiled
-PCH retain their direct library includes. A header's `pch_` name alone does not
-justify replacing narrow includes with it. Each registered owner creates its own compiled artifact with
-its own compiler, options, definitions, and include environment. C, CUDA,
+Declaration headers, CUDA, and product sources without a compiled PCH retain
+their direct library includes. The standalone tools use the
+[standard-module policy above](#standard-library-provider-and-textual-boundaries).
+A header's `pch_` name alone does not justify replacing narrow includes with it.
+Each registered owner creates its own compiled artifact with its own compiler,
+options, definitions, and include environment. C, CUDA,
 retained module providers/implementations/importers, header-isolation units,
 and sources with distinct per-source compile settings do not consume it.
 For example, ordinary `native_optimizer.cpp` uses the training owner's PCH;

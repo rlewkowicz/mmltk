@@ -9,7 +9,7 @@ and product policy; Rust/Iced owns presentation and interaction, as defined by
 This page owns authoring syntax; [the application boundary](application-wire.md)
 owns schema admission, generated projections, wire representations and compatibility.
 The independent driver's reflected command vocabulary belongs to its
-[native tools graph](build.md#native-tools-and-checkout-bootstrap).
+[native tools composition](build.md#composition-and-fixture-isolation).
 
 ## Declare once, project structurally
 

@@ -76,7 +76,7 @@ available analysis overrides are in
 ```
 
 This operation formats and validates only translation units registered in
-[the standalone tools graph](build.md#native-tools-and-checkout-bootstrap),
+[the standalone tools graph](build.md#standalone-tools-module-graph),
 using `.cache/cmake/tools` and the tools image. Its C++26/module units are
 validated by building their GCC objects and dependencies; clang-tidy does not
 consume GCC BMIs. Grouped `--file` and `--start-at` use the same selection rules
@@ -410,7 +410,7 @@ acceptance evidence.
 
 ### Native tool fixtures
 
-The [separate tools runner](build.md#native-tools-and-checkout-bootstrap),
+The [separate tools runner](build.md#composition-and-fixture-isolation),
 `mmltk-tests`, owns these fixtures. The production driver starts that runner
 for internal fixture requests and contains only production code. Public suite
 routing stays containerized:
@@ -441,6 +441,28 @@ The explicit `./mmltk --test log-query-tool --tools-ownership` selection runs
 the cold-bootstrap ownership/handoff fixture as container root with the
 required UID/GID and ownership capabilities. Ordinary fixture discovery and
 `all` omit that case and retain restricted container permissions.
+
+### Standalone tools acceptance record
+
+The 2026-10-08–09 validation completed against code commit `571afbd8`.
+The local [gate ledger](../build/validation/tools-dag/final-validation.json)
+records both complete tidy passes, the initial and final builds, cleanup,
+focused retries, oracle image preparation, and final test gates. These ignored
+`build/` artifacts belong to that run and are not shipped with a clean checkout.
+
+| Evidence | Recorded result |
+| --- | --- |
+| [Configured module and target graphs](../build/validation/tools-dag/standalone-graph.json) | 49 authored standalone units, 46 unique named providers, 220 scanner requirement edges; both graphs acyclic. All 53 authored tools C++ units, including the four separately deployed helpers, import `std`. Generated standard-library providers are separate. |
+| [Published production ELF](../build/validation/tools-dag/executable-final.json) | Stripped, 2,654,064 bytes; 0.433% above the 2,642,632-byte baseline. No fixture entry symbols and no direct GPU, Python, or Weston runtime dependency. |
+| [Final cleanup reports](../build/validation/tools-dag/cleanup-final.json) | C++ 1,122 files, frontend 124, tools 54; zero textual or structural hits in all three profiles. The [tools rejection review](../build/validation/tools-dag/rejected-review.json) inspected 214 CPD and 4 Duplo rejections without filter changes. |
+| [Final build](../build/logs/mmltk-build-20261008-232450-850863.log) | `./mmltk --build`, exit 0. |
+| [Final complete suites](../build/logs/mmltk-test-20261008-233138-865826.log) | `./mmltk --test all`, exit 0: 2,045 native passes and 14 skips; 173 JavaScript and 803 Rust passes, one ignored Rust case; cleanup/declaration groups 40/21/15/14, log-query 198, compositor fixtures 21. |
+| [Subsequent packaged Wayland acceptance](../build/logs/mmltk-test-20261009-000456-928834.log) | `./mmltk --test workspace-wayland --headless-compositor`, exit 0: 88 passes, one unavailable GDR case, 144,211 assertions. |
+
+The separate [tools ownership run](../build/logs/mmltk-test-20261008-230601-818065.log)
+also passed. Graph and binary inspection establish build/packaging ownership;
+the fixture and packaged acceptance runs establish the exercised behavior.
+Skipped hardware remains outside the passing coverage.
 
 ### Data compilation and resampling profiles
 

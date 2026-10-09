@@ -17,14 +17,14 @@ Source anchors below use `N/` for
 
 The governing sources read were `AGENTS.md`, `CONTRACT.md`, the training and
 workflow references, and the build/validation documentation. In particular,
-[`docs/rfdetr-training.md:7`](/home/ryan/Repos/win/cplusplusloader/docs/rfdetr-training.md:7)
+[`docs/rfdetr-training.md:7`](../../rfdetr-training.md)
 limits upstream equivalence to equivalent configuration, admitted tensors,
 stochastic samples, and optimizer settings. Native data membership,
 augmentation, class layouts, catalog, Match-Free, DN, multilane execution, and
 optimizer choices retain their own contracts. No capability should be removed
 to make an upstream comparison pass.
 
-[`docker/nvidia-payload.json:2`](/home/ryan/Repos/win/cplusplusloader/docker/nvidia-payload.json:2)
+[`docker/nvidia-payload.json:2`](../../../docker/nvidia-payload.json#L2)
 pins NGC `26.08-py3` at digest
 `sha256:33ef5fc15e8937602d64022209cdb2777b32dadf742f41332023d946041b3c14`,
 Torch `2.14.0a0+4fdf77b940` and CUDA `13.4.1` / NVCC `13.4.59`.
