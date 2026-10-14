@@ -145,14 +145,18 @@ impl App {
                     .begin_admission(ApplicationIntentEndpoint::ExploreStop);
                 if self.model.explore_stop_available() {
                     self.workspace.explore_clear_viewport_admission();
-                    self.submit_intent(
+                    if self.submit_intent(
                         ApplicationIntentEndpoint::ExploreStop,
                         crate::generated::encode_explore_Stop,
-                    );
+                    ) {
+                        self.model.explore.reset_transport();
+                        self.abandon_viewer();
+                        self.presentation.retire_frame();
+                    }
                 } else {
                     self.model.report_admission_error(
                         ApplicationIntentEndpoint::ExploreStop,
-                        UiError::busy("Explore is not running or is already stopping."),
+                        UiError::busy("Explore is not open or is already closing."),
                     );
                 }
             }
@@ -377,6 +381,10 @@ impl App {
 
     fn dispatch_explore_desired(&mut self) {
         self.reconcile_viewer();
+        if self.model.explore_stopping() {
+            self.model.explore.reset_transport();
+            return;
+        }
         if self.connection.is_none() {
             self.abandon_explore_edit(ApplicationIntentEndpoint::ExploreUpdateOverlay);
             return;

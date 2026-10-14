@@ -957,6 +957,14 @@ enum Phase {
     AwaitPrevious(u32),
     DetailCloseEvidence,
     AwaitDetailClose,
+    ExploreDatasetStop {
+        revision: u64,
+        frame_revision: u64,
+    },
+    AwaitExploreDatasetClosed {
+        revision: u64,
+        frame_revision: u64,
+    },
     ExploreDatasetReopen {
         revision: u64,
         frame_revision: u64,
@@ -1077,6 +1085,7 @@ impl Phase {
             | Self::AwaitExploreGallery
             | Self::AwaitExplorePreparation(_)
             | Self::AwaitExploreDatasetReopen { .. }
+            | Self::AwaitExploreDatasetClosed { .. }
             | Self::AwaitDetailAgain
             | Self::AwaitAnnotation
             | Self::AwaitAnnotationFrame(_)
@@ -1731,6 +1740,7 @@ impl Controller {
             | Phase::DetailPrevious(..)
             | Phase::DetailCloseEvidence
             | Phase::ExploreDatasetReopen { .. }
+            | Phase::ExploreDatasetStop { .. }
             | Phase::GalleryReselect => self.retained.located_retained(
                 &mut self.driver,
                 &mut self.probes,
@@ -2174,6 +2184,8 @@ impl Controller {
             | Phase::AwaitDetailClose
             | Phase::ExploreDatasetReopen { .. }
             | Phase::AwaitExploreDatasetReopen { .. }
+            | Phase::ExploreDatasetStop { .. }
+            | Phase::AwaitExploreDatasetClosed { .. }
             | Phase::GalleryReselect
             | Phase::AwaitDetailAgain => self.retained.advance_retained(
                 &mut self.driver,

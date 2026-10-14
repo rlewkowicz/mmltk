@@ -79,6 +79,55 @@ using namespace visual_test_support;
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
+template <class Scenario>
+void check_closed_explore(Scenario& scenario) {
+ auto& explore = scenario.system();
+ REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
+ const auto closed = explore.snapshot();
+ CHECK_FALSE(closed.ready);
+ CHECK_FALSE(closed.render_pending);
+ CHECK_FALSE(closed.cancellation_requested);
+ CHECK_FALSE(closed.frame.valid());
+ CHECK(closed.dataset.identity == 0U);
+ CHECK(closed.dataset.class_names.empty());
+ CHECK(closed.order.visible_indices.empty());
+ CHECK(closed.gallery.slots.empty());
+ CHECK_FALSE(explore.BorrowFrame().valid());
+}
+TEST_CASE("Explore Stop unloads gallery and detail resources and permits reopening", "[explore][lifecycle]") {
+ const bool detail = GENERATE(false, true);
+ const bool hold_read = GENERATE(false, true);
+ LoadedSettings settings;
+ auto backend = std::make_shared<FakeImageBackend>();
+ ExploreScenario scenario{settings, backend};
+ auto& explore = scenario.system();
+ const ExploreViewport viewport{.extent = {48U, 16U}, .row_count = 1U, .columns = 3U};
+ scenario.OpenAndWait(viewport);
+ if (detail) {
+  static_cast<void>(explore.Select({.compiled_index = 1U}));
+  REQUIRE(scenario.Wait([&] { return explore.snapshot().mode == ExploreMode::Detail; }));
+ }
+ const auto frame = explore.snapshot().frame;
+ auto held = hold_read ? explore.BorrowFrame() : mmltk::frameworks::gpu::BorrowedImageProductReadView{};
+ const auto stopping = explore.Stop();
+ CHECK(stopping.busy);
+ CHECK(stopping.cancellation_requested);
+ check_closed_explore(scenario);
+ CHECK_FALSE(explore.ImageSnapshot(frame).has_value());
+ if (hold_read) {
+  CHECK(held.valid());
+  CHECK(held.plane(0U).revision() == frame.revision);
+  CHECK(backend->contexts_destroyed.load() == 0U);
+ }
+ held = {};
+ // Shutdown is not required to release the last read or the worker's runtime.
+ REQUIRE(scenario.Wait([&] { return backend->contexts_destroyed.load() == 1U; }));
+ CHECK(backend->planes_freed.load() == backend->planes_allocated.load());
+ scenario.OpenAndWait(viewport);
+ CHECK(explore.snapshot().frame.revision > frame.revision);
+ static_cast<void>(explore.Stop());
+ check_closed_explore(scenario);
+}
 TEST_CASE("Gallery demand clips four neighboring rows independently", "[explore][cache]") {
  using explore_detail::GalleryThumbnailCache;
  const auto columns = GENERATE(4U, 10U);
@@ -574,8 +623,7 @@ TEST_CASE("Explore retries only the newest desired product after held reads rele
  CHECK(explore.UpdateFilter({.filter = filter, .overlay = retained.overlay}).busy);
  CHECK_THROWS_AS(explore.UpdateViewport({.viewport = fixture.viewport}), contracts::BusyError);
  static_cast<void>(explore.Stop());
- REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy; }));
- CHECK(explore.snapshot().frame == retained.frame);
+ check_closed_explore(fixture.scenario);
 }
 TEST_CASE("Explore retains semantic detail baseline custody through an idle output wait") {
  ExplorePressureFixture fixture;
@@ -618,12 +666,11 @@ TEST_CASE("Explore retains semantic detail baseline custody through an idle outp
   CHECK(explore.snapshot().overlay == overlay);
   CHECK(fixture.settings.system().explore_settings_candidate().preferences.policy.overlay == overlay);
  }
- SECTION("Stop releases the pending baseline and leaves the completed detail selected") {
+ SECTION("Stop releases the pending baseline and closes the completed detail") {
   static_cast<void>(explore.Stop());
   fixture.held = {};
-  explore.Shutdown();
-  CHECK(explore.snapshot().frame == retained.frame);
-  CHECK(explore.snapshot().overlay == retained.overlay);
+  check_closed_explore(fixture.scenario);
+  CHECK(fixture.settings.system().explore_settings_candidate().preferences.policy.overlay == retained.overlay);
  }
 }
 TEST_CASE("Explore settles an accepted viewport before a discrete filter under output pressure") {
@@ -663,23 +710,19 @@ TEST_CASE("Explore settles an accepted viewport before a discrete filter under o
   CHECK(persisted.filter == policy.filter);
   CHECK(persisted.overlay == policy.overlay);
  }
- SECTION("Stop cancels waiting stages and preserves the last completed predecessor") {
+ SECTION("Stop cancels waiting stages and unloads the completed predecessor") {
   const bool predecessor_settled = GENERATE(false, true);
   CAPTURE(predecessor_settled);
-  auto completed_frame = incumbent.frame;
   if (predecessor_settled) {
    // CLEANUP-IGNORE: Separate branches release the predecessor output and await its own viewport before different cancellation ordering checks.
    fixture.held[0U] = {};
    REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().viewport.first_row == 0U; }));
-   completed_frame = explore.snapshot().frame;
    fixture.probe.WaitIdle(5U);
   }
   static_cast<void>(explore.Stop());
   fixture.held = {};
-  explore.Shutdown();
-  CHECK_FALSE(explore.snapshot().busy);
-  CHECK(explore.snapshot().frame == completed_frame);
-  CHECK(explore.snapshot().filter == incumbent.filter);
+  check_closed_explore(fixture.scenario);
+  CHECK(fixture.settings.system().explore_settings_candidate().preferences.policy.filter == incumbent.filter);
  }
  SECTION("ordinary predecessor failure settles before the admitted filter") {
   fixture.probe.fail_render.store(true, std::memory_order_release);
@@ -727,17 +770,13 @@ TEST_CASE("Stop cancels Explore work resumed by an output availability continuat
  ExplorePressureFixture fixture{true};
  fixture.HoldGalleryPool();
  auto& explore = fixture.scenario.system();
- const auto incumbent = explore.snapshot();
  fixture.RequestViewport(0U);
  fixture.held[0U] = {};
  mmltk::testsupport::await_test_promise(fixture.probe.render_gate->entered, "resumed Explore render");
  static_cast<void>(explore.Stop());
  fixture.probe.render_gate->release.set_value();
  fixture.held = {};
- explore.Shutdown();
- CHECK(explore.snapshot().frame == incumbent.frame);
- CHECK(explore.snapshot().viewport == incumbent.viewport);
- CHECK_FALSE(explore.snapshot().busy);
+ check_closed_explore(fixture.scenario);
 }
 [[nodiscard]] auto settle_explore_on_exit(ExploreSystem& explore, std::promise<void>& release) {
  return mmltk::testsupport::ScopedTestCleanup{[&explore, &release] {
@@ -1157,7 +1196,7 @@ TEST_CASE("Explore prepared-product failure restores exact borrows or retires fa
  }
 }
 // CLEANUP-IGNORE: This test begins a lifecycle-stop contract distinct from the preceding rollback transaction.
-TEST_CASE("Explore Stop abandons unfinished thumbnails while retaining completed product meaning") {
+TEST_CASE("Explore Stop unloads unfinished thumbnails and the completed product") {
  // CLEANUP-IGNORE: Stop coverage deliberately creates unfinished lanes but does not configure candidate failure.
  StreamingExploreFixture scenario{2U};
  auto& explore = scenario.system();
@@ -1165,14 +1204,10 @@ TEST_CASE("Explore Stop abandons unfinished thumbnails while retaining completed
  scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
  // CLEANUP-IGNORE: This scenario observes allocation before its specific rollback, stop, or pre-read transition.
  scenario.probe().AllowAllocationAndWait(2U);
- const auto incumbent = explore.snapshot();
  static_cast<void>(explore.Stop());
  scenario.probe().ReleaseAll();
- explore.Shutdown();
- const auto stopped = explore.snapshot();
- CHECK(stopped.frame == incumbent.frame);
- check_gallery_identity(stopped, incumbent);
- CHECK(stopped.order.visible_indices == incumbent.order.visible_indices);
+ check_closed_explore(scenario);
+ CHECK(scenario.backend().contexts_destroyed.load() == 1U);
  CHECK(scenario.failure_count() == 0U);
 }
 TEST_CASE("Explore failed staged runtime construction resumes the incumbent unfinished gallery") {
@@ -1305,6 +1340,15 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
    gate->release.set_value();
   }
   const auto restored = await_explore_settled(scenario, admitted.revision);
+  if (rejection == Rejection::Cancelled) {
+   check_closed_explore(scenario);
+   CHECK(scenario.failure_count() == 0U);
+   std::scoped_lock lock(scenario.probe().mutex);
+   CHECK(scenario.probe().assignments.empty());
+   CHECK(scenario.probe().aborted_assignments >= 2U);
+   CHECK(scenario.probe().publications == publications_before);
+   return;
+  }
   CHECK(restored.ready);
   CHECK(restored.augmentation.enabled == committed.augmentation.enabled);
   CHECK(restored.augmentation.seed == committed.augmentation.seed);
@@ -1321,11 +1365,6 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
    scenario.probe().render_gate.reset();
   }
   const auto restored_frame = restored.frame.revision;
-  if (rejection == Rejection::Cancelled) {
-   // Stop abandons the restored continuation. A subsequent explicit
-   // viewport demand resumes the same logical gallery.
-   explore.UpdateViewport({.viewport = restored.viewport});
-  }
   scenario.ReleaseAndWaitForFrameAfter(restored_frame);
   CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
   explore.Shutdown();
@@ -2042,12 +2081,10 @@ TEST_CASE("Explore successful persistence is settled before Stop can observe it"
   .filter = {.minimum_instances = 1U},
  }));
  const auto stopping = stop_after_persistence(explore, stopped, *persistence_entered, *release_persistence);
- CHECK_FALSE(stopping.busy);
- CHECK_FALSE(stopping.cancellation_requested);
- REQUIRE(scenario.Wait([&] {
-  const auto state = explore.snapshot();
-  return !state.busy && !state.cancellation_requested && state.filter.minimum_instances == 1U;
- }));
+ CHECK(stopping.busy);
+ CHECK(stopping.cancellation_requested);
+ check_closed_explore(scenario);
+ CHECK(settings.system().explore_settings_candidate().preferences.policy.filter.minimum_instances == 1U);
  CHECK(commits->load(std::memory_order_acquire) == 2U);
 }
 TEST_CASE("Explore Open cancellation wins at its post-render finalization boundary") {
@@ -2105,20 +2142,17 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
  // operation tests successful persistence before Stop.
  static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"}));
  const auto stop_result = stop_after_persistence(explore, stopped, *persistence_entered, *release_persistence);
- REQUIRE(scenario.Wait([&] { return changed_events->load(std::memory_order_acquire) == events_before_open + 1U && !explore.snapshot().busy; }));
+ check_closed_explore(scenario);
  const auto settled = explore.snapshot();
- CHECK(settled.ready);
- CHECK_FALSE(settled.cancellation_requested);
- CHECK(settled.dataset.class_catalog_identity != first_identity);
- CHECK(settled.filter.class_selection.mode == ExploreClassSelectionMode::All);
- CHECK(settled.overlay.class_selection.mode == ExploreClassSelectionMode::All);
- CHECK(stop_result.revision == settled.revision);
- CHECK(stop_result.busy == settled.busy);
- CHECK(stop_result.cancellation_requested == settled.cancellation_requested);
- CHECK(stop_result.dataset.class_catalog_identity == settled.dataset.class_catalog_identity);
- CHECK(changed_events->load(std::memory_order_acquire) == events_before_open + 1U);
- CHECK(changed_revision->load(std::memory_order_acquire) == settled.revision);
- CHECK(settings.system().explore_settings_candidate().preferences.class_catalog_identity == settled.dataset.class_catalog_identity);
+ CHECK(stop_result.busy);
+ CHECK(stop_result.cancellation_requested);
+ CHECK(stop_result.revision < settled.revision);
+ REQUIRE(scenario.Wait([&] { return changed_revision->load(std::memory_order_acquire) == settled.revision; }));
+ CHECK(changed_events->load(std::memory_order_acquire) >= events_before_open + 2U);
+ const auto preferences = settings.system().explore_settings_candidate().preferences;
+ CHECK(preferences.class_catalog_identity != first_identity);
+ CHECK(preferences.policy.filter.class_selection.mode == ExploreClassSelectionMode::All);
+ CHECK(preferences.policy.overlay.class_selection.mode == ExploreClassSelectionMode::All);
  CHECK(commits->load(std::memory_order_acquire) == 3U);
 }
 TEST_CASE("Explore cancellation during saved-filter preparation discards the unpublished native Open") {
@@ -2153,11 +2187,8 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
   mmltk::testsupport::await_test_future(cancelled, "cancelled", 2s);
   wait_settled(admission);
   const auto settled = explore.snapshot();
-  CHECK(settled.ready == (blocked_call != 0U));
-  CHECK(settled.dataset.image_count == blocked_call);
-  CHECK(settled.dataset.class_names.empty() == (blocked_call == 0U));
-  CHECK(settled.order.visible_indices.empty() == (blocked_call == 0U));
-  CHECK(settled.frame.valid() == (blocked_call != 0U));
+  check_closed_explore(scenario);
+  CHECK(settled.dataset.image_count == 0U);
   CHECK_FALSE(settled.cancellation_requested);
   CHECK(probe->resets.load(std::memory_order_acquire) == (blocked_call == 0U ? 1U : 0U));
   CHECK(probe->commits.load(std::memory_order_acquire) == blocked_call);
@@ -2373,7 +2404,7 @@ TEST_CASE("Explore discrete products use the viewport current at execution") {
  SECTION("filter") { run(false); }
  SECTION("selection") { run(true); }
 }
-TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") {
+TEST_CASE("queued Explore cancellation closes after the active render settles") {
  auto backend = std::make_shared<FakeImageBackend>();
  auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);
  auto commits = std::make_shared<std::atomic_uint64_t>(0U);
@@ -2388,24 +2419,21 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
  auto& explore = scenario.system();
  auto settle_explore = settle_explore_on_exit(explore, gate->release);
  scenario.OpenAndWait({.extent = {64U, 64U}});
- const auto committed = explore.snapshot();
  explore.UpdateViewport({.viewport = {.extent = {48U, 48U}}});
  mmltk::testsupport::await_test_future(entered, "entered", 2s);
  const auto admitted = explore.Reroll();
  CHECK(admitted.busy);
  const auto stopped = explore.Stop();
- CHECK_FALSE(stopped.busy);
- CHECK_FALSE(stopped.cancellation_requested);
+ CHECK(stopped.busy);
+ CHECK(stopped.cancellation_requested);
  CHECK(stopped.revision > admitted.revision);
  CHECK(commits->load(std::memory_order_acquire) == 1U);
  // CLEANUP-IGNORE: Separate cancellation windows release different algorithm gates before inspecting domain-specific settled state.
  gate->release.set_value();
- REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
- CHECK(explore.snapshot().viewport.extent == committed.viewport.extent);
- CHECK_FALSE(explore.snapshot().busy);
+ check_closed_explore(scenario);
  CHECK(commits->load(std::memory_order_acquire) == 1U);
 }
-TEST_CASE("post-render Explore cancellation restores the committed gallery product") {
+TEST_CASE("post-render Explore cancellation unloads the committed gallery product") {
  const auto run = [](const bool selection) {
   // CLEANUP-IGNORE: Cancellation owns a separate post-render gate from stale settings persistence and observes different rollback facts.
   auto backend = std::make_shared<FakeImageBackend>();
@@ -2429,18 +2457,11 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
    static_cast<void>(explore.Reroll());
   mmltk::testsupport::await_test_future(entered, "entered", 2s);
   const auto stopping = explore.Stop();
-  CHECK(stopping.busy == !selection);
-  CHECK(stopping.cancellation_requested == !selection);
+  CHECK(stopping.busy);
+  CHECK(stopping.cancellation_requested);
   gate->release.set_value();
-  const auto restored = await_explore_settled(scenario, stopping.revision);
-  // CLEANUP-IGNORE: Different cancellation boundaries independently preserve their committed filter and visible ordering.
-  CHECK(restored.filter == before.filter);
-  // CLEANUP-IGNORE: Persistence refusal and post-render cancellation require independent mode and selection continuity evidence.
-  CHECK(restored.order.visible_indices == before.order.visible_indices);
-  CHECK(restored.mode == before.mode);
-  CHECK(restored.selected_image == before.selected_image);
-  CHECK(restored.frame == before.frame);
-  check_retained_explore_frame(explore, restored.frame.revision);
+  check_closed_explore(scenario);
+  CHECK(settings.system().explore_settings_candidate().preferences.policy.filter == before.filter);
   CHECK(commits->load(std::memory_order_acquire) == 1U);
  };
  SECTION("discrete order") { run(false); }
@@ -2521,7 +2542,6 @@ TEST_CASE("stopping Explore retains busy until its admitted operation settles") 
  const auto first_admission = explore.Open({.viewport = {.extent = {32U, 32U}}, .compiled_source = "/test"});
  // CLEANUP-IGNORE: Diagnostics and cancellation scenarios independently await readiness before capturing their own product revision.
  REQUIRE(scenario.Wait([&] { return explore.snapshot().ready; }));
- const auto completed = explore.snapshot().frame.revision;
  CHECK(explore.snapshot().revision > first_admission.revision);
  const auto second_admission = explore.Open({.viewport = {.extent = {32U, 32U}}, .compiled_source = "/test"});
  CHECK(second_admission.busy);
@@ -2535,10 +2555,10 @@ TEST_CASE("stopping Explore retains busy until its admitted operation settles") 
  mmltk::testsupport::await_test_future(cancellation, "cancellation", 2s);
  REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
  CHECK(explore.snapshot().revision > stopping.revision);
- CHECK(explore.snapshot().frame.revision == completed);
+ check_closed_explore(scenario);
 }
 // CLEANUP-IGNORE: Filter cancellation tracks native commit ownership; lifecycle Stop observes a different admitted operation.
-TEST_CASE("cancelled Explore filter retains one native and public committed order") {
+TEST_CASE("cancelled Explore filter preserves saved policy while unloading the dataset") {
  auto backend = std::make_shared<FakeImageBackend>();
  auto probe = std::make_shared<CancellationProbe>();
  auto entered = probe->entered.get_future();
@@ -2561,13 +2581,9 @@ TEST_CASE("cancelled Explore filter retains one native and public committed orde
  mmltk::testsupport::await_test_future(cancelled, "cancelled", 2s);
  REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
  CHECK(commits->load(std::memory_order_acquire) == 1U);
- // CLEANUP-IGNORE: Compiled-dataset acceptance independently verifies filter/order continuity against the subsystem unit-test boundary.
- CHECK(explore.snapshot().filter == before.filter);
- CHECK(explore.snapshot().order.visible_indices == before.order.visible_indices);
+ check_closed_explore(scenario);
+ CHECK(settings.system().explore_settings_candidate().preferences.policy.filter == before.filter);
  CHECK(settings.system().snapshot().revision == settings_revision);
- // CLEANUP-IGNORE: End-to-end visual routing independently checks the selected image revision against the Explore subsystem test boundary.
- REQUIRE(explore.BorrowFrame().valid());
- CHECK(explore.BorrowFrame().plane(0U).revision() == explore.snapshot().frame.revision);
 }
 // CLEANUP-IGNORE: Finalization-gate cancellation and viewport execution configure distinct algorithm seams.
 TEST_CASE("Explore stop at filter finalization cancels before persistence") {
@@ -2596,13 +2612,11 @@ TEST_CASE("Explore stop at filter finalization cancels before persistence") {
  const auto stopping = explore.Stop();
  CHECK(stopping.cancellation_requested);
  release_and_wait_for_idle(scenario, gate->release);
- const auto settled = explore.snapshot();
- CHECK(settled.filter == before.filter);
- CHECK(settled.overlay.show_boxes == before.overlay.show_boxes);
- CHECK(settled.overlay.show_masks == before.overlay.show_masks);
- CHECK(settled.frame == before.frame);
+ check_closed_explore(scenario);
+ const auto policy = settings.system().explore_settings_candidate().preferences.policy;
+ CHECK(policy.filter == before.filter);
+ CHECK(policy.overlay == before.overlay);
  CHECK(settings.system().snapshot().revision == settings_revision);
- check_retained_explore_frame(explore, settled.frame.revision);
 }
 TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retain its GPU owner") {
  struct Result final {

@@ -1132,6 +1132,9 @@ mod tests {
             assert_eq!(settings.draft, before);
         }
         assert!(artifact_row(FeatureId::Train, "/model.onnx").is_err());
+        for workflow in [FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
+            assert!(artifact_row(workflow, "/run/session.json").is_err());
+        }
         assert_eq!(
             artifact_row(FeatureId::Validate, "/MODEL.ONNX")
                 .unwrap()
@@ -1157,39 +1160,41 @@ mod tests {
 
     #[test]
     fn train_custom_weights_uses_the_existing_typed_dialog_before_atomic_confirmation() {
-        let mut settings = installed_settings_model();
-        let mut component = Component::new(FeatureId::Train);
-        let browse = component
-            .update(Message::BrowseRequested, None, &mut settings)
-            .unwrap();
-        assert!(matches!(
-            browse,
-            Some(Outcome::BrowseRequested(
-                crate::generated::FileDialogTarget::ModelArtifactTarget(_)
-            ))
-        ));
-        component
-            .update(
-                Message::ConfirmArtifact {
-                    path: "/tmp/custom.pth".into(),
-                    generation: 1,
-                },
-                Some(&selected_model_dialog(
-                    settings.draft.as_ref().unwrap(),
-                    component.workflow,
-                    "/tmp/custom.pth",
-                    1,
-                )),
-                &mut settings,
-            )
-            .unwrap();
-        let selected = projection(settings.draft.as_ref().unwrap(), FeatureId::Train).unwrap();
-        assert_eq!(selected.selection.key.source, ModelSelectionSource::Custom);
-        assert_eq!(
-            selected.selection.key.input,
-            ModelArtifactInputKind::Weights
-        );
-        assert_eq!(selected.selection.artifact, "/tmp/custom.pth");
+        for path in ["/tmp/custom.pth", "/tmp/run/session.json"] {
+            let mut settings = installed_settings_model();
+            let mut component = Component::new(FeatureId::Train);
+            let browse = component
+                .update(Message::BrowseRequested, None, &mut settings)
+                .unwrap();
+            assert!(matches!(
+                browse,
+                Some(Outcome::BrowseRequested(
+                    crate::generated::FileDialogTarget::ModelArtifactTarget(_)
+                ))
+            ));
+            component
+                .update(
+                    Message::ConfirmArtifact {
+                        path: path.into(),
+                        generation: 1,
+                    },
+                    Some(&selected_model_dialog(
+                        settings.draft.as_ref().unwrap(),
+                        component.workflow,
+                        path,
+                        1,
+                    )),
+                    &mut settings,
+                )
+                .unwrap();
+            let selected = projection(settings.draft.as_ref().unwrap(), FeatureId::Train).unwrap();
+            assert_eq!(selected.selection.key.source, ModelSelectionSource::Custom);
+            assert_eq!(
+                selected.selection.key.input,
+                ModelArtifactInputKind::Weights
+            );
+            assert_eq!(selected.selection.artifact, path);
+        }
     }
 
     #[test]

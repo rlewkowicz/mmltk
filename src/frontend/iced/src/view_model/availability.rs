@@ -480,16 +480,32 @@ impl ApplicationModel {
 
     pub fn explore_stop_available(&self) -> bool {
         self.connection == ConnectionState::Connected
-            && self
+            && self.explore.snapshot.as_ref().is_some_and(|snapshot| {
+                (snapshot.busy || snapshot.ready) && !snapshot.cancellationrequested
+            })
+            && !self.has_explore_pending()
+    }
+
+    pub(crate) fn explore_stopping(&self) -> bool {
+        self.has_pending(ApplicationIntentEndpoint::ExploreStop)
+            || self
                 .explore
                 .snapshot
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.busy && !snapshot.cancellationrequested)
-            && !self.has_explore_pending()
+                .is_some_and(|snapshot| snapshot.cancellationrequested)
+    }
+
+    pub(crate) fn explore_preview_closed(&self) -> bool {
+        self.explore_stopping()
+            || (!self.has_pending(ApplicationIntentEndpoint::ExploreOpen)
+                && self.explore.snapshot.as_ref().is_some_and(|snapshot| {
+                    !snapshot.ready && !snapshot.busy && snapshot.frame.revision == 0
+                }))
     }
 
     pub fn explore_mutation_available(&self) -> bool {
         self.connection == ConnectionState::Connected
+            && !self.explore_stopping()
             && !self.native_settings_unsettled()
             && self
                 .explore
@@ -500,6 +516,7 @@ impl ApplicationModel {
 
     pub fn explore_augmentation_update_available(&self) -> bool {
         self.connection == ConnectionState::Connected
+            && !self.explore_stopping()
             && !self.native_settings_unsettled()
             && self
                 .explore
@@ -934,6 +951,32 @@ mod tests {
             .reconciliationpending = true;
         assert!(model.remote_retry_available());
         model.abandon_intent(settings);
+    }
+
+    #[test]
+    fn explore_stop_closes_ready_gallery_and_detail_and_cancels_opening() {
+        let mut model = bootstrapped();
+        for mode in [
+            crate::generated::ExploreMode::Gallery,
+            crate::generated::ExploreMode::Detail,
+        ] {
+            for (busy, ready) in [(true, false), (false, true), (true, true), (false, false)] {
+                let snapshot = model.explore.snapshot.as_mut().unwrap();
+                snapshot.mode = mode;
+                snapshot.busy = busy;
+                snapshot.ready = ready;
+                snapshot.cancellationrequested = false;
+                assert_eq!(model.explore_stop_available(), busy || ready);
+                model
+                    .explore
+                    .snapshot
+                    .as_mut()
+                    .unwrap()
+                    .cancellationrequested = true;
+                assert!(!model.explore_stop_available());
+                assert!(!model.explore_mutation_available());
+            }
+        }
     }
 
     #[test]

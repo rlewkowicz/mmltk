@@ -116,7 +116,7 @@ full model recipes and policies. Individual model `.pt` files, epoch candidates,
 and soups are Transfer/deployment inputs, even if an archive contains fields
 that belong to a session. They cannot authorize a partial-model Resume.
 The [GUI continuation reference](rfdetr-workflows.md#checkpoints-and-continuation)
-covers inspection/Prepare Resume and the current weights-only chooser limitation.
+covers selecting `session.json` under Custom Weights, inspection, and Prepare Resume.
 
 [TrainingSessionAdmission](../src/backend/models/rfdetr/training/detail/training_session_checkpoint.h)
 validates the entire manifest, every named model, plan, checksum, and continuation

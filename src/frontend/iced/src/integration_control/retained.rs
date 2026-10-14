@@ -3756,9 +3756,55 @@ impl State {
                 if snapshot.busy || snapshot.mode != crate::generated::ExploreMode::Gallery {
                     return Task::none();
                 }
-                driver.phase = Phase::ExploreDatasetReopen {
+                driver.phase = Phase::ExploreDatasetStop {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
+                };
+                widgets.arm(driver, explore::STOP_ID)
+            }
+            Phase::ExploreDatasetStop { .. } => widgets.arm(driver, explore::STOP_ID),
+            Phase::AwaitExploreDatasetClosed {
+                revision,
+                frame_revision,
+            } => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.busy
+                    || snapshot.ready
+                    || snapshot.revision <= revision
+                    || model.has_explore_pending()
+                {
+                    return Task::none();
+                }
+                if snapshot.frame.revision != 0
+                    || snapshot.dataset.identity != 0
+                    || crate::presentation_surface::retained_surface().is_some()
+                    || model.explore.presentation_title() != "Waiting for a dataset"
+                    || !model.explore_open_available()
+                    || model.explore_stop_available()
+                {
+                    driver.fail(
+                        "Explore Stop did not close the dataset and release the displayed preview",
+                    );
+                    return Task::none();
+                }
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_closed",
+                        explore::STOP_ID,
+                        "closed-and-released",
+                        [
+                            snapshot.revision as f64,
+                            revision as f64,
+                            frame_revision as f64,
+                            0.0,
+                        ],
+                    )
+                });
+                driver.phase = Phase::ExploreDatasetReopen {
+                    revision: snapshot.revision,
+                    frame_revision,
                 };
                 widgets.arm(driver, EXPLORE_OPEN)
             }
@@ -4030,6 +4076,7 @@ impl State {
             Phase::DetailPrevious(_) => EXPLORE_PREVIOUS.to_owned(),
             Phase::DetailCloseEvidence => EXPLORE_DETAIL_CLOSE.to_owned(),
             Phase::ExploreDatasetReopen { .. } => EXPLORE_OPEN.to_owned(),
+            Phase::ExploreDatasetStop { .. } => explore::STOP_ID.to_owned(),
             Phase::GalleryReselect => EXPLORE_GALLERY.to_owned(),
             _ => return None,
         })
@@ -4362,6 +4409,16 @@ impl State {
                     driver.fail("Firefox click dispatch failed");
                 }
                 None
+            }
+            Phase::ExploreDatasetStop {
+                revision,
+                frame_revision,
+            } => {
+                driver.phase = Phase::AwaitExploreDatasetClosed {
+                    revision,
+                    frame_revision,
+                };
+                driver.click_located(input_bounds)
             }
             Phase::ExploreDatasetReopen {
                 revision,

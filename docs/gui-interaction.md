@@ -937,6 +937,12 @@ introduces no intentional frame delay, but makes no hard one-frame guarantee.
 
 ## Explore gallery and displayed geometry
 
+Explore's **Stop** remains available while opening or while a dataset is open,
+including Detail. It cancels outstanding work, closes the session, and releases
+dataset, thumbnail, preview, and runtime resources after physical reads settle.
+The view returns to **Waiting for a dataset** and can be opened again with the
+saved settings. **Close** in Detail returns to the retained gallery.
+
 [Explore residency](datasets.md#explore-thumbnails-and-atlas-residency) owns the
 cache, tile geometry, priority, and physical atlas rules. The GUI includes every
 partially visible row in demand. Its measured viewport may alternate between

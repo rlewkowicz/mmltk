@@ -176,9 +176,10 @@ Train, Validate, Predict, and Export use the same **RF-DETR Weights** card:
 catalog presets and **Custom Weights**, with a compact selected path and active
 preparation progress. Operational errors appear in the session
 [Status panel](gui-interaction.md#session-status). Train's chooser accepts
-trainable weights (`.pt`, `.pth`, `.ckpt`,
-`.safetensors`). Validate and Predict also accept ONNX (`.onnx`) and TensorRT
-(`.engine`, `.trt`). Export's custom chooser accepts `.pt` weights. The selected
+trainable weights (`.pt`, `.pth`, `.ckpt`, `.safetensors`) and saved training
+session manifests (`.json`) for Resume. Validate and Predict accept weights,
+ONNX (`.onnx`), and TensorRT (`.engine`, `.trt`). Export's custom chooser accepts
+`.pt` weights. The selected
 extension identifies an input kind through
 the native [compatibility catalog](../src/controller/contracts/model_selection.h);
 normal artifact and class admission still apply.
@@ -375,10 +376,11 @@ Individual archives/candidates authorize Transfer only.
 Train's weights card owns mutually exclusive **Transfer** and **Resume** radios.
 Catalog and weights-only inputs use Transfer and cannot Resume. An admitted
 resumable custom selection defaults to Resume. Selecting a file or changing the
-radio never starts work. The current custom chooser/confirmation accepts weights
-extensions and rejects a newly selected `.json` manifest; Browse Output only
-loads history. A custom path already present in settings follows native
-inspection and the existing Prepare Resume path. The CLI accepts a manifest
+radio never starts work. To resume, choose the saved run's `session.json` under
+**Custom Weights** and confirm it; successful native inspection enables Resume.
+Weights-only selections explain this requirement beneath the radios. Browse
+Output only loads history. A custom path already present in settings follows
+the same native inspection and Prepare Resume path. The CLI accepts a manifest
 through `--resume`; see [whole-session Resume](model-merging.md#whole-session-resume).
 
 Custom selection starts worker-owned cancellable inspection of the archive,
@@ -388,7 +390,10 @@ retains immutable evidence with identity rechecked on use, as defined by
 path refreshes inspection; errors remain actionable without automatic retry.
 
 Start in Resume mode restores the saved training settings, settles that
-restoration, and passes the native continuation admission used by CLI training.
+restoration, and passes the retained native continuation admission directly to
+Training. The admitted session supplies model facts for input validation;
+the manifest does not enter ordinary model-weight preparation. Native training
+uses the same continuation admission as CLI training.
 Only the still-current explicit Start request may proceed after preparation.
 A path or run-history manifest alone cannot make an artifact resumable.
 See the [checkpoint API](../src/backend/models/rfdetr/training/checkpoint.h),

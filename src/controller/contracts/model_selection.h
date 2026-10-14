@@ -138,7 +138,11 @@ struct TrainWeightsModelSelection final
        member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::weights_path>,
        member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::class_layout_path>> {
  inline static constexpr ModelArtifactInputKind input_kind = ModelArtifactInputKind::Weights;
- inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("train.weights", workflow, input_kind, true, artifact_field_path.view());
+ inline static constexpr ModelSelectionCompatibility compatibility = [] {
+  auto result = custom_model_compatibility("train.weights", workflow, input_kind, true, artifact_field_path.view());
+  result.dialog_pattern = "*.pt *.pth *.ckpt *.safetensors *.json";
+  return result;
+ }();
 };
 template <auto Artifact, ModelArtifactInputKind Input>
 // CLEANUP-IGNORE: Each workflow row declares distinct reflected paths into its own request type.

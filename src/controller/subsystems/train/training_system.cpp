@@ -15,6 +15,7 @@
 #include "src/controller/services/training/train_run_store.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::controller {
@@ -311,7 +312,16 @@ public:
    facts.settings.workflows.train.request.resume_path.clear();
   else if (facts.settings.workflows.train.request.resume_path != resume)
    throw contracts::InvalidIntentError("Resume settings no longer match the selected checkpoint");
-  const auto selection = model_.selection();
+  contracts::ModelSelection selection;
+  if (admission) {
+   // Session inspection already admitted every model; its manifest is not a weights archive.
+   auto input = subsystems::system::ComputeIntentMaterializer::ModelInputFor(facts.settings, contracts::FeatureId::Train);
+   if (!input) throw contracts::InvalidIntentError(input.error().detail);
+   selection = {.key = std::move(input->key), .inspection_device = input->inspection_device, .artifact = resume.string()};
+   if (admission->checkpoint().class_layout) selection.class_layout = mmltk::backend::models::rfdetr::ResolvedClassLayout(*admission->checkpoint().class_layout).summary();
+  } else {
+   selection = model_.selection();
+  }
   run_.Start({
    .prepare =
     [this, admission, revision = facts.revision] {

@@ -111,9 +111,11 @@ and previews survive interruption or failure, and success settles required outpu
 writes.
 
 Validation and exploration share viewers while retaining their own results and
-display policies. Prediction owns incremental image/video processing and output
-policy; native media facilities preserve source timing, audio, and interrupted
-output. Display filtering preserves inference, evaluation, and annotation meaning.
+display policies. Stopping exploration closes its dataset and previews, releasing
+their resources after active work and readers settle. Prediction owns incremental
+image/video processing and output policy; native media facilities preserve source
+timing, audio, and interrupted output. Display filtering preserves inference,
+evaluation, and annotation meaning.
 Annotation owns atomic import, ordered editing, undo/redo, and explicit saving.
 Upscale consumes the selected native source; Live owns capture and processing.
 

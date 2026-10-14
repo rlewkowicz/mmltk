@@ -1245,6 +1245,7 @@ TEST_CASE("model file dialog targets remain typed through native resolution", "[
  REQUIRE(resolved);
  CHECK(resolved->target == request.target);
  CHECK(resolved->descriptor.defer_apply());
+ CHECK(resolved->descriptor.filter.pattern.view().contains("*.json"));
  CHECK_FALSE(
   mmltk::controller::services::file_dialog_catalog().resolve(FileDialogOpen{.target = mmltk::controller::services::FileDialogTarget{mmltk::controller::services::SettingsFieldTarget{stable_id}}}));
  auto mismatched = request;

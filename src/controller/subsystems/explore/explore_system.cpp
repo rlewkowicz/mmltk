@@ -438,37 +438,43 @@ public:
   });
  }
  [[nodiscard]] ExploreSnapshot Stop() noexcept {
-  std::scoped_lock transaction(desired_admission_mutex_);
-  std::scoped_lock open_finalization_lock(open_finalization_mutex_);
+  std::unique_lock transaction(desired_admission_mutex_);
+  std::unique_lock open_finalization_lock(open_finalization_mutex_);
   ExploreSnapshot result;
-  worker_.SetOutputRetry(false);
   {
    std::scoped_lock lock(mutex_);
-   // Stop abandons further thumbnails; the selected product retains
-   // its readiness facts independently of this stream-demand decision.
+   if (closing_ || worker_.stopped()) return state_;
+   closing_ = true;
    active_gallery_generation_ = 0U;
    latest_generation_->store(ReserveGeneration(), std::memory_order_release);
-   if (pending_discrete_) {
-    pending_discrete_ = {};
-    Complete(state_);
-   }
-   if (desired_) {
-    desired_.reset();
-    state_.render_pending = false;
-    AdvanceRevision();
-   }
-   if (state_.busy && !state_.cancellation_requested) {
-    state_.cancellation_requested = true;
-    AdvanceRevision();
-   }
+   pending_discrete_.reset();
+   desired_.reset();
+   state_.render_pending = false;
+   state_.busy = true;
+   state_.cancellation_requested = true;
+   AdvanceRevision();
    result = state_;
   }
-  if (worker_.RequestActiveStop()) {
-   std::scoped_lock lock(mutex_);
-   result = state_;
-  }
-  // CLEANUP-IGNORE: Explore owns different stop admission and typed snapshot state from Annotation; their common
-  // worker and checked-borrow mechanics are already consolidated.
+  worker_.Unload([this] {
+   {
+    std::scoped_lock lock(mutex_);
+    ReleaseProductsLocked();
+    state_ = UnavailableSnapshotLocked();
+   }
+   return [this] {
+    ExploreSnapshot closed;
+    {
+     std::scoped_lock lock(mutex_);
+     closing_ = false;
+     Complete(state_);
+     closed = state_;
+    }
+    Publish(ExploreChanged{std::move(closed)});
+   };
+  });
+  open_finalization_lock.unlock();
+  transaction.unlock();
+  Publish(ExploreChanged{result});
   return result;
  }
  void Shutdown() noexcept {
@@ -485,18 +491,11 @@ public:
    std::scoped_lock admission(desired_admission_mutex_);
    std::scoped_lock lock(mutex_);
    latest_generation_->store(generation, std::memory_order_release);
-   active_gallery_generation_ = 0U;
-   desired_.reset();
+   ReleaseProductsLocked();
    if (state_.render_pending) {
     state_.render_pending = false;
     AdvanceRevision();
    }
-   pending_discrete_.reset();
-   reserved_output_ = {};
-   retained_gallery_ = {};
-   retained_detail_ = {};
-   retained_runtime_ = nullptr;
-   configured_algorithm_ = nullptr;
   }
   worker_.FinishStoppedRetirement();
  }
@@ -536,6 +535,22 @@ public:
  }
 
 private:
+ void ReleaseProductsLocked() {
+  active_gallery_generation_ = 0U;
+  desired_.reset();
+  pending_discrete_.reset();
+  reserved_output_ = {};
+  retained_gallery_ = {};
+  retained_detail_ = {};
+  retained_runtime_ = nullptr;
+  configured_algorithm_ = nullptr;
+  document_.reset();
+  committed_source_.clear();
+  runtime_settings_.reset();
+  installed_settings_ = {};
+  runtime_initialized_ = false;
+  atlas_columns_ = atlas_side_ = atlas_rows_ = 0U;
+ }
  template <class Update>
  ExploreSnapshot InstallRetainedSetting(std::unique_lock<std::mutex>& transaction, ExploreSettingsCandidate refreshed, Update update) {
   ExploreSnapshot changed;
@@ -1370,7 +1385,7 @@ private:
    throw contracts::InvalidIntentError("Explore viewport is outside the configured device bounds");
  }
  void RequireIdle() const {
-  if (state_.busy) throw contracts::BusyError("Explore is busy");
+  if (closing_ || state_.busy) throw contracts::BusyError("Explore is busy");
  }
  void GuardIdle() const {
   std::scoped_lock lock(mutex_);
@@ -1401,9 +1416,9 @@ private:
   runtime_initialized_ = true;
  }
  void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
- static void Complete(ExploreSnapshot& snapshot) {
-  snapshot.busy = false;
-  snapshot.cancellation_requested = false;
+ void Complete(ExploreSnapshot& snapshot) const {
+  snapshot.busy = closing_;
+  snapshot.cancellation_requested = closing_;
   snapshot.revision = mmltk::common::types::advance_monotonic_identity(snapshot.revision);
  }
  void CompleteProduct(ExploreSnapshot& snapshot, const PreparedProduct& product) {
@@ -1428,6 +1443,8 @@ private:
  [[nodiscard]] ExploreSnapshot UnavailableSnapshotLocked() const {
   return {
    .revision = mmltk::common::types::advance_monotonic_identity(state_.revision),
+   .busy = closing_,
+   .cancellation_requested = closing_,
    .nproc = state_.nproc,
    .maximum_atlas_extent = state_.maximum_atlas_extent,
   };
@@ -1516,7 +1533,7 @@ private:
    }
    failed.failure = detail;
    failed.render_pending = false;
-   failed.failure_kind = kind == ExploreFailureKind::Operation && !runtime_initialized_ ? ExploreFailureKind::RuntimeInitialization : kind;
+   failed.failure_kind = kind == ExploreFailureKind::Operation && !runtime_initialized_ && !closing_ ? ExploreFailureKind::RuntimeInitialization : kind;
    state_ = failed;
    pending_discrete_ = {};
    desired_.reset();
@@ -1541,6 +1558,7 @@ private:
    ExecutionSettingsChanged();
   };
  }
+ std::atomic_bool closing_{false};
  bool runtime_initialized_ = false;
  std::string committed_source_;
  std::optional<ExploreSettingsCandidate> runtime_settings_;

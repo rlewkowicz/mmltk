@@ -310,6 +310,12 @@ Use this prompt verbatim, replacing `<MAIN PHASE>`, `<PHASE TITLE>`,
 
 ### Final Validation workflow
 
+This workflow is required only during `actionplan.md` execution. Outside an
+action plan, run checks appropriate to the changed behavior and affected
+boundaries; the full test suite, full tidy/cleanup passes, and complete Wayland
+acceptance suite are not required. GUI changes still require a build and focused
+rendered-behavior validation as described in [Web GUI](#web-gui).
+
 The main agent owns all validation commands, diagnosis, and edits, including
 application code, tests, build wiring, diagnostics, tooling, cleanup, and tidy.
 Regardless of fix size or failed attempts, do not delegate validation
@@ -489,7 +495,10 @@ never weaken required behavior to obtain a passing result.
 
 Do not add regression tests. You may add standard tests that exercise required
 behavior, boundaries, failure handling, resource safety, and integration.
-Final test selection is fixed by [Final Validation](#final-validation-workflow).
+During `actionplan.md` execution, final test selection is fixed by
+[Final Validation](#final-validation-workflow). Outside an action plan, select
+focused tests for the changed behavior and affected boundaries; running all
+tests is optional.
 A new `--test all`, including filtered invocations, replaces earlier test runs
 owned by this checkout; [focused suite names preserve them](docs/validation.md#replacing-an-active-test-run).
 
@@ -526,8 +535,10 @@ unnecessary blocking.
 
 ## Tidy
 
-All validation follows [Final Validation](#final-validation-workflow)'s stage
-order, commands, and completion rules.
+During `actionplan.md` execution, validation follows
+[Final Validation](#final-validation-workflow)'s stage order, commands, and
+completion rules. Outside an action plan, use focused formatting and analysis
+appropriate to the changes.
 
 The full suite includes the standalone tools stage, formats first-party
 C/C++/CUDA and the Iced application Rust package, runs clang-tidy on supported

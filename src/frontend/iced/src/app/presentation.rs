@@ -216,6 +216,7 @@ impl Controller {
         }
         let source = model.explore.snapshot.as_ref().filter(|snapshot| {
             route == FeatureId::Explore
+                && !model.explore_stopping()
                 && snapshot.mode == crate::generated::ExploreMode::Detail
                 && !model.explore.desired_close
                 && model.explore.navigation_offset == 0
@@ -935,6 +936,13 @@ impl Controller {
     }
 
     fn present(&mut self, frame: FrameReady, model: &ApplicationModel) -> bool {
+        if model.explore_preview_closed()
+            && frame.content_session
+                == crate::generated::presentation_source_session(PresentationSourceKind::Explore)
+        {
+            crate::presentation_surface::release(frame);
+            return false;
+        }
         if self.pending.and_then(|pending| pending.frame) == Some(frame) {
             return false;
         }
@@ -1042,7 +1050,9 @@ impl Controller {
             .suspended
             .as_ref()
             .map_or(feature, |suspended| suspended.route);
-        if matches!(feature, FeatureId::Train | FeatureId::Export) {
+        if matches!(feature, FeatureId::Train | FeatureId::Export)
+            || (feature == FeatureId::Explore && model.explore_preview_closed())
+        {
             self.retire_frame();
             return Ok(());
         }
@@ -1864,6 +1874,36 @@ mod tests {
             selection,
             crate::generated::encode_presentation_Select(selection.correlation, source).record
         );
+    }
+
+    #[test]
+    fn explore_stop_retires_previews_and_pending_actions_while_draws_settle() {
+        for direct_sampling in [false, true] {
+            let (mut app, mut frame) = viewer_app();
+            frame.direct_sampling = direct_sampling;
+            let (sender, _receiver) = Connection::test_channel();
+            app.connection = Some(sender);
+            install_next(&app, frame);
+            app.present_native_frame(frame);
+            let read = crate::presentation_surface::test_sample_read(frame);
+            app.model.explore.desired_selection = Some(2);
+            app.model.explore.navigation_offset = 1;
+            app.model.explore.desired_open = true;
+            assert!(app.model.explore_stop_available());
+            drop(app.on_explore(crate::view::explore::Outcome::StopRequested));
+            assert!(app.model.explore_stopping());
+            assert!(!app.model.explore.desired_open);
+            assert_eq!(app.model.explore.desired_selection, None);
+            assert_eq!(app.model.explore.navigation_offset, 0);
+            assert!(app.model.requested_upscale.is_none());
+            assert!(app.model.presentation_refresh().is_none());
+            assert!(crate::presentation_surface::retained_surface().is_none());
+            app.reconcile_viewer();
+            assert!(app.model.requested_upscale.is_none());
+            assert!(test_releases().is_empty());
+            drop(read);
+            assert_eq!(test_releases(), vec![frame]);
+        }
     }
 
     #[test]

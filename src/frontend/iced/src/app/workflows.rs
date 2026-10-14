@@ -527,9 +527,10 @@ impl App {
         if self.model.model_request_pending() {
             return;
         }
-        if !self
-            .model
-            .model_selection_matches(self.settings.draft().unwrap(), feature)
+        if pending.resume_checkpoint.is_none()
+            && !self
+                .model
+                .model_selection_matches(self.settings.draft().unwrap(), feature)
         {
             let Some(snapshot) = self.model.model_snapshot.as_ref() else {
                 return;
@@ -1993,7 +1994,7 @@ mod tests {
         snapshot.revision += 1;
         let train = &mut snapshot.settingsstate.workflows.train;
         train.modelsource = crate::generated::ModelSelectionSource::Custom;
-        train.request.weightspath = "/saved/full.pt".into();
+        train.request.weightspath = "/saved/session.json".into();
         let checkpoint = crate::generated::TrainingCheckpointCapability {
             path: train.request.weightspath.clone(),
             resumable: true,
@@ -2077,7 +2078,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_resume_waits_for_restore_reply_and_settings_before_model_preparation() {
+    fn explicit_resume_waits_for_restore_reply_and_settings_before_launch() {
         for event_first in [false, true] {
             let (mut app, mut capture) = start_app();
             let checkpoint = select_resumable(&mut app);
@@ -2116,9 +2117,8 @@ mod tests {
                 app.settings.install(&snapshot);
             }
             app.advance_start();
-            next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
-            let pending = app.model.workflow.pending_start.as_ref().unwrap();
-            assert!(pending.inputs.matches(app.settings.draft().unwrap()));
+            next_intent(&mut capture, ApplicationIntentEndpoint::TrainingResume);
+            assert!(app.model.workflow.pending_start.is_none());
             assert!(capture.try_recv().is_err());
         }
     }

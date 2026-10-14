@@ -241,8 +241,8 @@ TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation a
  const bool before_start = GENERATE(false, true);
  mmltk::testsupport::ScopedTempDir root{"training-resume-admission"};
  ApplicationDataFixture fixture{root.path()};
- fixture.PrepareModel();
  auto [settings, unused_dataset, model] = fixture.systems();
+ REQUIRE_FALSE(model.selection().valid());
  contracts::SettingsUpdateRequest manual;
  manual.updates = {
   {.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
@@ -254,7 +254,8 @@ TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation a
  auto configuration = settings.snapshot().settings_state.workflows.train.request;
  configuration.output_dir = root.path() / "saved-training-run";
  const auto selected_output = settings.snapshot().settings_state.workflows.train.output.directory;
- const auto path = configuration.weights_path;
+ const auto path = root.path() / "session.json";
+ std::ofstream(path) << "checkpoint inspection fixture";
  const auto companion = std::filesystem::path(path.string() + ".classes.json");
  const auto layout = r::unresolved_class_layout(2);
  std::ofstream(companion) << r::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout});

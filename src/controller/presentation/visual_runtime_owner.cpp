@@ -51,7 +51,7 @@ bool VisualRuntimeOwner::SubmitDiscrete(Work work, Notification cancellation, co
  {
   std::scoped_lock lock(mutex_);
   const std::size_t required = 1U + static_cast<std::size_t>(latest_.has_value());
-  if (stopping_ || runtime_retirement_blocked_ || discrete_queued_ || (active_discrete_ && active_outcome_ != ActiveOutcome::Completed) || ordered_.size() > 32U - required) return false;
+  if (stopping_ || unloading_ || runtime_retirement_blocked_ || discrete_queued_ || (active_discrete_ && active_outcome_ != ActiveOutcome::Completed) || ordered_.size() > 32U - required) return false;
   FlushLatest();
   ordered_.push_back(ScheduledWork{
    .run = std::move(work),
@@ -71,7 +71,7 @@ bool VisualRuntimeOwner::SubmitOrdered(Work work) {
  {
   std::scoped_lock lock(mutex_);
   const std::size_t required = 1U + static_cast<std::size_t>(latest_.has_value());
-  if (stopping_ || runtime_retirement_blocked_ || ordered_.size() > 32U - required) return false;
+  if (stopping_ || unloading_ || runtime_retirement_blocked_ || ordered_.size() > 32U - required) return false;
   FlushLatest();
   ordered_.push_back(ScheduledWork{
    .run = std::move(work),
@@ -93,7 +93,7 @@ void VisualRuntimeOwner::RegisterOrderedDrain(Work work) {
 bool VisualRuntimeOwner::NotifyOrderedDrain() {
  {
   std::scoped_lock lock(mutex_);
-  if (!ordered_drain_ || stopping_ || runtime_retirement_blocked_ || terminal_barrier_active_) return false;
+  if (!ordered_drain_ || stopping_ || unloading_ || runtime_retirement_blocked_ || terminal_barrier_active_) return false;
   if (drain_queued_) return true;
   FlushLatest();
   ordered_.push_back(ScheduledWork{
@@ -125,7 +125,7 @@ bool VisualRuntimeOwner::SubmitTerminalBarrier(Work work) {
  if (!work) throw std::invalid_argument("visual terminal barrier work is empty");
  {
   std::scoped_lock lock(mutex_);
-  if (stopping_ || runtime_retirement_blocked_ || terminal_barrier_active_) return false;
+  if (stopping_ || unloading_ || runtime_retirement_blocked_ || terminal_barrier_active_) return false;
   latest_.reset();
   continuation_state_.store(0U, std::memory_order_release);
   ordered_.push_back(ScheduledWork{
@@ -144,7 +144,7 @@ bool VisualRuntimeOwner::SubmitLatest(Work work) {
  if (!work) throw std::invalid_argument("visual latest work is empty");
  {
   std::scoped_lock lock(mutex_);
-  if (stopping_ || runtime_retirement_blocked_) return false;
+  if (stopping_ || unloading_ || runtime_retirement_blocked_) return false;
   latest_ = std::move(work);
  }
  worker_.Wake();
@@ -162,8 +162,10 @@ void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dis
  continuation_state_.store(kContinuationEnabled, std::memory_order_release);
 }
 bool VisualRuntimeOwner::NotifyContinuation() noexcept {
- const auto state = continuation_state_.fetch_or(kContinuationPending, std::memory_order_acq_rel);
- if ((state & kContinuationEnabled) == 0U) return false;
+ auto state = continuation_state_.load(std::memory_order_acquire);
+ do {
+  if ((state & kContinuationEnabled) == 0U) return false;
+ } while (!continuation_state_.compare_exchange_weak(state, state | kContinuationPending, std::memory_order_acq_rel, std::memory_order_acquire));
  if ((state & kContinuationPending) == 0U) worker_.Wake();
  return true;
 }
@@ -232,6 +234,30 @@ bool VisualRuntimeOwner::TryCompleteActiveWork() noexcept {
  if (!active_stop_.stop_possible() || active_outcome_ == ActiveOutcome::Cancelled) return false;
  active_outcome_ = ActiveOutcome::Completed;
  return true;
+}
+void VisualRuntimeOwner::Unload(std::move_only_function<Notification()> release) {
+ if (!release) throw std::invalid_argument("visual unload work is empty");
+ std::stop_source stop{std::nostopstate};
+ {
+  std::scoped_lock lock(mutex_);
+  if (stopping_ || unloading_) return;
+  unloading_ = true;
+  unload_ = std::move(release);
+  ordered_.clear();
+  latest_.reset();
+  drain_queued_ = false;
+  discrete_queued_ = false;
+  terminal_barrier_active_ = false;
+  continuation_deadline_.reset();
+  continuation_state_.store(0U, std::memory_order_release);
+  if (active_outcome_ == ActiveOutcome::Running) {
+   active_outcome_ = ActiveOutcome::Cancelled;
+   stop = active_stop_;
+  }
+ }
+ SetOutputRetry(false);
+ static_cast<void>(stop.request_stop());
+ worker_.Wake();
 }
 void VisualRuntimeOwner::RequestStop() noexcept {
  std::stop_source stop{std::nostopstate};
@@ -476,6 +502,26 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
   completion_runtime_ = nullptr;
   if (!worker_stop.stop_requested()) completed();
  }
+ std::move_only_function<Notification()> unload;
+ {
+  std::scoped_lock lock(mutex_);
+  unload = std::move(unload_);
+ }
+ if (unload) {
+  auto notification = unload();
+  std::exception_ptr failure;
+  try {
+   RetireRuntime();
+  } catch (...) { failure = std::current_exception(); }
+  {
+   std::scoped_lock lock(mutex_);
+   unloading_ = false;
+   if (continuation_ && !stopping_ && !runtime_retirement_blocked_) continuation_state_.store(kContinuationEnabled, std::memory_order_release);
+  }
+  if (failure) ReportFailure(failure);
+  if (notification) notification();
+  return;
+ }
  if (runtime_) runtime_->CompleteWorkspaces();
  ServiceWorkspace();
  std::optional<ScheduledWork> ordered_work;
@@ -573,7 +619,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
   std::scoped_lock lock(mutex_);
   if (terminal_barrier) {
    terminal_barrier_active_ = false;
-   if (continuation_ && !stopping_) continuation_state_.store(kContinuationEnabled, std::memory_order_release);
+   if (continuation_ && !stopping_ && !unloading_) continuation_state_.store(kContinuationEnabled, std::memory_order_release);
   }
   active_stop_ = std::stop_source{std::nostopstate};
   active_discrete_ = false;
@@ -623,7 +669,7 @@ void VisualRuntimeOwner::ReportFailure(std::exception_ptr failure) noexcept {
   active_discrete_ = false;
   active_preserves_input_ = false;
   runtime_retirement_blocked_ = stopping_ || retained_.index() != 0U || execution_policy_.has_value();
-  if (continuation_ && !runtime_retirement_blocked_) continuation_state_.store(kContinuationEnabled, std::memory_order_release);
+  if (continuation_ && !runtime_retirement_blocked_ && !unloading_) continuation_state_.store(kContinuationEnabled, std::memory_order_release);
  }
  NotifyReaders();
  if (!failures_) return;
@@ -701,7 +747,7 @@ std::exception_ptr VisualRuntimeOwner::FinishDeferredRetirement() noexcept {
   if (settled.completion_reached) {
    retained_.emplace<std::monostate>();
    runtime_retirement_blocked_ = stopping_ || execution_policy_.has_value();
-   if (continuation_ && !runtime_retirement_blocked_) continuation_state_.fetch_or(kContinuationEnabled, std::memory_order_release);
+   if (continuation_ && !runtime_retirement_blocked_ && !unloading_) continuation_state_.fetch_or(kContinuationEnabled, std::memory_order_release);
   } else {
    retained_.emplace<Runtime::UnsafeCustody>(std::move(custody));
   }

@@ -204,6 +204,9 @@ impl ApplicationModel {
     }
 
     pub(super) fn frame_for(&self, kind: PresentationSourceKind) -> Option<&VisualFrame> {
+        if kind == PresentationSourceKind::Explore && self.explore_stopping() {
+            return None;
+        }
         if kind == PresentationSourceKind::Upscale && self.current_upscale().is_none() {
             return None;
         }

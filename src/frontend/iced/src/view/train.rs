@@ -142,6 +142,14 @@ fn continuation_controls<'a>(
             crate::view_model::CheckpointCapability::Pending { .. } => {
                 controls = controls.push(status_text("Inspecting checkpoint…").size(12))
             }
+            crate::view_model::CheckpointCapability::Ready(checkpoint) if !checkpoint.resumable => {
+                controls = controls.push(
+                    status_text(
+                        "For Resume, select the saved run's session.json in Custom Weights.",
+                    )
+                    .size(12),
+                )
+            }
             _ => {}
         }
     }

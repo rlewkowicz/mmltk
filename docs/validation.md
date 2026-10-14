@@ -2,9 +2,11 @@
 
 [Wiki index](README.md) · [Quick start](../README.md#build) · [Logging](logging.md) · [Headless Wayland](headless-wayland.md)
 
-[AGENTS.md](../AGENTS.md#final-validation-workflow) owns validation stage order,
-fix/review ownership, checkpoints, and the final documentation pass. After the
-required final full build, both gate commands must pass in this order:
+[AGENTS.md](../AGENTS.md#final-validation-workflow) owns validation scope, stage
+order, fix/review ownership, checkpoints, and the final documentation pass.
+Outside action-plan execution, use focused checks for the changed behavior and
+affected boundaries; full test suites are optional. During action-plan execution,
+after the required final full build, both gate commands must pass in this order:
 
 ```bash
 ./mmltk --test all
@@ -15,8 +17,8 @@ Unfiltered `all` runs native, browser JavaScript/Rust, cleanup/declaration,
 log-query, and compositor fixtures. Resume failed tests and tidy checks with
 the focused selections below; retain successful results and finish checks left
 unexecuted by an interruption. Rebuild changed product code through `./mmltk --build`
-before testing. Once focused retries pass, run the required full completion
-pass. Retries do not restart or reorder validation stages.
+before testing. During action-plan execution, once focused retries pass, run the
+required full completion pass. Retries do not restart or reorder validation stages.
 
 ## Formatting and static analysis
 
@@ -61,7 +63,7 @@ or resume at a translation unit with `--start-at`:
 ```
 
 `--file` and `--start-at` cannot be combined. Focused runs do not replace the
-full passes required by the workflow. Tidy retains a
+full passes required during action-plan execution. Tidy retains a
 [wrapper transcript](logging.md#wrapper-build-test-and-tidy-transcripts), with
 `MMLTK_TIDY_LOG_FILE` selecting its destination. The implementation and
 available analysis overrides are in

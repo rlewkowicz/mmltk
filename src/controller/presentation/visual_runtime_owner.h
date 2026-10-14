@@ -72,6 +72,10 @@ public:
  // and independent system execution remain live.
  void DeferCompletion(Runtime&, Notification);
  bool RequestActiveStop() noexcept;
+ // Cancel queued/active work, release domain products on the worker, and
+ // retire the runtime without stopping the reusable worker. The returned
+ // notification runs after retirement; external reads retain exact custody.
+ void Unload(std::move_only_function<Notification()> release);
  void RequestStop() noexcept;
  void StopAndWait() noexcept;
  // After StopAndWait and release of domain-owned products, finish healthy
@@ -131,6 +135,8 @@ private:
  std::atomic_bool retirement_ready_{false};
  std::atomic_bool output_notifications_{false};
  Notification completion_;
+ std::move_only_function<Notification()> unload_;
+ bool unloading_ = false;
  Runtime* completion_runtime_ = nullptr;
  std::atomic_bool completion_ready_{false};
  RuntimeFactory factory_;

@@ -59,6 +59,13 @@ impl ExploreModel {
 
     pub fn presentation_title(&self) -> &'static str {
         match self.presentation_state() {
+            _ if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.cancellationrequested) =>
+            {
+                "Closing dataset"
+            }
             ExplorePresentationState::Loading => "Opening compiled dataset",
             ExplorePresentationState::Empty
                 if self
@@ -86,6 +93,13 @@ impl ExploreModel {
         drawable: bool,
         presentation: super::GalleryPresentation,
     ) -> &'static str {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.cancellationrequested)
+        {
+            return self.presentation_title();
+        }
         if self
             .snapshot
             .as_ref()

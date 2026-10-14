@@ -1533,6 +1533,13 @@ void test_native_explore_transaction_faults_and_inactive_release() {
  CHECK(held.plane(0U).revision() == incumbent.frame.revision);
  if (outcome == Outcome::Commit) {
   CHECK(settled.frame != incumbent.frame);
+ } else if (outcome == Outcome::Cancel) {
+  CHECK_FALSE(settled.ready);
+  CHECK_FALSE(settled.frame.valid());
+  CHECK(settled.dataset.identity == 0U);
+  CHECK(settled.order.visible_indices.empty());
+  CHECK(settled.failure.empty());
+  CHECK_FALSE(system.BorrowFrame().valid());
  } else {
   CHECK_FALSE(incumbent_artifact.expired());
   // CLEANUP-IGNORE: These end-to-end rollback assertions intentionally restate the public continuity contract
