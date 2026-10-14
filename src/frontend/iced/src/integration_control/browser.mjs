@@ -1183,8 +1183,11 @@ export function mmltkIntegrationCompileResize(step, generation, revision, begin)
   };
   if (!request || request.step !== step || request.generation !== generation || !canvas) return waiting('request');
   if (!root || !uiRoot || uiRoot.sequence <= request.sequence) return waiting('root');
-  if (revision <= request.revision || root.revision <= request.revision) return waiting('native-progress');
+  // Resize owns a new draw, while native progress may remain quiet during sync.
+  // Require the current native facts in that draw without coupling it to another update.
+  if (revision < request.revision || root.revision !== revision) return waiting('native-state');
   if (!transition || transition.sequence <= request.sequence || transition.sequence <= root.before_draw ||
+      transition.sequence <= uiRoot.sequence ||
       transition.event !== 'iced.window.presented') return waiting('presentation');
   const css = canvas.getBoundingClientRect(), scale = window.devicePixelRatio;
   const sized = step < 2 ? mmltkIntegrationCanvasSizeSettled(step === 0 ? 480 : 960, step === 0 ? 900 : 720) :
@@ -1196,6 +1199,7 @@ export function mmltkIntegrationCompileResize(step, generation, revision, begin)
     Math.abs(root.x) < 1 && Math.abs(root.y) < 1 &&
     Math.abs(root.width * root.scale - canvas.width) <= 2 && Math.abs(root.height * root.scale - canvas.height) <= 2;
   const facts = {step, generation, before_revision: request.revision, revision, root_revision: root.revision,
+      request_sequence: request.sequence, root_before_draw: root.before_draw, ui_root_sequence: uiRoot.sequence,
       css: [css.width, css.height], backing: [canvas.width, canvas.height], viewport: [window.innerWidth, window.innerHeight],
       prior_viewport: request.viewport, configured, ui_root: actualRoot, root: [root.x, root.y, root.width, root.height],
       root_scale: root.scale, device_scale: scale, inputs: request.inputs, transition};

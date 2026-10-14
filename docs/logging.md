@@ -1071,7 +1071,7 @@ fixture matrix, real input, and native cancellation/restart requirements.
 | `integration.dataset_native_work`, `.dataset_native_track` | Native generation and exact current-work/track facts captured with the draw; `detail` contains JSON with decimal integer values |
 | `integration.compile_progress`, `.compile_metrics`, `.compile_cancelled`, `.dataset_complete` | Real native activity, metrics, inactive cancellation, and the later successful generation |
 | `integration.compile_resize_requested`, `.compile_resize_wait` | Resize request and an unmet predicate, with step/generation/revisions, viewport/fullscreen, input count, root, and presentation facts when available |
-| `integration.compile_resize` | Completed active-compilation resize: advancing native/root revisions, CSS/backing/configured/presented extents, actual UI root, scale, and zero recorded pointer/wheel/keydown events |
+| `integration.compile_resize` | Completed active-compilation resize: current native/root revisions, resize-request/root-draw/presentation sequences, CSS/backing/configured/presented extents, actual UI root, scale, and zero recorded pointer/wheel/keydown events |
 | `integration.dataset_fixture`, `.dataset_pixels`, `.dataset_label_pixels`, `.dataset_divider_pixels` | Settled local fixture receipt, canvas contrast, visible label samples, and measured divider color/span/stroke/gaps |
 | `integration.dataset_reversal`, `.dataset_hidden_input`, `.dataset_drag_edit`, `.dataset_offscreen_release` | Actual interrupted motion, rejected outgoing input, settled drag-selection editing, and unchanged native value after offscreen release |
 | `integration.dataset_custody` | Probe admission/stimulus/outcome and retired-callback drain, with request scope, owner, geometry, snapshot/read/report counts, and replacement-owner isolation |
@@ -1087,7 +1087,7 @@ or resource-lifetime state.
 The compile-resize sequence uses steps 0/1 for 480×900 and 960×720 canvas sizes,
 then 2/3 for real fullscreen entry and exit. A successful record puts its facts
 in JSON `detail`; request/wait diagnostics expose fields directly. Wait `reason`
-identifies `request`, `root`, `native-progress`, `presentation`, `canvas-size`,
+identifies `request`, `root`, `native-state`, `presentation`, `canvas-size`,
 `fullscreen-viewport`, `root-coverage`, `input`, `pending-resize`, `backing-size`,
 `configuration`, or `presented-size`. These records explain which predicate
 remains unmet; a wait record alone is not failure or a deadline extension.

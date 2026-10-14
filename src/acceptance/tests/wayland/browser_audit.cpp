@@ -1486,9 +1486,13 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    const auto step = facts.value("step", 4U);
    const auto& transition = facts["transition"];
    const double scale = facts.value("root_scale", 0.0), dpi = facts.value("device_scale", 0.0);
-   valid = generation == active_compile_generation && generation != 0 && step < 4 && scale > 0 && dpi > 0 && facts.value("inputs", 1U) == 0 &&
-           facts.value("revision", std::uint64_t{0}) > facts.value("before_revision", std::uint64_t{0}) &&
-           facts.value("root_revision", std::uint64_t{0}) > facts.value("before_revision", std::uint64_t{0}) && transition.value("event", "") == "iced.window.presented" &&
+   valid = generation == active_compile_generation && generation != 0 && step < 4 && scale > 0 && dpi > 0 && facts.value("inputs", 1U) == 0 && facts.value("before_revision", std::uint64_t{0}) != 0 &&
+           facts.value("revision", std::uint64_t{0}) >= facts.value("before_revision", std::uint64_t{0}) &&
+           facts.value("root_revision", std::uint64_t{0}) == facts.value("revision", std::uint64_t{0}) && facts.contains("request_sequence") && facts.contains("root_before_draw") &&
+           facts.value("root_before_draw", std::uint64_t{0}) >= facts.value("request_sequence", std::uint64_t{0}) &&
+           facts.value("ui_root_sequence", std::uint64_t{0}) > facts.value("request_sequence", std::uint64_t{0}) &&
+           transition.value("sequence", std::uint64_t{0}) > facts.value("root_before_draw", std::uint64_t{0}) &&
+           transition.value("sequence", std::uint64_t{0}) > facts.value("ui_root_sequence", std::uint64_t{0}) && transition.value("event", "") == "iced.window.presented" &&
            !transition.value("pending_resize", true);
    for (std::size_t axis = 0; axis < 2; ++axis) {
     const double backing = facts["backing"][axis].get<double>();

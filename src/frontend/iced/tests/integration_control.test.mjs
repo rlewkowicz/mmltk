@@ -1707,7 +1707,7 @@ test('Status semantic evidence retires its observer with the accepted session', 
 });
 
 
-test('active compile resize waits for native progress and actual surface/root settlement without input', t => {
+for (const revision of [2, 3]) test(`active compile resize presents current native state without input, revision=${revision}`, t => {
   const f = canvasFixture(t, true);
   window.innerWidth = 1280; window.innerHeight = 1024;
   assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 2, true), true);
@@ -1721,17 +1721,21 @@ test('active compile resize waits for native progress and actual surface/root se
   window.mmltkIcedWindowState = {extent: [480, 900]};
   const transition = {event: 'iced.window.redraw', sequence: 4, width: 480, height: 900, pending_resize: false};
   window.mmltkIntegrationWindowTrace(transition);
-  browser.mmltkIntegrationCompileRoot(1, 3, 0, 0, 480, 900, 1);
+  browser.mmltkIntegrationCompileRoot(1, revision, 0, 0, 480, 900, 1);
   assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 3, false), false);
   window.mmltkIntegrationWindowTrace({event: 'iced.window.root', sequence: 5, root: [0, 0, 480, 900]});
   window.mmltkIntegrationWindowTrace({...transition, event: 'iced.window.presented', sequence: 6});
-  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 2, false), false);
-  assert.equal(f.reports.at(-1).reason, 'native-progress');
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 1, false), false);
+  assert.equal(f.reports.at(-1).reason, 'native-state');
   assert.equal(f.reports.at(-1).before_revision, 2);
-  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 3, false), true);
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, revision + 1, false), false);
+  assert.equal(f.reports.at(-1).reason, 'native-state');
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, revision, false), true);
   assert.equal(f.events.length, 0);
   const report = f.reports.find(value => value.event === 'integration.compile_resize');
   assert.equal(JSON.parse(report.detail).inputs, 0);
+  assert.equal(JSON.parse(report.detail).root_revision, revision);
+  assert.equal(JSON.parse(report.detail).ui_root_sequence, 5);
   assert.equal(browser.mmltkIntegrationCompileResize(1, 1, 3, true), true);
   f.input('wheel');
   f.css.width = f.canvas.width = 960; f.css.height = f.canvas.height = 720;

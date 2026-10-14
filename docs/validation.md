@@ -1093,10 +1093,13 @@ or active-progress evidence. Directory's acquisition caption follows the
 
 Before cancelling and again before the successful generation settles, the
 retained scenario requires four active resize steps: 480×900, 960×720,
-fullscreen, and restored window. Each joins a later native revision, a later
-Dataset root draw, the actual Iced root covering the canvas, matching CSS/backing
-and configured/presented extents, and zero recorded pointer, wheel, or keydown
-events between the resize request and completion.
+fullscreen, and restored window. Each joins the current native revision with a
+new Dataset root draw after the resize request, the actual Iced root covering
+the canvas, matching CSS/backing and configured/presented extents, and zero
+recorded pointer, wheel, or keydown events between the resize request and
+completion. Native progress may remain
+unchanged while the new root is drawn and presented, including during Syncing;
+the evidence requires current native facts and fresh draw/presentation sequences.
 Fullscreen entry/exit must change the real viewport through Firefox's native
 window path. DOM fullscreen state or a redraw request alone is insufficient.
 The [resize observations](logging.md#dataset-presentation-evidence) distinguish

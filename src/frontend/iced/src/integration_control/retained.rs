@@ -3753,7 +3753,11 @@ impl State {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.busy || snapshot.mode != crate::generated::ExploreMode::Gallery {
+                // The retained detail overlay can still cover the sidebar after
+                // native mode changes. Wait until the gallery exposes Stop.
+                if !model.explore_stop_available()
+                    || fully_drawn_gallery(frame, snapshot, probes.draws().gallery).is_none()
+                {
                     return Task::none();
                 }
                 driver.phase = Phase::ExploreDatasetStop {

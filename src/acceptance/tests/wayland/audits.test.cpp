@@ -2455,13 +2455,19 @@ void native_compile_resizes(BrowserAudit& audit, std::uint64_t generation, std::
   nlohmann::json facts{
    {"step", step}, {"generation", generation}, {"before_revision", 2U}, {"revision", 3U}, {"root_revision", 3U}, {"css", {width, height}}, {"backing", {width, height}},
    {"configured", {width, height}}, {"root", {0, 0, width, height}}, {"ui_root", {0, 0, width, height}}, {"root_scale", 1}, {"device_scale", 1}, {"inputs", 0}, {"viewport", {width, height}},
-   {"prior_viewport", {1280, 1024}}, {"transition", {{"event", "iced.window.presented"}, {"pending_resize", false}, {"width", width}, {"height", height}}}
+   {"prior_viewport", {1280, 1024}}, {"request_sequence", 4U}, {"root_before_draw", 5U}, {"ui_root_sequence", 6U},
+   {"transition", {{"event", "iced.window.presented"}, {"sequence", 7U}, {"pending_resize", false}, {"width", width}, {"height", height}}}
   };
+  if (defect == "quiet-progress") facts["revision"] = facts["root_revision"] = 2U;
   if (defect == "stale-ui-root") facts["ui_root"][2] = width - 100;
   if (defect == "stale-root") facts["root"][2] = width - 100;
   if (defect == "stale-configure") facts["configured"][1] = height - 1;
   if (defect == "input-wakeup") facts["inputs"] = 1;
-  if (defect == "stale-progress") facts["revision"] = 2;
+  if (defect == "stale-progress") facts["revision"] = 1;
+  if (defect == "stale-root-revision") facts["root_revision"] = 2;
+  if (defect == "stale-draw") facts["root_before_draw"] = 3;
+  if (defect == "stale-ui-draw") facts["ui_root_sequence"] = 4;
+  if (defect == "stale-presentation") facts["transition"]["sequence"] = 6;
   if (defect == "pending-resize") facts["transition"]["pending_resize"] = true;
   if (defect == "no-present") facts["transition"]["event"] = "iced.window.requested";
   if (defect == "unchanged-viewport") facts["prior_viewport"] = facts["viewport"];
@@ -2469,12 +2475,14 @@ void native_compile_resizes(BrowserAudit& audit, std::uint64_t generation, std::
  }
 }
 }  // namespace
-TEST_CASE("active compile resize evidence requires progress actual presentation and root coverage", "[workspace][audit]") {
- for (const std::string defect : {"none", "stale-root", "stale-ui-root", "stale-configure", "input-wakeup", "stale-progress", "pending-resize", "no-present", "unchanged-viewport"}) {
+TEST_CASE("active compile resize evidence requires current native state and a new presented root", "[workspace][audit]") {
+ for (const std::string defect :
+  {"none", "quiet-progress", "stale-root", "stale-ui-root", "stale-configure", "input-wakeup", "stale-progress", "stale-root-revision", "stale-draw", "stale-ui-draw", "stale-presentation",
+   "pending-resize", "no-present", "unchanged-viewport"}) {
   BrowserAudit audit;
   native_dataset_frame(audit, 1U);
   native_compile_resizes(audit, 1U, defect);
-  CHECK(audit.compile_resize_complete(1U) == (defect == "none"));
+  CHECK(audit.compile_resize_complete(1U) == (defect == "none" || defect == "quiet-progress"));
  }
 }
 TEST_CASE("native drawn work requires correlated exact captions and track meaning", "[workspace][audit]") {
