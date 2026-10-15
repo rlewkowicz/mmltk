@@ -9,10 +9,18 @@ bool identity(const std::string& value) {
  return !value.empty() && value.size() <= 64 && value.find_first_not_of("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-") == std::string::npos;
 }
 }  // namespace
-double training_selection_metric(const EvalSummary& summary, bool masks) {
- if (masks && !summary.mask) throw std::invalid_argument("segmentation selection requires mask AP");
- if (!(masks ? summary.mask->available : summary.bbox.available)) throw std::invalid_argument("selection requires an available validation metric");
- const double value = masks ? summary.mask->ap : summary.bbox.ap;
+double training_selection_metric(const EvalSummary& summary, ModelTask task) {
+ if (!model_task_name(task)) throw std::invalid_argument("selection model task is invalid");
+ const MetricSummary* selected = &summary.bbox;
+ if (task == ModelTask::Segmentation) {
+  if (!summary.mask) throw std::invalid_argument("segmentation selection requires mask AP");
+  selected = &*summary.mask;
+ } else if (task == ModelTask::Keypoints) {
+  if (!summary.keypoint) throw std::invalid_argument("keypoint selection requires OKS AP");
+  selected = &*summary.keypoint;
+ }
+ if (!selected->available) throw std::invalid_argument("selection requires an available task metric");
+ const double value = selected->ap;
  if (!std::isfinite(value)) throw std::invalid_argument("selection requires a finite validation metric");
  return value;
 }
@@ -32,7 +40,7 @@ void validate_training_selection(const TrainingSelection& value) {
  if (std::abs(total - 1.0) > 1e-12) throw std::invalid_argument("selected coefficients are not normalized");
 }
 void validate_training_session_manifest(const TrainingSessionManifest& value) {
- if (value.format_version != kTrainingSessionFormat || !identity(value.session_id) || !identity(value.attempt_id) || !identity(value.generation) ||
+ if ((value.identity_schema != 1 && value.identity_schema != 2) || value.format_version != kTrainingSessionFormat || !identity(value.session_id) || !identity(value.attempt_id) || !identity(value.generation) ||
      (!value.previous_generation.empty() && (!identity(value.previous_generation) || value.previous_generation == value.generation)) || !digest(value.initialization) || !digest(value.configuration) ||
      !digest(value.validation) || !digest(value.plan_sha256) || value.models.empty() || value.models.size() > kMaximumTrainingModels)
   throw std::invalid_argument("invalid training session manifest");

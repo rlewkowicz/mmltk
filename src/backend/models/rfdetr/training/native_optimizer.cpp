@@ -17,7 +17,7 @@ bool muon_parameter_eligible(const std::string_view name, const torch::Tensor& p
  if ((parameter.dim() != 2 && parameter.dim() != 4) || name.find(".weight") == std::string_view::npos) { return false; }
  if (name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos || name.find("cls_token") != std::string_view::npos ||
      name.find("mask_token") != std::string_view::npos || name.find("query_feat") != std::string_view::npos || name.find("refpoint_embed") != std::string_view::npos ||
-     name.find("class_embed") != std::string_view::npos || name.find("bbox_embed") != std::string_view::npos || name.find("segmentation_head") != std::string_view::npos) {
+     name.find("class_embed") != std::string_view::npos || name.find("bbox_embed") != std::string_view::npos || name.find("segmentation_head") != std::string_view::npos || name.find("keypoint_embed") != std::string_view::npos) {
   return false;
  }
  return true;
@@ -999,34 +999,37 @@ void NativeOptimizer::load(torch::serialize::InputArchive& archive) {
  std::visit([&](auto& optimizer) { optimizer.load(archive); }, storage_);
 }
 bool is_encoder_param(std::string_view name) { return name.find("backbone.0.encoder") != std::string_view::npos; }
-bool encoder_zero_weight_decay(std::string_view name) {
+bool encoder_zero_weight_decay(std::string_view name, BackboneKind family) {
+ if (family == BackboneKind::PeCoreTiny) return name.find("pos_embed") != std::string_view::npos || name.find("rel_pos") != std::string_view::npos || name.find("bias") != std::string_view::npos || name.find("norm") != std::string_view::npos || name.find("cls_token") != std::string_view::npos || name.find("reg_token") != std::string_view::npos || name.find("patch_embed") != std::string_view::npos;
  return name.find("gamma") != std::string_view::npos || name.find("bias") != std::string_view::npos || name.find("norm") != std::string_view::npos ||
         name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos || name.find("rel_pos") != std::string_view::npos;
 }
-int encoder_layer_id(std::string_view name) {
- constexpr int kNumVitLayers = 13;
+int encoder_layer_id(std::string_view name, const BackboneConfig& backbone) {
+ const int kNumVitLayers = backbone.features.back() + (backbone.kind == BackboneKind::PeCoreTiny ? 2 : 1);
+ if (backbone.kind == BackboneKind::PeCoreTiny && (name.find(".pos_embed") != std::string_view::npos || name.find(".patch_embed") != std::string_view::npos || name.find(".cls_token") != std::string_view::npos || name.find(".reg_token") != std::string_view::npos)) return 0;
  if (name.find("embeddings") != std::string_view::npos) { return 0; }
- const auto layer_pos = name.find(".layer.");
+ const auto layer_marker = backbone.kind == BackboneKind::PeCoreTiny ? std::string_view(".blocks.") : std::string_view(".layer.");
+ const auto layer_pos = name.find(layer_marker);
  if (layer_pos != std::string_view::npos && name.find(".residual.") == std::string_view::npos) {
-  const auto digits_pos = layer_pos + std::string_view(".layer.").size();
+  const auto digits_pos = layer_pos + layer_marker.size();
   size_t digits_len = 0;
   while (digits_pos + digits_len < name.size() && std::isdigit(static_cast<unsigned char>(name[digits_pos + digits_len]))) { ++digits_len; }
   if (digits_len > 0) { return std::stoi(std::string(name.substr(digits_pos, digits_len))) + 1; }
  }
  return kNumVitLayers + 1;
 }
-double parameter_lr(std::string_view name, const TrainRequest& options) {
+double parameter_lr(std::string_view name, const TrainRequest& options, const BackboneConfig& backbone) {
  if (is_encoder_param(name)) {
-  constexpr int kNumVitLayers = 13;
-  const int layer_id = encoder_layer_id(name);
+  const int kNumVitLayers = backbone.features.back() + (backbone.kind == BackboneKind::PeCoreTiny ? 2 : 1);
+  const int layer_id = encoder_layer_id(name, backbone);
   return options.recipe.lr_encoder * std::pow(options.recipe.encoder_layer_decay, static_cast<double>(kNumVitLayers + 1 - layer_id)) * options.recipe.lr_component_decay *
          options.recipe.lr_component_decay;
  }
  if (name.find("transformer.decoder") != std::string_view::npos) { return options.recipe.lr * options.recipe.lr_component_decay; }
  return options.recipe.lr;
 }
-double parameter_weight_decay(std::string_view name, const TrainRequest& options) {
- if (is_encoder_param(name)) { return encoder_zero_weight_decay(name) ? 0.0 : options.recipe.weight_decay; }
+double parameter_weight_decay(std::string_view name, const TrainRequest& options, const BackboneConfig& backbone) {
+ if (is_encoder_param(name)) { return encoder_zero_weight_decay(name, backbone.kind) ? 0.0 : options.recipe.weight_decay; }
  return options.recipe.weight_decay;
 }
 // Builds the group/parameter inputs shared by the native optimizers: one NamedParameter per trainable
@@ -1046,7 +1049,7 @@ std::pair<std::vector<typename Optimizer::Group>, std::vector<typename Optimizer
  }
  return {std::move(optimizer_groups), std::move(optimizer_params)};
 }
-OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch::Tensor>& parameters, const TrainRequest& options) {
+OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch::Tensor>& parameters, const TrainRequest& options, const BackboneConfig& backbone) {
  struct GroupSpec {
   double lr = 0.0;
   double weight_decay = 0.0;
@@ -1060,8 +1063,8 @@ OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch
  for (const auto& item : parameters) {
   const auto& param = item.value();
   if (!param.is_floating_point()) continue;
-  const double lr = parameter_lr(item.key(), options);
-  const double weight_decay = parameter_weight_decay(item.key(), options);
+  const double lr = parameter_lr(item.key(), options, backbone);
+  const double weight_decay = parameter_weight_decay(item.key(), options, backbone);
   const bool use_muon = options.recipe.optimizer == TrainOptimizerKind::Muon && muon_parameter_eligible(item.key(), param);
   const auto role = options.recipe.optimizer == TrainOptimizerKind::SGD && item.key().find("bias") != std::string::npos ? TrainingGroupRole::Bias : TrainingGroupRole::Ordinary;
   const std::string key = std::format("{}{}:{}:{}", use_muon ? "muon:" : "aux:", lr, weight_decay, static_cast<int>(role));

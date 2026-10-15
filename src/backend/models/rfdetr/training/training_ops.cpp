@@ -294,6 +294,10 @@ TrainingScalarPacket::Tensors ordinary_scalar_tensors(const TensorMap& losses, c
  assign.operator()<^^TrainingScalars::giou>("loss_giou");
  assign.operator()<^^TrainingScalars::mask_ce>("loss_mask_ce");
  assign.operator()<^^TrainingScalars::mask_dice>("loss_mask_dice");
+ assign.operator()<^^TrainingScalars::keypoint_l1>("loss_keypoints_l1");
+ assign.operator()<^^TrainingScalars::keypoint_findable>("loss_keypoints_findable");
+ assign.operator()<^^TrainingScalars::keypoint_visible>("loss_keypoints_visible");
+ assign.operator()<^^TrainingScalars::keypoint_nll>("loss_keypoints_nll");
  assign.operator()<^^TrainingScalars::class_error>("class_error");
  assign.operator()<^^TrainingScalars::cardinality_error>("cardinality_error");
  return values;

@@ -7,6 +7,7 @@
 #include "src/common/io/path_publication.h"
 #include "src/frameworks/serialization/reflected_json.h"
 #include "src/pch_std.h"
+#include <nlohmann/json.hpp>
 namespace mmltk::backend::models::rfdetr {
 namespace {
 namespace io = mmltk::common::io;
@@ -38,7 +39,7 @@ void write_json(const std::filesystem::path& path, const T& value, serial::wire:
 }
 void require_metric(const TrainingArtifact& artifact, const NativeCheckpointMetadata& metadata) {
  const auto* preset = find_preset_catalog_entry(metadata.preset_name);
- if (!artifact.selection_metric || !artifact.evaluation || !preset || training_selection_metric(*artifact.evaluation, preset->task == ModelTask::Segmentation) != *artifact.selection_metric)
+ if (!artifact.selection_metric || !artifact.evaluation || !preset || training_selection_metric(*artifact.evaluation, preset->task) != *artifact.selection_metric)
   throw std::invalid_argument("native training artifact metric differs");
 }
 }  // namespace
@@ -113,7 +114,9 @@ TrainingSelection read_training_selection(const std::filesystem::path& path) {
 }
 void write_training_manifest(const std::filesystem::path& path, const TrainingSessionManifest& value) { write_json(path, value, manifest_limits); }
 TrainingSessionManifest read_training_manifest(const std::filesystem::path& path) {
- auto value = serial::decode_reflected_json<TrainingSessionManifest>(read_file(path, kTrainingManifestBytes), manifest_limits);
+ auto document = nlohmann::json::parse(read_file(path, kTrainingManifestBytes));
+ if (!document.contains("identity_schema")) document["identity_schema"] = 1;
+ auto value = serial::decode_reflected_json<TrainingSessionManifest>(document.dump(), manifest_limits);
  validate_training_session_manifest(value);
  return value;
 }

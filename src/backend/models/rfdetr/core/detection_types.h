@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <span>
 #include <meta>
 #include <type_traits>
 #include <optional>
@@ -190,6 +191,8 @@ struct OutputTensors {
  torch::Tensor pred_logits;
  torch::Tensor pred_boxes;
  std::optional<torch::Tensor> pred_masks{};
+ std::optional<torch::Tensor> pred_keypoints{};
+ std::span<const std::uint16_t> keypoints_per_class{};
 };
 void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, at::ScalarType expected_dtype, const char* context);
 struct DetectionConfig {
@@ -205,6 +208,11 @@ struct DetectionConfig {
  bool aux_loss = false;
  bool two_stage = false;
  bool include_masks = false;
+ std::vector<std::uint16_t> keypoints_per_class;
+ double keypoint_l1_loss_coef = 0.0;
+ double keypoint_findable_loss_coef = 0.0;
+ double keypoint_visible_loss_coef = 0.0;
+ double keypoint_nll_loss_coef = 0.0;
  bool use_jit_traced_loss_ops = false;
  int64_t mask_point_sample_ratio = 16;
  double focal_alpha = 0.25;

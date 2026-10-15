@@ -2,6 +2,9 @@
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "src/backend/models/rfdetr/contract/evaluation_metrics.h"
 #include <array>
+#include <span>
+#include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/models/rfdetr/core/keypoint_prediction.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include <algorithm>
 #include <cstddef>
@@ -19,11 +22,13 @@ struct PhaseTiming {
 enum class EvaluationMetricSet : std::uint8_t {
  BBox,
  BBoxAndMask,
+ BBoxAndKeypoint,
 };
 [[nodiscard]] constexpr const char* evaluation_metric_set_name(const EvaluationMetricSet metric_set) noexcept {
  switch (metric_set) {
   case EvaluationMetricSet::BBox: return "bbox";
   case EvaluationMetricSet::BBoxAndMask: return "bbox_and_mask";
+  case EvaluationMetricSet::BBoxAndKeypoint: return "bbox_and_keypoint";
  }
  return "unknown";
 }
@@ -88,6 +93,19 @@ inline std::array<float, 4> ordered_xyxy(const float* box_values) {
   std::max(y1, y2),
  };
 }
+struct PredictedKeypoint final {
+ float x = 0, y = 0, confidence = 0;
+ // Precision Cholesky parameters in the normalized model coordinate domain.
+ std::array<float, 3> precision_cholesky{};
+};
+struct KeypointPredictionView final {
+ const float* data = nullptr;
+ std::ptrdiff_t prediction_stride = 0;
+ std::size_t joint_capacity = 0;
+};
+[[nodiscard]] double keypoint_oks(const KeypointPredictionView&, std::size_t prediction,
+ std::span<const mmltk::backend::data::PackedKeypoint> target, std::span<const double> sigmas,
+ const std::array<float, 4>& target_box, double target_area, const std::array<double, 2>& source_scale);
 struct Prediction {
  int image_id = 0;
  int class_reference = 0;
@@ -96,6 +114,8 @@ struct Prediction {
  std::array<float, 4> bbox_xyxy{};
  EncodedMask mask{};
  bool has_mask = false;
+ std::vector<PredictedKeypoint> keypoints;
+ std::vector<mmltk::backend::data::catalog::KeypointVisibility> keypoint_visibility;
 };
 struct BBoxPredictionView {
  int image_id = 0;

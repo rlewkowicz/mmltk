@@ -57,6 +57,8 @@ struct TrainingModelFile final {
  bool operator==(const TrainingModelFile&) const = default;
 };
 struct TrainingSessionManifest final {
+ // Identity schema 1 is the immutable 1c13fec8 configuration/header vocabulary.
+ std::uint32_t identity_schema = 2;
  std::uint32_t format_version = kTrainingSessionFormat;
  MMLTK_MAX_BYTES(64) std::string session_id;
  MMLTK_MAX_BYTES(64) std::string attempt_id;
@@ -82,7 +84,7 @@ struct TrainingFailure final {
  MMLTK_MAX_BYTES(65536) std::string detail;
  bool operator==(const TrainingFailure&) const = default;
 };
-[[nodiscard]] double training_selection_metric(const EvalSummary&, bool masks);
+[[nodiscard]] double training_selection_metric(const EvalSummary&, ModelTask task);
 void validate_training_selection(const TrainingSelection&);
 void validate_training_session_manifest(const TrainingSessionManifest&);
 MMLTK_REFLECT_ENUM(EvaluatedWeights)

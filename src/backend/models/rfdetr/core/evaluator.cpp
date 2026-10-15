@@ -8,13 +8,18 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <map>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
-EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks) {
+EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks, bool request_keypoints) {
+ if (request_keypoints) {
+  if (!loader.class_catalog()->has_keypoints()) throw std::invalid_argument("keypoint evaluation requires an admitted dataset schema");
+  return EvaluationMetricSet::BBoxAndKeypoint;
+ }
  const bool masks = request_masks && std::ranges::all_of(loader.eligible_slots(),
                                       [&](auto slot) { return std::ranges::all_of(loader.annotations(slot).labels, [](const auto& annotation) { return annotation.has_mask(); }); });
  return masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox;
@@ -40,7 +45,7 @@ public:
  void limit_images(size_t limit);
  bool has_image(int image_id) const;
  [[nodiscard]] ImageEvaluationMatches match_staged_predictions(
-  std::int64_t dataset_index, const BBoxPredictionView& bbox, const std::optional<PackedMaskPredictionView>& mask, size_t max_dets_per_image, std::span<const Prediction> encoded_masks = {}) const;
+  std::int64_t dataset_index, const BBoxPredictionView& bbox, const std::optional<PackedMaskPredictionView>& mask, size_t max_dets_per_image, std::span<const Prediction> encoded_masks = {}, std::optional<KeypointPredictionView> keypoints = {}) const;
  void merge_matches(ImageEvaluationMatches&& matches);
  void clear_predictions();
  EvalSummary evaluate(size_t max_dets_per_image, EvaluationDetailRetention retention, mmltk::common::concurrency::WorkerPool* worker_pool = nullptr) const;
@@ -92,6 +97,9 @@ private:
  std::vector<std::uint16_t> ground_truth_categories_;
  std::vector<std::uint32_t> ground_truth_ordinals_;
  std::vector<double> image_area_scale_;
+ std::vector<std::array<double, 2>> image_source_scale_;
+ std::vector<std::vector<mmltk::backend::data::PackedKeypoint>> ground_truth_joints_;
+ std::vector<std::array<size_t, kEvaluationAreaCount>> keypoint_ground_truth_totals_;
  std::vector<double> ground_truth_areas_;
  std::vector<std::uint8_t> ground_truth_flags_;
  std::vector<std::array<size_t, kEvaluationAreaCount>> area_ground_truth_totals_;
@@ -106,6 +114,8 @@ private:
  size_t prediction_count_ = 0;
  std::optional<size_t> matched_max_dets_per_image_;
  mutable MetricScratch bbox_metric_scratch_;
+ mutable MetricScratch keypoint_metric_scratch_;
+ mutable std::vector<std::vector<CompactImageMatchRecord>> keypoint_matches_by_category_;
  mutable std::optional<MetricScratch> mask_metric_scratch_;
  mutable std::vector<EvaluationMetricDetail> details_;
 };
@@ -200,7 +210,6 @@ struct ImageMatchingScratch {
 ImageMatchingScratch& image_matching_scratch(const size_t category_count) {
  thread_local ImageMatchingScratch scratch;
  scratch.predictions_by_category.resize(category_count);
- for (auto& predictions : scratch.predictions_by_category) { predictions.clear(); }
  return scratch;
 }
 std::uint16_t eligible_threshold_bits(const double iou) {
@@ -211,6 +220,7 @@ std::uint16_t eligible_threshold_bits(const double iou) {
  return bits;
 }
 size_t group_staged_predictions_by_category(const BBoxPredictionView& predictions, const size_t category_count, const size_t max_dets_per_image, ImageMatchingScratch& scratch) {
+ for (auto& category_predictions : scratch.predictions_by_category) { category_predictions.clear(); }
  size_t selected_count = 0;
  for (size_t prediction_index = 0; prediction_index < predictions.count; ++prediction_index) {
   const std::ptrdiff_t offset = static_cast<std::ptrdiff_t>(prediction_index);
@@ -366,6 +376,9 @@ CocoDataset::CocoDataset(const CocoDataset& other)
       ground_truth_categories_(other.ground_truth_categories_),
       ground_truth_ordinals_(other.ground_truth_ordinals_),
       image_area_scale_(other.image_area_scale_),
+      image_source_scale_(other.image_source_scale_),
+      ground_truth_joints_(other.ground_truth_joints_),
+      keypoint_ground_truth_totals_(other.keypoint_ground_truth_totals_),
       ground_truth_areas_(other.ground_truth_areas_),
       ground_truth_flags_(other.ground_truth_flags_),
       area_ground_truth_totals_(other.area_ground_truth_totals_),
@@ -378,7 +391,8 @@ CocoDataset::CocoDataset(const CocoDataset& other)
       bbox_matches_by_category_(other.bbox_matches_by_category_),
       mask_matches_by_category_(other.mask_matches_by_category_),
       prediction_count_(other.prediction_count_),
-      matched_max_dets_per_image_(other.matched_max_dets_per_image_) {
+      matched_max_dets_per_image_(other.matched_max_dets_per_image_),
+      keypoint_matches_by_category_(other.keypoint_matches_by_category_) {
  bbox_metric_scratch_.reset(catalog_->size());
  if (metric_set_ == EvaluationMetricSet::BBoxAndMask) {
   mask_metric_scratch_.emplace();
@@ -447,9 +461,12 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
  }
  if (annotation_offset != label_count) { throw std::runtime_error("compiled evaluation dense-span cardinality mismatch"); }
  out.image_area_scale_.resize(image_count);
+ out.image_source_scale_.resize(image_count);
+ if (metric_set == EvaluationMetricSet::BBoxAndKeypoint) out.ground_truth_joints_.resize(label_count);
  for (size_t image = 0; image < image_count; ++image) {
   const auto& entry = loader.image_entry(static_cast<std::uint32_t>(out.image_ids_[image] - 1));
   const auto geometry = loader.geometry(static_cast<std::uint32_t>(out.image_ids_[image] - 1));
+  out.image_source_scale_[image] = {static_cast<double>(entry.original_width) / geometry.resized_width, static_cast<double>(entry.original_height) / geometry.resized_height};
   out.image_area_scale_[image] = (static_cast<double>(entry.original_width) / geometry.resized_width) * (static_cast<double>(entry.original_height) / geometry.resized_height);
  }
  out.ground_truth_areas_.resize(label_count);
@@ -486,6 +503,11 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
    out.ground_truth_flags_[dense_index] = packed.flags;
    out.ground_truth_categories_[dense_index] = packed.class_id;
    out.ground_truth_ordinals_[dense_index] = annotation_ordinal;
+   if (metric_set == EvaluationMetricSet::BBoxAndKeypoint) {
+    const auto joints = annotations.instance_joints(annotation_ordinal);
+    if (joints.size() != out.catalog_->keypoints(packed.class_id).names.size()) throw std::invalid_argument("evaluation target joint schema differs");
+    out.ground_truth_joints_[dense_index].assign(joints.begin(), joints.end());
+   }
    if (metric_set == EvaluationMetricSet::BBoxAndMask) {
     if (ground_truth_masks_storage == nullptr || ground_truth_mask_runs_storage == nullptr) { throw std::logic_error("mask evaluation storage was not initialized"); }
     std::vector<GroundTruthMask>& ground_truth_masks = *ground_truth_masks_storage;
@@ -519,12 +541,18 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
 }
 void CocoDataset::rebuild_ground_truth_totals() {
  area_ground_truth_totals_.assign(catalog_->size(), {});
+ keypoint_ground_truth_totals_.assign(catalog_->size(), {});
  for (size_t image_index = 0; image_index < image_ids_.size(); ++image_index) {
   for (size_t category_index = 0; category_index < catalog_->size(); ++category_index) {
    const auto span = ground_truth_spans_[ground_truth_span_index(image_index, category_index)];
    for (size_t gt = span.offset; gt < span.offset + span.count; ++gt) {
     if ((ground_truth_flags_[gt] & mmltk::backend::data::kAnnotationCrowd) != 0U) continue;
-    for (size_t area = 0; area < kEvaluationAreaCount; ++area) { area_ground_truth_totals_[category_index][area] += evaluation_area_contains(area, ground_truth_areas_[gt]) ? 1U : 0U; }
+    for (size_t area = 0; area < kEvaluationAreaCount; ++area) {
+     const bool included = evaluation_area_contains(area, ground_truth_areas_[gt]);
+     area_ground_truth_totals_[category_index][area] += included ? 1U : 0U;
+     if (metric_set_ == EvaluationMetricSet::BBoxAndKeypoint && area != static_cast<size_t>(EvaluationArea::Small) && included &&
+         std::ranges::any_of(ground_truth_joints_[gt], [](const auto& point) { return point.visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; })) ++keypoint_ground_truth_totals_[category_index][area];
+    }
    }
   }
  }
@@ -542,6 +570,8 @@ void CocoDataset::rebuild_ground_truth_totals() {
  }
 }
 void CocoDataset::reset_match_storage() {
+ keypoint_matches_by_category_.resize(catalog_->size());
+ for (auto& matches : keypoint_matches_by_category_) matches.clear();
  if (bbox_matches_by_category_.size() != catalog_->size()) { bbox_matches_by_category_.resize(catalog_->size()); }
  for (auto& category_matches : bbox_matches_by_category_) { category_matches.clear(); }
  if (metric_set_ == EvaluationMetricSet::BBoxAndMask) {
@@ -568,6 +598,8 @@ void CocoDataset::limit_images(const size_t limit) {
  }
  ground_truth_spans_.resize(retained_span_count);
  image_area_scale_.resize(limit);
+ image_source_scale_.resize(limit);
+ if (!ground_truth_joints_.empty()) ground_truth_joints_.resize(retained_annotation_count);
  ground_truth_areas_.resize(retained_annotation_count);
  ground_truth_flags_.resize(retained_annotation_count);
  ground_truth_boxes_.resize(retained_annotation_count);
@@ -594,12 +626,13 @@ void CocoDataset::limit_images(const size_t limit) {
  if (mask_matches_by_category_) {
   for (auto& category_matches : *mask_matches_by_category_) { std::erase_if(category_matches, remove_outside_limit); }
  }
+ for (auto& matches : keypoint_matches_by_category_) std::erase_if(matches, remove_outside_limit);
  if (prediction_count_ == 0) { matched_max_dets_per_image_.reset(); }
  rebuild_ground_truth_totals();
 }
 bool CocoDataset::has_image(int image_id) const { return image_id_to_index_.contains(image_id); }
 ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t dataset_index, const BBoxPredictionView& bbox, const std::optional<PackedMaskPredictionView>& mask,
- const size_t max_dets_per_image, const std::span<const Prediction> encoded_masks) const {
+ const size_t max_dets_per_image, const std::span<const Prediction> encoded_masks, const std::optional<KeypointPredictionView> keypoints) const {
  if (dataset_index < 0 || dataset_index >= std::numeric_limits<int>::max() || !image_id_to_index_.contains(static_cast<int>(dataset_index + 1)))
   throw std::out_of_range("staged prediction image index is outside the evaluation dataset");
  if (max_dets_per_image == 0 || bbox.count > std::numeric_limits<std::uint32_t>::max() ||
@@ -609,6 +642,10 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
  const size_t image_index = image_id_to_index_.at(static_cast<int>(dataset_index + 1));
  if (bbox.image_id != image_ids_[image_index]) { throw std::invalid_argument("staged prediction image ID does not match the image matcher index"); }
  const bool mask_mode = metric_set_ == EvaluationMetricSet::BBoxAndMask;
+ const bool keypoint_mode = metric_set_ == EvaluationMetricSet::BBoxAndKeypoint;
+ if (keypoint_mode != keypoints.has_value() || (keypoints && ((bbox.count && !keypoints->data) || keypoints->joint_capacity > mmltk::backend::data::catalog::kKeypointsPerClassCapacity || keypoints->prediction_stride < static_cast<std::ptrdiff_t>(keypoints->joint_capacity * sizeof(KeypointPrediction) / sizeof(float)))))
+  throw std::invalid_argument("keypoint evaluation prediction extent or task differs");
+ if (keypoints) static_cast<void>(checked_prediction_extent(bbox.count, keypoints->prediction_stride, kMaximumPredictionTensorBytes / sizeof(float)));
  if ((!mask_mode && (mask || !encoded_masks.empty())) || (mask_mode && bbox.count != 0U && !mask && encoded_masks.size() != bbox.count)) {
   throw std::invalid_argument("staged prediction mask view does not match the dataset metric mode");
  }
@@ -679,6 +716,34 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
    }, [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
   }
  }
+ if (keypoint_mode) {
+  auto& matches = result.keypoint.emplace();
+  // Stock keypoint maxDets is always 20, independent of the bbox cap.
+  group_staged_predictions_by_category(bbox, category_count, 20, scratch);
+  for (size_t category = 0; category < category_count; ++category) {
+   const auto& schema = catalog_->keypoints(category);
+   if (schema.names.empty()) continue;
+   if (schema.names.size() > keypoints->joint_capacity) throw std::invalid_argument("prediction omitted active keypoints");
+   const auto span = category_ground_truth_span(category);
+   const auto annotated = [this, span](size_t index) { return std::ranges::any_of(ground_truth_joints_[span.offset + index], [](const auto& joint) { return joint.visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; }); };
+   size_t comparisons = 0;
+   match_category_predictions(scratch.predictions_by_category[category], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category), scratch, matches,
+    comparisons, bbox_prediction_score, [&](std::uint32_t prediction, size_t ground_truth) {
+     const auto index = span.offset + ground_truth;
+     return keypoint_oks(*keypoints, prediction, ground_truth_joints_[index], schema.oks_sigmas, ground_truth_boxes_[index], ground_truth_areas_[index], image_source_scale_[image_index]);
+    }, [&](size_t index) { return annotated(index) ? ground_truth_areas_[span.offset + index] : -1.0; }, [&](size_t index) {
+     // COCO keypoint result loading derives area from the active joint bounds.
+     const auto* data = keypoints->data + index * keypoints->prediction_stride;
+     float left = std::numeric_limits<float>::infinity(), top = left, right = -left, bottom = -left;
+     for (size_t joint = 0; joint < schema.names.size(); ++joint) {
+      KeypointPrediction point;
+      std::memcpy(&point, data + joint * sizeof(point) / sizeof(float), sizeof(point));
+      left = std::min(left, point.x); right = std::max(right, point.x); top = std::min(top, point.y); bottom = std::max(bottom, point.y);
+     }
+     return static_cast<double>(right - left) * (bottom - top) * image_area_scale_[image_index];
+    }, [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
+  }
+ }
  result.bbox_iou_candidate_count = bbox_iou_candidate_count;
  result.mask_iou_candidate_count = mask_iou_candidate_count;
  return result;
@@ -699,7 +764,11 @@ void CocoDataset::merge_matches(ImageEvaluationMatches&& matches) {
    if (record.category_index >= mask_matches_by_category->size()) { throw std::out_of_range("mask match category is outside the evaluation dataset"); }
   }
  }
+ if ((metric_set_ == EvaluationMetricSet::BBoxAndKeypoint) != matches.keypoint.has_value()) throw std::invalid_argument("compact keypoint metric mode differs");
+ if (matches.keypoint) for (const auto& record : *matches.keypoint)
+  if (record.category_index >= keypoint_matches_by_category_.size()) throw std::out_of_range("keypoint match category differs");
  matched_max_dets_per_image_ = matches.max_dets_per_image;
+ if (matches.keypoint) for (const auto& record : *matches.keypoint) keypoint_matches_by_category_[record.category_index].push_back(record);
  for (CompactImageMatchRecord& record : matches.bbox) { bbox_matches_by_category_[record.category_index].push_back(record); }
  if (mask_records != nullptr) {
   for (const CompactImageMatchRecord& record : *mask_records) { (*mask_matches_by_category)[record.category_index].push_back(record); }
@@ -715,8 +784,10 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
  const std::array<std::uint32_t, 3> caps{1U, static_cast<std::uint32_t>(std::min<size_t>(10U, max_dets_per_image)), static_cast<std::uint32_t>(max_dets_per_image)};
  details_.clear();
  const bool retain_details = retention == EvaluationDetailRetention::Detailed;
- if (retain_details) details_.resize((catalog_->size() + 1U) * kEvaluationAreaCount * (metric_set_ == EvaluationMetricSet::BBoxAndMask ? 2U : 1U));
+ if (retain_details) details_.resize((catalog_->size() + 1U) * kEvaluationAreaCount * (metric_set_ == EvaluationMetricSet::BBox ? 1U : 2U));
  const auto reduce_metric = [this, worker_pool, &caps, retain_details](auto& matches_by_category, MetricScratch& scratch, EvaluationMetricKind kind) {
+  const auto metric_caps = kind == EvaluationMetricKind::Keypoint ? std::array<std::uint32_t, 3>{20, 20, 20} : caps;
+  const auto& totals = kind == EvaluationMetricKind::Keypoint ? keypoint_ground_truth_totals_ : area_ground_truth_totals_;
   scratch.reset(catalog_->size());
   const auto row_width = catalog_->size() + 1U;
   const auto base = kind == EvaluationMetricKind::Box ? 0U : row_width * kEvaluationAreaCount;
@@ -724,7 +795,7 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
    for (size_t category = 0; category < catalog_->size(); ++category)
     for (size_t area = 0; area < kEvaluationAreaCount; ++area) scratch.categories[category].areas[area].detail = &details_[base + area * row_width + category + 1U];
   const auto reduce_range = [&](const size_t begin, const size_t end) {
-   for (size_t category = begin; category < end; ++category) { reduce_category_matches(matches_by_category[category], area_ground_truth_totals_[category], caps, scratch.categories[category]); }
+   for (size_t category = begin; category < end; ++category) { reduce_category_matches(matches_by_category[category], totals[category], metric_caps, scratch.categories[category]); }
   };
   if (worker_pool != nullptr && catalog_->size() > 1U) {
    const size_t workers = std::min(worker_pool->size(), catalog_->size());
@@ -732,7 +803,10 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
   } else
    reduce_range(0, catalog_->size());
   std::array<ConfidenceMetrics, kEvaluationConfidenceCount> macro{};
+  std::size_t nonempty = 0;
   for (const auto category : ground_truth_nonempty_categories_) {
+   if (!totals[category][0]) continue;
+   ++nonempty;
    const auto& values = scratch.categories[category].confidence;
    for (size_t threshold = 0; threshold < macro.size(); ++threshold) {
     macro[threshold].precision += values[threshold].precision;
@@ -742,8 +816,8 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
   }
   size_t best = 0U;
   for (size_t threshold = 0; threshold < macro.size(); ++threshold) {
-   if (!ground_truth_nonempty_categories_.empty()) {
-    const double divisor = static_cast<double>(ground_truth_nonempty_categories_.size());
+   if (nonempty != 0) {
+    const double divisor = static_cast<double>(nonempty);
     macro[threshold].precision /= divisor;
     macro[threshold].recall /= divisor;
     macro[threshold].f1 /= divisor;
@@ -751,7 +825,7 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
    if (macro[threshold].f1 > macro[best].f1) best = threshold;
   }
   MetricSummary summary;
-  summary.detection_limits = caps;
+  summary.detection_limits = metric_caps;
   summary.confidence = macro[best];
   summary.confidence_threshold = kEvaluationAxes.confidence[best];
   for (size_t area = 0; area < kEvaluationAreaCount; ++area) {
@@ -760,11 +834,22 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
    if (aggregate_detail) {
     aggregate_detail->kind = kind;
     aggregate_detail->area = static_cast<EvaluationArea>(area);
-    aggregate_detail->detection_limits = caps;
+    aggregate_detail->detection_limits = metric_caps;
     aggregate_detail->confidence = macro[best];
     aggregate_detail->confidence_threshold = summary.confidence_threshold;
    }
-   size_t available_categories = 0U;
+   double available_weight = 0;
+   // The pinned evaluator combines per-count COCO evaluations with the full
+   // category count of each available group, including its absent categories.
+   std::map<std::size_t, std::pair<std::size_t, std::size_t>> joint_groups;
+   if (kind == EvaluationMetricKind::Keypoint)
+    for (size_t category = 0; category < catalog_->size(); ++category) {
+     const auto count = catalog_->keypoints(category).names.size();
+     if (!count) continue;
+     auto& group = joint_groups[count];
+     ++group.first;
+     group.second += scratch.categories[category].areas[area].available;
+    }
    for (size_t category = 0; category < catalog_->size(); ++category) {
     auto& detail = scratch.categories[category].areas[area];
     if (detail.detail) {
@@ -774,7 +859,7 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
      row.category = static_cast<std::uint32_t>(category);
      row.available = detail.available;
      row.ground_truth_count = detail.ground_truth_count;
-     row.detection_limits = caps;
+     row.detection_limits = metric_caps;
      row.average_precision = detail.average_precision;
      row.average_recall = detail.average_recall;
      row.confidence = scratch.categories[category].confidence[best];
@@ -782,27 +867,28 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
     }
     aggregate.ground_truth_count += detail.ground_truth_count;
     if (!detail.available) continue;
-    ++available_categories;
+    const double weight = kind == EvaluationMetricKind::Keypoint ? static_cast<double>(joint_groups.at(catalog_->keypoints(category).names.size()).first) / joint_groups.at(catalog_->keypoints(category).names.size()).second : 1.0;
+    available_weight += weight;
     for (size_t iou = 0; iou < kIouThresholds.size(); ++iou) {
-     aggregate.average_precision[iou] += detail.average_precision[iou];
-     for (size_t cap = 0; cap < caps.size(); ++cap) aggregate.average_recall[cap][iou] += detail.average_recall[cap][iou];
+     aggregate.average_precision[iou] += weight * detail.average_precision[iou];
+     for (size_t cap = 0; cap < metric_caps.size(); ++cap) aggregate.average_recall[cap][iou] += weight * detail.average_recall[cap][iou];
      if (aggregate_detail)
-      for (size_t recall = 0; recall < kEvaluationRecallCount; ++recall) aggregate_detail->precision_curve[iou][recall] += detail.detail->precision_curve[iou][recall];
+      for (size_t recall = 0; recall < kEvaluationRecallCount; ++recall) aggregate_detail->precision_curve[iou][recall] += weight * detail.detail->precision_curve[iou][recall];
     }
    }
-   aggregate.available = available_categories != 0U;
+   aggregate.available = available_weight != 0;
    double ap = 0.0;
    std::array<double, 3> ar{};
    if (aggregate.available) {
     for (size_t iou = 0; iou < kIouThresholds.size(); ++iou) {
-     aggregate.average_precision[iou] /= static_cast<double>(available_categories);
+     aggregate.average_precision[iou] /= available_weight;
      ap += aggregate.average_precision[iou] / static_cast<double>(kIouThresholds.size());
-     for (size_t cap = 0; cap < caps.size(); ++cap) {
-      aggregate.average_recall[cap][iou] /= static_cast<double>(available_categories);
+     for (size_t cap = 0; cap < metric_caps.size(); ++cap) {
+      aggregate.average_recall[cap][iou] /= available_weight;
       ar[cap] += aggregate.average_recall[cap][iou] / static_cast<double>(kIouThresholds.size());
      }
      if (aggregate_detail)
-      for (double& precision : aggregate_detail->precision_curve[iou]) precision /= static_cast<double>(available_categories);
+      for (double& precision : aggregate_detail->precision_curve[iou]) precision /= available_weight;
     }
    }
    if (aggregate_detail) {
@@ -817,7 +903,7 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
     summary.ap50 = aggregate.average_precision[0];
     summary.ap75 = aggregate.average_precision[5];
     if (aggregate.available)
-     for (size_t cap = 0; cap < caps.size(); ++cap) summary.average_recall[cap] = ar[cap];
+     for (size_t cap = 0; cap < metric_caps.size(); ++cap) summary.average_recall[cap] = ar[cap];
    } else if (aggregate.available) {
     summary.area_ap[area - 1U] = ap;
     summary.area_ar[area - 1U] = ar.back();
@@ -828,6 +914,7 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
  EvalSummary summary;
  summary.model_detection_budget = static_cast<std::uint32_t>(max_dets_per_image);
  summary.bbox = reduce_metric(bbox_matches_by_category_, bbox_metric_scratch_, EvaluationMetricKind::Box);
+ if (metric_set_ == EvaluationMetricSet::BBoxAndKeypoint) summary.keypoint = reduce_metric(keypoint_matches_by_category_, keypoint_metric_scratch_, EvaluationMetricKind::Keypoint);
  if (metric_set_ == EvaluationMetricSet::BBoxAndMask) {
   if (!mask_matches_by_category_ || !mask_metric_scratch_) throw std::logic_error("mask evaluation reduction storage is unavailable");
   summary.mask = reduce_metric(*mask_matches_by_category_, *mask_metric_scratch_, EvaluationMetricKind::Mask);
@@ -856,8 +943,8 @@ void EvaluationDatasetOwner::merge_bbox_predictions(const std::int64_t dataset_i
  impl_->dataset.merge_matches(impl_->dataset.match_staged_predictions(dataset_index, predictions, std::nullopt, max_dets_per_image));
 }
 EvaluationDatasetOwner::ImageMatches EvaluationDatasetOwner::match_predictions(const std::int64_t dataset_index, const BBoxPredictionView predictions,
- const std::optional<PackedMaskPredictionView> masks, const std::size_t max_dets_per_image, const std::span<const Prediction> encoded_masks) const {
- return impl_->dataset.match_staged_predictions(dataset_index, predictions, masks, max_dets_per_image, encoded_masks);
+ const std::optional<PackedMaskPredictionView> masks, const std::size_t max_dets_per_image, const std::span<const Prediction> encoded_masks, const std::optional<KeypointPredictionView> keypoints) const {
+ return impl_->dataset.match_staged_predictions(dataset_index, predictions, masks, max_dets_per_image, encoded_masks, keypoints);
 }
 void EvaluationDatasetOwner::merge_matches(ImageMatches matches) { impl_->dataset.merge_matches(std::move(matches)); }
 EvalSummary EvaluationDatasetOwner::evaluate(const std::size_t max_dets_per_image, EvaluationDetailRetention retention) const { return impl_->dataset.evaluate(max_dets_per_image, retention); }

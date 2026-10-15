@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/contract/model_topology.h"
 #include <stop_token>
 #include <span>
 #include <stdexcept>
@@ -246,5 +247,5 @@ struct OptimizerBuildResult {
  std::vector<TrainingGroupRole> roles;
 };
 bool is_encoder_param(std::string_view name);
-OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch::Tensor>& parameters, const TrainRequest& options);
+OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch::Tensor>& parameters, const TrainRequest& options, const BackboneConfig& backbone = {});
 }  // namespace mmltk::backend::models::rfdetr

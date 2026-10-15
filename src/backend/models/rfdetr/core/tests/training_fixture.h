@@ -81,6 +81,8 @@ inline void populate_target_views(PreparedTargets& result) {
  result.set_cost_class = model.set_cost_class;
  result.set_cost_bbox = model.set_cost_bbox;
  result.set_cost_giou = model.set_cost_giou;
+ result.keypoints_per_class = model.keypoints_per_class;
+ project_loss_coefficients(result, model);
  return result;
 }
 }  // namespace mmltk::backend::models::rfdetr::testsupport

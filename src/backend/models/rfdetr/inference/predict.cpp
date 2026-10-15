@@ -38,6 +38,7 @@ module;
 #include "src/backend/models/rfdetr/core/execution_precision.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/postprocess.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/ml/torch/scalar_type.h"
 #include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/imaging/resample/image_resize.h"
@@ -358,6 +359,8 @@ private:
      .pred_logits = outputs.main.pred_logits.narrow(0, static_cast<std::int64_t>(index), 1),
      .pred_boxes = outputs.main.pred_boxes.narrow(0, static_cast<std::int64_t>(index), 1),
      .pred_masks = annotations.want_masks && outputs.main.pred_masks ? std::optional{outputs.main.pred_masks->narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
+     .pred_keypoints = outputs.main.pred_keypoints ? std::optional{outputs.main.pred_keypoints->narrow(0, index, 1)} : std::nullopt,
+     .keypoints_per_class = native_->config().keypoints_per_class,
     },
     storage.source_region.height, storage.source_region.width, static_cast<std::int64_t>(count), annotations.want_masks, postprocess_.get());
    const auto active = processed.scores.size(1);
@@ -444,10 +447,11 @@ struct PredictionReadback final {
        labels(device, {}, retirement, operations),
        scores(device, {}, retirement, operations),
        masks(device, {}, retirement, operations),
+       keypoints(device, {}, retirement, operations),
        indices(delivery_indices) {}
  [[nodiscard]] CUresult Close() {
-  box_values = label_values = score_values = mask_values = index_values = torch::Tensor{};
-  for (auto* host : {&boxes, &labels, &scores, &masks}) {
+  box_values = label_values = score_values = mask_values = index_values = keypoint_values = torch::Tensor{};
+  for (auto* host : {&boxes, &labels, &scores, &masks, &keypoints}) {
    const auto status = host->ReleaseSettled();
    if (status != CUDA_SUCCESS && status != CUDA_ERROR_NOT_READY) return status;
   }
@@ -462,6 +466,16 @@ struct PredictionReadback final {
   box_values.copy_(batch.boxes, true);
   label_values.copy_(batch.labels, true);
   score_values.copy_(batch.scores, true);
+  if (!batch.selections.empty() && batch.selections.front().keypoints) {
+   const auto& first = *batch.selections.front().keypoints;
+   const std::vector<int64_t> shape{static_cast<int64_t>(batch.selections.size()), first.size(1), first.size(2), first.size(3)};
+   static_cast<void>(checked_prediction_extent(batch.selections.size() * first.size(1), first.size(2) * sizeof(KeypointPrediction), kMaximumPredictionTensorBytes));
+   keypoint_values = keypoints.view(shape, at::kFloat);
+   for (std::size_t index = 0; index < batch.selections.size(); ++index) {
+    if (!batch.selections[index].keypoints) throw std::invalid_argument("prediction batch omitted keypoints");
+    keypoint_values[index].copy_((*batch.selections[index].keypoints)[0], true);
+   }
+  } else keypoint_values = torch::Tensor{};
  }
  void Read(AnnotationBatch& batch) {
   const auto stream = c10::cuda::getCurrentCUDAStream(batch.boxes.get_device());
@@ -470,11 +484,11 @@ struct PredictionReadback final {
   for (auto& annotation : batch.storage) annotation.count.SettleAfterCompletion(annotation.value_capacity);
   index_values = indices.view(batch.labels.sizes(), at::kLong);
  }
- mmltk::backend::ml::cuda::NumaHostTensor boxes, labels, scores, masks;
+ mmltk::backend::ml::cuda::NumaHostTensor boxes, labels, scores, masks, keypoints;
  mmltk::backend::ml::cuda::NumaHostTensor& indices;
  torch::Tensor device_indices, selected_queries, packed_masks;
  SelectedMaskWorkspace mask_workspace;
- torch::Tensor box_values, label_values, score_values, mask_values, index_values;
+ torch::Tensor box_values, label_values, score_values, mask_values, index_values, keypoint_values;
 };
 ResolvedPredictionDemand prediction_demand(
  const PredictRequest& options, const PredictionBackend& backend, const PredictionDelivery& delivery, const PredictionRecord& record, std::uint32_t width, std::uint32_t height) {
@@ -550,6 +564,22 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
    .mask = {},
    .has_mask = false,
   });
+ }
+ if (storage.keypoint_values.defined()) {
+  const auto& catalog = batch.storage[index].class_catalog;
+  if (!catalog) throw std::invalid_argument("keypoint predictions require a semantic catalog");
+  for (std::size_t survivor = 0; survivor < survivors; ++survivor) {
+   auto& prediction = result[survivor];
+   const auto joints = catalog->keypoints(prediction.class_reference).names.size();
+   if (joints > static_cast<std::size_t>(storage.keypoint_values.size(2))) throw std::invalid_argument("prediction keypoint extent differs from schema");
+   const auto* source = storage.keypoint_values.data_ptr<float>() + index * storage.keypoint_values.stride(0) + retained[survivor] * storage.keypoint_values.stride(1);
+   prediction.keypoints.reserve(joints);
+   for (std::size_t joint = 0; joint < joints; ++joint) {
+    KeypointPrediction point;
+    std::memcpy(&point, source + joint * KeypointPredictionPacket::size, sizeof(point));
+    prediction.keypoints.push_back({point.x, point.y, 1.0F / (1.0F + std::exp(-point.findable_logit)), {point.log_l11, point.l21, point.log_l22}});
+   }
+  }
  }
  auto& annotation = batch.storage[index];
  const auto source_region = annotation.source_region;

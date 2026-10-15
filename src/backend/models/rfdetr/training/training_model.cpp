@@ -62,7 +62,7 @@ struct TrainingModel::Impl final {
   owner->train();
   for (auto& item : owner->named_parameters(true))
    if (options.freeze_encoder && is_encoder_param(item.key())) item.value().set_requires_grad(false);
-  optimizer_build = build_optimizer(owner->named_parameters(true), options);
+  optimizer_build = build_optimizer(owner->named_parameters(true), options, owner->config().backbone);
   clock = std::make_unique<TrainingSchedule>(options.recipe, optimizer_build.base_lrs, optimizer_build.roles, options.epochs, plan.epoch(index, 0).microbatches, contributions);
   continuation.data.model_id = shard.model_id;
   continuation.data.plan_hash = plan.hash();
@@ -134,6 +134,8 @@ void TrainingModel::stage_resume(const DecodedNativeModelState& state, const det
  active.reserve(optimizer.eligible_parameter_names().size());
  for (std::size_t i = 0; i < optimizer.eligible_parameter_names().size(); ++i)
   active.push_back(optimizer.eligible_parameters()[i].requires_grad() || (saved.values.epoch_policy.encoder_unfrozen && is_encoder_param(optimizer.eligible_parameter_names()[i])));
+ if (p.owner->class_layout()->record() != state.metadata.class_layout) throw std::invalid_argument("Resume ordered class/joint schema differs");
+ require_checkpoint_model_topology(p.owner->config(), state.metadata);
  p.staged_model = p.owner->stage_normalized_state(state.entries(), detail::NormalizedModelStateAdmission::Exact);
  p.staged_resume = load_resume_checkpoint_state({}, state, saved, p.optimizer_build.optimizer, optimizer.eligible_parameter_names(), optimizer.eligible_parameters(), active);
  if (p.distributed.rank == 0)
@@ -458,7 +460,7 @@ EvalPassResult TrainingModel::evaluate(TrainingValidationRuntime& validation, Ev
 TrainingArtifactCandidate TrainingModel::save_candidate(const NativeCheckpointMetadata& metadata, const std::filesystem::path& directory, std::string_view session, std::string_view initialization,
  std::string_view configuration, std::string_view validation, std::uint64_t merge, EvaluatedWeights weights, const EvalSummary& summary) {
  auto& p = *impl_;
- const auto metric = training_selection_metric(summary, p.detection.include_masks);
+ const auto metric = training_selection_metric(summary, p.owner->config().task);
  TrainingArtifact value;
  value.session_id = session;
  value.model_id = p.shard.model_id;

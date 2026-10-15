@@ -16,8 +16,10 @@
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/io/file_digest.h"
 namespace mmltk::backend::models::rfdetr {
-// Uses the admitted header and file metadata only; never reads dataset payloads.
-[[nodiscard]] std::string training_dataset_identity(const mmltk::backend::data::FileHeader&, const mmltk::common::io::FileSnapshot&, std::string_view configuration);
+// Uses admitted source metadata (header/catalog), file generation and model identity;
+// never scans image or annotation payloads. An empty span selects the historical header form.
+[[nodiscard]] std::string training_dataset_identity(const mmltk::backend::data::FileHeader&, const mmltk::common::io::FileSnapshot&, std::string_view configuration, std::span<const std::byte> source_metadata = {});
+[[nodiscard]] std::string training_configuration_identity(const NativeRfDetrConfig&, const ModelClassLayout&, std::uint32_t schema);
 [[nodiscard]] bool is_training_session_manifest(const std::filesystem::path&);
 enum class TrainingPublicationStep { Created, PlanWritten, ModelWritten, ModelValidated, Serialized, Validated, Synced, Published, Retained };
 // The bounded admission retains a physical directory lease through all archive

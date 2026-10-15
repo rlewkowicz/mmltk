@@ -17,9 +17,14 @@ void populate_default_detection_weight_dict(DetectionConfig& config) {
   config.weight_dict.emplace_back("loss_mask_ce", config.mask_ce_loss_coef);
   config.weight_dict.emplace_back("loss_mask_dice", config.mask_dice_loss_coef);
  }
- if (!config.aux_loss) { return; }
+ if (!config.keypoints_per_class.empty()) {
+  config.weight_dict.emplace_back("loss_keypoints_l1", config.keypoint_l1_loss_coef);
+  config.weight_dict.emplace_back("loss_keypoints_findable", config.keypoint_findable_loss_coef);
+  config.weight_dict.emplace_back("loss_keypoints_visible", config.keypoint_visible_loss_coef);
+  config.weight_dict.emplace_back("loss_keypoints_nll", config.keypoint_nll_loss_coef);
+ }
  const auto base_weights = config.weight_dict;
- for (std::int64_t layer_index = 0; layer_index < config.dec_layers - 1; ++layer_index) {
+ for (std::int64_t layer_index = 0; config.aux_loss && layer_index < config.dec_layers - 1; ++layer_index) {
   for (const auto& item : base_weights) { config.weight_dict.emplace_back(item.first + "_" + std::to_string(layer_index), item.second); }
  }
  if (config.two_stage && config.dec_layers > 0) {

@@ -1,6 +1,6 @@
 #include "detail/semantic_sampling.h"
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
-#include <cctype>
+#include <string_view>
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
 #include "detail/training_mask_loss.h"
@@ -31,6 +31,7 @@
 #include "detail/scipy_rectangular_lsap.h"
 #include "detail/lsap_scratch.h"
 #include "detail/matcher_workspace.h"
+#include "detail/keypoint_ops.h"
 #include "detail/traced_loss_cache.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/numa_memory.h"
@@ -317,6 +318,12 @@ torch::Tensor build_dense_matcher_cost(const OutputLayer& layer, const PreparedT
   cost = cost + config.mask_ce_loss_coef * batch_sigmoid_ce_loss(pred_masks_logits, tgt_masks_flat, config.use_jit_traced_loss_ops) +
          config.mask_dice_loss_coef * batch_dice_loss(pred_masks_logits, tgt_masks_flat, config.use_jit_traced_loss_ops);
  }
+ if (!config.keypoints_per_class.empty()) {
+  if (!layer.pred_keypoints || !targets.all_keypoints.defined()) throw std::invalid_argument("keypoint matcher requires admitted predictions and targets");
+  const auto boxes = targets.all_boxes.index_select(0, logical_indices);
+  const auto terms = keypoint_matching_cost(layer.pred_keypoints->to(torch::kFloat32), targets.all_keypoints.index_select(0, logical_indices), tgt_ids, boxes.select(1, 2) * boxes.select(1, 3), KeypointTensorLayout(config.keypoints_per_class));
+  cost = add_keypoint_matching_cost(cost.reshape(terms.l1.sizes()), terms, config).flatten(0, 1);
+ }
  return cost.reshape({bs, num_queries, total_targets}).to(torch::kFloat32);
 }
 std::pair<torch::Tensor, torch::Tensor> target_metadata_on_device(const PreparedTargets& targets, const torch::Device& device) {
@@ -335,6 +342,13 @@ void build_cuda_matcher_cost_into(const OutputLayer& layer, const PreparedTarget
  const auto target_boxes = targets.all_boxes.to(device, torch::kFloat32, false, false).contiguous();
  pairwise_detection_cost_cuda_out(compact_cost, pred_logits, pred_boxes, target_labels, target_boxes, target_offsets, target_counts, output_offsets, padded_queries, max_targets, config.set_cost_class,
   config.set_cost_bbox, config.set_cost_giou, config.focal_alpha);
+ if (!config.keypoints_per_class.empty()) {
+  if (!layer.pred_keypoints || !targets.all_keypoints.defined()) throw std::invalid_argument("keypoint matcher requires admitted predictions and targets");
+  const KeypointTensorLayout layout(config.keypoints_per_class);
+  pairwise_keypoint_cost_cuda_add_(compact_cost, layer.pred_keypoints->contiguous(), targets.all_keypoints.contiguous(), target_labels, target_boxes,
+   active_matcher_workspace()->keypoint_counts(config.keypoints_per_class, device), target_offsets, target_counts, output_offsets, padded_queries, max_targets, layout.maximum_joints(),
+   config.keypoint_l1_loss_coef, config.keypoint_findable_loss_coef, config.keypoint_visible_loss_coef, config.keypoint_nll_loss_coef);
+ }
  if (!config.include_masks || !has_target_masks(targets)) { return; }
  mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_cost_masks{"rfdetr.matcher.cost_masks"};
  const auto [point_coords, pred_masks_logits] = sample_matcher_mask_logits(layer, config, retained_coords);
@@ -664,6 +678,14 @@ TensorMap loss_masks(const OutputLayer& layer, const PreparedTargets& targets, c
  losses["loss_mask_dice"] = dice_loss(point_logits, point_labels, num_boxes, config.use_jit_traced_loss_ops);
  return losses;
 }
+TensorMap loss_keypoints(const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& normalizer) {
+ if (!layer.pred_keypoints || !targets.all_keypoints.defined()) throw std::invalid_argument("keypoint criterion requires admitted predictions and targets");
+ const auto source = layer.pred_keypoints->index({indices.source.first, indices.source.second});
+ const auto boxes = targets.all_boxes.index_select(0, indices.global_targets);
+ const auto terms = keypoint_losses(source, targets.all_keypoints.index_select(0, indices.global_targets), targets.all_labels.index_select(0, indices.global_targets), boxes.select(1, 2) * boxes.select(1, 3), KeypointTensorLayout(config.keypoints_per_class));
+ return {{"loss_keypoints_l1", terms.l1.sum() / normalizer}, {"loss_keypoints_findable", terms.findable.sum() / normalizer},
+         {"loss_keypoints_visible", terms.visible.sum() / normalizer}, {"loss_keypoints_nll", terms.nll.sum() / normalizer}};
+}
 void update_losses(TensorMap& destination, TensorMap source, const std::string& suffix = std::string()) {
  for (auto& item : source) { destination[item.first + suffix] = std::move(item.second); }
 }
@@ -726,6 +748,7 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets
  update_losses(losses, loss_labels(outputs.main, targets, indices, config, num_boxes_value, true, statistics));
  update_losses(losses, loss_cardinality(outputs.main, targets, statistics));
  update_losses(losses, loss_boxes(outputs.main, targets, indices, num_boxes_value));
+ if (!config.keypoints_per_class.empty()) update_losses(losses, loss_keypoints(outputs.main, targets, indices, config, num_boxes_value));
  if (config.include_masks) { update_losses(losses, loss_masks(outputs.main, targets, indices, config, num_boxes_value, layer_samples(0), 0)); }
  if (!outputs.aux_outputs.empty()) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_aux{"rfdetr.criterion.aux"};
@@ -734,6 +757,7 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets
    update_losses(losses, loss_labels(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value, false), "_" + std::to_string(aux_index));
    update_losses(losses, loss_cardinality(outputs.aux_outputs[aux_index], targets), "_" + std::to_string(aux_index));
    update_losses(losses, loss_boxes(outputs.aux_outputs[aux_index], targets, aux_indices, num_boxes_value), "_" + std::to_string(aux_index));
+   if (!config.keypoints_per_class.empty()) update_losses(losses, loss_keypoints(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value), "_" + std::to_string(aux_index));
    if (config.include_masks) {
     update_losses(losses, loss_masks(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value, layer_samples(aux_index + 1), aux_index + 1), "_" + std::to_string(aux_index));
    }
@@ -745,6 +769,7 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets
   update_losses(losses, loss_labels(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value, false), "_enc");
   update_losses(losses, loss_cardinality(*outputs.enc_outputs, targets), "_enc");
   update_losses(losses, loss_boxes(*outputs.enc_outputs, targets, enc_indices, num_boxes_value), "_enc");
+  if (!config.keypoints_per_class.empty()) update_losses(losses, loss_keypoints(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value), "_enc");
   if (config.include_masks) {
    update_losses(losses, loss_masks(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value, layer_samples(matcher_layers.size() - 1), matcher_layers.size() - 1), "_enc");
   }
@@ -759,8 +784,13 @@ torch::Tensor weighted_detection_loss(const TensorMap& loss_dict, const Detectio
   auto found = loss_dict.find(item.first);
   if (found == loss_dict.end()) { continue; }
   auto weighted = found->second * item.second;
-  if (auxiliary_weighted && (item.first.ends_with("_enc") || (!item.first.empty() && std::isdigit(static_cast<unsigned char>(item.first.back()))))) {
-   *auxiliary_weighted = auxiliary_weighted->defined() ? *auxiliary_weighted + weighted : weighted;
+  if (auxiliary_weighted) {
+   const std::string_view name = item.first;
+   const auto separator = name.rfind('_');
+   const auto suffix = separator == std::string_view::npos ? std::string_view{} : name.substr(separator + 1);
+   if (suffix == "enc" || (!suffix.empty() && std::ranges::all_of(suffix, [](char value) { return value >= '0' && value <= '9'; }))) {
+    *auxiliary_weighted = auxiliary_weighted->defined() ? *auxiliary_weighted + weighted : weighted;
+   }
   }
   if (!has_loss) {
    total = weighted;

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -70,6 +71,10 @@ struct AlignmentSample final {
  std::vector<float> scores;
  std::vector<std::int64_t> labels;
  std::vector<float> boxes;
+ std::vector<std::vector<mmltk::backend::data::catalog::JointIndex>> evaluator_joints, model_joints;
+ std::vector<KeypointPrediction> joint_values;
+ std::size_t joint_capacity = 0;
+ bool keypoints = false;
  std::vector<Prediction> ground_truth;
  bool masks = false;
  const auto is_sample = [&](std::int64_t index) { return std::in_range<std::uint32_t>(index) && std::ranges::binary_search(samples, static_cast<std::uint32_t>(index)); };
@@ -85,7 +90,8 @@ struct AlignmentSample final {
     [&](const PredictionRunResult& result) {
   if (result.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || !result.class_catalog)
    throw std::invalid_argument("semantic evaluation requires a fully bound model class layout");
-  const auto mode = resolve_evaluation_metric_set(loader, delivery.mask_metrics && result.masks_available);
+  const auto mode = resolve_evaluation_metric_set(loader, delivery.mask_metrics && result.masks_available, result.artifacts.config.has_keypoints());
+  keypoints = mode == EvaluationMetricSet::BBoxAndKeypoint;
   masks = mode == EvaluationMetricSet::BBoxAndMask;
   if (!dataset || dataset->facts().metric_set != mode)
    dataset.emplace(loader, mode);
@@ -94,7 +100,15 @@ struct AlignmentSample final {
   if (request.limit_images != 0U) dataset->limit_images(request.limit_images);
   evaluator_order = result.class_catalog->permutation_to(*dataset->class_catalog());
   model_order.resize(evaluator_order.size());
-  for (std::size_t category = 0; category < evaluator_order.size(); ++category) model_order[evaluator_order[category]] = static_cast<std::uint32_t>(category);
+  evaluator_joints.resize(evaluator_order.size());
+  model_joints.resize(evaluator_order.size());
+  for (std::size_t category = 0; category < evaluator_order.size(); ++category) {
+   const auto destination = evaluator_order[category];
+   model_order[destination] = static_cast<std::uint32_t>(category);
+   evaluator_joints[category] = mmltk::backend::data::catalog::keypoint_permutation(result.class_catalog->keypoints(category), dataset->class_catalog()->keypoints(destination));
+   model_joints[destination] = mmltk::backend::data::catalog::keypoint_permutation(dataset->class_catalog()->keypoints(destination), result.class_catalog->keypoints(category));
+   joint_capacity = std::max(joint_capacity, evaluator_joints[category].size());
+  }
  },
    .completed =
     [&](const PredictionRecord& record, PredictionPixels pixels, const runtime::AnalysisAnnotationStorage& annotations) {
@@ -104,6 +118,8 @@ struct AlignmentSample final {
   scores.reserve(record.detections.size());
   labels.reserve(record.detections.size());
   boxes.reserve(record.detections.size() * 4U);
+  if (keypoints) joint_values.assign(record.detections.size() * joint_capacity, {});
+  std::size_t prediction_index = 0;
   for (const auto& detection : record.detections) {
    scores.push_back(detection.score);
    if (detection.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || detection.class_reference < 0 ||
@@ -111,10 +127,23 @@ struct AlignmentSample final {
     throw std::invalid_argument("invalid semantic evaluator class reference");
    labels.push_back(evaluator_order[detection.class_reference]);
    boxes.insert(boxes.end(), detection.bbox_xyxy.begin(), detection.bbox_xyxy.end());
+   if (keypoints) {
+    const auto& mapping = evaluator_joints[detection.class_reference];
+    if (detection.keypoints.size() != mapping.size()) throw std::invalid_argument("prediction keypoint names/extent differs from admitted schema");
+    for (std::size_t joint = 0; joint < mapping.size(); ++joint) {
+     const auto& source = detection.keypoints[joint];
+     auto& destination = joint_values[prediction_index * joint_capacity + mapping[joint]];
+     destination.x = source.x; destination.y = source.y;
+     destination.findable_logit = std::log(source.confidence / (1 - source.confidence));
+     destination.log_l11 = source.precision_cholesky[0]; destination.l21 = source.precision_cholesky[1]; destination.log_l22 = source.precision_cholesky[2];
+    }
+   }
+   ++prediction_index;
   }
   dataset->merge_matches(dataset->match_predictions(record.dataset_index,
    {.image_id = static_cast<int>(record.image_id), .scores = scores.data(), .labels_zero_based = labels.data(), .boxes_xyxy = boxes.data(), .count = scores.size()}, std::nullopt, evaluation_cap,
-   masks ? std::span<const Prediction>{record.detections} : std::span<const Prediction>{}));
+   masks ? std::span<const Prediction>{record.detections} : std::span<const Prediction>{},
+   keypoints ? std::optional{KeypointPredictionView{reinterpret_cast<const float*>(joint_values.data()), static_cast<std::ptrdiff_t>(joint_capacity * sizeof(KeypointPrediction) / sizeof(float)), joint_capacity}} : std::nullopt));
   if (delivery.sample && is_sample(record.dataset_index)) {
    ground_truth.clear();
    const auto sample_index = static_cast<std::uint32_t>(record.dataset_index);
@@ -127,6 +156,15 @@ struct AlignmentSample final {
     // consume the already-admitted model-to-dataset permutation.
     gt.class_reference = static_cast<int>(model_order[packed.class_id]);
     gt.bbox_xyxy = {static_cast<float>(packed.bbox_x1), static_cast<float>(packed.bbox_y1), static_cast<float>(packed.bbox_x2), static_cast<float>(packed.bbox_y2)};
+    const auto joints = entry.instance_joints(ordinal);
+    const auto& mapping = model_joints[packed.class_id];
+    if (joints.size() != mapping.size()) throw std::invalid_argument("sample keypoint schema differs");
+    gt.keypoints.resize(joints.size());
+    gt.keypoint_visibility.resize(joints.size());
+    for (std::size_t joint = 0; joint < joints.size(); ++joint) {
+     gt.keypoints[mapping[joint]] = {joints[joint].x, joints[joint].y, 0, {}};
+     gt.keypoint_visibility[mapping[joint]] = joints[joint].visibility;
+    }
     gt.has_mask = packed.has_mask();
     gt.mask.width = loader.image_width();
     gt.mask.height = loader.image_height();

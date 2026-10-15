@@ -100,7 +100,7 @@ void accumulate_prediction_transfer_bytes(EvaluationProfileRecord& profile, cons
   const size_t pixels_per_mask = static_cast<size_t>(processed.masks->size(2)) * static_cast<size_t>(processed.masks->size(3));
   mask_bytes = prediction_count * ((pixels_per_mask + 7U) / 8U);
  }
- profile.transferred_bytes += bbox_bytes + mask_bytes + (processed.counts.defined() ? image_count * sizeof(std::int64_t) : 0U);
+ profile.transferred_bytes += (processed.keypoints ? processed.keypoints->nbytes() : 0) + bbox_bytes + mask_bytes + (processed.counts.defined() ? image_count * sizeof(std::int64_t) : 0U);
  profile.mask_transferred_bytes += mask_bytes;
 }
 const char* evaluation_precision_name(const at::ScalarType scalar_type) noexcept {
@@ -318,6 +318,7 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
  auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
  if (stream == nullptr) { throw std::runtime_error("stage_prediction_batch requires a CUDA stream"); }
  std::optional<StagedMaskPredictionBatch> staged_mask;
+ std::optional<torch::Tensor> staged_keypoints;
  try {
   const DeviceIndex checked_index = checked_device_index(device_id);
   CudaGuard device_guard(checked_index);
@@ -331,6 +332,15 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
     count_view.copy_(batch.counts.narrow(0, 0, batch_count), true);
    else
     count_view.fill_(prediction_count);
+  }
+  if (batch.keypoints) {
+   const auto& source = *batch.keypoints;
+   if (source.dim() != 4 || source.size(0) < batch_count || source.size(1) != prediction_count || source.size(3) != sizeof(KeypointPrediction) / sizeof(float)) throw std::invalid_argument("invalid keypoint staging extent");
+   static_cast<void>(checked_prediction_extent(source.numel(), source.element_size(), kMaximumPredictionTensorBytes));
+   if (!buffers.keypoints_cpu.defined() || buffers.keypoints_cpu.size(0) < batch_count || buffers.keypoints_cpu.size(1) < prediction_count || buffers.keypoints_cpu.size(2) != source.size(2))
+    buffers.keypoints_cpu = mmltk::backend::ml::cuda::numa_empty(source.sizes(), torch::kFloat32, device_id);
+   staged_keypoints = buffers.keypoints_cpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
+   staged_keypoints->copy_(source.narrow(0, 0, batch_count), true);
   }
   if (batch.masks.has_value()) {
    const torch::Tensor& source_masks = *batch.masks;
@@ -374,6 +384,7 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
   max_dets_per_image,
   static_cast<size_t>(batch_count),
   std::move(lease),
+  std::move(staged_keypoints),
  };
 }
 // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
@@ -428,7 +439,9 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
    };
   }
   const auto match_started = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  result.evaluation_matches = evaluation_dataset->match_predictions(result.dataset_index, bbox_view, mask_view, staged.max_dets_per_image);
+  std::optional<KeypointPredictionView> keypoints;
+  if (staged.keypoints_cpu) keypoints = KeypointPredictionView{staged.keypoints_cpu->data_ptr<float>() + image_offset * staged.keypoints_cpu->stride(0), staged.keypoints_cpu->stride(1), static_cast<size_t>(staged.keypoints_cpu->size(2))};
+  result.evaluation_matches = evaluation_dataset->match_predictions(result.dataset_index, bbox_view, mask_view, staged.max_dets_per_image, {}, keypoints);
   if (profile != nullptr) {
    record_profile_duration(profile, &EvaluationProfileRecord::cpu_match_nanoseconds, match_started);
    profile->iou_candidate_count.fetch_add(result.evaluation_matches->bbox_iou_candidate_count + result.evaluation_matches->mask_iou_candidate_count, std::memory_order_relaxed);

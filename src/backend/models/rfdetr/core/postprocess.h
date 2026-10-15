@@ -12,6 +12,7 @@
 #include <cuda_runtime_api.h>
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include <torch/types.h>
 namespace mmltk::backend::models::rfdetr {
@@ -37,6 +38,7 @@ public:
  void Prepare(const torch::Device& device);
  [[nodiscard]] torch::Tensor ValidateLogits(const torch::Tensor& logits) const;
  [[nodiscard]] torch::Tensor References(const torch::Tensor& physical_indices) const;
+ [[nodiscard]] torch::Tensor KeypointMask(const KeypointTensorLayout&, const torch::Device&);
  // Read-only storage for use on the calling stream; the returned tensor retains custody.
  [[nodiscard]] torch::Tensor BoxScale(const torch::Tensor& boxes, int64_t height, int64_t width);
  // Borrowed handle. Copy to retain an allocation across replacement or lane
@@ -47,6 +49,9 @@ public:
 private:
  std::shared_ptr<const ResolvedClassLayout> layout_;
  torch::Tensor references_;
+ torch::Tensor keypoint_mask_;
+ std::vector<std::uint16_t> keypoint_counts_;
+ cudaStream_t keypoint_stream_ = nullptr;
  cudaStream_t prepared_stream_ = nullptr;
  detail::FixedBoxScale box_scale_;
 };
@@ -60,6 +65,7 @@ struct PostprocessedSelection {
  torch::Tensor query_indices{};
  std::optional<torch::Tensor> mask_logits{};
  torch::Tensor counts{};
+ std::optional<torch::Tensor> keypoints{};
 };
 PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false, PostprocessLane* lane = nullptr);
 // Complete concurrently live scratch: gathered logits, expanded logits, device
@@ -100,6 +106,7 @@ struct PostprocessedBatch {
  torch::Tensor boxes;
  std::optional<torch::Tensor> masks;
  torch::Tensor counts{};
+ std::optional<torch::Tensor> keypoints{};
  [[nodiscard]] int64_t size() const { return scores.defined() ? scores.size(0) : 0; }
 };
 PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select, PostprocessLane* lane = nullptr);

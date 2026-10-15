@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 #include <array>
+#include <cmath>
 #include <bit>
 #include <algorithm>
 #include <optional>
@@ -501,4 +502,119 @@ TEST_CASE("evaluation retained prefixes preserve score bits records and metrics"
   CHECK(*actual == *expected);
  }
  CHECK_THROWS_AS(match(full, 0, predictions, 0U, true), std::invalid_argument);
+}
+
+TEST_CASE("OKS uses named-schema sigmas occlusion and source geometry independently of confidence", "[rfdetr][evaluation][keypoints]") {
+ using Visibility = data::catalog::KeypointVisibility;
+ std::array<data::PackedKeypoint, 3> target{{{10,20,Visibility::Visible}, {20,30,Visibility::Occluded}, {0,0,Visibility::Unannotated}}};
+ std::array<r::KeypointPrediction, 3> predictions{{{10,20}, {20,30}, {10000,10000}}};
+ const std::array<double,3> sigmas{.1,.2,.3};
+ r::KeypointPredictionView view{reinterpret_cast<const float*>(predictions.data()), 3*sizeof(r::KeypointPrediction)/sizeof(float), 3};
+ CHECK(r::keypoint_oks(view, 0, target, sigmas, {0,0,40,40}, 1600, {1,1}) == Approx(1));
+ predictions[1].x += 10;
+ CHECK(r::keypoint_oks(view, 0, target, sigmas, {0,0,40,40}, 1600, {2,1}) == Approx((1 + std::exp(-400./(.16*1600*2)))/2));
+ for (auto& point : target) point.visibility = Visibility::Unannotated;
+ predictions = {{{0,0}, {80,80}, {-40,-40}}};
+ CHECK(r::keypoint_oks(view, 0, target, sigmas, {0,0,40,40}, 1600, {1,1}) == Approx(1));
+ view.joint_capacity = 2;
+ REQUIRE_THROWS(r::keypoint_oks(view, 0, target, sigmas, {0,0,40,40}, 1600, {1,1}));
+}
+TEST_CASE("Native keypoint evaluation retains bbox metrics twenty detections and schema-specific area results", "[rfdetr][evaluation][keypoints][gpu]") {
+ mmltk::testsupport::ScopedTempDir root("keypoint-evaluation");
+ data::testsupport::FixtureSpec spec{root.path().string(), "train", 128,128,2,0,0};
+ data::testsupport::create_keypoint_dataset(spec);
+ data::testsupport::compile_existing_fixture(spec);
+ data::DatasetLoader loader({.compiled_path=data::testsupport::compiled_bin_path(spec), .batch_size=1, .shuffle=false});
+ REQUIRE(r::resolve_evaluation_metric_set(loader,false,true) == r::EvaluationMetricSet::BBoxAndKeypoint);
+ r::EvaluationDatasetOwner owner(loader, r::EvaluationMetricSet::BBoxAndKeypoint);
+ const auto annotations = loader.annotations(1);
+ const std::size_t capacity = loader.class_catalog()->keypoints(0).names.size();
+ std::vector<r::KeypointPrediction> joints(annotations.labels.size()*capacity);
+ std::vector<float> scores(annotations.labels.size(), .9), boxes;
+ std::vector<std::int64_t> labels;
+ for (std::size_t index=0; index<annotations.labels.size(); ++index) {
+  const auto& label=annotations.labels[index];
+  labels.push_back(label.class_id);
+  boxes.insert(boxes.end(), {float(label.bbox_x1),float(label.bbox_y1),float(label.bbox_x2),float(label.bbox_y2)});
+  const auto source=annotations.instance_joints(index);
+  for (std::size_t joint=0; joint<source.size(); ++joint) joints[index*capacity+joint]={source[joint].x,source[joint].y};
+ }
+ const r::BBoxPredictionView boxes_view{2,scores.data(),labels.data(),boxes.data(),scores.size()};
+ const r::KeypointPredictionView joint_view{reinterpret_cast<const float*>(joints.data()),static_cast<std::ptrdiff_t>(capacity*sizeof(r::KeypointPrediction)/sizeof(float)),capacity};
+ auto matches=owner.match_predictions(1,boxes_view,{},1,{},joint_view);
+ REQUIRE(matches.keypoint);
+ CHECK(matches.keypoint->size()==2);
+ owner.merge_matches(std::move(matches));
+ const auto summary=owner.evaluate(1,r::EvaluationDetailRetention::Detailed);
+ CHECK(summary.bbox.ap==Approx(1));
+ REQUIRE(summary.keypoint);
+ CHECK(summary.keypoint->ap==Approx(1));
+ CHECK((summary.keypoint->detection_limits==std::array<std::uint32_t,3>{20,20,20}));
+ CHECK_FALSE(summary.keypoint->area_ap[0]);
+ REQUIRE(summary.keypoint->area_ap[2]);
+ CHECK(*summary.keypoint->area_ap[2]==Approx(1));
+ const auto details=owner.take_details();
+ CHECK_FALSE(row(details,r::EvaluationArea::All,2U,r::EvaluationMetricKind::Keypoint).available);
+ CHECK(row(details,r::EvaluationArea::Large,0U,r::EvaluationMetricKind::Keypoint).available);
+ auto copy=owner;
+ copy.clear_predictions();
+ CHECK(copy.evaluate(1,r::EvaluationDetailRetention::CompactOnly).keypoint->ap==0);
+ CHECK(owner.evaluate(1,r::EvaluationDetailRetention::CompactOnly).keypoint->ap==Approx(1));
+ REQUIRE_THROWS(owner.match_predictions(1,boxes_view,{},1));
+ owner.limit_images(1);
+ CHECK_FALSE(owner.evaluate(1,r::EvaluationDetailRetention::CompactOnly).keypoint->available);
+}
+
+TEST_CASE("Keypoint matching retains crowd missing-joint ignores area filters and the twenty-result prefix", "[rfdetr][evaluation][keypoints][gpu]") {
+ const mmltk::testsupport::ScopedTempDir root("keypoint-match-rules");
+ const data::testsupport::FixtureSpec spec{root.path().string(), "train", 128,128,2,0,0};
+ data::testsupport::create_keypoint_dataset(spec);
+ {
+  std::ofstream output(std::filesystem::path(data::testsupport::dataset_dir(spec))/spec.split/"000002.jsonl");
+  output << R"({"class":"marker","bbox_xyxy":[20,20,60,60],"area":1600,"ignore":true,"keypoints":[20,20,2,40,40,1]})" << '\n';
+  output << R"({"class":"marker","bbox_xyxy":[90,90,120,120],"area":900,"iscrowd":true,"keypoints":[100,100,2,110,110,2]})" << '\n';
+  output << R"({"class":"marker","bbox_xyxy":[0,0,8,8],"area":64,"keypoints":[0,0,0,0,0,0]})" << '\n';
+ }
+ data::testsupport::compile_existing_fixture(spec);
+ data::DatasetLoader loader({.compiled_path=data::testsupport::compiled_bin_path(spec),.batch_size=1,.shuffle=false});
+ r::EvaluationDatasetOwner owner(loader,r::EvaluationMetricSet::BBoxAndKeypoint);
+ std::vector<r::KeypointPrediction> joints(30*2);
+ std::vector<float> scores(30),boxes(30*4);
+ std::vector<std::int64_t> labels(30,1);
+ for (std::size_t prediction=0;prediction<30;++prediction) {
+  scores[prediction]=1.F-static_cast<float>(prediction)/32;
+  joints[prediction*2]={80,80}; joints[prediction*2+1]={90,90};
+ }
+ joints[2]={20,20}; joints[3]={40,40};
+ joints[4]={100,100}; joints[5]={110,110};
+ joints[6]=joints[4]; joints[7]=joints[5];
+ joints[8]={3,3}; joints[9]={4,4};
+ const r::KeypointPredictionView joint_view{reinterpret_cast<const float*>(joints.data()),2*sizeof(r::KeypointPrediction)/sizeof(float),2};
+ auto matches=owner.match_predictions(1,{2,scores.data(),labels.data(),boxes.data(),scores.size()},{},1,{},joint_view);
+ REQUIRE(matches.keypoint);
+ REQUIRE(matches.keypoint->size()==20);
+ REQUIRE(matches.bbox.size()==1);
+ CHECK(matches.bbox.front().prediction_ordinal==0);
+ for (std::size_t index=0;index<matches.keypoint->size();++index) {
+  CHECK(matches.keypoint->at(index).prediction_ordinal==index);
+  CHECK(matches.keypoint->at(index).category_rank==index);
+ }
+ for (const std::size_t bbox_cap:{7U,30U}) {
+  const auto capped=owner.match_predictions(1,{2,scores.data(),labels.data(),boxes.data(),scores.size()},{},bbox_cap,{},joint_view);
+  REQUIRE(capped.keypoint);
+  REQUIRE(capped.keypoint->size()==20);
+  CHECK(capped.bbox.size()==bbox_cap);
+  for (std::size_t index=0;index<capped.keypoint->size();++index) CHECK(capped.keypoint->at(index).prediction_ordinal==index);
+ }
+ CHECK(matches.keypoint->at(0).area_matched_bits[0]==0);
+ CHECK(matches.keypoint->at(1).area_matched_bits[0]==1023);
+ for (const std::size_t index:{2U,3U,4U}) CHECK(matches.keypoint->at(index).area_ignored_bits[0]==1023);
+ owner.merge_matches(std::move(matches));
+ const auto summary=owner.evaluate(1,r::EvaluationDetailRetention::Detailed);
+ REQUIRE(summary.keypoint);
+ CHECK(summary.keypoint->ap==Approx(.5));
+ CHECK_FALSE(summary.keypoint->area_ap[0]);
+ REQUIRE(summary.keypoint->area_ap[1]);
+ CHECK(*summary.keypoint->area_ap[1]==Approx(1));
+ CHECK_FALSE(summary.keypoint->area_ap[2]);
 }

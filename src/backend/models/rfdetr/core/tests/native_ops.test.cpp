@@ -32,6 +32,9 @@
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "detail/lsap_scratch.h"
+#include "detail/keypoint_ops.h"
+#include "detail/detr_matcher_cuda.h"
+#include <catch2/catch_approx.hpp>
 #include "detail/matcher_workspace.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/numa_memory.h"
@@ -1305,5 +1308,156 @@ TEST_CASE("PE-Core positions and RoPE admit dynamic geometry without learned-sta
    CHECK(torch::equal(parameters["backbone.0.encoder.model.pos_embed"], position));
    CHECK(model.named_buffers().size() == buffers_before);
   }
+ }
+}
+
+TEST_CASE("Keypoint objectives keep visibility masks finite derivatives and class-local normalizers", "[rfdetr][criterion][keypoints]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ using Packet = r::KeypointPredictionPacket;
+ const r::KeypointTensorLayout layout(std::vector<std::uint16_t>{2, 0, 1});
+ for (const auto& device : mmltk::backend::ml::testsupport::available_devices()) {
+  const auto options = torch::TensorOptions().device(device);
+  auto predictions = torch::zeros({4, layout.padded_count(), Packet::size}, options).set_requires_grad(true);
+  const auto targets = torch::tensor({{{.5F, 0.F, 2.F}, {.25F, 0.F, 1.F}}, {{0.F, 0.F, 0.F}, {0.F, 0.F, 0.F}}, {{0.F, 0.F, 0.F}, {0.F, 0.F, 0.F}}, {{0.F, 0.F, 0.F}, {0.F, 0.F, 0.F}}}, options);
+  const auto classes = torch::tensor({0, 1, 2, 3}, options.dtype(torch::kInt64));
+  const auto areas = torch::full({4}, .25, options);
+  const auto losses = r::keypoint_losses(predictions, targets, classes, areas, layout);
+  CHECK(losses.l1[0].item<float>() == Catch::Approx(.75));
+  CHECK(losses.nll[0].item<float>() == Catch::Approx(.3125));
+  for (const auto& loss : {losses.findable, losses.visible}) {
+   CHECK(loss[0].item<float>() == Catch::Approx(std::log(2.)));
+   CHECK(loss[2].item<float>() == Catch::Approx(std::log(2.)));
+   CHECK(loss[1].item<float>() == 0);
+   CHECK(loss[3].item<float>() == 0);
+  }
+  (losses.l1 + losses.findable + losses.visible + losses.nll).sum().backward();
+  REQUIRE(torch::isfinite(predictions.grad()).all().item<bool>());
+  CHECK(predictions.grad().index({0, 0, Packet::index<^^r::KeypointPrediction::x>()}).item<float>() == Catch::Approx(-2.));
+  CHECK(predictions.grad().index({0, 0, Packet::index<^^r::KeypointPrediction::findable_logit>()}).item<float>() == Catch::Approx(-.25));
+  CHECK(predictions.grad().index({0, 1, Packet::index<^^r::KeypointPrediction::visible_logit>()}).item<float>() == Catch::Approx(.25));
+  for (int fault = 0; fault < 4; ++fault) {
+   auto invalid = predictions.detach().clone();
+   const auto channel = fault == 0 ? Packet::index<^^r::KeypointPrediction::x>() : fault == 1 ? Packet::index<^^r::KeypointPrediction::findable_logit>() : Packet::index<^^r::KeypointPrediction::log_l11>();
+   invalid.index_put_({0, 0, channel}, fault == 3 ? 100.F : std::numeric_limits<float>::infinity());
+   invalid.set_requires_grad(true);
+   const auto value = r::keypoint_losses(invalid, targets, classes, areas, layout);
+   auto total = (value.l1 + value.findable + value.visible + value.nll).sum();
+   REQUIRE(torch::isfinite(total).item<bool>());
+   total.backward();
+   REQUIRE(torch::isfinite(invalid.grad()).all().item<bool>());
+   if (fault == 1) CHECK(value.findable[0].item<float>() == Catch::Approx(std::log(2.)));
+   if (fault >= 2) CHECK(value.nll[0].item<float>() == Catch::Approx(.125));
+  }
+  auto concentrated = predictions.detach().clone();
+  Packet::select<^^r::KeypointPrediction::log_l11>(concentrated, -1).fill_(1);
+  Packet::select<^^r::KeypointPrediction::log_l22>(concentrated, -1).fill_(1);
+  auto coincident = targets.clone();
+  coincident.narrow(-1, 0, 2).zero_();
+  CHECK(r::keypoint_losses(concentrated, coincident, classes, areas, layout).nll[0].item<float>() == Catch::Approx(-2.));
+  const auto empty = r::keypoint_losses(predictions.narrow(0, 0, 0), targets.narrow(0, 0, 0), classes.narrow(0, 0, 0), areas.narrow(0, 0, 0), layout);
+  CHECK(empty.l1.numel() == 0);
+  REQUIRE_THROWS(r::keypoint_losses(predictions.narrow(1, 0, 1), targets, classes, areas, layout));
+ }
+}
+TEST_CASE("Keypoint criterion includes every grouped auxiliary and encoder loss in the shared objective", "[rfdetr][criterion][keypoints]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ for (const auto& device : mmltk::backend::ml::testsupport::available_devices()) {
+  const auto options = torch::TensorOptions().device(device);
+  r::DetectionConfig config;
+  config.num_classes = 4; config.group_detr = 2; config.dec_layers = 2; config.keypoints_per_class = {2, 0, 1};
+  config.aux_loss = true; config.two_stage = true; config.cls_loss_coef = 2;
+  config.keypoint_l1_loss_coef = config.keypoint_findable_loss_coef = config.keypoint_visible_loss_coef = config.keypoint_nll_loss_coef = 1;
+  r::populate_default_detection_weight_dict(config);
+  const auto layer = [&] {
+   r::OutputLayer result;
+   result.pred_logits = torch::zeros({1, 4, 4}, options).set_requires_grad(true);
+   result.pred_boxes = torch::full({1, 4, 4}, .5, options).set_requires_grad(true);
+   result.pred_keypoints = torch::zeros({1, 4, 6, r::KeypointPredictionPacket::size}, options).set_requires_grad(true);
+   return result;
+  };
+  r::ModelOutputs outputs{layer(), {layer()}, layer()};
+  auto targets = r::testsupport::one_image_targets(torch::tensor({{.5F,.5F,.5F,.5F}, {.5F,.5F,.5F,.5F}}, options), torch::tensor({0,2}, options.dtype(torch::kInt64)));
+  targets.all_keypoints = torch::tensor({{{.3F,.2F,2.F}, {.6F,.7F,1.F}}, {{.2F,.4F,2.F}, {0.F,0.F,0.F}}}, options);
+  targets.all_keypoint_counts = torch::tensor({2,1}, options.dtype(torch::kInt64));
+  auto losses = r::detection_loss_dict(outputs, targets, config, true, false);
+  for (const auto suffix : {"", "_0", "_enc"})
+   for (const auto name : {"loss_keypoints_l1", "loss_keypoints_findable", "loss_keypoints_visible", "loss_keypoints_nll"}) {
+    const auto key = std::string(name) + suffix;
+    REQUIRE(losses.contains(key));
+    CHECK(torch::isfinite(losses.at(key)).item<bool>());
+    CHECK(std::ranges::any_of(config.weight_dict, [&](const auto& item) { return item.first == key; }));
+   }
+  torch::Tensor auxiliary_weighted;
+  const auto total = r::weighted_detection_loss(losses, config, device, &auxiliary_weighted);
+  REQUIRE(auxiliary_weighted.defined());
+  REQUIRE(losses.at("loss_keypoints_l1").item<float>() > 0);
+  const auto main_weighted = losses.at("loss_ce") * config.cls_loss_coef + losses.at("loss_bbox") * config.bbox_loss_coef + losses.at("loss_giou") * config.giou_loss_coef +
+                             losses.at("loss_keypoints_l1") + losses.at("loss_keypoints_findable") + losses.at("loss_keypoints_visible") + losses.at("loss_keypoints_nll");
+  CHECK(torch::allclose(total - auxiliary_weighted, main_weighted));
+  total.backward();
+  for (const auto* value : {&outputs.main, &outputs.aux_outputs.front(), &*outputs.enc_outputs}) {
+   REQUIRE(value->pred_keypoints->grad().defined());
+   CHECK(value->pred_keypoints->grad().abs().sum().item<float>() > 0);
+  }
+  auto doubled = r::detection_loss_dict(outputs, targets, config, true, 8.0);
+  for (const auto& [key, loss] : losses) if (key.starts_with("loss_keypoints")) CHECK(torch::allclose(doubled.at(key) * 2, loss));
+ }
+}
+TEST_CASE("Compact CUDA joint costs preserve padded offsets and the stock nonfinite matching domain", "[rfdetr][matcher][keypoints][gpu]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; joint matcher coverage unverified");
+ const torch::Device device(torch::kCUDA, 0);
+ const r::KeypointTensorLayout layout(std::vector<std::uint16_t>{2, 0, 1});
+ r::DetectionConfig config;
+ config.keypoint_l1_loss_coef = .7; config.keypoint_findable_loss_coef = 1.1; config.keypoint_visible_loss_coef = .9; config.keypoint_nll_loss_coef = .5;
+ const auto labels = torch::tensor({2,0,1,0}, torch::kInt64);
+ const auto targets = torch::tensor({{{.3F,.2F,2.F},{0.F,0.F,0.F}},{{.1F,.7F,1.F},{.2F,.1F,2.F}},{{0.F,0.F,0.F},{0.F,0.F,0.F}},{{.3F,.5F,0.F},{.1F,.4F,0.F}}});
+ const auto boxes = torch::full({4,4}, .5);
+ const auto offsets = torch::tensor({1,0}, torch::kInt64), counts = torch::tensor({3,1}, torch::kInt64), prefix = torch::tensor({0,3}, torch::kInt64);
+ for (int fault = 0; fault < 3; ++fault) {
+  auto prediction = torch::sin(torch::arange(2*3*6*8, torch::kFloat32)).reshape({2,3,6,8}) * .2;
+  if (fault) prediction.index_put_({0,0,0,fault == 1 ? r::KeypointPredictionPacket::index<^^r::KeypointPrediction::findable_logit>() : r::KeypointPredictionPacket::index<^^r::KeypointPrediction::log_l11>()}, std::numeric_limits<float>::infinity());
+  const auto terms = r::keypoint_matching_cost(prediction, targets, labels, boxes.select(1,2)*boxes.select(1,3), layout);
+  const auto dense = r::add_keypoint_matching_cost(torch::ones_like(terms.l1), terms, config);
+  const auto expected = torch::cat({dense[0].narrow(1,1,3).flatten(), dense[1].narrow(1,0,1).flatten()});
+  auto output = torch::ones({12}, torch::TensorOptions().device(device));
+  r::pairwise_keypoint_cost_cuda_add_(output, prediction.to(device), targets.to(device), labels.to(device), boxes.to(device), torch::tensor({2,0,1}, torch::kInt64).to(device),
+   offsets.to(device), counts.to(device), prefix.to(device), 3, 3, 2, .7,1.1,.9,.5);
+  const auto actual = output.cpu();
+  CHECK(torch::equal(torch::isfinite(actual), torch::isfinite(expected)));
+  const auto valid = torch::isfinite(expected);
+  CHECK(torch::allclose(actual.index({valid}), expected.index({valid}), 2e-5, 2e-6));
+ }
+}
+
+TEST_CASE("Joint postprocessing keeps physical class selection and pinned uncertainty score fusion", "[rfdetr][postprocess][keypoints]") {
+ namespace r=mmltk::backend::models::rfdetr;
+ namespace catalog=mmltk::backend::data::catalog;
+ catalog::OrderedClassCatalog names;
+ names.names={{"marker"},{"object"}};
+ names.keypoints=std::vector{catalog::ClassKeypointSchema{{"left","right"},{{0,1}},{1,0},{.1,.1}},catalog::ClassKeypointSchema{}};
+ auto layout=r::native_training_class_layout(catalog::ClassCatalog(names));
+ std::swap(layout.slots[0],layout.slots[2]);
+ auto resolved=std::make_shared<r::ResolvedClassLayout>(layout);
+ for (const auto device:mmltk::backend::ml::testsupport::available_devices()) {
+  r::PostprocessLane lane(resolved);
+  lane.Prepare(device);
+  const auto options=torch::TensorOptions().device(device);
+  const std::vector<std::uint16_t> counts{0,0,2};
+  auto joints=torch::zeros({1,2,6,8},options);
+  r::KeypointPredictionPacket::select<^^r::KeypointPrediction::x>(joints,-1).fill_(.25);
+  r::KeypointPredictionPacket::select<^^r::KeypointPrediction::y>(joints,-1).fill_(.75);
+  auto logits=torch::tensor({{{-10.F,0.F,2.F},{-10.F,0.F,2.F}}},options);
+  const r::OutputTensors output{logits,torch::full({1,2,4},.5,options),{},joints,counts};
+  const auto selected=r::select_output_batch_fixed_size(output,100,200,4,false,&lane);
+  REQUIRE(selected.keypoints);
+  CHECK(selected.query_indices.cpu().flatten().to(torch::kInt64).equal(torch::tensor({0,1,0,1},torch::kInt64)));
+  CHECK(selected.labels.cpu().flatten().equal(torch::tensor({0,0,1,1},torch::kInt64)));
+  CHECK(selected.keypoints->index({0,0,0,r::KeypointPredictionPacket::index<^^r::KeypointPrediction::x>()}).item<float>()==50);
+  CHECK(selected.keypoints->index({0,0,0,r::KeypointPredictionPacket::index<^^r::KeypointPrediction::y>()}).item<float>()==75);
+  const double expected=1/(1+std::exp(-(std::log(1/(1+std::exp(-2.)))-.2*std::log(2.))));
+  CHECK(selected.scores[0][0].item<float>()==Catch::Approx(expected));
+  CHECK(selected.scores[0][2].item<float>()==Catch::Approx(1./3));
+  CHECK(torch::isnan(selected.keypoints->index({0,2,0,r::KeypointPredictionPacket::index<^^r::KeypointPrediction::log_l11>()})).item<bool>());
  }
 }

@@ -85,6 +85,8 @@ mmltk_register_ordinary_sources(
     pe_core_backbone.cpp
     keypoint_head.cpp
     keypoint_layout.cpp
+    keypoint_ops.cpp
+    keypoint_evaluation.cpp
     decoder_attention.cpp
     segmentation_depthwise.cpp
     gpu_batch_preprocessor.cpp
@@ -101,6 +103,7 @@ mmltk_register_private_headers(
     detail/tensor_trace.h
     detail/backbone.h
     detail/keypoint_head.h
+    detail/keypoint_ops.h
     detail/decoder_attention.h
     detail/lsap_scratch.h
     detail/matcher_workspace.h

@@ -14,7 +14,7 @@ namespace mmltk::common::concurrency {
 class WorkerPool;
 }
 namespace mmltk::backend::models::rfdetr {
-[[nodiscard]] EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks);
+[[nodiscard]] EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks, bool request_keypoints = false);
 enum class EvaluationDetailRetention : std::uint8_t { CompactOnly, Detailed };
 class EvaluationDatasetOwner final {
 public:
@@ -39,6 +39,7 @@ public:
  struct ImageMatches final {
   std::vector<MatchRecord> bbox;
   std::optional<std::vector<MatchRecord>> mask;
+  std::optional<std::vector<MatchRecord>> keypoint;
   std::size_t prediction_count = 0U;
   std::size_t max_dets_per_image = 0U;
   std::size_t bbox_iou_candidate_count = 0U;
@@ -51,7 +52,7 @@ public:
   std::size_t mask_rle_pair_count = 0U;
  };
  [[nodiscard]] ImageMatches match_predictions(
-  std::int64_t dataset_index, BBoxPredictionView predictions, std::optional<PackedMaskPredictionView> masks, std::size_t max_dets_per_image, std::span<const Prediction> encoded_masks = {}) const;
+  std::int64_t dataset_index, BBoxPredictionView predictions, std::optional<PackedMaskPredictionView> masks, std::size_t max_dets_per_image, std::span<const Prediction> encoded_masks = {}, std::optional<KeypointPredictionView> keypoints = {}) const;
  void merge_matches(ImageMatches matches);
  [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image, EvaluationDetailRetention retention) const;
  [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool& worker_pool, EvaluationDetailRetention retention) const;

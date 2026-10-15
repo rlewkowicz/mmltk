@@ -1,4 +1,7 @@
 #include "detail/detr_matcher_cuda.h"
+#include "keypoint_prediction.h"
+#include "src/backend/data/catalog/keypoint_visibility.h"
+#include <cstddef>
 #include "src/backend/ml/ops/box_geometry.cuh"
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -63,6 +66,60 @@ __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, con
  const float giou = cxcywh_generalized_iou(prediction_float, target);
  const float cost = class_cost * (positive_class_cost - negative_class_cost) + bbox_cost * l1 - giou_cost * giou;
  output[output_index] = cost;
+}
+// RF-DETR e2b5f096 keypoint matcher equations (Apache-2.0, Roboflow).
+// One compact pair owns its active class row; no padded Cartesian joint tensor
+// or device-to-host class inventory is needed.
+template <typename Scalar>
+__global__ void matcher_keypoint_cost_kernel(float* output, const Scalar* predictions, const float* targets,
+ const int64_t* labels, const float* boxes, const int64_t* schema_counts, int64_t schema_slots, int64_t maximum_joints, int64_t target_joints,
+ const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets, int64_t output_targets,
+ int64_t batch, int64_t queries, int64_t max_targets, int64_t total_targets, float l1_cost, float findable_cost, float visible_cost, float nll_cost) {
+ const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+ MatcherPair pair;
+ if (!matcher_pair(index, target_offsets, target_counts, output_offsets, output_targets, batch, queries, max_targets, total_targets, pair)) return;
+ const auto label = labels[pair.target_index];
+ if (label < 0 || label >= schema_slots || !schema_counts[label]) return;
+ const auto joint_count = schema_counts[label];
+ if (joint_count < 0 || joint_count > maximum_joints) { output[pair.output_index] = std::numeric_limits<float>::quiet_NaN(); return; }
+ constexpr auto width = sizeof(KeypointPrediction) / sizeof(float);
+ const auto* prediction = predictions + ((pair.batch_index * queries + pair.query_index) * schema_slots + label) * maximum_joints * width;
+ const auto* target = targets + pair.target_index * target_joints * 3;
+ const auto area = boxes[pair.target_index * 4 + 2] * boxes[pair.target_index * 4 + 3];
+ const float safe_area = isnan(area) ? area : fmaxf(area, std::numeric_limits<float>::epsilon());
+ float l1 = 0, nll = 0, findable_softplus = 0, findable_product = 0, visible_softplus = 0, visible_product = 0;
+ int visible_count = 0;
+ for (int64_t joint = 0; joint < joint_count; ++joint) {
+  const auto* row = prediction + joint * width;
+  const auto field = [row](std::size_t offset) { return static_cast<float>(row[offset / sizeof(float)]); };
+  const float tx = joint < target_joints ? target[joint * 3] : 0, ty = joint < target_joints ? target[joint * 3 + 1] : 0;
+  const float visibility = joint < target_joints ? target[joint * 3 + 2] : 0;
+  const bool findable = visibility > static_cast<int>(mmltk::backend::data::catalog::KeypointVisibility::Unannotated);
+  const bool visible = visibility > static_cast<int>(mmltk::backend::data::catalog::KeypointVisibility::Occluded);
+  const float fl = field(offsetof(KeypointPrediction, findable_logit)), vl = field(offsetof(KeypointPrediction, visible_logit));
+  // The reference performs softplus reduction minus a separate dot product.
+  // Keep 0*infinity nonfinite so the existing matcher sentinel policy sees it.
+  findable_softplus += fl > 20 ? fl : stable_softplus(fl);
+  visible_softplus += vl > 20 ? vl : stable_softplus(vl);
+  findable_product += fl * static_cast<float>(findable);
+  visible_product += vl * static_cast<float>(visible);
+  if (!(isfinite(visibility) && findable && isfinite(tx) && isfinite(ty) && isfinite(area) && area > std::numeric_limits<float>::epsilon())) continue;
+  ++visible_count;
+  const float x = field(offsetof(KeypointPrediction, x)), y = field(offsetof(KeypointPrediction, y));
+  const float dx = x - tx, dy = y - ty;
+  l1 += fabsf(dx) + fabsf(dy);
+  const float a = field(offsetof(KeypointPrediction, log_l11)), b = field(offsetof(KeypointPrediction, l21)), c = field(offsetof(KeypointPrediction, log_l22));
+  const float u = expf(a) * dx + b * dy, v = expf(c) * dy, maha = u * u + v * v;
+  if (!(isfinite(x) && isfinite(y) && isfinite(a) && isfinite(b) && isfinite(c) && isfinite(u) && isfinite(v) && isfinite(maha))) continue;
+  const float value = .5f * maha / safe_area - (a + c);
+  nll += isnan(value) ? 0 : isinf(value) ? (value > 0 ? std::numeric_limits<float>::max() / 2 : std::numeric_limits<float>::lowest()) : value;
+ }
+ const float denominator = static_cast<float>(visible_count > 0 ? visible_count : 1);
+ l1 = l1 / denominator / sqrtf(safe_area);
+ if (!isfinite(l1)) l1 = 0;
+ const float count = static_cast<float>(joint_count);
+ const float findable = (findable_softplus - findable_product) / count, visible = (visible_softplus - visible_product) / count;
+ output[pair.output_index] = output[pair.output_index] + l1_cost * l1 + findable_cost * findable + visible_cost * visible + nll_cost * (nll / denominator);
 }
 template <typename Logit>
 __global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits, const float* target_masks, const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets,
@@ -186,6 +243,37 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
   });
  });
  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "matcher cost CUDA kernel launch failed");
+}
+void pairwise_keypoint_cost_cuda_add_(const torch::Tensor& output, const torch::Tensor& predictions, const torch::Tensor& targets,
+ const torch::Tensor& labels, const torch::Tensor& boxes, const torch::Tensor& schema_counts,
+ const torch::Tensor& target_offsets, const torch::Tensor& target_counts, const torch::Tensor& output_offsets,
+ int64_t padded_queries, int64_t max_targets, int64_t maximum_joints, double l1_cost, double findable_cost, double visible_cost, double nll_cost) {
+ check_matcher_tensor(output, torch::kFloat32, 1, "matcher keypoint cost output");
+ check_matcher_floating_tensor(predictions, 4, "matcher keypoint predictions");
+ check_matcher_tensor(targets, torch::kFloat32, 3, "matcher keypoint targets");
+ check_matcher_tensor(labels, torch::kInt64, 1, "matcher keypoint labels");
+ check_matcher_tensor(boxes, torch::kFloat32, 2, "matcher keypoint boxes");
+ check_matcher_tensor(schema_counts, torch::kInt64, 1, "matcher keypoint schema");
+ check_matcher_offsets(output, target_offsets, target_counts, output_offsets);
+ for (const auto& tensor : {predictions, targets, labels, boxes, schema_counts}) TORCH_CHECK(tensor.device() == output.device(), "matcher keypoint tensors must share one device");
+ const auto batch = predictions.size(0), queries = predictions.size(1), total_targets = targets.size(0);
+ TORCH_CHECK(maximum_joints > 0 && schema_counts.numel() > 0 && predictions.size(2) % maximum_joints == 0 && predictions.size(2) / maximum_joints == schema_counts.numel() && predictions.size(3) == sizeof(KeypointPrediction) / sizeof(float) &&
+  targets.size(1) <= maximum_joints && targets.size(2) == 3 && labels.numel() == total_targets && boxes.size(0) == total_targets && boxes.size(1) == 4 &&
+  target_offsets.numel() == batch && target_counts.numel() == batch && padded_queries >= queries, "matcher keypoint tensor layout differs");
+ const auto output_targets = checked_output_targets(output, output_offsets, batch, queries, padded_queries, max_targets, "matcher keypoint output");
+ const float l1 = checked_cost_coefficient(l1_cost, "matcher keypoint L1"), findable = checked_cost_coefficient(findable_cost, "matcher keypoint findability"),
+  visible = checked_cost_coefficient(visible_cost, "matcher keypoint visibility"), nll = checked_cost_coefficient(nll_cost, "matcher keypoint NLL");
+ c10::cuda::CUDAGuard guard(output.device());
+ constexpr int threads = 256;
+ const auto pairs = checked_extent({batch, queries, max_targets}, static_cast<int64_t>(std::numeric_limits<int>::max()) * threads, "matcher keypoint launch");
+ if (!pairs) return;
+ const auto blocks = static_cast<int>((pairs + threads - 1) / threads);
+ AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, predictions.scalar_type(), "pairwise_keypoint_cost", [&] {
+  matcher_keypoint_cost_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(output.data_ptr<float>(), predictions.data_ptr<scalar_t>(), targets.data_ptr<float>(),
+   labels.data_ptr<int64_t>(), boxes.data_ptr<float>(), schema_counts.data_ptr<int64_t>(), schema_counts.numel(), maximum_joints, targets.size(1),
+   target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), output_offsets.data_ptr<int64_t>(), output_targets, batch, queries, max_targets, total_targets, l1, findable, visible, nll);
+ });
+ TORCH_CHECK(cudaGetLastError() == cudaSuccess, "matcher keypoint cost CUDA kernel launch failed");
 }
 void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tensor& pred_mask_logits, const torch::Tensor& target_masks, const torch::Tensor& target_offsets,
  const torch::Tensor& target_counts, const torch::Tensor& output_offsets, int64_t padded_queries, int64_t max_targets, double ce_cost, double dice_cost) {

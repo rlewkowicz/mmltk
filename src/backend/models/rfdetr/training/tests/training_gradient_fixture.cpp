@@ -3,6 +3,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "training_gradient_fixture.h"
 #include "training_continuation_fixture.h"
+#include "model_state_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/training_ops_private.h"
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -1402,7 +1403,7 @@ void equal_training_state(const std::vector<NormalizedModelStateEntry>& actual, 
  }
 }
 }  // namespace
-void exercise_prepared_training(const DistributedContext& distributed, int device) {
+void exercise_prepared_training(const DistributedContext& distributed, int device, std::string_view preset) {
  namespace data = mmltk::backend::data;
  const bool deterministic = at::globalContext().deterministicCuDNN();
  const bool benchmark = at::globalContext().benchmarkCuDNN();
@@ -1421,11 +1422,14 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   mmltk::testsupport::ScopedTempDir root("prepared-training");
   data::testsupport::FixtureSpec fixture;
   fixture.root_dir = root.path().string();
-  fixture.width = fixture.height = 64;
+  auto config = native_config_from_preset(preset.empty() ? model_presets().front() : *find_preset_catalog_entry(preset));
+  config.resolution = preset.empty() ? 64 : config.patch_size * config.num_windows * 2;
+  fixture.width = fixture.height = config.resolution;
   fixture.num_images = static_cast<int>(4 * batches[batch_case] + 1);
   fixture.background_images = 0;
   fixture.pixel_evidence = true;
-  data::testsupport::create_synthetic_dataset(fixture);
+  if (config.has_keypoints()) data::testsupport::create_keypoint_dataset(fixture);
+  else data::testsupport::create_synthetic_dataset(fixture);
   data::testsupport::compile_existing_fixture(fixture);
   auto runtime_config = resolve_runtime_config(4, 1, 2, {}, device);
   RuntimeContext runtime(runtime_config);
@@ -1455,20 +1459,25 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   request.recipe.lr = 1e-4;
   request.recipe.weight_decay = 0;
   request.gpu_augmentation = {.enabled = true, .geometry = {}, .resize = {}, .color = {}, .noise = {}, .blur = {}, .occlusion = {}, .copy_paste_probability = .5F};
-  request.training_supervision.assignment = TrainAssignmentKind::MatchFree;
+  if (preset.empty()) request.training_supervision.assignment = TrainAssignmentKind::MatchFree;
+  request.preset_name = config.preset_name;
   TrainingDataPlan plan(*catalog_loader, request);
   const auto draws = plan.epoch(0, 0);
   const auto slice = plan.rank_slice(distributed.rank, distributed.world_size);
   const auto initial_draws = *draws.schedule;
   const auto annotations = catalog_loader->describe_batch(*draws.schedule, 0, request.batch_size, slice.begin, slice.count);
   require(!annotations.owner && !annotations.device_images && annotations.image_custody.expired(), "annotation preparation fabricated a raw-image lease");
-  auto config = native_config_from_preset(model_presets().front());
-  config.resolution = 64;
+
   config.num_classes = static_cast<int>(catalog_loader->num_classes()) + 1;
-  config.num_queries = config.num_select = 2;
-  config.dec_layers = config.group_detr = 1;
+  config.num_queries = config.num_select = config.has_keypoints() ? 4 : 2;
+  if (preset.empty()) config.dec_layers = config.group_detr = 1;
+  else config.group_detr = 2;
+  if (config.has_keypoints()) {
+   config.keypoints_per_class.assign(config.num_classes, 0);
+   for (std::size_t category=0;category<catalog_loader->num_classes();++category) config.keypoints_per_class[category]=catalog_loader->class_catalog()->keypoints(category).names.size();
+  }
   config.training_supervision = request.training_supervision;
-  request.num_queries = 2;
+  request.num_queries = config.num_queries;
   auto detection = detection_fixture_base(config);
   project_loss_coefficients(detection, config);
   populate_default_detection_weight_dict(detection);
@@ -1497,12 +1506,7 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
    return owner;
   };
   const auto save = [&](TrainingModel& owner, const std::filesystem::path& path) {
-   auto metadata = synthetic_training_metadata();
-   metadata.class_layout = owner.model().class_layout()->record();
-   metadata.preset_name = config.preset_name;
-   metadata.num_classes = config.num_classes;
-   metadata.num_queries = config.num_queries;
-   metadata.num_select = config.num_select;
+   auto metadata = model_checkpoint_metadata(owner.model(), "native-fixture", "seeded-native-fixture.pt");
    auto publication = owner.begin_publication();
    owner.save_resume(path, metadata, "prepared-training", "original.json");
    publication.finish();

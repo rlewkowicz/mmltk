@@ -180,20 +180,20 @@ TEST_CASE("final selection keeps explicit and uniform outcomes even when validat
   CHECK(state.entries().front().tensor.item<double>() > 0);
   return evaluation(.1);
  };
- const auto explicit_result = r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, false, temp.path(), evaluate);
+ const auto explicit_result = r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, r::ModelTask::Detection, temp.path(), evaluate);
  CHECK(explicit_result.artifact.weights == r::EvaluatedWeights::Soup);
  CHECK(*explicit_result.artifact.selection_metric == .1);
  CHECK(explicit_result.ingredients.front().coefficient == 0);
  CHECK(explicit_result.ingredients.back().coefficient == 1);
  CHECK(r::decode_native_model_state(explicit_result.artifact.path).entries().front().tensor.item<double>() == 5);
- const auto uniform = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), evaluate);
+ const auto uniform = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), evaluate);
  CHECK(r::decode_native_model_state(uniform.artifact.path).entries().front().tensor.item<double>() == 3);
  CHECK(std::filesystem::exists(candidates[0].artifact.path));
  CHECK(std::filesystem::exists(explicit_result.artifact.path));
  CHECK(r::read_training_selection(temp.path() / "selected.json") == uniform);
  candidates[1].coefficient = 0;
  // CLEANUP-IGNORE: Invalid coefficient tests independently require rejection to preserve distinct previously selected artifacts.
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, false, temp.path(), evaluate));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, r::ModelTask::Detection, temp.path(), evaluate));
  CHECK(r::read_training_selection(temp.path() / "selected.json") == uniform);
 }
 TEST_CASE("greedy uses strict improvement stable ties and identified duplicate ingredients", "[model][rfdetr][training][merge]") {
@@ -204,7 +204,7 @@ TEST_CASE("greedy uses strict improvement stable ties and identified duplicate i
   ++evaluations;
   return evaluation(.8);
  };
- const auto retained = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), equal);
+ const auto retained = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, r::ModelTask::Detection, temp.path(), equal);
  CHECK(retained.artifact.model_id == 4);
  REQUIRE(retained.ingredients.size() == 1);
  CHECK(evaluations == 2);
@@ -216,14 +216,14 @@ TEST_CASE("greedy uses strict improvement stable ties and identified duplicate i
   ++evaluations;
   return evaluation(.9);
  };
- const auto accepted = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), improve);
+ const auto accepted = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, r::ModelTask::Detection, temp.path(), improve);
  REQUIRE(accepted.ingredients.size() == 2);
  CHECK(evaluations == 1);
  CHECK(accepted.ingredients[0].model_id == 4);
  CHECK(accepted.ingredients[1].model_id == 12);
  CHECK(accepted.ingredients[0].coefficient == .5);
  evaluations = 0;
- const auto off = r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), improve);
+ const auto off = r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, temp.path(), improve);
  CHECK(off.artifact.model_id == 4);
  CHECK(evaluations == 0);
 }
@@ -231,14 +231,14 @@ TEST_CASE("final ingredients require common initialization complete identity and
  mmltk::testsupport::ScopedTempDir temp("native-selection-admission");
  std::array candidates{ingredient(temp.path(), 1, 1, .8, true), ingredient(temp.path(), 2, 2, .7, true)};
  const auto evaluate = [](const auto&) { return evaluation(.9, true); };
- const auto saved = r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, true, temp.path(), evaluate);
+ const auto saved = r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Segmentation, temp.path(), evaluate);
  candidates[1].artifact.initialization = std::string(64, '4');
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, true, temp.path(), evaluate));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Segmentation, temp.path(), evaluate));
  candidates[1].artifact.initialization = candidates[0].artifact.initialization;
  candidates[1].artifact.evaluation->mask.reset();
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, true, temp.path(), evaluate));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Segmentation, temp.path(), evaluate));
  candidates[1].artifact.evaluation = evaluation(std::numeric_limits<double>::quiet_NaN(), true);
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, true, temp.path(), evaluate));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Segmentation, temp.path(), evaluate));
  CHECK(r::read_training_selection(temp.path() / "selected.json") == saved);
 }
 TEST_CASE("immutable session generations retain complete previous files through each publication fault", "[model][rfdetr][training][checkpoint]") {
@@ -290,12 +290,12 @@ TEST_CASE("final selection rejects incomplete coefficients and failures preserve
  candidates[0].artifact.epoch = 2;
  candidates[1].artifact.epoch = 3;
  const auto evaluate = [](const auto&) { return evaluation(.9); };
- const auto old = r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), evaluate);
+ const auto old = r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, temp.path(), evaluate);
  CHECK(old.artifact.model_id == 2);
  const auto reject = [&](double coefficient) {
   candidates[1].coefficient = coefficient;
   // CLEANUP-IGNORE: Invalid coefficient tests independently require rejection to preserve distinct previously selected artifacts.
-  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, false, temp.path(), evaluate));
+  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, r::ModelTask::Detection, temp.path(), evaluate));
   CHECK(r::read_training_selection(temp.path() / "selected.json") == old);
  };
  reject(-1);
@@ -303,14 +303,14 @@ TEST_CASE("final selection rejects incomplete coefficients and failures preserve
  reject(std::numeric_limits<double>::infinity());
  candidates[1].coefficient = 1;
  REQUIRE_THROWS(
-  r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) -> r::EvalSummary { throw std::runtime_error("selection evaluation failed"); }));
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) { return evaluation(std::numeric_limits<double>::quiet_NaN()); }));
+  r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) -> r::EvalSummary { throw std::runtime_error("selection evaluation failed"); }));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(std::numeric_limits<double>::quiet_NaN()); }));
  CHECK(r::read_training_selection(temp.path() / "selected.json") == old);
  candidates[1].artifact.weights = r::EvaluatedWeights::Ema;
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), evaluate));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, temp.path(), evaluate));
  candidates[1].artifact.weights = r::EvaluatedWeights::Ordinary;
  candidates[1].artifact.model_id = candidates[0].artifact.model_id;
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), evaluate));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, temp.path(), evaluate));
  CHECK(std::filesystem::exists(candidates[0].artifact.path));
  CHECK(std::filesystem::exists(candidates[1].artifact.path));
 }
@@ -321,7 +321,7 @@ TEST_CASE("identical native content is one greedy ingredient even through separa
  CHECK(candidates[0].artifact.content == candidates[1].artifact.content);
  std::size_t calls = 0;
  const auto select_without_evaluation = [&] {
-  auto result = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), [&](const auto&) {
+  auto result = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, r::ModelTask::Detection, temp.path(), [&](const auto&) {
    ++calls;
    return evaluation(.9);
   });
@@ -411,26 +411,26 @@ TEST_CASE("selection retires unpublished trials and preserves every committed ar
   return paths;
  };
  for (int repeat = 0; repeat < 3; ++repeat) {
-  const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), [](const auto&) { return evaluation(.1); });
+  const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.1); });
   CHECK(inventory().empty());
-  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) -> r::EvalSummary { throw std::runtime_error("evaluation failure"); }));
-  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) { return evaluation(std::numeric_limits<double>::quiet_NaN()); }));
+  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) -> r::EvalSummary { throw std::runtime_error("evaluation failure"); }));
+  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(std::numeric_limits<double>::quiet_NaN()); }));
   CHECK(inventory().empty());
   CHECK(r::read_training_selection(temp.path() / "selected.json") == selected);
  }
  double metric = .8;
- const auto first = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), [&](const auto&) {
+ const auto first = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, r::ModelTask::Detection, temp.path(), [&](const auto&) {
   metric += .05;
   return evaluation(metric);
  });
  REQUIRE(inventory().size() == 1);
  CHECK(std::filesystem::exists(first.artifact.path));
- const auto second = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) { return evaluation(.5); });
+ const auto second = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.5); });
  CHECK(inventory().size() == 2);
  CHECK(std::filesystem::exists(first.artifact.path));
  CHECK(std::filesystem::exists(second.artifact.path));
  std::filesystem::create_directory(temp.path() / "selected.json.staging");
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) { return evaluation(.7); }));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.7); }));
  CHECK(inventory().size() == 2);
  CHECK(r::read_training_selection(temp.path() / "selected.json") == second);
  for (const auto& candidate : candidates) CHECK(std::filesystem::exists(candidate.artifact.path));
@@ -440,17 +440,17 @@ TEST_CASE("periodic duplicate admissions retain all logical ingredient identitie
  const auto first = ingredient(temp.path(), 1, 3, .5);
  std::vector<r::TrainingSelectionCandidate> candidates(r::kMaximumTrainingModels, first);
  for (std::size_t index = 0; index < candidates.size(); ++index) candidates[index].artifact.model_id = index + 1;
- const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) { return evaluation(.5); });
+ const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.5); });
  REQUIRE(selected.ingredients.size() == r::kMaximumTrainingModels);
  for (std::size_t index = 0; index < candidates.size(); ++index) CHECK(selected.ingredients[index].model_id == index + 1);
  candidates.back().artifact.sha256 = std::string(64, '0');
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), [](const auto&) { return evaluation(.5); }));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.5); }));
  candidates.back() = first;
  candidates.back().artifact.model_id = r::kMaximumTrainingModels;
  candidates.back().artifact.path = temp.path() / "distinct.pt";
  std::filesystem::copy_file(first.artifact.path, candidates.back().artifact.path);
  std::ofstream(candidates.back().artifact.path, std::ios::binary | std::ios::app) << "changed";
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), [](const auto&) { return evaluation(.5); }));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.5); }));
 }
 TEST_CASE("artifact evidence survives decoded readers and rejects identical named-file replacement", "[model][rfdetr][training][checkpoint]") {
  mmltk::testsupport::ScopedTempDir temp("artifact-retained-evidence");
@@ -543,13 +543,13 @@ TEST_CASE("each named equal-content artifact and late companion is checked befor
  // CLEANUP-IGNORE: Different selection policies independently assert equal content across separately named artifact inputs before distinct publication behavior.
  std::array candidates{ingredient(temp.path(), 1, 3, .5), ingredient(temp.path(), 2, 3, .5)};
  CHECK(candidates[0].artifact.content == candidates[1].artifact.content);
- const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) { return evaluation(.5); });
+ const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.5); });
  REQUIRE(selected.ingredients.size() == 2);
  CHECK(selected.ingredients[0].model_id == 1);
  CHECK(selected.ingredients[1].model_id == 2);
  for (const auto& candidate : candidates) {
   const auto companion = std::filesystem::path(candidate.artifact.path.string() + ".classes.json");
-  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [&](const auto&) {
+  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [&](const auto&) {
    std::ofstream(companion) << "late companion";
    return evaluation(.6);
   }));
@@ -558,7 +558,7 @@ TEST_CASE("each named equal-content artifact and late companion is checked befor
  }
  // Equal tensor content never authorizes sharing the other path's file proof.
  candidates[1].admission = std::make_shared<r::TrainingArtifactAdmission>(candidates[0].artifact);
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), [](const auto&) { return evaluation(.5); }));
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.5); }));
 }
 TEST_CASE("last session publication checks include retained candidates and all generation files", "[model][rfdetr][training][checkpoint]") {
  for (const auto target : {0, 1, 2}) {
@@ -587,4 +587,36 @@ TEST_CASE("last session publication checks include retained candidates and all g
   CHECK(r::TrainingSessionAdmission(fixture.checkpoint.path()).manifest() == previous);
   for (const auto& model : previous.models) CHECK(std::filesystem::exists(temp.path() / model.path));
  }
+}
+
+TEST_CASE("Selection requires the task metric and exact joint topology before averaging", "[rfdetr][training][merge][keypoints]") {
+ auto summary=evaluation(.9);
+ summary.keypoint.emplace();
+ summary.keypoint->available=true;
+ summary.keypoint->ap=.25;
+ CHECK(r::training_selection_metric(summary,r::ModelTask::Keypoints)==.25);
+ CHECK(r::training_selection_metric(summary,r::ModelTask::Detection)==.9);
+ summary.keypoint->available=false;
+ REQUIRE_THROWS(r::training_selection_metric(summary,r::ModelTask::Keypoints));
+ summary.keypoint.reset();
+ REQUIRE_THROWS(r::training_selection_metric(summary,r::ModelTask::Keypoints));
+ auto config=r::native_config_from_preset(*r::find_model_preset_by_weight_filename("rf-detr-keypoint-preview-xlarge.pth"));
+ config.num_classes=2; config.keypoints_per_class={2,0};
+ namespace catalog=mmltk::backend::data::catalog;
+ catalog::OrderedClassCatalog record;
+ record.names={{"marker"}};
+ record.keypoints=std::vector{catalog::ClassKeypointSchema{{"left","right"},{{0,1}},{1,0},{.1,.2}}};
+ const auto layout=r::native_training_class_layout(catalog::ClassCatalog(record));
+ r::NativeCheckpointMetadata a;
+ a.preset_name=config.preset_name; a.num_classes=config.num_classes; a.num_queries=config.num_queries; a.num_select=config.num_select;
+ a.native_configuration=r::encode_checkpoint_configuration(config); a.class_layout=layout;
+ auto b=a;
+ CHECK(r::same_native_model_semantics(a,b));
+ b.class_layout.foreground.keypoints->front().oks_sigmas.front()=.3;
+ CHECK_FALSE(r::same_native_model_semantics(a,b));
+ b=a;
+ config.keypoints_per_class={1,0};
+ b.native_configuration=r::encode_checkpoint_configuration(config);
+ CHECK_FALSE(r::same_native_model_semantics(a,b));
+ REQUIRE_THROWS(r::require_checkpoint_model_topology(config,a));
 }

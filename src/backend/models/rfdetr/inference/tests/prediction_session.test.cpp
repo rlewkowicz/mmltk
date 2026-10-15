@@ -2081,12 +2081,12 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
    candidate.validation = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(compiled));
    auto admission = std::make_shared<rfdetr::TrainingArtifactAdmission>(candidate.path);
    candidate.evaluation = evaluate(candidate.path);
-   candidate.selection_metric = rfdetr::training_selection_metric(*candidate.evaluation, masks);
+   candidate.selection_metric = rfdetr::training_selection_metric(*candidate.evaluation, masks ? rfdetr::ModelTask::Segmentation : rfdetr::ModelTask::Detection);
    candidate = admission->describe(std::move(candidate));
    admission->release_decoded_state();
    candidates[index].admission = std::move(admission);
   }
-  const auto selected = rfdetr::select_training_artifact(candidates, rfdetr::TrainFinalPolicy::Uniform, masks, directory, evaluate);
+  const auto selected = rfdetr::select_training_artifact(candidates, rfdetr::TrainFinalPolicy::Uniform, masks ? rfdetr::ModelTask::Segmentation : rfdetr::ModelTask::Detection, directory, evaluate);
   REQUIRE(selected.artifact.weights == rfdetr::EvaluatedWeights::Soup);
   CHECK_FALSE(rfdetr::inspect_training_checkpoint(selected.artifact.path).checkpoint().resumable);
   rfdetr::ExportOnnxRequest export_request;
@@ -2261,4 +2261,112 @@ TEST_CASE("Model-taking export isolates eager selective and full source executio
    CHECK(torch::allclose(source.forward({input, {}}, true).main.pred_logits, expected, 4e-4, 4e-4));
   }
  }
+}
+
+TEST_CASE("Native keypoint validation maps classes and named joints in both metric and sample directions", "[model][rfdetr][validation][keypoints][gpu]") {
+ namespace data = mmltk::backend::data;
+ namespace catalog = data::catalog;
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+ const mmltk::testsupport::ScopedTempDir root("named-joint-validation");
+ auto config = rfdetr::native_config_from_preset(*rfdetr::find_model_preset_by_weight_filename("rf-detr-keypoint-preview-xlarge.pth"));
+ config.resolution = config.patch_size * config.num_windows * 2;
+ config.num_queries = 4;
+ config.num_select = 1;
+ config.group_detr = 1;
+ config.num_classes = 4;
+ config.keypoints_per_class = {2, 17, 0, 0};
+ const data::testsupport::FixtureSpec fixture{.root_dir = root.path().string(), .width = config.resolution, .height = config.resolution, .num_images = 2, .background_images = 0};
+ data::testsupport::create_keypoint_dataset(fixture);
+ data::testsupport::compile_existing_fixture(fixture);
+ auto source = data::CompiledDataset::open(data::testsupport::compiled_bin_path(fixture));
+ const auto original = source.class_catalog()->record();
+ catalog::OrderedClassCatalog reordered;
+ reordered.names = {original.names[1], original.names[0], original.names[2]};
+ reordered.keypoints = std::vector{catalog::permute_keypoint_schema(original.keypoints->at(1), std::array<catalog::JointIndex, 2>{1, 0}), original.keypoints->at(0), original.keypoints->at(2)};
+ const auto layout = rfdetr::native_training_class_layout(catalog::ClassCatalog(reordered));
+ const auto weights = root.path() / "named-joints.pt";
+ {
+  torch::manual_seed(71);
+  rfdetr::NativeRfDetrModel model(config, layout);
+  {
+   torch::NoGradGuard guard;
+   const auto parameters = model.named_parameters();
+   parameters["class_embed.weight"].zero_();
+   parameters["class_embed.bias"].fill_(-10);
+   parameters["class_embed.bias"][0].fill_(10);
+   parameters["keypoint_embed.layers.2.weight"].normal_(0, .01);
+  }
+  rfdetr::DecodedNativeModelState checkpoint(rfdetr::collect_module_state(model));
+  rfdetr::ResolvedModelArtifacts artifacts;
+  artifacts.config = config;
+  artifacts.class_layout = layout;
+  checkpoint.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
+  rfdetr::save_native_checkpoint(weights, checkpoint);
+ }
+ const mmltk::testsupport::ScopedTestStream stream;
+ const mmltk::backend::ml::runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
+ rfdetr::PredictRequest predict;
+ predict.weights_path = weights;
+ predict.preset_name = config.preset_name;
+ predict.resolution = config.resolution;
+ predict.source_kind = rfdetr::PredictSourceKind::CompiledDataset;
+ predict.compiled_path = data::testsupport::compiled_bin_path(fixture);
+ predict.backend = "weights";
+ predict.allow_fp16 = false;
+ predict.compilation_mode = rfdetr::CompilationMode::kNone;
+ predict.include_masks = false;
+ predict.max_dets_per_image = 1;
+ predict.progress_bar = false;
+ std::array<rfdetr::Prediction, 2> expected;
+ {
+  rfdetr::PredictionSession session;
+  const auto result = session.Run(predict, command, {.completed = [&](const auto& record, auto, const auto&) {
+   REQUIRE(record.detections.size() == 1);
+   REQUIRE(record.detections.front().class_reference == 0);
+   REQUIRE(record.detections.front().keypoints.size() == 2);
+   expected.at(record.dataset_index) = record.detections.front();
+  }});
+  REQUIRE(result.processed_images == 2);
+ }
+ // The native output becomes exact ground truth in the dataset's original
+ // left/right order. Evaluation must reverse it back from model right/left.
+ for (std::size_t image = 0; image < expected.size(); ++image) {
+  const auto& joints = expected[image].keypoints;
+  REQUIRE((joints[0].x != joints[1].x || joints[0].y != joints[1].y));
+  nlohmann::json annotation{{"class", "marker"}, {"bbox_xyxy", expected[image].bbox_xyxy},
+   {"keypoints", {joints[1].x, joints[1].y, 2, joints[0].x, joints[0].y, 1}}, {"image_size_wh", {config.resolution, config.resolution}}};
+  std::ofstream output(std::filesystem::path(data::testsupport::dataset_dir(fixture)) / fixture.split / ("00000" + std::to_string(image + 1) + ".jsonl"));
+  output << annotation.dump() << '\n';
+ }
+ data::testsupport::compile_existing_fixture(fixture);
+ rfdetr::ValidateRequest request;
+ static_cast<rfdetr::ModelArtifactRequest&>(request) = predict;
+ static_cast<rfdetr::InferenceExecutionConfig&>(request) = predict;
+ request.compiled_path = predict.compiled_path;
+ request.eval_order = "weights";
+ request.candidate_count = request.eval_max_dets = 1;
+ request.batch_size = 2;
+ request.write_report_json = false;
+ request.log_mode = rfdetr::ValidationLogMode::Quiet;
+ std::size_t samples = 0;
+ rfdetr::ValidationSession validator;
+ const auto result = validator.Run(request, command, {.sample = [&](rfdetr::ValidationSampleView sample) {
+  ++samples;
+  REQUIRE(sample.ground_truth.size() == 1);
+  const auto& truth = sample.ground_truth.front();
+  const auto& prediction = expected.at(sample.prediction.dataset_index);
+  CHECK(truth.class_reference == 0);
+  REQUIRE(truth.keypoints.size() == 2);
+  CHECK(truth.keypoint_visibility == std::vector{catalog::KeypointVisibility::Occluded, catalog::KeypointVisibility::Visible});
+  for (std::size_t joint = 0; joint < 2; ++joint) {
+   CHECK(std::abs(truth.keypoints[joint].x - prediction.keypoints[joint].x) < .001F);
+   CHECK(std::abs(truth.keypoints[joint].y - prediction.keypoints[joint].y) < .001F);
+  }
+ }});
+ CHECK(samples == 2);
+ const auto& summary = result.backends.at("weights").summary;
+ REQUIRE(summary.keypoint);
+ CHECK(std::abs(summary.keypoint->ap - 1) < 1e-9);
+ CHECK(std::abs(summary.bbox.ap - 1) < 1e-9);
+ CHECK(summary.keypoint->available);
 }

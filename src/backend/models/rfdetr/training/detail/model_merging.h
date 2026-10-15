@@ -53,5 +53,5 @@ struct TrainingSelectionCandidate final {
 // The evaluator sees the exact saved native artifact. Publication of the small
 // selected descriptor is the final operation and never replaces an ingredient.
 [[nodiscard]] TrainingSelection select_training_artifact(
- std::span<const TrainingSelectionCandidate>, TrainFinalPolicy, bool masks, const std::filesystem::path& output, std::function_ref<EvalSummary(const std::filesystem::path&)> evaluate);
+ std::span<const TrainingSelectionCandidate>, TrainFinalPolicy, ModelTask task, const std::filesystem::path& output, std::function_ref<EvalSummary(const std::filesystem::path&)> evaluate);
 }  // namespace mmltk::backend::models::rfdetr

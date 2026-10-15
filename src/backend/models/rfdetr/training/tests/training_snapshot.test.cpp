@@ -640,3 +640,22 @@ TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][trai
  malformed.back() = torch::full_like(malformed.back(), std::numeric_limits<float>::quiet_NaN());
  REQUIRE_THROWS(r::ModelEma::from_cpu_shadow(parameters, malformed, 0.5, 0.0, ema.completed_updates()));
 }
+
+TEST_CASE("Session identities bind joint metadata while baseline identities preserve original vocabulary", "[rfdetr][training][session][keypoints]") {
+ auto config=r::native_config_from_preset(r::model_presets().front());
+ auto layout=r::testsupport::synthetic_training_layout(2);
+ config.num_classes=3;
+ const auto baseline=r::training_configuration_identity(config,layout,1);
+ CHECK(baseline.find("segmentation=0;")!=std::string::npos);
+ CHECK(baseline.find("backbone=")==std::string::npos);
+ CHECK(baseline.find("keypoints")==std::string::npos);
+ CHECK(r::training_configuration_identity(config,layout,2)!=baseline);
+ mmltk::backend::data::FileHeader header{};
+ mmltk::common::io::FileSnapshot file{.bytes=1024,.modified_seconds=7};
+ std::array<std::byte,4> metadata{std::byte{1},std::byte{2},std::byte{3},std::byte{4}};
+ const auto identity=r::training_dataset_identity(header,file,baseline,metadata);
+ metadata.back()=std::byte{5};
+ CHECK(r::training_dataset_identity(header,file,baseline,metadata)!=identity);
+ config.task=r::ModelTask::Keypoints;
+ REQUIRE_THROWS(r::training_configuration_identity(config,layout,1));
+}

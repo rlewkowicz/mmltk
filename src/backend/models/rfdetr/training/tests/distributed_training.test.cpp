@@ -30,6 +30,9 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
  namespace process = mmltk::frameworks::process;
  std::string scenario;
  SECTION("complete trajectory, target preparation and count handoff on empty ranks") { scenario = "trajectory"; }
+ SECTION("PE grouped training and exact Resume") { scenario = "family-rf-detr-femto"; }
+ SECTION("DINO Base grouped training and exact Resume") { scenario = "family-rf-detr-xlarge"; }
+ SECTION("Keypoint grouped training and exact Resume on empty ranks") { scenario = "family-rf-detr-keypoint-preview"; }
  SECTION("first-rank cancellation aborts waiting peer") { scenario = "cancel"; }
  SECTION("failure after an early bucket retains custody and aborts waiting peer") { scenario = "early-failure"; }
  SECTION("cancellation retains a real in-flight count collective") { scenario = "cancel-count"; }
@@ -44,7 +47,7 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
     process::prepare_captured_output_child(output, errors);
     ::execv(arguments.program(), arguments.data());
     process::fail_child_setup(errors, process::ChildSetupStage::Exec);
-   }, {}, std::chrono::seconds(180));
+   }, {}, std::chrono::seconds(600));
   });
  for (std::size_t rank = 0; rank < children.size(); ++rank) {
   CAPTURE(rank);
@@ -57,7 +60,7 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
   }
   INFO(result.output);
   CHECK_FALSE(result.setup_failure.has_value());
-  if (scenario == "trajectory") {
+  if (scenario == "trajectory" || scenario.starts_with("family-")) {
    CHECK(WIFEXITED(result.status));
    CHECK(WEXITSTATUS(result.status) == 0);
   } else {

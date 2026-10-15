@@ -174,6 +174,7 @@ enum class PredictionSlotState : std::uint8_t {
 struct PinnedPredictionBuffers {
  std::vector<PredictionBatchMetadata> images;
  PinnedBBoxPredictionBuffers bbox;
+ torch::Tensor keypoints_cpu;
  std::optional<PinnedMaskPredictionBuffers> mask;
  cudaEvent_t ready_event = nullptr;
  int event_device_id = -1;
@@ -231,6 +232,7 @@ struct StagedPredictionBatch {
  size_t max_dets_per_image = 0;
  size_t active_image_count = 0;
  PredictionBufferLease lease;
+ std::optional<torch::Tensor> keypoints_cpu;
 };
 struct PendingPredictionBatchEncoding {
  std::vector<std::future<PredictionBatchItem>> images;

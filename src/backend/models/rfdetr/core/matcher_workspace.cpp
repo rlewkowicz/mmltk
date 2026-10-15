@@ -98,7 +98,8 @@ struct AssignmentSlot final {
 struct MatcherCostResources final {
  std::shared_ptr<MatcherContext> context;
  std::unique_ptr<mmltk::backend::ml::cuda::NumaHostTensor> host;
- at::Tensor device_backing, device_cost, cpu_cost, output_prefixes;
+ at::Tensor device_backing, device_cost, cpu_cost, output_prefixes, joint_counts;
+ std::vector<std::uint16_t> joint_schema;
  std::vector<std::int64_t> queries, target_prefixes, layer_prefixes;
  CUevent complete{};
  bool pending = false;
@@ -108,6 +109,7 @@ struct MatcherCostResources final {
    cpu_cost = at::Tensor{};
    if (host) check(host->ReleaseSettled(), "release matcher cost pages");
    output_prefixes = at::Tensor{};
+   joint_counts = at::Tensor{};
    device_cost = at::Tensor{};
    device_backing = at::Tensor{};
    if (complete) {
@@ -192,6 +194,17 @@ struct MatcherWorkspace::State {
 MatcherWorkspace::MatcherWorkspace(int node, bool h2d) : memory_(node), solver_(&memory_), state_(std::make_unique<State>(h2d)) {}
 MatcherWorkspace::~MatcherWorkspace() = default;
 TracedLossOpCache& MatcherWorkspace::loss_cache() noexcept { return state_->loss_cache; }
+at::Tensor MatcherWorkspace::keypoint_counts(std::span<const std::uint16_t> counts, const at::Device& device) {
+ state_->bind(device);
+ auto& storage = *state_->cost;
+ if (!storage.joint_counts.defined() || storage.joint_counts.device() != device || !std::ranges::equal(counts, storage.joint_schema)) {
+  std::vector<std::int64_t> values(counts.begin(), counts.end());
+  auto replacement = at::tensor(values, at::TensorOptions().dtype(at::kLong)).to(device);
+  storage.joint_schema.assign(counts.begin(), counts.end());
+  storage.joint_counts = std::move(replacement);
+ }
+ return storage.joint_counts;
+}
 void MatcherWorkspace::enable_statistics() noexcept { state_->observed = true; }
 MatcherStatistics MatcherWorkspace::statistics() const noexcept { return state_->statistics; }
 at::Tensor MatcherWorkspace::cpu_indices(std::int64_t count) {

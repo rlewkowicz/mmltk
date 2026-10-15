@@ -382,6 +382,7 @@ OutputLayer narrow_output_layer_batch(const OutputLayer& layer, int64_t count) {
  narrowed.pred_boxes = layer.pred_boxes.narrow(0, 0, count);
  if (layer.query_features.has_value()) { narrowed.query_features = layer.query_features->narrow(0, 0, count); }
  narrowed.query_layout = layer.query_layout;
+ if (layer.pred_keypoints.has_value()) { narrowed.pred_keypoints = layer.pred_keypoints->narrow(0, 0, count); }
  if (layer.pred_masks.has_value()) { narrowed.pred_masks = layer.pred_masks->narrow(0, 0, count); }
  if (layer.sparse_pred_masks.has_value()) {
   narrowed.sparse_pred_masks = SparsePredMasks{
@@ -426,7 +427,7 @@ public:
        query_count_automatic_(query_count_automatic) {}
  void initialize(const TrainRequest& options, bool enable_loss, EvaluationMetricSet metric_set, std::int64_t prediction_capacity) {
   if (!loader_) { throw std::invalid_argument("training validation runtime requires a dataset loader"); }
-  metric_set = resolve_evaluation_metric_set(*loader_, metric_set == EvaluationMetricSet::BBoxAndMask);
+  metric_set = resolve_evaluation_metric_set(*loader_, metric_set == EvaluationMetricSet::BBoxAndMask, metric_set == EvaluationMetricSet::BBoxAndKeypoint);
   detection_limit_ = resolve_dataset_limit(loader_->max_instances_per_image(), resolve_evaluation_max_dets(options.eval_max_dets));
   detection_limit_.automatic = options.eval_max_dets == 0;
   torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(options.device_id));
@@ -789,7 +790,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
   PostprocessedBatch processed = [&]() {
    mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_postprocess{"rfdetr.train.eval.postprocess"};
    if (batch_timing) { evaluation_run.record_timing_start(batch_timing, EvaluationCudaBatchTiming::Phase::Postprocess, evaluation_stream); }
-   PostprocessedBatch postprocessed = postprocess_output_batch_fixed_size(OutputTensors{evaluated_outputs->main.pred_logits, evaluated_outputs->main.pred_boxes, evaluated_outputs->main.pred_masks},
+   PostprocessedBatch postprocessed = postprocess_output_batch_fixed_size(OutputTensors{evaluated_outputs->main.pred_logits, evaluated_outputs->main.pred_boxes, evaluated_outputs->main.pred_masks, evaluated_outputs->main.pred_keypoints, model.config().keypoints_per_class},
     static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select, &evaluation_postprocess);
    for (std::size_t image = 0; image < batch.num_images; ++image) {
     const auto geometry = loader.geometry(static_cast<std::uint32_t>(prediction_metadata[image].dataset_index));

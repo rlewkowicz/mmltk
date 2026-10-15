@@ -2,6 +2,7 @@
 #include <ATen/ATen.h>
 #include <cuda.h>
 #include <memory>
+#include <span>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -34,6 +35,7 @@ public:
  [[nodiscard]] at::Tensor read_cost();
  [[nodiscard]] at::Tensor cpu_indices(std::int64_t count);
  [[nodiscard]] TracedLossOpCache& loss_cache() noexcept;
+ [[nodiscard]] at::Tensor keypoint_counts(std::span<const std::uint16_t>, const at::Device&);
  [[nodiscard]] LsapScratch& solver() noexcept { return solver_; }
  [[nodiscard]] std::vector<MatcherLayerIndices> pack(const std::vector<std::vector<std::pair<at::Tensor, at::Tensor>>>&, const std::vector<std::int64_t>& target_offsets, const at::Device&);
  // Called after the lane's complete forward/backward use. CPU ownership still

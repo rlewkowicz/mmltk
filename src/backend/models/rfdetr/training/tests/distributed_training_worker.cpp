@@ -33,6 +33,11 @@ int main(int argc, char** argv) {
   }
   if (std::string_view(argv[4]).starts_with("cancel-")) testsupport::exercise_collective_cancellation(group, device, std::string_view(argv[4]).substr(7));
   if (std::string_view(argv[4]) == "early-failure") testsupport::exercise_early_bucket_overlap(group, device, true);
+  if (std::string_view(argv[4]).starts_with("family-")) {
+   testsupport::exercise_prepared_training(group, device, std::string_view(argv[4]).substr(7));
+   distributed_shutdown(group);
+   return 0;
+  }
   testsupport::exercise_training_initialization(group, device);
   testsupport::exercise_early_bucket_overlap(group, device);
   testsupport::exercise_gradient_trajectory(group, device);

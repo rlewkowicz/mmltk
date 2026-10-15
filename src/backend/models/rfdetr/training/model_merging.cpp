@@ -125,7 +125,7 @@ void TrainingMergeSchedule::retire_interval() {
  state_.merge = mmltk::common::math::checked_add(state_.merge, std::uint64_t{1}, "merge index overflow");
  state_.interval_rounds = 0;
 }
-TrainingSelection select_training_artifact(std::span<const TrainingSelectionCandidate> candidates, TrainFinalPolicy policy, bool masks, const std::filesystem::path& output,
+TrainingSelection select_training_artifact(std::span<const TrainingSelectionCandidate> candidates, TrainFinalPolicy policy, ModelTask task, const std::filesystem::path& output,
  std::function_ref<EvalSummary(const std::filesystem::path&)> evaluate) {
  switch (policy) {
   case TrainFinalPolicy::Off:
@@ -164,7 +164,7 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
   const auto& artifact = candidate.artifact;
   if (!ids.insert(artifact.model_id).second || artifact.session_id != reference.session_id || artifact.initialization != reference.initialization ||
       artifact.configuration != reference.configuration || artifact.validation != reference.validation || artifact.weights != reference.weights || !artifact.selection_metric || !artifact.evaluation ||
-      training_selection_metric(*artifact.evaluation, masks) != *artifact.selection_metric || artifact.initialization.empty() || artifact.validation.empty())
+      training_selection_metric(*artifact.evaluation, task) != *artifact.selection_metric || artifact.initialization.empty() || artifact.validation.empty())
    throw std::invalid_argument("incompatible final model candidate");
   const auto path = std::filesystem::absolute(artifact.path).lexically_normal();
   const auto found = std::ranges::find_if(admitted, [&](const auto& file) { return file->evidence()->artifact_path() == path; });
@@ -245,7 +245,7 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
   admission->release_decoded_state();
   auto summary = evaluate(path);
   admission->require_unchanged();
-  const auto metric = training_selection_metric(summary, masks);
+  const auto metric = training_selection_metric(summary, task);
   return std::tuple{path, std::move(summary), metric, std::move(admission)};
  };
  const auto accept_trial = [&](std::filesystem::path path, EvalSummary summary, double metric, std::shared_ptr<TrainingArtifactAdmission> admission) {

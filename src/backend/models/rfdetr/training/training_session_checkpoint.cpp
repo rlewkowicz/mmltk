@@ -7,19 +7,45 @@
 #include "src/common/io/file_memory.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 #include "src/pch_std.h"
+#include "src/frameworks/serialization/reflected_json.h"
+#include <nlohmann/json.hpp>
 #include "src/pch_linux.h"
 namespace mmltk::backend::models::rfdetr {
-std::string training_dataset_identity(const mmltk::backend::data::FileHeader& header, const mmltk::common::io::FileSnapshot& file, std::string_view configuration) {
+std::string training_dataset_identity(const mmltk::backend::data::FileHeader& header, const mmltk::common::io::FileSnapshot& file, std::string_view configuration, std::span<const std::byte> source_metadata) {
  namespace io = mmltk::common::io;
  static_assert(std::has_unique_object_representations_v<mmltk::backend::data::FileHeader>);
  io::Sha256Hasher identity;
- identity.Update({reinterpret_cast<const std::uint8_t*>(&header), sizeof(header)});
+ if (source_metadata.empty()) identity.Update({reinterpret_cast<const std::uint8_t*>(&header), sizeof(header)});
+ else identity.Update({reinterpret_cast<const std::uint8_t*>(source_metadata.data()), source_metadata.size()});
  // Exclude inode/device and ctime so moving or copying an immutable dataset
  // with its modification time preserved retains the same session identity.
  const std::array<std::uint64_t, 3> generation{file.bytes, static_cast<std::uint64_t>(file.modified_seconds), static_cast<std::uint64_t>(file.modified_nanoseconds)};
  identity.Update({reinterpret_cast<const std::uint8_t*>(generation.data()), sizeof(generation)});
  identity.Update({reinterpret_cast<const std::uint8_t*>(configuration.data()), configuration.size()});
  return io::sha256_hex(identity.Finish());
+}
+std::string training_configuration_identity(const NativeRfDetrConfig& config, const ModelClassLayout& layout, std::uint32_t schema) {
+ if (schema == 2) return encode_checkpoint_configuration(config) + encode_class_layout(layout);
+ if (schema != 1 || config.has_keypoints() || config.backbone.kind != BackboneKind::DinoV2Small || layout.foreground.keypoints || layout.class_name_evidence.keypoints)
+  throw std::invalid_argument("baseline session identity cannot represent the requested model/schema");
+ // Exact 1c13fec8 reflected field order and spelling. This is a persisted
+ // identity conversion, never an alternate configuration or execution schema.
+ std::ostringstream signature;
+ signature << std::hexfloat;
+ template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeRfDetrConfig, std::meta::access_context::current()))) {
+  constexpr auto name = std::meta::identifier_of(member);
+  if constexpr (name == "task") signature << "segmentation=" << config.has_masks() << ';';
+  else if constexpr (name == "backbone" || name == "projector" || name.starts_with("keypoint") || name == "inter_instance_keypoint_attention") {}
+  else if constexpr (name == "training_supervision") {
+   std::array<std::byte, 4096> scratch{};
+   signature << mmltk::frameworks::serialization::reflected_json(config.[:member:], scratch, {.max_bytes = scratch.size(), .max_items = 128, .max_depth = 16}).dump();
+  } else signature << std::define_static_string(name) << '=' << config.[:member:] << ';';
+ }
+ auto old_layout = nlohmann::json::parse(encode_class_layout(layout));
+ old_layout["foreground"].erase("keypoints");
+ old_layout["class_name_evidence"].erase("keypoints");
+ signature << old_layout.dump();
+ return signature.str();
 }
 namespace {
 namespace io = mmltk::common::io;
