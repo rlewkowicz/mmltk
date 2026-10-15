@@ -1,6 +1,7 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/io/file_memory.h"
@@ -110,6 +111,8 @@ void create_keypoint_dataset(const FixtureSpec& spec);
 void create_synthetic_dataset(const FixtureSpec& spec);
 [[nodiscard]] CompilerConfig compiler_config(const FixtureSpec& spec);
 void compile_existing_fixture(const FixtureSpec& spec);
+void create_compiled_fixture(const FixtureSpec& spec, bool keypoints);
+[[nodiscard]] DatasetLoader compile_fixture_loader(const FixtureSpec& spec);
 [[nodiscard]] std::vector<RLEPair> alternating_mask_runs(std::size_t count);
 void replace_synthetic_image(const FixtureSpec& spec, int image_index, int width, int height);
 std::vector<float> expected_nchw_stub(const std::string& path, int width, int height);

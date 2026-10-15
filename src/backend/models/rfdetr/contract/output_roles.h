@@ -1,5 +1,6 @@
 #pragma once
 #include "src/frameworks/reflection/reflected_declarations.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cstdint>
 #include <cstddef>
 #include <compare>
@@ -45,9 +46,7 @@ struct RfdetrOutputSchema final {
  inline static constexpr auto members = std::define_static_array(std::meta::enumerators_of(^^RfdetrOutputRole));
  template <std::meta::info Member>
  [[nodiscard]] static consteval RfdetrOutputPolicy policy() {
-  constexpr auto annotations = std::define_static_array(std::meta::annotations_of(Member));
-  static_assert(annotations.size() == 1);
-  constexpr auto declaration = std::meta::extract<RfdetrOutputDeclaration>(annotations[0]);
+  constexpr auto declaration = mmltk::frameworks::reflection::reflected_annotation<Member, RfdetrOutputDeclaration>();
   constexpr RfdetrOutputPolicy result{declaration.name, declaration.rank, declaration.executable, declaration.has_task ? std::optional{declaration.task} : std::nullopt};
   static_assert(result.executable ? !result.name.empty() && result.rank >= 3 : result.name.empty() && result.rank == 0 && !result.task);
   static_assert(!result.task || mmltk::frameworks::reflection::enum_contains(*result.task));

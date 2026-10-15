@@ -53,6 +53,10 @@ void run_subprocess(const std::vector<std::string>& args) {
  INFO("command: " << command_string(args) << "\nexit status: " << result.exit_code << "\n" << result.output_text);
  REQUIRE(result.exit_code == 0);
 }
+mmltk::backend::models::rfdetr::DecodedNativeModelState normalize_checkpoint(const fs::path& input, const fs::path& output) {
+ run_subprocess({mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", input.string(), "--output", output.string()});
+ return mmltk::backend::models::rfdetr::decode_model_state(output);
+}
 void assert_native_checkpoint(const fs::path& path, const char* expected_preset) {
  const bool path_exists = fs::exists(path);
  REQUIRE(path_exists);
@@ -201,8 +205,7 @@ TEST_CASE("All official asset digests admit their exact native topology independ
    constexpr std::string_view legacy_prefix = "keypoint_head.keypoint_proj.";
    CHECK(std::ranges::none_of(admitted.model_state.entries(), [&](const auto& entry) { return entry.name.starts_with(legacy_prefix); }));
    const auto normalized = directory.path() / "keypoint-native.pt";
-   run_subprocess({mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", renamed.string(), "--output", normalized.string()});
-   const auto restored = r::decode_model_state(normalized);
+   const auto restored = normalize_checkpoint(renamed, normalized);
    CHECK(restored.tensor_count() == admitted.model_state.tensor_count());
    CHECK(model.load_normalized_state(restored.entries(), true, &restored.metadata.class_layout).unexpected_names.empty());
    const auto healthy_digest = mmltk::common::io::sha256_file(normalized);
@@ -238,8 +241,7 @@ TEST_CASE("All official asset digests admit their exact native topology independ
    CHECK_THROWS(model.stage_normalized_state(malformed, r::detail::NormalizedModelStateAdmission::RequiredCore));
    CHECK(torch::equal(model.named_parameters()["class_embed.weight"], before));
    const auto normalized = directory.path() / "atto-native.pt";
-   run_subprocess({mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", renamed.string(), "--output", normalized.string()});
-   const auto restored = r::decode_model_state(normalized);
+   const auto restored = normalize_checkpoint(renamed, normalized);
    REQUIRE(restored.tensor_count() == admitted.model_state.tensor_count());
    for (std::size_t index = 0; index < restored.tensor_count(); ++index) {
     CHECK(restored.entries()[index].name == admitted.model_state.entries()[index].name);

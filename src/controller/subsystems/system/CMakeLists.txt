@@ -108,6 +108,7 @@ function(mmltk_add_controller_subsystems_system_tests)
     mmltk_configure_component(mmltk_controller_data_compute_systems_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_data_compute_systems_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(mmltk_controller_data_compute_systems_tests PRIVATE stb
+        mmltk_backend_data_catalog_test_support
         mmltk_controller_settings_test_support
         mmltk_backend_models_rfdetr_class_artifact_test_support
         mmltk_common_system_test_support

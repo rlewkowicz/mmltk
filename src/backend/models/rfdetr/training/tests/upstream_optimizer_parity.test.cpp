@@ -217,8 +217,7 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
 }  // namespace
 TEST_CASE("Actual upstream matched-state criterion AdamW and measured independent trajectory", "[rfdetr][parity][upstream_oracle][cuda]") {
  const auto requested = support::UpstreamOracle::requested();
- REQUIRE(requested);
- const support::UpstreamOracle oracle(*requested);
+ const support::UpstreamOracle oracle(requested);
  // CLEANUP-IGNORE: CUDA availability, device scope, and precision scope are separate prerequisites; model, training, and optimizer oracles retain independent setup.
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  c10::cuda::CUDAGuard guard(0);
@@ -240,7 +239,7 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
      request.fused_optimizer = false;
      auto built = rf::build_optimizer(model.named_parameters(true), request, model.config().backbone);
      const rf::TrainingStep step(1, 1., entry.dtype() != torch::kFloat32, entry.dtype());
-     support::OracleComparison comparison(*requested, (matched_state ? "training-" : "trajectory-") + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype());
+     support::OracleComparison comparison(requested, (matched_state ? "training-" : "trajectory-") + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype());
      comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
      std::set<std::string> actual_weights, expected_weights;
      for (const auto& [name, weight] : entry.loss_weights) expected_weights.insert(name);

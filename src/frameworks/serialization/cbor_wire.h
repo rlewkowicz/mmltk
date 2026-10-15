@@ -43,6 +43,7 @@ struct Error {
  ErrorCode code = ErrorCode::MalformedItem;
  std::size_t offset = 0U;
  std::string path;
+ bool operator==(const Error&) const = default;
 };
 using DecodeError = Error;
 using EncodeError = Error;
@@ -155,6 +156,13 @@ struct StructuralValidationScratch final {
 // CBOR's argument encoding is shared by the reader, writer, and counter.  Keeping
 // it here makes all budget calculations use the same shortest-form rule.
 [[nodiscard]] constexpr std::size_t head_size(const std::uint64_t value) noexcept { return value < 24U ? 1U : value <= 0xffU ? 2U : value <= 0xffffU ? 3U : value <= 0xffffffffU ? 5U : 9U; }
+struct SignedIntegerEncoding final {
+ std::uint8_t major;
+ std::uint64_t argument;
+};
+[[nodiscard]] constexpr SignedIntegerEncoding signed_integer_encoding(std::int64_t value) noexcept {
+ return value >= 0 ? SignedIntegerEncoding{0U, static_cast<std::uint64_t>(value)} : SignedIntegerEncoding{1U, static_cast<std::uint64_t>(-(value + 1))};
+}
 enum class CanonicalFloatWidth : std::uint8_t {
  Half = 2U,
  Single = 4U,

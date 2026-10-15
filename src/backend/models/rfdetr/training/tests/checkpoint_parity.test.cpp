@@ -41,6 +41,11 @@ using mmltk::backend::models::rfdetr::testsupport::log_fixture_phase;
 using mmltk::backend::models::rfdetr::testsupport::make_fixture_image;
 using mmltk::backend::models::rfdetr::testsupport::parity_fixture_cases;
 using mmltk::backend::models::rfdetr::testsupport::ParityFixtureCase;
+void require_joint_topology(const torch::Tensor& mask, const NativeRfDetrConfig& config, const mmltk::backend::models::rfdetr::ResolvedClassLayout& layout) {
+ const auto joints = mmltk::backend::models::rfdetr::KeypointTensorLayout::from_active_mask(mask);
+ REQUIRE(std::ranges::equal(joints.counts(), config.keypoints_per_class));
+ joints.require_class_layout(layout);
+}
 NativeRfDetrConfig config_for_fixture(const ParityFixtureCase& fixture) {
  const auto* preset = find_preset_catalog_entry(fixture.preset_name);
  if (preset == nullptr) { throw std::runtime_error(std::string("missing model preset for parity fixture: ") + fixture.preset_name); }
@@ -179,8 +184,7 @@ TEST_CASE("Native checkpoint format round-trip matches for all registered fixtur
 TEST_CASE("All official and controlled assets retain strict topology and checkpoint normalization", "[model][rfdetr][checkpoint_parity][upstream_oracle]") {
  namespace rf = mmltk::backend::models::rfdetr;
  const auto requested = rf::testsupport::UpstreamOracle::requested();
- REQUIRE(requested);
- const rf::testsupport::UpstreamOracle oracle(*requested);
+ const rf::testsupport::UpstreamOracle oracle(requested);
  for (const auto& row : rf::kPresetCatalog) {
   DYNAMIC_SECTION(row.preset_name) {
    const auto original = oracle.official_checkpoint(row.preset_name);
@@ -203,9 +207,7 @@ TEST_CASE("All official and controlled assets retain strict topology and checkpo
    const auto active = std::ranges::find(entries, std::string("_kp_active_mask"), &rf::NormalizedModelStateEntry::name);
    if (row.task == rf::ModelTask::Keypoints) {
     REQUIRE(active != entries.end());
-    const auto joints = rf::KeypointTensorLayout::from_active_mask(active->tensor);
-    REQUIRE(std::ranges::equal(joints.counts(), config.keypoints_per_class));
-    joints.require_class_layout(layout);
+    require_joint_topology(active->tensor, config, layout);
     REQUIRE(layout.catalog()->names().size() == 1);
     CHECK(layout.catalog()->names().front() == "person");
     CHECK(layout.catalog()->keypoints(0) == mmltk::backend::data::catalog::coco_person_keypoint_schema());
@@ -267,9 +269,7 @@ TEST_CASE("All official and controlled assets retain strict topology and checkpo
    if (row.task == rf::ModelTask::Keypoints) {
     const auto mask = std::ranges::find(controlled_entries, std::string("_kp_active_mask"), &rf::NormalizedModelStateEntry::name);
     REQUIRE(mask != controlled_entries.end());
-    const auto joints = rf::KeypointTensorLayout::from_active_mask(mask->tensor);
-    REQUIRE(std::ranges::equal(joints.counts(), config.keypoints_per_class));
-    joints.require_class_layout(layout);
+    require_joint_topology(mask->tensor, config, layout);
    }
    require_normalization(controlled_path, controlled, "controlled.pt");
    auto conflicting = metadata;

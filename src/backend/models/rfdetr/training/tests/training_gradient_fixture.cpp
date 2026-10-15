@@ -16,6 +16,7 @@
 #include "src/backend/models/rfdetr/training/detail/training_model.h"
 #include "src/backend/models/rfdetr/training/detail/training_snapshot.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -1430,11 +1431,7 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   fixture.num_images = static_cast<int>(4 * batches[batch_case] + 1);
   fixture.background_images = 0;
   fixture.pixel_evidence = true;
-  if (config.has_keypoints())
-   data::testsupport::create_keypoint_dataset(fixture);
-  else
-   data::testsupport::create_synthetic_dataset(fixture);
-  data::testsupport::compile_existing_fixture(fixture);
+  data::testsupport::create_compiled_fixture(fixture, config.has_keypoints());
   auto runtime_config = resolve_runtime_config(4, 1, 2, {}, device);
   RuntimeContext runtime(runtime_config);
   ScopedRuntimeContext runtime_scope(&runtime);
@@ -1477,11 +1474,7 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
    config.dec_layers = config.group_detr = 1;
   else
    config.group_detr = 2;
-  if (config.has_keypoints()) {
-   config.keypoints_per_class.assign(config.num_classes, 0);
-   for (std::size_t category = 0; category < catalog_loader->num_classes(); ++category)
-    config.keypoints_per_class[category] = static_cast<std::uint16_t>(catalog_loader->class_catalog()->keypoints(category).names.size());
-  }
+  if (config.has_keypoints()) config.keypoints_per_class = native_training_keypoint_counts(*catalog_loader->class_catalog());
   config.training_supervision = request.training_supervision;
   request.num_queries = config.num_queries;
   auto detection = detection_fixture_base(config);

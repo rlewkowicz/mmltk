@@ -370,10 +370,13 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
   std::array<std::size_t, 3> loads{};
   const support::OracleArchive archive(root.path(), committed, [&](std::size_t index) { ++loads.at(index); });
   CHECK((loads == std::array<std::size_t, 3>{1, 1, 1}));
+  const auto check_grouped_loads = [&] {
+   CHECK(std::ranges::all_of(loads, [](std::size_t count) { return count <= 1; }));
+   CHECK(std::accumulate(loads.begin(), loads.end(), std::size_t{0}) == 2);
+  };
   loads.fill(0);
   CHECK(archive.read_tensors(std::array<std::string, 3>{"gradient/z", "stock/gradient/z", "updated/z"}).size() == 3);
-  CHECK(std::ranges::all_of(loads, [](std::size_t count) { return count <= 1; }));
-  CHECK(std::accumulate(loads.begin(), loads.end(), std::size_t{0}) == 2);
+  check_grouped_loads();
   const std::vector<std::string> requested{"gradient/z", "stock/gradient/z", "updated/z", "gradient/a", "stock/gradient/a", "updated/a", "gradient/z", "optional"};
   for (int pass = 0; pass < 2; ++pass) {
    CAPTURE(pass);
@@ -381,8 +384,7 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
    const auto selected = archive.read_tensors(requested);
    CHECK(selected.size() == 7);
    CHECK_FALSE(selected.at("optional").defined());
-   CHECK(std::ranges::all_of(loads, [](std::size_t count) { return count <= 1; }));
-   CHECK(std::accumulate(loads.begin(), loads.end(), std::size_t{0}) == 2);
+   check_grouped_loads();
    std::size_t selected_bytes = 0;
    for (std::size_t index = 0; index < families.size(); ++index) {
     for (const auto* suffix : {"z", "a"}) {
@@ -406,8 +408,7 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
   for (int count = 0; count < 32; ++count) repeated.insert(repeated.end(), requested.begin(), requested.end());
   loads.fill(0);
   CHECK(archive.read_tensors(repeated).size() == 7);
-  CHECK(std::ranges::all_of(loads, [](std::size_t count) { return count <= 1; }));
-  CHECK(std::accumulate(loads.begin(), loads.end(), std::size_t{0}) == 2);
+  check_grouped_loads();
   CHECK((archive.ordered_defined_names("loss/") == std::vector<std::string>{"z", "a", "m"}));
   CHECK((archive.ordered_defined_names("gradient/") == std::vector<std::string>{"unused", "z", "a"}));
  }
@@ -554,8 +555,7 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
 }
 TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[rfdetr][parity][upstream_oracle][cuda]") {
  const auto requested = rf::testsupport::UpstreamOracle::requested();
- REQUIRE(requested);
- const rf::testsupport::UpstreamOracle oracle(*requested);
+ const rf::testsupport::UpstreamOracle oracle(requested);
  // CLEANUP-IGNORE: CUDA availability, device scope, and precision scope are separate prerequisites; model, training, and optimizer oracles retain independent setup.
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  c10::cuda::CUDAGuard guard(0);
@@ -569,7 +569,7 @@ TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[r
     if (mode != rf::CompilationMode::kNone) model.optimize_for_inference(entry.batch, entry.training, mode);
     const auto archive = oracle.archive(entry, 0);
     rf::testsupport::OracleComparison comparison(
-     *requested, "core-" + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype(), "actual upstream forward and fixed cotangent VJP; eager native production CUDA");
+     requested, "core-" + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype(), "actual upstream forward and fixed cotangent VJP; eager native production CUDA");
     comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
     comparison.fact("case topology", {{"protocol", entry.protocol}, {"groups", entry.groups}});
     auto input = archive.tensor("input", torch::kCUDA).clone().set_requires_grad(true);
@@ -626,13 +626,13 @@ TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[r
 TEST_CASE("Independent upstream repetitions measure the numerical noise floor", "[rfdetr][parity][upstream_repeat]") {
  const auto requested = rf::testsupport::UpstreamOracle::requested();
  const auto* repeated = std::getenv("MMLTK_RFDETR_UPSTREAM_REPEAT_DIR");
- if (!requested || !repeated) SKIP("two independent upstream artifact generations were not requested");
- const rf::testsupport::UpstreamOracle oracle(*requested), repeat(repeated);
+ if (!repeated) SKIP("two independent upstream artifact generations were not requested");
+ const rf::testsupport::UpstreamOracle oracle(requested), repeat(repeated);
  for (const auto& entry : oracle.cases()) {
   DYNAMIC_SECTION(entry.id) {
    const auto found = std::ranges::find_if(repeat.cases(), [&](const auto& value) { return value.id == entry.id; });
    REQUIRE(found != repeat.cases().end());
-   rf::testsupport::OracleComparison comparison(*requested, "repeat-" + entry.id, entry.dtype(), "two independent actual upstream executions; no native model execution");
+   rf::testsupport::OracleComparison comparison(requested, "repeat-" + entry.id, entry.dtype(), "two independent actual upstream executions; no native model execution");
    REQUIRE(found->steps.size() == entry.steps.size());
    comparison.observe_values([&] {
     for (std::size_t step = 0; step < entry.steps.size(); ++step) {
@@ -658,10 +658,9 @@ TEST_CASE("Independent upstream repetitions measure the numerical noise floor", 
 TEST_CASE("Explicit RGB resampling matches actual upstream tensor resize and records PIL differences", "[rfdetr][parity][upstream_oracle][torch_resize]") {
  namespace resize = mmltk::backend::imaging::resample;
  const auto requested = rf::testsupport::UpstreamOracle::requested();
- REQUIRE(requested);
- const rf::testsupport::UpstreamOracle oracle(*requested);
+ const rf::testsupport::UpstreamOracle oracle(requested);
  const auto archive = oracle.resize_archive();
- rf::testsupport::OracleComparison comparison(*requested, "rgb-resampling", torch::kFloat32, "actual torchvision float RGB bilinear align_corners=false; PIL RGB8 dataset path recorded separately");
+ rf::testsupport::OracleComparison comparison(requested, "rgb-resampling", torch::kFloat32, "actual torchvision float RGB bilinear align_corners=false; PIL RGB8 dataset path recorded separately");
  for (const auto* name : {"identity", "enlarge", "shrink", "odd_aspect", "high_frequency"}) {
   const std::string key(name);
   const auto rgb = archive.tensor(key + "/rgb8").contiguous();

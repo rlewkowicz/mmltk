@@ -305,11 +305,13 @@ TEST_CASE("Skeleton batches admit full catalog schemas without maximum-sized scr
  CHECK(projected.uncertainty_point_count == 0);
  CHECK(words.capacity() == capacity);
  const auto accepted = words;
+ const auto check_rejected_schema = [&] {
+  CHECK_THROWS_AS(raster::append_skeleton_projection(words, schema, [](std::size_t) { return raster::SkeletonSample{}; }), std::invalid_argument);
+  CHECK(words == accepted);
+ };
  schema.skeleton.push_back({0, 256});
- CHECK_THROWS_AS(raster::append_skeleton_projection(words, schema, [](std::size_t) { return raster::SkeletonSample{}; }), std::invalid_argument);
- CHECK(words == accepted);
+ check_rejected_schema();
  schema.skeleton.pop_back();
  schema.skeleton.back().second = 256;
- CHECK_THROWS_AS(raster::append_skeleton_projection(words, schema, [](std::size_t) { return raster::SkeletonSample{}; }), std::invalid_argument);
- CHECK(words == accepted);
+ check_rejected_schema();
 }

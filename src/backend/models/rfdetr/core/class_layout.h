@@ -33,6 +33,7 @@ private:
  bool semantic_ = true;
 };
 [[nodiscard]] ModelClassLayout native_training_class_layout(const mmltk::backend::data::catalog::ClassCatalog& catalog);
+[[nodiscard]] std::vector<std::uint16_t> native_training_keypoint_counts(const mmltk::backend::data::catalog::ClassCatalog& catalog);
 [[nodiscard]] ModelClassLayout unresolved_class_layout(std::size_t output_width);
 [[nodiscard]] ModelClassLayout coco_class_layout(ClassLayoutProvenance provenance);
 [[nodiscard]] std::string encode_class_layout(const ModelClassLayout& layout);

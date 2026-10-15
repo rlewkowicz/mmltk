@@ -2,6 +2,7 @@ pub(crate) mod output;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view::shared::status_text;
+use crate::view::workflow::overlay_controls::{self, KeypointSettingsMessage};
 use crate::view_model::ApplicationModel;
 use iced::widget::{button, column, container};
 
@@ -21,8 +22,7 @@ pub enum Message {
     PauseRequested(bool),
     Model(crate::view::workflow::model_card::Message),
     ThresholdChanged(f32),
-    KeypointsChanged(bool),
-    UncertaintyChanged(bool),
+    KeypointSettings(KeypointSettingsMessage),
     SourceChanged(crate::generated::SourceKind),
     CompiledPathChanged(String),
     ImagePathChanged(String),
@@ -250,7 +250,9 @@ impl Component {
                         "Skeletons",
                         draft.is_none_or(|value| value.showkeypoints),
                         settings_edit_available,
-                        Message::KeypointsChanged
+                        |value| Message::KeypointSettings(KeypointSettingsMessage::Keypoints(
+                            value
+                        ))
                     )
                 ),
                 crate::view::shared::identified(
@@ -259,7 +261,9 @@ impl Component {
                         "Joint uncertainty",
                         draft.is_some_and(|value| value.showuncertainty),
                         settings_edit_available,
-                        Message::UncertaintyChanged
+                        |value| Message::KeypointSettings(KeypointSettingsMessage::Uncertainty(
+                            value
+                        ))
                     )
                 ),
                 crate::view::workflow::loading::view(
@@ -371,6 +375,7 @@ impl Component {
             advanced,
             None,
         )
+        // CLEANUP-IGNORE: The shared compositor ends this view; the match crosses its independent reducer signature and local message arms.
         .with_run_cards(model, settings, output_card, Message::Gpu)
         .render(width)
     }
@@ -384,15 +389,8 @@ impl Component {
         let outcome = match message {
             Message::Product(action) => Outcome::Product(action),
             Message::Ignore => return Ok(None),
-            Message::KeypointsChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
-                    crate::generated::edit_workflowspredictshowkeypoints(draft, value)
-                })?,
-            ),
-            Message::UncertaintyChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
-                    crate::generated::edit_workflowspredictshowuncertainty(draft, value)
-                })?,
+            Message::KeypointSettings(message) => Outcome::SettingsEdited(
+                overlay_controls::update_keypoint_settings(settings, message)?,
             ),
             Message::ResizeMethodChanged(value) => Outcome::SettingsEdited(
                 settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {

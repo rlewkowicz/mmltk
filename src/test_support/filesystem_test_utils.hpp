@@ -6,6 +6,7 @@
 #include <istream>
 #include <nlohmann/json.hpp>
 #include <ostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -19,6 +20,8 @@ struct FileLockProbe {
 // Retain the opened inode and any acquired lock until the caller retires the probe.
 [[nodiscard]] mmltk::common::io::FileHandle open_test_directory(const std::filesystem::path& path);
 [[nodiscard]] FileLockProbe probe_file_lock(const std::filesystem::path& path);
+// Root must already be canonical. Existing paths resolve through symlinks before containment is checked.
+[[nodiscard]] std::optional<std::filesystem::path> canonical_fixture_path(const std::filesystem::path& root, const std::filesystem::path& path);
 [[nodiscard]] std::filesystem::path make_temp_root(const char* name_prefix);
 void write_text_file(const std::filesystem::path& path, std::string_view contents);
 void write_text_file(const std::filesystem::path& path, std::string_view contents, std::filesystem::perms permissions);

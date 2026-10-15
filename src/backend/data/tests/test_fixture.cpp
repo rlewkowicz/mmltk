@@ -549,6 +549,17 @@ void compile_existing_fixture(const FixtureSpec& spec) {
  const auto plan = DatasetCompiler::prepare(config, {config.split});
  DatasetCompiler::compile(plan, 0U);
 }
+void create_compiled_fixture(const FixtureSpec& spec, const bool keypoints) {
+ if (keypoints)
+  create_keypoint_dataset(spec);
+ else
+  create_synthetic_dataset(spec);
+ compile_existing_fixture(spec);
+}
+DatasetLoader compile_fixture_loader(const FixtureSpec& spec) {
+ compile_existing_fixture(spec);
+ return DatasetLoader({.compiled_path = compiled_bin_path(spec), .batch_size = 1, .shuffle = false});
+}
 void create_synthetic_dataset(const FixtureSpec& spec) {
  const std::string data_dir = dataset_dir(spec);
  const fs::path split_dir = fs::path(data_dir) / spec.split;

@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/media/live/live_analysis_product.h"
+#include "src/backend/data/catalog/tests/keypoint_schema_fixture.h"
 #include <array>
 #include <cstring>
 #include <cstddef>
@@ -70,16 +71,7 @@ struct LiveAnalysisFixture final {
  }
  static void DeliverLargeSchema(LiveAnalysisProduct& product, LiveFrameId frame, std::uint32_t count) {
   namespace catalog = mmltk::backend::data::catalog;
-  catalog::ClassKeypointSchema schema;
-  for (std::size_t joint = 0; joint < catalog::kKeypointsPerClassCapacity; ++joint) {
-   auto name = std::to_string(joint);
-   name.append(catalog::kKeypointNameCapacity - name.size(), 'j');
-   schema.names.push_back(std::move(name));
-   schema.horizontal_flip.push_back(static_cast<catalog::JointIndex>(joint));
-   schema.oks_sigmas.push_back(.1);
-  }
-  for (std::size_t edge = 0; edge < catalog::kSkeletonEdgeCapacity; ++edge)
-   schema.skeleton.push_back({static_cast<catalog::JointIndex>(edge % 256), static_cast<catalog::JointIndex>((edge % 256 + 1 + edge / 256) % 256)});
+  const auto schema = catalog::test_support::maximum_keypoint_schema();
   auto classes = std::make_shared<const catalog::ClassCatalog>(catalog::OrderedClassCatalog{{{"custom"}}, std::vector{schema}});
   std::vector<std::array<float, 4>> boxes(count, {0, 0, 3, 3});
   std::vector<std::int32_t> categories(count, 0), counts(count, 256);
@@ -101,19 +93,20 @@ struct LiveAnalysisFixture final {
    .class_catalog = std::move(classes)
   };
   annotation.count.SetKnown(count, count);
-  product.PrepareDevice(frame, 4, 4, std::span{&annotation, 1});
-  if (product.EnqueueDeviceCopy(1, &Copy) != cudaSuccess) throw std::runtime_error("fixture copy failed");
-  product.CompleteDeviceCopy();
+  DeliverAnnotation(product, frame, annotation);
  }
  static cudaError_t Copy(void* target, const void* source, std::size_t bytes, std::uintptr_t) noexcept {
   std::memcpy(target, source, bytes);
   return cudaSuccess;
  }
- void Deliver(LiveAnalysisProduct& product, LiveFrameId frame, bool pending = true) {
-  auto annotation = Annotation(pending);
+ static void DeliverAnnotation(LiveAnalysisProduct& product, LiveFrameId frame, RuntimeAnnotation& annotation) {
   product.PrepareDevice(frame, 4, 4, std::span{&annotation, 1});
   if (product.EnqueueDeviceCopy(1, &Copy) != cudaSuccess) throw std::runtime_error("fixture copy failed");
   product.CompleteDeviceCopy();
+ }
+ void Deliver(LiveAnalysisProduct& product, LiveFrameId frame, bool pending = true) {
+  auto annotation = Annotation(pending);
+  DeliverAnnotation(product, frame, annotation);
  }
 };
 }  // namespace mmltk::backend::media::live::test_support

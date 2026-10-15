@@ -1,4 +1,5 @@
 #include "workflow_wayland_inputs.h"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/frameworks/serialization/reflected_json.h"
 #include "src/common/io/file_digest.h"
 #include <algorithm>
@@ -92,9 +93,7 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root, 
  if (keypoints_) {
   config.keypoint_head = rfdetr::KeypointHeadKind::GroupPose;
   config.projector = rfdetr::ProjectorKind::DualKeypointOnly;
-  config.keypoints_per_class.assign(config.num_classes, 0);
-  for (std::size_t index = 0; index < compiled.class_catalog()->size(); ++index)
-   config.keypoints_per_class[index] = static_cast<std::uint16_t>(compiled.class_catalog()->keypoints(index).names.size());
+  config.keypoints_per_class = rfdetr::native_training_keypoint_counts(*compiled.class_catalog());
   config.keypoint_l1_loss_coef = config.keypoint_findable_loss_coef = config.keypoint_visible_loss_coef = config.keypoint_nll_loss_coef = 1;
  }
  rfdetr::NativeRfDetrModel model{config, rfdetr::native_training_class_layout(*compiled.class_catalog())};
@@ -209,10 +208,9 @@ void WorkflowWaylandInputs::VerifyCatalogTraining(
  if (!keypoints_) throw std::logic_error("catalog keypoint evidence requires its retained dataset fixture");
  const auto root = std::filesystem::canonical(session_root);
  const auto inside = [&](const std::filesystem::path& path) {
-  const auto absolute = std::filesystem::canonical(path.is_absolute() ? path : root / path);
-  const auto relative = absolute.lexically_relative(root);
-  if (relative.empty() || *relative.begin() == "..") throw std::runtime_error("catalog training artifact escaped its acceptance root");
-  return absolute;
+  const auto absolute = mmltk::testsupport::canonical_fixture_path(root, path);
+  if (!absolute) throw std::runtime_error("catalog training artifact escaped its acceptance root");
+  return *absolute;
  };
  const auto directory = inside(output), artifact = inside(checkpoint);
  const auto manifest = directory / "run.json";

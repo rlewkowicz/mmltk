@@ -1254,8 +1254,10 @@ void lower_repeat_node(torch::jit::Node* node) {
 }
 void lower_repeat_interleave_node(torch::jit::Node* node) {
  if (node->inputs().size() < 3) throw_lowering_error(node, "repeat_interleave requires scalar repeats and an axis");
+ // CLEANUP-OFF: Repeat count and repetition axis are distinct operator operands; constant decoding already has a shared owner.
  const auto repeats = constant_int_value(node->input(1));
  const auto dimension = constant_int_value(node->input(2));
+ // CLEANUP-ON
  const auto sizes = value_tensor_sizes(node->input(0));
  if (!repeats || *repeats <= 0 || !dimension || !sizes) throw_lowering_error(node, "repeat_interleave requires static positive repeats and shape");
  const auto axis = normalize_axis(*dimension, sizes->size(), node);
@@ -1671,8 +1673,10 @@ void lower_topk_node(torch::jit::Node* node) {
  if (node->inputs().size() != 5 || node->outputs().size() != 2) { throw_lowering_error(node, "expected 5 inputs and 2 outputs"); }
  // CLEANUP-IGNORE: These operand reads have different meaning: an axis in ranked extraction and a result count in top-k.
  const auto input_rank = value_tensor_rank(node->input(0));
+ // CLEANUP-OFF: Top-k count and extraction axis are distinct operator operands; constant decoding already has a shared owner.
  const auto k = constant_int_value(node->input(1));
  const auto dim = constant_int_value(node->input(2));
+ // CLEANUP-ON
  const auto largest = constant_bool_value(node->input(3));
  const auto sorted = constant_bool_value(node->input(4));
  if (!input_rank.has_value() || !k.has_value() || !dim.has_value() || !largest.has_value() || !sorted.has_value()) { throw_lowering_error(node, "topk parameters must be compile-time constants"); }

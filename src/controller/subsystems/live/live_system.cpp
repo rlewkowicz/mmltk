@@ -40,11 +40,7 @@ std::optional<LiveImageMetadata> project_live_metadata(const VisualFrame& frame,
      for (int joint = 0; joint < count; ++joint) {
       const auto& point = region.keypoints[index * region.keypoint_capacity + joint];
       VisualKeypoint value{.point = {point.x, point.y}, .confidence = point.confidence};
-      if (!value.point.finite()) {
-       value.point = {};
-       value.confidence = 0;
-      }
-      if (!std::isfinite(value.confidence)) value.confidence = 0;
+      value.Sanitize();
       if (std::isfinite(point.covariance_xx) && std::isfinite(point.covariance_xy) && std::isfinite(point.covariance_yy))
        value.covariance = std::array{point.covariance_xx, point.covariance_xy, point.covariance_yy};
       label.skeleton.joints.push_back(value);

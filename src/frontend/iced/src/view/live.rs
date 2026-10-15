@@ -1,6 +1,7 @@
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view::shared::status_text;
+use crate::view::workflow::overlay_controls::{self, KeypointSettingsMessage};
 use crate::view_model::ApplicationModel;
 use iced::widget::{button, column};
 
@@ -9,8 +10,7 @@ pub enum Message {
     Product(crate::view::image_viewer::ProductAction),
     Model(crate::view::workflow::model_card::Message),
     AnalysisChanged(bool),
-    KeypointsChanged(bool),
-    UncertaintyChanged(bool),
+    KeypointSettings(KeypointSettingsMessage),
     StartRequested,
     StopRequested,
     Workspace(crate::view::workspace::Message),
@@ -22,6 +22,7 @@ pub enum Outcome {
     Model(crate::view::workflow::model_card::Outcome),
     StartRequested,
     StopRequested,
+    // CLEANUP-IGNORE: Separate pages own their message type, input binding and child state; the match crosses that ownership boilerplate and a view signature.
     SettingsEdited(crate::view::settings::EditSchedule),
 }
 
@@ -40,7 +41,7 @@ impl Default for Component {
         }
     }
 }
-// CLEANUP-IGNORE: Live owns its direct page view and input binding; Export owns model-card state.
+// CLEANUP-IGNORE: Live owns its direct page view, input binding and Predict-bound model-card state.
 impl Component {
     pub fn view<'a>(
         &'a self,
@@ -91,8 +92,8 @@ impl Component {
                         )),
                         crate::view::shared::identified("live.analysis.enabled", crate::view::workflow::fields::toggle("Analyze captured frames", draft.is_some_and(|value| value.liveanalysisenabled), settings_edit_available, Message::AnalysisChanged)),
                         status_text("Analysis requires a prepared ONNX or TensorRT model on the capture device."),
-                        crate::view::shared::identified("live.keypoints", crate::view::workflow::fields::toggle("Skeletons", draft.is_none_or(|value| value.showkeypoints), settings_edit_available, Message::KeypointsChanged)),
-                        crate::view::shared::identified("live.uncertainty", crate::view::workflow::fields::toggle("Joint uncertainty", draft.is_some_and(|value| value.showuncertainty), settings_edit_available, Message::UncertaintyChanged)),
+                        crate::view::shared::identified("live.keypoints", crate::view::workflow::fields::toggle("Skeletons", draft.is_none_or(|value| value.showkeypoints), settings_edit_available, |value| Message::KeypointSettings(KeypointSettingsMessage::Keypoints(value)))),
+                        crate::view::shared::identified("live.uncertainty", crate::view::workflow::fields::toggle("Joint uncertainty", draft.is_some_and(|value| value.showuncertainty), settings_edit_available, |value| Message::KeypointSettings(KeypointSettingsMessage::Uncertainty(value)))),
                         status_text(state_label),
                         completed_frames,
                     ]
@@ -160,6 +161,7 @@ impl Component {
             advanced,
             None,
         )
+        // CLEANUP-IGNORE: This match crosses the completed shared compositor call and the independent page reducer signature.
         .render(width)
     }
 
@@ -182,15 +184,8 @@ impl Component {
                     crate::generated::edit_workflowspredictliveanalysisenabled(draft, value)
                 })?,
             ),
-            Message::KeypointsChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
-                    crate::generated::edit_workflowspredictshowkeypoints(draft, value)
-                })?,
-            ),
-            Message::UncertaintyChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
-                    crate::generated::edit_workflowspredictshowuncertainty(draft, value)
-                })?,
+            Message::KeypointSettings(message) => Outcome::SettingsEdited(
+                overlay_controls::update_keypoint_settings(settings, message)?,
             ),
             Message::StartRequested => Outcome::StartRequested,
             // CLEANUP-IGNORE: Live reduces its Stop lifecycle before its independent workspace child.

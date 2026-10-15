@@ -189,11 +189,7 @@ VisualSkeleton PredictionPreviewFrame::Skeleton(const rfdetr::Prediction& predic
  for (std::size_t index = 0; index < prediction.keypoints.size(); ++index) {
   const auto& point = prediction.keypoints[index];
   VisualKeypoint joint{.point = {point.x, point.y}, .confidence = point.confidence};
-  if (!joint.point.finite()) {
-   joint.point = {};
-   joint.confidence = 0;
-  }
-  if (!std::isfinite(joint.confidence)) joint.confidence = 0;
+  joint.Sanitize();
   if (ground_truth) joint.visibility = prediction.keypoint_visibility.empty() ? mmltk::backend::data::catalog::KeypointVisibility::Visible : prediction.keypoint_visibility.at(index);
   const auto covariance = rfdetr::keypoint_covariance(point);
   if (std::ranges::all_of(covariance, [](float value) { return std::isfinite(value); })) joint.covariance = covariance;

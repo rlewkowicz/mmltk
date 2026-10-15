@@ -26,6 +26,7 @@ struct VisualKeypoint final {
  MMLTK_FINITE float confidence = 0;
  std::optional<mmltk::backend::data::catalog::KeypointVisibility> visibility{};
  std::optional<std::array<float, 3>> covariance{};
+ void Sanitize() noexcept;
 };
 MMLTK_REFLECT_FIELDS(VisualKeypoint)
 struct VisualSkeleton final {

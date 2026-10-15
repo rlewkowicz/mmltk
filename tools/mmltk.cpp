@@ -78,6 +78,11 @@ std::string lower(std::string text) {
 std::string filename(const std::string& path) { return fs::path(path).filename().string(); }
 std::string parent(const std::string& path) { return fs::path(path).parent_path().string(); }
 void append(Args& to, const Args& from) { to.insert(to.end(), from.begin(), from.end()); }
+Args source_git_args(const std::string& source, const Args& arguments) {
+ Args result{"git", "--no-optional-locks", "-c", "safe.directory=" + source, "-C", source};
+ append(result, arguments);
+ return result;
+}
 Args tail(const Args& arguments, std::size_t start = 1) { return Args(arguments.begin() + static_cast<std::ptrdiff_t>(std::min(start, arguments.size())), arguments.end()); }
 std::string first(const Args& arguments) { return arguments.empty() ? std::string{} : arguments.front(); }
 std::string joined(const Args& arguments, std::string_view delimiter = " ") {
@@ -2351,9 +2356,7 @@ class Wrapper {
    const auto& pin = sources.at(kind);
    require(fs::is_regular_file(source + "/src/" + pin.at("package").get<std::string>() + "/__init__.py"), "oracle source package missing: " + kind);
    const auto source_git = [&](Args command) {
-    Args invocation{"git", "--no-optional-locks", "-c", "safe.directory=" + source, "-C", source};
-    append(invocation, command);
-    const auto result = capture(invocation);
+    const auto result = capture(source_git_args(source, command));
     require(!result.status, "cannot inspect oracle source: " + kind);
     return mmltk::tools::text::trim_newlines(result.out);
    };
@@ -2505,11 +2508,7 @@ class Wrapper {
    fs::remove_all(evidence);
    owned_dirs({base, evidence});
    if (!present(source)) must({"git", "-C", repo, "worktree", "add", "--detach", source, std::string(revision)});
-   const auto source_git = [&](Args args) {
-    Args command{"git", "--no-optional-locks", "-c", "safe.directory=" + source, "-C", source};
-    append(command, args);
-    return get(command);
-   };
+   const auto source_git = [&](Args args) { return get(source_git_args(source, args)); };
    require(
     trim(source_git({"rev-parse", "HEAD"})) == revision && trim(source_git({"rev-parse", "HEAD^{tree}"})) == tree && trim(source_git({"status", "--porcelain", "--untracked-files=all"})).empty(),
     "historical source must be the clean pinned application");

@@ -291,7 +291,7 @@ std::set<std::string> OracleArchive::names(const std::string_view prefix) const 
   if (name.starts_with(prefix)) result.insert(name.substr(prefix.size()));
  return result;
 }
-std::optional<std::filesystem::path> UpstreamOracle::requested() {
+std::filesystem::path UpstreamOracle::requested() {
  const auto* value = std::getenv("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR");
  if (!value) invalid("required reference preparation is absent; run the owning rfdetr suite through ./mmltk");
  if (!*value) invalid("explicitly requested evidence path is empty");

@@ -1,5 +1,7 @@
 #pragma once
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/weight_catalog.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/common/io/file_digest.h"
@@ -13,6 +15,20 @@
 #include <string_view>
 #include <utility>
 namespace mmltk::backend::models::rfdetr::test_support {
+template <class Visitor>
+void with_configuration_envelope(Visitor&& visitor) {
+ auto config = native_config_from_preset(model_presets().front());
+ config.preset_name.assign(60000, 'p');
+ SECTION("Long custom name") {}
+ SECTION("Maximum classifier slots") {
+  config = native_config_from_preset(*find_model_preset_by_weight_filename("rf-detr-keypoint-preview-xlarge.pth"));
+  config.preset_name.assign(52000, 'p');
+  config.num_classes = kMaximumClassOutputSlots;
+  config.keypoints_per_class.resize(kMaximumClassOutputSlots);
+ }
+ REQUIRE(native_model_config_valid(config));
+ std::forward<Visitor>(visitor)(config);
+}
 void write_prediction_model(const std::filesystem::path&, std::int64_t queries = 2, bool include_masks = true, std::optional<ModelClassLayout> layout = {});
 [[nodiscard]] PredictRequest prediction_image_fixture(const std::filesystem::path& directory);
 inline std::string write_class_descriptor_fixture(const std::filesystem::path& path, const ModelClassDescriptor& descriptor) {

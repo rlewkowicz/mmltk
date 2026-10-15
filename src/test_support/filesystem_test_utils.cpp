@@ -23,6 +23,12 @@ FileLockProbe probe_file_lock(const std::filesystem::path& path) {
  if (!available && errno != EWOULDBLOCK && errno != EAGAIN) throw mmltk::common::io::errno_error("cannot probe file lock", path.string());
  return {std::move(descriptor), available};
 }
+std::optional<std::filesystem::path> canonical_fixture_path(const std::filesystem::path& root, const std::filesystem::path& path) {
+ auto absolute = std::filesystem::canonical(path.is_absolute() ? path : root / path);
+ const auto relative = absolute.lexically_relative(root);
+ if (relative.empty() || *relative.begin() == "..") return std::nullopt;
+ return absolute;
+}
 std::filesystem::path make_temp_root(const char* const name_prefix) {
  std::string pattern = (std::filesystem::temp_directory_path() / (std::string{name_prefix} + ".XXXXXX")).string();
  const char* const created = ::mkdtemp(pattern.data());

@@ -220,6 +220,7 @@ impl Component {
             advanced,
             None,
         )
+        // CLEANUP-IGNORE: This match crosses the completed shared compositor call and the independent page reducer signature.
         .with_run_cards(model, settings, output_card, Message::Gpu)
         .render(width)
     }

@@ -522,8 +522,7 @@ TEST_CASE("Native keypoint evaluation retains bbox metrics twenty detections and
  mmltk::testsupport::ScopedTempDir root("keypoint-evaluation");
  data::testsupport::FixtureSpec spec{root.path().string(), "train", 128, 128, 2, 0, 0};
  data::testsupport::create_keypoint_dataset(spec);
- data::testsupport::compile_existing_fixture(spec);
- data::DatasetLoader loader({.compiled_path = data::testsupport::compiled_bin_path(spec), .batch_size = 1, .shuffle = false});
+ auto loader = data::testsupport::compile_fixture_loader(spec);
  REQUIRE(r::resolve_evaluation_metric_set(loader, false, true) == r::EvaluationMetricSet::BBoxAndKeypoint);
  r::EvaluationDatasetOwner owner(loader, r::EvaluationMetricSet::BBoxAndKeypoint);
  const auto annotations = loader.annotations(1);
@@ -573,8 +572,7 @@ TEST_CASE("Keypoint matching retains crowd missing-joint ignores area filters an
   output << R"({"class":"marker","bbox_xyxy":[90,90,120,120],"area":900,"iscrowd":true,"keypoints":[100,100,2,110,110,2]})" << '\n';
   output << R"({"class":"marker","bbox_xyxy":[0,0,8,8],"area":64,"keypoints":[0,0,0,0,0,0]})" << '\n';
  }
- data::testsupport::compile_existing_fixture(spec);
- data::DatasetLoader loader({.compiled_path = data::testsupport::compiled_bin_path(spec), .batch_size = 1, .shuffle = false});
+ auto loader = data::testsupport::compile_fixture_loader(spec);
  r::EvaluationDatasetOwner owner(loader, r::EvaluationMetricSet::BBoxAndKeypoint);
  std::vector<r::KeypointPrediction> joints(30 * 2);
  std::vector<float> scores(30), boxes(30 * 4);

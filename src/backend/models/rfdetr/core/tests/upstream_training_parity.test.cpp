@@ -1474,10 +1474,9 @@ TEST_CASE("Pinned upstream GroupPose schema losses initializer and OKS boundarie
  namespace support = rf::testsupport;
  using Policy = support::OracleComparisonPolicy;
  const auto requested = support::UpstreamOracle::requested();
- REQUIRE(requested);
- const support::UpstreamOracle oracle(*requested);
+ const support::UpstreamOracle oracle(requested);
  const auto archive = oracle.keypoint_archive();
- support::OracleComparison comparison(*requested, "keypoint-boundaries", torch::kFloat32, "actual pinned GroupPose and COCO evaluator boundaries");
+ support::OracleComparison comparison(requested, "keypoint-boundaries", torch::kFloat32, "actual pinned GroupPose and COCO evaluator boundaries");
  for (const auto& item : oracle.keypoint_cases()) {
   const auto id = item.at("id").get<std::string>();
   const auto counts = item.at("counts").get<std::vector<std::uint16_t>>();

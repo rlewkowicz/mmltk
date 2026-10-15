@@ -77,7 +77,10 @@ bool allocation_allowed(const void* raw_context, const wire::AllocationRequest& 
 namespace mmltk::frameworks::serialization::implementation {
 FixedCborEncoder::FixedCborEncoder(const std::span<std::byte> destination) noexcept : destination_(destination) {}
 bool FixedCborEncoder::unsigned_integer(const std::uint64_t value) noexcept { return head(0U, value); }
-bool FixedCborEncoder::signed_integer(const std::int64_t value) noexcept { return value >= 0 ? head(0U, static_cast<std::uint64_t>(value)) : head(1U, static_cast<std::uint64_t>(-(value + 1))); }
+bool FixedCborEncoder::signed_integer(const std::int64_t value) noexcept {
+ const auto encoding = wire::signed_integer_encoding(value);
+ return head(encoding.major, encoding.argument);
+}
 bool FixedCborEncoder::floating(const double value) noexcept {
  const auto encoding = wire::canonical_float_encoding(value);
  if (!encoding) return false;

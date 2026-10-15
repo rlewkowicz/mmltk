@@ -14,6 +14,13 @@
 #include <unistd.h>
 #include "src/controller/contracts/application_boundary.h"
 namespace mmltk::controller {
+void VisualKeypoint::Sanitize() noexcept {
+ if (!point.finite()) {
+  point = {};
+  confidence = 0;
+ }
+ if (!std::isfinite(confidence)) confidence = 0;
+}
 void VisualDocument::BindResource(contracts::WorkspaceResource resource) {
  // An immutable image document is a product identity, independent of editor
  // revisions. OS entropy scopes the monotonic meaning identity across process

@@ -57,6 +57,10 @@ struct AugmentationExecution final {
  if (geometry) { config.geometry = {.probability = 1.0F, .min_strength = 1.0F, .max_strength = 1.0F}; }
  return config;
 }
+inline void set_horizontal_flip_geometry(AugmentationImagePlan& plan) {
+ plan.forward = {-1, 0, 1, 0, 1, 0};
+ plan.inverse = plan.forward;
+}
 [[nodiscard]] inline AugmentationImagePlan small_object_plan(int transform) {
  AugmentationImagePlan plan;
  if (transform == 1) {

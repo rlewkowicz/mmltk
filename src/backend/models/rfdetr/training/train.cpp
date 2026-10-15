@@ -349,9 +349,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   artifacts.class_layout = native_training_class_layout(*train_loader.class_catalog());
   if (artifacts.config.has_keypoints()) {
    if (!train_loader.class_catalog()->has_keypoints()) throw std::invalid_argument("keypoint training requires a dataset joint schema");
-   std::vector<std::uint16_t> counts(artifacts.class_layout.slots.size());
-   for (std::size_t slot = 0; slot < counts.size(); ++slot)
-    if (const auto foreground = artifacts.class_layout.slots[slot].foreground_index) counts[slot] = static_cast<std::uint16_t>(train_loader.class_catalog()->keypoints(*foreground).names.size());
+   auto counts = native_training_keypoint_counts(*train_loader.class_catalog());
    if (resumed && counts != artifacts.config.keypoints_per_class) throw std::invalid_argument("Resume keypoint schema topology differs");
    artifacts.config.keypoints_per_class = std::move(counts);
   }

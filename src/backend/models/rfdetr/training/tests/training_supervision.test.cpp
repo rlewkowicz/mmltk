@@ -2042,6 +2042,13 @@ TEST_CASE("checkpoint capability rejects unknown and damaged archive containers"
  std::ofstream(path, std::ios::binary) << "PK\003\004damaged";
  REQUIRE_THROWS(mmltk::backend::models::rfdetr::inspect_training_checkpoint(path));
 }
+namespace {
+void require_single_foreground_target(const rfdetr::PreparedTargets& targets, std::int64_t label) {
+ REQUIRE(targets.counts == std::vector<std::int64_t>{1});
+ CHECK(targets.all_labels.cpu().item<std::int64_t>() == label);
+}
+}  // namespace
+// CLEANUP-IGNORE: Independent GPU cases require a caller-scoped stream guard through every target inspection; the stream factory is already shared.
 TEST_CASE("training excludes crowds and retains continuous targets with known empty masks", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
@@ -2059,15 +2066,13 @@ TEST_CASE("training excludes crowds and retains continuous targets with known em
   plan.active_size = 1;
   plan.images.resize(1);
   plan.transforms_geometry = flipped;
-  if (flipped) {
-   plan.images[0].forward = {-1, 0, 1, 0, 1, 0};
-   plan.images[0].inverse = plan.images[0].forward;
-  }
+  if (flipped) { rfdetr::test_support::set_horizontal_flip_geometry(plan.images[0]); }
+  // CLEANUP-IGNORE: The shared builder and caller-scoped lease prepare independently mutated foreground and all-crowd batches; their outcome assertions differ.
   auto targets = rfdetr::build_targets(batch, 8, 8, true, true, 0, scratch, "train", 8, rfdetr::TrainingSupervisionConfig{}, 2, &plan);
+  // CLEANUP-IGNORE: Each target set retains its own consumer lease through distinct assertions; target construction and lease handoff already have canonical owners.
   rfdetr::TargetConsumerLease lease(scratch, targets, 0);
   lease.handoff();
-  REQUIRE(targets.counts == std::vector<std::int64_t>{1});
-  CHECK(targets.all_labels.cpu().item<std::int64_t>() == 1);
+  require_single_foreground_target(targets, 1);
   CHECK(targets.all_iscrowd.cpu().item<std::int64_t>() == 0);
   // CLEANUP-IGNORE: The CPU tensor must outlive its borrowed accessor; each block inspects a different independent numeric box oracle.
   const auto values = targets.all_boxes.cpu();
@@ -2514,8 +2519,7 @@ TEST_CASE("Native compiled training retains routed objectives gradients optimize
 TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilation", "[rfdetr][training_supervision][compilation][upstream_oracle][cuda]") {
  using ComparisonPolicy = rfdetr::testsupport::OracleComparisonPolicy;
  const auto requested = rfdetr::testsupport::UpstreamOracle::requested();
- if (!requested) SKIP("optional official pretrained oracle artifacts not requested; representative recipe remains unexecuted");
- const rfdetr::testsupport::UpstreamOracle oracle(*requested);
+ const rfdetr::testsupport::UpstreamOracle oracle(requested);
  // CLEANUP-IGNORE: CUDA availability, device scope, and precision scope are separate prerequisites; model, training, and optimizer oracles retain independent setup.
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  c10::cuda::CUDAGuard device_guard(0);
@@ -2557,7 +2561,7 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
     const auto detection = training_detection_fixture(config);
     const rfdetr::TrainingStep step(1, 1., true, dtype);
     const std::string comparison_name = std::string(dtype == torch::kFloat16 ? "matchfree-nano384-fp16" : "matchfree-nano384-bf16") + (mode == rfdetr::CompilationMode::kNone ? "-eager-repeat" : "");
-    rfdetr::testsupport::OracleComparison comparison(*requested, comparison_name, dtype,
+    rfdetr::testsupport::OracleComparison comparison(requested, comparison_name, dtype,
      mode == rfdetr::CompilationMode::kNone ? "independent native Match-Free eager repetitions; compilation noise baseline"
                                             : "native Match-Free None/Selective compilation; independent equation/VJP coverage is separate from stock upstream");
     comparison.fact("representative recipe",
@@ -2970,6 +2974,7 @@ TEST_CASE("Criterion failure reports retain first nonfinite terms and lexical ex
   CHECK(report.details({parameter}, {"fixture.weight"}) == " nonfinite_param=fixture.weight");
  }
 }
+// CLEANUP-IGNORE: Independent GPU cases require a caller-scoped stream guard through every target inspection; the stream factory is already shared.
 TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusable target custody", "[rfdetr][training_supervision][keypoints][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
@@ -2995,11 +3000,11 @@ TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusab
  plan.active_size = 1;
  plan.transforms_geometry = true;
  plan.images[0].horizontal_flip = true;
- plan.images[0].forward = {-1, 0, 1, 0, 1, 0};
- plan.images[0].inverse = plan.images[0].forward;
+ rfdetr::test_support::set_horizontal_flip_geometry(plan.images[0]);
  const void* allocation = nullptr;
  for (int step = 0; step < 2; ++step) {
   auto targets = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 8, {}, 3, &plan);
+  // CLEANUP-IGNORE: Each target set retains its own consumer lease through distinct assertions; target construction and lease handoff already have canonical owners.
   rfdetr::TargetConsumerLease lease(scratch, targets, 0);
   lease.handoff();
   REQUIRE(targets.counts == std::vector<std::int64_t>{2});
@@ -3007,8 +3012,10 @@ TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusab
   CHECK(targets.all_keypoint_counts.cpu().equal(torch::tensor({2, 0}, torch::kInt64)));
   REQUIRE(targets.all_keypoints.size(0) == 2);
   REQUIRE(targets.all_keypoints.size(1) == 2);
+  // CLEANUP-OFF: The CPU tensor owns storage borrowed by this accessor through the following independent mixed-schema numeric assertions.
   const auto values = targets.all_keypoints.cpu();
   const auto coordinates = values.accessor<float, 3>();
+  // CLEANUP-ON
   CHECK(coordinates[0][0][0] == .25F);
   CHECK(coordinates[0][0][1] == .625F);
   CHECK(coordinates[0][0][2] == 1.0F);
@@ -3046,13 +3053,15 @@ TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusab
  image.paste_joints = donor_joints.data();
  image.paste_joint_count = donor_joints.size();
  auto pasted = rfdetr::build_targets(batch, 8, 8, true, true, 0, scratch, "train", 8, {}, 3, &plan);
+ // CLEANUP-IGNORE: Each target set retains its own consumer lease through distinct assertions; target construction and lease handoff already have canonical owners.
  rfdetr::TargetConsumerLease pasted_lease(scratch, pasted, 0);
  pasted_lease.handoff();
- REQUIRE(pasted.counts == std::vector<std::int64_t>{1});
- CHECK(pasted.all_labels.cpu().item<std::int64_t>() == 1);
+ require_single_foreground_target(pasted, 1);
  CHECK(pasted.all_keypoint_counts.cpu().item<std::int64_t>() == 2);
+ // CLEANUP-OFF: The CPU tensor owns storage borrowed by this accessor through the following independent masked-donor numeric assertions.
  const auto pasted_values = pasted.all_keypoints.cpu();
  const auto pasted_coordinates = pasted_values.accessor<float, 3>();
+ // CLEANUP-ON
  CHECK(pasted_coordinates[0][0][0] == .0625F);
  CHECK(pasted_coordinates[0][0][1] == .0625F);
  CHECK(pasted_coordinates[0][0][2] == 2.0F);

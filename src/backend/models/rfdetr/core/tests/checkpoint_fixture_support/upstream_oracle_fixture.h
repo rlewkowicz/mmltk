@@ -84,7 +84,7 @@ private:
 class UpstreamOracle final {
 public:
  // Required ordinary-suite evidence. Missing preparation fails acceptance.
- [[nodiscard]] static std::optional<std::filesystem::path> requested();
+ [[nodiscard]] static std::filesystem::path requested();
  explicit UpstreamOracle(const std::filesystem::path& root);
  [[nodiscard]] const std::vector<OracleCase>& cases() const noexcept { return cases_; }
  [[nodiscard]] const std::filesystem::path& directory() const noexcept { return directory_; }

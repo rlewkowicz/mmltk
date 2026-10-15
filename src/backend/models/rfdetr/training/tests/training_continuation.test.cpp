@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <chrono>
 #include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/training/train.h"
 #include "detail/training_session_checkpoint.h"
 #include "src/common/io/file_digest.h"
@@ -639,11 +640,9 @@ TEST_CASE("Original application sessions resume with immutable format ten identi
  REQUIRE_FALSE(evidence.at("inputs").empty());
  REQUIRE_FALSE(evidence.at("files").empty());
  const auto admitted_path = [&](const std::filesystem::path& path) {
-  const auto absolute = std::filesystem::canonical(path.is_absolute() ? path : root / path);
-  const auto relative = absolute.lexically_relative(root);
-  REQUIRE_FALSE(relative.empty());
-  REQUIRE(*relative.begin() != "..");
-  return absolute;
+  const auto absolute = mmltk::testsupport::canonical_fixture_path(root, path);
+  REQUIRE(absolute);
+  return *absolute;
  };
  std::map<std::filesystem::path, std::string> hashes;
  for (const auto& record : evidence.at("files")) {
@@ -762,18 +761,10 @@ TEST_CASE("PE Base and keypoint sessions retain shared independent and averaged 
   config.num_queries = config.num_select = 8;
   config.group_detr = 2;
   data::testsupport::FixtureSpec spec{.root_dir = root.path().string(), .width = config.resolution, .height = config.resolution, .num_images = 4, .background_images = 0};
-  if (config.has_keypoints())
-   data::testsupport::create_keypoint_dataset(spec);
-  else
-   data::testsupport::create_synthetic_dataset(spec);
-  data::testsupport::compile_existing_fixture(spec);
+  data::testsupport::create_compiled_fixture(spec, config.has_keypoints());
   auto source = data::CompiledDataset::open(data::testsupport::compiled_bin_path(spec));
   config.num_classes = static_cast<int>(source.class_catalog()->size()) + 1;
-  if (config.has_keypoints()) {
-   config.keypoints_per_class.assign(config.num_classes, 0);
-   for (std::size_t category = 0; category < source.class_catalog()->size(); ++category)
-    config.keypoints_per_class[category] = static_cast<std::uint16_t>(source.class_catalog()->keypoints(category).names.size());
-  }
+  if (config.has_keypoints()) config.keypoints_per_class = r::native_training_keypoint_counts(*source.class_catalog());
   const auto seed_path = root.path() / "seed.pt";
   {
    torch::manual_seed(123);

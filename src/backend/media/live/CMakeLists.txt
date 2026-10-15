@@ -70,6 +70,7 @@ mmltk_register_public_headers(mmltk_backend_media_live_test_support
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES tests/support/live_analysis_fixture.h)
 target_link_libraries(mmltk_backend_media_live_test_support INTERFACE
+    mmltk_backend_data_catalog_test_support
     mmltk::backend::media::live)
 
 function(mmltk_add_backend_media_live_tests)

@@ -112,6 +112,13 @@ ModelClassLayout native_training_class_layout(const catalog::ClassCatalog& catal
  result.slots.push_back({ClassSlotRole::Unused, std::nullopt});
  return result;
 }
+std::vector<std::uint16_t> native_training_keypoint_counts(const catalog::ClassCatalog& catalog) {
+ std::vector<std::uint16_t> result;
+ result.reserve(catalog.size() + 1U);
+ for (std::size_t index = 0; index < catalog.size(); ++index) result.push_back(static_cast<std::uint16_t>(catalog.keypoints(index).names.size()));
+ result.push_back(0U);
+ return result;
+}
 ModelClassLayout unresolved_class_layout(std::size_t output_width) {
  if (output_width == 0 || output_width > kMaximumClassOutputSlots) throw std::invalid_argument("RF-DETR output width exceeds layout capacity");
  ModelClassLayout result;

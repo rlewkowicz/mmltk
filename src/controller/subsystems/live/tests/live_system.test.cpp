@@ -42,6 +42,10 @@ using media::test_support::LiveAnalysisFixture;
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
+void stop_and_wait(LiveSystem& live, EventGate& events) {
+ static_cast<void>(live.Stop());
+ REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
+}
 struct LiveReceiverCopyProbe final {
  static inline cudaError_t wait_status = cudaSuccess;
  static inline cudaError_t copy_status = cudaSuccess;
@@ -305,9 +309,11 @@ TEST_CASE("Live captures immutable prepared Predict settings and cancels partial
  start();
  REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 2; }));
  const auto retained = live.snapshot();
+ // CLEANUP-OFF: This caller-owned paired read retains GPU custody through its independent Live lifecycle assertions.
  auto read = live.BorrowDocument(retained.frame);
  REQUIRE(read.valid());
  REQUIRE(read.image_metadata);
+ // CLEANUP-ON
  CHECK(std::holds_alternative<mmltk::frameworks::serialization::wire::Value::Array>(read.image_metadata->storage));
  CHECK(read.document->facts() == retained.document);
  edit("workflows.predict.request.threshold", 1.0);
@@ -368,10 +374,6 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
   kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
   [&](LiveSystem::event_type) { events.Advance(); }
  };
- const auto stop_and_wait = [&] {
-  static_cast<void>(live.Stop());
-  REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
- };
  const auto check = [](const auto& read, const std::size_t value) {
   REQUIRE(read.valid());
   const auto plane = read.plane(0U).plane();
@@ -404,7 +406,7 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
  CHECK(third.plane(0U).plane().data == first_pointer);
  second = {};
  third = {};
- stop_and_wait();
+ stop_and_wait(live, events);
  state->Offer();
  static_cast<void>(live.Start({.extent = {3U, 5U}, .frames_per_second = 240U}));
  REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 4U; }));
@@ -413,7 +415,7 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
  CHECK(resized.plane(0U).plane().descriptor.width == 3U);
  CHECK(resized.plane(0U).plane().descriptor.height == 5U);
  resized = {};
- stop_and_wait();
+ stop_and_wait(live, events);
  CHECK(backend->same_copies == 0U);
  CHECK(backend->plane_clears == 0U);
 }
@@ -434,8 +436,7 @@ TEST_CASE("Live rejected or stopped complete captures never report frame progres
   REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
  else {
   REQUIRE(state->changed.Wait([&] { return state->acquisitions.load() >= 2U; }));
-  static_cast<void>(live.Stop());
-  REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
+  stop_and_wait(live, events);
  }
  CHECK(state->captures == 1U);
  CHECK(live.snapshot().completed_frames == 0U);
@@ -480,10 +481,7 @@ TEST_CASE("Live exact-frame analysis reads retain image and schema across reuse 
   [&](LiveSystem::event_type) { events.Advance(); }
  };
  const auto await_frame = [&](std::uint64_t count) { REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == count; })); };
- const auto stop = [&] {
-  static_cast<void>(live.Stop());
-  REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
- };
+ const auto stop = [&] { stop_and_wait(live, events); };
  state->Offer();
  static_cast<void>(live.Start({.extent = {7, 3}, .frames_per_second = 240}));
  await_frame(1);
@@ -600,8 +598,11 @@ TEST_CASE("Live metadata capacity refuses only the replacement and stops with us
   events.Advance();
  }
  };
- state->Offer();
- static_cast<void>(live.Start({.extent = {4, 4}, .frames_per_second = 240}));
+ const auto start = [&] {
+  state->Offer();
+  static_cast<void>(live.Start({.extent = {4, 4}, .frames_per_second = 240}));
+ };
+ start();
  REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 1; }));
  const auto first = live.snapshot();
  auto held = live.BorrowDocument(first.frame);
@@ -626,13 +627,11 @@ TEST_CASE("Live metadata capacity refuses only the replacement and stops with us
   CHECK(fresh.document->facts() == held.document->facts());
   CHECK(live.ImageSnapshot(first.frame).has_value());
   fresh = {};
-  state->Offer();
-  static_cast<void>(live.Start({.extent = {4, 4}, .frames_per_second = 240}));
+  start();
   REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 2; }));
   CHECK(live.snapshot().frame != first.frame);
   check(held);
-  static_cast<void>(live.Stop());
-  REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
+  stop_and_wait(live, events);
  } else {
   CHECK_FALSE(live.BorrowDocument(first.frame).valid());
   CHECK_FALSE(live.ImageSnapshot(first.frame));

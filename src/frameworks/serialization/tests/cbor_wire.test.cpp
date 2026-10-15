@@ -96,11 +96,7 @@ std::expected<std::size_t, wire::EncodeError> check_measurement_against_encoder(
  REQUIRE(counted.has_value() == encoded.has_value());
  if (encoded)
   CHECK(*counted == bytes.size());
- else {
-  CHECK(counted.error().code == encoded.error().code);
-  CHECK(counted.error().path == encoded.error().path);
-  CHECK(counted.error().offset == encoded.error().offset);
- }
+ else { CHECK(counted.error() == encoded.error()); }
  return counted;
 }
 template <class T>

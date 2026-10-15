@@ -8,6 +8,7 @@
 #include "src/controller/services/settings/settings_system.h"
 #include <atomic>
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/frameworks/serialization/serialization.h"
 #include <array>
 #include <vector>
@@ -39,35 +40,27 @@ namespace {
 }
 TEST_CASE("Prepared model facts publish complete admitted custom names and task configuration", "[controller][model][boundary]") {
  namespace rfdetr = mmltk::backend::models::rfdetr;
- auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
- config.preset_name.assign(60000, 'p');
- SECTION("Long custom name") {}
- SECTION("Maximum classifier slots") {
-  config = rfdetr::native_config_from_preset(*rfdetr::find_model_preset_by_weight_filename("rf-detr-keypoint-preview-xlarge.pth"));
-  config.preset_name.assign(52000, 'p');
-  config.num_classes = rfdetr::kMaximumClassOutputSlots;
-  config.keypoints_per_class.resize(rfdetr::kMaximumClassOutputSlots);
- }
- REQUIRE(rfdetr::native_model_config_valid(config));
- contracts::ModelUiState state;
- state.selection.key.source = contracts::ModelSelectionSource::Custom;
- state.selection.key.input = contracts::ModelArtifactInputKind::Weights;
- state.selection.training_config = config;
- state.selection.task = config.task;
- state.selection.training_capabilities = rfdetr::model_training_capabilities(config.task, config.dec_layers);
- state.selection.artifact.assign(contracts::kModelArtifactCapacity, 'a');
- state.progress.activity.assign(contracts::kModelDetailCapacity, 'p');
- state.terminal.detail.assign(contracts::kModelDetailCapacity, 'd');
- state.terminal.outcome = contracts::ModelSelectionOutcome::Accepted;
- namespace serial = mmltk::frameworks::serialization;
- std::vector<std::byte> bytes;
- const serial::wire::Limits limits{.max_bytes = contracts::kModelUiStateByteBudget, .max_items = contracts::kModelUiStateByteBudget};
- REQUIRE(serial::encode(state, bytes, limits));
- REQUIRE(bytes.size() > 65536);
- const auto decoded = serial::decode<contracts::ModelUiState>({.first = bytes}, limits);
- REQUIRE(decoded);
- CHECK(*decoded == state);
- CHECK(decoded->selection.training_config->preset_name == config.preset_name);
+ rfdetr::test_support::with_configuration_envelope([&](const rfdetr::NativeRfDetrConfig& config) {
+  contracts::ModelUiState state;
+  state.selection.key.source = contracts::ModelSelectionSource::Custom;
+  state.selection.key.input = contracts::ModelArtifactInputKind::Weights;
+  state.selection.training_config = config;
+  state.selection.task = config.task;
+  state.selection.training_capabilities = rfdetr::model_training_capabilities(config.task, config.dec_layers);
+  state.selection.artifact.assign(contracts::kModelArtifactCapacity, 'a');
+  state.progress.activity.assign(contracts::kModelDetailCapacity, 'p');
+  state.terminal.detail.assign(contracts::kModelDetailCapacity, 'd');
+  state.terminal.outcome = contracts::ModelSelectionOutcome::Accepted;
+  namespace serial = mmltk::frameworks::serialization;
+  std::vector<std::byte> bytes;
+  const serial::wire::Limits limits{.max_bytes = contracts::kModelUiStateByteBudget, .max_items = contracts::kModelUiStateByteBudget};
+  REQUIRE(serial::encode(state, bytes, limits));
+  REQUIRE(bytes.size() > 65536);
+  const auto decoded = serial::decode<contracts::ModelUiState>({.first = bytes}, limits);
+  REQUIRE(decoded);
+  CHECK(*decoded == state);
+  CHECK(decoded->selection.training_config->preset_name == config.preset_name);
+ });
 }
 TEST_CASE("Keypoint task admission uses catalog presence and native supervision capabilities", "[controller][model][keypoints]") {
  namespace rfdetr = mmltk::backend::models::rfdetr;

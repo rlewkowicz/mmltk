@@ -649,9 +649,8 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
  namespace support = rf::testsupport;
  namespace runtime = mmltk::backend::ml::runtime;
  const auto requested = support::UpstreamOracle::requested();
- REQUIRE(requested);
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
- const support::UpstreamOracle oracle(*requested);
+ const support::UpstreamOracle oracle(requested);
  const mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  support::MatcherExecutionFixture matcher;
  rf::ScopedRuntimeContext runtime_context(nullptr, 0, &matcher.workspace);
@@ -739,7 +738,7 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
      outputs.push_back(buffer(values.back()));
     }
     support::OracleComparison comparison(
-     *requested, "export-" + entry.id + "-" + std::to_string(static_cast<int>(kind)), torch::kFloat32, "persisted artifact export and runtime against actual upstream task tensors");
+     requested, "export-" + entry.id + "-" + std::to_string(static_cast<int>(kind)), torch::kFloat32, "persisted artifact export and runtime against actual upstream task tensors");
     for (int pass = 0; pass < 2; ++pass) {
      auto receipt = backend->Run(buffer(input), outputs, {}, {}, {});
      backend->ReleaseAfterCompletion(std::move(receipt));

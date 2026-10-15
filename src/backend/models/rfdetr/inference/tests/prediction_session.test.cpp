@@ -73,6 +73,23 @@ import mmltk.backend.models.rfdetr.model_export;
 import mmltk.common.logging.mmltk_logging;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 using rfdetr::test_support::write_prediction_model;
+namespace {
+rfdetr::DecodedNativeModelState native_checkpoint(std::vector<rfdetr::NormalizedModelStateEntry> entries, const rfdetr::NativeRfDetrConfig& config, const rfdetr::ModelClassLayout& layout) {
+ rfdetr::DecodedNativeModelState checkpoint(std::move(entries));
+ rfdetr::ResolvedModelArtifacts artifacts;
+ artifacts.config = config;
+ artifacts.class_layout = layout;
+ checkpoint.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
+ return checkpoint;
+}
+rfdetr::ModelClassDescriptor simplify_with_companion(
+ const std::filesystem::path& path, const std::filesystem::path& companion, const rfdetr::ModelClassLayout& layout, const std::vector<rfdetr::RfdetrNamedOutputRole>& roles) {
+ namespace io = mmltk::common::io;
+ rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout, roles});
+ rfdetr::simplify_onnx_model_file(path);
+ return rfdetr::test_support::checked_class_descriptor_fixture(path, companion, layout);
+}
+}  // namespace
 TEST_CASE("Image prediction applies selected RGB methods while retaining original preview custody", "[model][rfdetr][prediction][gpu][torch_resize]") {
  using namespace mmltk::backend::imaging::resample;
  const mmltk::testsupport::ScopedTempDir root("prediction-rgb-resampling");
@@ -1393,9 +1410,7 @@ TEST_CASE("ONNX output roles accept explicit producer names without shape guessi
  layout.slots.pop_back();
  const auto companion = std::filesystem::path(path.string() + ".classes.json");
  namespace io = mmltk::common::io;
- rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout, roles});
- rfdetr::simplify_onnx_model_file(path);
- const auto descriptor = rfdetr::test_support::checked_class_descriptor_fixture(path, companion, layout);
+ const auto descriptor = simplify_with_companion(path, companion, layout, roles);
  CHECK((rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path, descriptor.output_roles)) == descriptor.output_roles));
 }
 TEST_CASE("Same-path ONNX simplification rebinds authoritative companion layout and roles", "[model][rfdetr][layout][onnx]") {
@@ -1409,9 +1424,7 @@ TEST_CASE("Same-path ONNX simplification rebinds authoritative companion layout 
  layout.slots[0].foreground_index = 1;
  layout.slots[1].foreground_index = 0;
  const auto roles = rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path));
- rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout, roles});
- rfdetr::simplify_onnx_model_file(path);
- const auto descriptor = rfdetr::test_support::checked_class_descriptor_fixture(path, companion, layout);
+ const auto descriptor = simplify_with_companion(path, companion, layout, roles);
  CHECK((descriptor.output_roles == roles));
  const auto info = rfdetr::load_onnx_model_info(path, descriptor.output_roles);
  CHECK(rfdetr::ClassArtifactAdmission(path).Resolve(info.num_classes, info.class_layout) == layout);
@@ -1991,11 +2004,7 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
  const auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"}));
  rfdetr::NativeRfDetrModel model(config, layout);
  auto entries = rfdetr::collect_module_state(model);
- rfdetr::DecodedNativeModelState checkpoint(std::move(entries));
- rfdetr::ResolvedModelArtifacts artifacts;
- artifacts.config = config;
- artifacts.class_layout = layout;
- checkpoint.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
+ auto checkpoint = native_checkpoint(std::move(entries), config, layout);
  const auto weights = root.path() / "model.native.pt";
  rfdetr::save_native_checkpoint(weights, checkpoint);
  const auto image = root.path() / "frame.ppm";
@@ -2136,9 +2145,6 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
   rfdetr::NativeRfDetrModel model(config, layout);
   auto entries = rfdetr::collect_module_state(model);
   const auto initialization = rfdetr::native_state_fingerprint(entries);
-  rfdetr::ResolvedModelArtifacts artifacts;
-  artifacts.config = config;
-  artifacts.class_layout = layout;
   const auto evaluate = [&](const std::filesystem::path& path) {
    rfdetr::EvaluateRequest request;
    request.weights_path = path;
@@ -2156,8 +2162,7 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
   torch::NoGradGuard no_grad;
   for (std::size_t index = 0; index < candidates.size(); ++index) {
    if (index) model.named_parameters(true)["class_embed.bias"].add_(.01);
-   rfdetr::DecodedNativeModelState state(entries);
-   state.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
+   auto state = native_checkpoint(entries, config, layout);
    auto& candidate = candidates[index].artifact;
    candidate.path = directory / ("model-" + std::to_string(index) + ".pt");
    rfdetr::save_native_checkpoint(candidate.path, state);
@@ -2383,11 +2388,7 @@ TEST_CASE("Native keypoint validation maps classes and named joints in both metr
    parameters["class_embed.bias"][0].fill_(10);
    parameters["keypoint_embed.layers.2.weight"].normal_(0, .01);
   }
-  rfdetr::DecodedNativeModelState checkpoint(rfdetr::collect_module_state(model));
-  rfdetr::ResolvedModelArtifacts artifacts;
-  artifacts.config = config;
-  artifacts.class_layout = layout;
-  checkpoint.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
+  auto checkpoint = native_checkpoint(rfdetr::collect_module_state(model), config, layout);
   rfdetr::save_native_checkpoint(weights, checkpoint);
  }
  const mmltk::testsupport::ScopedTestStream stream;

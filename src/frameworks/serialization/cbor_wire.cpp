@@ -711,7 +711,10 @@ std::expected<void, EncodeError> Writer::write_object_body(const std::size_t siz
 }
 std::expected<void, EncodeError> Writer::write_body(std::monostate) { return put(std::byte{0xf6}); }
 std::expected<void, EncodeError> Writer::write_body(const bool value) { return put(value ? std::byte{0xf5} : std::byte{0xf4}); }
-std::expected<void, EncodeError> Writer::write_body(const std::int64_t value) { return value >= 0 ? head(0U, static_cast<std::uint64_t>(value)) : head(1U, static_cast<std::uint64_t>(-(value + 1))); }
+std::expected<void, EncodeError> Writer::write_body(const std::int64_t value) {
+ const auto encoding = signed_integer_encoding(value);
+ return head(encoding.major, encoding.argument);
+}
 std::expected<void, EncodeError> Writer::write_body(const std::uint64_t value) { return head(0U, value); }
 std::expected<void, EncodeError> Writer::write_body(const double value) {
  const auto encoding = canonical_float_encoding(value);

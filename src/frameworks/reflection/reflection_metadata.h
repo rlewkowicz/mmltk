@@ -16,6 +16,12 @@ template <std::meta::info Target>
 [[nodiscard]] consteval auto reflected_annotations() {
  return std::define_static_array(std::meta::annotations_of(Target));
 }
+template <std::meta::info Target, class Annotation>
+[[nodiscard]] consteval Annotation reflected_annotation() {
+ constexpr auto annotations = reflected_annotations<Target>();
+ static_assert(annotations.size() == 1U);
+ return std::meta::extract<Annotation>(annotations[0]);
+}
 template <std::meta::info Target, class Predicate>
 [[nodiscard]] consteval std::size_t reflected_annotation_count([[maybe_unused]] Predicate predicate) {
  std::size_t count = 0U;

@@ -303,9 +303,15 @@ fs::path admitted_file(const fs::path& directory, const std::string& name) {
   throw std::runtime_error("invalid evidence filename");
  return directory / name;
 }
+struct EvidenceFile {
+ fs::path path;
+ std::uint64_t bytes;
+};
+EvidenceFile admitted_file_record(const fs::path& directory, const Json& reference) {
+ return {admitted_file(directory, reference.at("file").get<std::string>()), reference.at("bytes").get<std::uint64_t>()};
+}
 Json authenticated_json(const fs::path& directory, const Json& reference) {
- const auto path = admitted_file(directory, reference.at("file").get<std::string>());
- const auto bytes = reference.at("bytes").get<std::uint64_t>();
+ const auto [path, bytes] = admitted_file_record(directory, reference);
  if (!bytes || bytes > MaxManifest || fs::file_size(path) != bytes || digest(path) != reference.at("sha256")) throw std::runtime_error("completed evidence index changed");
  return read_json(path);
 }
@@ -332,8 +338,7 @@ void verify_archive(const fs::path& directory, const Json& reference) {
   const auto shard = authenticated_json(directory, ref);
   for (const auto& [name, spec] : shard.at("tensors").items())
    if (!names.insert(name).second || names.size() > MaxTensors) throw std::runtime_error("duplicate completed tensor");
-  const auto path = admitted_file(directory, shard.at("file").get<std::string>());
-  const auto bytes = shard.at("bytes").get<std::uint64_t>();
+  const auto [path, bytes] = admitted_file_record(directory, shard);
   if (!files.insert(path.filename().string()).second || !bytes || bytes > MaxArchive || bytes > MaxStepStorage - total || fs::file_size(path) != bytes || digest(path) != shard.at("sha256"))
    throw std::runtime_error("completed tensor shard changed");
   total += bytes;

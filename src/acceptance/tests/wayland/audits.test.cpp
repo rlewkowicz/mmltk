@@ -2947,20 +2947,32 @@ TEST_CASE("training source pixels require stable identity and original observati
 namespace mmltk::acceptance::wayland {
 TEST_CASE("Keypoint evidence requires current paired catalog retained derived and clean pixels", "[workspace][audit][keypoints]") {
  BrowserAudit audit;
- for (const auto stage :
-  {"keypoint-explore", "keypoint-validate", "keypoint-predict", "keypoint-predict-upscale", "live-capture-only", "live-production-analysis", "live-zero-detections", "live-new-model-restart",
-   "live-failure-retained", "live-upscale", "live-import-clean", "catalog-pe-image"}) {
-  const std::string_view name(stage);
-  const bool empty = name == "live-capture-only" || name == "live-zero-detections" || name == "live-failure-retained";
-  const bool clean = name == "live-import-clean", catalog = name == "catalog-pe-image";
-  const auto control = name == "keypoint-explore"    ? "explore.detail.workspace"
-                       : name == "keypoint-validate" ? "validate.samples.atlas"
-                        : clean                      ? "annotation.workspace.surface"
-                                                     : "workflow.visual.workspace";
+ struct PixelCase {
+  const char* stage;
+  const char* control;
+  std::uint32_t sampled, matched, joints, source_samples;
+  bool empty, clean, catalog;
+ };
+ // Independent expected records exercise the audit's stage policy.
+ constexpr std::array cases{
+  PixelCase{"keypoint-explore", "explore.detail.workspace", 17, 17, 17, 0, false, false, false},
+  PixelCase{"keypoint-validate", "validate.samples.atlas", 17, 17, 17, 0, false, false, false},
+  PixelCase{"keypoint-predict", "workflow.visual.workspace", 17, 17, 17, 0, false, false, false},
+  PixelCase{"keypoint-predict-upscale", "workflow.visual.workspace", 17, 17, 17, 0, false, false, false},
+  PixelCase{"live-capture-only", "workflow.visual.workspace", 100, 80, 0, 0, true, false, false},
+  PixelCase{"live-production-analysis", "workflow.visual.workspace", 17, 17, 17, 0, false, false, false},
+  PixelCase{"live-zero-detections", "workflow.visual.workspace", 100, 80, 0, 0, true, false, false},
+  PixelCase{"live-new-model-restart", "workflow.visual.workspace", 17, 17, 17, 0, false, false, false},
+  PixelCase{"live-failure-retained", "workflow.visual.workspace", 100, 80, 0, 0, true, false, false},
+  PixelCase{"live-upscale", "workflow.visual.workspace", 17, 17, 17, 0, false, false, false},
+  PixelCase{"live-import-clean", "annotation.workspace.surface", 17, 17, 0, 17, false, true, false},
+  PixelCase{"catalog-pe-image", "workflow.visual.workspace", 17, 17, 0, 17, false, false, true},
+ };
+ for (const auto& record : cases) {
   audit.consume(
-   {{"event", "integration.workflow.pixels"}, {"detail", stage}, {"control", control}, {"a", 3U}, {"b", 8U}, {"c", empty ? 100U : 17U}, {"d", empty ? 80U : 17U},
-    {"native_joints", empty || clean || catalog ? 0U : 17U}, {"analyzed_empty", empty}, {"matched", true}, {"oks_pixels", 24U}, {"current_receipt", true}, {"drawn_source", 3U},
-    {"drawn_presentation", 8U}, {"clean_import", clean}, {"catalog_image", catalog}, {"source_samples", clean || catalog ? 17U : 0U}, {"variation", 30U}});
+   {{"event", "integration.workflow.pixels"}, {"detail", record.stage}, {"control", record.control}, {"a", 3U}, {"b", 8U}, {"c", record.sampled}, {"d", record.matched},
+    {"native_joints", record.joints}, {"analyzed_empty", record.empty}, {"matched", true}, {"oks_pixels", 24U}, {"current_receipt", true}, {"drawn_source", 3U}, {"drawn_presentation", 8U},
+    {"clean_import", record.clean}, {"catalog_image", record.catalog}, {"source_samples", record.source_samples}, {"variation", 30U}});
  }
  REQUIRE(audit.keypoint_pixels_complete());
  SECTION("wrong image") { audit.keypoint_pixels["keypoint-predict"]["a"] = 0; }

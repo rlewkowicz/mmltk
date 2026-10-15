@@ -1548,9 +1548,7 @@ TEST_CASE("native image and Annotation measurements agree with emitted complete 
    const auto counted = index == 0U ? result : measure(ceiling);
    REQUIRE(counted.has_value() == emitted.has_value());
    if (!emitted) {
-    CHECK(counted.error().code == emitted.error().code);
-    CHECK(counted.error().path == emitted.error().path);
-    CHECK(counted.error().offset == emitted.error().offset);
+    CHECK(counted.error() == emitted.error());
     if (index == 0U) break;
    } else {
     CHECK(*counted == bytes.size());

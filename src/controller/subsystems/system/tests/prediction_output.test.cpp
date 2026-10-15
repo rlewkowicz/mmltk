@@ -1,4 +1,5 @@
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
+#include "src/backend/data/catalog/tests/keypoint_schema_fixture.h"
 #include "src/controller/subsystems/system/detail/prediction_output.h"
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
@@ -42,16 +43,7 @@ TEST_CASE("Predict publishes full custom schemas and refuses aggregate excess be
  const auto replacement_count = GENERATE(std::size_t{64}, std::size_t{128});
  namespace catalog = mmltk::backend::data::catalog;
  namespace serial = mmltk::frameworks::serialization;
- catalog::ClassKeypointSchema schema;
- for (std::size_t index = 0; index < catalog::kKeypointsPerClassCapacity; ++index) {
-  auto name = std::to_string(index);
-  name.append(catalog::kKeypointNameCapacity - name.size(), 'j');
-  schema.names.push_back(std::move(name));
-  schema.horizontal_flip.push_back(static_cast<catalog::JointIndex>(index));
-  schema.oks_sigmas.push_back(.1);
- }
- for (std::size_t edge = 0; edge < catalog::kSkeletonEdgeCapacity; ++edge)
-  schema.skeleton.push_back({static_cast<catalog::JointIndex>(edge % 256), static_cast<catalog::JointIndex>((edge % 256 + 1 + edge / 256) % 256)});
+ const auto schema = catalog::test_support::maximum_keypoint_schema();
  const auto catalog_ptr = std::make_shared<const catalog::ClassCatalog>(catalog::OrderedClassCatalog{{{"custom"}}, std::vector{schema}});
  auto count = std::make_shared<std::atomic_size_t>(32);
  class Runtime final : public PredictRuntime {

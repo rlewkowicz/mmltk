@@ -788,6 +788,7 @@ TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", 
   auto criterion = rf::testsupport::detection_fixture_base(config);
   criterion.include_masks = config.has_masks();
   criterion.mask_point_sample_ratio = config.mask_point_sample_ratio;
+  // CLEANUP-IGNORE: Each numerical case owns a fresh random input after its distinct model, optimizer and criterion setup.
   rf::populate_default_detection_weights(criterion);
   const auto options = torch::TensorOptions().device(device);
   const auto input = torch::rand({1, 3, config.resolution, config.resolution}, options);
@@ -845,6 +846,7 @@ TEST_CASE("Stock joint losses train through compilation AMP accumulation and eve
    const auto kind = mode == rf::CompilationMode::kNone ? rf::TrainOptimizerKind::AdamW : mode == rf::CompilationMode::kSelective ? rf::TrainOptimizerKind::Muon : rf::TrainOptimizerKind::SGD;
    auto optimizer = rf::build_optimizer(model.named_parameters(), optimizer_test_request(kind), config.backbone);
    auto criterion = rf::testsupport::detection_fixture_base(config);
+   // CLEANUP-IGNORE: Each numerical case owns a fresh random input after its distinct model, optimizer and criterion setup.
    rf::populate_default_detection_weights(criterion);
    const auto options = torch::TensorOptions().device(device);
    const auto input = torch::rand({1, 3, config.resolution, config.resolution}, options);

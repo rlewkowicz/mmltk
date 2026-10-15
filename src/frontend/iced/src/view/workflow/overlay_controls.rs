@@ -7,6 +7,27 @@ pub enum Message {
     Boxes(bool),
     Keypoints(bool),
 }
+#[derive(Debug, Clone, Copy)]
+pub enum KeypointSettingsMessage {
+    Keypoints(bool),
+    Uncertainty(bool),
+}
+pub fn update_keypoint_settings(
+    settings: &mut crate::view::settings::SettingsModel,
+    message: KeypointSettingsMessage,
+) -> Result<crate::view::settings::EditSchedule, String> {
+    settings.edit(
+        crate::view::settings::EditCadence::Immediate,
+        |draft| match message {
+            KeypointSettingsMessage::Keypoints(value) => {
+                crate::generated::edit_workflowspredictshowkeypoints(draft, value)
+            }
+            KeypointSettingsMessage::Uncertainty(value) => {
+                crate::generated::edit_workflowspredictshowuncertainty(draft, value)
+            }
+        },
+    )
+}
 pub fn view(
     labels: bool,
     masks: bool,

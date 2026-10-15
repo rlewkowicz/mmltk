@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <torch/types.h>
 #include <array>
 #include <cstddef>
@@ -45,9 +46,7 @@ struct CriterionSchema final {
  inline static constexpr std::size_t size = members.size();
  template <std::meta::info Member>
  static consteval CriterionTermPolicy policy() {
-  constexpr auto annotations = std::define_static_array(std::meta::annotations_of(Member));
-  static_assert(annotations.size() == 1);
-  constexpr auto declaration = std::meta::extract<CriterionTermDeclaration>(annotations[0]);
+  constexpr auto declaration = mmltk::frameworks::reflection::reflected_annotation<Member, CriterionTermDeclaration>();
   constexpr CriterionTermPolicy result{declaration.external_name, declaration.coefficient, declaration.domain};
   static_assert(!result.external_name.empty());
   static_assert(result.coefficient.empty() == (result.domain == CriterionDomain::Statistic));

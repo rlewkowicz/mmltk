@@ -399,12 +399,11 @@ TEST_CASE("Pinned upstream tied selection retains physical schema and original-s
  namespace support = r::testsupport;
  using Policy = support::OracleComparisonPolicy;
  const auto requested = support::UpstreamOracle::requested();
- REQUIRE(requested);
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  c10::cuda::CUDAGuard guard(0);
- const support::UpstreamOracle oracle(*requested);
+ const support::UpstreamOracle oracle(requested);
  const auto archive = oracle.keypoint_archive();
- support::OracleComparison comparison(*requested, "keypoint-selection", torch::kFloat32, "actual pinned stable selection, class slots, pixel coordinates and covariance");
+ support::OracleComparison comparison(requested, "keypoint-selection", torch::kFloat32, "actual pinned stable selection, class slots, pixel coordinates and covariance");
  for (const auto& item : oracle.keypoint_cases()) {
   const auto id = item.at("id").get<std::string>(), prefix = id + "/selection/";
   const auto counts = item.at("counts").get<std::vector<std::uint16_t>>();

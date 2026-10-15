@@ -37,6 +37,17 @@ namespace {
   .frame_ready = true,
  };
 }
+void open_and_select_first(subsystems::annotation::AnnotationDocument& editor, const contracts::AnnotationSceneContent& scene) {
+ REQUIRE(editor.Open(scene).outcome == subsystems::annotation::DocumentOutcome::Applied);
+ REQUIRE(editor.Edit({AnnotationObjectEdit{0}}).outcome == subsystems::annotation::DocumentOutcome::Applied);
+}
+[[nodiscard]] subsystems::annotation::LoadedAnnotationDocument save_and_reload(
+ subsystems::annotation::AnnotationDocument& editor, const contracts::AnnotationSceneContent& source, const std::filesystem::path& path) {
+ REQUIRE(editor.Save(path.string()).outcome == subsystems::annotation::DocumentOutcome::Applied);
+ auto loaded = subsystems::annotation::load_annotation_document(source, path.string());
+ REQUIRE(loaded);
+ return std::move(*loaded);
+}
 void apply_gesture(
  subsystems::annotation::AnnotationDocument& editor, AnnotationPointer& pointer, contracts::AnnotationPoint end, contracts::AnnotationPointerPhase phase = contracts::AnnotationPointerPhase::End) {
  REQUIRE(editor.Pointer(pointer).outcome == subsystems::annotation::DocumentOutcome::Applied);
@@ -1168,11 +1179,9 @@ TEST_CASE("Class skeleton documents admit COCO and catalog limits through editin
   CHECK(displayed.identities->at(0) == identity);
   mmltk::testsupport::ScopedTempDir root{"annotation-keypoints"};
   const auto path = root.path() / "pose.cbor";
-  REQUIRE(editor.Save(path.string()).outcome == document::DocumentOutcome::Applied);
-  auto loaded = document::load_annotation_document(scene, path.string());
-  REQUIRE(loaded);
-  CHECK(loaded->scene == editor.ui().scene);
-  CHECK(loaded->scene.keypoint_schemas[0] == schema);
+  auto loaded = save_and_reload(editor, scene, path);
+  CHECK(loaded.scene == editor.ui().scene);
+  CHECK(loaded.scene.keypoint_schemas[0] == schema);
   auto edited_source = editor.ui().scene;
   ++edited_source.document.revision;
   CHECK(document::load_annotation_document(edited_source, path.string()).has_value());
@@ -1197,8 +1206,7 @@ TEST_CASE("Schema reclassification maps joint identity by full name and reverses
    .skeleton_nodes = {{"shared", {8, 9}, catalog::KeypointVisibility::Occluded}, {"old", {12, 13}, catalog::KeypointVisibility::Visible}},
    .skeleton_edges = {{0, 1}}});
  document::AnnotationDocument editor;
- REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
- REQUIRE(editor.Edit({AnnotationObjectEdit{0}}).outcome == document::DocumentOutcome::Applied);
+ open_and_select_first(editor, scene);
  AnnotationRenderState before;
  editor.CaptureRender(before);
  REQUIRE(editor.Edit({AnnotationSelectedObjectEdit{1, true}}).outcome == document::DocumentOutcome::Applied);
@@ -1206,9 +1214,11 @@ TEST_CASE("Schema reclassification maps joint identity by full name and reverses
  CHECK(current.skeleton_nodes[0].key == "new");
  CHECK(current.skeleton_nodes[0].visibility == catalog::KeypointVisibility::Unannotated);
  CHECK(current.skeleton_nodes[1] == scene.objects[0].skeleton_nodes[0]);
+ // CLEANUP-OFF: Independent edits retain separate render snapshots and verify stable object identity before distinct joint mapping or clearing assertions.
  AnnotationRenderState after;
  editor.CaptureRender(after);
  CHECK(after.identities->at(0).object == before.identities->at(0).object);
+ // CLEANUP-ON
  CHECK(after.identities->at(0).elements[1] == before.identities->at(0).elements[0]);
  CHECK(after.identities->at(0).elements[0] != before.identities->at(0).elements[1]);
  REQUIRE(editor.Edit({AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
@@ -1246,9 +1256,11 @@ TEST_CASE("Explicit empty class schemas reject placement and retain reversible r
  CHECK(empty[0].skeleton_nodes.empty());
  CHECK(empty[0].skeleton_edges.empty());
  CHECK_FALSE(editor.ui().editor.selected_skeleton_joint);
+ // CLEANUP-OFF: Independent edits retain separate render snapshots and verify stable object identity before distinct joint mapping or clearing assertions.
  AnnotationRenderState cleared;
  editor.CaptureRender(cleared);
  CHECK(cleared.identities->at(0).object == original.identities->at(0).object);
+ // CLEANUP-ON
  CHECK(cleared.identities->at(0).elements.empty());
  apply(AnnotationUndoEdit{});
  CHECK(editor.ui().scene.objects == scene.objects);
@@ -1272,11 +1284,9 @@ TEST_CASE("Explicit empty class schemas reject placement and retain reversible r
  mmltk::testsupport::ScopedTempDir directory("annotation-empty-schema");
  const auto path = directory.path() / "empty.cbor";
  apply(AnnotationSelectedObjectEdit{1, true});
- REQUIRE(editor.Save(path.string()).outcome == document::DocumentOutcome::Applied);
- const auto loaded = document::load_annotation_document(scene, path.string());
- REQUIRE(loaded);
- CHECK(loaded->scene.objects == editor.ui().scene.objects);
- CHECK(loaded->scene.keypoint_schemas == scene.keypoint_schemas);
+ const auto loaded = save_and_reload(editor, scene, path);
+ CHECK(loaded.scene.objects == editor.ui().scene.objects);
+ CHECK(loaded.scene.keypoint_schemas == scene.keypoint_schemas);
  // Placement cannot turn an explicitly empty class into a free-form skeleton.
  auto placement = scene;
  placement.objects.clear();
@@ -1343,8 +1353,7 @@ TEST_CASE("Aggregate skeleton bounds publish within the wire envelope and reject
  scene.keypoint_schemas = {schema};
  scene.objects.resize(contracts::kAnnotationDocumentJointCapacity / schema.names.size(), object);
  document::AnnotationDocument editor;
- REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
- REQUIRE(editor.Edit({AnnotationObjectEdit{0}}).outcome == document::DocumentOutcome::Applied);
+ open_and_select_first(editor, scene);
  std::vector<std::byte> bytes;
  namespace serial = mmltk::frameworks::serialization;
  const serial::wire::Limits limits{.max_bytes = contracts::kAnnotationUiStateByteBudget, .max_items = contracts::kAnnotationUiStateByteBudget};
@@ -1365,11 +1374,9 @@ TEST_CASE("Saved annotation binding distinguishes products sessions and crops wh
  document::AnnotationDocument editor;
  REQUIRE(editor.Open(paired).outcome == document::DocumentOutcome::Applied);
  const auto path = root.path() / "bound.cbor";
- REQUIRE(editor.Save(path.string()).outcome == document::DocumentOutcome::Applied);
- auto loaded = document::load_annotation_document(paired, path.string());
- REQUIRE(loaded);
- CHECK_FALSE(loaded->legacy_source_attached);
- CHECK(loaded->scene.document.view() == paired.document.view());
+ auto loaded = save_and_reload(editor, paired, path);
+ CHECK_FALSE(loaded.legacy_source_attached);
+ CHECK(loaded.scene.document.view() == paired.document.view());
  auto edited = paired;
  edited.document.revision += 123;
  CHECK(document::load_annotation_document(edited, path.string()));
@@ -1407,10 +1414,8 @@ TEST_CASE("Saved annotation binding distinguishes products sessions and crops wh
  other_kind.document = contracts::WorkspaceResource::From("predict://image/snapshot-other", 1);
  CHECK_FALSE(document::load_annotation_document(other_kind, root.path().string()));
  REQUIRE(editor.Open(attached->scene).outcome == document::DocumentOutcome::Applied);
- REQUIRE(editor.Save(path.string()).outcome == document::DocumentOutcome::Applied);
- auto rebound = document::load_annotation_document(paired, path.string());
- REQUIRE(rebound);
- CHECK_FALSE(rebound->legacy_source_attached);
+ auto rebound = save_and_reload(editor, paired, path);
+ CHECK_FALSE(rebound.legacy_source_attached);
 }
 TEST_CASE("Skeleton source crop and Upscale preserve schema slots and label visibility", "[annotation][keypoints][visual]") {
  namespace catalog = mmltk::backend::data::catalog;
