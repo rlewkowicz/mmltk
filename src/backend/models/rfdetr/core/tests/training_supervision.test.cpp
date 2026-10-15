@@ -39,6 +39,7 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
+using mmltk::backend::models::rfdetr::CriterionTerm;
 namespace {
 using mmltk::backend::ml::testsupport::independent_leaf;
 namespace rfdetr = mmltk::backend::models::rfdetr;
@@ -151,10 +152,7 @@ rfdetr::DetectionConfig detection_config(const rfdetr::NativeRfDetrConfig& model
  config.sum_group_losses = model.sum_group_losses;
  config.use_varifocal_loss = model.use_varifocal_loss;
  config.use_position_supervised_loss = model.use_position_supervised_loss;
- config.cls_loss_coef = model.cls_loss_coef;
- config.bbox_loss_coef = model.bbox_loss_coef;
- config.giou_loss_coef = model.giou_loss_coef;
- rfdetr::populate_default_detection_weight_dict(config);
+ rfdetr::populate_default_detection_weights(config);
  return config;
 }
 void require_layer_equal(const rfdetr::OutputLayer& lhs, const rfdetr::OutputLayer& rhs) {
@@ -270,12 +268,12 @@ void test_geometry_preserves_consumer_policies_and_batch_isolation() {
  auto criterion_config = detection_config(match_free_config());
  criterion_config.aux_loss = false;
  criterion_config.two_stage = false;
- const auto losses = rfdetr::detection_loss_dict(criterion_outputs, criterion_targets, criterion_config, true, 1.0);
+ const auto losses = rfdetr::detection_loss_terms(criterion_outputs, criterion_targets, criterion_config, true, 1.0);
  const auto target_xyxy = rfdetr::box_cxcywh_to_xyxy(criterion_targets.all_boxes, rfdetr::BoxExtentPolicy::Preserve);
  const auto preserve_expected = 1.0F - rfdetr::aligned_generalized_box_iou(criterion, target_xyxy).index({0});
  const auto clamp_expected = 1.0F - rfdetr::aligned_generalized_box_iou(nonnegative_extent, target_xyxy).index({0});
- REQUIRE_FALSE(torch::allclose(losses.at("loss_giou"), preserve_expected));
- REQUIRE(torch::allclose(losses.at("loss_giou"), clamp_expected));
+ REQUIRE_FALSE(torch::allclose(losses.at({CriterionTerm::giou}), preserve_expected));
+ REQUIRE(torch::allclose(losses.at({CriterionTerm::giou}), clamp_expected));
 }
 void test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d() {
  auto config = match_free_config();
@@ -857,13 +855,13 @@ void test_conditional_model_construction_preserves_rng_and_default_state_topolog
   REQUIRE(torch::equal(inactive_matches[index].first, active_matches[index].first));
   REQUIRE(torch::equal(inactive_matches[index].second, active_matches[index].second));
  }
- const auto inactive_losses = rfdetr::detection_loss_dict(inactive_outputs, targets, retained_config, false, 1.0);
- const auto active_losses = rfdetr::detection_loss_dict(active_outputs, targets, retained_config, false, 1.0);
+ const auto inactive_losses = rfdetr::detection_loss_terms(inactive_outputs, targets, retained_config, false, 1.0);
+ const auto active_losses = rfdetr::detection_loss_terms(active_outputs, targets, retained_config, false, 1.0);
  REQUIRE(inactive_losses.size() == active_losses.size());
- for (const auto& [name, value] : inactive_losses) {
-  REQUIRE(active_losses.contains(name));
-  REQUIRE(torch::equal(value, active_losses.at(name)));
- }
+ inactive_losses.for_each([&](rfdetr::CriterionKey key, const torch::Tensor& value) {
+  REQUIRE(active_losses.contains(key));
+  REQUIRE(torch::equal(value, active_losses.at(key)));
+ });
 }
 void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  auto config = denoising_config();

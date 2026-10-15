@@ -117,7 +117,7 @@ DetectionConfig make_detection_config(const NativeRfDetrConfig& config, int64_t 
  apply_detection_mask_supervision(detection_config, config);
  apply_detection_loss_terms(detection_config, config, compilation_mode);
  apply_detection_box_weights(detection_config, config);
- populate_default_detection_weight_dict(detection_config);
+ populate_default_detection_weights(detection_config);
  return detection_config;
 }
 class TrainingRuntimeOwner final {

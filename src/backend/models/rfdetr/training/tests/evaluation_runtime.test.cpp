@@ -101,7 +101,7 @@ TEST_CASE("Training validation owns independent capacity and versioned immutable
  DetectionConfig detection;
  detection.num_classes = config.num_classes;
  detection.num_select = config.num_select;
- populate_default_detection_weight_dict(detection);
+ populate_default_detection_weights(detection);
  TrainingMetricHandoff metrics(0);
  const auto evaluated = evaluate_model(request, validation, master, detection, true, EvaluationPurpose::SelectionValidation, EvaluatedWeights::Ordinary, std::nullopt, &metrics, 2);
  CHECK(evaluated.timing.images == 7);

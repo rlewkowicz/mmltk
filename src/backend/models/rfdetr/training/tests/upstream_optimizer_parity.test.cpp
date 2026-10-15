@@ -72,14 +72,15 @@ torch::Tensor compare_loss(support::OracleComparison& comparison, const support:
  compare_assignments(comparison, archive, outputs, targets, config, training, samples, prefix);
  const auto count = std::accumulate(targets.counts.begin(), targets.counts.end(), int64_t{0}) * (training ? config.group_detr : 1);
  const auto normalizer = torch::tensor(static_cast<float>(std::max<int64_t>(count, 1)), outputs.main.pred_boxes.options().dtype(torch::kFloat32));
- const auto losses = rf::detection_loss_dict(outputs, targets, config, training, normalizer, samples);
+ const auto losses = rf::detection_loss_terms(outputs, targets, config, training, normalizer, samples);
+ const auto external_losses = support::oracle_criterion_tensors(losses);
  std::set<std::string> actual_losses, actual_statistics;
- for (const auto& [key, value] : losses) (key.starts_with("loss_") ? actual_losses : actual_statistics).insert(key);
+ for (const auto& [key, value] : external_losses) (key.starts_with("loss_") ? actual_losses : actual_statistics).insert(key);
  auto expected_losses = archive.names(prefix + "loss/");
  expected_losses.erase("total");
  comparison.inventory(prefix + "loss inventory", actual_losses, expected_losses);
  comparison.inventory(prefix + "statistic inventory", actual_statistics, archive.names(prefix + "statistic/"));
- for (const auto& [key, value] : losses) {
+ for (const auto& [key, value] : external_losses) {
   const auto name = prefix + (key.starts_with("loss_") ? "loss/" : "statistic/") + key;
   comparison.compare(name, value, archive.tensor(name), ComparisonPolicy::Value);
   if (prefix.empty()) comparison.compare("stock-policy/" + name, value, archive.tensor("stock/" + name), ComparisonPolicy::Value, true);
@@ -192,9 +193,10 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
     comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
     std::set<std::string> actual_weights, expected_weights;
     for (const auto& [name, weight] : entry.loss_weights) expected_weights.insert(name);
-    for (const auto& [name, weight] : config.weight_dict) {
+    for (const auto& weight : config.weights) {
+     const auto name = rf::criterion_external_name(weight.key);
      actual_weights.insert(name);
-     comparison.compare("parameter-group/loss-weight/" + name, torch::tensor(weight, torch::kFloat64), torch::tensor(entry.loss_weights.at(name), torch::kFloat64), ComparisonPolicy::Hyperparameter);
+     comparison.compare("parameter-group/loss-weight/" + name, torch::tensor(weight.coefficient, torch::kFloat64), torch::tensor(entry.loss_weights.at(name), torch::kFloat64), ComparisonPolicy::Hyperparameter);
     }
     comparison.inventory("loss weight inventory", actual_weights, expected_weights);
     rf::TensorMap expected_before;

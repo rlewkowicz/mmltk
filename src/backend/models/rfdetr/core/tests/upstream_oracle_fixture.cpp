@@ -544,10 +544,9 @@ std::vector<LayerMaskSamples> oracle_samples(const OracleArchive& archive, std::
 }
 DetectionConfig oracle_detection(const NativeRfDetrConfig& config) {
  auto result = detection_fixture_base(config);
- project_loss_coefficients(result, config);
  result.include_masks = config.has_masks();
  result.mask_point_sample_ratio = config.mask_point_sample_ratio;
- populate_default_detection_weight_dict(result);
+ populate_default_detection_weights(result);
  return result;
 }
 void compare_oracle_outputs(OracleComparison& comparison, const OracleArchive& archive, const ModelOutputs& outputs, const std::vector<torch::Tensor>& encoder_indices, const std::string& prefix) {

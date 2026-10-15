@@ -26,6 +26,8 @@
 #include <vector>
 #include "training_continuation_fixture.h"
 #include "src/backend/ml/torch/archive.h"
+using mmltk::backend::models::rfdetr::CriterionTerm;
+using mmltk::backend::models::rfdetr::CriterionLayer;
 namespace mmltk::backend::models::rfdetr::testsupport {
 struct NativeAdamWTestAccess {
  static std::vector<std::pair<const void*, std::size_t>> storage(const NativeAdamW& optimizer) {
@@ -284,10 +286,10 @@ TEST_CASE("Stock target normalization keeps the global objective at the distribu
    // This rank has no targets but still contributes background classification;
    // the other rank supplies the global count through the ordinary reducer.
    int reductions = 0;
-   const auto loss = rf::detection_loss_dict(outputs, empty, config, true, true, [&](torch::Tensor& count) {
+   const auto loss = rf::detection_loss_terms(outputs, empty, config, true, true, [&](torch::Tensor& count) {
     ++reductions;
     count.add_(global_targets * groups);
-   }).at("loss_ce");
+   }).at({CriterionTerm::classification});
    REQUIRE(reductions == 1);
    const double native_divisor = std::max(global_targets * groups, 1);
    const double upstream_effective_divisor = std::max(global_targets * groups, 2);
@@ -460,7 +462,7 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
         rf::ModelOutputs output;
         output.main.pred_logits = logits;
         output.main.pred_boxes = torch::tensor({{{0.2F, 0.2F, 0.1F, 0.1F}, {0.8F, 0.8F, 0.1F, 0.1F}}}, options);
-        loss = rf::detection_loss_dict(output, gt, config, true, true, [&](torch::Tensor& normalizer) { normalizer.add_(other_targets); }).at("loss_ce");
+        loss = rf::detection_loss_terms(output, gt, config, true, true, [&](torch::Tensor& normalizer) { normalizer.add_(other_targets); }).at({CriterionTerm::classification});
        });
        if (parallel) {
         const auto gradients = execution.gradients(loss, optimizer.parameters());
@@ -736,8 +738,8 @@ TEST_CASE("Atto trains encoder predictions while retaining cold dormant state wi
   CHECK_FALSE(parameter.try_read("momentum_buffer", tensor));
  }
  auto detection = rf::testsupport::detection_fixture_base(config);
- rf::populate_default_detection_weight_dict(detection);
- for (const auto& [name, weight] : detection.weight_dict) CHECK_FALSE(name.ends_with("_enc"));
+ rf::populate_default_detection_weights(detection);
+ for (const auto& weight : detection.weights) CHECK(weight.key.layer.kind() == CriterionLayer::Kind::Main);
  model.eval();
  torch::NoGradGuard guard;
  const auto output = model.forward({input, {}}, false);
@@ -789,7 +791,7 @@ TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", 
   auto criterion=rf::testsupport::detection_fixture_base(config);
   criterion.include_masks=config.has_masks();
   criterion.mask_point_sample_ratio=config.mask_point_sample_ratio;
-  rf::populate_default_detection_weight_dict(criterion);
+  rf::populate_default_detection_weights(criterion);
   const auto options=torch::TensorOptions().device(device);
   const auto input=torch::rand({1,3,config.resolution,config.resolution},options);
   auto targets=rf::testsupport::one_image_targets(torch::tensor({{.5F,.5F,.4F,.6F}},options),torch::tensor({1},options.dtype(torch::kInt64)));
@@ -805,7 +807,7 @@ TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", 
   }
   for (int step=0;step<2;++step) {
    auto output=model.forward({input,{}},config.has_masks());
-   auto losses=rf::detection_loss_dict(output,targets,criterion,true,false);
+   auto losses=rf::detection_loss_terms(output,targets,criterion,true,false);
    const auto total=rf::weighted_detection_loss(losses,criterion,device);
    REQUIRE(torch::isfinite(total).item<bool>());
    total.backward();
@@ -844,7 +846,7 @@ TEST_CASE("Stock joint losses train through compilation AMP accumulation and eve
    const auto kind=mode==rf::CompilationMode::kNone?rf::TrainOptimizerKind::AdamW:mode==rf::CompilationMode::kSelective?rf::TrainOptimizerKind::Muon:rf::TrainOptimizerKind::SGD;
    auto optimizer=rf::build_optimizer(model.named_parameters(),optimizer_test_request(kind),config.backbone);
    auto criterion=rf::testsupport::detection_fixture_base(config);
-   rf::populate_default_detection_weight_dict(criterion);
+   rf::populate_default_detection_weights(criterion);
    const auto options=torch::TensorOptions().device(device);
    const auto input=torch::rand({1,3,config.resolution,config.resolution},options);
    auto targets=rf::testsupport::one_image_targets(torch::tensor({{.4F,.5F,.5F,.5F},{.6F,.5F,.5F,.5F}},options),torch::tensor({0,2},options.dtype(torch::kInt64)));
@@ -859,10 +861,10 @@ TEST_CASE("Stock joint losses train through compilation AMP accumulation and eve
      step.forward([&] {
       auto output=model.forward({input,{}},false);
       REQUIRE(output.main.pred_keypoints);
-      const auto values=rf::detection_loss_dict(output,targets,criterion,true,false);
-      for (const auto name:{"loss_keypoints_l1","loss_keypoints_findable","loss_keypoints_visible","loss_keypoints_nll"}) {
-       REQUIRE(values.contains(name));
-       REQUIRE(torch::isfinite(values.at(name)).item<bool>());
+      const auto values=rf::detection_loss_terms(output,targets,criterion,true,false);
+      for (const auto term : {CriterionTerm::keypoint_l1, CriterionTerm::keypoint_findable, CriterionTerm::keypoint_visible, CriterionTerm::keypoint_nll}) {
+       REQUIRE(values.contains({term}));
+       REQUIRE(torch::isfinite(values.at({term})).item<bool>());
       }
       loss=rf::weighted_detection_loss(values,criterion,device);
      });

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/criterion_terms.h"
 #include "src/backend/models/rfdetr/core/detection_statistics.h"
 #include "src/common/concurrency/worker_pool.h"
 #include <atomic>
@@ -53,19 +54,19 @@ struct TrainLaneResult {
  TrainingScalarPacket::Tensors scalars;
  DetectionStatisticsPacket::Tensors statistics;
  // Detached scalar criterion values, bounded by the model's criterion schema.
- TensorMap loss_terms;
+ CriterionResult loss_terms;
  // Borrowed until this wave settles; the lane retains and reuses its event.
  at::cuda::CUDAEvent* ready_event = nullptr;
 };
 class TrainingLossReport final {
 public:
  void begin_attempt();
- void accumulate(TensorMap terms);
+ void accumulate(CriterionResult terms);
  [[nodiscard]] std::string details(const std::vector<torch::Tensor>& parameters, const std::vector<std::string>& names) const;
  [[nodiscard]] std::runtime_error failure(const std::vector<torch::Tensor>& parameters, const std::vector<std::string>& names) const;
 
 private:
- std::vector<std::string> names_;
+ std::vector<CriterionKey> terms_;
  std::vector<torch::Tensor> incoming_;
  torch::Tensor values_;
 };

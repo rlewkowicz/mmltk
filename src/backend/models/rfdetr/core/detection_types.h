@@ -16,6 +16,7 @@
 #include <memory>
 #include "src/backend/data/catalog/class_catalog.h"
 #include "reflected_tensor_packet.h"
+#include "criterion_terms.h"
 namespace mmltk::backend::models::rfdetr {
 using TensorMap = std::map<std::string, torch::Tensor>;
 struct PreparedTarget {
@@ -224,7 +225,7 @@ struct DetectionConfig {
  double set_cost_class = 1.0;
  double set_cost_bbox = 1.0;
  double set_cost_giou = 1.0;
- std::vector<std::pair<std::string, double>> weight_dict;
+ std::vector<CriterionWeight> weights;
 };
-void populate_default_detection_weight_dict(DetectionConfig& config);
+void populate_default_detection_weights(DetectionConfig& config);
 }  // namespace mmltk::backend::models::rfdetr

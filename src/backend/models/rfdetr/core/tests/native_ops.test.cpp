@@ -6,6 +6,7 @@
 #include <ATen/CPUGeneratorImpl.h>
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
 #include "src/backend/models/rfdetr/core/tests/training_fixture.h"
+#include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/upstream_oracle_fixture.h"
 // RF-DETR core operation coverage.
 #include <algorithm>
 #include <array>
@@ -49,6 +50,8 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
+using mmltk::backend::models::rfdetr::CriterionTerm;
+using mmltk::backend::models::rfdetr::CriterionLayer;
 namespace mmltk::backend::models::rfdetr {
 torch::Tensor sample_packed_masks_cuda(const torch::Tensor& packed_mask_bits, int64_t height, int64_t width, const torch::Tensor& mask_indices, const torch::Tensor& point_coords);
 }
@@ -144,7 +147,7 @@ mmltk::backend::models::rfdetr::DetectionConfig make_config() {
  config.set_cost_class = 2.0;
  config.set_cost_bbox = 5.0;
  config.set_cost_giou = 2.0;
- mmltk::backend::models::rfdetr::populate_default_detection_weight_dict(config);
+ mmltk::backend::models::rfdetr::populate_default_detection_weights(config);
  return config;
 }
 // Populates `layer` with the canonical two-query logits/boxes used across these tests.
@@ -230,13 +233,43 @@ mmltk::backend::models::rfdetr::PreparedTargets make_packed_mask_targets(const i
  targets.packed_masks = pack_dense_masks(target_masks);
  return targets;
 }
-void test_weight_dict_population() {
+void test_weights_population() {
+ namespace rf = mmltk::backend::models::rfdetr;
  const auto config = make_config();
- REQUIRE(config.weight_dict.size() == 12);
- REQUIRE(config.weight_dict[0].first == "loss_ce");
- REQUIRE(config.weight_dict[3].first == "loss_ce_0");
- REQUIRE(config.weight_dict[6].first == "loss_ce_1");
- REQUIRE(config.weight_dict[9].first == "loss_ce_enc");
+ REQUIRE(config.weights.size() == 12);
+ REQUIRE((config.weights[0].key == mmltk::backend::models::rfdetr::CriterionKey{CriterionTerm::classification}));
+ REQUIRE((config.weights[3].key == mmltk::backend::models::rfdetr::CriterionKey{CriterionTerm::classification, CriterionLayer::auxiliary(0)}));
+ REQUIRE((config.weights[6].key == mmltk::backend::models::rfdetr::CriterionKey{CriterionTerm::classification, CriterionLayer::auxiliary(1)}));
+ REQUIRE((config.weights[9].key == mmltk::backend::models::rfdetr::CriterionKey{CriterionTerm::classification, CriterionLayer::encoder()}));
+ rf::NativeRfDetrConfig native;
+ native.cls_loss_coef = 1; native.bbox_loss_coef = 2; native.giou_loss_coef = 3;
+ native.mask_ce_loss_coef = 4; native.mask_dice_loss_coef = 5;
+ native.keypoint_l1_loss_coef = 6; native.keypoint_findable_loss_coef = 7;
+ native.keypoint_visible_loss_coef = 8; native.keypoint_nll_loss_coef = 9;
+ auto all = config;
+ rf::project_loss_coefficients(all, native);
+ all.include_masks = true;
+ all.keypoints_per_class = {2, 0, 1};
+ rf::populate_default_detection_weights(all);
+ // Independent upstream spelling and coefficient order, including the L1 alias.
+ const std::array names{"loss_ce", "loss_bbox", "loss_giou", "loss_mask_ce", "loss_mask_dice",
+  "loss_keypoints_l1", "loss_keypoints_findable", "loss_keypoints_visible", "loss_keypoints_nll"};
+ const std::array suffixes{"", "_0", "_1", "_enc"};
+ REQUIRE(all.weights.size() == names.size() * suffixes.size());
+ for (std::size_t layer = 0; layer < suffixes.size(); ++layer)
+  for (std::size_t term = 0; term < names.size(); ++term) {
+   const auto& weight = all.weights[layer * names.size() + term];
+   CHECK(rf::criterion_external_name(weight.key) == std::string(names[term]) + suffixes[layer]);
+   CHECK(weight.coefficient == static_cast<double>(term + 1));
+  }
+ all.aux_loss = false;
+ rf::populate_default_detection_weights(all);
+ REQUIRE(all.weights.size() == 2 * names.size());
+ CHECK(all.weights.back().key.layer == CriterionLayer::encoder());
+ all.dec_layers = 0;
+ rf::populate_default_detection_weights(all);
+ REQUIRE(all.weights.size() == names.size());
+ for (const auto& weight : all.weights) CHECK(weight.key.layer.kind() == CriterionLayer::Kind::Main);
 }
 void test_matcher_and_losses() {
  const auto config = make_config();
@@ -244,14 +277,14 @@ void test_matcher_and_losses() {
  const auto targets = make_targets();
  const auto indices = mmltk::backend::models::rfdetr::matcher_indices(outputs, targets, config, true);
  assert_single_trivial_match(indices);
- const auto loss_dict = mmltk::backend::models::rfdetr::detection_loss_dict(outputs, targets, config, true, false);
- REQUIRE(loss_dict.count("loss_ce") == 1);
- REQUIRE(loss_dict.count("loss_bbox") == 1);
- REQUIRE(loss_dict.count("loss_giou") == 1);
- REQUIRE(loss_dict.count("cardinality_error") == 1);
- REQUIRE(loss_dict.count("loss_ce_0") == 1);
- REQUIRE(loss_dict.count("loss_ce_1") == 1);
- REQUIRE(loss_dict.count("loss_ce_enc") == 1);
+ const auto loss_dict = mmltk::backend::models::rfdetr::detection_loss_terms(outputs, targets, config, true, false);
+ REQUIRE(loss_dict.contains({CriterionTerm::classification}));
+ REQUIRE(loss_dict.contains({CriterionTerm::l1}));
+ REQUIRE(loss_dict.contains({CriterionTerm::giou}));
+ REQUIRE(loss_dict.contains({CriterionTerm::cardinality_error}));
+ REQUIRE(loss_dict.contains({CriterionTerm::classification, CriterionLayer::auxiliary(0)}));
+ REQUIRE(loss_dict.contains({CriterionTerm::classification, CriterionLayer::auxiliary(1)}));
+ REQUIRE(loss_dict.contains({CriterionTerm::classification, CriterionLayer::encoder()}));
  // CLEANUP-IGNORE: Independent criterion configurations verify finite aggregate losses before distinct expectations for included terms.
  const auto weighted = mmltk::backend::models::rfdetr::weighted_detection_loss(loss_dict, config, torch::Device(torch::kCPU));
  REQUIRE(torch::isfinite(weighted).item<bool>());
@@ -264,33 +297,33 @@ void test_batched_matcher_transfer_matches_single_layer_losses() {
  auto& enc_outputs = require_optional_ref(outputs.enc_outputs, "expected encoder outputs in batched matcher transfer test");
  enc_outputs.pred_logits = enc_outputs.pred_logits.narrow(1, 0, 1).clone();
  enc_outputs.pred_boxes = enc_outputs.pred_boxes.narrow(1, 0, 1).clone();
- const auto combined = mmltk::backend::models::rfdetr::detection_loss_dict(outputs, targets, config, true, false);
+ const auto combined = mmltk::backend::models::rfdetr::detection_loss_terms(outputs, targets, config, true, false);
  mmltk::backend::models::rfdetr::DetectionConfig single_config = config;
  single_config.aux_loss = false;
  single_config.two_stage = false;
- mmltk::backend::models::rfdetr::populate_default_detection_weight_dict(single_config);
+ mmltk::backend::models::rfdetr::populate_default_detection_weights(single_config);
  auto main_only = outputs;
  main_only.aux_outputs.clear();
  main_only.enc_outputs.reset();
- const auto main_loss = mmltk::backend::models::rfdetr::detection_loss_dict(main_only, targets, single_config, true, false);
- REQUIRE(torch::allclose(combined.at("loss_ce"), main_loss.at("loss_ce"), 1.0e-6, 1.0e-6));
- REQUIRE(torch::allclose(combined.at("loss_bbox"), main_loss.at("loss_bbox"), 1.0e-6, 1.0e-6));
- REQUIRE(torch::allclose(combined.at("loss_giou"), main_loss.at("loss_giou"), 1.0e-6, 1.0e-6));
+ const auto main_loss = mmltk::backend::models::rfdetr::detection_loss_terms(main_only, targets, single_config, true, false);
+ REQUIRE(torch::allclose(combined.at({CriterionTerm::classification}), main_loss.at({CriterionTerm::classification}), 1.0e-6, 1.0e-6));
+ REQUIRE(torch::allclose(combined.at({CriterionTerm::l1}), main_loss.at({CriterionTerm::l1}), 1.0e-6, 1.0e-6));
+ REQUIRE(torch::allclose(combined.at({CriterionTerm::giou}), main_loss.at({CriterionTerm::giou}), 1.0e-6, 1.0e-6));
  for (size_t aux_index = 0; aux_index < outputs.aux_outputs.size(); ++aux_index) {
   mmltk::backend::models::rfdetr::ModelOutputs aux_only;
   aux_only.main = outputs.aux_outputs[aux_index];
-  const auto aux_loss = mmltk::backend::models::rfdetr::detection_loss_dict(aux_only, targets, single_config, true, false);
-  const std::string suffix = "_" + std::to_string(aux_index);
-  REQUIRE(torch::allclose(combined.at("loss_ce" + suffix), aux_loss.at("loss_ce"), 1.0e-6, 1.0e-6));
-  REQUIRE(torch::allclose(combined.at("loss_bbox" + suffix), aux_loss.at("loss_bbox"), 1.0e-6, 1.0e-6));
-  REQUIRE(torch::allclose(combined.at("loss_giou" + suffix), aux_loss.at("loss_giou"), 1.0e-6, 1.0e-6));
+  const auto aux_loss = mmltk::backend::models::rfdetr::detection_loss_terms(aux_only, targets, single_config, true, false);
+  const auto layer = CriterionLayer::auxiliary(aux_index);
+  REQUIRE(torch::allclose(combined.at({CriterionTerm::classification, layer}), aux_loss.at({CriterionTerm::classification}), 1.0e-6, 1.0e-6));
+  REQUIRE(torch::allclose(combined.at({CriterionTerm::l1, layer}), aux_loss.at({CriterionTerm::l1}), 1.0e-6, 1.0e-6));
+  REQUIRE(torch::allclose(combined.at({CriterionTerm::giou, layer}), aux_loss.at({CriterionTerm::giou}), 1.0e-6, 1.0e-6));
  }
  mmltk::backend::models::rfdetr::ModelOutputs enc_only;
  enc_only.main = require_optional_ref(outputs.enc_outputs, "expected encoder outputs when building encoder-only loss");
- const auto enc_loss = mmltk::backend::models::rfdetr::detection_loss_dict(enc_only, targets, single_config, true, false);
- REQUIRE(torch::allclose(combined.at("loss_ce_enc"), enc_loss.at("loss_ce"), 1.0e-6, 1.0e-6));
- REQUIRE(torch::allclose(combined.at("loss_bbox_enc"), enc_loss.at("loss_bbox"), 1.0e-6, 1.0e-6));
- REQUIRE(torch::allclose(combined.at("loss_giou_enc"), enc_loss.at("loss_giou"), 1.0e-6, 1.0e-6));
+ const auto enc_loss = mmltk::backend::models::rfdetr::detection_loss_terms(enc_only, targets, single_config, true, false);
+ REQUIRE(torch::allclose(combined.at({CriterionTerm::classification, CriterionLayer::encoder()}), enc_loss.at({CriterionTerm::classification}), 1.0e-6, 1.0e-6));
+ REQUIRE(torch::allclose(combined.at({CriterionTerm::l1, CriterionLayer::encoder()}), enc_loss.at({CriterionTerm::l1}), 1.0e-6, 1.0e-6));
+ REQUIRE(torch::allclose(combined.at({CriterionTerm::giou, CriterionLayer::encoder()}), enc_loss.at({CriterionTerm::giou}), 1.0e-6, 1.0e-6));
 }
 void test_multi_match_box_losses() {
  const auto config = make_config();
@@ -298,9 +331,9 @@ void test_multi_match_box_losses() {
  const auto targets = make_multi_targets();
  const auto indices = mmltk::backend::models::rfdetr::matcher_indices(outputs, targets, config, true);
  assert_single_image_match_count(indices, 2);
- const auto loss_dict = mmltk::backend::models::rfdetr::detection_loss_dict(outputs, targets, config, true, false);
- REQUIRE(loss_dict.count("loss_bbox") == 1);
- REQUIRE(loss_dict.count("loss_giou") == 1);
+ const auto loss_dict = mmltk::backend::models::rfdetr::detection_loss_terms(outputs, targets, config, true, false);
+ REQUIRE(loss_dict.contains({CriterionTerm::l1}));
+ REQUIRE(loss_dict.contains({CriterionTerm::giou}));
  const auto pred_boxes = outputs.main.pred_boxes.squeeze(0).cpu();
  const auto target_boxes = targets.all_boxes.cpu();
  const auto row_index = indices[0].first.cpu();
@@ -321,8 +354,8 @@ void test_multi_match_box_losses() {
  }
  const float expected_bbox = bbox_sum / static_cast<float>(row_index.size(0));
  const float expected_giou = giou_sum / static_cast<float>(row_index.size(0));
- const auto actual_bbox = loss_dict.at("loss_bbox").item<float>();
- const auto actual_giou = loss_dict.at("loss_giou").item<float>();
+ const auto actual_bbox = loss_dict.at({CriterionTerm::l1}).item<float>();
+ const auto actual_giou = loss_dict.at({CriterionTerm::giou}).item<float>();
  REQUIRE(std::fabs(actual_bbox - expected_bbox) < 1.0e-5f);
  REQUIRE(std::fabs(actual_giou - expected_giou) < 1.0e-5f);
 }
@@ -341,7 +374,7 @@ void test_rectangular_matcher_layers_preserve_all_targets() {
  auto config = make_config();
  config.group_detr = static_cast<int>(groups);
  config.dec_layers = 2;
- rfdetr::populate_default_detection_weight_dict(config);
+ rfdetr::populate_default_detection_weights(config);
  const auto float_options = torch::TensorOptions().dtype(torch::kFloat32);
  const auto integer_options = float_options.dtype(torch::kInt64);
  auto targets = make_single_image_targets(torch::full({target_count + 1, 4}, 0.2F, float_options), torch::zeros({target_count + 1}, integer_options), torch::ones({target_count + 1}, float_options));
@@ -380,12 +413,12 @@ void test_rectangular_matcher_layers_preserve_all_targets() {
   }
   if (layer_index == 0) retained = matches;
  }
- const auto losses = rfdetr::detection_loss_dict(outputs, targets, config, true, false);
- const std::array<std::string, 3> suffixes{"", "_0", "_enc"};
+ const auto losses = rfdetr::detection_loss_terms(outputs, targets, config, true, false);
+ const std::array term_layers{CriterionLayer{}, CriterionLayer::auxiliary(0), CriterionLayer::encoder()};
  for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
   const auto matched = std::min(query_counts[layer_index] / groups, target_count) + 1;
   const float expected = 0.1F * static_cast<float>(matched) / static_cast<float>(target_count + 1);
-  REQUIRE(std::fabs(losses.at("loss_bbox" + suffixes[layer_index]).item<float>() - expected) < 1.0e-5F);
+  REQUIRE(std::fabs(losses.at({CriterionTerm::l1, term_layers[layer_index]}).item<float>() - expected) < 1.0e-5F);
  }
  const auto weighted = rfdetr::weighted_detection_loss(losses, config, torch::Device(torch::kCPU));
  REQUIRE(torch::isfinite(weighted).item<bool>());
@@ -415,7 +448,7 @@ auto make_mask_loss_config(const int mask_point_sample_ratio = 4) {
  config.aux_loss = false;
  config.two_stage = false;
  config.mask_point_sample_ratio = mask_point_sample_ratio;
- mmltk::backend::models::rfdetr::populate_default_detection_weight_dict(config);
+ mmltk::backend::models::rfdetr::populate_default_detection_weights(config);
  return config;
 }
 void test_cpu_mask_loss_uses_upstream_keys() {
@@ -424,10 +457,10 @@ void test_cpu_mask_loss_uses_upstream_keys() {
  auto targets = make_packed_mask_targets(kHeight, kWidth, {{1, 1}, {1, 2}, {2, 1}, {2, 2}});
  auto config = make_mask_loss_config();
  auto outputs = make_mask_outputs(kHeight, kWidth);
- const auto loss_dict = mmltk::backend::models::rfdetr::detection_loss_dict(outputs, targets, config, true, false);
- REQUIRE(loss_dict.count("loss_mask_ce") == 1);
- REQUIRE(loss_dict.count("loss_mask_dice") == 1);
- REQUIRE(loss_dict.count("loss_dice") == 0);
+ const auto loss_dict = mmltk::backend::models::rfdetr::detection_loss_terms(outputs, targets, config, true, false);
+ REQUIRE(loss_dict.contains({CriterionTerm::mask_ce}));
+ REQUIRE(loss_dict.contains({CriterionTerm::mask_dice}));
+ REQUIRE_FALSE(mmltk::backend::models::rfdetr::testsupport::oracle_criterion_tensors(loss_dict).contains("loss_dice"));
  // CLEANUP-IGNORE: Independent criterion configurations verify finite aggregate losses before distinct expectations for included terms.
  const auto weighted = mmltk::backend::models::rfdetr::weighted_detection_loss(loss_dict, config, torch::Device(torch::kCPU));
  REQUIRE(torch::isfinite(weighted).item<bool>());
@@ -454,11 +487,11 @@ void test_sparse_mask_loss_matches_dense_reference() {
   bias,
  };
  torch::manual_seed(1234);
- const auto dense_loss = mmltk::backend::models::rfdetr::detection_loss_dict(dense_outputs, targets, config, true, false);
+ const auto dense_loss = mmltk::backend::models::rfdetr::detection_loss_terms(dense_outputs, targets, config, true, false);
  torch::manual_seed(1234);
- const auto sparse_loss = mmltk::backend::models::rfdetr::detection_loss_dict(sparse_outputs, targets, config, true, false);
- REQUIRE(torch::allclose(dense_loss.at("loss_mask_ce"), sparse_loss.at("loss_mask_ce"), 1.0e-5, 1.0e-5));
- REQUIRE(torch::allclose(dense_loss.at("loss_mask_dice"), sparse_loss.at("loss_mask_dice"), 1.0e-5, 1.0e-5));
+ const auto sparse_loss = mmltk::backend::models::rfdetr::detection_loss_terms(sparse_outputs, targets, config, true, false);
+ REQUIRE(torch::allclose(dense_loss.at({CriterionTerm::mask_ce}), sparse_loss.at({CriterionTerm::mask_ce}), 1.0e-5, 1.0e-5));
+ REQUIRE(torch::allclose(dense_loss.at({CriterionTerm::mask_dice}), sparse_loss.at({CriterionTerm::mask_dice}), 1.0e-5, 1.0e-5));
 }
 void test_matcher_mask_cost_handles_zero_point_sampling_on_cuda() {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
@@ -569,7 +602,50 @@ void test_postprocess_cuda_stream_replacement() {
  }
 }
 }  // namespace
-TEST_CASE("test_weight_dict_population", "[model][rfdetr][native_ops]") { test_weight_dict_population(); }
+TEST_CASE("test_weights_population", "[model][rfdetr][native_ops]") { test_weights_population(); }
+TEST_CASE("Typed criterion weights retain custom addition order absent terms and graph custody", "[rfdetr][criterion]") {
+ namespace rf = mmltk::backend::models::rfdetr;
+ for (const auto& device : mmltk::backend::ml::testsupport::available_devices()) {
+  const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  auto leaves = torch::tensor({1.0e20F, -1.0e20F, 3.F, 7.F}, options).set_requires_grad(true);
+  rf::CriterionResult terms;
+  terms.main[CriterionTerm::classification] = leaves[0];
+  terms.main[CriterionTerm::l1] = leaves[1];
+  terms.main[CriterionTerm::giou] = leaves[2];
+  terms.main[CriterionTerm::keypoint_l1] = leaves[3];
+  terms.main[CriterionTerm::class_error] = torch::full({}, 99., options);
+  terms.auxiliary.resize(1);
+  terms.auxiliary[0][CriterionTerm::giou] = leaves[2] * 2;
+  terms.encoder.emplace()[CriterionTerm::keypoint_l1] = leaves[3] * 3;
+  rf::DetectionConfig config;
+  config.weights = {{{CriterionTerm::classification}, 1.}, {{CriterionTerm::mask_ce}, 1000.},
+   {{CriterionTerm::l1}, 1.}, {{CriterionTerm::giou}, 1.}};
+  const auto ordered = rf::weighted_detection_loss(terms, config, device);
+  CHECK(ordered.item<float>() == 3.F);
+  std::swap(config.weights[2], config.weights[3]);
+  CHECK(rf::weighted_detection_loss(terms, config, device).item<float>() == 0.F);
+  config.weights = {{{CriterionTerm::keypoint_l1}, 2.}, {{CriterionTerm::giou, CriterionLayer::auxiliary(0)}, 3.},
+   {{CriterionTerm::classification, CriterionLayer::auxiliary(4)}, 1000.}, {{CriterionTerm::keypoint_l1, CriterionLayer::encoder()}, 4.},
+   {{CriterionTerm::keypoint_l1}, .5}};
+  torch::Tensor auxiliary;
+  const auto total = rf::weighted_detection_loss(terms, config, device, &auxiliary);
+  CHECK(auxiliary.item<float>() == 102.F);
+  CHECK(total.item<float>() == 119.5F);
+  total.backward();
+  REQUIRE(torch::equal(leaves.grad(), torch::tensor({0.F, 0.F, 6.F, 14.5F}, options)));
+  CHECK_FALSE(terms.contains({CriterionTerm::mask_ce}));
+  CHECK_FALSE(terms.contains({CriterionTerm::classification, CriterionLayer::auxiliary(4)}));
+  REQUIRE_THROWS_AS(terms.at({CriterionTerm::mask_ce}), std::out_of_range);
+  config.weights = {{{CriterionTerm::mask_ce}, 1.}, {{CriterionTerm::classification, CriterionLayer::auxiliary(4)}, 1.}};
+  REQUIRE_THROWS_WITH(rf::weighted_detection_loss(terms, config, device), "native RF-DETR criterion returned no weighted losses");
+  config.weights.clear();
+  REQUIRE_THROWS_WITH(rf::weighted_detection_loss(terms, config, device), "native RF-DETR criterion returned no weighted losses");
+  config.weights = {{{CriterionTerm::giou}, 0.}};
+  const auto zero = rf::weighted_detection_loss(terms, config, device);
+  CHECK(zero.item<float>() == 0.F);
+  CHECK(zero.requires_grad());
+ }
+}
 TEST_CASE("test_matcher_and_losses", "[model][rfdetr][native_ops]") { test_matcher_and_losses(); }
 TEST_CASE("test_batched_matcher_transfer_matches_single_layer_losses", "[model][rfdetr][native_ops]") { test_batched_matcher_transfer_matches_single_layer_losses(); }
 TEST_CASE("test_multi_match_box_losses", "[model][rfdetr][native_ops]") { test_multi_match_box_losses(); }
@@ -631,7 +707,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
  config.group_detr = group;
  config.aux_loss = true;
  config.two_stage = true;
- populate_default_detection_weight_dict(config);
+ populate_default_detection_weights(config);
  auto targets = make_packed_mask_targets(4, 4, {{1, 1}, {1, 2}, {2, 1}, {2, 2}});
  targets.all_boxes = targets.all_boxes.to(device);
  targets.all_labels = targets.all_labels.to(device);
@@ -639,7 +715,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
  targets.target_offsets = torch::tensor(targets.offsets, torch::TensorOptions().dtype(torch::kInt64).device(device));
  targets.target_counts = torch::tensor(targets.counts, torch::TensorOptions().dtype(torch::kInt64).device(device));
  struct Outcome final {
-  TensorMap losses;
+  CriterionResult losses;
   std::vector<torch::Tensor> gradients;
   MatcherStatistics statistics;
  };
@@ -666,13 +742,14 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
   for (auto& layer : outputs.aux_outputs) prepare(layer);
   prepare(*outputs.enc_outputs);
   torch::manual_seed(7921);
-  auto losses = detection_loss_dict(outputs, targets, config, true, false);
+  auto losses = detection_loss_terms(outputs, targets, config, true, false);
   auto total = weighted_detection_loss(losses, config, device);
   total.backward();
   workspace.complete_assignments(c10::cuda::getCurrentCUDAStream(0).stream());
   REQUIRE(workspace.statistics().completion_dependencies == 1);
   Outcome outcome;
-  for (const auto& [name, loss] : losses) outcome.losses[name] = loss.detach().cpu();
+  outcome.losses = std::move(losses);
+  outcome.losses.for_each([](CriterionKey, torch::Tensor& loss) { loss = loss.detach().cpu(); });
   for (const auto& input : inputs) {
    REQUIRE(input.grad().defined());
    outcome.gradients.push_back(input.grad().cpu());
@@ -683,7 +760,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
  const auto baseline = evaluate(true);
  const auto observed = evaluate(selected_h2d);
  REQUIRE(observed.losses.size() == baseline.losses.size());
- for (const auto& [name, expected] : baseline.losses) REQUIRE(torch::allclose(observed.losses.at(name), expected, 1e-6, 1e-6));
+ baseline.losses.for_each([&](CriterionKey key, const torch::Tensor& expected) { REQUIRE(torch::allclose(observed.losses.at(key), expected, 1e-6, 1e-6)); });
  REQUIRE(observed.gradients.size() == baseline.gradients.size());
  for (std::size_t index = 0; index < baseline.gradients.size(); ++index) REQUIRE(torch::allclose(observed.gradients[index], baseline.gradients[index], 1e-6, 1e-6));
  REQUIRE(observed.statistics.cost_submissions == 1);
@@ -745,7 +822,7 @@ TEST_CASE("Ordinary auxiliary publication controls criterion inventory and mask 
  detection.aux_loss = false;
  detection.include_masks = segmentation;
  detection.mask_point_sample_ratio = 4;
- rf::populate_default_detection_weight_dict(detection);
+ rf::populate_default_detection_weights(detection);
  const auto coords = [](int64_t count) { return torch::linspace(.01, .99, count * 2).reshape({1, count, 2}); };
  const rf::LayerMaskSamples fixed{coords(16), coords(48), coords(4)};
  const std::array<rf::LayerMaskSamples, 2> reduced_samples{fixed, fixed};
@@ -768,10 +845,10 @@ TEST_CASE("Ordinary auxiliary publication controls criterion inventory and mask 
   CHECK(actual.enc_outputs->pred_masks.has_value() == (segmentation && !training));
   CHECK(actual.enc_outputs->sparse_pred_masks.has_value() == (segmentation && training));
   const auto num_boxes = torch::tensor(1.F);
-  const auto fixed_all = rf::detection_loss_dict(all, targets, detection, training, num_boxes, all_samples);
-  const auto fixed_actual = rf::detection_loss_dict(actual, targets, detection, training, num_boxes, reduced_samples);
-  CHECK_FALSE(fixed_actual.contains("loss_ce_0"));
-  CHECK(fixed_actual.contains("loss_ce_enc"));
+  const auto fixed_all = rf::detection_loss_terms(all, targets, detection, training, num_boxes, all_samples);
+  const auto fixed_actual = rf::detection_loss_terms(actual, targets, detection, training, num_boxes, reduced_samples);
+  CHECK_FALSE(fixed_actual.contains({CriterionTerm::classification, CriterionLayer::auxiliary(0)}));
+  CHECK(fixed_actual.contains({CriterionTerm::classification, CriterionLayer::encoder()}));
   CHECK(torch::equal(rf::weighted_detection_loss(fixed_all, detection, torch::kCPU), rf::weighted_detection_loss(fixed_actual, detection, torch::kCPU)));
   auto reduced = all;
   reduced.aux_outputs.clear();
@@ -780,18 +857,18 @@ TEST_CASE("Ordinary auxiliary publication controls criterion inventory and mask 
    targets.microbatch_key = 19;
    auto generator = at::detail::getDefaultCPUGenerator();
    const auto rng = generator.get_state();
-   const auto expected_losses = rf::detection_loss_dict(reduced, targets, detection, training, num_boxes);
+   const auto expected_losses = rf::detection_loss_terms(reduced, targets, detection, training, num_boxes);
    const auto expected_rng = generator.get_state();
    generator.set_state(rng);
-   const auto actual_losses = rf::detection_loss_dict(actual, targets, detection, training, num_boxes);
+   const auto actual_losses = rf::detection_loss_terms(actual, targets, detection, training, num_boxes);
    CHECK(torch::equal(expected_rng, generator.get_state()));
    REQUIRE(actual_losses.size() == expected_losses.size());
-   for (const auto& [name, expected] : expected_losses) CHECK(torch::equal(actual_losses.at(name), expected));
+   expected_losses.for_each([&](rf::CriterionKey key, const torch::Tensor& expected) { CHECK(torch::equal(actual_losses.at(key), expected)); });
    if (keyed || !segmentation) CHECK(torch::equal(rng, expected_rng));
    if (keyed) {
-    const auto keyed_all = rf::detection_loss_dict(all, targets, detection, training, num_boxes);
-    CHECK(torch::equal(keyed_all.at("loss_ce"), actual_losses.at("loss_ce")));
-    if (segmentation) CHECK(torch::equal(keyed_all.at("loss_mask_ce"), actual_losses.at("loss_mask_ce")));
+    const auto keyed_all = rf::detection_loss_terms(all, targets, detection, training, num_boxes);
+    CHECK(torch::equal(keyed_all.at({CriterionTerm::classification}), actual_losses.at({CriterionTerm::classification})));
+    if (segmentation) CHECK(torch::equal(keyed_all.at({CriterionTerm::mask_ce}), actual_losses.at({CriterionTerm::mask_ce})));
    }
   }
  }
@@ -1367,7 +1444,7 @@ TEST_CASE("Keypoint criterion includes every grouped auxiliary and encoder loss 
   config.num_classes = 4; config.group_detr = 2; config.dec_layers = 2; config.keypoints_per_class = {2, 0, 1};
   config.aux_loss = true; config.two_stage = true; config.cls_loss_coef = 2;
   config.keypoint_l1_loss_coef = config.keypoint_findable_loss_coef = config.keypoint_visible_loss_coef = config.keypoint_nll_loss_coef = 1;
-  r::populate_default_detection_weight_dict(config);
+  r::populate_default_detection_weights(config);
   const auto layer = [&] {
    r::OutputLayer result;
    result.pred_logits = torch::zeros({1, 4, 4}, options).set_requires_grad(true);
@@ -1379,28 +1456,53 @@ TEST_CASE("Keypoint criterion includes every grouped auxiliary and encoder loss 
   auto targets = r::testsupport::one_image_targets(torch::tensor({{.5F,.5F,.5F,.5F}, {.5F,.5F,.5F,.5F}}, options), torch::tensor({0,2}, options.dtype(torch::kInt64)));
   targets.all_keypoints = torch::tensor({{{.3F,.2F,2.F}, {.6F,.7F,1.F}}, {{.2F,.4F,2.F}, {0.F,0.F,0.F}}}, options);
   targets.all_keypoint_counts = torch::tensor({2,1}, options.dtype(torch::kInt64));
-  auto losses = r::detection_loss_dict(outputs, targets, config, true, false);
-  for (const auto suffix : {"", "_0", "_enc"})
-   for (const auto name : {"loss_keypoints_l1", "loss_keypoints_findable", "loss_keypoints_visible", "loss_keypoints_nll"}) {
-    const auto key = std::string(name) + suffix;
+  auto losses = r::detection_loss_terms(outputs, targets, config, true, false);
+  for (const auto identity : {CriterionLayer{}, CriterionLayer::auxiliary(0), CriterionLayer::encoder()})
+   for (const auto term : {CriterionTerm::keypoint_l1, CriterionTerm::keypoint_findable, CriterionTerm::keypoint_visible, CriterionTerm::keypoint_nll}) {
+    const r::CriterionKey key{term, identity};
     REQUIRE(losses.contains(key));
     CHECK(torch::isfinite(losses.at(key)).item<bool>());
-    CHECK(std::ranges::any_of(config.weight_dict, [&](const auto& item) { return item.first == key; }));
+    CHECK(std::ranges::any_of(config.weights, [&](const auto& item) { return item.key == key; }));
    }
   torch::Tensor auxiliary_weighted;
   const auto total = r::weighted_detection_loss(losses, config, device, &auxiliary_weighted);
   REQUIRE(auxiliary_weighted.defined());
-  REQUIRE(losses.at("loss_keypoints_l1").item<float>() > 0);
-  const auto main_weighted = losses.at("loss_ce") * config.cls_loss_coef + losses.at("loss_bbox") * config.bbox_loss_coef + losses.at("loss_giou") * config.giou_loss_coef +
-                             losses.at("loss_keypoints_l1") + losses.at("loss_keypoints_findable") + losses.at("loss_keypoints_visible") + losses.at("loss_keypoints_nll");
+  REQUIRE(losses.at({CriterionTerm::keypoint_l1}).item<float>() > 0);
+  const auto main_weighted = losses.at({CriterionTerm::classification}) * config.cls_loss_coef + losses.at({CriterionTerm::l1}) * config.bbox_loss_coef + losses.at({CriterionTerm::giou}) * config.giou_loss_coef +
+                             losses.at({CriterionTerm::keypoint_l1}) + losses.at({CriterionTerm::keypoint_findable}) + losses.at({CriterionTerm::keypoint_visible}) + losses.at({CriterionTerm::keypoint_nll});
   CHECK(torch::allclose(total - auxiliary_weighted, main_weighted));
   total.backward();
   for (const auto* value : {&outputs.main, &outputs.aux_outputs.front(), &*outputs.enc_outputs}) {
    REQUIRE(value->pred_keypoints->grad().defined());
    CHECK(value->pred_keypoints->grad().abs().sum().item<float>() > 0);
   }
-  auto doubled = r::detection_loss_dict(outputs, targets, config, true, 8.0);
-  for (const auto& [key, loss] : losses) if (key.starts_with("loss_keypoints")) CHECK(torch::allclose(doubled.at(key) * 2, loss));
+  auto doubled = r::detection_loss_terms(outputs, targets, config, true, 8.0);
+  r::CriterionSchema::visit([&]<CriterionTerm Term>(r::CriterionTermPolicy policy) {
+   if (policy.domain != r::CriterionDomain::Keypoints) return;
+   for (const auto identity : {CriterionLayer{}, CriterionLayer::auxiliary(0), CriterionLayer::encoder()})
+    CHECK(torch::allclose(doubled.at({Term, identity}) * 2, losses.at({Term, identity})));
+  });
+  for (const auto count : {0, 1}) {
+   // The nonempty case selects the zero-joint class from the mixed schema.
+   auto zero_targets = r::testsupport::one_image_targets(torch::full({count, 4}, .5, options), torch::ones({count}, options.dtype(torch::kInt64)));
+   zero_targets.all_keypoints = torch::zeros({count, 2, 3}, options);
+   zero_targets.all_keypoint_counts = torch::zeros({count}, options.dtype(torch::kInt64));
+   r::ModelOutputs zero_outputs{layer(), {layer()}, layer()};
+   const auto zero_losses = r::detection_loss_terms(zero_outputs, zero_targets, config, true, false);
+   for (const auto identity : {CriterionLayer{}, CriterionLayer::auxiliary(0), CriterionLayer::encoder()})
+    for (const auto term : {CriterionTerm::keypoint_l1, CriterionTerm::keypoint_findable, CriterionTerm::keypoint_visible, CriterionTerm::keypoint_nll}) {
+     const auto& value = zero_losses.at({term, identity});
+     REQUIRE(value.requires_grad());
+     CHECK(value.item<float>() == 0.F);
+    }
+   r::weighted_detection_loss(zero_losses, config, device).backward();
+   for (const auto* value : {&zero_outputs.main, &zero_outputs.aux_outputs.front(), &*zero_outputs.enc_outputs}) {
+    REQUIRE(value->pred_keypoints->grad().defined());
+    CHECK(value->pred_keypoints->grad().count_nonzero().item<int64_t>() == 0);
+    REQUIRE(value->pred_boxes.grad().defined());
+    REQUIRE(value->pred_logits.grad().defined());
+   }
+  }
  }
 }
 TEST_CASE("Compact CUDA joint costs preserve padded offsets and the stock nonfinite matching domain", "[rfdetr][matcher][keypoints][gpu]") {

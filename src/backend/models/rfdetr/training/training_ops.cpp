@@ -276,30 +276,17 @@ torch::Tensor GradScaler::check_and_unscale_gradients_(const std::vector<torch::
  if (!gradients.empty()) at::_amp_foreach_non_finite_check_and_unscale_(gradients, found_inf_device_, inverse_scale_device_);
  return found_inf_device_;
 }
-torch::Tensor loss_value_or_zero(const TensorMap& loss_dict, const torch::Device& device, std::string_view key) {
- const auto found = loss_dict.find(std::string(key));
- if (found != loss_dict.end()) { return found->second; }
+torch::Tensor loss_value_or_zero(const CriterionResult& losses, const torch::Device& device, CriterionTerm term) {
+ if (const auto* value = losses.find({term})) return *value;
  return torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 }
-TrainingScalarPacket::Tensors ordinary_scalar_tensors(const TensorMap& losses, const torch::Tensor& total, const torch::Tensor& auxiliary) {
+TrainingScalarPacket::Tensors ordinary_scalar_tensors(const CriterionResult& losses, const torch::Tensor& total, const torch::Tensor& auxiliary) {
  TrainingScalarPacket::Tensors values;
  TrainingScalarPacket::set<^^TrainingScalars::total>(values, total);
  TrainingScalarPacket::set<^^TrainingScalars::auxiliary_weighted>(values, auxiliary);
- const auto assign = [&]<std::meta::info Member>(std::string_view name) {
-  const auto found = losses.find(std::string(name));
-  if (found != losses.end()) TrainingScalarPacket::set<Member>(values, found->second);
- };
- assign.operator()<^^TrainingScalars::classification>("loss_ce");
- assign.operator()<^^TrainingScalars::l1>("loss_bbox");
- assign.operator()<^^TrainingScalars::giou>("loss_giou");
- assign.operator()<^^TrainingScalars::mask_ce>("loss_mask_ce");
- assign.operator()<^^TrainingScalars::mask_dice>("loss_mask_dice");
- assign.operator()<^^TrainingScalars::keypoint_l1>("loss_keypoints_l1");
- assign.operator()<^^TrainingScalars::keypoint_findable>("loss_keypoints_findable");
- assign.operator()<^^TrainingScalars::keypoint_visible>("loss_keypoints_visible");
- assign.operator()<^^TrainingScalars::keypoint_nll>("loss_keypoints_nll");
- assign.operator()<^^TrainingScalars::class_error>("class_error");
- assign.operator()<^^TrainingScalars::cardinality_error>("cardinality_error");
+ CriterionSchema::visit_metrics<TrainingScalars>([&]<CriterionTerm Term, std::meta::info Member> {
+  TrainingScalarPacket::set<Member>(values, losses.main[Term]);
+ });
  return values;
 }
 RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const TrainingSupervisionRoute route, const ModelOutputs& outputs, const PreparedTargets& targets,
@@ -321,12 +308,12 @@ RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const 
  const double group_divisor = detection_config.sum_group_losses ? 1.0 : static_cast<double>(detection_config.group_detr);
  const auto num_boxes = torch::clamp_min(normalizer.target_count * group_divisor, 1.0);
  DetectionStatisticsPacket::Tensors statistics;
- auto ordinary_terms = detection_loss_dict(outputs, targets, detection_config, true, num_boxes, &statistics);
+ auto ordinary_terms = detection_loss_terms(outputs, targets, detection_config, true, num_boxes, &statistics);
  torch::Tensor auxiliary;
  auto total = weighted_detection_loss(ordinary_terms, detection_config, outputs.main.pred_logits.device(), &auxiliary);
  auto scalars = ordinary_scalar_tensors(ordinary_terms, total, auxiliary);
- auto classification = loss_value_or_zero(ordinary_terms, outputs.main.pred_logits.device(), "loss_ce");
- auto box = loss_value_or_zero(ordinary_terms, outputs.main.pred_logits.device(), "loss_bbox");
+ auto classification = loss_value_or_zero(ordinary_terms, outputs.main.pred_logits.device(), CriterionTerm::classification);
+ auto box = loss_value_or_zero(ordinary_terms, outputs.main.pred_logits.device(), CriterionTerm::l1);
  if (route_uses_denoising(route)) {
   const auto denoising = model.supervision_loss(outputs, targets, normalizer, true);
   total = total + denoising.total;

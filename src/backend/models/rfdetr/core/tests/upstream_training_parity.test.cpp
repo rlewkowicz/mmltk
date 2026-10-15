@@ -1,4 +1,5 @@
 #include "src/backend/models/rfdetr/core/tests/training_fixture.h"
+#include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/upstream_oracle_fixture.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/models/rfdetr/core/detail/training_supervision.h"
@@ -32,6 +33,8 @@
 #include <vector>
 #include <unordered_map>
 #include <cmath>
+using mmltk::backend::models::rfdetr::CriterionTerm;
+using mmltk::backend::models::rfdetr::CriterionLayer;
 namespace {
 using mmltk::backend::ml::testsupport::independent_leaf;
 namespace rf = mmltk::backend::models::rfdetr;
@@ -127,7 +130,8 @@ torch::Tensor reference_depthwise(const torch::Tensor& input, const torch::Tenso
  }
  return torch::stack(channels).unsqueeze(0);
 }
-void require_stock_loss_vocabulary(const rf::TensorMap& losses, std::size_t auxiliaries, bool encoder, bool masks) {
+void require_stock_loss_vocabulary(const rf::CriterionResult& terms, std::size_t auxiliaries, bool encoder, bool masks) {
+ const auto losses = rf::testsupport::oracle_criterion_tensors(terms);
  std::vector<std::string> suffixes{""};
  for (std::size_t layer = 0; layer < auxiliaries; ++layer) suffixes.push_back("_" + std::to_string(layer));
  if (encoder) suffixes.push_back("_enc");
@@ -310,25 +314,25 @@ TEST_CASE("Empty stock masks retain representation-specific connected expression
    config.use_jit_traced_loss_ops = false;
    const auto empty = one_image_targets(torch::empty({0, 4}), torch::empty({0}, torch::kInt64));
    rf::DetectionStatisticsPacket::Tensors statistics;
-   const auto losses = rf::detection_loss_dict(outputs, empty, config, true, 1.0, &statistics);
+   const auto losses = rf::detection_loss_terms(outputs, empty, config, true, 1.0, &statistics);
    require_stock_loss_vocabulary(losses, 1, true, true);
-   REQUIRE(losses.at("loss_ce").item<float>() > 0.0F);
+   REQUIRE(losses.at({CriterionTerm::classification}).item<float>() > 0.0F);
    // CLEANUP-IGNORE: Empty-target class error and zero matches differ from grouped foreground statistics.
-   REQUIRE(losses.at("class_error").item<float>() == 100.F);
+   REQUIRE(losses.at({CriterionTerm::class_error}).item<float>() == 100.F);
    REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::matched_count>(statistics).item<float>() == 0.F);
    // CLEANUP-IGNORE: These zero error and one-image facts inspect different reflected fields from mask matched counts.
    REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::class_error_sum>(statistics).item<float>() == 0.F);
    REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::image_count>(statistics).item<float>() == 1.F);
    for (const auto& statistic : statistics) REQUIRE_FALSE(statistic.requires_grad());
-   for (const auto suffix : {"", "_0", "_enc"}) {
-    const auto mask_loss = losses.at(std::string("loss_mask_ce") + suffix) + losses.at(std::string("loss_mask_dice") + suffix);
+   for (const auto layer : {CriterionLayer{}, CriterionLayer::auxiliary(0), CriterionLayer::encoder()}) {
+    const auto mask_loss = losses.at({CriterionTerm::mask_ce, layer}) + losses.at({CriterionTerm::mask_dice, layer});
     REQUIRE(mask_loss.requires_grad());
     if (sparse && nonfinite)
      REQUIRE(torch::isnan(mask_loss).all().item<bool>());
     else
      REQUIRE(mask_loss.item<float>() == 0.0F);
    }
-   losses.at("loss_mask_ce").backward();
+   losses.at({CriterionTerm::mask_ce}).backward();
    REQUIRE(spatial.grad().defined());
    REQUIRE(spatial.grad().count_nonzero().item<int64_t>() == 0);
    if (sparse) {
@@ -462,7 +466,7 @@ TEST_CASE("IA-BCE casts detached quality independently into mixed precision dest
      // CLEANUP-IGNORE: Different AMP parity cases explicitly assert their expected native assignment before distinct independent numerical comparisons.
      const auto indices = rf::matcher_indices(outputs, gt, config, true);
      REQUIRE(indices[0].first.item<int64_t>() == 0);
-     actual = rf::detection_loss_dict(outputs, gt, config, true, 1.).at("loss_ce");
+     actual = rf::detection_loss_terms(outputs, gt, config, true, 1.).at({CriterionTerm::classification});
      const auto probability = reference_logits.sigmoid();
      const auto iou = reference_giou(reference_corners(outputs.main.pred_boxes[0][0].detach().unsqueeze(0)), reference_corners(box), false).squeeze(0);
      const auto quality = (torch::pow(probability[0][0][0], config.focal_alpha) * torch::pow(iou, 1 - config.focal_alpha)).clamp_min(.01).detach();
@@ -673,7 +677,7 @@ TEST_CASE("Stock matched classification and box losses follow independent groupe
     config.cls_loss_coef = 1.3;
     config.bbox_loss_coef = 4.1;
     config.giou_loss_coef = 2.7;
-    rf::populate_default_detection_weight_dict(config);
+    rf::populate_default_detection_weights(config);
     auto logits = torch::tensor({{{1.1, -0.4}, {-0.7, 0.8}}}, torch::kFloat32).repeat({1, groups, 1}).to(device).set_requires_grad(true);
     auto boxes = torch::tensor({{{0.31, 0.42, 0.21, 0.19}, {0.8, 0.7, 0.1, 0.2}}}, torch::kFloat32).repeat({1, groups, 1}).to(device).set_requires_grad(true);
     const auto gt_box = torch::tensor({{0.3, 0.4, 0.2, 0.2}}, torch::kFloat32).to(device);
@@ -684,7 +688,7 @@ TEST_CASE("Stock matched classification and box losses follow independent groupe
     const auto pairs = rf::matcher_indices(output, gt, config, true);
     REQUIRE(torch::equal(pairs[0].first, torch::arange(0, groups * 2, 2, torch::kInt64)));
     rf::DetectionStatisticsPacket::Tensors statistics;
-    const auto losses = rf::detection_loss_dict(output, gt, config, true, torch::tensor(double(groups), boxes.options()), &statistics);
+    const auto losses = rf::detection_loss_terms(output, gt, config, true, torch::tensor(double(groups), boxes.options()), &statistics);
     require_stock_loss_vocabulary(losses, 0, false, false);
     auto l = independent_leaf(logits), b = independent_leaf(boxes);
     const auto selected = torch::arange(0, groups * 2, 2, torch::TensorOptions().device(device).dtype(torch::kInt64));
@@ -719,36 +723,36 @@ TEST_CASE("Stock matched classification and box losses follow independent groupe
     REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::image_count>(statistics).item<float>() == 1.F);
     REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::cardinality_error_sum>(statistics).item<float>() == static_cast<float>(2 * groups - 1));
     for (const auto& statistic : statistics) REQUIRE_FALSE(statistic.requires_grad());
-    REQUIRE(torch::allclose(losses.at("loss_ce"), classification, 1e-5, 1e-6));
-    REQUIRE(torch::allclose(losses.at("loss_bbox"), l1, 1e-5, 1e-6));
-    REQUIRE(torch::allclose(losses.at("loss_giou"), box_loss, 1e-5, 1e-6));
+    REQUIRE(torch::allclose(losses.at({CriterionTerm::classification}), classification, 1e-5, 1e-6));
+    REQUIRE(torch::allclose(losses.at({CriterionTerm::l1}), l1, 1e-5, 1e-6));
+    REQUIRE(torch::allclose(losses.at({CriterionTerm::giou}), box_loss, 1e-5, 1e-6));
     auto distributed_config = config;
     distributed_config.world_size = 2;
     int reductions = 0;
     rf::DetectionStatisticsPacket::Tensors distributed_statistics;
-    const auto distributed = rf::detection_loss_dict(output, gt, distributed_config, true, true, [&](torch::Tensor& count) {
+    const auto distributed = rf::detection_loss_terms(output, gt, distributed_config, true, true, [&](torch::Tensor& count) {
      ++reductions;
      count.add_(3 * groups);
     }, &distributed_statistics);
     REQUIRE(reductions == 1);
     require_same_statistics(statistics, distributed_statistics);
-    REQUIRE(torch::allclose(distributed.at("loss_ce"), classification / 4, 1e-5, 1e-6));
-    REQUIRE(torch::allclose(distributed.at("loss_bbox"), l1 / 4, 1e-5, 1e-6));
+    REQUIRE(torch::allclose(distributed.at({CriterionTerm::classification}), classification / 4, 1e-5, 1e-6));
+    REQUIRE(torch::allclose(distributed.at({CriterionTerm::l1}), l1 / 4, 1e-5, 1e-6));
     auto summed_config = config;
     summed_config.sum_group_losses = true;
-    const auto summed = rf::detection_loss_dict(output, gt, summed_config, true, false);
+    const auto summed = rf::detection_loss_terms(output, gt, summed_config, true, false);
     require_stock_loss_vocabulary(summed, 0, false, false);
-    REQUIRE(torch::allclose(summed.at("loss_ce"), classification * groups, 1e-5, 1e-6));
+    REQUIRE(torch::allclose(summed.at({CriterionTerm::classification}), classification * groups, 1e-5, 1e-6));
     auto layered = output;
     auto background = output.main;
     background.pred_logits = torch::full_like(logits, -2);
     layered.aux_outputs = {background};
     layered.enc_outputs = background;
     rf::DetectionStatisticsPacket::Tensors main_statistics;
-    const auto layered_losses = rf::detection_loss_dict(layered, gt, config, true, 1.0, &main_statistics);
+    const auto layered_losses = rf::detection_loss_terms(layered, gt, config, true, 1.0, &main_statistics);
     require_stock_loss_vocabulary(layered_losses, 1, true, false);
-    REQUIRE(layered_losses.at("cardinality_error_0").item<float>() == 1.F);
-    REQUIRE(layered_losses.at("cardinality_error_enc").item<float>() == 1.F);
+    REQUIRE(layered_losses.at({CriterionTerm::cardinality_error, CriterionLayer::auxiliary(0)}).item<float>() == 1.F);
+    REQUIRE(layered_losses.at({CriterionTerm::cardinality_error, CriterionLayer::encoder()}).item<float>() == 1.F);
     require_same_statistics(statistics, main_statistics);
     const auto actual = rf::weighted_detection_loss(losses, config, device);
     const auto expected = 1.3 * classification + 4.1 * l1 + 2.7 * box_loss;
@@ -777,10 +781,10 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
     config.ia_bce_loss = false;
     config.mask_point_sample_ratio = ratio;
     config.focal_alpha = alpha;
-    for (const auto suffix : {"", "_0", "_enc"}) {
-     config.weight_dict.emplace_back(std::string("loss_ce") + suffix, 1.3);
-     config.weight_dict.emplace_back(std::string("loss_mask_ce") + suffix, 2.1);
-     config.weight_dict.emplace_back(std::string("loss_mask_dice") + suffix, 0.7);
+    for (const auto layer : {CriterionLayer{}, CriterionLayer::auxiliary(0), CriterionLayer::encoder()}) {
+     config.weights.push_back({{CriterionTerm::classification, layer}, 1.3});
+     config.weights.push_back({{CriterionTerm::mask_ce, layer}, 2.1});
+     config.weights.push_back({{CriterionTerm::mask_dice, layer}, 0.7});
     }
     const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
     auto gt = one_image_targets(torch::tensor({{0.5, 0.5, 0.2, 0.2}}, options), torch::zeros({1}, torch::kInt64).to(device));
@@ -811,7 +815,7 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
       output.main.pred_boxes = gt.all_boxes.unsqueeze(0);
       set_mask_layers(output, sparse, spatial, query, bias);
       rf::DetectionStatisticsPacket::Tensors statistics;
-      const auto losses = rf::detection_loss_dict(output, gt, config, true, torch::full({}, denominator, options), samples, &statistics);
+      const auto losses = rf::detection_loss_terms(output, gt, config, true, torch::full({}, denominator, options), samples, &statistics);
       require_stock_loss_vocabulary(losses, 1, true, true);
       REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::matched_count>(statistics).item<float>() == 1.F);
       REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::image_count>(statistics).item<float>() == 1.F);
@@ -839,7 +843,7 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
          [](const torch::Tensor&, const torch::Tensor&) -> torch::Tensor { throw std::runtime_error("replacement failure"); }, logits.to(torch::kFloat64), labels.to(torch::kFloat64)));
        }
        REQUIRE(slot.identity() == original);
-       const auto reused = rf::detection_loss_dict(output, gt, config, true, torch::full({}, denominator, options), samples);
+       const auto reused = rf::detection_loss_terms(output, gt, config, true, torch::full({}, denominator, options), samples);
        require_stock_loss_vocabulary(reused, 1, true, true);
        REQUIRE(slot.identity() == original);
        REQUIRE(torch::allclose(totals[route], rf::weighted_detection_loss(reused, config, device), 1e-5, 1e-6));
@@ -854,7 +858,7 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
         mmltk::backend::ml::cuda::TorchAutocastScope backward_scope(false, torch::kFloat32);
         REQUIRE(torch::allclose(torch::autograd::grad({changed}, {logits}, {}, true)[0], torch::autograd::grad({reference}, {logits}, {}, true)[0], 1e-5, 1e-6));
        }
-       const auto restored = rf::detection_loss_dict(output, gt, config, true, torch::full({}, denominator, options), samples);
+       const auto restored = rf::detection_loss_terms(output, gt, config, true, torch::full({}, denominator, options), samples);
        if (change != 3) REQUIRE(slot.identity() == original);
        const auto restored_total = rf::weighted_detection_loss(restored, config, device), reused_total = rf::weighted_detection_loss(reused, config, device);
        REQUIRE(torch::allclose(totals[route], restored_total, 1e-5, 1e-6));
@@ -1295,7 +1299,7 @@ TEST_CASE("Explicit criterion samples reject incompatible invocation metadata", 
  config.num_classes = 1;
  config.mask_point_sample_ratio = 4;
  std::array<rf::LayerMaskSamples, 2> excessive;
- REQUIRE_THROWS_AS(rf::detection_loss_dict(output, gt, config, true, torch::tensor(1.F), excessive), std::invalid_argument);
+ REQUIRE_THROWS_AS(rf::detection_loss_terms(output, gt, config, true, torch::tensor(1.F), excessive), std::invalid_argument);
  for (int fault : {0, 1}) {
   rf::LayerMaskSamples samples;
   samples.matcher = fault == 0 ? torch::zeros({1, 3, 2}) : torch::zeros({1, 4, 2}, torch::kFloat64);

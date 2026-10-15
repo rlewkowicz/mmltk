@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/criterion_terms.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
@@ -114,6 +115,13 @@ private:
  bool observing_ = false;
  std::string deferred_difference_;
 };
+// Structural projection at the upstream comparison boundary. The independent
+// reference archives and vocabulary assertions retain their original names.
+[[nodiscard]] inline TensorMap oracle_criterion_tensors(const CriterionResult& terms) {
+ TensorMap result;
+ terms.for_each([&](CriterionKey key, const torch::Tensor& value) { result.emplace(criterion_external_name(key), value); });
+ return result;
+}
 [[nodiscard]] TensorMap oracle_output_tensors(const ModelOutputs& outputs);
 [[nodiscard]] PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& entry, torch::Device device);
 [[nodiscard]] std::vector<LayerMaskSamples> oracle_samples(const OracleArchive&, std::size_t layers, torch::Device, const std::string& prefix = "");

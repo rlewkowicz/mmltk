@@ -67,7 +67,8 @@ inline void populate_target_views(PreparedTargets& result) {
 [[nodiscard]] inline torch::Tensor reference_reparam_boxes(const torch::Tensor& base, const torch::Tensor& delta) {
  return torch::cat({delta.slice(-1, 0, 2) * base.slice(-1, 2, 4) + base.slice(-1, 0, 2), delta.slice(-1, 2, 4).exp() * base.slice(-1, 2, 4)}, -1);
 }
-// Cases retain their own class-loss policy, coefficients and mask settings.
+// Project canonical coefficients once; cases choose their class-loss policy,
+// mask settings and ordered criterion weights.
 [[nodiscard]] inline DetectionConfig detection_fixture_base(const NativeRfDetrConfig& model) {
  DetectionConfig result;
  result.num_classes = model.num_classes;

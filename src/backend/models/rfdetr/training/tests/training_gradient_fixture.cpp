@@ -708,12 +708,14 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
     const auto control = metrics.complete_step(torch::zeros({}, loss.options()), 1, 1, distributed);
     require(!control.loss_finite && control.gradients_finite, "nonfinite constant loss was not globally rejected");
     TrainLaneResult contribution;
-    contribution.loss_terms.emplace("loss_ce", loss.detach());
+    contribution.loss_terms.main[CriterionTerm::classification] = loss.detach();
     TrainingLossReport failure_report;
     failure_report.accumulate(std::move(contribution.loss_terms));
     // A later healthy contribution must not erase the earlier cause, and
     // neither contribution may keep its autograd graph alive in the report.
-    failure_report.accumulate({{"loss_ce", torch::zeros({}, loss.options().requires_grad(false))}});
+    CriterionResult healthy;
+    healthy.main[CriterionTerm::classification] = torch::zeros({}, loss.options().requires_grad(false));
+    failure_report.accumulate(std::move(healthy));
     const auto message = std::string(failure_report.failure(optimizer.parameters(), optimizer.parameter_names()).what());
     require(message.find("non-finite RF-DETR loss or gradients encountered during native training") != std::string::npos, "training loss failure message changed");
     if (distributed.rank == distributed.world_size - 1) {
@@ -1479,8 +1481,7 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   config.training_supervision = request.training_supervision;
   request.num_queries = config.num_queries;
   auto detection = detection_fixture_base(config);
-  project_loss_coefficients(detection, config);
-  populate_default_detection_weight_dict(detection);
+  populate_default_detection_weights(detection);
   std::shared_ptr<PreparedUploadSignal> signal;
   std::atomic<std::size_t> failures{0};
   const auto construct = [&](const std::filesystem::path& resume = {}) {

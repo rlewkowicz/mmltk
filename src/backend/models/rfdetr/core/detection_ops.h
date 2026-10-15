@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/criterion_terms.h"
 #include <torch/types.h>
 #include <functional>
 #include <utility>
@@ -9,11 +10,11 @@ namespace mmltk::backend::models::rfdetr {
 using AllReduceTensorFn = std::function<void(torch::Tensor&)>;
 [[nodiscard]] torch::Tensor cardinality_error(const torch::Tensor& logits, const torch::Tensor& target_counts);
 std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode);
-TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, bool distributed_enabled,
+CriterionResult detection_loss_terms(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, bool distributed_enabled,
  const AllReduceTensorFn& distributed_all_reduce = {}, DetectionStatisticsPacket::Tensors* statistics = nullptr);
-TensorMap detection_loss_dict(
+CriterionResult detection_loss_terms(
  const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, double num_boxes_value, DetectionStatisticsPacket::Tensors* statistics = nullptr);
-TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value,
+CriterionResult detection_loss_terms(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value,
  DetectionStatisticsPacket::Tensors* statistics = nullptr);
-torch::Tensor weighted_detection_loss(const TensorMap& loss_dict, const DetectionConfig& config, const torch::Device& device, torch::Tensor* auxiliary_weighted = nullptr);
+torch::Tensor weighted_detection_loss(const CriterionResult& losses, const DetectionConfig& config, const torch::Device& device, torch::Tensor* auxiliary_weighted = nullptr);
 }  // namespace mmltk::backend::models::rfdetr

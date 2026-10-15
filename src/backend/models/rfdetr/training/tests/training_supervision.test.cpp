@@ -144,10 +144,9 @@ rfdetr::NativeRfDetrConfig tiny_native_training_config() {
 }
 rfdetr::DetectionConfig training_detection_fixture(const rfdetr::NativeRfDetrConfig& config) {
  auto detection = rfdetr::testsupport::detection_fixture_base(config);
- rfdetr::project_loss_coefficients(detection, config);
  detection.include_masks = config.has_masks();
  detection.mask_point_sample_ratio = config.mask_point_sample_ratio;
- rfdetr::populate_default_detection_weight_dict(detection);
+ rfdetr::populate_default_detection_weights(detection);
  return detection;
 }
 rfdetr::TrainRequest gradient_update_request(double learning_rate = 1e-3) {
@@ -2288,10 +2287,10 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
     stock_outputs.denoising.reset();
     const auto stock_loss = rfdetr::compute_routed_training_loss(stock, rfdetr::TrainingSupervisionRoute::Hungarian, stock_outputs, targets, {torch::tensor(4.F, options)}, detection);
     REQUIRE(torch::equal(after_dn, at::cuda::detail::getDefaultCUDAGenerator().get_state()));
-    for (const auto& [name, value] : routed.ordinary_terms) {
-     CAPTURE(name, value, stock_loss.ordinary_terms.at(name));
-     CHECK(torch::equal(value, stock_loss.ordinary_terms.at(name)));
-    }
+    routed.ordinary_terms.for_each([&](rfdetr::CriterionKey key, const torch::Tensor& value) {
+     CAPTURE(rfdetr::criterion_external_name(key), value, stock_loss.ordinary_terms.at(key));
+     CHECK(torch::equal(value, stock_loss.ordinary_terms.at(key)));
+    });
     REQUIRE(routed.total.item<float>() > stock_loss.total.item<float>());
     outputs[micro].denoising->main.sparse_pred_masks->query_features.retain_grad();
     outputs[micro].denoising->aux_outputs.front().sparse_pred_masks->query_features.retain_grad();
@@ -2886,6 +2885,79 @@ TEST_CASE("Partial target DMA failure retains staging and permits bounded recove
  }
  scratch.wait_for_pending_copy();
  REQUIRE(scratch.device_masks(128).cpu().sum().item<int64_t>() == 0);
+}
+TEST_CASE("Ordinary criterion telemetry projects raw main terms and detaches only published values", "[rfdetr][training_supervision][criterion]") {
+ namespace rf = mmltk::backend::models::rfdetr;
+ for (const auto& device : mmltk::backend::ml::testsupport::available_devices()) {
+  const auto options = torch::TensorOptions().device(device);
+  auto leaves = torch::tensor({2.F, 3.F, 5.F, 7.F}, options).set_requires_grad(true);
+  rf::CriterionResult terms;
+  terms.main[rf::CriterionTerm::classification] = leaves[0];
+  terms.main[rf::CriterionTerm::mask_ce] = leaves[1];
+  terms.main[rf::CriterionTerm::keypoint_l1] = leaves[2];
+  terms.main[rf::CriterionTerm::keypoint_visible] = leaves[3];
+  terms.main[rf::CriterionTerm::class_error] = torch::full({}, 25., options);
+  terms.auxiliary.resize(1);
+  terms.auxiliary.front()[rf::CriterionTerm::classification] = leaves[0] * 10;
+  terms.encoder.emplace()[rf::CriterionTerm::keypoint_l1] = leaves[2] * 10;
+  rf::DetectionConfig config;
+  config.weights = {{{rf::CriterionTerm::classification}, 2.}, {{rf::CriterionTerm::mask_ce}, 3.},
+   {{rf::CriterionTerm::keypoint_l1}, 4.}, {{rf::CriterionTerm::keypoint_visible}, 5.},
+   {{rf::CriterionTerm::classification, rf::CriterionLayer::auxiliary(0)}, 2.}, {{rf::CriterionTerm::keypoint_l1, rf::CriterionLayer::encoder()}, 4.}};
+  torch::Tensor auxiliary;
+  const auto total = rf::weighted_detection_loss(terms, config, device, &auxiliary);
+  const auto scalars = rf::ordinary_scalar_tensors(terms, total, auxiliary);
+  using Packet = rf::TrainingScalarPacket;
+  REQUIRE(Packet::get<^^rf::TrainingScalars::total>(scalars).item<float>() == 308.F);
+  REQUIRE(Packet::get<^^rf::TrainingScalars::auxiliary_weighted>(scalars).item<float>() == 240.F);
+  REQUIRE(Packet::get<^^rf::TrainingScalars::classification>(scalars).item<float>() == 2.F);
+  REQUIRE(Packet::get<^^rf::TrainingScalars::mask_ce>(scalars).item<float>() == 3.F);
+  REQUIRE(Packet::get<^^rf::TrainingScalars::keypoint_l1>(scalars).item<float>() == 5.F);
+  REQUIRE(Packet::get<^^rf::TrainingScalars::keypoint_visible>(scalars).item<float>() == 7.F);
+  REQUIRE(Packet::get<^^rf::TrainingScalars::class_error>(scalars).item<float>() == 25.F);
+  CHECK_FALSE(Packet::get<^^rf::TrainingScalars::mask_dice>(scalars).defined());
+  CHECK_FALSE(Packet::get<^^rf::TrainingScalars::keypoint_findable>(scalars).defined());
+  CHECK_FALSE(Packet::get<^^rf::TrainingScalars::denoising_weighted>(scalars).defined());
+  for (const auto& value : scalars) if (value.defined()) CHECK_FALSE(value.requires_grad());
+  total.backward();
+  REQUIRE(torch::equal(leaves.grad(), torch::tensor({22.F, 3.F, 44.F, 5.F}, options)));
+ }
+}
+TEST_CASE("Criterion failure reports retain first nonfinite terms and lexical external names", "[rfdetr][training_supervision][criterion]") {
+ namespace rf = mmltk::backend::models::rfdetr;
+ for (const auto& device : mmltk::backend::ml::testsupport::available_devices()) {
+  const auto options = torch::TensorOptions().device(device);
+  const auto infinity = std::numeric_limits<float>::infinity();
+  const auto nan = std::numeric_limits<float>::quiet_NaN();
+  rf::CriterionResult terms;
+  terms.main[rf::CriterionTerm::classification] = torch::full({}, infinity, options);
+  terms.main[rf::CriterionTerm::class_error] = torch::full({}, nan, options);
+  terms.auxiliary.resize(11);
+  terms.auxiliary[2][rf::CriterionTerm::classification] = torch::full({}, infinity, options);
+  terms.auxiliary[10][rf::CriterionTerm::classification] = torch::full({}, nan, options);
+  terms.encoder.emplace()[rf::CriterionTerm::l1] = torch::full({}, -infinity, options);
+  rf::TrainingLossReport report;
+  report.begin_attempt();
+  report.accumulate(terms);
+  auto healthy = terms;
+  healthy.for_each([](rf::CriterionKey, torch::Tensor& value) { value = torch::zeros_like(value); });
+  report.accumulate(healthy);
+  CHECK(report.details({}, {}) == " nonfinite_losses=[class_error=nan, loss_bbox_enc=-inf, loss_ce=inf, loss_ce_10=nan, loss_ce_2=inf]");
+  auto changed = healthy;
+  changed.main[rf::CriterionTerm::class_error] = {};
+  changed.main[rf::CriterionTerm::cardinality_error] = torch::zeros({}, options);
+  REQUIRE_THROWS_WITH(report.accumulate(changed), "training criterion report term changed within an attempt");
+  changed.main[rf::CriterionTerm::cardinality_error] = {};
+  REQUIRE_THROWS_WITH(report.accumulate(changed), "training criterion report schema changed within an attempt");
+  report.begin_attempt();
+  report.accumulate(healthy);
+  CHECK(report.details({}, {}).empty());
+  auto parameter = torch::zeros({1}, options).set_requires_grad(true);
+  parameter.mutable_grad() = torch::full({1}, infinity, options);
+  CHECK(report.details({parameter}, {"fixture.weight"}) == " nonfinite_grad=fixture.weight");
+  parameter.detach().fill_(nan);
+  CHECK(report.details({parameter}, {"fixture.weight"}) == " nonfinite_param=fixture.weight");
+ }
 }
 TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusable target custody", "[rfdetr][training_supervision][keypoints][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");

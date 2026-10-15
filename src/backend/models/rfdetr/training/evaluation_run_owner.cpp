@@ -768,14 +768,14 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     const auto target_count = torch::tensor({static_cast<float>(prepared_target_count(*prepared))}, torch::TensorOptions().dtype(torch::kFloat32).device(inference_input.device()));
     loss = forward_model.supervision_loss(*evaluated_outputs, *prepared, DeviceLossNormalizer{target_count.select(0, 0)}, false).total;
    } else {
-    TensorMap loss_dict;
+    CriterionResult loss_terms;
     {
      mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_loss_dict{"rfdetr.train.eval.loss_dict"};
-     loss_dict = detection_loss_dict(*evaluated_outputs, *prepared, detection_config, false, false);
+     loss_terms = detection_loss_terms(*evaluated_outputs, *prepared, detection_config, false, false);
      runtime.matcher_workspace().complete_assignments(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(options.device_id)).stream());
     }
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_loss_total{"rfdetr.train.eval.loss_total"};
-    loss = weighted_detection_loss(loss_dict, detection_config, inference_input.device());
+    loss = weighted_detection_loss(loss_terms, detection_config, inference_input.device());
    }
    criterion_timing.finish();
    target_consumer->retire();

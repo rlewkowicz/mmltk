@@ -7,28 +7,19 @@ void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch
  const bool valid_box_dtype = pred_boxes.scalar_type() == expected_dtype || (expected_dtype != at::kFloat && pred_boxes.scalar_type() == at::kFloat);
  if (!valid_box_dtype) { throw std::runtime_error(std::string(context) + " returned boxes with the wrong element type"); }
 }
-void populate_default_detection_weight_dict(DetectionConfig& config) {
- config.weight_dict = {
-  {"loss_ce", config.cls_loss_coef},
-  {"loss_bbox", config.bbox_loss_coef},
-  {"loss_giou", config.giou_loss_coef},
- };
- if (config.include_masks) {
-  config.weight_dict.emplace_back("loss_mask_ce", config.mask_ce_loss_coef);
-  config.weight_dict.emplace_back("loss_mask_dice", config.mask_dice_loss_coef);
- }
- if (!config.keypoints_per_class.empty()) {
-  config.weight_dict.emplace_back("loss_keypoints_l1", config.keypoint_l1_loss_coef);
-  config.weight_dict.emplace_back("loss_keypoints_findable", config.keypoint_findable_loss_coef);
-  config.weight_dict.emplace_back("loss_keypoints_visible", config.keypoint_visible_loss_coef);
-  config.weight_dict.emplace_back("loss_keypoints_nll", config.keypoint_nll_loss_coef);
- }
- const auto base_weights = config.weight_dict;
+void populate_default_detection_weights(DetectionConfig& config) {
+ config.weights.clear();
+ CriterionSchema::visit_coefficients<DetectionConfig>([&]<CriterionTerm Term, std::meta::info Coefficient>(CriterionDomain domain) {
+  if (domain == CriterionDomain::Masks && !config.include_masks) return;
+  if (domain == CriterionDomain::Keypoints && config.keypoints_per_class.empty()) return;
+  config.weights.push_back({{Term}, config.[:Coefficient:]});
+ });
+ const auto base_weights = config.weights;
  for (std::int64_t layer_index = 0; config.aux_loss && layer_index < config.dec_layers - 1; ++layer_index) {
-  for (const auto& item : base_weights) { config.weight_dict.emplace_back(item.first + "_" + std::to_string(layer_index), item.second); }
+  for (const auto& item : base_weights) { config.weights.push_back({{item.key.term, CriterionLayer::auxiliary(static_cast<std::size_t>(layer_index))}, item.coefficient}); }
  }
  if (config.two_stage && config.dec_layers > 0) {
-  for (const auto& item : base_weights) { config.weight_dict.emplace_back(item.first + "_enc", item.second); }
+  for (const auto& item : base_weights) { config.weights.push_back({{item.key.term, CriterionLayer::encoder()}, item.coefficient}); }
  }
 }
 }  // namespace mmltk::backend::models::rfdetr

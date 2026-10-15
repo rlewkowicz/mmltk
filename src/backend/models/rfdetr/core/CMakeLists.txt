@@ -44,6 +44,7 @@ mmltk_register_public_headers(
         model.h
         model_state_load.h
         runtime.h
+        criterion_terms.h
         detection_types.h
         detection_statistics.h
         reflected_tensor_packet.h

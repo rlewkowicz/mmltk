@@ -62,25 +62,26 @@ void record_lane_result_on_current_stream(const TrainLaneResult& lane_result, in
  record_tensor(lane_result.box_loss);
  for (const auto& scalar : lane_result.scalars) record_tensor(scalar);
  for (const auto& value : lane_result.statistics) record_tensor(value);
- for (const auto& [name, value] : lane_result.loss_terms) record_tensor(value);
+ lane_result.loss_terms.for_each([&](CriterionKey, const torch::Tensor& value) { record_tensor(value); });
 }
 void TrainingLossReport::begin_attempt() { values_ = torch::Tensor{}; }
-void TrainingLossReport::accumulate(TensorMap terms) {
+void TrainingLossReport::accumulate(CriterionResult terms) {
  // One scalar per criterion term, independent of logical K; never keep a
  // graph. Batch the device selection instead of launching kernels per term.
  torch::NoGradGuard no_grad;
- if (names_.empty()) {
-  names_.reserve(terms.size());
-  incoming_.reserve(terms.size());
-  for (const auto& [name, value] : terms) names_.push_back(name);
+ const auto count = terms.size();
+ if (terms_.empty()) {
+  terms_.reserve(count);
+  incoming_.reserve(count);
+  terms.for_each([&](CriterionKey key, const torch::Tensor&) { terms_.push_back(key); });
  }
- if (terms.size() != names_.size()) throw std::logic_error("training criterion report schema changed within an attempt");
+ if (count != terms_.size()) throw std::logic_error("training criterion report schema changed within an attempt");
  incoming_.clear();
  std::size_t index = 0;
- for (const auto& [name, value] : terms) {
-  if (name != names_[index++]) throw std::logic_error("training criterion report term changed within an attempt");
+ terms.for_each([&](CriterionKey key, const torch::Tensor& value) {
+  if (key != terms_[index++]) throw std::logic_error("training criterion report term changed within an attempt");
   incoming_.push_back(value);
- }
+ });
  if (incoming_.empty()) return;
  auto incoming = torch::stack(incoming_);
  incoming_.clear();
@@ -94,9 +95,14 @@ std::string TrainingLossReport::details(const std::vector<torch::Tensor>& parame
  if (values_.defined()) {
   const auto host = values_.to(torch::kCPU, torch::kFloat64).contiguous();
   const auto* values = host.const_data_ptr<double>();
-  for (std::size_t index = 0; index < names_.size(); ++index) {
-   if (std::isfinite(values[index])) continue;
-   report << (wrote_loss ? ", " : " nonfinite_losses=[") << names_[index] << "=" << values[index];
+  // External diagnostic order remains lexical, independently of tensor/weight
+  // order. Rendering and sorting happen only on this failure boundary.
+  std::vector<std::pair<std::string, double>> nonfinite;
+  for (std::size_t index = 0; index < terms_.size(); ++index)
+   if (!std::isfinite(values[index])) nonfinite.emplace_back(criterion_external_name(terms_[index]), values[index]);
+  std::ranges::sort(nonfinite, {}, &std::pair<std::string, double>::first);
+  for (const auto& [name, value] : nonfinite) {
+   report << (wrote_loss ? ", " : " nonfinite_losses=[") << name << "=" << value;
    wrote_loss = true;
   }
  }
@@ -415,7 +421,7 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
    torch::Tensor detached_box_loss;
    TrainingScalarPacket::Tensors scalar_values;
    DetectionStatisticsPacket::Tensors statistics;
-   TensorMap loss_terms;
+   CriterionResult loss_terms;
    {
     RoutedTrainingLoss loss_result;
     auto& lane_owner = (*lane.model);
@@ -460,7 +466,7 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
     scalar_values = std::move(loss_result.scalars);
     statistics = std::move(loss_result.statistics);
     loss_terms = std::move(loss_result.ordinary_terms);
-    for (auto& [name, value] : loss_terms) value = value.detach();
+    loss_terms.for_each([](CriterionKey, torch::Tensor& value) { value = value.detach(); });
    }
    lane.ready.record(lane.stream);
    return TrainLaneResult{
