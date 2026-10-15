@@ -298,19 +298,31 @@ private:
      // Admission and file I/O run on the same ordered document worker as edits.
      // A file supplies meaning only; the current receiver-owned pixels remain
      // paired by resource identity and checked geometry before replacement.
-     { std::scoped_lock lock(mutex_); if (!state_.ready) throw contracts::InvalidIntentError("Annotation reload requires a ready paired image"); }
+     {
+      std::scoped_lock lock(mutex_);
+      if (!state_.ready) throw contracts::InvalidIntentError("Annotation reload requires a ready paired image");
+     }
      auto loaded = document::load_annotation_document(document_.ui().scene, request.source);
      if (!loaded) throw contracts::InvalidIntentError("Annotation document is invalid or does not match the current source image and geometry");
-     if (CancelRequested()) { InstallUi(true); return; }
+     if (CancelRequested()) {
+      InstallUi(true);
+      return;
+     }
      const auto result = document_.Open(std::move(loaded->scene));
-     if (result.outcome != document::DocumentOutcome::Applied) { Reject(result.detail, true); return; }
+     if (result.outcome != document::DocumentOutcome::Applied) {
+      Reject(result.detail, true);
+      return;
+     }
      static_cast<void>(CancelGesture());
-     { std::scoped_lock lock(mutex_); state_.legacy_source_attached = loaded->legacy_source_attached; state_.input_document_epoch = mmltk::common::types::advance_monotonic_identity(state_.input_document_epoch); }
+     {
+      std::scoped_lock lock(mutex_);
+      state_.legacy_source_attached = loaded->legacy_source_attached;
+      state_.input_document_epoch = mmltk::common::types::advance_monotonic_identity(state_.input_document_epoch);
+     }
      InstallUi(true);
      QueueRender();
     } catch (const std::exception& error) { Reject(error.what(), true); }
-   }
-   else {
+   } else {
     bool ready;
     {
      std::scoped_lock lock(mutex_);

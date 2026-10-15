@@ -102,9 +102,9 @@ struct AnnotationSceneEdit final {};
 struct AnnotationUndoEdit final {};
 struct AnnotationRedoEdit final {};
 struct AnnotationEdit final {
- using variant_type =
-  std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit, AnnotationCategoryEdit, AnnotationSelectedObjectEdit, AnnotationSplineEdit,
-   AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationSkeletonConnectionEdit, AnnotationMaskCleanupEdit, AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
+ using variant_type = std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit, AnnotationCategoryEdit, AnnotationSelectedObjectEdit,
+  AnnotationSplineEdit, AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationSkeletonConnectionEdit, AnnotationMaskCleanupEdit, AnnotationMaskColorsEdit, AnnotationSceneEdit,
+  AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
  variant_type value{};
 };
 struct AnnotationEditRequest final {

@@ -8,14 +8,14 @@ void write_analysis_keypoints(const PostprocessedSelection& selected, mmltk::bac
  if (!selected.keypoints) return;
  const auto& source = *selected.keypoints;
  const auto count = source.size(1), joints = source.size(2);
- if (!annotation.keypoint_capacity) return; // Semantic-only delivery retains the selected native packet.
- if (source.size(0) != 1 || annotation.keypoint_capacity != joints || annotation.value_capacity < static_cast<size_t>(count) ||
-     !annotation.keypoints.address || !annotation.keypoint_counts.address || annotation.keypoints.element_type != runtime::AnalysisElementType::Float32 ||
-     annotation.keypoint_counts.element_type != runtime::AnalysisElementType::Int32 || annotation.keypoints.shape.rank != 3 ||
-     annotation.keypoints.shape.extents[0] < count || annotation.keypoints.shape.extents[1] != joints || annotation.keypoints.shape.extents[2] != runtime::kAnalysisKeypointChannels ||
-     annotation.keypoint_counts.shape.rank != 1 || annotation.keypoint_counts.shape.extents[0] < count ||
+ if (!annotation.keypoint_capacity) return;  // Semantic-only delivery retains the selected native packet.
+ if (source.size(0) != 1 || annotation.keypoint_capacity != joints || annotation.value_capacity < static_cast<size_t>(count) || !annotation.keypoints.address || !annotation.keypoint_counts.address ||
+     annotation.keypoints.element_type != runtime::AnalysisElementType::Float32 || annotation.keypoint_counts.element_type != runtime::AnalysisElementType::Int32 ||
+     annotation.keypoints.shape.rank != 3 || annotation.keypoints.shape.extents[0] < count || annotation.keypoints.shape.extents[1] != joints ||
+     annotation.keypoints.shape.extents[2] != runtime::kAnalysisKeypointChannels || annotation.keypoint_counts.shape.rank != 1 || annotation.keypoint_counts.shape.extents[0] < count ||
      annotation.keypoints.capacity_bytes < checked_prediction_extent(count, joints * sizeof(runtime::AnalysisKeypoint), kMaximumPredictionTensorBytes) ||
-     annotation.keypoint_counts.capacity_bytes < static_cast<size_t>(count) * sizeof(int32_t)) throw std::invalid_argument("analysis keypoint storage disagrees with admitted schema/capacity");
+     annotation.keypoint_counts.capacity_bytes < static_cast<size_t>(count) * sizeof(int32_t))
+  throw std::invalid_argument("analysis keypoint storage disagrees with admitted schema/capacity");
  using Packet = KeypointPredictionPacket;
  using Product = ReflectedTensorPacket<runtime::AnalysisKeypoint>;
  static_assert(Product::size == runtime::kAnalysisKeypointChannels);
@@ -42,4 +42,4 @@ void write_analysis_keypoints(const PostprocessedSelection& selected, mmltk::bac
  torch::from_blob(reinterpret_cast<void*>(annotation.keypoint_counts.address), {count}, counts.options()).copy_(counts);
  annotation.keypoints_available = true;
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

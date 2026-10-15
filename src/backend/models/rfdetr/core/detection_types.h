@@ -205,8 +205,7 @@ consteval auto output_role_members() {
   template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Owner, std::meta::access_context::current()))) {
    if (std::meta::identifier_of(member) == facts.name) {
     using Tensor = typename[:std::meta::type_of(member):];
-    if (facts.task ? !std::is_same_v<Tensor, std::optional<torch::Tensor>> : !std::is_same_v<Tensor, torch::Tensor>)
-     throw "RF-DETR output role has the wrong required/optional tensor type";
+    if (facts.task ? !std::is_same_v<Tensor, std::optional<torch::Tensor>> : !std::is_same_v<Tensor, torch::Tensor>) throw "RF-DETR output role has the wrong required/optional tensor type";
     result[RfdetrOutputSchema::index<Role>()] = member;
     return;
    }

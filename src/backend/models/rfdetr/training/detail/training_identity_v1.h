@@ -14,7 +14,6 @@
 #include "src/backend/models/rfdetr/contract/model_topology.h"
 #include "src/frameworks/reflection/reflected_declarations.h"
 #include "src/frameworks/serialization/cbor_wire.h"
-
 namespace mmltk::backend::models::rfdetr::detail::training_identity_v1 {
 // Persisted identity values from application 1c13fec8b04036661a4028b8807d0e1cff42407d:
 // contract/model_config.h, contract/training_supervision.h, contract/class_layout.h,
@@ -25,7 +24,6 @@ inline constexpr mmltk::frameworks::serialization::wire::Limits kSupervisionLimi
 inline constexpr mmltk::frameworks::serialization::wire::Limits kClassLayoutLimits{.max_bytes = 1024U * 1024U, .max_items = 1024U * 1024U, .max_depth = 64U};
 inline constexpr float kOpenUnitMinimum = std::numeric_limits<float>::denorm_min();
 inline constexpr float kOpenUnitMaximum = std::nextafter(1.0F, 0.0F);
-
 enum class TrainAssignmentKind : std::uint8_t { Hungarian, MatchFree };
 enum class ClassSlotRole : std::uint8_t { Foreground, Background, Unused, Unresolved };
 enum class ClassScoreEncoding : std::uint8_t { SigmoidLogits, SoftmaxLogits };
@@ -36,7 +34,6 @@ MMLTK_REFLECT_ENUM(ClassSlotRole)
 MMLTK_REFLECT_ENUM(ClassScoreEncoding)
 MMLTK_REFLECT_ENUM(NoObjectEncoding)
 MMLTK_REFLECT_ENUM(ClassLayoutOrigin)
-
 struct MatchFreeSupervisionConfig final {
  MMLTK_MINIMUM(float, kOpenUnitMinimum) MMLTK_MAXIMUM(float, kOpenUnitMaximum) MMLTK_FINITE float rho = 0.5F;
  MMLTK_MINIMUM(float, 0.0F) MMLTK_FINITE float correspondence_weight = 1.0F;
@@ -57,7 +54,6 @@ struct TrainingSupervisionConfig final {
 MMLTK_REFLECT_FIELDS(MatchFreeSupervisionConfig)
 MMLTK_REFLECT_FIELDS(DenoisingSupervisionConfig)
 MMLTK_REFLECT_FIELDS(TrainingSupervisionConfig)
-
 struct Configuration final {
  std::string preset_name;
  int resolution = 0;
@@ -96,7 +92,6 @@ struct Configuration final {
  TrainingSupervisionConfig training_supervision;
 };
 MMLTK_REFLECT_FIELDS(Configuration)
-
 struct ClassName final {
  MMLTK_MAX_BYTES(256U) std::string value;
 };
@@ -127,7 +122,6 @@ MMLTK_REFLECT_FIELDS(OrderedClassCatalog)
 MMLTK_REFLECT_FIELDS(ModelClassSlot)
 MMLTK_REFLECT_FIELDS(ClassLayoutProvenance)
 MMLTK_REFLECT_FIELDS(ModelClassLayout)
-
 // Unlike the exact-type project_record facility, this private historical
 // conversion recursively projects nested records and enums, with one renamed
 // semantic field. Only the frozen destination supplies the member inventory.
@@ -143,7 +137,8 @@ template <class Destination, class Source>
   }
  } else if constexpr (std::is_enum_v<Destination> && std::is_enum_v<Source>) {
   static_assert(std::same_as<std::underlying_type_t<Destination>, std::underlying_type_t<Source>>);
-  template for (constexpr auto target : std::define_static_array(mmltk::frameworks::reflection::enum_entries<Destination>())) {
+  constexpr const auto& targets = materialized_enum_entries(std::type_identity<Destination>{});
+  template for (constexpr auto target : targets) {
    constexpr auto corresponding = [=] consteval {
     for (const auto candidate : mmltk::frameworks::reflection::enum_entries<Source>())
      if (candidate.name == target.name) return candidate.value;
@@ -174,5 +169,4 @@ template <class Destination, class Source>
   return result;
  }
 }
-
 }  // namespace mmltk::backend::models::rfdetr::detail::training_identity_v1

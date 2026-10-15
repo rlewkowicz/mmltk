@@ -19,7 +19,10 @@ struct DocumentResult final {
  bool render_changed = false;
 };
 enum class DocumentSaveEffect : std::uint8_t { NotApplied, Committed, Uncertain };
-struct LoadedAnnotationDocument final { contracts::AnnotationSceneContent scene; bool legacy_source_attached = false; };
+struct LoadedAnnotationDocument final {
+ contracts::AnnotationSceneContent scene;
+ bool legacy_source_attached = false;
+};
 [[nodiscard]] std::optional<LoadedAnnotationDocument> load_annotation_document(const contracts::AnnotationSceneContent& paired_source, std::string_view source);
 [[nodiscard]] DocumentSaveEffect save_annotation_document(const contracts::AnnotationUiState&, std::string_view, std::uint64_t) noexcept;
 class AnnotationDocument final {

@@ -83,7 +83,7 @@ TEST_CASE("Keypoint task admission uses catalog presence and native supervision 
  auto model = selected_model(settings, contracts::FeatureId::Train);
  model.training_config = rfdetr::native_config_from_preset(*rfdetr::find_model_preset_by_weight_filename("rf-detr-keypoint-preview-xlarge.pth"));
  model.task = model.training_config->task;
- contracts::ArtifactInspection inspection{.compatible = true, .splits = {split("/tmp/train.bin"), split("/tmp/val.bin")}};
+ contracts::ArtifactInspection inspection{.compatible = true, .splits = {split("/tmp/train.bin"), split("/tmp/val.bin")}, .detail = {}};
  CHECK_FALSE(Materializer::LocalTrain(settings, inspection, model));
  for (auto& fact : inspection.splits) fact.has_keypoints = true;
  CHECK(Materializer::LocalTrain(settings, inspection, model));

@@ -78,14 +78,14 @@ const PresetCatalogEntry* infer_state_preset(const std::vector<NormalizedModelSt
  for (const auto& preset : kPresetCatalog) {
   const auto config = native_config_from_preset(preset);
   if (pe != (config.backbone.kind == BackboneKind::PeCoreTiny) || config.has_keypoints() != keypoints || config.has_masks() != segmentation || config.dec_layers != decoder_layers ||
-      patch->size(0) != config.backbone.dimension || patch->size(1) != 3 || patch->size(2) != config.patch_size || patch->size(3) != config.patch_size ||
-      positions->size(0) != 1 || positions->size(1) != config.positional_encoding_size * config.positional_encoding_size + 1 || positions->size(2) != config.backbone.dimension) continue;
+      patch->size(0) != config.backbone.dimension || patch->size(1) != 3 || patch->size(2) != config.patch_size || patch->size(3) != config.patch_size || positions->size(0) != 1 ||
+      positions->size(1) != config.positional_encoding_size * config.positional_encoding_size + 1 || positions->size(2) != config.backbone.dimension)
+   continue;
   if (match) throw std::invalid_argument("raw RF-DETR state has ambiguous catalog topology");
   match = &preset;
  }
  return match;
 }
-
 void validate_queries(const NativeCheckpointMetadata& metadata, const std::string& path, bool required) {
  if (!required && metadata.num_queries == 0 && metadata.num_select == 0) { return; }
  if (metadata.num_queries <= 0 || metadata.num_select <= 0 || metadata.num_select > metadata.num_queries) { throw std::runtime_error("RF-DETR native checkpoint has invalid query metadata: " + path); }
@@ -118,17 +118,21 @@ void validate_checkpoint_topology(const Config& config, const Metadata& metadata
 consteval bool configuration_policy_field(std::meta::info member) {
  const auto name = std::meta::identifier_of(member);
  if (name == "preset_name" || name == "resolution" || name == "num_select" || name == "training_supervision") return true;
- template for (constexpr auto evidence : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
-  using Value = std::remove_cvref_t<decltype(std::declval<NativeCheckpointMetadata>().[:evidence:])>;
-  if constexpr (model_state_detail::is_optional<Value>) if (std::meta::identifier_of(evidence) == name) return true;
- }
- return false;
+ return []<class Metadata>(std::string_view field_name) consteval {
+  template for (constexpr auto evidence : std::define_static_array(std::meta::nonstatic_data_members_of(^^Metadata, std::meta::access_context::current()))) {
+   using Value = std::remove_cvref_t<decltype(std::declval<Metadata>().[:evidence:])>;
+   if constexpr (model_state_detail::is_optional<Value>)
+    if (std::meta::identifier_of(evidence) == field_name) return true;
+  }
+  return false;
+ }.template operator()<NativeCheckpointMetadata>(name);
 }
 }  // namespace
 std::string encode_checkpoint_configuration(const NativeRfDetrConfig& config) {
  if (!native_model_config_valid(config)) throw std::invalid_argument("invalid native RF-DETR checkpoint configuration");
  std::vector<std::byte> bytes;
- if (!mmltk::frameworks::serialization::encode(config, bytes, {.max_bytes = 65536U, .max_items = 2U * kMaximumClassOutputSlots})) throw std::invalid_argument("RF-DETR configuration exceeds artifact budget");
+ if (!mmltk::frameworks::serialization::encode(config, bytes, {.max_bytes = 65536U, .max_items = 2U * kMaximumClassOutputSlots}))
+  throw std::invalid_argument("RF-DETR configuration exceeds artifact budget");
  auto text = mmltk::frameworks::serialization::json_from_cbor({bytes, {}}, {.max_bytes = 65536U, .max_items = 2U * kMaximumClassOutputSlots}).dump();
  if (text.size() > 65536U) throw std::invalid_argument("RF-DETR configuration escaped JSON exceeds artifact budget");
  return text;
@@ -142,7 +146,8 @@ NativeRfDetrConfig decode_checkpoint_configuration(std::string_view text) {
 }
 NativeRfDetrConfig checkpoint_configuration(const NativeCheckpointMetadata& metadata) {
  NativeRfDetrConfig result;
- if (!metadata.native_configuration.empty()) result = decode_checkpoint_configuration(metadata.native_configuration);
+ if (!metadata.native_configuration.empty())
+  result = decode_checkpoint_configuration(metadata.native_configuration);
  else {
   const auto* preset = find_preset_catalog_entry(metadata.preset_name);
   if (!preset) throw std::invalid_argument("legacy/external RF-DETR state requires an admitted preset");
@@ -191,22 +196,28 @@ NativeRfDetrConfig checkpoint_configuration(const NativeCheckpointMetadata& meta
    if (!counts->is_array() || counts->size() > kMaximumClassOutputSlots) throw std::invalid_argument("invalid external keypoint counts");
    std::vector<std::uint16_t> admitted;
    for (const auto& count : *counts) {
-    if (!count.is_number_integer() || count.get<int64_t>() < 0 || count.get<int64_t>() > static_cast<int64_t>(mmltk::backend::data::catalog::kKeypointsPerClassCapacity)) throw std::invalid_argument("invalid external joint count");
+    if (!count.is_number_integer() || count.get<int64_t>() < 0 || count.get<int64_t>() > static_cast<int64_t>(mmltk::backend::data::catalog::kKeypointsPerClassCapacity))
+     throw std::invalid_argument("invalid external joint count");
     admitted.push_back(count.get<std::uint16_t>());
    }
-   if (metadata.native_configuration.empty()) result.keypoints_per_class = std::move(admitted);
-   else require("num_keypoints_per_class", result.keypoints_per_class);
+   if (metadata.native_configuration.empty())
+    result.keypoints_per_class = std::move(admitted);
+   else
+    require("num_keypoints_per_class", result.keypoints_per_class);
   }
   if (const auto schedule = topology.find("window_block_indexes"); schedule != topology.end() && !schedule->is_null()) {
    std::vector<int> windowed;
    if (result.backbone.kind == BackboneKind::PeCoreTiny) throw std::invalid_argument("PE-Core-T does not admit a separate window block schedule");
-   for (int index = 0; index < result.backbone.layers; ++index) if (std::ranges::find(result.backbone.features, index) == result.backbone.features.end()) windowed.push_back(index);
+   for (int index = 0; index < result.backbone.layers; ++index)
+    if (std::ranges::find(result.backbone.features, index) == result.backbone.features.end()) windowed.push_back(index);
    require("window_block_indexes", windowed);
   }
-  template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeRfDetrConfig, std::meta::access_context::current()))) {
-   using Value = std::remove_cvref_t<decltype(result.[:field:])>;
-   if constexpr (std::is_arithmetic_v<Value>) require(std::meta::identifier_of(field), result.[:field:]);
-  }
+  [&]<class Config>(const Config& configuration) {
+   template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^Config, std::meta::access_context::current()))) {
+    using Value = std::remove_cvref_t<decltype(configuration.[:field:])>;
+    if constexpr (std::is_arithmetic_v<Value>) require(std::meta::identifier_of(field), configuration.[:field:]);
+   }
+  }(result);
  }
  validate_checkpoint_topology(result, metadata);
  if (!native_model_config_valid(result)) throw std::invalid_argument("RF-DETR checkpoint has unsupported topology");
@@ -216,15 +227,19 @@ void require_checkpoint_model_topology(const NativeRfDetrConfig& destination, co
  const auto source = checkpoint_configuration(metadata);
  // Execution resolution, selection and training policy can be requested anew.
  // Every remaining native fact participates automatically in exact topology.
- template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeRfDetrConfig, std::meta::access_context::current()))) {
-  constexpr bool policy = configuration_policy_field(member);
-  if constexpr (!policy) if (source.[:member:] != destination.[:member:]) throw std::invalid_argument("exact checkpoint loading conflicts with model topology: " + std::string(std::meta::identifier_of(member)));
- }
+ []<class Config>(const Config& admitted, const Config& selected) {
+  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Config, std::meta::access_context::current()))) {
+   constexpr bool policy = configuration_policy_field(member);
+   if constexpr (!policy)
+    if (admitted.[:member:] != selected.[:member:]) throw std::invalid_argument("exact checkpoint loading conflicts with model topology: " + std::string(std::meta::identifier_of(member)));
+  }
+ }(source, destination);
 }
 bool same_native_model_semantics(const NativeCheckpointMetadata& left, const NativeCheckpointMetadata& right) {
  return []<class Metadata>(const Metadata& a, const Metadata& b) {
   template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^Metadata, std::meta::access_context::current()))) {
-   if constexpr (std::meta::identifier_of(field) != "source_path" && std::meta::identifier_of(field) != "source_kind" && std::meta::identifier_of(field) != "external_topology" && std::meta::identifier_of(field) != "native_configuration")
+   if constexpr (std::meta::identifier_of(field) != "source_path" && std::meta::identifier_of(field) != "source_kind" && std::meta::identifier_of(field) != "external_topology" &&
+                 std::meta::identifier_of(field) != "native_configuration")
     if (a.[:field:] != b.[:field:]) return false;
   }
   return encode_checkpoint_configuration(checkpoint_configuration(a)) == encode_checkpoint_configuration(checkpoint_configuration(b));
@@ -250,19 +265,23 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
     if (!std::ranges::equal(supplied.counts(), keypoints->counts())) throw std::invalid_argument("checkpoint active mask conflicts with model configuration");
     supplied.require_class_layout(layout);
    }
-   if (entry.name == "transformer.decoder.keypoint_class_mask" && (!value.has_keypoints() || entry.tensor.scalar_type() != torch::kBool || !torch::equal(entry.tensor.to(torch::kCPU), keypoints->class_mask()))) throw std::invalid_argument("checkpoint keypoint attention mask disagrees with schema");
+   if (entry.name == "transformer.decoder.keypoint_class_mask" &&
+       (!value.has_keypoints() || entry.tensor.scalar_type() != torch::kBool || !torch::equal(entry.tensor.to(torch::kCPU), keypoints->class_mask())))
+    throw std::invalid_argument("checkpoint keypoint attention mask disagrees with schema");
    const bool dino_patch = entry.name == "backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight";
    const bool pe_patch = entry.name == "backbone.0.encoder.model.patch_embed.proj.weight";
    if (dino_patch || pe_patch) {
     const std::array<int64_t, 4> expected{value.backbone.dimension, 3, value.patch_size, value.patch_size};
-    if (pe_patch != (value.backbone.kind == BackboneKind::PeCoreTiny) || entry.tensor.sizes() != c10::IntArrayRef(expected) || !entry.tensor.is_floating_point()) throw std::invalid_argument("checkpoint patch embedding disagrees with admitted backbone");
+    if (pe_patch != (value.backbone.kind == BackboneKind::PeCoreTiny) || entry.tensor.sizes() != c10::IntArrayRef(expected) || !entry.tensor.is_floating_point())
+     throw std::invalid_argument("checkpoint patch embedding disagrees with admitted backbone");
    }
   }
   const auto axis = detail::class_tensor_shape(entry.name);
   if (!axis) continue;
   if (!entry.tensor.defined() || entry.tensor.dim() != axis->rank || entry.tensor.size(axis->dimension) <= 0) throw std::invalid_argument("invalid class-dependent checkpoint tensor: " + entry.name);
   if (axis->coordinates == detail::ClassTensorCoordinates::NamedJoints) {
-   if (!config || !config->has_keypoints() || entry.tensor.size(axis->dimension) != keypoints->compact_count()) throw std::invalid_argument("joint-dependent checkpoint tensor disagrees with admitted schema: " + entry.name);
+   if (!config || !config->has_keypoints() || entry.tensor.size(axis->dimension) != keypoints->compact_count())
+    throw std::invalid_argument("joint-dependent checkpoint tensor disagrees with admitted schema: " + entry.name);
    continue;
   }
   const bool classifier = axis->coordinates == detail::ClassTensorCoordinates::OutputSlots;
@@ -279,7 +298,6 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
   keypoints->require_class_layout(layout);
  }
 }
-
 ModelStateContainer identify_model_state_container(const std::filesystem::path& checkpoint_path) {
  const auto path = canonical_path(checkpoint_path);
  std::ifstream stream(path, std::ios::binary);
@@ -358,7 +376,8 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  result.replace_entries(std::move(entries));
  if (version == 4) {
   const auto converted = checkpoint_configuration(metadata);
-  if (converted.backbone.kind != BackboneKind::DinoV2Small || converted.has_keypoints() || converted.dec_layers == 0 || metadata.class_layout.foreground.keypoints) throw std::invalid_argument("native format 4 contains topology outside its historical schema");
+  if (converted.backbone.kind != BackboneKind::DinoV2Small || converted.has_keypoints() || converted.dec_layers == 0 || metadata.class_layout.foreground.keypoints)
+   throw std::invalid_argument("native format 4 contains topology outside its historical schema");
   metadata.native_configuration = encode_checkpoint_configuration(converted);
  }
  validate_decoded_model_state(result);
@@ -373,14 +392,15 @@ void normalize_legacy_keypoint_projection(DecodedNativeModelState& state, const 
  // The pinned Preview checkpoint retains this unused pre-GroupPose head
  // (upstream models/weights.py). Admit its complete verified inventory only.
  const KeypointTensorLayout keypoints(config.keypoints_per_class);
- if (!config.has_keypoints() || config.hidden_dim != 256 || config.num_classes != 2 || config.keypoints_per_class.size() != 2 ||
-     keypoints.compact_count() != 17 || keypoints.maximum_joints() != 17)
+ if (!config.has_keypoints() || config.hidden_dim != 256 || config.num_classes != 2 || config.keypoints_per_class.size() != 2 || keypoints.compact_count() != 17 || keypoints.maximum_joints() != 17)
   throw std::invalid_argument("legacy GroupPose projection disagrees with admitted topology");
  constexpr std::array<int64_t, 2> hidden_weight{256, 256}, projection_weight{238, 256};
  constexpr std::array<int64_t, 1> hidden_bias{256}, projection_bias{238};
  const std::array<std::pair<std::string_view, c10::IntArrayRef>, 4> expected{{
-  {"keypoint_head.keypoint_proj.0.weight", hidden_weight}, {"keypoint_head.keypoint_proj.0.bias", hidden_bias},
-  {"keypoint_head.keypoint_proj.2.weight", projection_weight}, {"keypoint_head.keypoint_proj.2.bias", projection_bias},
+  {"keypoint_head.keypoint_proj.0.weight", hidden_weight},
+  {"keypoint_head.keypoint_proj.0.bias", hidden_bias},
+  {"keypoint_head.keypoint_proj.2.weight", projection_weight},
+  {"keypoint_head.keypoint_proj.2.bias", projection_bias},
  }};
  std::array<bool, 4> seen{};
  for (const auto& entry : state.entries()) {
@@ -397,7 +417,7 @@ void normalize_legacy_keypoint_projection(DecodedNativeModelState& state, const 
  std::erase_if(entries, [&](const auto& entry) { return entry.name.starts_with(prefix); });
  state.replace_entries(std::move(entries));
 }
-}
+}  // namespace
 DecodedNativeModelState decode_model_state(
  const std::filesystem::path& checkpoint_path, std::shared_ptr<const ClassArtifactAdmission> admission, const std::filesystem::path& class_layout_path, std::stop_token stop) {
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
@@ -421,10 +441,11 @@ DecodedNativeModelState decode_model_state(
   result.metadata.source_kind = "upstream-python";
   result.metadata.source_path = canonical.string();
   const PresetCatalogEntry* preset = nullptr;
-  for (const auto& asset : weight_catalog()) if (asset.md5_hash == digests->md5) {
-   preset = find_model_preset_by_weight_filename(asset.filename);
-   break;
-  }
+  for (const auto& asset : weight_catalog())
+   if (asset.md5_hash == digests->md5) {
+    preset = find_model_preset_by_weight_filename(asset.filename);
+    break;
+   }
   if (!preset && !result.metadata.native_configuration.empty()) preset = find_preset_catalog_entry(decode_checkpoint_configuration(result.metadata.native_configuration).preset_name);
   if (!preset) preset = find_model_preset_by_weight_filename(canonical.filename().string());
   if (preset == nullptr) { preset = infer_model_preset_from_path(canonical); }
@@ -447,39 +468,39 @@ DecodedNativeModelState decode_model_state(
    result.metadata.class_layout.class_name_evidence = std::move(evidence);
   }
   for (const auto& asset : weight_catalog()) {
-    if (asset.md5_hash != digests->md5) continue;
-    if (asset.classifier_width != result.metadata.num_classes) throw std::invalid_argument("verified asset classifier width disagrees with its hash-bound evidence");
-    const auto embedded = result.metadata.class_layout;
-    auto source_evidence = std::move(result.metadata.class_layout.class_name_evidence);
-    const ClassLayoutProvenance provenance{ClassLayoutOrigin::VerifiedAsset, std::string(asset.filename), mmltk::common::io::sha256_hex(digests->sha256)};
-    switch (asset.class_layout) {
-     case OfficialClassLayout::CocoSparse: result.metadata.class_layout = coco_class_layout(provenance); break;
-     case OfficialClassLayout::PersonActiveFirst:
-     case OfficialClassLayout::PersonBackgroundFirst: {
-      auto& layout = result.metadata.class_layout;
-      layout.foreground.names = {{"person"}};
-      layout.foreground.keypoints.emplace(1U, mmltk::backend::data::catalog::coco_person_keypoint_schema());
-      layout.slots.assign(asset.classifier_width, {ClassSlotRole::Unused, std::nullopt});
-      const auto foreground_slot = asset.class_layout == OfficialClassLayout::PersonActiveFirst ? 0U : 1U;
-      if (foreground_slot >= layout.slots.size()) throw std::invalid_argument("verified person asset has an invalid foreground slot");
-      layout.slots[foreground_slot] = {ClassSlotRole::Foreground, 0U};
-      const auto background_slot = asset.class_layout == OfficialClassLayout::PersonActiveFirst ? 1U : 0U;
-      if (background_slot >= layout.slots.size()) throw std::invalid_argument("verified person asset has an invalid background slot");
-      layout.slots[background_slot] = {ClassSlotRole::Background, std::nullopt};
-      layout.no_object = NoObjectEncoding::ExplicitBackground;
-      layout.provenance = provenance;
-      break;
-     }
-     case OfficialClassLayout::Unresolved: throw std::invalid_argument("registered official asset has ambiguous class evidence");
+   if (asset.md5_hash != digests->md5) continue;
+   if (asset.classifier_width != result.metadata.num_classes) throw std::invalid_argument("verified asset classifier width disagrees with its hash-bound evidence");
+   const auto embedded = result.metadata.class_layout;
+   auto source_evidence = std::move(result.metadata.class_layout.class_name_evidence);
+   const ClassLayoutProvenance provenance{ClassLayoutOrigin::VerifiedAsset, std::string(asset.filename), mmltk::common::io::sha256_hex(digests->sha256)};
+   switch (asset.class_layout) {
+    case OfficialClassLayout::CocoSparse: result.metadata.class_layout = coco_class_layout(provenance); break;
+    case OfficialClassLayout::PersonActiveFirst:
+    case OfficialClassLayout::PersonBackgroundFirst: {
+     auto& layout = result.metadata.class_layout;
+     layout.foreground.names = {{"person"}};
+     layout.foreground.keypoints.emplace(1U, mmltk::backend::data::catalog::coco_person_keypoint_schema());
+     layout.slots.assign(asset.classifier_width, {ClassSlotRole::Unused, std::nullopt});
+     const auto foreground_slot = asset.class_layout == OfficialClassLayout::PersonActiveFirst ? 0U : 1U;
+     if (foreground_slot >= layout.slots.size()) throw std::invalid_argument("verified person asset has an invalid foreground slot");
+     layout.slots[foreground_slot] = {ClassSlotRole::Foreground, 0U};
+     const auto background_slot = asset.class_layout == OfficialClassLayout::PersonActiveFirst ? 1U : 0U;
+     if (background_slot >= layout.slots.size()) throw std::invalid_argument("verified person asset has an invalid background slot");
+     layout.slots[background_slot] = {ClassSlotRole::Background, std::nullopt};
+     layout.no_object = NoObjectEncoding::ExplicitBackground;
+     layout.provenance = provenance;
+     break;
     }
-    result.metadata.class_layout.class_name_evidence = std::move(source_evidence);
-    if (ResolvedClassLayout(embedded).semantic()) {
-     auto expected = result.metadata.class_layout;
-     auto supplied = embedded;
-     expected.provenance = supplied.provenance;
-     if (expected != supplied) throw std::invalid_argument("official checkpoint class layout conflicts with hash-bound evidence");
-    }
-    break;
+    case OfficialClassLayout::Unresolved: throw std::invalid_argument("registered official asset has ambiguous class evidence");
+   }
+   result.metadata.class_layout.class_name_evidence = std::move(source_evidence);
+   if (ResolvedClassLayout(embedded).semantic()) {
+    auto expected = result.metadata.class_layout;
+    auto supplied = embedded;
+    expected.provenance = supplied.provenance;
+    if (expected != supplied) throw std::invalid_argument("official checkpoint class layout conflicts with hash-bound evidence");
+   }
+   break;
   }
   const ResolvedClassLayout layout(result.metadata.class_layout);
   if (layout.output_width() != static_cast<std::size_t>(result.metadata.num_classes)) throw std::runtime_error("external checkpoint output width disagrees with class layout");
@@ -490,7 +511,7 @@ DecodedNativeModelState decode_model_state(
  result.metadata.class_layout = admission->Resolve(result.metadata.num_classes, std::optional{result.metadata.class_layout}, stop);
  if (!native && !result.metadata.preset_name.empty()) {
   auto config = checkpoint_configuration(result.metadata);
-  const auto active = std::ranges::find(result.entries(), "_kp_active_mask", &NormalizedModelStateEntry::name);
+  const auto active = std::ranges::find(result.entries(), std::string_view("_kp_active_mask"), &NormalizedModelStateEntry::name);
   if (active != result.entries().end()) {
    const auto keypoints = KeypointTensorLayout::from_active_mask(active->tensor);
    const auto counts = keypoints.counts();

@@ -222,8 +222,11 @@ public:
   }
   if (receipt.kind == Kind::PressureEntered && std::exchange(frontend_pressure_, true)) return reject("duplicate_pressure");
   if (receipt.kind == Kind::Settled) frontend_settled_ = true;
-  const bool sent = SendControlObservation(
-   {.event = ControlEvent::Frontend, .generation = receipt.sequence, .slot = static_cast<std::uint64_t>(receipt.kind), .compiled_index = receipt.kind == Kind::ArtifactMutationRequested ? receipt.compiled_index : receipt.progress, .staging_bytes = receipt.failureline},
+  const bool sent = SendControlObservation({.event = ControlEvent::Frontend,
+                                            .generation = receipt.sequence,
+                                            .slot = static_cast<std::uint64_t>(receipt.kind),
+                                            .compiled_index = receipt.kind == Kind::ArtifactMutationRequested ? receipt.compiled_index : receipt.progress,
+                                            .staging_bytes = receipt.failureline},
    &receipt);
   if (!sent || receipt.kind == Kind::Failed) {
    terminal_ = true;
@@ -379,7 +382,9 @@ private:
    }
    if (redraw || callback || completion) {
     try {
-     const bool accepted = completion ? (*completion)(static_cast<ControlCommand>(command)) : redraw ? (*redraw)() : (*callback)({.kind = frontend_kind, .sequence = sequence, .compiled_index = artifact_mutation_index});
+     const bool accepted = completion ? (*completion)(static_cast<ControlCommand>(command))
+                           : redraw   ? (*redraw)()
+                                      : (*callback)({.kind = frontend_kind, .sequence = sequence, .compiled_index = artifact_mutation_index});
      if (accepted) continue;
     } catch (...) {}
     Terminal();

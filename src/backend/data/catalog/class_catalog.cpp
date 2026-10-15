@@ -61,12 +61,14 @@ const ClassKeypointSchema& ClassCatalog::keypoints(const std::size_t foreground_
  return keypoints_.empty() ? empty : keypoints_[foreground_index];
 }
 bool ClassCatalog::has_keypoints() const noexcept {
- for (const auto& schema : keypoints_) if (!schema.names.empty()) return true;
+ for (const auto& schema : keypoints_)
+  if (!schema.names.empty()) return true;
  return false;
 }
 bool ClassCatalog::ordered_equal(const ClassCatalog& other) const noexcept {
  if (names_ != other.names_) return false;
- for (std::size_t index = 0U; index < size(); ++index) if (keypoints(index) != other.keypoints(index)) return false;
+ for (std::size_t index = 0U; index < size(); ++index)
+  if (keypoints(index) != other.keypoints(index)) return false;
  return true;
 }
 }  // namespace mmltk::backend::data::catalog

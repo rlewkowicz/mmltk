@@ -32,8 +32,8 @@ void checked(cudaError_t status) {
  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 using SkeletonSpan = raster::SkeletonProjection;
-void append_skeleton(std::vector<std::uint32_t>& words, std::vector<SkeletonSpan>& spans, const rfdetr::Prediction& prediction,
- const mmltk::backend::data::catalog::ClassCatalog& catalog, int classes, bool ground_truth) {
+void append_skeleton(std::vector<std::uint32_t>& words, std::vector<SkeletonSpan>& spans, const rfdetr::Prediction& prediction, const mmltk::backend::data::catalog::ClassCatalog& catalog, int classes,
+ bool ground_truth) {
  if (prediction.keypoints.empty()) return;
  const auto& schema = catalog.keypoints(prediction.class_reference);
  if (schema.names.size() != prediction.keypoints.size() || (!prediction.keypoint_visibility.empty() && prediction.keypoint_visibility.size() != prediction.keypoints.size()))
@@ -189,7 +189,10 @@ VisualSkeleton PredictionPreviewFrame::Skeleton(const rfdetr::Prediction& predic
  for (std::size_t index = 0; index < prediction.keypoints.size(); ++index) {
   const auto& point = prediction.keypoints[index];
   VisualKeypoint joint{.point = {point.x, point.y}, .confidence = point.confidence};
-  if (!joint.point.finite()) { joint.point = {}; joint.confidence = 0; }
+  if (!joint.point.finite()) {
+   joint.point = {};
+   joint.confidence = 0;
+  }
   if (!std::isfinite(joint.confidence)) joint.confidence = 0;
   if (ground_truth) joint.visibility = prediction.keypoint_visibility.empty() ? mmltk::backend::data::catalog::KeypointVisibility::Visible : prediction.keypoint_visibility.at(index);
   const auto covariance = rfdetr::keypoint_covariance(point);
@@ -220,13 +223,14 @@ std::shared_ptr<const VisualDocument> PredictionPreviewFrame::Document(contracts
   object.mask.present = prediction.has_mask;
   const auto skeleton = Skeleton(prediction, ground_truth);
   const auto joints = skeleton.Annotations();
-  document->AppendSourceObject(std::move(object), prediction.has_mask ? mmltk::backend::imaging::sampling::rle_support_bounds(std::span{prediction.mask.runs}, prediction.mask.width, prediction.mask.height) : std::array<float, 4>{}, joints);
+  document->AppendSourceObject(std::move(object),
+   prediction.has_mask ? mmltk::backend::imaging::sampling::rle_support_bounds(std::span{prediction.mask.runs}, prediction.mask.width, prediction.mask.height) : std::array<float, 4>{}, joints);
   masks->push_back(prediction.mask);
  }
  document->mask_contains = [masks](std::size_t index, float x, float y) {
   if (index >= masks->size() || !(x >= 0 && x < 1 && y >= 0 && y < 1)) return false;
   const auto& mask = (*masks)[index];
-  const auto offset = static_cast<std::uint32_t>(y * mask.height) * mask.width + static_cast<std::uint32_t>(x * mask.width);
+  const auto offset = static_cast<std::uint32_t>(y * static_cast<float>(mask.height)) * mask.width + static_cast<std::uint32_t>(x * static_cast<float>(mask.width));
   const auto after = std::ranges::upper_bound(mask.runs, offset, {}, &std::pair<std::uint32_t, std::uint32_t>::first);
   if (after == mask.runs.begin()) return false;
   const auto& run = *std::prev(after);
@@ -286,8 +290,11 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
  std::vector<SkeletonSpan> skeletons;
  for (const auto& prediction : predictions) append_skeleton(skeleton_words, skeletons, prediction, *catalog, classes, false);
  for (const auto& gt : ground_truth) append_skeleton(skeleton_words, skeletons, gt, *catalog, classes, true);
- const auto joint_bytes = annotations.keypoints_available ? rfdetr::checked_prediction_extent(count, annotations.keypoint_capacity * sizeof(mmltk::backend::ml::runtime::AnalysisKeypoint), rfdetr::kMaximumPredictionTensorBytes) : 0U;
- if (joint_bytes && (!annotations.keypoints.address || !annotations.keypoint_counts.address || annotations.keypoints.capacity_bytes < joint_bytes || annotations.keypoint_counts.capacity_bytes < count * sizeof(std::int32_t)))
+ const auto joint_bytes = annotations.keypoints_available
+                           ? rfdetr::checked_prediction_extent(count, annotations.keypoint_capacity * sizeof(mmltk::backend::ml::runtime::AnalysisKeypoint), rfdetr::kMaximumPredictionTensorBytes)
+                           : 0U;
+ if (joint_bytes && (!annotations.keypoints.address || !annotations.keypoint_counts.address || annotations.keypoints.capacity_bytes < joint_bytes ||
+                     annotations.keypoint_counts.capacity_bytes < count * sizeof(std::int32_t)))
   throw std::invalid_argument("preview joint planes exceed the produced storage");
  const auto joint_storage_bytes = joint_bytes ? joint_bytes + count * sizeof(std::int32_t) + 3U : 0U;
  const auto raw_bytes = joint_storage_bytes + pixel_bytes + count * (5U * sizeof(float) + sizeof(std::int32_t) + 3U) + mask_bytes;
@@ -394,8 +401,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
    state.category_count = classes;
    state.predictions.clear();
    state.predictions.reserve(count);
-   for (const auto& prediction : predictions)
-    state.predictions.push_back(prediction);
+   for (const auto& prediction : predictions) state.predictions.push_back(prediction);
    auto* destination = static_cast<std::uint8_t*>(state.storage.active());
    bool source_submitted = false;
    try {
@@ -571,7 +577,8 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
     }
     if (write_clean || write_semantic)
      region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream, overlays.prediction_boxes, overlays.prediction_masks, overlays.ground_truth_boxes,
-      overlays.ground_truth_masks, overlays.complementary_layers, write_clean, write_semantic, overlays.confidence_threshold, overlays.prediction_keypoints, overlays.ground_truth_keypoints, overlays.prediction_uncertainty, overlays.ground_truth_uncertainty);
+      overlays.ground_truth_masks, overlays.complementary_layers, write_clean, write_semantic, overlays.confidence_threshold, overlays.prediction_keypoints, overlays.ground_truth_keypoints,
+      overlays.prediction_uncertainty, overlays.ground_truth_uncertainty);
     if (allocation) staged.cells[index] = {region.frame, region.frame->state_->capture, region.crop, overlays, true, true};
    }
    if (finalize) finalize(clean, semantic, stream);
@@ -613,7 +620,8 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
  }
 }
 void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::ImagePlaneView clean, gpu::ImagePlaneView semantic, std::uintptr_t stream, bool prediction_boxes, bool prediction_masks,
- bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers, bool write_clean, bool write_semantic, std::optional<float> confidence_threshold, bool prediction_keypoints, bool ground_truth_keypoints, bool prediction_uncertainty, bool ground_truth_uncertainty) const {
+ bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers, bool write_clean, bool write_semantic, std::optional<float> confidence_threshold, bool prediction_keypoints,
+ bool ground_truth_keypoints, bool prediction_uncertainty, bool ground_truth_uncertainty) const {
  if (!CompatibleWith(runtime)) throw std::runtime_error("Preview belongs to a retired visual context");
  auto& state = *state_;
  std::lock_guard state_lock(state.mutex);
@@ -656,7 +664,10 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
     checked(static_cast<cudaError_t>(converted));
     if (prepared_storage) state.pending.clean = true;
    }
-   const PredictionPreviewComposition::Options semantic_options{prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks, complementary_layers, false, confidence_threshold, prediction_keypoints, ground_truth_keypoints, prediction_uncertainty, ground_truth_uncertainty};
+   const PredictionPreviewComposition::Options semantic_options{
+    prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks, complementary_layers, false, confidence_threshold, prediction_keypoints, ground_truth_keypoints, prediction_uncertainty,
+    ground_truth_uncertainty
+   };
    if (write_semantic && (!prepared_storage || !state.prepared.semantic || state.prepared.options != semantic_options)) {
     if (prepared_storage) state.prepared.semantic = false;
     checked(state.clear_semantic(semantic_pixels, semantic_pitch, 0, pitch, state.extent.height, cuda_stream));
@@ -698,8 +709,7 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
     for (const auto& skeleton : state.skeletons) {
      const bool uncertainty = skeleton.ground_truth ? ground_truth_uncertainty : prediction_uncertainty;
      if (skeleton.ground_truth ? !ground_truth_keypoints && !uncertainty : (!prediction_keypoints && !uncertainty) || skeleton.score < confidence_threshold.value_or(0.0F)) continue;
-     checked(static_cast<cudaError_t>(raster::raster_projected_skeleton(overlay,
-      reinterpret_cast<const std::uint32_t*>(data + state.skeleton_offset), skeleton, {reinterpret_cast<void*>(stream)},
+     checked(static_cast<cudaError_t>(raster::raster_projected_skeleton(overlay, reinterpret_cast<const std::uint32_t*>(data + state.skeleton_offset), skeleton, {reinterpret_cast<void*>(stream)},
       skeleton.ground_truth ? ground_truth_keypoints : prediction_keypoints, uncertainty, skeleton.ground_truth && complementary_layers)));
     }
     std::size_t word = 0U, gt_index = 0U;

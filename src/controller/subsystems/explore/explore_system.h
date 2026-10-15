@@ -85,7 +85,7 @@ struct ExploreDatasetFacts final {
  ExploreClassCatalogIdentity class_catalog_identity = 0U;
  MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<mmltk::backend::data::catalog::ClassName> class_names {};
  MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<contracts::AnnotationColor> palette {};
- MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<mmltk::backend::data::catalog::ClassKeypointSchema> keypoint_schemas;
+ MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<mmltk::backend::data::catalog::ClassKeypointSchema> keypoint_schemas {};
 };
 struct ExploreLabel final {
  contracts::AnnotationBox box{};

@@ -74,10 +74,11 @@ ClassArtifactAdmission::ClassArtifactAdmission(
 }
 std::optional<RfdetrOutputContract> ClassArtifactAdmission::output_contract() const {
  std::optional<RfdetrOutputContract> result;
- for (const auto& descriptor : descriptors_) if (descriptor.output_contract) {
-  if (result && *result != *descriptor.output_contract) throw std::invalid_argument("authoritative output contracts disagree");
-  result = descriptor.output_contract;
- }
+ for (const auto& descriptor : descriptors_)
+  if (descriptor.output_contract) {
+   if (result && *result != *descriptor.output_contract) throw std::invalid_argument("authoritative output contracts disagree");
+   result = descriptor.output_contract;
+  }
  return result;
 }
 std::vector<RfdetrNamedOutputRole> ClassArtifactAdmission::output_roles() const { return class_descriptor_output_roles(descriptors_); }

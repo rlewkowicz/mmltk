@@ -94,8 +94,8 @@ std::optional<torch::Tensor> postprocess_keypoints(const OutputTensors& outputs,
  using Packet = KeypointPredictionPacket;
  const KeypointTensorLayout layout(outputs.keypoints_per_class);
  const auto& raw = *outputs.pred_keypoints;
- if (raw.dim() != 4 || raw.size(0) != outputs.pred_logits.size(0) || raw.size(1) != outputs.pred_logits.size(1) || raw.size(2) != layout.padded_count() || raw.size(3) != Packet::size || layout.slot_count() == 0 ||
-     !raw.is_floating_point() || raw.device() != outputs.pred_logits.device() || outputs.pred_masks)
+ if (raw.dim() != 4 || raw.size(0) != outputs.pred_logits.size(0) || raw.size(1) != outputs.pred_logits.size(1) || raw.size(2) != layout.padded_count() || raw.size(3) != Packet::size ||
+     layout.slot_count() == 0 || !raw.is_floating_point() || raw.device() != outputs.pred_logits.device() || outputs.pred_masks)
   throw std::invalid_argument("keypoint postprocessing schema disagrees with output");
  const auto batch = raw.size(0), queries = raw.size(1), k = layout.maximum_joints();
  static_cast<void>(checked_prediction_extent(batch * core.scores.size(1), k * sizeof(KeypointPrediction), kMaximumPredictionTensorBytes));
@@ -109,7 +109,8 @@ std::optional<torch::Tensor> postprocess_keypoints(const OutputTensors& outputs,
  // The upstream postprocessor skips uncertainty fusion for an entirely
  // zero-width physical schema. Mixed schemas still fuse every admitted slot.
  if (k > 0) {
-  const auto a = Packet::select<^^KeypointPrediction::log_l11>(selected, -1), b = Packet::select<^^KeypointPrediction::l21>(selected, -1), c = Packet::select<^^KeypointPrediction::log_l22>(selected, -1);
+  const auto a = Packet::select<^^KeypointPrediction::log_l11>(selected, -1), b = Packet::select<^^KeypointPrediction::l21>(selected, -1),
+             c = Packet::select<^^KeypointPrediction::log_l22>(selected, -1);
   const auto weight = Packet::select<^^KeypointPrediction::findable_logit>(selected, -1).sigmoid().clamp_min(1e-12).log().masked_fill(~mask, -std::numeric_limits<float>::infinity());
   const auto trace = torch::logsumexp(torch::stack({-2 * a, -2 * c, 2 * b.abs().clamp_min(1e-12).log() - 2 * a - 2 * c}, -1), -1);
   const auto mean_trace = torch::where(mask.any(-1), torch::logsumexp(trace + weight, -1) - torch::logsumexp(weight, -1), torch::zeros_like(core.scores));
@@ -118,7 +119,7 @@ std::optional<torch::Tensor> postprocess_keypoints(const OutputTensors& outputs,
   core.scores = torch::where(core.physical_labels.lt(layout.slot_count()), fused, core.scores);
  }
  selected = selected.masked_fill(~mask.unsqueeze(-1), 0);
- map_prediction_keypoints_(selected, width, height);
+ map_prediction_keypoints_(selected, static_cast<double>(width), static_cast<double>(height));
  selected.narrow(-1, Packet::index<^^KeypointPrediction::log_l11>(), 3).masked_fill_(~mask.unsqueeze(-1), std::numeric_limits<float>::quiet_NaN());
  return selected;
 }
@@ -187,7 +188,10 @@ PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outpu
   throw std::invalid_argument("RF-DETR mask logits are incompatible with selected queries");
  if (outputs.pred_masks) static_cast<void>(checked_prediction_extent(outputs.pred_masks->numel(), outputs.pred_masks->element_size(), kMaximumPredictionTensorBytes));
  auto keypoints = postprocess_keypoints(outputs, core, height, width, lane);
- return {std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks, std::move(core.counts), std::move(keypoints), std::move(core.keypoint_counts)};
+ return {
+  std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks, std::move(core.counts), std::move(keypoints),
+  std::move(core.keypoint_counts)
+ };
 }
 SelectedMaskCapacity SelectedMaskWorkspace::RetainedCapacity(std::size_t host_bytes) const {
  const auto capacity = [](const auto& tensor) -> std::size_t { return tensor.defined() ? tensor.storage().nbytes() : 0U; };

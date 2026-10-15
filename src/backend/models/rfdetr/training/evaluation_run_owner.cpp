@@ -791,7 +791,10 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
   PostprocessedBatch processed = [&]() {
    mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_postprocess{"rfdetr.train.eval.postprocess"};
    if (batch_timing) { evaluation_run.record_timing_start(batch_timing, EvaluationCudaBatchTiming::Phase::Postprocess, evaluation_stream); }
-   PostprocessedBatch postprocessed = postprocess_output_batch_fixed_size(OutputTensors{evaluated_outputs->main.pred_logits, evaluated_outputs->main.pred_boxes, evaluated_outputs->main.pred_masks, evaluated_outputs->main.pred_keypoints, model.config().keypoints_per_class},
+   PostprocessedBatch postprocessed = postprocess_output_batch_fixed_size(
+    OutputTensors{
+     evaluated_outputs->main.pred_logits, evaluated_outputs->main.pred_boxes, evaluated_outputs->main.pred_masks, evaluated_outputs->main.pred_keypoints, model.config().keypoints_per_class
+    },
     static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select, &evaluation_postprocess);
    for (std::size_t image = 0; image < batch.num_images; ++image) {
     const auto geometry = loader.geometry(static_cast<std::uint32_t>(prediction_metadata[image].dataset_index));

@@ -41,10 +41,10 @@ using test_support::LiveAnalysisFixture;
 struct AnalysisAllocationProbe final {
  static inline std::size_t allocations = 0;
  static inline bool fail = false;
- static std::shared_ptr<void> Allocate(std::size_t bytes,LiveAnalysisProduct::Storage) {
+ static std::shared_ptr<void> Allocate(std::size_t bytes, LiveAnalysisProduct::Storage) {
   ++allocations;
   if (fail) throw std::bad_alloc{};
-  return {::operator new(bytes),[](void* address) { ::operator delete(address); }};
+  return {::operator new(bytes), [](void* address) { ::operator delete(address); }};
  }
 };
 TEST_CASE("Live completed semantic copies retain named mixed joints independently of provider storage") {
@@ -52,13 +52,13 @@ TEST_CASE("Live completed semantic copies retain named mixed joints independentl
  auto catalog = source.catalog;
  const std::weak_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog_custody = catalog;
  const std::weak_ptr<std::int64_t> count_custody = source.count;
- LiveAnalysisProduct compositor{LiveAnalysisProduct::Storage::Pinned,&AnalysisAllocationProbe::Allocate};
- source.Deliver(compositor,{4,5});
+ LiveAnalysisProduct compositor{LiveAnalysisProduct::Storage::Pinned, &AnalysisAllocationProbe::Allocate};
+ source.Deliver(compositor, {4, 5});
  REQUIRE(compositor.ready());
  REQUIRE(compositor.analyzed());
  REQUIRE(compositor.regions().size() == 1);
  const auto& region = compositor.regions()[0];
- CHECK(region.source_region == mmltk::backend::ml::runtime::AnalysisRegion{1,1,2,2});
+ CHECK(region.source_region == mmltk::backend::ml::runtime::AnalysisRegion{1, 1, 2, 2});
  CHECK(region.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground);
  CHECK(region.class_catalog == catalog);
  CHECK(region.count == 2);
@@ -78,7 +78,7 @@ TEST_CASE("Live completed semantic copies retain named mixed joints independentl
  receiver.CopyFrom(compositor);
  compositor.Reset();
  source.catalog.reset();
- CHECK(receiver.frame() == LiveFrameId{4,5});
+ CHECK(receiver.frame() == LiveFrameId{4, 5});
  CHECK(receiver.regions()[0].keypoints[0].covariance_xy == -.5F);
  CHECK(receiver.regions()[0].class_catalog == catalog);
  CHECK_FALSE(compositor.ready());
@@ -88,13 +88,13 @@ TEST_CASE("Live completed semantic copies retain named mixed joints independentl
  CHECK(catalog_custody.expired());
 }
 TEST_CASE("Live distinguishes no analysis from successful zero detections and clears stale values") {
- const bool pending = GENERATE(false,true);
+ const bool pending = GENERATE(false, true);
  LiveAnalysisFixture source;
  LiveAnalysisProduct product;
- source.Deliver(product,{2,1},pending);
+ source.Deliver(product, {2, 1}, pending);
  const auto capacity = product.capacity_bytes();
  *source.count = 0;
- source.Deliver(product,{2,2},pending);
+ source.Deliver(product, {2, 2}, pending);
  REQUIRE(product.ready());
  REQUIRE(product.analyzed());
  REQUIRE(product.regions().size() == 1);
@@ -103,7 +103,7 @@ TEST_CASE("Live distinguishes no analysis from successful zero detections and cl
  CHECK(product.regions()[0].boxes_xyxy.empty());
  CHECK(product.regions()[0].class_catalog == source.catalog);
  CHECK(product.capacity_bytes() == capacity);
- product.Reset({2,3});
+ product.Reset({2, 3});
  CHECK(product.ready());
  CHECK_FALSE(product.analyzed());
  CHECK(product.regions().empty());
@@ -115,17 +115,17 @@ TEST_CASE("Live semantic capacity is reusable and failed growth preserves receiv
  AnalysisAllocationProbe::allocations = 0;
  AnalysisAllocationProbe::fail = false;
  LiveAnalysisFixture source;
- LiveAnalysisProduct compositor,receiver{LiveAnalysisProduct::Storage::Host,&AnalysisAllocationProbe::Allocate};
+ LiveAnalysisProduct compositor, receiver{LiveAnalysisProduct::Storage::Host, &AnalysisAllocationProbe::Allocate};
  *source.count = 0;
- source.Deliver(compositor,{3,1},false);
+ source.Deliver(compositor, {3, 1}, false);
  receiver.CopyFrom(compositor);
  const auto capacity = receiver.capacity_bytes();
  *source.count = 2;
- source.Deliver(compositor,{3,2},false);
+ source.Deliver(compositor, {3, 2}, false);
  AnalysisAllocationProbe::fail = true;
- CHECK_THROWS_AS(receiver.CopyFrom(compositor),std::bad_alloc);
+ CHECK_THROWS_AS(receiver.CopyFrom(compositor), std::bad_alloc);
  AnalysisAllocationProbe::fail = false;
- CHECK(receiver.frame() == LiveFrameId{3,1});
+ CHECK(receiver.frame() == LiveFrameId{3, 1});
  CHECK(receiver.ready());
  CHECK(receiver.regions()[0].count == 0);
  CHECK(receiver.capacity_bytes() == capacity);
@@ -142,23 +142,23 @@ TEST_CASE("Live semantic admission rejects invalid extents and never publishes i
  SECTION("region outside source") { annotation.source_region.x = 4; }
  SECTION("rank") { annotation.keypoints.shape.rank = 2; }
  SECTION("full plane bytes even with a known zero count") {
-  annotation.count.SetKnown(0,2);
+  annotation.count.SetKnown(0, 2);
   annotation.keypoints.capacity_bytes -= sizeof(float);
  }
  SECTION("task joint capacity") { annotation.keypoint_capacity = 257; }
  SECTION("named domain") { annotation.class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot; }
- CHECK_THROWS_AS(product.PrepareDevice({1,1},4,4,std::span{&annotation,1}),std::invalid_argument);
+ CHECK_THROWS_AS(product.PrepareDevice({1, 1}, 4, 4, std::span{&annotation, 1}), std::invalid_argument);
  CHECK_FALSE(product.ready());
  CHECK(product.regions().empty());
 }
 TEST_CASE("Live semantic completion validates survivor and named joint counts before publication") {
- const int invalid = GENERATE(0,1,2);
+ const int invalid = GENERATE(0, 1, 2);
  LiveAnalysisFixture source;
  if (invalid == 0) *source.count = 3;
  if (invalid == 1) source.joint_counts[0] = 1;
  if (invalid == 2) source.classes[1] = 2;
  LiveAnalysisProduct product;
- CHECK_THROWS_AS(source.Deliver(product,{1,1}),std::invalid_argument);
+ CHECK_THROWS_AS(source.Deliver(product, {1, 1}), std::invalid_argument);
  CHECK_FALSE(product.ready());
  CHECK(product.regions().empty());
 }
@@ -171,10 +171,10 @@ TEST_CASE("Live retains raw detection products without inventing joint or catalo
  annotation.keypoint_capacity = 0;
  annotation.keypoints = annotation.keypoint_counts = {};
  annotation.masks_available = false;
- source.classes = {91,365};
+ source.classes = {91, 365};
  LiveAnalysisProduct product;
- product.PrepareDevice({1,1},4,4,std::span{&annotation,1});
- REQUIRE(product.EnqueueDeviceCopy(1,&LiveAnalysisFixture::Copy) == cudaSuccess);
+ product.PrepareDevice({1, 1}, 4, 4, std::span{&annotation, 1});
+ REQUIRE(product.EnqueueDeviceCopy(1, &LiveAnalysisFixture::Copy) == cudaSuccess);
  product.CompleteDeviceCopy();
  const auto& region = product.regions()[0];
  CHECK(region.class_references[1] == 365);
@@ -187,26 +187,26 @@ TEST_CASE("Live retains raw detection products without inventing joint or catalo
 }
 struct AnalysisCopyFailure final {
  static inline std::size_t copies = 0;
- static cudaError_t Copy(void* target,const void* source,std::size_t bytes,std::uintptr_t stream) noexcept {
+ static cudaError_t Copy(void* target, const void* source, std::size_t bytes, std::uintptr_t stream) noexcept {
   if (++copies == 3) return cudaErrorLaunchFailure;
-  return LiveAnalysisFixture::Copy(target,source,bytes,stream);
+  return LiveAnalysisFixture::Copy(target, source, bytes, stream);
  }
 };
 TEST_CASE("Live partial semantic submission remains unpublished until its owner settles and resets") {
  LiveAnalysisFixture source;
  auto annotation = source.Annotation();
  LiveAnalysisProduct product;
- product.PrepareDevice({1,1},4,4,std::span{&annotation,1});
- CHECK_THROWS_AS(product.CompleteDeviceCopy(),std::logic_error);
+ product.PrepareDevice({1, 1}, 4, 4, std::span{&annotation, 1});
+ CHECK_THROWS_AS(product.CompleteDeviceCopy(), std::logic_error);
  AnalysisCopyFailure::copies = 0;
- CHECK(product.EnqueueDeviceCopy(1,&AnalysisCopyFailure::Copy) == cudaErrorLaunchFailure);
+ CHECK(product.EnqueueDeviceCopy(1, &AnalysisCopyFailure::Copy) == cudaErrorLaunchFailure);
  CHECK_FALSE(product.ready());
  CHECK(product.regions().empty());
- CHECK_THROWS_AS(product.CompleteDeviceCopy(),std::logic_error);
+ CHECK_THROWS_AS(product.CompleteDeviceCopy(), std::logic_error);
  // The injected copies have already settled. Production uses its slot stream.
  product.SettleDeviceCopy();
  product.Reset();
- source.Deliver(product,{1,2});
+ source.Deliver(product, {1, 2});
  CHECK(product.ready());
  CHECK(product.regions()[0].keypoint_counts[0] == 2);
 }
@@ -214,7 +214,10 @@ struct StartupOwner final {
  std::atomic_bool failed{false};
  [[nodiscard]] LiveDataPlaneConfig Configuration() {
   LiveDataPlaneConfig config;
-  config.resource_worker = mmltk::frameworks::gpu::ResourceOwnerWorkerCapability{this, 1, [](const void*, std::uintptr_t) noexcept { return true; }, [](const void* context, std::uintptr_t) noexcept { static_cast<StartupOwner*>(const_cast<void*>(context))->failed = true; return true; }};
+  config.resource_worker = mmltk::frameworks::gpu::ResourceOwnerWorkerCapability{this, 1, [](const void*, std::uintptr_t) noexcept { return true; }, [](const void* context, std::uintptr_t) noexcept {
+   static_cast<StartupOwner*>(const_cast<void*>(context))->failed = true;
+   return true;
+  }};
   config.capture.cuda_device_index = 0;
   config.capture.width = config.capture.height = 32;
   config.capture.device_path = "/must-not-open-before-provider";
@@ -235,17 +238,19 @@ TEST_CASE("Live provider admission failure requires joined clean media resources
  provider.cancelled = cancelled;
  LiveMediaDataPlane plane(owner.Configuration());
  CHECK_FALSE(plane.no_custody_start_settlement().ok());
- auto startup = std::async(std::launch::async, [&] { return plane.start({&provider, [](const void* context, mmltk::backend::ml::runtime::BorrowedCommandStream stream) -> std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider> {
-  auto& state = *static_cast<Provider*>(const_cast<void*>(context));
-  if (!stream.valid) throw std::runtime_error("provider stream unavailable");
-  state.construction.receipt().ArriveAndWait();
-  // PhysicalResources creates this stream immediately before this factory.
-  // No provider exists and no analyzer/capture worker has started, so there
-  // are no submitted stream consumers or callbacks. Deliberately retire the
-  // otherwise unused stream to exercise the owner's real cleanup error path.
-  if (state.invalidate_stream) state.invalidation = cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream.native_handle));
-  throw std::runtime_error(state.cancelled ? "provider admission cancelled before capture" : "provider artifact IO admission refused before capture");
- }}); });
+ auto startup = std::async(std::launch::async, [&] {
+  return plane.start({&provider, [](const void* context, mmltk::backend::ml::runtime::BorrowedCommandStream stream) -> std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider> {
+   auto& state = *static_cast<Provider*>(const_cast<void*>(context));
+   if (!stream.valid) throw std::runtime_error("provider stream unavailable");
+   state.construction.receipt().ArriveAndWait();
+   // PhysicalResources creates this stream immediately before this factory.
+   // No provider exists and no analyzer/capture worker has started, so there
+   // are no submitted stream consumers or callbacks. Deliberately retire the
+   // otherwise unused stream to exercise the owner's real cleanup error path.
+   if (state.invalidate_stream) state.invalidation = cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream.native_handle));
+   throw std::runtime_error(state.cancelled ? "provider admission cancelled before capture" : "provider artifact IO admission refused before capture");
+  }});
+ });
  const mmltk::testsupport::ScopedTestCleanup cleanup([&] { provider.construction.Release(); });
  REQUIRE(provider.construction.WaitEntered(std::chrono::seconds{20}));
  CHECK_FALSE(plane.no_custody_start_settlement().ok());
@@ -275,118 +280,167 @@ class PlaneTestProvider final : public mmltk::backend::ml::runtime::AnalysisProv
  cudaStream_t stream_;
  cudaEvent_t event_ = nullptr;
  bool empty_;
- const std::array<float,4> box_{4,4,26,26};
- const std::array<std::uint8_t,3> color_{255,0,0};
+ const std::array<float, 4> box_{4, 4, 26, 26};
+ const std::array<std::uint8_t, 3> color_{255, 0, 0};
  const int category_ = 0;
  const float confidence_ = .9F;
  std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog_ = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
+
 public:
- PlaneTestProvider(std::uintptr_t stream,bool empty) : stream_(reinterpret_cast<cudaStream_t>(stream)),empty_(empty) {
-  if (cudaEventCreateWithFlags(&event_,cudaEventDisableTiming) != cudaSuccess) throw std::runtime_error("fixture event");
+ PlaneTestProvider(std::uintptr_t stream, bool empty) : stream_(reinterpret_cast<cudaStream_t>(stream)), empty_(empty) {
+  if (cudaEventCreateWithFlags(&event_, cudaEventDisableTiming) != cudaSuccess) throw std::runtime_error("fixture event");
  }
- ~PlaneTestProvider() override { if (event_) static_cast<void>(cudaEventDestroy(event_)); }
+ ~PlaneTestProvider() override {
+  if (event_) static_cast<void>(cudaEventDestroy(event_));
+ }
  ProviderWorkResult DoAnalyze(const Runtime& request) noexcept override {
   using namespace mmltk::backend::ml::runtime;
-  auto status = cudaStreamWaitEvent(stream_,reinterpret_cast<cudaEvent_t>(request.source_ready.event),0);
+  auto status = cudaStreamWaitEvent(stream_, reinterpret_cast<cudaEvent_t>(request.source_ready.event), 0);
   for (auto& output : request.annotations) {
-   const auto copy = [&](std::uintptr_t destination,const void* source,std::size_t bytes) {
-    if (status == cudaSuccess) status = cudaMemcpyAsync(reinterpret_cast<void*>(destination),source,bytes,cudaMemcpyHostToDevice,stream_);
+   const auto copy = [&](std::uintptr_t destination, const void* source, std::size_t bytes) {
+    if (status == cudaSuccess) status = cudaMemcpyAsync(reinterpret_cast<void*>(destination), source, bytes, cudaMemcpyHostToDevice, stream_);
    };
-   copy(output.boxes_xyxy.address,box_.data(),sizeof(box_));
-   copy(output.colors_rgb.address,color_.data(),sizeof(color_));
-   copy(output.class_references.address,&category_,sizeof(category_));
-   copy(output.confidences.address,&confidence_,sizeof(confidence_));
-   if (status == cudaSuccess) status = cudaMemsetAsync(reinterpret_cast<void*>(output.masks.address),1,output.source_region.width*output.source_region.height,stream_);
-   output.class_catalog=catalog_; output.class_domain=mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
-   output.masks_available=true; output.count.SetKnown(empty_ ? 0 : 1,output.value_capacity);
+   copy(output.boxes_xyxy.address, box_.data(), sizeof(box_));
+   copy(output.colors_rgb.address, color_.data(), sizeof(color_));
+   copy(output.class_references.address, &category_, sizeof(category_));
+   copy(output.confidences.address, &confidence_, sizeof(confidence_));
+   if (status == cudaSuccess) status = cudaMemsetAsync(reinterpret_cast<void*>(output.masks.address), 1, output.source_region.width * output.source_region.height, stream_);
+   output.class_catalog = catalog_;
+   output.class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
+   output.masks_available = true;
+   output.count.SetKnown(empty_ ? 0 : 1, output.value_capacity);
   }
-  if (status == cudaSuccess) status = cudaEventRecord(event_,stream_);
-  if (status != cudaSuccess) return {.identity=request.identity};
-  return {.identity=request.identity,.terminal=AnalysisTerminal::Completed,.completed_ns=1,.output_count=request.annotations.size(),
-   .completion={request.source.device,reinterpret_cast<std::uintptr_t>(event_),reinterpret_cast<std::uintptr_t>(stream_)}};
+  if (status == cudaSuccess) status = cudaEventRecord(event_, stream_);
+  if (status != cudaSuccess) return {.identity = request.identity};
+  return {
+   .identity = request.identity,
+   .terminal = AnalysisTerminal::Completed,
+   .completed_ns = 1,
+   .output_count = request.annotations.size(),
+   .completion = {request.source.device, reinterpret_cast<std::uintptr_t>(event_), reinterpret_cast<std::uintptr_t>(stream_)}
+  };
  }
  bool ObserveCompletion(const mmltk::backend::ml::runtime::AnalysisCompletion&) noexcept override { return cudaEventSynchronize(event_) == cudaSuccess; }
  void RetireIssuedWork(const ProviderWorkResult&) noexcept override { static_cast<void>(cudaStreamSynchronize(stream_)); }
  void DoShutdown() noexcept override {}
 };
 TEST_CASE("Live media leases keep capture clean beside masks boxes and manual alpha", "[live][cuda][planes]") {
- const int mode = GENERATE(0,1,2); // Capture only, completed zero, completed mask/box.
+ const int mode = GENERATE(0, 1, 2);  // Capture only, completed zero, completed mask/box.
  mmltk::testsupport::ScopedTempDir directory("live-media-planes");
- test_support::LiveCaptureFixture capture(directory.path()/"capture.fifo",16);
+ test_support::LiveCaptureFixture capture(directory.path() / "capture.fifo", 16);
  StartupOwner owner;
- auto config=owner.Configuration(); config.capture.device_path=capture.path(); config.capture.device_api=capture.api(); config.fanout_slots=16;
+ auto config = owner.Configuration();
+ config.capture.device_path = capture.path();
+ config.capture.device_api = capture.api();
+ config.fanout_slots = 16;
  LiveMediaDataPlane plane(config);
- std::mutex mutex; std::condition_variable changed; std::uint64_t generation=0;
- struct Notification { std::mutex* mutex; std::condition_variable* changed; std::uint64_t* generation; } notification{&mutex,&changed,&generation};
- plane.set_revision_listener({&notification,[](void* context) noexcept {
-  auto& state=*static_cast<Notification*>(context);
-  { std::scoped_lock lock(*state.mutex); ++*state.generation; } state.changed->notify_one();
+ std::mutex mutex;
+ std::condition_variable changed;
+ std::uint64_t generation = 0;
+ struct Notification {
+  std::mutex* mutex;
+  std::condition_variable* changed;
+  std::uint64_t* generation;
+ } notification{&mutex, &changed, &generation};
+ plane.set_revision_listener({&notification, [](void* context) noexcept {
+  auto& state = *static_cast<Notification*>(context);
+  {
+   std::scoped_lock lock(*state.mutex);
+   ++*state.generation;
+  }
+  state.changed->notify_one();
  }});
- ManualOverlayDocumentSnapshot manual{.capture_width=32,.capture_height=32};
- ManualOverlayInstance object{.instance_id="manual",.mask_region={8,8,8,8},.mask=std::vector<std::uint8_t>(64,1)};
- object.style=ManualOverlayStyle{.r=0,.g=100,.b=0,.alpha=128};
- manual.instances.push_back(std::move(object)); plane.publish_manual_overlay(std::move(manual));
+ ManualOverlayDocumentSnapshot manual{};
+ manual.capture_width = manual.capture_height = 32;
+ ManualOverlayInstance object{};
+ object.instance_id = "manual";
+ object.mask_region = {8, 8, 8, 8};
+ object.mask.assign(64, 1);
+ object.style = ManualOverlayStyle{.r = 0, .g = 100, .b = 0, .alpha = 128};
+ manual.instances.push_back(std::move(object));
+ plane.publish_manual_overlay(std::move(manual));
  LiveAnalysisProviderFactory factory;
- if (mode) factory={&mode,[](const void* context,mmltk::backend::ml::runtime::BorrowedCommandStream stream) -> std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider> {
-  return std::make_shared<PlaneTestProvider>(stream.native_handle,*static_cast<const int*>(context)==1);
- }};
+ if (mode)
+  factory = {&mode, [](const void* context, mmltk::backend::ml::runtime::BorrowedCommandStream stream) -> std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider> {
+   return std::make_shared<PlaneTestProvider>(stream.native_handle, *static_cast<const int*>(context) == 1);
+  }};
  REQUIRE(plane.start(factory).running());
  const mmltk::testsupport::ScopedTestCleanup cleanup([&] { static_cast<void>(plane.stop()); });
  LiveCompositeOutputLease held;
- std::array<std::uint8_t,32*32*4> clean{},semantic{};
- std::uint64_t observed=0;
- const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{20};
+ std::array<std::uint8_t, 32 * 32 * 4> clean{}, semantic{};
+ std::uint64_t observed = 0;
+ const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{20};
  for (;;) {
-  { std::unique_lock lock(mutex); REQUIRE(changed.wait_until(lock,deadline,[&] { return generation!=observed; })); observed=generation; }
-  const auto revision=plane.newest_revision();
-  if (!revision || !plane.try_acquire_output(*revision,&held)) continue;
-  const auto view=held.view();
+  {
+   std::unique_lock lock(mutex);
+   REQUIRE(changed.wait_until(lock, deadline, [&] { return generation != observed; }));
+   observed = generation;
+  }
+  const auto revision = plane.newest_revision();
+  if (!revision || !plane.try_acquire_output(*revision, &held)) continue;
+  const auto view = held.view();
   REQUIRE(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(view.ready_event)) == cudaSuccess);
-  REQUIRE(cudaMemcpy2D(clean.data(),128,reinterpret_cast<void*>(view.clean),view.clean_pitch_bytes,128,32,cudaMemcpyDeviceToHost) == cudaSuccess);
-  REQUIRE(cudaMemcpy2D(semantic.data(),128,reinterpret_cast<void*>(view.semantic),view.semantic_pitch_bytes,128,32,cudaMemcpyDeviceToHost) == cudaSuccess);
-  const auto center=(10*32+10)*4;
-  if (semantic[center+1] && (!mode || view.analysis->analyzed())) break;
+  REQUIRE(cudaMemcpy2D(clean.data(), 128, reinterpret_cast<void*>(view.clean), view.clean_pitch_bytes, 128, 32, cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(cudaMemcpy2D(semantic.data(), 128, reinterpret_cast<void*>(view.semantic), view.semantic_pitch_bytes, 128, 32, cudaMemcpyDeviceToHost) == cudaSuccess);
+  const auto center = (10 * 32 + 10) * 4;
+  if (semantic[center + 1] && (!mode || view.analysis->analyzed())) break;
   std::move(held).Complete();
  }
- for (std::size_t y=0;y<32;++y) for (std::size_t x=0;x<32;++x) {
-  const auto offset=(y*32+x)*4;
-  CHECK(clean[offset]==16); CHECK(clean[offset+1]==24);
-  CHECK(clean[offset+2]==(((x/16+y/16)%2) ? 48 : 96)); CHECK(clean[offset+3]==255);
+ for (std::size_t y = 0; y < 32; ++y)
+  for (std::size_t x = 0; x < 32; ++x) {
+   const auto offset = (y * 32 + x) * 4;
+   CHECK(clean[offset] == 16);
+   CHECK(clean[offset + 1] == 24);
+   CHECK(clean[offset + 2] == (((x / 16 + y / 16) % 2) ? 48 : 96));
+   CHECK(clean[offset + 3] == 255);
+  }
+ CHECK(held.view().analysis->analyzed() == (mode != 0));
+ if (mode) CHECK(held.view().analysis->regions().front().count == (mode == 2 ? 1 : 0));
+ const auto center = (10 * 32 + 10) * 4;
+ CHECK(semantic[center + 3] == (mode == 2 ? 185 : 128));
+ CHECK(semantic[center] == (mode == 2 ? 78 : 0));
+ CHECK(semantic[center + 1] == (mode == 2 ? 69 : 100));
+ if (mode == 2) {
+  CHECK(semantic[(4 * 32 + 4) * 4] == 255);
+  CHECK(semantic[(4 * 32 + 4) * 4 + 3] == 255);
  }
- CHECK(held.view().analysis->analyzed() == (mode!=0));
- if (mode) CHECK(held.view().analysis->regions().front().count == (mode==2 ? 1 : 0));
- const auto center=(10*32+10)*4;
- CHECK(semantic[center+3] == (mode==2 ? 185 : 128));
- CHECK(semantic[center] == (mode==2 ? 78 : 0));
- CHECK(semantic[center+1] == (mode==2 ? 69 : 100));
- if (mode==2) { CHECK(semantic[(4*32+4)*4]==255); CHECK(semantic[(4*32+4)*4+3]==255); }
- namespace raster=mmltk::backend::imaging::raster;
+ namespace raster = mmltk::backend::imaging::raster;
  mmltk::testsupport::ScopedTestStream composite_stream;
- auto output=mmltk::testsupport::allocate_cuda_test_object<decltype(clean)>();
- REQUIRE(raster::finalize_rgba({
-  .clean={reinterpret_cast<const std::uint8_t*>(held.view().clean),held.view().clean_pitch_bytes,32,32},
-  .semantic={reinterpret_cast<const std::uint8_t*>(held.view().semantic),held.view().semantic_pitch_bytes,32,32},
-  .destination={reinterpret_cast<std::uint8_t*>(output.get()),128,32,32},.stream={composite_stream.get()}}) == cudaSuccess);
+ auto output = mmltk::testsupport::allocate_cuda_test_object<decltype(clean)>();
+ REQUIRE(raster::finalize_rgba(
+          {.clean = {reinterpret_cast<const std::uint8_t*>(held.view().clean), held.view().clean_pitch_bytes, 32, 32},
+           .semantic = {reinterpret_cast<const std::uint8_t*>(held.view().semantic), held.view().semantic_pitch_bytes, 32, 32},
+           .destination = {reinterpret_cast<std::uint8_t*>(output.get()), 128, 32, 32},
+           .stream = {composite_stream.get()}}) == cudaSuccess);
  decltype(clean) composite;
- REQUIRE(cudaMemcpyAsync(composite.data(),output.get(),composite.size(),cudaMemcpyDeviceToHost,composite_stream.get()) == cudaSuccess);
+ REQUIRE(cudaMemcpyAsync(composite.data(), output.get(), composite.size(), cudaMemcpyDeviceToHost, composite_stream.get()) == cudaSuccess);
  REQUIRE(cudaStreamSynchronize(composite_stream.get()) == cudaSuccess);
- CHECK(composite[center] == (mode==2 ? 60 : 7));
- CHECK(composite[center+1] == (mode==2 ? 56 : 62));
- CHECK(composite[center+2] == (mode==2 ? 26 : 47)); CHECK(composite[center+3]==255);
- std::array<std::uint8_t,32*32*3> raw{}; std::promise<bool> readback;
- REQUIRE(plane.request_raw_readback({.frame=held.frame_revision().frame,.destination=raw,.context=&readback,
-  .complete=[](void* context,LiveFrameId,std::size_t bytes,bool completed) noexcept {
-   try { static_cast<std::promise<bool>*>(context)->set_value(completed && bytes==32*32*3); } catch (...) {}
-  }}));
- auto result=readback.get_future(); REQUIRE(mmltk::testsupport::await_test_future(result,"Live clean raw readback"));
- CHECK(raw[0]==96); CHECK(raw[1]==24); CHECK(raw[2]==16);
- auto stop=std::async(std::launch::async,[&] { return plane.stop(); });
- mmltk::testsupport::ScopedTestCleanup release_held([&] { if (held) std::move(held).Complete(); });
+ CHECK(composite[center] == (mode == 2 ? 60 : 7));
+ CHECK(composite[center + 1] == (mode == 2 ? 56 : 62));
+ CHECK(composite[center + 2] == (mode == 2 ? 26 : 47));
+ CHECK(composite[center + 3] == 255);
+ std::array<std::uint8_t, 32 * 32 * 3> raw{};
+ std::promise<bool> readback;
+ REQUIRE(
+  plane.request_raw_readback({.frame = held.frame_revision().frame, .destination = raw, .context = &readback, .complete = [](void* context, LiveFrameId, std::size_t bytes, bool completed) noexcept {
+  try {
+   static_cast<std::promise<bool>*>(context)->set_value(completed && bytes == 32 * 32 * 3);
+  } catch (...) {}
+ }}));
+ auto result = readback.get_future();
+ REQUIRE(mmltk::testsupport::await_test_future(result, "Live clean raw readback"));
+ CHECK(raw[0] == 96);
+ CHECK(raw[1] == 24);
+ CHECK(raw[2] == 16);
+ auto stop = std::async(std::launch::async, [&] { return plane.stop(); });
+ mmltk::testsupport::ScopedTestCleanup release_held([&] {
+  if (held) std::move(held).Complete();
+ });
  // The exact acquired slot keeps both physical planes alive during Stop.
- REQUIRE(cudaMemcpy2D(clean.data(),128,reinterpret_cast<void*>(held.view().clean),held.view().clean_pitch_bytes,128,32,cudaMemcpyDeviceToHost) == cudaSuccess);
- CHECK(clean[0]==16);
+ REQUIRE(cudaMemcpy2D(clean.data(), 128, reinterpret_cast<void*>(held.view().clean), held.view().clean_pitch_bytes, 128, 32, cudaMemcpyDeviceToHost) == cudaSuccess);
+ CHECK(clean[0] == 16);
  std::move(held).Complete();
- CHECK(mmltk::testsupport::await_test_future(stop,"Live plane retirement").ok());
+ CHECK(mmltk::testsupport::await_test_future(stop, "Live plane retirement").ok());
 }
 TEST_CASE("Live capture custody and pending physical release cannot prove no-custody recovery", "[live][cuda][startup]") {
  StartupOwner owner;
@@ -397,7 +451,10 @@ TEST_CASE("Live capture custody and pending physical release cannot prove no-cus
  auto config = owner.Configuration();
  config.capture.device_path = "/dev/null";
  config.capture.device_api = {&capture, [](void*, int, unsigned long request, void*) noexcept {
-  if (request == VIDIOC_STREAMON) { errno = EIO; return -1; }
+  if (request == VIDIOC_STREAMON) {
+   errno = EIO;
+   return -1;
+  }
   return 0;
  }, [](void* context, std::uint32_t slot) noexcept {
   auto& state = *static_cast<Capture*>(context);
@@ -466,18 +523,18 @@ constexpr LiveOutputFrame kView{
 TEST_CASE("Live output leases admit only completed semantics for their exact physical frame") {
  LiveAnalysisFixture source;
  LiveAnalysisProduct product;
- source.Deliver(product,kRevision.frame);
+ source.Deliver(product, kRevision.frame);
  auto view = kView;
  view.analysis = &product;
  LeaseProbe probe;
- auto lease = LiveCompositeOutputLease::Create(&probe,&LeaseProbe::Complete,&LeaseProbe::Abandon,view,kRevision);
+ auto lease = LiveCompositeOutputLease::Create(&probe, &LeaseProbe::Complete, &LeaseProbe::Abandon, view, kRevision);
  REQUIRE(lease);
  CHECK(lease.view().analysis->frame() == lease.frame_revision().frame);
  CHECK(lease.view().analysis->regions()[0].keypoint_counts[0] == 2);
  std::move(lease).Complete();
  CHECK(probe.completions == 1);
- product.Reset({4,6});
- CHECK_FALSE(LiveCompositeOutputLease::Create(&probe,&LeaseProbe::Complete,&LeaseProbe::Abandon,view,kRevision));
+ product.Reset({4, 6});
+ CHECK_FALSE(LiveCompositeOutputLease::Create(&probe, &LeaseProbe::Complete, &LeaseProbe::Abandon, view, kRevision));
  CHECK(probe.abandonments == 0);
 }
 TEST_CASE("completed Live output lease releases its exact source revision once") {

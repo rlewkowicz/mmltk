@@ -1876,8 +1876,8 @@ TEST_CASE("compiled keypoint catalogs and contiguous payloads survive resize and
  CHECK(person[1].x == 2.5F);
  CHECK(person[1].y == 7.5F);
  CHECK(person[1].visibility == catalog::KeypointVisibility::Occluded);
- CHECK(person[2].x == 0);
- CHECK(person[2].y == 0);
+ CHECK(person[2].x == 0.0F);
+ CHECK(person[2].y == 0.0F);
  CHECK(person[2].visibility == catalog::KeypointVisibility::Unannotated);
  const auto joint_bytes = std::as_bytes(person);
  CHECK(joint_bytes[8] == std::byte{2});
@@ -1891,7 +1891,6 @@ TEST_CASE("compiled keypoint catalogs and contiguous payloads survive resize and
  CHECK(annotations.labels[2].source_ordinal == 3);
  CHECK(source.header().max_label_bytes == source.image_entry(1).label_bytes);
  CHECK(inspect_compiled_dataset(compiled_bin_path(fixture)).class_catalog->ordered_equal(*source.class_catalog()));
-
  auto payload = std::vector<std::byte>(source.label_payload(1).begin(), source.label_payload(1).end());
  const auto entry = source.image_entry(1);
  CHECK_THROWS(annotation_view(entry, std::span{payload}.first(payload.size() - 1)));
@@ -1924,7 +1923,9 @@ TEST_CASE("format ten admission retains exact header identity and eight-bit fore
  header.version = 10;
  const auto path = root.path() / "legacy.bin";
  const auto file = mmltk::common::io::FileHandle::create_output(path.string(), layout.total_size);
- const std::array labels{PackedInstance{.class_id = 0, .bbox_x2 = 1, .bbox_y2 = 1}, PackedInstance{.class_id = 255, .bbox_x2 = 1, .bbox_y2 = 1}};
+ std::array<PackedInstance, 2> labels{};
+ labels[1].class_id = 255;
+ for (auto& label : labels) label.bbox_x2 = label.bbox_y2 = 1;
  ImageEntry entry{.status = ImageStatus::Eligible, .original_width = 1, .original_height = 1};
  set_annotation_extent(entry, labels.size(), 0, "legacy");
  file.pwrite_all(&header, sizeof(header), 0);
@@ -1966,7 +1967,6 @@ TEST_CASE("keypoint streaming borrows gathered joint payloads until batch releas
   loader.synchronize();
  }
 }
-
 TEST_CASE("Directory keypoint admission rejects malformed late triples without replacing a valid artifact", "[backend][data][keypoints][admission]") {
  const mmltk::testsupport::ScopedTempDir root("keypoint-source-admission");
  FixtureSpec fixture{.root_dir = root.path().string(), .num_images = 2};
@@ -1982,9 +1982,12 @@ TEST_CASE("Directory keypoint admission rejects malformed late triples without r
  input.close();
  const std::string_view invalid = GENERATE("length", "coordinate", "3", "255", "256", "257", "258", "18446744073709551615", "-1", "1.5", "2.0", "true");
  CAPTURE(invalid);
- if (invalid == "length") record["keypoints"].erase(record["keypoints"].end() - 1);
- else if (invalid == "coordinate") record["keypoints"][49] = "not a coordinate";
- else record["keypoints"][50] = nlohmann::json::parse(invalid.begin(), invalid.end());
+ if (invalid == "length")
+  record["keypoints"].erase(record["keypoints"].end() - 1);
+ else if (invalid == "coordinate")
+  record["keypoints"][49] = "not a coordinate";
+ else
+  record["keypoints"][50] = nlohmann::json::parse(invalid.begin(), invalid.end());
  std::ofstream(path) << record.dump() << '\n';
  CHECK_THROWS(compile_existing_fixture(fixture));
  const auto retained = read_compiled_header(compiled_bin_path(fixture));

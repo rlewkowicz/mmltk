@@ -183,8 +183,7 @@ struct PredictionOutput::Impl final {
   auto candidate = runtime->AcquireOutput();
   const VisualExtent extent{pixels.width, pixels.height};
   const std::array regions{PredictionPreviewComposition::Region{raw, {0U, 0U, extent.width, extent.height}}};
-  PredictionPreviewComposition::Draw(*runtime, candidate, extent, regions, PredictionPreviewComposition::Options::Prediction(options.preview), nullptr,
-   [&](auto clean, auto semantic, auto stream) {
+  PredictionPreviewComposition::Draw(*runtime, candidate, extent, regions, PredictionPreviewComposition::Options::Prediction(options.preview), nullptr, [&](auto clean, auto semantic, auto stream) {
    raster::CaptionRaster::Composite(clean, semantic, stream);
    captions->Draw(clean, labels, stream);
   });

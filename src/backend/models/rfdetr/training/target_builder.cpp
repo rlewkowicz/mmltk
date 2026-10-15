@@ -298,7 +298,8 @@ void TargetScratch::ensure_packed_mask_capacity(int64_t instances, int height, i
  mask_words_per_instance = packed_mask_words_for_shape(mask_height, mask_width);
  static_cast<void>(instances);
 }
-TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_size, const int64_t instances, const bool include_masks, const int height, const int width, const int64_t joint_capacity) {
+TargetStagingSlot& TargetScratch::acquire_staging_slot(
+ const std::size_t batch_size, const int64_t instances, const bool include_masks, const int height, const int width, const int64_t joint_capacity) {
  require(!staging_slot_acquired_, "target staging slot is already acquired");
  require(copy_stream_device_id_ >= 0, "target staging slot acquisition requires configured copy resources");
  torch_cuda::TorchCudaDeviceGuard device_guard(mmltk::backend::ml::cuda::checked_device_index(copy_stream_device_id_));
@@ -330,7 +331,8 @@ TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_s
  const int64_t slot_instance_capacity = std::max(slot.instance_capacity, required_instances);
  const int64_t mask_words = include_masks ? packed_mask_words_for_shape(height, width) : 0;
  // The common shape keeps the already-bound views as well as its allocations.
- if (slot.metadata.defined() && slot.image_ids.size(0) == required_batch && slot.boxes.size(0) == required_instances && slot.keypoints.size(1) == joint_capacity && slot.erasure.size(0) == (include_masks ? required_instances : 0) &&
+ if (slot.metadata.defined() && slot.image_ids.size(0) == required_batch && slot.boxes.size(0) == required_instances && slot.keypoints.size(1) == joint_capacity &&
+     slot.erasure.size(0) == (include_masks ? required_instances : 0) &&
      (!include_masks || (slot.packed_masks.defined() && slot.mask_height == height && slot.mask_width == width && slot.packed_masks.size(0) == required_instances))) {
   active_staging_slot_ = index;
   next_staging_slot_ = (index + 1) % staging_slots_.size();
@@ -611,15 +613,18 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
  for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
   const auto entry = batch.annotations(image_pos);
   maximum_instances += static_cast<int64_t>(entry.labels.size());
-  if (!entry.joints.empty() || (prepared.class_catalog && prepared.class_catalog->has_keypoints())) for (std::size_t instance = 0; instance < entry.labels.size(); ++instance) {
-   const auto joints = entry.instance_joints(instance);
-   if ((!joints.empty() && !prepared.class_catalog) || (prepared.class_catalog && joints.size() != prepared.class_catalog->keypoints(entry.labels[instance].class_id).names.size())) throw std::runtime_error("target keypoint count differs from class schema");
-   if (!entry.labels[instance].is_crowd()) joint_capacity = std::max(joint_capacity, static_cast<int64_t>(joints.size()));
-  }
+  if (!entry.joints.empty() || (prepared.class_catalog && prepared.class_catalog->has_keypoints()))
+   for (std::size_t instance = 0; instance < entry.labels.size(); ++instance) {
+    const auto joints = entry.instance_joints(instance);
+    if ((!joints.empty() && !prepared.class_catalog) || (prepared.class_catalog && joints.size() != prepared.class_catalog->keypoints(entry.labels[instance].class_id).names.size()))
+     throw std::runtime_error("target keypoint count differs from class schema");
+    if (!entry.labels[instance].is_crowd()) joint_capacity = std::max(joint_capacity, static_cast<int64_t>(joints.size()));
+   }
   if (augmentation_plan) {
    const auto& plan = augmentation_plan->images[image_pos];
    if (plan.paste_donor_slot >= 0) {
-    if ((!prepared.class_catalog && plan.paste_joint_count) || (prepared.class_catalog && plan.paste_joint_count != prepared.class_catalog->keypoints(plan.paste_label).names.size())) throw std::runtime_error("donor keypoint count differs from class schema");
+    if ((!prepared.class_catalog && plan.paste_joint_count) || (prepared.class_catalog && plan.paste_joint_count != prepared.class_catalog->keypoints(plan.paste_label).names.size()))
+     throw std::runtime_error("donor keypoint count differs from class schema");
     joint_capacity = std::max(joint_capacity, static_cast<int64_t>(plan.paste_joint_count));
    }
   }
@@ -661,8 +666,8 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   map_augmentation_keypoints(source, prepared.class_catalog->keypoints(label), image_width, image_height, plan, std::span{transformed}.first(source.size()), donor);
   auto* output = staging.keypoints.data_ptr<float>() + row * joint_capacity * 3;
   for (std::size_t joint = 0; joint < source.size(); ++joint) {
-   output[joint * 3] = transformed[joint].x / image_width;
-   output[joint * 3 + 1] = transformed[joint].y / image_height;
+   output[joint * 3] = transformed[joint].x / static_cast<float>(image_width);
+   output[joint * 3 + 1] = transformed[joint].y / static_cast<float>(image_height);
    output[joint * 3 + 2] = static_cast<float>(std::to_underlying(transformed[joint].visibility));
   }
  };

@@ -26,8 +26,8 @@
 #include <vector>
 #include "training_continuation_fixture.h"
 #include "src/backend/ml/torch/archive.h"
-using mmltk::backend::models::rfdetr::CriterionTerm;
 using mmltk::backend::models::rfdetr::CriterionLayer;
+using mmltk::backend::models::rfdetr::CriterionTerm;
 namespace mmltk::backend::models::rfdetr::testsupport {
 struct NativeAdamWTestAccess {
  static std::vector<std::pair<const void*, std::size_t>> storage(const NativeAdamW& optimizer) {
@@ -687,7 +687,6 @@ TEST_CASE("Optimizer Resume seals group policy while restoring held schedule and
  }
 }
 }  // namespace
-
 TEST_CASE("Atto trains encoder predictions while retaining cold dormant state without moments", "[rfdetr][training][atto]") {
  auto config = rf::native_config_from_preset(*rf::find_model_preset_by_weight_filename("rf-detr-atto.pth"));
  config.resolution = 80;
@@ -746,77 +745,78 @@ TEST_CASE("Atto trains encoder predictions while retaining cold dormant state wi
  CHECK(output.main.pred_logits.size(1) == config.num_queries);
  CHECK_FALSE(output.enc_outputs);
 }
-
 TEST_CASE("PE optimizer groups use actual depth token and decay policy for every optimizer", "[rfdetr][training][optimizer][pe]") {
  namespace serial = mmltk::backend::ml::serialization;
  const auto backbone = rf::native_config_from_preset(*rf::find_model_preset_by_weight_filename("rf-detr-femto.pth")).backbone;
  const std::array cases{
-  std::tuple{"backbone.0.encoder.model.pos_embed",14,0.},
-  std::tuple{"backbone.0.encoder.model.patch_embed.proj.weight",14,0.},
-  std::tuple{"backbone.0.encoder.model.cls_token",14,0.},
-  std::tuple{"backbone.0.encoder.model.reg_token",14,0.},
-  std::tuple{"backbone.0.encoder.model.blocks.0.attn.qkv.weight",13,.1},
-  std::tuple{"backbone.0.encoder.model.blocks.11.mlp.fc1.weight",2,.1},
-  std::tuple{"backbone.0.encoder.model.blocks.4.norm1.weight",9,0.},
-  std::tuple{"backbone.0.encoder.model.norm.weight",0,0.}};
- for (const auto kind : {rf::TrainOptimizerKind::AdamW,rf::TrainOptimizerKind::Muon,rf::TrainOptimizerKind::SGD})
-  for (const auto& [name,exponent,decay] : cases) {
-   CAPTURE(kind,name);
-   auto request=optimizer_test_request(kind);
-   request.recipe.lr_encoder=.002; request.recipe.encoder_layer_decay=.8; request.recipe.lr_component_decay=.7; request.recipe.weight_decay=.1;
-   torch::OrderedDict<std::string,torch::Tensor> parameters;
-   parameters.insert(name,torch::ones({2,2}).set_requires_grad(true));
-   auto built=rf::build_optimizer(parameters,request,backbone);
-   REQUIRE(built.base_lrs.size()==1);
-   CHECK(built.base_lrs[0]==Catch::Approx(.002*std::pow(.8,exponent)*.7*.7));
-   auto archive=optimizer_checkpoint(built.optimizer);
+  std::tuple{"backbone.0.encoder.model.pos_embed", 14, 0.}, std::tuple{"backbone.0.encoder.model.patch_embed.proj.weight", 14, 0.}, std::tuple{"backbone.0.encoder.model.cls_token", 14, 0.},
+  std::tuple{"backbone.0.encoder.model.reg_token", 14, 0.}, std::tuple{"backbone.0.encoder.model.blocks.0.attn.qkv.weight", 13, .1},
+  std::tuple{"backbone.0.encoder.model.blocks.11.mlp.fc1.weight", 2, .1}, std::tuple{"backbone.0.encoder.model.blocks.4.norm1.weight", 9, 0.}, std::tuple{"backbone.0.encoder.model.norm.weight", 0, 0.}
+ };
+ for (const auto kind : {rf::TrainOptimizerKind::AdamW, rf::TrainOptimizerKind::Muon, rf::TrainOptimizerKind::SGD})
+  for (const auto& [name, exponent, decay] : cases) {
+   CAPTURE(kind, name);
+   auto request = optimizer_test_request(kind);
+   request.recipe.lr_encoder = .002;
+   request.recipe.encoder_layer_decay = .8;
+   request.recipe.lr_component_decay = .7;
+   request.recipe.weight_decay = .1;
+   torch::OrderedDict<std::string, torch::Tensor> parameters;
+   parameters.insert(name, torch::ones({2, 2}).set_requires_grad(true));
+   auto built = rf::build_optimizer(parameters, request, backbone);
+   REQUIRE(built.base_lrs.size() == 1);
+   CHECK(built.base_lrs[0] == Catch::Approx(.002 * std::pow(.8, exponent) * .7 * .7));
+   auto archive = optimizer_checkpoint(built.optimizer);
    torch::serialize::InputArchive group;
-   archive.read(serial::archive_entry_name("group",0),group);
-   CHECK(serial::require_double(group,"weight_decay")==decay);
+   archive.read(serial::archive_entry_name("group", 0), group);
+   CHECK(serial::require_double(group, "weight_decay") == decay);
   }
 }
 TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", "[rfdetr][training][stock-suite][gpu]") {
- REQUIRE(mmltk::testsupport::checked_cuda_device_count()>0);
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  const tensor_fixture::FullMatrixPrecision precision;
- const torch::Device device(torch::kCUDA,0);
+ const torch::Device device(torch::kCUDA, 0);
  for (const auto& preset : rf::model_presets()) {
   CAPTURE(preset.preset_name);
-  auto config=rf::native_config_from_preset(preset);
+  auto config = rf::native_config_from_preset(preset);
   torch::manual_seed(715);
   rf::NativeRfDetrModel model(config);
   model.to(device);
   model.train();
-  auto request=optimizer_test_request(rf::TrainOptimizerKind::AdamW);
-  auto built=rf::build_optimizer(model.named_parameters(),request,config.backbone);
-  auto criterion=rf::testsupport::detection_fixture_base(config);
-  criterion.include_masks=config.has_masks();
-  criterion.mask_point_sample_ratio=config.mask_point_sample_ratio;
+  auto request = optimizer_test_request(rf::TrainOptimizerKind::AdamW);
+  auto built = rf::build_optimizer(model.named_parameters(), request, config.backbone);
+  auto criterion = rf::testsupport::detection_fixture_base(config);
+  criterion.include_masks = config.has_masks();
+  criterion.mask_point_sample_ratio = config.mask_point_sample_ratio;
   rf::populate_default_detection_weights(criterion);
-  const auto options=torch::TensorOptions().device(device);
-  const auto input=torch::rand({1,3,config.resolution,config.resolution},options);
-  auto targets=rf::testsupport::one_image_targets(torch::tensor({{.5F,.5F,.4F,.6F}},options),torch::tensor({1},options.dtype(torch::kInt64)));
+  const auto options = torch::TensorOptions().device(device);
+  const auto input = torch::rand({1, 3, config.resolution, config.resolution}, options);
+  auto targets = rf::testsupport::one_image_targets(torch::tensor({{.5F, .5F, .4F, .6F}}, options), torch::tensor({1}, options.dtype(torch::kInt64)));
   if (config.has_masks()) {
-   const auto words=(config.resolution*config.resolution+63)/64;
-   targets.packed_masks=rf::PackedTargetMasks{torch::full({1,words},-1,options.dtype(torch::kInt64)),config.resolution,config.resolution};
+   const auto words = (config.resolution * config.resolution + 63) / 64;
+   targets.packed_masks = rf::PackedTargetMasks{torch::full({1, words}, -1, options.dtype(torch::kInt64)), config.resolution, config.resolution};
   }
   if (config.has_keypoints()) {
-   const auto count=config.keypoints_per_class.at(1);
-   targets.all_keypoints=torch::full({1,count,3},.4,options);
-   targets.all_keypoints.select(-1,2).fill_(2);
-   targets.all_keypoint_counts=torch::tensor({static_cast<std::int64_t>(count)},options.dtype(torch::kInt64));
+   const auto count = config.keypoints_per_class.at(1);
+   targets.all_keypoints = torch::full({1, count, 3}, .4, options);
+   targets.all_keypoints.select(-1, 2).fill_(2);
+   targets.all_keypoint_counts = torch::tensor({static_cast<std::int64_t>(count)}, options.dtype(torch::kInt64));
   }
-  for (int step=0;step<2;++step) {
-   auto output=model.forward({input,{}},config.has_masks());
-   auto losses=rf::detection_loss_terms(output,targets,criterion,true,false);
-   const auto total=rf::weighted_detection_loss(losses,criterion,device);
+  for (int step = 0; step < 2; ++step) {
+   auto output = model.forward({input, {}}, config.has_masks());
+   auto losses = rf::detection_loss_terms(output, targets, criterion, true, false);
+   const auto total = rf::weighted_detection_loss(losses, criterion, device);
    REQUIRE(torch::isfinite(total).item<bool>());
    total.backward();
-   bool joint_gradient=false;
-   for (const auto& parameter:model.named_parameters()) {
-    if (!parameter.value().requires_grad()) { CHECK_FALSE(parameter.value().grad().defined()); continue; }
+   bool joint_gradient = false;
+   for (const auto& parameter : model.named_parameters()) {
+    if (!parameter.value().requires_grad()) {
+     CHECK_FALSE(parameter.value().grad().defined());
+     continue;
+    }
     if (!parameter.value().grad().defined()) continue;
     REQUIRE(torch::isfinite(parameter.value().grad()).all().item<bool>());
-    if (parameter.key().starts_with("keypoint_embed.") && parameter.value().grad().abs().sum().item<double>()>0) joint_gradient=true;
+    if (parameter.key().starts_with("keypoint_embed.") && parameter.value().grad().abs().sum().item<double>() > 0) joint_gradient = true;
    }
    if (config.has_keypoints()) REQUIRE(joint_gradient);
    built.optimizer.clip_grad_norm_(.1);
@@ -825,59 +825,59 @@ TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", 
   }
  }
 }
-
 TEST_CASE("Stock joint losses train through compilation AMP accumulation and every optimizer", "[rfdetr][training][keypoints][compilation][amp][gpu]") {
- REQUIRE(mmltk::testsupport::checked_cuda_device_count()>0);
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  const tensor_fixture::FullMatrixPrecision precision;
- const torch::Device device(torch::kCUDA,0);
- for (const auto dtype:{torch::kFloat32,torch::kFloat16,torch::kBFloat16})
-  for (const auto mode:{rf::CompilationMode::kNone,rf::CompilationMode::kSelective,rf::CompilationMode::kFullTrace}) {
-   CAPTURE(dtype,mode);
-   auto config=rf::native_config_from_preset(*rf::find_preset_catalog_entry("rf-detr-keypoint-preview"));
-   config.resolution=config.patch_size*config.num_windows*2;
-   config.num_queries=config.num_select=4;
-   config.group_detr=2;
-   config.num_classes=4;
-   config.keypoints_per_class={2,0,1};
+ const torch::Device device(torch::kCUDA, 0);
+ for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16})
+  for (const auto mode : {rf::CompilationMode::kNone, rf::CompilationMode::kSelective, rf::CompilationMode::kFullTrace}) {
+   CAPTURE(dtype, mode);
+   auto config = rf::native_config_from_preset(*rf::find_preset_catalog_entry("rf-detr-keypoint-preview"));
+   config.resolution = config.patch_size * config.num_windows * 2;
+   config.num_queries = config.num_select = 4;
+   config.group_detr = 2;
+   config.num_classes = 4;
+   config.keypoints_per_class = {2, 0, 1};
    torch::manual_seed(881);
    rf::NativeRfDetrModel model(config);
    model.to(device);
-   model.optimize_for_inference(1,true,mode);
-   const auto kind=mode==rf::CompilationMode::kNone?rf::TrainOptimizerKind::AdamW:mode==rf::CompilationMode::kSelective?rf::TrainOptimizerKind::Muon:rf::TrainOptimizerKind::SGD;
-   auto optimizer=rf::build_optimizer(model.named_parameters(),optimizer_test_request(kind),config.backbone);
-   auto criterion=rf::testsupport::detection_fixture_base(config);
+   model.optimize_for_inference(1, true, mode);
+   const auto kind = mode == rf::CompilationMode::kNone ? rf::TrainOptimizerKind::AdamW : mode == rf::CompilationMode::kSelective ? rf::TrainOptimizerKind::Muon : rf::TrainOptimizerKind::SGD;
+   auto optimizer = rf::build_optimizer(model.named_parameters(), optimizer_test_request(kind), config.backbone);
+   auto criterion = rf::testsupport::detection_fixture_base(config);
    rf::populate_default_detection_weights(criterion);
-   const auto options=torch::TensorOptions().device(device);
-   const auto input=torch::rand({1,3,config.resolution,config.resolution},options);
-   auto targets=rf::testsupport::one_image_targets(torch::tensor({{.4F,.5F,.5F,.5F},{.6F,.5F,.5F,.5F}},options),torch::tensor({0,2},options.dtype(torch::kInt64)));
-   targets.all_keypoints=torch::tensor({{{.3F,.4F,2.F},{.5F,.6F,1.F}},{{.7F,.6F,2.F},{0.F,0.F,0.F}}},options);
-   targets.all_keypoint_counts=torch::tensor({2,1},options.dtype(torch::kInt64));
-   const auto parameter=model.named_parameters()["keypoint_embed.layers.2.weight"];
-   const auto original=parameter.detach().clone();
-   for (int attempt=0;attempt<2;++attempt) {
-    for (int micro=0;micro<2;++micro) {
-     const rf::TrainingStep step(2,1,dtype!=torch::kFloat32,dtype);
+   const auto options = torch::TensorOptions().device(device);
+   const auto input = torch::rand({1, 3, config.resolution, config.resolution}, options);
+   auto targets = rf::testsupport::one_image_targets(torch::tensor({{.4F, .5F, .5F, .5F}, {.6F, .5F, .5F, .5F}}, options), torch::tensor({0, 2}, options.dtype(torch::kInt64)));
+   targets.all_keypoints = torch::tensor({{{.3F, .4F, 2.F}, {.5F, .6F, 1.F}}, {{.7F, .6F, 2.F}, {0.F, 0.F, 0.F}}}, options);
+   targets.all_keypoint_counts = torch::tensor({2, 1}, options.dtype(torch::kInt64));
+   const auto parameter = model.named_parameters()["keypoint_embed.layers.2.weight"];
+   const auto original = parameter.detach().clone();
+   for (int attempt = 0; attempt < 2; ++attempt) {
+    for (int micro = 0; micro < 2; ++micro) {
+     const rf::TrainingStep step(2, 1, dtype != torch::kFloat32, dtype);
      torch::Tensor loss;
      step.forward([&] {
-      auto output=model.forward({input,{}},false);
+      auto output = model.forward({input, {}}, false);
       REQUIRE(output.main.pred_keypoints);
-      const auto values=rf::detection_loss_terms(output,targets,criterion,true,false);
+      const auto values = rf::detection_loss_terms(output, targets, criterion, true, false);
       for (const auto term : {CriterionTerm::keypoint_l1, CriterionTerm::keypoint_findable, CriterionTerm::keypoint_visible, CriterionTerm::keypoint_nll}) {
        REQUIRE(values.contains({term}));
        REQUIRE(torch::isfinite(values.at({term})).item<bool>());
       }
-      loss=rf::weighted_detection_loss(values,criterion,device);
+      loss = rf::weighted_detection_loss(values, criterion, device);
      });
      REQUIRE(torch::isfinite(loss).item<bool>());
      step.backward(loss);
     }
     REQUIRE(parameter.grad().defined());
-    CHECK(parameter.grad().abs().sum().item<double>()>0);
-    for (const auto& value:optimizer.optimizer.parameters()) if (value.grad().defined()) REQUIRE(torch::isfinite(value.grad()).all().item<bool>());
+    CHECK(parameter.grad().abs().sum().item<double>() > 0);
+    for (const auto& value : optimizer.optimizer.parameters())
+     if (value.grad().defined()) REQUIRE(torch::isfinite(value.grad()).all().item<bool>());
     optimizer.optimizer.clip_grad_norm_(.1);
     optimizer.optimizer.step();
     optimizer.optimizer.zero_grad(true);
    }
-   CHECK_FALSE(torch::equal(parameter,original));
+   CHECK_FALSE(torch::equal(parameter, original));
   }
 }

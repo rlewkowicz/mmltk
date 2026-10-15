@@ -1533,8 +1533,10 @@ TEST_CASE("native image and Annotation measurements agree with emitted complete 
  // native declaration, including exact and one-byte-short successful budgets.
  const auto compare = [](const auto& source, bool transport, std::size_t budget = kVisualMetadataByteBudget) {
   const auto projected = transport ? serial::reflected_transport_value(source) : serial::reflected_value(source);
-  const auto measure = [&](std::size_t ceiling) { return transport ? serial::measure_transport(source, {.max_bytes = ceiling, .max_items = kVisualMetadataByteBudget})
-                                                                : serial::measure(source, {.max_bytes = ceiling, .max_items = kVisualMetadataByteBudget}); };
+  const auto measure = [&](std::size_t ceiling) {
+   return transport ? serial::measure_transport(source, {.max_bytes = ceiling, .max_items = kVisualMetadataByteBudget})
+                    : serial::measure(source, {.max_bytes = ceiling, .max_items = kVisualMetadataByteBudget});
+  };
   const auto result = measure(budget);
   std::array ceilings{budget, budget, budget};
   for (std::size_t index = 0U; index < ceilings.size(); ++index) {
@@ -1579,8 +1581,10 @@ TEST_CASE("native image and Annotation measurements agree with emitted complete 
  REQUIRE(full.schema.names.size() == 256U);
  REQUIRE(full.schema.skeleton.size() == 512U);
  const VisualObjectLabel label{.box = {{0, 0}, {64, 64}}, .confidence = .875F, .name = std::string(256U, 'c'), .skeleton = full};
- const VisualSkeleton small{.schema = {{"left", "right"}, {{0U, 1U}}, {1U, 0U}, {.1, .1}},
-  .joints = {{{1, 2}, .5F, catalog::KeypointVisibility::Occluded, {}}, {{3, 4}, .75F, catalog::KeypointVisibility::Visible, std::array{1.0F, 0.0F, 1.0F}}}};
+ const VisualSkeleton small{
+  .schema = {{"left", "right"}, {{0U, 1U}}, {1U, 0U}, {.1, .1}},
+  .joints = {{{1, 2}, .5F, catalog::KeypointVisibility::Occluded, {}}, {{3, 4}, .75F, catalog::KeypointVisibility::Visible, std::array{1.0F, 0.0F, 1.0F}}}
+ };
  PredictImageMetadata prediction;
  prediction.content_identity = 1U;
  prediction.frame = visual_frame({PresentationSourceKind::Predict, 1U}, {64U, 64U}, 1U);

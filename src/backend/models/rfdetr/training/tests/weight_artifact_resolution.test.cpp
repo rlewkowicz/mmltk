@@ -105,7 +105,6 @@ TEST_CASE("admitted native state resolves complete metadata without reopening it
  std::filesystem::rename(replacement, path);
  REQUIRE_THROWS(rfdetr::resolve_admitted_model_artifacts(admitted, path, {}, 0));
 }
-
 TEST_CASE("Native configuration preserves admitted long custom names within its checkpoint envelope", "[model][rfdetr][checkpoint_resolution][boundary]") {
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  config.preset_name.assign(60000, 'p');

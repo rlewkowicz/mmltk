@@ -40,9 +40,9 @@ void validate_training_selection(const TrainingSelection& value) {
  if (std::abs(total - 1.0) > 1e-12) throw std::invalid_argument("selected coefficients are not normalized");
 }
 void validate_training_session_manifest(const TrainingSessionManifest& value) {
- if ((value.identity_schema != 1 && value.identity_schema != 2) || value.format_version != kTrainingSessionFormat || !identity(value.session_id) || !identity(value.attempt_id) || !identity(value.generation) ||
-     (!value.previous_generation.empty() && (!identity(value.previous_generation) || value.previous_generation == value.generation)) || !digest(value.initialization) || !digest(value.configuration) ||
-     !digest(value.validation) || !digest(value.plan_sha256) || value.models.empty() || value.models.size() > kMaximumTrainingModels)
+ if ((value.identity_schema != 1 && value.identity_schema != 2) || value.format_version != kTrainingSessionFormat || !identity(value.session_id) || !identity(value.attempt_id) ||
+     !identity(value.generation) || (!value.previous_generation.empty() && (!identity(value.previous_generation) || value.previous_generation == value.generation)) || !digest(value.initialization) ||
+     !digest(value.configuration) || !digest(value.validation) || !digest(value.plan_sha256) || value.models.empty() || value.models.size() > kMaximumTrainingModels)
   throw std::invalid_argument("invalid training session manifest");
  validate_train_request(value.request);
  if (derive_execution_facts(value.request, 0).logical_models != value.models.size()) throw std::invalid_argument("session model count differs from its admitted configuration");

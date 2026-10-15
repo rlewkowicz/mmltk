@@ -400,12 +400,13 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
     const auto& region = annotation.source_region;
     OutputTensors tensors;
     RfdetrOutputProjection::visit(tensors, [&]<RfdetrOutputRole Role>(RfdetrOutputPolicy, auto& tensor) {
-     if constexpr (Role == RfdetrOutputRole::Masks) { if (!bound_call.include_masks) return; }
+     if constexpr (Role == RfdetrOutputRole::Masks) {
+      if (!bound_call.include_masks) return;
+     }
      if (const auto resolved = roles.index<Role>()) tensor = bound_call.outputs->tensors[*resolved].narrow(0, static_cast<std::int64_t>(index), 1);
     });
     tensors.keypoints_per_class = bound_owner.state_->output_contract.keypoints_per_class;
-    auto selected = select_output_batch_fixed_size(tensors,
-     region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->postprocess.get());
+    auto selected = select_output_batch_fixed_size(tensors, region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->postprocess.get());
     // Selection is score ordered. Keep the valid prefix on the lane and publish
     // its count through the existing completion-owned readback storage.
     if (bound_call.confidence_threshold > 0.0F) selected.counts = torch::minimum(selected.counts, (selected.scores >= bound_call.confidence_threshold).sum(1).to(selected.counts.options()));
@@ -428,12 +429,17 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
      if (selected.keypoints) {
       const auto& joints = *selected.keypoints;
       destination.keypoints = runtime::RuntimeTensorBuffer{
-       .device_data = joints.data_ptr(), .capacity_bytes = joints.nbytes(),
+       .device_data = joints.data_ptr(),
+       .capacity_bytes = joints.nbytes(),
        .shape = {.rank = 4U, .extents = {1, joints.size(1), joints.size(2), joints.size(3)}},
-       .element_type = runtime::RuntimeElementType::Float32};
+       .element_type = runtime::RuntimeElementType::Float32
+      };
       destination.keypoint_counts = runtime::RuntimeTensorBuffer{
-       .device_data = selected.keypoint_counts.data_ptr(), .capacity_bytes = selected.keypoint_counts.nbytes(),
-       .shape = {.rank = 2U, .extents = {1, joints.size(1)}}, .element_type = runtime::RuntimeElementType::Int32};
+       .device_data = selected.keypoint_counts.data_ptr(),
+       .capacity_bytes = selected.keypoint_counts.nbytes(),
+       .shape = {.rank = 2U, .extents = {1, joints.size(1)}},
+       .element_type = runtime::RuntimeElementType::Int32
+      };
      }
      if (selected.mask_logits) {
       auto mask_buffer = bound_call.outputs->buffers[*roles.index<RfdetrOutputRole::Masks>()];
@@ -501,8 +507,8 @@ runtime::RuntimeStatus RfdetrRuntimeBackend::Close() noexcept {
 std::span<const RfdetrNamedOutputRole> RfdetrRuntimeBackend::output_roles() const noexcept { return state_->output_roles; }
 std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane(
  runtime::BorrowedCommandStream command_stream, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement) const {
- return std::shared_ptr<RfdetrRuntimeBackend>(new RfdetrRuntimeBackend(lane_->MakeLane(command_stream), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_contract, state_->output_roles,
-  state_->admission, retirement ? std::move(retirement) : state_->retirement, state_->operations));
+ return std::shared_ptr<RfdetrRuntimeBackend>(new RfdetrRuntimeBackend(lane_->MakeLane(command_stream), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_contract,
+  state_->output_roles, state_->admission, retirement ? std::move(retirement) : state_->retirement, state_->operations));
 }
 std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options) {
  if (options.stop.stop_requested()) throw RfdetrArtifactAdmissionCancelled{};
@@ -517,13 +523,16 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
  }
  auto admission = options.admission;
  if (!admission) {
-  try { admission = std::make_shared<const ClassArtifactAdmission>(artifact.path, options.artifacts.class_layout_path, nullptr, options.stop); }
-  catch (const ArtifactPublicationCancelled&) { throw RfdetrArtifactAdmissionCancelled{}; }
-  catch (const std::runtime_error& error) { throw RfdetrArtifactAdmissionFailure(error.what()); }
+  try {
+   admission = std::make_shared<const ClassArtifactAdmission>(artifact.path, options.artifacts.class_layout_path, nullptr, options.stop);
+  } catch (const ArtifactPublicationCancelled&) { throw RfdetrArtifactAdmissionCancelled{}; } catch (const std::runtime_error& error) {
+   throw RfdetrArtifactAdmissionFailure(error.what());
+  }
  }
  if (!admission->Matches(artifact.path, options.artifacts.class_layout_path)) throw std::runtime_error("runtime admission does not match selected artifact");
- try { admission->RequireUnchanged(options.stop); }
- catch (const ArtifactPublicationCancelled&) { throw RfdetrArtifactAdmissionCancelled{}; }
+ try {
+  admission->RequireUnchanged(options.stop);
+ } catch (const ArtifactPublicationCancelled&) { throw RfdetrArtifactAdmissionCancelled{}; }
  std::optional<ModelClassLayout> embedded;
  auto output_roles = admission->output_roles();
  auto output_contract = admission->output_contract();
@@ -553,8 +562,8 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
  static_cast<void>(validate_rfdetr_output_layout(info));
  output_roles = rfdetr_output_roles(info);
  auto layout = std::make_shared<const ResolvedClassLayout>(admission->Resolve(info.num_classes, embedded, options.stop));
- auto result = std::shared_ptr<RfdetrRuntimeBackend>(
-  new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, *info.output_contract, output_roles, admission, options.retirement, options.registered_host_operations));
+ auto result = std::shared_ptr<RfdetrRuntimeBackend>(new RfdetrRuntimeBackend(
+  std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, *info.output_contract, output_roles, admission, options.retirement, options.registered_host_operations));
  admission->RequireUnchanged(options.stop);
  if (publication) {
   publication->Publish(ModelClassDescriptor{1U, {}, layout->record(), output_roles, info.output_contract}, [&] { return options.stop.stop_requested(); });

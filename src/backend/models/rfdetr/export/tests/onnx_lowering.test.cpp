@@ -605,45 +605,44 @@ TEST_CASE("Math SDPA lowering refuses training dropout explicitly", "[model][rfd
  mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, "dropout_p must be 0");
 }
 TEST_CASE("GroupPose attention lowering preserves class masks and fully excluded rows", "[model][rfdetr][onnx_lowering]") {
- const auto input = torch::sin(torch::arange(24, torch::kFloat)).reshape({1,2,3,4});
+ const auto input = torch::sin(torch::arange(24, torch::kFloat)).reshape({1, 2, 3, 4});
  const auto reversed = input.flip({2});
- const auto admitted = torch::tensor({{true,false,true},{false,false,false},{false,true,true}}, torch::kBool);
- const auto additive = torch::zeros({3,3}).masked_fill(~admitted, -std::numeric_limits<float>::infinity());
- for (const bool math : {false,true}) {
+ const auto admitted = torch::tensor({{true, false, true}, {false, false, false}, {false, true, true}}, torch::kBool);
+ const auto additive = torch::zeros({3, 3}).masked_fill(~admitted, -std::numeric_limits<float>::infinity());
+ for (const bool math : {false, true}) {
   CAPTURE(math);
   const auto operation = [&](const torch::Tensor& value) {
    if (math) {
     const auto result = at::_scaled_dot_product_attention_math(value, value, reversed, additive);
-    return torch::cat({std::get<0>(result).flatten(),std::get<1>(result).flatten()});
+    return torch::cat({std::get<0>(result).flatten(), std::get<1>(result).flatten()});
    }
    return at::scaled_dot_product_attention(value, value, reversed, admitted).flatten();
   };
-  auto graph = trace_unary_graph(input,operation);
+  auto graph = trace_unary_graph(input, operation);
   lower_test_graph(graph);
-  const auto expected = operation(input), actual = execute_unary_onnx(graph,input);
+  const auto expected = operation(input), actual = execute_unary_onnx(graph, input);
   CHECK(torch::isfinite(actual).all().item<bool>());
-  CHECK(torch::allclose(actual,expected,1e-5,1e-6));
+  CHECK(torch::allclose(actual, expected, 1e-5, 1e-6));
  }
 }
 TEST_CASE("PE rotary pairs and GroupPose finite refinement survive ONNX lowering", "[model][rfdetr][onnx_lowering]") {
- const auto input = torch::arange(16,torch::kFloat).reshape({1,2,2,4}) / 10;
+ const auto input = torch::arange(16, torch::kFloat).reshape({1, 2, 2, 4}) / 10;
  const auto operation = [](const torch::Tensor& value) {
-  auto angles = value.narrow(-1,0,2).repeat_interleave(2,-1);
-  auto pairs = torch::stack({-value.slice(-1,1,4,2), value.slice(-1,0,4,2)},-1).reshape_as(value);
+  auto angles = value.narrow(-1, 0, 2).repeat_interleave(2, -1);
+  auto pairs = torch::stack({-value.slice(-1, 1, 4, 2), value.slice(-1, 0, 4, 2)}, -1).reshape_as(value);
   auto rotary = value * angles.cos() + pairs * angles.sin();
-  return rotary + value.narrow(-1,0,1).expand_as(value);
+  return rotary + value.narrow(-1, 0, 1).expand_as(value);
  };
- auto graph = trace_unary_graph(input,operation);
+ auto graph = trace_unary_graph(input, operation);
  lower_test_graph(graph);
- CHECK(torch::allclose(execute_unary_onnx(graph,input),operation(input),1e-5,1e-6));
+ CHECK(torch::allclose(execute_unary_onnx(graph, input), operation(input), 1e-5, 1e-6));
  const auto exceptional = torch::tensor({0.F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()});
- const auto finite = [](const torch::Tensor& value) { return torch::nan_to_num(value,0.,0.,0.); };
- graph = trace_unary_graph(exceptional,finite);
+ const auto finite = [](const torch::Tensor& value) { return torch::nan_to_num(value, 0., 0., 0.); };
+ graph = trace_unary_graph(exceptional, finite);
  lower_test_graph(graph);
- CHECK(torch::equal(execute_unary_onnx(graph,exceptional),finite(exceptional)));
+ CHECK(torch::equal(execute_unary_onnx(graph, exceptional), finite(exceptional)));
 }
 }  // namespace
-
 #if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
 TEST_CASE("Every official model and trained task artifact round trips through ONNX and TensorRT", "[model][rfdetr][export][upstream_oracle][cuda]") {
  namespace rf = mmltk::backend::models::rfdetr;
@@ -655,87 +654,100 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
  const support::UpstreamOracle oracle(*requested);
  const mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  support::MatcherExecutionFixture matcher;
- rf::ScopedRuntimeContext runtime_context(nullptr,0,&matcher.workspace);
+ rf::ScopedRuntimeContext runtime_context(nullptr, 0, &matcher.workspace);
  const mmltk::testsupport::ScopedTestStream stream;
- c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream.get(),0));
- const runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()),true};
+ c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream.get(), 0));
+ const runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
  for (const auto& entry : oracle.cases()) {
-  if (entry.protocol!="controlled-group2" || entry.precision != "fp32" || entry.batch != 1) continue;
+  if (entry.protocol != "controlled-group2" || entry.precision != "fp32" || entry.batch != 1) continue;
   DYNAMIC_SECTION(entry.preset << (entry.training ? " trained" : " official")) {
    const mmltk::testsupport::ScopedTempDir root("catalog-export-roundtrip");
-   const auto reference=oracle.archive(entry,0);
-   auto model=oracle.model(entry);
+   const auto reference = oracle.archive(entry, 0);
+   auto model = oracle.model(entry);
    rf::ExportOnnxRequest request;
-   request.preset_name=entry.preset;
-   request.resolution=entry.resolution;
-   request.output_path=root.path()/"model.onnx";
-   std::string expected_prefix="output/main/", input_key="input";
+   request.preset_name = entry.preset;
+   request.resolution = entry.resolution;
+   request.output_path = root.path() / "model.onnx";
+   std::string expected_prefix = "output/main/", input_key = "input";
    if (entry.training) {
     rf::TrainRequest training;
-    static_cast<rf::TrainRecipeValues&>(training.recipe)=entry.recipe;
-    training.fused_optimizer=false;
-    auto optimizer=rf::build_optimizer(model.named_parameters(),training,model.config().backbone);
-    const auto targets=support::oracle_targets(reference,entry,torch::kCUDA);
-    const auto output=model.forward({reference.tensor("input",torch::kCUDA),reference.tensor("input_mask",torch::kCUDA)},model.config().has_masks());
-    const auto criterion=support::oracle_detection(model.config());
-    const auto samples=support::oracle_samples(reference,1+output.aux_outputs.size()+static_cast<std::size_t>(output.enc_outputs.has_value()),torch::kCUDA);
-    const auto count=std::max<int64_t>(targets.all_labels.numel()*entry.groups,1);
-    const auto terms=rf::detection_loss_terms(output,targets,criterion,true,torch::tensor(static_cast<float>(count),output.main.pred_logits.options().dtype(torch::kFloat32)),samples);
-    rf::weighted_detection_loss(terms,criterion,torch::kCUDA).backward();
+    static_cast<rf::TrainRecipeValues&>(training.recipe) = entry.recipe;
+    training.fused_optimizer = false;
+    auto optimizer = rf::build_optimizer(model.named_parameters(), training, model.config().backbone);
+    const auto targets = support::oracle_targets(reference, entry, torch::kCUDA);
+    const auto output = model.forward({reference.tensor("input", torch::kCUDA), reference.tensor("input_mask", torch::kCUDA)}, model.config().has_masks());
+    const auto criterion = support::oracle_detection(model.config());
+    const auto samples = support::oracle_samples(reference, 1 + output.aux_outputs.size() + static_cast<std::size_t>(output.enc_outputs.has_value()), torch::kCUDA);
+    const auto count = std::max<int64_t>(targets.all_labels.numel() * entry.groups, 1);
+    const auto terms = rf::detection_loss_terms(output, targets, criterion, true, torch::tensor(static_cast<float>(count), output.main.pred_logits.options().dtype(torch::kFloat32)), samples);
+    rf::weighted_detection_loss(terms, criterion, torch::kCUDA).backward();
     optimizer.optimizer.clip_grad_norm_(entry.clip_max_norm);
     optimizer.optimizer.step();
-    request.weights_path=root.path()/"trained.pt";
+    request.weights_path = root.path() / "trained.pt";
     rf::DecodedNativeModelState state;
-    state.metadata=support::model_checkpoint_metadata(model,"trained-oracle-roundtrip",request.weights_path.string());
-    state.replace_entries(support::clone_normalized_model_state(model,true));
-    rf::save_native_checkpoint(request.weights_path,state);
-    expected_prefix="held/output/main/";
-    input_key="held/input";
-   } else request.weights_path=oracle.official_checkpoint(entry.preset);
+    state.metadata = support::model_checkpoint_metadata(model, "trained-oracle-roundtrip", request.weights_path.string());
+    state.replace_entries(support::clone_normalized_model_state(model, true));
+    rf::save_native_checkpoint(request.weights_path, state);
+    expected_prefix = "held/output/main/";
+    input_key = "held/input";
+   } else
+    request.weights_path = oracle.official_checkpoint(entry.preset);
    // Both official and trained paths re-admit a persisted artifact through
    // the production exporter, including named class/joint contract metadata.
    rf::export_onnx(request);
-   const auto metadata=rf::load_onnx_model_info(request.output_path);
+   const auto metadata = rf::load_onnx_model_info(request.output_path);
    REQUIRE(metadata.output_contract);
-   CHECK(metadata.output_contract->task==model.config().task);
-   CHECK(metadata.output_contract->keypoints_per_class==model.config().keypoints_per_class);
+   CHECK(metadata.output_contract->task == model.config().task);
+   CHECK(metadata.output_contract->keypoints_per_class == model.config().keypoints_per_class);
    REQUIRE(metadata.class_layout);
    CHECK(rf::ResolvedClassLayout(*metadata.class_layout).catalog()->ordered_equal(*model.class_layout()->catalog()));
-   const auto engine_path=root.path()/"model.engine";
+   const auto engine_path = root.path() / "model.engine";
    {
-    runtime::TensorRtEngine engine(request.output_path,{.allow_fp16=false,.allow_tf32=false});
+    runtime::TensorRtEngineOptions engine_options{};
+    engine_options.allow_fp16 = false;
+    engine_options.allow_tf32 = false;
+    runtime::TensorRtEngine engine(request.output_path, engine_options);
     REQUIRE_FALSE(engine.cancelled());
     engine.Save(engine_path);
    }
-   const auto input=reference.tensor(input_key,torch::kCUDA).contiguous();
-   const auto buffer=[](const torch::Tensor& tensor) {
+   const auto input = reference.tensor(input_key, torch::kCUDA).contiguous();
+   const auto buffer = [](const torch::Tensor& tensor) {
     runtime::RuntimeTensorBuffer result;
-    result.device_data=tensor.data_ptr(); result.capacity_bytes=tensor.nbytes(); result.shape.rank=tensor.dim();
-    std::copy(tensor.sizes().begin(),tensor.sizes().end(),result.shape.extents.begin());
+    result.device_data = tensor.data_ptr();
+    result.capacity_bytes = tensor.nbytes();
+    result.shape.rank = static_cast<std::uint8_t>(tensor.dim());
+    std::copy(tensor.sizes().begin(), tensor.sizes().end(), result.shape.extents.begin());
     return result;
    };
-   for (const auto kind : {runtime::RuntimeBackendKind::Onnx,runtime::RuntimeBackendKind::TensorRt}) {
-    auto backend=runtime::make_runtime_backend({.kind=kind,.model_path=kind==runtime::RuntimeBackendKind::Onnx?request.output_path:engine_path,.device=0,.command_stream=command,.allow_fp16=false});
-    const auto& info=backend->model_info();
-    REQUIRE(info.output_count==rf::RfdetrOutputSchema::count(model.config().task));
+   for (const auto kind : {runtime::RuntimeBackendKind::Onnx, runtime::RuntimeBackendKind::TensorRt}) {
+    runtime::RuntimeBackendOptions backend_options{};
+    backend_options.kind = kind;
+    backend_options.model_path = kind == runtime::RuntimeBackendKind::Onnx ? request.output_path : engine_path;
+    backend_options.device = 0;
+    backend_options.command_stream = command;
+    backend_options.allow_fp16 = false;
+    auto backend = runtime::make_runtime_backend(backend_options);
+    const auto& info = backend->model_info();
+    REQUIRE(info.output_count == rf::RfdetrOutputSchema::count(model.config().task));
     std::vector<torch::Tensor> values;
     std::vector<runtime::RuntimeTensorBuffer> outputs;
-    for (std::size_t index=0;index<info.output_count;++index) {
-     const auto& name=info.outputs[index].name;
-     REQUIRE(rf::RfdetrOutputSchema::canonical_role(name)!=rf::RfdetrOutputRole::Unspecified);
-     const auto expected=reference.tensor(expected_prefix+name);
-     values.push_back(torch::empty(expected.sizes(),input.options()));
+    for (std::size_t index = 0; index < info.output_count; ++index) {
+     const auto& name = info.outputs[index].name;
+     REQUIRE(rf::RfdetrOutputSchema::canonical_role(name) != rf::RfdetrOutputRole::Unspecified);
+     const auto expected = reference.tensor(expected_prefix + name);
+     values.push_back(torch::empty(expected.sizes(), input.options()));
      outputs.push_back(buffer(values.back()));
     }
-    support::OracleComparison comparison(*requested,"export-"+entry.id+"-"+std::to_string(static_cast<int>(kind)),torch::kFloat32,"persisted artifact export and runtime against actual upstream task tensors");
-    for (int pass=0;pass<2;++pass) {
-     auto receipt=backend->Run(buffer(input),outputs,{},{},{});
+    support::OracleComparison comparison(
+     *requested, "export-" + entry.id + "-" + std::to_string(static_cast<int>(kind)), torch::kFloat32, "persisted artifact export and runtime against actual upstream task tensors");
+    for (int pass = 0; pass < 2; ++pass) {
+     auto receipt = backend->Run(buffer(input), outputs, {}, {}, {});
      backend->ReleaseAfterCompletion(std::move(receipt));
-     REQUIRE(cudaStreamSynchronize(stream.get())==cudaSuccess);
-     for (std::size_t index=0;index<info.output_count;++index)
-      comparison.compare("output/"+info.outputs[index].name,values[index],reference.tensor(expected_prefix+info.outputs[index].name),support::OracleComparisonPolicy::Value);
+     REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+     for (std::size_t index = 0; index < info.output_count; ++index)
+      comparison.compare("output/" + info.outputs[index].name, values[index], reference.tensor(expected_prefix + info.outputs[index].name), support::OracleComparisonPolicy::Value);
     }
-    REQUIRE(backend->Close()==runtime::kRuntimeSuccess);
+    REQUIRE(backend->Close() == runtime::kRuntimeSuccess);
    }
   }
  }

@@ -171,7 +171,9 @@ public:
   level_start_index_ = torch::cat({spatial_shapes_.new_zeros({1}), spatial_shapes_.prod(1).cumsum(0).slice(0, 0, -1)}).contiguous();
   offset_normalizer_ = torch::stack({spatial_shapes_.select(1, 1), spatial_shapes_.select(1, 0)}, -1).to(device_, scalar_type_, false, true).contiguous();
  }
- bool compatible(const std::vector<int64_t>& shape_values, const torch::Device& device, const c10::ScalarType scalar_type) const { return shape_values_ == shape_values && device_ == device && scalar_type_ == scalar_type; }
+ bool compatible(const std::vector<int64_t>& shape_values, const torch::Device& device, const c10::ScalarType scalar_type) const {
+  return shape_values_ == shape_values && device_ == device && scalar_type_ == scalar_type;
+ }
  void require_compatible(const std::vector<int64_t>& shape_values, const torch::Device& device, const c10::ScalarType scalar_type) const {
   if (shape_values_ != shape_values) throw std::invalid_argument("RF-DETR feature layout changed after static construction");
   if (device_ != device || scalar_type_ != scalar_type) throw std::invalid_argument("RF-DETR feature layout has one fixed device projection");
@@ -264,7 +266,8 @@ TORCH_MODULE(MSDeformAttn);
 class NativeDecoderLayerImpl : public torch::nn::Module {
 public:
  bool force_math_attention_ = false;
- NativeDecoderLayerImpl(int64_t d_model, int64_t sa_nhead, int64_t ca_nhead, int64_t dim_feedforward, int64_t num_feature_levels, int64_t dec_n_points, const NativeRfDetrConfig* keypoint_config = nullptr)
+ NativeDecoderLayerImpl(
+  int64_t d_model, int64_t sa_nhead, int64_t ca_nhead, int64_t dim_feedforward, int64_t num_feature_levels, int64_t dec_n_points, const NativeRfDetrConfig* keypoint_config = nullptr)
      : self_attn(register_module("self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(d_model, sa_nhead).dropout(0.0)))),
        norm1(register_module("norm1", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))),
        cross_attn(register_module("cross_attn", MSDeformAttn(d_model, num_feature_levels, ca_nhead, dec_n_points))),
@@ -281,11 +284,13 @@ public:
     inst_out_proj = register_module("inst_out_proj", torch::nn::Linear(width, d_model));
     memory_in_proj = register_module("memory_in_proj", torch::nn::Linear(d_model, width));
    }
-   kp_inst_self_attn = register_module("kp_inst_self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(width, std::max<int64_t>(1, sa_nhead / config.keypoint_dimension_downscale)).dropout(0.0)));
+   kp_inst_self_attn =
+    register_module("kp_inst_self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(width, std::max<int64_t>(1, sa_nhead / config.keypoint_dimension_downscale)).dropout(0.0)));
    kp_inst_norm = register_module("kp_inst_norm", torch::nn::LayerNorm(std::vector<int64_t>{d_model}));
    kp_norm = register_module("kp_norm", torch::nn::LayerNorm(std::vector<int64_t>{width}));
    if (config.inter_instance_keypoint_attention) {
-    inter_inst_kp_attn = register_module("inter_inst_kp_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(width, std::max<int64_t>(1, ca_nhead / config.keypoint_dimension_downscale)).dropout(0.0)));
+    inter_inst_kp_attn = register_module(
+     "inter_inst_kp_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(width, std::max<int64_t>(1, ca_nhead / config.keypoint_dimension_downscale)).dropout(0.0)));
     inter_inst_kp_norm = register_module("inter_inst_kp_norm", torch::nn::LayerNorm(std::vector<int64_t>{width}));
    }
    if (config.keypoint_cross_attention) {
@@ -299,7 +304,8 @@ public:
   }
  }
  torch::Tensor forward(const torch::Tensor& tgt, const torch::Tensor& memory, const torch::Tensor& memory_key_padding_mask, const torch::Tensor& query_pos, const torch::Tensor& reference_points,
-  const FeatureLayout& feature_layout, const DecoderQueryLayout& query_layout, torch::Tensor* keypoints = nullptr, const torch::Tensor& keypoint_position = {}, const torch::Tensor& keypoint_mask = {}, const torch::Tensor& keypoint_memory = {}) {
+  const FeatureLayout& feature_layout, const DecoderQueryLayout& query_layout, torch::Tensor* keypoints = nullptr, const torch::Tensor& keypoint_position = {}, const torch::Tensor& keypoint_mask = {},
+  const torch::Tensor& keypoint_memory = {}) {
   const auto attended = isolated_group_self_attention(self_attn, tgt, query_pos, query_layout, force_math_attention_);
   auto output = norm1->forward(tgt + attended);
   auto cross = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
@@ -311,9 +317,9 @@ public:
    const auto instance = project(inst_in_proj, output), position = project(inst_pos_in_proj, query_pos);
    auto combined = torch::cat({instance.unsqueeze(2), joints}, 2).reshape({batch * queries, count + 1, width});
    auto positions = torch::cat({torch::zeros_like(instance).unsqueeze(2), keypoint_position}, 2).reshape({batch * queries, count + 1, width});
-   auto attended = keypoint_self_attention(kp_inst_self_attn, combined, positions, keypoint_mask, force_math_attention_).reshape({batch, queries, count + 1, width});
-   output = kp_inst_norm->forward(output + project(inst_out_proj, attended.select(2, 0)) * instance_kp_layer_scale);
-   joints = kp_norm->forward(joints + attended.narrow(2, 1, count));
+   auto attended_keypoints = keypoint_self_attention(kp_inst_self_attn, combined, positions, keypoint_mask, force_math_attention_).reshape({batch, queries, count + 1, width});
+   output = kp_inst_norm->forward(output + project(inst_out_proj, attended_keypoints.select(2, 0)) * instance_kp_layer_scale);
+   joints = kp_norm->forward(joints + attended_keypoints.narrow(2, 1, count));
    if (inter_inst_kp_attn) {
     auto swapped = joints.transpose(1, 2).reshape({batch * count, queries, width});
     auto swapped_position = position.unsqueeze(1).expand({batch, count, queries, width}).reshape({batch * count, queries, width});
@@ -322,7 +328,9 @@ public:
    }
    if (kp_cross_attn) {
     auto query = (joints + position.unsqueeze(2)).reshape({batch, queries * count, width});
-    auto references = reference_points.unsqueeze(2).expand({batch, queries, count, reference_points.size(2), reference_points.size(3)}).reshape({batch, queries * count, reference_points.size(2), reference_points.size(3)});
+    auto references = reference_points.unsqueeze(2)
+                       .expand({batch, queries, count, reference_points.size(2), reference_points.size(3)})
+                       .reshape({batch, queries * count, reference_points.size(2), reference_points.size(3)});
     auto attended_joints = kp_cross_attn->forward(query, references, project(memory_in_proj, keypoint_memory.defined() ? keypoint_memory : memory), feature_layout, memory_key_padding_mask);
     joints = kp_cross_attn_norm->forward(joints + attended_joints.reshape({batch, queries, count, width}));
    }
@@ -391,7 +399,8 @@ public:
  }
  void set_bbox_embed(const std::shared_ptr<RfDetrMlpImpl>& bbox_embed) { bbox_embed_ = bbox_embed; }
  std::pair<torch::Tensor, torch::Tensor> forward(const torch::Tensor& tgt, const torch::Tensor& memory, const torch::Tensor& memory_key_padding_mask, const torch::Tensor& pos,
-  const torch::Tensor& refpoints_unsigmoid, const FeatureLayout& feature_layout, const torch::Tensor& valid_ratios, const DecoderQueryLayout& query_layout, torch::Tensor keypoints, torch::Tensor& keypoint_states, const torch::Tensor& keypoint_memory) {
+  const torch::Tensor& refpoints_unsigmoid, const FeatureLayout& feature_layout, const torch::Tensor& valid_ratios, const DecoderQueryLayout& query_layout, torch::Tensor keypoints,
+  torch::Tensor& keypoint_states, const torch::Tensor& keypoint_memory) {
   auto output = tgt;
   std::vector<torch::Tensor> intermediate_keypoints;
   const auto positions = keypoints.defined() ? keypoint_pos_embed.unsqueeze(0).unsqueeze(0).expand_as(keypoints) : torch::Tensor{};
@@ -416,7 +425,8 @@ public:
   if (lite_refpoint_refine_) { std::tie(refpoints_input, query_pos) = get_reference(bbox_reparam_ ? refpoints : refpoints.sigmoid()); }
   for (int64_t layer_id = 0; layer_id < num_layers_; ++layer_id) {
    if (!lite_refpoint_refine_) { std::tie(refpoints_input, query_pos) = get_reference(bbox_reparam_ ? refpoints : refpoints.sigmoid()); }
-   output = layers[layer_id]->as<NativeDecoderLayer>()->forward(output, memory, memory_key_padding_mask, query_pos, refpoints_input, feature_layout, query_layout, keypoints.defined() ? &keypoints : nullptr, positions, keypoint_class_mask, keypoint_memory);
+   output = layers[layer_id]->as<NativeDecoderLayer>()->forward(
+    output, memory, memory_key_padding_mask, query_pos, refpoints_input, feature_layout, query_layout, keypoints.defined() ? &keypoints : nullptr, positions, keypoint_class_mask, keypoint_memory);
    if (keypoints.defined()) intermediate_keypoints.push_back(keypoints);
    if (!lite_refpoint_refine_ && bbox_embed_) {
     auto new_refpoints = refine(refpoints, bbox_embed_->forward(output));
@@ -505,8 +515,10 @@ public:
   }
   if (config.has_keypoints()) {
    const auto total = keypoints.compact_count();
-   keypoint_initializer = register_module(std::string(detail::kKeypointQueryAxis.module_name()), std::make_shared<detail::ConditionalQueryInitializer>(config.hidden_dim, total, config.hidden_dim / config.keypoint_dimension_downscale));
-   keypoint_initializer_enc = register_module(std::string(detail::kEncoderKeypointQueryAxis.module_name()), std::make_shared<detail::ConditionalQueryInitializer>(config.hidden_dim, total, config.hidden_dim / config.keypoint_dimension_downscale));
+   keypoint_initializer = register_module(
+    std::string(detail::kKeypointQueryAxis.module_name()), std::make_shared<detail::ConditionalQueryInitializer>(config.hidden_dim, total, config.hidden_dim / config.keypoint_dimension_downscale));
+   keypoint_initializer_enc = register_module(std::string(detail::kEncoderKeypointQueryAxis.module_name()),
+    std::make_shared<detail::ConditionalQueryInitializer>(config.hidden_dim, total, config.hidden_dim / config.keypoint_dimension_downscale));
    enc_out_keypoint_embed = register_module("enc_out_keypoint_embed", torch::nn::ModuleList());
   }
   torch::NoGradGuard no_grad;
@@ -558,7 +570,8 @@ public:
   return torch::cat(logits, 1);
  }
  NativeTransformerOutput forward(const std::vector<torch::Tensor>& srcs, const std::vector<torch::Tensor>& masks, const std::vector<torch::Tensor>& pos_embeds, const torch::Tensor& refpoint_embed,
-  const torch::Tensor& query_feat, bool training_mode, const DenoisingQueryBatch* denoising, TrainingSupervisionImpl* supervision, const torch::Tensor& keypoint_features, std::vector<torch::Tensor>* encoder_indices = nullptr) {
+  const torch::Tensor& query_feat, bool training_mode, const DenoisingQueryBatch* denoising, TrainingSupervisionImpl* supervision, const torch::Tensor& keypoint_features,
+  std::vector<torch::Tensor>* encoder_indices = nullptr) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_transformer{"rfdetr.model.transformer"};
   if (srcs.empty()) { throw std::runtime_error("RF-DETR transformer requires at least one source feature"); }
   const int64_t batch = srcs.front().size(0);
@@ -675,8 +688,8 @@ public:
    }
    if (denoising != nullptr) { supervision->begin_denoising_decoder_timing(); }
    try {
-    std::tie(hidden_states, refs_unsigmoid) =
-     decoder->forward(tgt, memory, mask_flatten_tensor, lvl_pos_embed_flatten, decoder_refpoints, layout, valid_ratios_tensor.to(memory.dtype()), query_layout, keypoint_initializer ? keypoint_initializer->forward(tgt) : torch::Tensor{}, keypoint_hidden_states, keypoint_memory);
+    std::tie(hidden_states, refs_unsigmoid) = decoder->forward(tgt, memory, mask_flatten_tensor, lvl_pos_embed_flatten, decoder_refpoints, layout, valid_ratios_tensor.to(memory.dtype()), query_layout,
+     keypoint_initializer ? keypoint_initializer->forward(tgt) : torch::Tensor{}, keypoint_hidden_states, keypoint_memory);
    } catch (...) {
     if (denoising != nullptr) { supervision->end_denoising_decoder_timing(); }
     throw;
@@ -696,8 +709,10 @@ public:
 private:
  [[nodiscard]] std::shared_ptr<const FeatureLayout> feature_layout(const std::vector<int64_t>& spatial_shape_values, const torch::Device& device, const c10::ScalarType scalar_type) {
   std::lock_guard lock(feature_layout_mutex_);
-  if (!feature_layout_ || (config_.backbone.kind == BackboneKind::PeCoreTiny && !feature_layout_->compatible(spatial_shape_values, device, scalar_type))) feature_layout_ = std::make_shared<const FeatureLayout>(spatial_shape_values, device, scalar_type);
-  else feature_layout_->require_compatible(spatial_shape_values, device, scalar_type);
+  if (!feature_layout_ || (config_.backbone.kind == BackboneKind::PeCoreTiny && !feature_layout_->compatible(spatial_shape_values, device, scalar_type)))
+   feature_layout_ = std::make_shared<const FeatureLayout>(spatial_shape_values, device, scalar_type);
+  else
+   feature_layout_->require_compatible(spatial_shape_values, device, scalar_type);
   return feature_layout_;
  }
  std::shared_ptr<NativeDecoderImpl> decoder;
@@ -739,7 +754,8 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
   keypoint_embed_ = register_module("keypoint_embed", std::make_shared<RfDetrMlpImpl>(width, width, KeypointPredictionPacket::size, 3));
   keypoint_active_mask_ = register_buffer("_kp_active_mask", keypoint_layout_.active_mask());
   torch::NoGradGuard guard;
-  for (auto& parameter : keypoint_embed_->named_parameters()) if (parameter.key().starts_with("layers.2.")) parameter.value().zero_();
+  for (auto& parameter : keypoint_embed_->named_parameters())
+   if (parameter.key().starts_with("layers.2.")) parameter.value().zero_();
   std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->initialize_keypoint_heads(*keypoint_embed_);
  }
  torch::NoGradGuard no_grad;
@@ -758,7 +774,8 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
   // Excluding them from the active optimizer inventory also avoids invented moments.
   for (auto& parameter : named_parameters()) {
    const auto& name = parameter.key();
-   if (name.starts_with("class_embed.") || name.starts_with("bbox_embed.") || name == kQueryFeatureWeight || name == kReferencePointWeight || name.starts_with("transformer.decoder.")) parameter.value().set_requires_grad(false);
+   if (name.starts_with("class_embed.") || name.starts_with("bbox_embed.") || name == kQueryFeatureWeight || name == kReferencePointWeight || name.starts_with("transformer.decoder."))
+    parameter.value().set_requires_grad(false);
   }
  }
  if (training_supervision_enabled(config_.training_supervision)) {
@@ -778,7 +795,9 @@ std::vector<detail::ClassTensorAxis> NativeRfDetrModel::Impl::class_axes() const
  detail::kDecoderClassAxis.AppendParameters(axes, *class_embed);
  std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->append_class_axes(axes);
  if (training_supervision_) training_supervision_->append_class_axes(axes);
- for (const auto& parameter : named_parameters()) if (const auto shape = detail::class_tensor_shape(parameter.key()); shape && shape->coordinates == detail::ClassTensorCoordinates::NamedJoints) axes.push_back({parameter.key(), shape->dimension, shape->coordinates});
+ for (const auto& parameter : named_parameters())
+  if (const auto shape = detail::class_tensor_shape(parameter.key()); shape && shape->coordinates == detail::ClassTensorCoordinates::NamedJoints)
+   axes.push_back({parameter.key(), shape->dimension, shape->coordinates});
  return axes;
 }
 std::shared_ptr<torch::nn::Module> test_support::DecoderTailTestAccess::make(int64_t width, int64_t feedforward) { return std::make_shared<NativeDecoderLayerImpl>(width, 2, 2, feedforward, 1, 2); }
@@ -936,7 +955,9 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
    srcs.push_back(feature.tensors);
    feature_masks.push_back(feature.mask);
    auto& positions = backbone_->at<PositionEmbeddingSineImpl>(1);
-   poss.push_back(config_.backbone.kind == BackboneKind::PeCoreTiny ? positions.forward_mask(feature.mask) : positions.forward_full_valid(feature.tensors.size(0), feature.tensors.size(2), feature.tensors.size(3), feature.tensors.device()));
+   poss.push_back(config_.backbone.kind == BackboneKind::PeCoreTiny
+                   ? positions.forward_mask(feature.mask)
+                   : positions.forward_full_valid(feature.tensors.size(0), feature.tensors.size(2), feature.tensors.size(3), feature.tensors.device()));
   }
  }
  const int64_t active_query_count = is_training() ? config_.num_queries * std::max(1, config_.group_detr) : config_.num_queries;
@@ -1064,8 +1085,10 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
     enc_output.pred_masks = segmentation_head->forward(features.front().tensors, {transformed.enc_memory}, {samples.tensors.size(2), samples.tensors.size(3)}, true)[0];
    }
   }
-  if (config_.dec_layers == 0) outputs.main = std::move(enc_output);
-  else outputs.enc_outputs = std::move(enc_output);
+  if (config_.dec_layers == 0)
+   outputs.main = std::move(enc_output);
+  else
+   outputs.enc_outputs = std::move(enc_output);
  }
  return outputs;
 }
@@ -1075,7 +1098,9 @@ ModelStateLoadSummary NativeRfDetrModel::Impl::load_normalized_state(const std::
  if (training_supervision_ && next_layout->record() != layout_->record()) throw std::invalid_argument("active supervision checkpoint requires the exact admitted layout");
  if (config_.has_keypoints()) {
   keypoint_layout_.require_class_layout(*next_layout);
-  if (layout_->semantic() && (next_layout->record().foreground != layout_->record().foreground || next_layout->record().slots != layout_->record().slots || next_layout->record().scores != layout_->record().scores || next_layout->record().no_object != layout_->record().no_object)) throw std::invalid_argument("exact keypoint loading requires the admitted class and joint schema");
+  if (layout_->semantic() && (next_layout->record().foreground != layout_->record().foreground || next_layout->record().slots != layout_->record().slots ||
+                              next_layout->record().scores != layout_->record().scores || next_layout->record().no_object != layout_->record().no_object))
+   throw std::invalid_argument("exact keypoint loading requires the admitted class and joint schema");
  }
  auto candidate = stage_normalized_state(state, strict ? detail::NormalizedModelStateAdmission::Exact : detail::NormalizedModelStateAdmission::PartialExact);
  auto summary = candidate.summary;
@@ -1123,11 +1148,13 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
  std::vector<std::pair<std::int64_t, std::int64_t>> foreground_matches, output_matches, joint_matches;
  std::optional<KeypointTensorLayout> source_keypoints;
  if (config_.has_keypoints()) {
-  const auto mask = std::ranges::find(state, "_kp_active_mask", &NormalizedModelStateEntry::name);
+  const auto mask = std::ranges::find(state, std::string_view("_kp_active_mask"), &NormalizedModelStateEntry::name);
   if (mask == state.end()) throw std::invalid_argument("keypoint state is missing its active mask");
   source_keypoints.emplace(KeypointTensorLayout::from_active_mask(mask->tensor));
-  if (transfer) joint_matches = keypoint_transfer_rows(*source_layout, *source_keypoints, *layout_, keypoint_layout_);
-  else if (!std::ranges::equal(source_keypoints->counts(), keypoint_layout_.counts())) throw std::invalid_argument("exact keypoint state requires the admitted joint counts");
+  if (transfer)
+   joint_matches = keypoint_transfer_rows(*source_layout, *source_keypoints, *layout_, keypoint_layout_);
+  else if (!std::ranges::equal(source_keypoints->counts(), keypoint_layout_.counts()))
+   throw std::invalid_argument("exact keypoint state requires the admitted joint counts");
  }
  if (transfer && source_layout->semantic()) {
   std::vector<std::int64_t> source_slots(source_layout->catalog()->size());
@@ -1157,8 +1184,7 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
   if (destination == nullptr) {
    // Upstream registers this inactive detector buffer even without keypoints.
    // Accept only its exact empty form on models without a keypoint owner.
-   if (entry.name == "_kp_active_mask" && entry.tensor.defined() && entry.tensor.scalar_type() == torch::kBool &&
-       entry.tensor.dim() == 2 && entry.tensor.size(0) == 0 && entry.tensor.size(1) == 0)
+   if (entry.name == "_kp_active_mask" && entry.tensor.defined() && entry.tensor.scalar_type() == torch::kBool && entry.tensor.dim() == 2 && entry.tensor.size(0) == 0 && entry.tensor.size(1) == 0)
     continue;
    if ((admission == detail::NormalizedModelStateAdmission::RequiredCore || (admission == detail::NormalizedModelStateAdmission::FreshTransfer && !training_supervision_)) &&
        entry.name.starts_with("training_supervision."))
@@ -1173,10 +1199,12 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
   torch::Tensor source = entry.tensor;
   if (entry.name == "_kp_active_mask" || entry.name == "transformer.decoder.keypoint_class_mask") {
    const auto expected = entry.name == "_kp_active_mask" ? source_keypoints->active_mask() : source_keypoints->class_mask();
-   if (!source.defined() || source.scalar_type() != torch::kBool || !torch::equal(source.to(torch::kCPU), expected)) throw std::invalid_argument("keypoint state mask disagrees with its admitted schema: " + entry.name);
+   if (!source.defined() || source.scalar_type() != torch::kBool || !torch::equal(source.to(torch::kCPU), expected))
+    throw std::invalid_argument("keypoint state mask disagrees with its admitted schema: " + entry.name);
    if (transfer) source = destination->detach().clone();
   }
-  if (source.defined() && (source.is_floating_point() != destination->is_floating_point() || (!source.is_floating_point() && source.scalar_type() != destination->scalar_type()))) throw std::invalid_argument("checkpoint tensor dtype disagrees with its role: " + entry.name);
+  if (source.defined() && (source.is_floating_point() != destination->is_floating_point() || (!source.is_floating_point() && source.scalar_type() != destination->scalar_type())))
+   throw std::invalid_argument("checkpoint tensor dtype disagrees with its role: " + entry.name);
   if (transfer) {
    if (const auto found = axis_by_name.find(entry.name); found != axis_by_name.end()) {
     const auto& axis = *found->second;

@@ -41,11 +41,14 @@ void GalleryDescriptorStorage::PrepareDescriptors(const std::size_t cards, const
   diagnostics, device, generation);
  ensure_gallery_buffer(storage_.buffers_.tiles_device_, std::max<std::size_t>(tiles * sizeof(explore::ExploreRenderTileDescriptor), 1U), "Explore tile descriptor high-water allocation failed",
   diagnostics, device, generation);
- ensure_gallery_buffer(storage_.buffers_.joints_device_, std::max<std::size_t>(joints * sizeof(data::PackedKeypoint), 1U), "Explore joint descriptor allocation failed", diagnostics, device, generation);
- ensure_gallery_buffer(storage_.buffers_.edges_device_, std::max<std::size_t>(layout.edges.count * sizeof(explore::detail::ExploreRenderEdgeAbi), 1U), "Explore skeleton edge allocation failed", diagnostics, device, generation);
+ ensure_gallery_buffer(
+  storage_.buffers_.joints_device_, std::max<std::size_t>(joints * sizeof(data::PackedKeypoint), 1U), "Explore joint descriptor allocation failed", diagnostics, device, generation);
+ ensure_gallery_buffer(storage_.buffers_.edges_device_, std::max<std::size_t>(layout.edges.count * sizeof(explore::detail::ExploreRenderEdgeAbi), 1U), "Explore skeleton edge allocation failed",
+  diagnostics, device, generation);
  for (std::size_t category = 0; category < classes; ++category) {
   auto offset = class_edges_[category].offset;
-  for (const auto& edge : catalog.keypoints(category).skeleton) store_payload(storage_.buffers_.descriptors_.data(), layout.edges.offset + offset++ * sizeof(explore::detail::ExploreRenderEdgeAbi), explore::detail::ExploreRenderEdgeAbi{edge.first, edge.second});
+  for (const auto& edge : catalog.keypoints(category).skeleton)
+   store_payload(storage_.buffers_.descriptors_.data(), layout.edges.offset + offset++ * sizeof(explore::detail::ExploreRenderEdgeAbi), explore::detail::ExploreRenderEdgeAbi{edge.first, edge.second});
  }
  descriptor_layout_ = layout;
 }

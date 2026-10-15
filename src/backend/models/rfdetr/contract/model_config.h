@@ -42,7 +42,7 @@ struct NativeRfDetrConfig {
  bool keypoint_cross_attention = true;
  bool inter_instance_keypoint_attention = false;
  // Counts index physical classifier slots; at most 256 slots own foreground schemas.
- MMLTK_MAX_ITEMS(kMaximumClassOutputSlots) std::vector<std::uint16_t> keypoints_per_class;
+ MMLTK_MAX_ITEMS(kMaximumClassOutputSlots) std::vector<std::uint16_t> keypoints_per_class {};
  int num_classes = 0;
  int num_queries = 0;
  int num_select = 0;

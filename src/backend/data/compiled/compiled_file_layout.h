@@ -45,8 +45,8 @@ struct AnnotationLayout {
 struct ImageAnnotations {
  std::span<const PackedInstance> labels;
  std::span<const RLEPair> runs;
- std::span<const PackedJointSpan> joint_spans;
- std::span<const PackedKeypoint> joints;
+ std::span<const PackedJointSpan> joint_spans{};
+ std::span<const PackedKeypoint> joints{};
  void validate_joints(const catalog::ClassCatalog* schema = nullptr) const;
  [[nodiscard]] std::span<const PackedKeypoint> instance_joints(std::size_t instance) const;
  [[nodiscard]] std::span<const RLEPair> instance_rle(const PackedInstance& instance) const;

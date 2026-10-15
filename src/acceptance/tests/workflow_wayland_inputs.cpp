@@ -67,9 +67,13 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root, 
     // publication interval, rather than observing only epoch-boundary records.
     : fixture_{.root_dir = root.string(), .split = "train", .width = 128, .height = 64, .num_images = 256, .background_images = 0, .pixel_evidence = true},
       weights_(root / "workflow.pt"),
-      video_(root / "workflow.y4m"), keypoints_(keypoints) {
- if (keypoints_) { fixture_.num_images = 8; data::testsupport::create_keypoint_dataset(fixture_); }
- else data::testsupport::create_synthetic_dataset(fixture_);
+      video_(root / "workflow.y4m"),
+      keypoints_(keypoints) {
+ if (keypoints_) {
+  fixture_.num_images = 8;
+  data::testsupport::create_keypoint_dataset(fixture_);
+ } else
+  data::testsupport::create_synthetic_dataset(fixture_);
  const auto plan = data::DatasetCompiler::prepare({.source_dir = data::testsupport::dataset_dir(fixture_),
                                                    .output_dir = data::testsupport::compiled_dir(fixture_),
                                                    .split = fixture_.split,
@@ -89,7 +93,8 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root, 
   config.keypoint_head = rfdetr::KeypointHeadKind::GroupPose;
   config.projector = rfdetr::ProjectorKind::DualKeypointOnly;
   config.keypoints_per_class.assign(config.num_classes, 0);
-  for (std::size_t index = 0; index < compiled.class_catalog()->size(); ++index) config.keypoints_per_class[index] = compiled.class_catalog()->keypoints(index).names.size();
+  for (std::size_t index = 0; index < compiled.class_catalog()->size(); ++index)
+   config.keypoints_per_class[index] = static_cast<std::uint16_t>(compiled.class_catalog()->keypoints(index).names.size());
   config.keypoint_l1_loss_coef = config.keypoint_findable_loss_coef = config.keypoint_visible_loss_coef = config.keypoint_nll_loss_coef = 1;
  }
  rfdetr::NativeRfDetrModel model{config, rfdetr::native_training_class_layout(*compiled.class_catalog())};
@@ -113,7 +118,10 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root, 
   rfdetr::save_native_checkpoint(alternate_weights, checkpoint);
   alternate_ = root / "alternate.onnx";
   rfdetr::ExportOnnxRequest request;
-  request.weights_path = alternate_weights; request.output_path = alternate_; request.preset_name = config.preset_name; request.resolution = config.resolution;
+  request.weights_path = alternate_weights;
+  request.output_path = alternate_;
+  request.preset_name = config.preset_name;
+  request.resolution = config.resolution;
   rfdetr::export_onnx(request);
  }
  std::ofstream video{video_, std::ios::binary};
@@ -196,8 +204,8 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
   predict.request.allow_fp16 = false;
  }
 }
-void WorkflowWaylandInputs::VerifyCatalogTraining(const std::filesystem::path& session_root, const std::filesystem::path& output, const std::filesystem::path& checkpoint,
- std::string_view run_id, std::string_view preset_name) const {
+void WorkflowWaylandInputs::VerifyCatalogTraining(
+ const std::filesystem::path& session_root, const std::filesystem::path& output, const std::filesystem::path& checkpoint, std::string_view run_id, std::string_view preset_name) const {
  if (!keypoints_) throw std::logic_error("catalog keypoint evidence requires its retained dataset fixture");
  const auto root = std::filesystem::canonical(session_root);
  const auto inside = [&](const std::filesystem::path& path) {
@@ -215,11 +223,13 @@ void WorkflowWaylandInputs::VerifyCatalogTraining(const std::filesystem::path& s
  if (!stream.read(text.data(), static_cast<std::streamsize>(text.size()))) throw std::runtime_error("catalog training manifest read failed");
  const auto run = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingRun>(text, {.max_bytes = rfdetr::kTrainingManifestBytes, .max_items = 65536, .max_depth = 32});
  const auto* preset = rfdetr::find_preset_catalog_entry(preset_name);
- if (!preset || preset->task != rfdetr::ModelTask::Keypoints || run.run_id != run_id || run.configuration.preset_name != preset_name || run.configuration.resolution != static_cast<int>(preset->resolution)
-     || run.configuration.epochs != 1 || !run.configuration.resume_path.empty() || run.configuration.weights_path != run.original_weights || run.original_weights == weights_
-     || std::filesystem::path(run.original_weights).filename() != preset->canonical_weight_filename) throw std::runtime_error("catalog training did not operate the selected ordinary weights/configuration");
+ if (!preset || preset->task != rfdetr::ModelTask::Keypoints || run.run_id != run_id || run.configuration.preset_name != preset_name ||
+     run.configuration.resolution != static_cast<int>(preset->resolution) || run.configuration.epochs != 1 || !run.configuration.resume_path.empty() ||
+     run.configuration.weights_path != run.original_weights || run.original_weights == weights_ || std::filesystem::path(run.original_weights).filename() != preset->canonical_weight_filename)
+  throw std::runtime_error("catalog training did not operate the selected ordinary weights/configuration");
  const auto compiled = data::CompiledDataset::open(run.configuration.train_compiled_path.is_absolute() ? run.configuration.train_compiled_path : root / run.configuration.train_compiled_path);
- if (compiled.header().image_width != preset->resolution || compiled.header().image_height != preset->resolution) throw std::runtime_error("catalog training input resolution differs from the selected model");
+ if (compiled.header().image_width != preset->resolution || compiled.header().image_height != preset->resolution)
+  throw std::runtime_error("catalog training input resolution differs from the selected model");
  const auto digest = mmltk::common::io::try_file_digests(run.original_weights, true);
  if (!digest || digest->md5 != preset->canonical_weight_md5) throw std::runtime_error("catalog training original weights lost their canonical hash");
  auto expected = rfdetr::native_config_from_preset(*preset);
@@ -252,38 +262,57 @@ void WorkflowWaylandInputs::VerifyCatalogTraining(const std::filesystem::path& s
   throw std::runtime_error("completed checkpoint lost catalog model or admitted query identity");
 }
 WorkflowArtifactMutation::WorkflowArtifactMutation(const std::filesystem::path& root, std::filesystem::path alternate)
- : artifact_(std::filesystem::absolute(root / "export" / "model.onnx").lexically_normal()), backup_(artifact_.string() + ".acceptance-retained"), alternate_(std::move(alternate)) {}
+    : artifact_(std::filesystem::absolute(root / "export" / "model.onnx").lexically_normal()), backup_(artifact_.string() + ".acceptance-retained"), alternate_(std::move(alternate)) {}
 WorkflowArtifactMutation::~WorkflowArtifactMutation() { Restore(); }
 void WorkflowArtifactMutation::Restore() noexcept {
  if (!held_) return;
  std::error_code error;
  if (companion_) {
   std::filesystem::rename(backup_.string() + ".classes.json", artifact_.string() + ".classes.json", error);
-  if (error) { std::fprintf(stderr, "acceptance artifact companion restore failed: %s\n", error.message().c_str()); return; }
+  if (error) {
+   std::fprintf(stderr, "acceptance artifact companion restore failed: %s\n", error.message().c_str());
+   return;
+  }
   companion_ = false;
   replacement_companion_ = false;
  } else if (replacement_companion_) {
   std::filesystem::remove(artifact_.string() + ".classes.json", error);
-  if (error) { std::fprintf(stderr, "acceptance replacement companion removal failed: %s\n", error.message().c_str()); return; }
+  if (error) {
+   std::fprintf(stderr, "acceptance replacement companion removal failed: %s\n", error.message().c_str());
+   return;
+  }
   replacement_companion_ = false;
  }
  std::filesystem::rename(backup_, artifact_, error);
- if (error) { std::fprintf(stderr, "acceptance artifact restore failed: %s\n", error.message().c_str()); return; }
+ if (error) {
+  std::fprintf(stderr, "acceptance artifact restore failed: %s\n", error.message().c_str());
+  return;
+ }
  held_ = false;
 }
 void WorkflowArtifactMutation::Apply(std::uint32_t index) {
  if (index != next_) throw std::logic_error("acceptance artifact mutation order");
- if (index == 1) { Restore(); if (held_) throw std::runtime_error("acceptance artifact restore incomplete"); }
- else if (index == 0 || index == 2) {
+ if (index == 1) {
+  Restore();
+  if (held_) throw std::runtime_error("acceptance artifact restore incomplete");
+ } else if (index == 0 || index == 2) {
   if (held_ || !std::filesystem::is_regular_file(artifact_) || std::filesystem::exists(backup_)) throw std::logic_error("acceptance exported artifact is unavailable");
   const bool has_companion = std::filesystem::exists(artifact_.string() + ".classes.json");
-  std::filesystem::rename(artifact_, backup_); held_ = true;
-  if (has_companion) { std::filesystem::rename(artifact_.string() + ".classes.json", backup_.string() + ".classes.json"); companion_ = true; }
+  std::filesystem::rename(artifact_, backup_);
+  held_ = true;
+  if (has_companion) {
+   std::filesystem::rename(artifact_.string() + ".classes.json", backup_.string() + ".classes.json");
+   companion_ = true;
+  }
   if (index == 2) {
    std::filesystem::copy_file(alternate_, artifact_);
-   if (std::filesystem::exists(alternate_.string() + ".classes.json")) { replacement_companion_ = true; std::filesystem::copy_file(alternate_.string() + ".classes.json", artifact_.string() + ".classes.json"); }
+   if (std::filesystem::exists(alternate_.string() + ".classes.json")) {
+    replacement_companion_ = true;
+    std::filesystem::copy_file(alternate_.string() + ".classes.json", artifact_.string() + ".classes.json");
+   }
   }
- } else throw std::logic_error("unexpected acceptance artifact mutation");
+ } else
+  throw std::logic_error("unexpected acceptance artifact mutation");
  ++next_;
 }
 }  // namespace mmltk::testsupport

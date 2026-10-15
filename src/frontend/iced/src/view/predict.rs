@@ -233,13 +233,35 @@ impl Component {
             self.input
                 .for_source(crate::generated::PresentationSourceKind::Predict, 0, None),
         );
-        let workspace = column![workspace, crate::view::image_viewer::product_actions(crate::generated::FeatureId::Predict, model).map(Message::Product)].spacing(8).into();
+        let workspace = column![
+            workspace,
+            crate::view::image_viewer::product_actions(crate::generated::FeatureId::Predict, model)
+                .map(Message::Product)
+        ]
+        .spacing(8)
+        .into();
         let advanced = crate::view::shared::card(
             "Advanced",
             "Prediction thresholds and preview behavior.",
             column![
-                crate::view::shared::identified("predict.keypoints", crate::view::workflow::fields::toggle("Skeletons", draft.is_none_or(|value| value.showkeypoints), settings_edit_available, Message::KeypointsChanged)),
-                crate::view::shared::identified("predict.uncertainty", crate::view::workflow::fields::toggle("Joint uncertainty", draft.is_some_and(|value| value.showuncertainty), settings_edit_available, Message::UncertaintyChanged)),
+                crate::view::shared::identified(
+                    "predict.keypoints",
+                    crate::view::workflow::fields::toggle(
+                        "Skeletons",
+                        draft.is_none_or(|value| value.showkeypoints),
+                        settings_edit_available,
+                        Message::KeypointsChanged
+                    )
+                ),
+                crate::view::shared::identified(
+                    "predict.uncertainty",
+                    crate::view::workflow::fields::toggle(
+                        "Joint uncertainty",
+                        draft.is_some_and(|value| value.showuncertainty),
+                        settings_edit_available,
+                        Message::UncertaintyChanged
+                    )
+                ),
                 crate::view::workflow::loading::view(
                     crate::generated::FeatureId::Predict,
                     settings,
@@ -362,8 +384,16 @@ impl Component {
         let outcome = match message {
             Message::Product(action) => Outcome::Product(action),
             Message::Ignore => return Ok(None),
-            Message::KeypointsChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Immediate, |draft| crate::generated::edit_workflowspredictshowkeypoints(draft, value))?),
-            Message::UncertaintyChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Immediate, |draft| crate::generated::edit_workflowspredictshowuncertainty(draft, value))?),
+            Message::KeypointsChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
+                    crate::generated::edit_workflowspredictshowkeypoints(draft, value)
+                })?,
+            ),
+            Message::UncertaintyChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
+                    crate::generated::edit_workflowspredictshowuncertainty(draft, value)
+                })?,
+            ),
             Message::ResizeMethodChanged(value) => Outcome::SettingsEdited(
                 settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
                     crate::generated::edit_workflowspredictrequestresizemethod(draft, value)

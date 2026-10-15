@@ -18,7 +18,8 @@
 namespace mmltk::backend::models::rfdetr {
 // Uses admitted source metadata (header/catalog), file generation and model identity;
 // never scans image or annotation payloads. An empty span selects the historical header form.
-[[nodiscard]] std::string training_dataset_identity(const mmltk::backend::data::FileHeader&, const mmltk::common::io::FileSnapshot&, std::string_view configuration, std::span<const std::byte> source_metadata = {});
+[[nodiscard]] std::string training_dataset_identity(
+ const mmltk::backend::data::FileHeader&, const mmltk::common::io::FileSnapshot&, std::string_view configuration, std::span<const std::byte> source_metadata = {});
 [[nodiscard]] std::string training_configuration_identity(const NativeRfDetrConfig&, const ModelClassLayout&, std::uint32_t schema);
 [[nodiscard]] bool is_training_session_manifest(const std::filesystem::path&);
 enum class TrainingPublicationStep { Created, PlanWritten, ModelWritten, ModelValidated, Serialized, Validated, Synced, Published, Retained };

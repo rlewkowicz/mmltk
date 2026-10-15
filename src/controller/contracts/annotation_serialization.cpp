@@ -17,7 +17,8 @@ std::optional<AnnotationUiState> decode_annotation_persistence(std::span<const s
   const auto member = [](wire::Value& object, std::string_view key) -> wire::Value* {
    auto* fields = std::get_if<wire::Value::Object>(&object.storage);
    if (!fields) return nullptr;
-   for (auto& [name, field] : *fields) if (name == key) return &field;
+   for (auto& [name, field] : *fields)
+    if (name == key) return &field;
    return nullptr;
   };
   auto* scene = member(*value, "scene");
@@ -39,13 +40,14 @@ std::optional<AnnotationUiState> decode_annotation_persistence(std::span<const s
     auto* visible = std::get_if<bool>(&old->storage);
     if (!visible) return {};
     const auto converted = *visible ? mmltk::backend::data::catalog::KeypointVisibility::Visible : mmltk::backend::data::catalog::KeypointVisibility::Unannotated;
-    for (auto& [name, field] : std::get<wire::Value::Object>(joint.storage)) if (name == "visible") {
-     name = "visibility";
-     auto encoded = serial::reflected_value(converted);
-     if (!encoded) return {};
-     field = std::move(*encoded);
-     break;
-    }
+    for (auto& [name, field] : std::get<wire::Value::Object>(joint.storage))
+     if (name == "visible") {
+      name = "visibility";
+      auto encoded = serial::reflected_value(converted);
+      if (!encoded) return {};
+      field = std::move(*encoded);
+      break;
+     }
    }
   }
   AnnotationUiState state;

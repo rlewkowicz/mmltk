@@ -570,246 +570,257 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
  CHECK((history.state() == retained));
  REQUIRE_THROWS(history.commit());
 }
-
 namespace {
 void require_archive_values_equal(torch::serialize::InputArchive& actual, torch::serialize::InputArchive& expected) {
- auto actual_keys=actual.keys(), expected_keys=expected.keys();
- std::ranges::sort(actual_keys); std::ranges::sort(expected_keys);
- REQUIRE(actual_keys==expected_keys);
- for (const auto& key:expected_keys) {
+ auto actual_keys = actual.keys(), expected_keys = expected.keys();
+ std::ranges::sort(actual_keys);
+ std::ranges::sort(expected_keys);
+ REQUIRE(actual_keys == expected_keys);
+ for (const auto& key : expected_keys) {
   INFO(key);
-  torch::serialize::InputArchive a,b;
-  if (expected.try_read(key,b)) {
-   REQUIRE(actual.try_read(key,a));
-   require_archive_values_equal(a,b);
+  torch::serialize::InputArchive a, b;
+  if (expected.try_read(key, b)) {
+   REQUIRE(actual.try_read(key, a));
+   require_archive_values_equal(a, b);
   } else {
-   c10::IValue left,right;
-   actual.read(key,left); expected.read(key,right);
+   c10::IValue left, right;
+   actual.read(key, left);
+   expected.read(key, right);
    if (right.isTensor()) {
     REQUIRE(left.isTensor());
-    CHECK(torch::equal(left.toTensor(),right.toTensor()));
-   } else CHECK(left==right);
+    CHECK(torch::equal(left.toTensor(), right.toTensor()));
+   } else
+    CHECK(left == right);
   }
  }
 }
 void require_session_trajectory_equal(const r::TrainingSessionAdmission& actual, const r::TrainingSessionAdmission& expected) {
- REQUIRE(actual.model_count()==expected.model_count());
- for (std::size_t model=0;model<actual.model_count();++model) {
-  const auto& left=actual.model(model).entries();
-  const auto& right=expected.model(model).entries();
-  REQUIRE(left.size()==right.size());
-  for (std::size_t entry=0;entry<left.size();++entry) {
+ REQUIRE(actual.model_count() == expected.model_count());
+ for (std::size_t model = 0; model < actual.model_count(); ++model) {
+  const auto& left = actual.model(model).entries();
+  const auto& right = expected.model(model).entries();
+  REQUIRE(left.size() == right.size());
+  for (std::size_t entry = 0; entry < left.size(); ++entry) {
    INFO(left[entry].name);
-   REQUIRE(left[entry].name==right[entry].name);
-   CHECK(torch::equal(left[entry].tensor,right[entry].tensor));
+   REQUIRE(left[entry].name == right[entry].name);
+   CHECK(torch::equal(left[entry].tensor, right[entry].tensor));
   }
-  const auto& a=actual.continuation(model).values;
-  const auto& b=expected.continuation(model).values;
-  CHECK(a.schedule==b.schedule);
-  CHECK(a.data==b.data);
-  CHECK(a.grad_scaler_scale==b.grad_scaler_scale);
-  CHECK(a.grad_scaler_growth_tracker==b.grad_scaler_growth_tracker);
-  CHECK(a.ema_completed_updates==b.ema_completed_updates);
-  for (const auto name:{"optimizer","ema_state"}) {
-   torch::serialize::InputArchive archive_a,archive_b;
-   const bool present=expected.model(model).admitted_archive()->try_read(name,archive_b);
-   REQUIRE(actual.model(model).admitted_archive()->try_read(name,archive_a)==present);
-   if (present) require_archive_values_equal(archive_a,archive_b);
+  const auto& a = actual.continuation(model).values;
+  const auto& b = expected.continuation(model).values;
+  CHECK(a.schedule == b.schedule);
+  CHECK(a.data == b.data);
+  CHECK(a.grad_scaler_scale == b.grad_scaler_scale);
+  CHECK(a.grad_scaler_growth_tracker == b.grad_scaler_growth_tracker);
+  CHECK(a.ema_completed_updates == b.ema_completed_updates);
+  for (const auto name : {"optimizer", "ema_state"}) {
+   torch::serialize::InputArchive archive_a, archive_b;
+   const bool present = expected.model(model).admitted_archive()->try_read(name, archive_b);
+   REQUIRE(actual.model(model).admitted_archive()->try_read(name, archive_a) == present);
+   if (present) require_archive_values_equal(archive_a, archive_b);
   }
  }
 }
-}
+}  // namespace
 TEST_CASE("Original application sessions resume with immutable format ten identities and retained candidates", "[rfdetr][training][continuation][baseline][gpu]") {
- namespace io=mmltk::common::io;
- namespace data=mmltk::backend::data;
- const auto* configured=std::getenv("MMLTK_RFDETR_BASELINE_SESSION");
+ namespace io = mmltk::common::io;
+ namespace data = mmltk::backend::data;
+ const auto* configured = std::getenv("MMLTK_RFDETR_BASELINE_SESSION");
  INFO("The wrapper must prepare the provenance-verified 1c13fec8 session fixture before running this acceptance case");
- REQUIRE(configured!=nullptr);
- const auto root=std::filesystem::canonical(configured);
- std::ifstream evidence_file(root/"baseline.json");
+ REQUIRE(configured != nullptr);
+ const auto root = std::filesystem::canonical(configured);
+ std::ifstream evidence_file(root / "baseline.json");
  REQUIRE(evidence_file.good());
- const auto evidence=nlohmann::json::parse(evidence_file);
- REQUIRE(evidence.at("format_version")==1);
- REQUIRE(evidence.at("application_revision")=="1c13fec8b04036661a4028b8807d0e1cff42407d");
- REQUIRE(evidence.at("source_tree")=="ab06f768a4ad225f0d3fdd0985ea414b726402df");
- REQUIRE(evidence.at("source_tree_clean")==true);
- REQUIRE(evidence.at("build_sha256").get<std::string>().size()==64);
+ const auto evidence = nlohmann::json::parse(evidence_file);
+ REQUIRE(evidence.at("format_version") == 1);
+ REQUIRE(evidence.at("application_revision") == "1c13fec8b04036661a4028b8807d0e1cff42407d");
+ REQUIRE(evidence.at("source_tree") == "ab06f768a4ad225f0d3fdd0985ea414b726402df");
+ REQUIRE(evidence.at("source_tree_clean") == true);
+ REQUIRE(evidence.at("build_sha256").get<std::string>().size() == 64);
  REQUIRE_FALSE(evidence.at("inputs").empty());
  REQUIRE_FALSE(evidence.at("files").empty());
- const auto admitted_path=[&](const std::filesystem::path& path) {
-  const auto absolute=std::filesystem::canonical(path.is_absolute()?path:root/path);
-  const auto relative=absolute.lexically_relative(root);
+ const auto admitted_path = [&](const std::filesystem::path& path) {
+  const auto absolute = std::filesystem::canonical(path.is_absolute() ? path : root / path);
+  const auto relative = absolute.lexically_relative(root);
   REQUIRE_FALSE(relative.empty());
-  REQUIRE(*relative.begin()!="..");
+  REQUIRE(*relative.begin() != "..");
   return absolute;
  };
- std::map<std::filesystem::path,std::string> hashes;
- for (const auto& record:evidence.at("files")) {
-  const auto path=admitted_path(record.at("path").get<std::string>());
-  REQUIRE(hashes.emplace(path,record.at("sha256").get<std::string>()).second);
+ std::map<std::filesystem::path, std::string> hashes;
+ for (const auto& record : evidence.at("files")) {
+  const auto path = admitted_path(record.at("path").get<std::string>());
+  REQUIRE(hashes.emplace(path, record.at("sha256").get<std::string>()).second);
  }
- const auto require_evidence=[&](const std::filesystem::path& path) {
-  const auto absolute=admitted_path(path);
+ const auto require_evidence = [&](const std::filesystem::path& path) {
+  const auto absolute = admitted_path(path);
   REQUIRE(hashes.contains(absolute));
   return absolute;
  };
- const auto verify_files=[&] {
-  for (const auto& record:evidence.at("files")) {
-   const auto path=admitted_path(record.at("path").get<std::string>());
+ const auto verify_files = [&] {
+  for (const auto& record : evidence.at("files")) {
+   const auto path = admitted_path(record.at("path").get<std::string>());
    INFO(path.string());
-   CHECK(io::sha256_hex(io::sha256_file(path))==record.at("sha256").get<std::string>());
-   CHECK(std::filesystem::file_size(path)==record.at("bytes").get<std::uint64_t>());
+   CHECK(io::sha256_hex(io::sha256_file(path)) == record.at("sha256").get<std::string>());
+   CHECK(std::filesystem::file_size(path) == record.at("bytes").get<std::uint64_t>());
   }
  };
  verify_files();
- const auto binary=require_evidence(evidence.at("build_path").get<std::string>());
- REQUIRE(hashes.at(binary)==evidence.at("build_sha256").get<std::string>());
+ const auto binary = require_evidence(evidence.at("build_path").get<std::string>());
+ REQUIRE(hashes.at(binary) == evidence.at("build_sha256").get<std::string>());
  require_evidence(evidence.at("build_transcript").get<std::string>());
  require_evidence(evidence.at("producer_transcript").get<std::string>());
- for (const auto* role:{"source","include","identity_declarations","link_options"}) require_evidence(evidence.at("harness").at(role).get<std::string>());
- REQUIRE(evidence.at("harness").size()==4);
- for (const auto& input:evidence.at("inputs")) {
-  const auto path=require_evidence(input.at("path").get<std::string>());
-  CHECK(hashes.at(path)==input.at("sha256").get<std::string>());
+ for (const auto* role : {"source", "include", "identity_declarations", "link_options"}) require_evidence(evidence.at("harness").at(role).get<std::string>());
+ REQUIRE(evidence.at("harness").size() == 4);
+ for (const auto& input : evidence.at("inputs")) {
+  const auto path = require_evidence(input.at("path").get<std::string>());
+  CHECK(hashes.at(path) == input.at("sha256").get<std::string>());
  }
- const auto original=require_evidence(evidence.at("session").get<std::string>());
- const auto continued=require_evidence(evidence.at("continued_session").get<std::string>());
+ const auto original = require_evidence(evidence.at("session").get<std::string>());
+ const auto continued = require_evidence(evidence.at("continued_session").get<std::string>());
  std::ifstream manifest_file(original);
- const auto original_manifest=nlohmann::json::parse(manifest_file);
+ const auto original_manifest = nlohmann::json::parse(manifest_file);
  REQUIRE_FALSE(original_manifest.contains("identity_schema"));
  std::ifstream continued_file(continued);
  REQUIRE_FALSE(nlohmann::json::parse(continued_file).contains("identity_schema"));
  r::TrainingSessionAdmission saved(original), expected(continued);
- REQUIRE(saved.manifest().identity_schema==1);
- REQUIRE(expected.manifest().identity_schema==1);
- for (const auto& [session,path]:std::array{std::pair{&saved,original},std::pair{&expected,continued}}) {
-  require_evidence(path.parent_path()/"generations"/session->manifest().generation/"plan.cbor");
-  for (const auto& model:session->manifest().models) {
-   require_evidence(path.parent_path()/model.path);
+ REQUIRE(saved.manifest().identity_schema == 1);
+ REQUIRE(expected.manifest().identity_schema == 1);
+ for (const auto& [session, path] : std::array{std::pair{&saved, original}, std::pair{&expected, continued}}) {
+  require_evidence(path.parent_path() / "generations" / session->manifest().generation / "plan.cbor");
+  for (const auto& model : session->manifest().models) {
+   require_evidence(path.parent_path() / model.path);
    if (model.best) require_evidence(model.best->path);
   }
-  for (const auto& dataset:{session->manifest().request.train_compiled_path,session->manifest().request.val_compiled_path,session->manifest().request.test_compiled_path}) {
+  for (const auto& dataset : {session->manifest().request.train_compiled_path, session->manifest().request.val_compiled_path, session->manifest().request.test_compiled_path}) {
    REQUIRE_FALSE(dataset.empty());
    require_evidence(dataset);
   }
  }
- const auto selected_path=require_evidence(evidence.at("continued_selection").get<std::string>());
- const auto expected_selection=r::read_training_selection(selected_path);
+ const auto selected_path = require_evidence(evidence.at("continued_selection").get<std::string>());
+ const auto expected_selection = r::read_training_selection(selected_path);
  require_evidence(expected_selection.artifact.path);
- REQUIRE(std::ranges::any_of(saved.manifest().models,[](const auto& model){return model.best.has_value();}));
- for (std::size_t model=0;model<saved.model_count();++model) {
-  CHECK(mmltk::backend::ml::serialization::require_int(*saved.model(model).admitted_archive(),"format_version")==4);
-  if (const auto candidate=saved.best_admission(model)) {
-   CHECK(mmltk::backend::ml::serialization::require_int(*candidate->decode()->admitted_archive(),"format_version")==4);
+ REQUIRE(std::ranges::any_of(saved.manifest().models, [](const auto& model) { return model.best.has_value(); }));
+ for (std::size_t model = 0; model < saved.model_count(); ++model) {
+  CHECK(mmltk::backend::ml::serialization::require_int(*saved.model(model).admitted_archive(), "format_version") == 4);
+  if (const auto candidate = saved.best_admission(model)) {
+   CHECK(mmltk::backend::ml::serialization::require_int(*candidate->decode()->admitted_archive(), "format_version") == 4);
    candidate->require_matches(*saved.manifest().models[model].best);
   }
  }
- const auto config=r::checkpoint_configuration(saved.model(0).metadata);
- const auto signature=r::training_configuration_identity(config,saved.model(0).metadata.class_layout,1);
- CHECK(signature==evidence.at("configuration_signature").get<std::string>());
- for (const auto& [name,path]:std::array{std::pair{"configuration",saved.manifest().request.train_compiled_path},std::pair{"validation",saved.manifest().request.val_compiled_path}}) {
-  const auto source=data::CompiledDataset::open(path);
-  CHECK(source.source_header().version==10);
-  const auto header_file=require_evidence(evidence.at("source_headers").at(name).get<std::string>());
-  REQUIRE(std::filesystem::file_size(header_file)==sizeof(data::FileHeader));
-  std::array<char,sizeof(data::FileHeader)> original_header{};
-  std::ifstream header_input(header_file,std::ios::binary);
-  header_input.read(original_header.data(),original_header.size());
+ const auto config = r::checkpoint_configuration(saved.model(0).metadata);
+ const auto signature = r::training_configuration_identity(config, saved.model(0).metadata.class_layout, 1);
+ CHECK(signature == evidence.at("configuration_signature").get<std::string>());
+ for (const auto& [name, path] : std::array{std::pair{"configuration", saved.manifest().request.train_compiled_path}, std::pair{"validation", saved.manifest().request.val_compiled_path}}) {
+  const auto source = data::CompiledDataset::open(path);
+  CHECK(source.source_header().version == 10);
+  const auto header_file = require_evidence(evidence.at("source_headers").at(name).get<std::string>());
+  REQUIRE(std::filesystem::file_size(header_file) == sizeof(data::FileHeader));
+  std::array<char, sizeof(data::FileHeader)> original_header{};
+  std::ifstream header_input(header_file, std::ios::binary);
+  header_input.read(original_header.data(), original_header.size());
   REQUIRE(header_input.good());
-  CHECK(std::memcmp(original_header.data(),&source.source_header(),original_header.size())==0);
-  const auto digest=r::training_dataset_identity(source.source_header(),io::FileSnapshot::Read(path),signature);
-  CHECK(digest==original_manifest.at(name).get<std::string>());
+  CHECK(std::memcmp(original_header.data(), &source.source_header(), original_header.size()) == 0);
+  const auto digest = r::training_dataset_identity(source.source_header(), io::FileSnapshot::Read(path), signature);
+  CHECK(digest == original_manifest.at(name).get<std::string>());
  }
  const mmltk::testsupport::ScopedTempDir output("baseline-session-resume");
- auto request=saved.manifest().request;
- request.resume_path=original;
- request.output_dir=output.path()/"resumed";
- request.epochs=expected.manifest().request.epochs;
- const auto result=r::run_training(request);
+ auto request = saved.manifest().request;
+ request.resume_path = original;
+ request.output_dir = output.path() / "resumed";
+ request.epochs = expected.manifest().request.epochs;
+ const auto result = r::run_training(request);
  r::TrainingSessionAdmission actual(result.checkpoint_path);
- REQUIRE(actual.manifest().identity_schema==2);
- require_session_trajectory_equal(actual,expected);
+ REQUIRE(actual.manifest().identity_schema == 2);
+ require_session_trajectory_equal(actual, expected);
  REQUIRE(result.selected);
- CHECK(result.selected->artifact.content==expected_selection.artifact.content);
- CHECK(result.selected->artifact.selection_metric==expected_selection.artifact.selection_metric);
- CHECK(result.selected->method==expected_selection.method);
+ CHECK(result.selected->artifact.content == expected_selection.artifact.content);
+ CHECK(result.selected->artifact.selection_metric == expected_selection.artifact.selection_metric);
+ CHECK(result.selected->method == expected_selection.method);
  REQUIRE(result.test_summary);
- auto changed=request;
- changed.output_dir=output.path()/"changed-recipe";
- changed.recipe.lr*=2;
+ auto changed = request;
+ changed.output_dir = output.path() / "changed-recipe";
+ changed.recipe.lr *= 2;
  REQUIRE_THROWS(r::run_training(changed));
- const auto changed_data=output.path()/"changed-train.bin";
- std::filesystem::copy_file(request.train_compiled_path,changed_data);
- std::filesystem::last_write_time(changed_data,std::filesystem::last_write_time(request.train_compiled_path)+std::chrono::seconds(1));
- changed=request;
- changed.output_dir=output.path()/"changed-data";
- changed.train_compiled_path=changed_data;
+ const auto changed_data = output.path() / "changed-train.bin";
+ std::filesystem::copy_file(request.train_compiled_path, changed_data);
+ std::filesystem::last_write_time(changed_data, std::filesystem::last_write_time(request.train_compiled_path) + std::chrono::seconds(1));
+ changed = request;
+ changed.output_dir = output.path() / "changed-data";
+ changed.train_compiled_path = changed_data;
  REQUIRE_THROWS(r::run_training(changed));
  verify_files();
  saved.require_unchanged();
  expected.require_unchanged();
 }
-
 TEST_CASE("PE Base and keypoint sessions retain shared independent and averaged trajectories through final selection", "[rfdetr][training][continuation][lanes][gpu]") {
- namespace data=mmltk::backend::data;
- REQUIRE(mmltk::testsupport::checked_cuda_device_count()>0);
- for (const auto preset:{"rf-detr-femto","rf-detr-xlarge","rf-detr-keypoint-preview"}) {
+ namespace data = mmltk::backend::data;
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+ for (const auto preset : {"rf-detr-femto", "rf-detr-xlarge", "rf-detr-keypoint-preview"}) {
   CAPTURE(preset);
   const mmltk::testsupport::ScopedTempDir root("family-session");
-  auto config=r::native_config_from_preset(*r::find_preset_catalog_entry(preset));
-  config.resolution=config.patch_size*config.num_windows*2;
-  config.num_queries=config.num_select=8;
-  config.group_detr=2;
-  data::testsupport::FixtureSpec spec{.root_dir=root.path().string(),.width=config.resolution,.height=config.resolution,.num_images=4,.background_images=0};
-  if (config.has_keypoints()) data::testsupport::create_keypoint_dataset(spec);
-  else data::testsupport::create_synthetic_dataset(spec);
+  auto config = r::native_config_from_preset(*r::find_preset_catalog_entry(preset));
+  config.resolution = config.patch_size * config.num_windows * 2;
+  config.num_queries = config.num_select = 8;
+  config.group_detr = 2;
+  data::testsupport::FixtureSpec spec{.root_dir = root.path().string(), .width = config.resolution, .height = config.resolution, .num_images = 4, .background_images = 0};
+  if (config.has_keypoints())
+   data::testsupport::create_keypoint_dataset(spec);
+  else
+   data::testsupport::create_synthetic_dataset(spec);
   data::testsupport::compile_existing_fixture(spec);
-  auto source=data::CompiledDataset::open(data::testsupport::compiled_bin_path(spec));
-  config.num_classes=static_cast<int>(source.class_catalog()->size())+1;
+  auto source = data::CompiledDataset::open(data::testsupport::compiled_bin_path(spec));
+  config.num_classes = static_cast<int>(source.class_catalog()->size()) + 1;
   if (config.has_keypoints()) {
-   config.keypoints_per_class.assign(config.num_classes,0);
-   for (std::size_t category=0;category<source.class_catalog()->size();++category) config.keypoints_per_class[category]=source.class_catalog()->keypoints(category).names.size();
+   config.keypoints_per_class.assign(config.num_classes, 0);
+   for (std::size_t category = 0; category < source.class_catalog()->size(); ++category)
+    config.keypoints_per_class[category] = static_cast<std::uint16_t>(source.class_catalog()->keypoints(category).names.size());
   }
-  const auto seed_path=root.path()/"seed.pt";
+  const auto seed_path = root.path() / "seed.pt";
   {
    torch::manual_seed(123);
-   r::NativeRfDetrModel model(config,r::native_training_class_layout(*source.class_catalog()));
+   r::NativeRfDetrModel model(config, r::native_training_class_layout(*source.class_catalog()));
    r::DecodedNativeModelState seed;
-   seed.metadata=r::testsupport::model_checkpoint_metadata(model,"native-fixture","seed.pt");
+   seed.metadata = r::testsupport::model_checkpoint_metadata(model, "native-fixture", "seed.pt");
    seed.replace_entries(r::testsupport::clone_normalized_model_state(model));
-   r::save_native_checkpoint(seed_path,seed);
+   r::save_native_checkpoint(seed_path, seed);
   }
-  for (const auto mode:{r::TrainLaneMode::SharedGradients,r::TrainLaneMode::Independent,r::TrainLaneMode::PeriodicAveraging}) {
+  for (const auto mode : {r::TrainLaneMode::SharedGradients, r::TrainLaneMode::Independent, r::TrainLaneMode::PeriodicAveraging}) {
    CAPTURE(mode);
    r::TrainRequest request;
-   request.preset_name=preset; request.weights_path=seed_path;
-   request.train_compiled_path=request.val_compiled_path=request.test_compiled_path=data::testsupport::compiled_bin_path(spec);
-   request.output_dir=root.path()/std::to_string(static_cast<int>(mode))/"initial";
-   request.num_queries=config.num_queries;
-   request.lanes=2; request.workers=4; request.batch_size=1; request.val_batch_size=3;
-   request.compilation_mode=r::CompilationMode::kNone;
-   request.amp=request.fused_optimizer=request.progress_bar=false;
-   request.use_ema=true; request.validation_loss=true; request.freeze_encoder=true;
-   request.lane_configuration.mode=mode;
-   r::resize_training_models(request.lane_configuration,mode==r::TrainLaneMode::SharedGradients?1:2,request.recipe,request.seed);
-   request.lane_configuration.final_policy=mode==r::TrainLaneMode::Independent?r::TrainFinalPolicy::Uniform:r::TrainFinalPolicy::Off;
-   const auto initial=r::run_training(request);
+   request.preset_name = preset;
+   request.weights_path = seed_path;
+   request.train_compiled_path = request.val_compiled_path = request.test_compiled_path = data::testsupport::compiled_bin_path(spec);
+   request.output_dir = root.path() / std::to_string(static_cast<int>(mode)) / "initial";
+   request.num_queries = config.num_queries;
+   request.lanes = 2;
+   request.workers = 4;
+   request.batch_size = 1;
+   request.val_batch_size = 3;
+   request.compilation_mode = r::CompilationMode::kNone;
+   request.amp = request.fused_optimizer = request.progress_bar = false;
+   request.use_ema = true;
+   request.validation_loss = true;
+   request.freeze_encoder = true;
+   request.lane_configuration.mode = mode;
+   r::resize_training_models(request.lane_configuration, mode == r::TrainLaneMode::SharedGradients ? 1 : 2, request.recipe, request.seed);
+   request.lane_configuration.final_policy = mode == r::TrainLaneMode::Independent ? r::TrainFinalPolicy::Uniform : r::TrainFinalPolicy::Off;
+   const auto initial = r::run_training(request);
    REQUIRE(initial.selected);
    REQUIRE(initial.test_summary);
-   request.resume_path=initial.checkpoint_path; request.epochs=2;
-   request.output_dir=request.output_dir.parent_path()/"resumed-a";
-   const auto a=r::run_training(request);
-   request.output_dir=request.output_dir.parent_path()/"resumed-b";
-   const auto b=r::run_training(request);
-   r::TrainingSessionAdmission left(a.checkpoint_path),right(b.checkpoint_path);
-   require_session_trajectory_equal(left,right);
+   request.resume_path = initial.checkpoint_path;
+   request.epochs = 2;
+   request.output_dir = request.output_dir.parent_path() / "resumed-a";
+   const auto a = r::run_training(request);
+   request.output_dir = request.output_dir.parent_path() / "resumed-b";
+   const auto b = r::run_training(request);
+   r::TrainingSessionAdmission left(a.checkpoint_path), right(b.checkpoint_path);
+   require_session_trajectory_equal(left, right);
    REQUIRE(a.selected);
    REQUIRE(a.test_summary);
-   CHECK(a.selected->artifact.selection_metric==r::training_selection_metric(a.selected->validation,config.task));
+   CHECK(a.selected->artifact.selection_metric == r::training_selection_metric(a.selected->validation, config.task));
    if (config.has_keypoints()) {
     REQUIRE(a.test_summary->keypoint);
     REQUIRE(a.test_summary->keypoint->available);
-    CHECK(r::checkpoint_configuration(left.model(0).metadata).keypoints_per_class==config.keypoints_per_class);
+    CHECK(r::checkpoint_configuration(left.model(0).metadata).keypoints_per_class == config.keypoints_per_class);
    }
   }
  }

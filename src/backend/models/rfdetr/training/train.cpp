@@ -351,7 +351,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    if (!train_loader.class_catalog()->has_keypoints()) throw std::invalid_argument("keypoint training requires a dataset joint schema");
    std::vector<std::uint16_t> counts(artifacts.class_layout.slots.size());
    for (std::size_t slot = 0; slot < counts.size(); ++slot)
-    if (const auto foreground = artifacts.class_layout.slots[slot].foreground_index) counts[slot] = train_loader.class_catalog()->keypoints(*foreground).names.size();
+    if (const auto foreground = artifacts.class_layout.slots[slot].foreground_index) counts[slot] = static_cast<std::uint16_t>(train_loader.class_catalog()->keypoints(*foreground).names.size());
    if (resumed && counts != artifacts.config.keypoints_per_class) throw std::invalid_argument("Resume keypoint schema topology differs");
    artifacts.config.keypoints_per_class = std::move(counts);
   }
@@ -442,7 +442,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    const auto& source = *loader->compiled_source();
    const auto admitted = std::ranges::find(admitted_files, source.path(), &AdmittedFile::path);
    if (admitted == admitted_files.end()) throw std::logic_error("training source lacks admitted file metadata");
-   return training_dataset_identity(source.source_header(), admitted->snapshot, historical ? admitted_signature : resolved_signature, historical ? std::span<const std::byte>{} : source.source_metadata_bytes());
+   return training_dataset_identity(
+    source.source_header(), admitted->snapshot, historical ? admitted_signature : resolved_signature, historical ? std::span<const std::byte>{} : source.source_metadata_bytes());
   };
   // The compiled header and admitted file generation already identify each
   // source. Starting training must not scan image or mask payloads for a hash.
@@ -460,7 +461,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   if (resumed) {
    const bool historical = session.identity_schema == 1;
    const auto admitted_configuration = historical ? share_identity(source_fingerprint(&train_loader, true), 64) : configuration_fingerprint;
-   const auto admitted_validation = historical ? (options.val_compiled_path == options.train_compiled_path ? admitted_configuration : share_identity(source_fingerprint(val_loader.get(), true), 64)) : validation_fingerprint;
+   const auto admitted_validation =
+    historical ? (options.val_compiled_path == options.train_compiled_path ? admitted_configuration : share_identity(source_fingerprint(val_loader.get(), true), 64)) : validation_fingerprint;
    if (session.configuration != admitted_configuration) throw std::runtime_error("Resume training data/model configuration differs");
    if (session.validation != admitted_validation) throw std::runtime_error("Resume validation split/configuration differs");
    // Only verified identities normalize. Original immutable manifests and file
@@ -468,10 +470,11 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    session.identity_schema = 2;
    session.configuration = configuration_fingerprint;
    session.validation = validation_fingerprint;
-   for (auto& entry : session.models) if (entry.best) {
-    entry.best->configuration = configuration_fingerprint;
-    entry.best->validation = validation_fingerprint;
-   }
+   for (auto& entry : session.models)
+    if (entry.best) {
+     entry.best->configuration = configuration_fingerprint;
+     entry.best->validation = validation_fingerprint;
+    }
   }
   latest.session_id = session.session_id;
   latest.scope = TrainingRecordScope::Session;
@@ -531,7 +534,10 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    if (main_process) {
     checkpoint = std::make_unique<TrainingSessionCheckpoint>(options.output_dir);
     validation = std::make_unique<TrainingValidationRuntime>(options, train_runtime, std::move(val_loader), val_batch_size, options.validation_loss,
-     artifacts.config.has_keypoints() ? EvaluationMetricSet::BBoxAndKeypoint : detection.include_masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox, artifacts.config.num_select, "val", dataset_limits.automatic);
+     artifacts.config.has_keypoints() ? EvaluationMetricSet::BBoxAndKeypoint
+     : detection.include_masks        ? EvaluationMetricSet::BBoxAndMask
+                                      : EvaluationMetricSet::BBox,
+     artifacts.config.num_select, "val", dataset_limits.automatic);
     TrainingRun run;
     run.run_id = session.session_id;
     run.configuration = options;
@@ -777,7 +783,10 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     if (!options.test_compiled_path.empty()) {
      auto test_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.test_compiled_path, val_batch_size, options.prefetch_factor, false, false));
      validate_loader(*test_loader, "test");
-     TrainingValidationRuntime test(options, train_runtime, std::move(test_loader), val_batch_size, false, artifacts.config.has_keypoints() ? EvaluationMetricSet::BBoxAndKeypoint : detection.include_masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox,
+     TrainingValidationRuntime test(options, train_runtime, std::move(test_loader), val_batch_size, false,
+      artifacts.config.has_keypoints() ? EvaluationMetricSet::BBoxAndKeypoint
+      : detection.include_masks        ? EvaluationMetricSet::BBoxAndMask
+                                       : EvaluationMetricSet::BBox,
       artifacts.config.num_select, "test", dataset_limits.automatic);
      NativeRfDetrModel selected(deployment_config, artifacts.class_layout);
      selected.to(mmltk::backend::ml::cuda::cuda_device(options.device_id));

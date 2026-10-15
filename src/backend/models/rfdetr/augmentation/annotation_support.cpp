@@ -27,8 +27,7 @@ bool contains(const std::array<float, 4>& box, std::span<const mmltk::backend::d
  return sampling::rle_support_contains(runs.data(), runs.size(), pixel);
 }
 }  // namespace
-void map_augmentation_keypoints(std::span<const mmltk::backend::data::PackedKeypoint> source,
- const mmltk::backend::data::catalog::ClassKeypointSchema& schema, int width, int height,
+void map_augmentation_keypoints(std::span<const mmltk::backend::data::PackedKeypoint> source, const mmltk::backend::data::catalog::ClassKeypointSchema& schema, int width, int height,
  const AugmentationImagePlan* plan, std::span<mmltk::backend::data::PackedKeypoint> destination, bool donor) {
  if (width <= 0 || height <= 0 || source.size() != schema.names.size() || destination.size() != source.size()) throw std::invalid_argument("keypoint augmentation schema or geometry differs");
  auto forward = plan ? plan->forward : identity;
@@ -43,21 +42,27 @@ void map_augmentation_keypoints(std::span<const mmltk::backend::data::PackedKeyp
  }
  const bool flip = plan && plan->horizontal_flip && !donor;
  if (flip && schema.horizontal_flip.size() != source.size()) throw std::invalid_argument("keypoint flip mapping is missing");
+ const auto image_width = static_cast<float>(width), image_height = static_cast<float>(height);
  for (std::size_t index = 0; index < source.size(); ++index) {
   const auto& point = source[index];
   const auto target = flip ? schema.horizontal_flip[index] : index;
-  if (target >= destination.size() || !std::isfinite(point.x) || !std::isfinite(point.y) || !mmltk::frameworks::reflection::enum_contains(point.visibility)) throw std::invalid_argument("invalid keypoint augmentation input");
+  if (target >= destination.size() || !std::isfinite(point.x) || !std::isfinite(point.y) || !mmltk::frameworks::reflection::enum_contains(point.visibility))
+   throw std::invalid_argument("invalid keypoint augmentation input");
   auto& out = destination[target];
   out = {};
   if (point.visibility == KeypointVisibility::Unannotated) continue;
-  const float source_x = point.x / width, source_y = point.y / height;
-  if (donor && !plan->paste_masked && (source_x < plan->paste_source_box[0] || source_x > plan->paste_source_box[2] || source_y < plan->paste_source_box[1] || source_y > plan->paste_source_box[3])) continue;
+  const float source_x = point.x / image_width, source_y = point.y / image_height;
+  if (donor && !plan->paste_masked && (source_x < plan->paste_source_box[0] || source_x > plan->paste_source_box[2] || source_y < plan->paste_source_box[1] || source_y > plan->paste_source_box[3]))
+   continue;
   const auto [x, y] = sampling::affine_point(forward.data(), source_x, source_y);
   if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || x > 1 || y < 0 || y > 1) continue;
-  out.x = x * width; out.y = y * height; out.visibility = point.visibility;
+  out.x = x * image_width;
+  out.y = y * image_height;
+  out.visibility = point.visibility;
   if (plan) {
    const bool pasted_over = !donor && plan->paste_donor_slot >= 0 && (!plan->paste_masked || plan->paste_support_count) &&
-    contains(plan->paste_source_box, plan->paste_masked ? std::span{plan->paste_support, plan->paste_support_count} : std::span<const mmltk::backend::data::RLEPair>{}, plan->paste_inverse, x, y, width, height);
+                            contains(plan->paste_source_box, plan->paste_masked ? std::span{plan->paste_support, plan->paste_support_count} : std::span<const mmltk::backend::data::RLEPair>{},
+                             plan->paste_inverse, x, y, width, height);
    if (pasted_over || augment_math::erases_sample(plan->erasure, x, y, width, height)) out.visibility = KeypointVisibility::Occluded;
   }
  }

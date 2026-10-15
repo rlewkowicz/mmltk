@@ -24,8 +24,8 @@ template <class Metadata>
 struct VisualKeypoint final {
  contracts::AnnotationPoint point{};
  MMLTK_FINITE float confidence = 0;
- std::optional<mmltk::backend::data::catalog::KeypointVisibility> visibility;
- std::optional<std::array<float, 3>> covariance;
+ std::optional<mmltk::backend::data::catalog::KeypointVisibility> visibility{};
+ std::optional<std::array<float, 3>> covariance{};
 };
 MMLTK_REFLECT_FIELDS(VisualKeypoint)
 struct VisualSkeleton final {
@@ -40,8 +40,8 @@ struct VisualObjectLabel final {
  mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
  float confidence = 0.0F;
  contracts::AnnotationColor color{};
- MMLTK_MAX_BYTES(256U) std::string name;
- VisualSkeleton skeleton;
+ MMLTK_MAX_BYTES(256U) std::string name {};
+ VisualSkeleton skeleton{};
 };
 MMLTK_REFLECT_FIELDS(VisualObjectLabel)
 struct VisualDocumentFacts final {

@@ -61,7 +61,10 @@ LiveAnalyzerWorker::~LiveAnalyzerWorker() {
 }
 void LiveAnalyzerWorker::set_provider(std::shared_ptr<runtime::AnalysisProvider> provider) {
  if (running_.load(std::memory_order_acquire)) throw std::logic_error("cannot replace running Live analysis provider");
- if (!provider) { provider_.reset(); return; }
+ if (!provider) {
+  provider_.reset();
+  return;
+ }
  const auto joints = provider->keypoint_capacity();
  if (joints > mmltk::backend::data::catalog::kKeypointsPerClassCapacity) throw std::invalid_argument("Live provider joint capacity exceeds catalog bounds");
  for (std::uint32_t index = 0; index < slot_count_; ++index)
@@ -103,10 +106,16 @@ void LiveAnalyzerWorker::set_provider(std::shared_ptr<runtime::AnalysisProvider>
    }
    annotation.keypoint_capacity = joints;
    annotation.keypoints_available = false;
-   annotation.keypoints = joints ? runtime::AnalysisDeviceBuffer{static_cast<std::uintptr_t>(allocation[0]), annotation.value_capacity * joints * sizeof(runtime::AnalysisKeypoint),
-    {3U, {static_cast<std::uint32_t>(annotation.value_capacity), joints, static_cast<std::uint32_t>(runtime::kAnalysisKeypointChannels)}}, runtime::AnalysisElementType::Float32} : runtime::AnalysisDeviceBuffer{};
-   annotation.keypoint_counts = joints ? runtime::AnalysisDeviceBuffer{static_cast<std::uintptr_t>(allocation[1]), annotation.value_capacity * sizeof(std::int32_t),
-    {1U, {static_cast<std::uint32_t>(annotation.value_capacity)}}, runtime::AnalysisElementType::Int32} : runtime::AnalysisDeviceBuffer{};
+   annotation.keypoints =
+    joints
+     ? runtime::
+        AnalysisDeviceBuffer{static_cast<std::uintptr_t>(allocation[0]), annotation.value_capacity * joints * sizeof(runtime::AnalysisKeypoint), {3U, {static_cast<std::uint32_t>(annotation.value_capacity), joints, static_cast<std::uint32_t>(runtime::kAnalysisKeypointChannels)}}, runtime::AnalysisElementType::Float32}
+     : runtime::AnalysisDeviceBuffer{};
+   annotation.keypoint_counts =
+    joints
+     ? runtime::
+        AnalysisDeviceBuffer{static_cast<std::uintptr_t>(allocation[1]), annotation.value_capacity * sizeof(std::int32_t), {1U, {static_cast<std::uint32_t>(annotation.value_capacity)}}, runtime::AnalysisElementType::Int32}
+     : runtime::AnalysisDeviceBuffer{};
   }
  }
  provider_ = std::move(provider);

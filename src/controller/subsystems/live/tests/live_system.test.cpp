@@ -51,23 +51,24 @@ struct LiveReceiverCopyProbe final {
  static inline std::size_t synchronizations = 0U;
  static inline std::size_t completions = 0U, abandonments = 0U;
  static inline media::LiveAnalysisProduct* source_product = nullptr;
- static void Complete(void*,media::PhysicalFrameRevision) noexcept {
+ static void Complete(void*, media::PhysicalFrameRevision) noexcept {
   ++completions;
   if (source_product) source_product->Reset();
  }
- static void Abandon(void*,media::PhysicalFrameRevision) noexcept { ++abandonments; }
+ static void Abandon(void*, media::PhysicalFrameRevision) noexcept { ++abandonments; }
  static media::LiveCompositeOutputLease Lease(media::LiveAnalysisProduct* product = nullptr) {
   static int owner = 0;
-  return media::LiveCompositeOutputLease::Create(&owner,&Complete,&Abandon,
-   {.clean=2,.clean_pitch_bytes=16,.semantic=5,.semantic_pitch_bytes=16,.width=4,.height=4,.ready_event=3,.analysis=product},
-   {.revision=1,.frame={1,1},.slot=0,.ready_event=3});
+  return media::LiveCompositeOutputLease::Create(&owner, &Complete, &Abandon,
+   {.clean = 2, .clean_pitch_bytes = 16, .semantic = 5, .semantic_pitch_bytes = 16, .width = 4, .height = 4, .ready_event = 3, .analysis = product},
+   {.revision = 1, .frame = {1, 1}, .slot = 0, .ready_event = 3});
  }
  static void Reset() noexcept {
   wait_status = cudaSuccess;
   copy_status = cudaSuccess;
   synchronize_status = cudaSuccess;
   waits = 0U;
-  copies = 0U; fail_copy = 1U;
+  copies = 0U;
+  fail_copy = 1U;
   synchronizations = 0U;
   completions = abandonments = 0U;
   source_product = nullptr;
@@ -105,11 +106,11 @@ constexpr detail::LiveReceiverCopyOperations kLiveReceiverCopyProbe{
 TEST_CASE("Live receiver completes image and semantic copies before releasing the media lease") {
  LiveReceiverCopyProbe::Reset();
  LiveAnalysisFixture fixture;
- media::LiveAnalysisProduct source,destination;
- fixture.Deliver(source,{1,1});
+ media::LiveAnalysisProduct source, destination;
+ fixture.Deliver(source, {1, 1});
  LiveReceiverCopyProbe::source_product = &source;
  auto lease = LiveReceiverCopyProbe::Lease(&source);
- CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(),live_receiver_copy_target(true),lease,destination,4,kLiveReceiverCopyProbe) == cudaSuccess);
+ CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(), live_receiver_copy_target(true), lease, destination, 4, kLiveReceiverCopyProbe) == cudaSuccess);
  CHECK(LiveReceiverCopyProbe::waits == 1);
  CHECK(LiveReceiverCopyProbe::copies == 2);
  CHECK(LiveReceiverCopyProbe::synchronizations == 1);
@@ -117,29 +118,32 @@ TEST_CASE("Live receiver completes image and semantic copies before releasing th
  CHECK_FALSE(lease);
  CHECK_FALSE(source.ready());
  REQUIRE(destination.ready());
- CHECK(destination.frame() == media::LiveFrameId{1,1});
+ CHECK(destination.frame() == media::LiveFrameId{1, 1});
  REQUIRE(destination.regions().size() == 1);
  CHECK(destination.regions()[0].keypoints[0].covariance_xy == -.5F);
  CHECK(destination.regions()[0].class_catalog == fixture.catalog);
  LiveReceiverCopyProbe::source_product = nullptr;
 }
 TEST_CASE("Live receiver failures settle prior reads or retain terminal media custody") {
- const int failure = GENERATE(0,1,2,3);
+ const int failure = GENERATE(0, 1, 2, 3);
  LiveReceiverCopyProbe::Reset();
  if (failure == 0) LiveReceiverCopyProbe::wait_status = cudaErrorLaunchFailure;
  if (failure == 1) LiveReceiverCopyProbe::copy_status = cudaErrorLaunchFailure;
- if (failure == 2) { LiveReceiverCopyProbe::copy_status = cudaErrorLaunchFailure; LiveReceiverCopyProbe::fail_copy = 2; }
+ if (failure == 2) {
+  LiveReceiverCopyProbe::copy_status = cudaErrorLaunchFailure;
+  LiveReceiverCopyProbe::fail_copy = 2;
+ }
  if (failure == 3) LiveReceiverCopyProbe::synchronize_status = cudaErrorLaunchFailure;
  media::LiveAnalysisProduct destination;
- destination.Reset({8,9});
+ destination.Reset({8, 9});
  {
   auto lease = LiveReceiverCopyProbe::Lease();
-  CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(),live_receiver_copy_target(true),lease,destination,4,kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
+  CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(), live_receiver_copy_target(true), lease, destination, 4, kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
   CHECK(LiveReceiverCopyProbe::copies == (failure == 0 ? 0 : failure == 1 ? 1 : 2));
   CHECK(LiveReceiverCopyProbe::synchronizations == 1);
   CHECK(LiveReceiverCopyProbe::completions == (failure == 3 ? 0 : 1));
   CHECK(static_cast<bool>(lease) == (failure == 3));
-  CHECK(destination.frame() == media::LiveFrameId{8,9});
+  CHECK(destination.frame() == media::LiveFrameId{8, 9});
  }
  CHECK(LiveReceiverCopyProbe::abandonments == (failure == 3 ? 1 : 0));
 }
@@ -147,15 +151,14 @@ TEST_CASE("Live receiver semantic allocation failure releases only after settled
  LiveReceiverCopyProbe::Reset();
  LiveAnalysisFixture fixture;
  media::LiveAnalysisProduct source;
- fixture.Deliver(source,{1,1});
- media::LiveAnalysisProduct destination{media::LiveAnalysisProduct::Storage::Host,
-  [](std::size_t,media::LiveAnalysisProduct::Storage)->std::shared_ptr<void> { throw std::bad_alloc{}; }};
- destination.Reset({8,9});
+ fixture.Deliver(source, {1, 1});
+ media::LiveAnalysisProduct destination{media::LiveAnalysisProduct::Storage::Host, [](std::size_t, media::LiveAnalysisProduct::Storage) -> std::shared_ptr<void> { throw std::bad_alloc{}; }};
+ destination.Reset({8, 9});
  auto lease = LiveReceiverCopyProbe::Lease(&source);
- CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(),live_receiver_copy_target(true),lease,destination,4,kLiveReceiverCopyProbe) == cudaErrorMemoryAllocation);
+ CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(), live_receiver_copy_target(true), lease, destination, 4, kLiveReceiverCopyProbe) == cudaErrorMemoryAllocation);
  CHECK(LiveReceiverCopyProbe::synchronizations == 1);
  CHECK(LiveReceiverCopyProbe::completions == 1);
- CHECK(destination.frame() == media::LiveFrameId{8,9});
+ CHECK(destination.frame() == media::LiveFrameId{8, 9});
  CHECK_FALSE(lease);
 }
 struct ControlledLiveCapture final {
@@ -169,7 +172,7 @@ struct ControlledLiveCapture final {
  std::function<void(std::shared_ptr<const LiveAnalysisConfiguration>, std::stop_token)> on_start;
  std::atomic_size_t stops{0};
  mmltk::backend::media::capture::Status stop_status = mmltk::backend::media::capture::Status::Ok();
- std::function<void(media::LiveAnalysisProduct&,std::uint64_t)> fill_analysis;
+ std::function<void(media::LiveAnalysisProduct&, std::uint64_t)> fill_analysis;
  void Offer() {
   std::function<void()> notify;
   {
@@ -183,7 +186,9 @@ struct ControlledLiveCapture final {
 class ControlledLiveAlgorithm final : public LiveAlgorithm {
 public:
  explicit ControlledLiveAlgorithm(std::shared_ptr<ControlledLiveCapture> state) : state_(std::move(state)) {}
- void Start(const LiveStart&, std::shared_ptr<const LiveAnalysisConfiguration> configuration, std::stop_token stop) override { if (state_->on_start) state_->on_start(std::move(configuration), stop); }
+ void Start(const LiveStart&, std::shared_ptr<const LiveAnalysisConfiguration> configuration, std::stop_token stop) override {
+  if (state_->on_start) state_->on_start(std::move(configuration), stop);
+ }
  void SetOutputAvailableSink(std::function<void()> wake) override {
   std::scoped_lock lock(state_->mutex);
   state_->wake = std::move(wake);
@@ -194,15 +199,16 @@ public:
   state_->changed.Advance();
   return ready;
  }
- bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t, mmltk::backend::media::live::LiveAnalysisProduct& analysis, std::stop_token) override {
+ bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t, mmltk::backend::media::live::LiveAnalysisProduct& analysis,
+  std::stop_token) override {
   const auto value = ++state_->captures;
   Fill(semantic, static_cast<std::uint8_t>(value + 100U));
-  analysis.Reset({1U,value});
+  analysis.Reset({1U, value});
   for (std::uint32_t y = 0U; y != target.descriptor.height; ++y)
    for (std::uint32_t x = 0U; x != target.descriptor.row_bytes(); ++x)
     *(reinterpret_cast<std::uint8_t*>(target.data) + y * target.descriptor.pitch_bytes + x) = static_cast<std::uint8_t>(value * 31U + y * 7U + x);
   std::function<void()> after;
-  std::function<void(media::LiveAnalysisProduct&,std::uint64_t)> fill;
+  std::function<void(media::LiveAnalysisProduct&, std::uint64_t)> fill;
   bool result = false;
   {
    std::scoped_lock lock(state_->mutex);
@@ -210,12 +216,15 @@ public:
    fill = state_->fill_analysis;
    result = state_->result;
   }
-  if (fill) fill(analysis,value);
+  if (fill) fill(analysis, value);
   state_->changed.Advance();
   if (after) after();
   return result;
  }
- mmltk::backend::media::capture::Status Stop() noexcept override { ++state_->stops; return state_->stop_status; }
+ mmltk::backend::media::capture::Status Stop() noexcept override {
+  ++state_->stops;
+  return state_->stop_status;
+ }
 
 private:
  std::shared_ptr<ControlledLiveCapture> state_;
@@ -223,7 +232,10 @@ private:
 TEST_CASE("Live captures immutable prepared Predict settings and cancels partial starts without replacing retained products") {
  class PreparedModel final : public ModelRuntime {
  public:
-  ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path& artifact, int, std::stop_token, const std::function<void(const contracts::ModelProgress&)>&) override { return {.artifact = artifact.string()}; }
+  ModelArtifactAdmission Acquire(
+   const contracts::ModelSelectionKey&, const std::filesystem::path& artifact, int, std::stop_token, const std::function<void(const contracts::ModelProgress&)>&) override {
+   return {.artifact = artifact.string()};
+  }
  };
  mmltk::testsupport::ScopedTempDir root{"live-admitted-settings"};
  auto draft = contracts::default_gui_settings_state();
@@ -238,7 +250,11 @@ TEST_CASE("Live captures immutable prepared Predict settings and cancels partial
  REQUIRE(settings.Load(location).applied());
  EventGate events;
  ModelSystem model{settings, [] { return std::make_unique<PreparedModel>(); }, [&](ModelSystem::event_type) { events.Advance(); }};
- const auto prepare = [&] { static_cast<void>(model.Select({.workflow = contracts::FeatureId::Predict})); REQUIRE(events.Wait([&] { return !model.snapshot().active; })); REQUIRE(model.snapshot().terminal.outcome == contracts::ModelSelectionOutcome::Accepted); };
+ const auto prepare = [&] {
+  static_cast<void>(model.Select({.workflow = contracts::FeatureId::Predict}));
+  REQUIRE(events.Wait([&] { return !model.snapshot().active; }));
+  REQUIRE(model.snapshot().terminal.outcome == contracts::ModelSelectionOutcome::Accepted);
+ };
  prepare();
  auto backend = std::make_shared<FakeImageBackend>();
  auto state = std::make_shared<ControlledLiveCapture>();
@@ -247,20 +263,47 @@ TEST_CASE("Live captures immutable prepared Predict settings and cancels partial
  std::stop_token admitted_stop;
  std::atomic_bool entered{false}, fail_start{false}, failed{false};
  state->on_start = [&](std::shared_ptr<const LiveAnalysisConfiguration> configuration, std::stop_token stop) {
-  { std::scoped_lock lock(admitted_mutex); admitted = std::move(configuration); admitted_stop = stop; }
-  entered = true; events.Advance();
+  {
+   std::scoped_lock lock(admitted_mutex);
+   admitted = std::move(configuration);
+   admitted_stop = stop;
+  }
+  entered = true;
+  events.Advance();
   if (fail_start) throw LiveProviderAdmissionFailure("requested settled provider admission failure");
  };
- LiveSystem live{kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2),
-  [&](LiveSystem::event_type event) { if (std::holds_alternative<LiveFailed>(event)) failed = true; events.Advance(); }, {}, &settings, &model};
- const auto start = [&] { entered = false; state->Offer(); static_cast<void>(live.Start({.extent={7,3}, .frames_per_second=240})); REQUIRE(events.Wait([&] { return entered.load(); })); };
- const auto stop = [&] { static_cast<void>(live.Stop()); REQUIRE(events.Wait([&] { return !live.snapshot().running && !live.snapshot().cancellation_requested; })); };
- const auto edit = [&](std::string path, auto value) { contracts::SettingsUpdateRequest request; request.updates.push_back({.path=std::move(path), .value=mmltk::frameworks::serialization::wire::FlatValue{value}}); static_cast<void>(settings.Update(std::move(request))); };
- start(); REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 1; }));
- { std::scoped_lock lock(admitted_mutex); CHECK_FALSE(admitted); }
+ LiveSystem live{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2),
+  [&](LiveSystem::event_type event) {
+  if (std::holds_alternative<LiveFailed>(event)) failed = true;
+  events.Advance();
+ }, {}, &settings, &model
+ };
+ const auto start = [&] {
+  entered = false;
+  state->Offer();
+  static_cast<void>(live.Start({.extent = {7, 3}, .frames_per_second = 240}));
+  REQUIRE(events.Wait([&] { return entered.load(); }));
+ };
+ const auto stop = [&] {
+  static_cast<void>(live.Stop());
+  REQUIRE(events.Wait([&] { return !live.snapshot().running && !live.snapshot().cancellation_requested; }));
+ };
+ const auto edit = [&](std::string path, mmltk::frameworks::serialization::wire::FlatValue value) {
+  contracts::SettingsUpdateRequest request;
+  request.updates.push_back({.path = std::move(path), .value = std::move(value)});
+  static_cast<void>(settings.Update(std::move(request)));
+ };
+ start();
+ REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 1; }));
+ {
+  std::scoped_lock lock(admitted_mutex);
+  CHECK_FALSE(admitted);
+ }
  stop();
  edit("workflows.predict.live_analysis_enabled", true);
- start(); REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 2; }));
+ start();
+ REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 2; }));
  const auto retained = live.snapshot();
  auto read = live.BorrowDocument(retained.frame);
  REQUIRE(read.valid());
@@ -268,35 +311,49 @@ TEST_CASE("Live captures immutable prepared Predict settings and cancels partial
  CHECK(std::holds_alternative<mmltk::frameworks::serialization::wire::Value::Array>(read.image_metadata->storage));
  CHECK(read.document->facts() == retained.document);
  edit("workflows.predict.request.threshold", 1.0);
- { std::scoped_lock lock(admitted_mutex); REQUIRE(admitted); CHECK(admitted->request.threshold == .25F); CHECK_FALSE(admitted_stop.stop_requested()); }
+ {
+  std::scoped_lock lock(admitted_mutex);
+  REQUIRE(admitted);
+  CHECK(admitted->request.threshold == .25F);
+  CHECK_FALSE(admitted_stop.stop_requested());
+ }
  stop();
- { std::scoped_lock lock(admitted_mutex); CHECK(admitted_stop.stop_requested()); }
+ {
+  std::scoped_lock lock(admitted_mutex);
+  CHECK(admitted_stop.stop_requested());
+ }
  fail_start = true;
  const auto stops = state->stops.load();
- start(); REQUIRE(events.Wait([&] { return failed.load(); }));
+ start();
+ REQUIRE(events.Wait([&] { return failed.load(); }));
  CHECK(state->stops > stops);
  CHECK(live.snapshot().frame == retained.frame);
  CHECK(live.snapshot().document == retained.document);
- { std::scoped_lock lock(admitted_mutex); CHECK(admitted->request.threshold == 1.F); }
+ {
+  std::scoped_lock lock(admitted_mutex);
+  CHECK(admitted->request.threshold == 1.F);
+ }
  CHECK(read.valid());
  read = {};
  fail_start = false;
- state->on_start = [&](std::shared_ptr<const LiveAnalysisConfiguration>, std::stop_token stop) {
-  entered = true; events.Advance();
+ state->on_start = [&](std::shared_ptr<const LiveAnalysisConfiguration>, std::stop_token cancellation) {
+  entered = true;
+  events.Advance();
   std::mutex mutex;
   std::condition_variable_any ready;
   std::unique_lock lock(mutex);
-  ready.wait(lock, stop, [] { return false; });
+  ready.wait(lock, cancellation, [] { return false; });
  };
  const auto completed = live.snapshot().completed_frames;
- start(); stop();
+ start();
+ stop();
  CHECK(live.snapshot().completed_frames == completed);
  CHECK(live.snapshot().frame == retained.frame);
  CHECK(live.snapshot().document == retained.document);
  const auto before_refusal = live.snapshot();
  entered = false;
- edit("workflows.predict.request.onnx_path", std::string{"/tmp/unprepared.onnx"});
- CHECK_THROWS_AS(live.Start({.extent={7,3}, .frames_per_second=240}), contracts::InvalidIntentError);
+ edit("workflows.predict.request.onnx_path", mmltk::frameworks::serialization::wire::FlatValue::text("/tmp/unprepared.onnx", mmltk::frameworks::reflection::kMaximumPathBytes).value());
+ CHECK_THROWS_AS(live.Start({.extent = {7, 3}, .frames_per_second = 240}), contracts::InvalidIntentError);
  CHECK_FALSE(entered.load());
  CHECK(live.snapshot().revision == before_refusal.revision);
  CHECK(live.snapshot().frame == before_refusal.frame);
@@ -393,7 +450,8 @@ TEST_CASE("Live receiver publication failure does not commit a captured candidat
  EventGate events;
  std::atomic_bool failed{false};
  LiveSystem live{
-  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U), [&](LiveSystem::event_type event) {
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+  [&](LiveSystem::event_type event) {
   if (std::holds_alternative<LiveFailed>(event)) failed = true;
   events.Advance();
  }
@@ -410,25 +468,30 @@ TEST_CASE("Live exact-frame analysis reads retain image and schema across reuse 
  auto state = std::make_shared<ControlledLiveCapture>();
  auto fixture = std::make_shared<LiveAnalysisFixture>();
  const auto catalog = fixture->catalog;
- state->fill_analysis = [fixture](media::LiveAnalysisProduct& product,std::uint64_t sequence) {
-  if (sequence == 4) return; // Capture's Reset supplies an explicit no-analysis frame.
+ state->fill_analysis = [fixture](media::LiveAnalysisProduct& product, std::uint64_t sequence) {
+  if (sequence == 4) return;  // Capture's Reset supplies an explicit no-analysis frame.
   *fixture->count = sequence == 2 ? 0 : 2;
   fixture->joints[0].x = static_cast<float>(sequence);
-  fixture->Deliver(product,{1,sequence});
+  fixture->Deliver(product, {1, sequence});
  };
  EventGate events;
- LiveSystem live{kDevice,RuntimeFactory(0,backend,mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-  [state] { return std::make_unique<ControlledLiveAlgorithm>(state); },2),[&](LiveSystem::event_type) { events.Advance(); }};
+ LiveSystem live{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2),
+  [&](LiveSystem::event_type) { events.Advance(); }
+ };
  const auto await_frame = [&](std::uint64_t count) { REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == count; })); };
- const auto stop = [&] { static_cast<void>(live.Stop()); REQUIRE(events.Wait([&] { return !live.snapshot().running; })); };
+ const auto stop = [&] {
+  static_cast<void>(live.Stop());
+  REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
+ };
  state->Offer();
- static_cast<void>(live.Start({.extent={7,3},.frames_per_second=240}));
+ static_cast<void>(live.Start({.extent = {7, 3}, .frames_per_second = 240}));
  await_frame(1);
  const auto first_frame = live.snapshot().frame;
  auto first = live.ReadAnalysis(first_frame);
  REQUIRE(first.valid());
  CHECK(first.frame() == first_frame);
- CHECK(first.analysis().frame() == media::LiveFrameId{1,1});
+ CHECK(first.analysis().frame() == media::LiveFrameId{1, 1});
  CHECK(first.analysis().regions()[0].class_catalog == catalog);
  CHECK(first.analysis().regions()[0].keypoints[0].covariance_xy == -.5F);
  state->Offer();
@@ -446,7 +509,7 @@ TEST_CASE("Live exact-frame analysis reads retain image and schema across reuse 
  CHECK(live.snapshot().completed_frames == 2);
  first = {};
  await_frame(3);
- CHECK(second.analysis().frame() == media::LiveFrameId{1,2});
+ CHECK(second.analysis().frame() == media::LiveFrameId{1, 2});
  CHECK(second.analysis().regions()[0].count == 0);
  second = {};
  auto third = live.ReadAnalysis(live.snapshot().frame);
@@ -455,11 +518,11 @@ TEST_CASE("Live exact-frame analysis reads retain image and schema across reuse 
  CHECK(third.analysis().regions()[0].keypoints[0].x == 3.F);
  CHECK(live.ReadAnalysis(third.frame()).valid());
  state->Offer();
- static_cast<void>(live.Start({.extent={3,5},.frames_per_second=240}));
+ static_cast<void>(live.Start({.extent = {3, 5}, .frames_per_second = 240}));
  await_frame(4);
  auto resized = live.ReadAnalysis(live.snapshot().frame);
  REQUIRE(resized.valid());
- CHECK(resized.frame().extent == VisualExtent{3,5});
+ CHECK(resized.frame().extent == VisualExtent{3, 5});
  CHECK_FALSE(resized.analysis().analyzed());
  CHECK(resized.analysis().regions().empty());
  CHECK(third.analysis().regions()[0].class_catalog == catalog);
@@ -470,20 +533,22 @@ TEST_CASE("Live exact-frame analysis reads retain image and schema across reuse 
  live.Shutdown();
 }
 TEST_CASE("Live failed and cancelled replacements preserve a retained completed semantic read") {
- const int outcome = GENERATE(0,1,2);
+ const int outcome = GENERATE(0, 1, 2);
  auto backend = std::make_shared<FakeImageBackend>();
  auto state = std::make_shared<ControlledLiveCapture>();
  auto fixture = std::make_shared<LiveAnalysisFixture>();
- state->fill_analysis = [fixture](media::LiveAnalysisProduct& product,std::uint64_t sequence) { fixture->Deliver(product,{1,sequence}); };
+ state->fill_analysis = [fixture](media::LiveAnalysisProduct& product, std::uint64_t sequence) { fixture->Deliver(product, {1, sequence}); };
  EventGate events;
  std::atomic_bool failed{false};
- LiveSystem live{kDevice,RuntimeFactory(0,backend,mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-  [state] { return std::make_unique<ControlledLiveAlgorithm>(state); },2),[&](LiveSystem::event_type event) {
-   if (std::holds_alternative<LiveFailed>(event)) failed = true;
-   events.Advance();
-  }};
+ LiveSystem live{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2),
+  [&](LiveSystem::event_type event) {
+  if (std::holds_alternative<LiveFailed>(event)) failed = true;
+  events.Advance();
+ }
+ };
  state->Offer();
- static_cast<void>(live.Start({.extent={7,3},.frames_per_second=240}));
+ static_cast<void>(live.Start({.extent = {7, 3}, .frames_per_second = 240}));
  REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 1; }));
  auto retained = live.ReadAnalysis(live.snapshot().frame);
  REQUIRE(retained.valid());
@@ -503,7 +568,7 @@ TEST_CASE("Live failed and cancelled replacements preserve a retained completed 
  REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
  // Failure has published its terminal state while this exact image read still
  // holds deferred retirement; its independently owned semantics remain usable.
- CHECK(retained.analysis().frame() == media::LiveFrameId{1,1});
+ CHECK(retained.analysis().frame() == media::LiveFrameId{1, 1});
  CHECK(retained.analysis().regions()[0].keypoint_counts[0] == 2);
  CHECK(retained.analysis().regions()[0].keypoints[0].covariance_xy == -.5F);
  CHECK(retained.image().valid());
@@ -518,21 +583,25 @@ TEST_CASE("Live metadata capacity refuses only the replacement and stops with us
  auto state = std::make_shared<ControlledLiveCapture>();
  auto fixture = std::make_shared<LiveAnalysisFixture>();
  state->fill_analysis = [fixture](media::LiveAnalysisProduct& product, std::uint64_t sequence) {
-  if (sequence == 2) LiveAnalysisFixture::DeliverLargeSchema(product,{1,sequence},128);
-  else fixture->Deliver(product,{1,sequence});
+  if (sequence == 2)
+   LiveAnalysisFixture::DeliverLargeSchema(product, {1, sequence}, 128);
+  else
+   fixture->Deliver(product, {1, sequence});
  };
  EventGate events;
  std::atomic_bool failed{false};
- LiveSystem live{kDevice,RuntimeFactory(0,backend,mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-  [state] { return std::make_unique<ControlledLiveAlgorithm>(state); },2),[&](LiveSystem::event_type event) {
-   if (const auto* failure = std::get_if<LiveFailed>(&event)) {
-    CHECK(failure->detail.find(cleanup_failure ? "cleanup failed" : "aggregate publication capacity") != std::string::npos);
-    failed = true;
-   }
-   events.Advance();
-  }};
+ LiveSystem live{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2),
+  [&](LiveSystem::event_type event) {
+  if (const auto* failure = std::get_if<LiveFailed>(&event)) {
+   CHECK(failure->detail.find(cleanup_failure ? "cleanup failed" : "aggregate publication capacity") != std::string::npos);
+   failed = true;
+  }
+  events.Advance();
+ }
+ };
  state->Offer();
- static_cast<void>(live.Start({.extent={4,4},.frames_per_second=240}));
+ static_cast<void>(live.Start({.extent = {4, 4}, .frames_per_second = 240}));
  REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 1; }));
  const auto first = live.snapshot();
  auto held = live.BorrowDocument(first.frame);
@@ -543,7 +612,7 @@ TEST_CASE("Live metadata capacity refuses only the replacement and stops with us
   CHECK(*reinterpret_cast<const std::uint8_t*>(read.pixels.plane(1).plane().data) == 101);
  };
  check(held);
- if (cleanup_failure) state->stop_status = {mmltk::backend::media::capture::StatusCode::kCudaError,"injected physical cleanup failure"};
+ if (cleanup_failure) state->stop_status = {mmltk::backend::media::capture::StatusCode::kCudaError, "injected physical cleanup failure"};
  state->Offer();
  REQUIRE(events.Wait([&] { return failed.load(); }));
  CHECK_FALSE(live.snapshot().running);
@@ -558,7 +627,7 @@ TEST_CASE("Live metadata capacity refuses only the replacement and stops with us
   CHECK(live.ImageSnapshot(first.frame).has_value());
   fresh = {};
   state->Offer();
-  static_cast<void>(live.Start({.extent={4,4},.frames_per_second=240}));
+  static_cast<void>(live.Start({.extent = {4, 4}, .frames_per_second = 240}));
   REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 2; }));
   CHECK(live.snapshot().frame != first.frame);
   check(held);
@@ -576,7 +645,9 @@ public:
  void Start(const LiveStart&, std::shared_ptr<const LiveAnalysisConfiguration>, std::stop_token) override {}
  void SetOutputAvailableSink(std::function<void()>) override {}
  bool AcquireOutput() override { return true; }
- bool Capture(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, mmltk::backend::media::live::LiveAnalysisProduct&, std::stop_token) override { throw std::runtime_error("deterministic Live capture failure"); }
+ bool Capture(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, mmltk::backend::media::live::LiveAnalysisProduct&, std::stop_token) override {
+  throw std::runtime_error("deterministic Live capture failure");
+ }
  mmltk::backend::media::capture::Status Stop() noexcept override { return mmltk::backend::media::capture::Status::Ok(); }
 };
 TEST_CASE("Live queued discrete cancellation settles without running obsolete work") {

@@ -203,7 +203,8 @@ void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
    .mask_present = label.has_mask(),
    .rle_offset = static_cast<std::uint32_t>(rle_cursor),
    .rle_count = static_cast<std::uint32_t>(runs.size()),
-   .joint_offset = static_cast<std::uint32_t>(joint_cursor), .joint_count = static_cast<std::uint32_t>(joints.size()),
+   .joint_offset = static_cast<std::uint32_t>(joint_cursor),
+   .joint_count = static_cast<std::uint32_t>(joints.size()),
    .card_index = lane.destination_slot,
    .class_id = label.class_id,
   };
@@ -318,7 +319,8 @@ GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(
  const auto labels = product.store->image_labels(compiled_index);
  result.annotations.count = labels.size();
  result.joints.count = product.store->annotations(compiled_index).joints.size();
- if (result.joints.count > explore::kExploreRenderJointCapacity || donor_joint_count > explore::kExploreRenderJointCapacity - result.joints.count) throw contracts::BusyError("Explore joints exceed renderer capacity");
+ if (result.joints.count > explore::kExploreRenderJointCapacity || donor_joint_count > explore::kExploreRenderJointCapacity - result.joints.count)
+  throw contracts::BusyError("Explore joints exceed renderer capacity");
  if (result.annotations.count > explore::kExploreRenderAnnotationCapacity) throw contracts::BusyError("Explore thumbnail annotations exceed renderer capacity");
  for (const auto& label : labels) {
   const auto run_count = product.store->instance_rle(compiled_index, label).size();

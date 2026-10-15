@@ -17,8 +17,7 @@ std::string encode_record(const Record& record) {
  if (text.size() > kClassLayoutByteBudget) throw std::invalid_argument("RF-DETR class record escaped JSON exceeds 1 MiB artifact budget");
  return text;
 }
-}
-
+}  // namespace
 ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std::move(record)) {
  if (record_.version != kClassLayoutVersion || record_.slots.size() > kMaximumClassOutputSlots) throw std::invalid_argument("unsupported or oversized RF-DETR class layout");
  if (record_.provenance.producer.find('\0') != std::string::npos || record_.provenance.producer.size() > 1024 || record_.provenance.artifact_sha256.size() > 64)
@@ -167,8 +166,15 @@ ModelClassLayout decode_class_layout(std::string_view text) {
  const ResolvedClassLayout validated(record);
  return record;
 }
-std::string encode_output_contract(const RfdetrOutputContract& contract) { validate_rfdetr_output_contract(contract); return encode_record(contract); }
-RfdetrOutputContract decode_output_contract(std::string_view text) { auto result = decode_record<RfdetrOutputContract>(text); validate_rfdetr_output_contract(result); return result; }
+std::string encode_output_contract(const RfdetrOutputContract& contract) {
+ validate_rfdetr_output_contract(contract);
+ return encode_record(contract);
+}
+RfdetrOutputContract decode_output_contract(std::string_view text) {
+ auto result = decode_record<RfdetrOutputContract>(text);
+ validate_rfdetr_output_contract(result);
+ return result;
+}
 std::string encode_class_descriptor(const ModelClassDescriptor& descriptor) {
  validate_descriptor(descriptor);
  return encode_record(descriptor);

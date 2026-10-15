@@ -37,9 +37,12 @@ fn values(summary: Option<&MetricSummary>) -> [Option<f64>; 12] {
     ]
 }
 fn cell_text(summary: Option<&MetricSummary>, index: usize) -> String {
-    let value = values(summary)[index].map_or_else(|| "—".to_owned(), |value| format!("{value:.4}"));
+    let value =
+        values(summary)[index].map_or_else(|| "—".to_owned(), |value| format!("{value:.4}"));
     if (6..9).contains(&index) {
-        summary.map_or(value.clone(), |summary| format!("{value} @ {}", summary.detectionlimits[index - 6]))
+        summary.map_or(value.clone(), |summary| {
+            format!("{value} @ {}", summary.detectionlimits[index - 6])
+        })
     } else {
         value
     }
@@ -56,21 +59,23 @@ pub fn view<'a, Message: 'a>(model: &crate::view_model::ApplicationModel) -> Ele
     let columns = [("Boxes", boxes), ("Masks", masks), ("OKS", keypoints)];
     let mut heading = row![container(text("COCO").size(12)).width(Fill)];
     for (label, summary) in columns {
-        if label == "Boxes" || summary.is_some() { heading = heading.push(container(text(label).size(12)).width(100)); }
+        if label == "Boxes" || summary.is_some() {
+            heading = heading.push(container(text(label).size(12)).width(100));
+        }
     }
     let mut rows = column![heading].spacing(3);
     for (index, name) in ROW_NAMES.iter().enumerate() {
         let mut cells = row![container(text(*name).size(12)).width(Fill)];
         for (label, summary) in columns {
-            if label != "Boxes" && summary.is_none() { continue; }
-            let cell = container(
-                    text(
-                        cell_text(summary, index),
-                    )
-                    .size(12),
-                )
-                .width(100);
-            cells = cells.push(if label == "OKS" && index == 0 { cell.id("validate.results.oks.ap") } else { cell });
+            if label != "Boxes" && summary.is_none() {
+                continue;
+            }
+            let cell = container(text(cell_text(summary, index)).size(12)).width(100);
+            cells = cells.push(if label == "OKS" && index == 0 {
+                cell.id("validate.results.oks.ap")
+            } else {
+                cell
+            });
         }
         rows = rows.push(container(cells).height(iced::Length::FillPortion(1)));
     }
@@ -86,10 +91,20 @@ mod tests {
     #[test]
     fn recall_cells_keep_each_native_metric_limit_and_missing_value() {
         let mut boxes = MetricSummary {
-            ap: 0.5, ap50: 0.6, ap75: 0.4, available: true,
-            averagerecall: [Some(0.2), Some(0.4), None], detectionlimits: [1, 10, 300],
-            areaap: [None; 3], areaar: [None; 3], confidencethreshold: 0.5,
-            confidence: crate::generated::ConfidenceMetrics { precision: 0.5, recall: 0.5, f1: 0.5 },
+            ap: 0.5,
+            ap50: 0.6,
+            ap75: 0.4,
+            available: true,
+            averagerecall: [Some(0.2), Some(0.4), None],
+            detectionlimits: [1, 10, 300],
+            areaap: [None; 3],
+            areaar: [None; 3],
+            confidencethreshold: 0.5,
+            confidence: crate::generated::ConfidenceMetrics {
+                precision: 0.5,
+                recall: 0.5,
+                f1: 0.5,
+            },
         };
         let mut joints = boxes.clone();
         joints.detectionlimits = [20, 20, 20];

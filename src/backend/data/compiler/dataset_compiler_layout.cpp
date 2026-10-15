@@ -33,8 +33,8 @@ int resolve_num_workers(int configured_workers, const std::span<const int> worke
  }
  return static_cast<int>(allowed.size());
 }
-void write_metadata_blocks(
- const FileHandle& fd, const FileLayout& layout, const FileHeader& header, std::span<const std::byte> catalog, const LabelBlocks& label_blocks, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+void write_metadata_blocks(const FileHandle& fd, const FileLayout& layout, const FileHeader& header, std::span<const std::byte> catalog, const LabelBlocks& label_blocks,
+ mmltk::common::concurrency::CancellationObservation cancel_requested) {
  constexpr size_t kWriteChunkBytes = size_t{16U} * 1024U * 1024U;
  const auto write_block = [&](const void* source, const size_t bytes, const size_t offset) {
   const auto* source_bytes = static_cast<const std::uint8_t*>(source);

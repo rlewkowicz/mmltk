@@ -20,10 +20,10 @@ struct SkeletonEdge final {
 };
 MMLTK_REFLECT_FIELDS(SkeletonEdge)
 struct ClassKeypointSchema final {
- MMLTK_MAX_ITEMS(kKeypointsPerClassCapacity) MMLTK_MAX_BYTES(kKeypointNameCapacity) std::vector<std::string> names;
- MMLTK_MAX_ITEMS(kSkeletonEdgeCapacity) std::vector<SkeletonEdge> skeleton;
- MMLTK_MAX_ITEMS(kKeypointsPerClassCapacity) std::vector<JointIndex> horizontal_flip;
- MMLTK_MAX_ITEMS(kKeypointsPerClassCapacity) std::vector<double> oks_sigmas;
+ MMLTK_MAX_ITEMS(kKeypointsPerClassCapacity) MMLTK_MAX_BYTES(kKeypointNameCapacity) std::vector<std::string> names {};
+ MMLTK_MAX_ITEMS(kSkeletonEdgeCapacity) std::vector<SkeletonEdge> skeleton {};
+ MMLTK_MAX_ITEMS(kKeypointsPerClassCapacity) std::vector<JointIndex> horizontal_flip {};
+ MMLTK_MAX_ITEMS(kKeypointsPerClassCapacity) std::vector<double> oks_sigmas {};
  auto operator<=>(const ClassKeypointSchema&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ClassKeypointSchema)

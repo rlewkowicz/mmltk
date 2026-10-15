@@ -27,8 +27,8 @@ struct ValidationLabel final {
  std::uint32_t category = 0U;
  bool ground_truth = false;
  float confidence = 0.0F;
- MMLTK_MAX_BYTES(256U) std::string name;
- VisualSkeleton skeleton;
+ MMLTK_MAX_BYTES(256U) std::string name {};
+ VisualSkeleton skeleton{};
 };
 struct ValidationSampleMetadata final {
  ValidationSampleIdentity identity{};

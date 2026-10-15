@@ -73,7 +73,8 @@ struct ModelClassDescriptor final {
  MMLTK_MAX_BYTES(64U) std::string artifact_sha256;
  ModelClassLayout layout;
  MMLTK_MAX_ITEMS(kMaximumNamedOutputRoles) std::vector<RfdetrNamedOutputRole> output_roles {};
- std::optional<RfdetrOutputContract> output_contract;
+ std::optional<RfdetrOutputContract> output_contract{};
+ bool operator==(const ModelClassDescriptor&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ModelClassDescriptor)
 }  // namespace mmltk::backend::models::rfdetr

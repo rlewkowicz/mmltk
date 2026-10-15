@@ -18,13 +18,13 @@ struct LiveAnalysisRegion final {
  std::size_t count = 0;
  std::uint32_t keypoint_capacity = 0;
  bool masks_available = false, keypoints_available = false;
- std::span<const std::array<float, 4>> boxes_xyxy;
- std::span<const std::int32_t> class_references;
- std::span<const float> confidences;
- std::span<const std::array<std::uint8_t, 3>> colors_rgb;
- std::span<const std::uint8_t> masks;
- std::span<const mmltk::backend::ml::runtime::AnalysisKeypoint> keypoints;
- std::span<const std::int32_t> keypoint_counts;
+ std::span<const std::array<float, 4>> boxes_xyxy{};
+ std::span<const std::int32_t> class_references{};
+ std::span<const float> confidences{};
+ std::span<const std::array<std::uint8_t, 3>> colors_rgb{};
+ std::span<const std::uint8_t> masks{};
+ std::span<const mmltk::backend::ml::runtime::AnalysisKeypoint> keypoints{};
+ std::span<const std::int32_t> keypoint_counts{};
 };
 // A compositor slot owns pinned readback; the controller owns an independent
 // reusable host copy. Owners settle queued reads before reset/reuse/destruction.

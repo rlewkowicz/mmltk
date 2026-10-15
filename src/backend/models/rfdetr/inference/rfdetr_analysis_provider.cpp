@@ -48,7 +48,11 @@ namespace {
 }  // namespace
 struct RfdetrAnalysisProvider::Impl final {
  explicit Impl(const RfdetrRuntimeBackendOptions& options, float threshold)
-     : backend(make_rfdetr_runtime_backend(options)), confidence_threshold(threshold), resolution(backend->static_resolution()), device(backend->device()), stream(reinterpret_cast<cudaStream_t>(backend->stream())) {
+     : backend(make_rfdetr_runtime_backend(options)),
+       confidence_threshold(threshold),
+       resolution(backend->static_resolution()),
+       device(backend->device()),
+       stream(reinterpret_cast<cudaStream_t>(backend->stream())) {
   if (!(threshold >= 0.0F && threshold <= 1.0F)) throw std::invalid_argument("RF-DETR analysis confidence threshold is invalid");
   using element_type = runtime::RuntimeElementType;
   if (resolution == 0U || device < 0 || stream == nullptr || (backend->input_element_type() != element_type::Float16 && backend->input_element_type() != element_type::Float32)) {
@@ -87,7 +91,9 @@ std::uint32_t RfdetrAnalysisProvider::keypoint_capacity() const noexcept {
  const auto& counts = impl_->backend->output_contract().keypoints_per_class;
  return counts.empty() ? 0U : *std::max_element(counts.begin(), counts.end());
 }
-std::shared_ptr<runtime::AnalysisProvider> MakeRfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options, float confidence_threshold) { return std::make_shared<RfdetrAnalysisProvider>(options, confidence_threshold); }
+std::shared_ptr<runtime::AnalysisProvider> MakeRfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options, float confidence_threshold) {
+ return std::make_shared<RfdetrAnalysisProvider>(options, confidence_threshold);
+}
 RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(const runtime::AnalysisRequest& request) noexcept {
  try {
   if (request.source.device != impl_->device || request.source.channels != 3U || request.regions.size() > runtime::kMaximumAnalysisRegions || impl_->active_submission.has_value()) {

@@ -136,7 +136,10 @@ struct AnnotationSkeletonNode final {
  AnnotationPoint point{};
  mmltk::backend::data::catalog::KeypointVisibility visibility = mmltk::backend::data::catalog::KeypointVisibility::Visible;
  [[nodiscard]] bool visible() const noexcept { return visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; }
- [[nodiscard]] bool valid() const noexcept { return !key.empty() && key.size() <= mmltk::backend::data::catalog::kKeypointNameCapacity && key.find('\0') == std::string::npos && point.finite() && mmltk::frameworks::reflection::enum_contains(visibility); }
+ [[nodiscard]] bool valid() const noexcept {
+  return !key.empty() && key.size() <= mmltk::backend::data::catalog::kKeypointNameCapacity && key.find('\0') == std::string::npos && point.finite() &&
+         mmltk::frameworks::reflection::enum_contains(visibility);
+ }
  auto operator<=>(const AnnotationSkeletonNode&) const = default;
 };
 struct AnnotationEdge final {
@@ -196,22 +199,28 @@ class AnnotationDocumentBudget final {
 public:
  [[nodiscard]] bool AddSchema(const mmltk::backend::data::catalog::ClassKeypointSchema& schema) noexcept {
   if (!Bytes(1, 128) || !Bytes(schema.names.size(), 32) || !Bytes(schema.skeleton.size(), 32)) return false;
-  for (const auto& name : schema.names) if (!Add(name.size(), names_, kAnnotationDocumentJointNameBytes) || !Bytes(name.size(), 1)) return false;
+  for (const auto& name : schema.names)
+   if (!Add(name.size(), names_, kAnnotationDocumentJointNameBytes) || !Bytes(name.size(), 1)) return false;
   return true;
  }
  [[nodiscard]] bool AddObject(const AnnotationObject& object, std::span<const mmltk::backend::data::catalog::ClassKeypointSchema> schemas) noexcept {
   if (!Add(object.mask.runs.size(), runs_, kAnnotationMaskRunCapacity) || !Add(object.skeleton_nodes.size(), joints_, kAnnotationDocumentJointCapacity) ||
-      !Add(object.skeleton_edges.size(), edges_, kAnnotationDocumentEdgeCapacity)) return false;
-  if (!Bytes(1, 1024) || !Bytes(object.mask.runs.size(), 32) || !Bytes(object.mask_points.size(), 32) || !Bytes(object.spline_knots.size(), 256) ||
-      !Bytes(object.skeleton_nodes.size(), 96) || !Bytes(object.skeleton_edges.size(), 32)) return false;
-  for (const auto& node : object.skeleton_nodes) if (!Add(node.key.size(), names_, kAnnotationDocumentJointNameBytes) || !Bytes(node.key.size(), 1)) return false;
+      !Add(object.skeleton_edges.size(), edges_, kAnnotationDocumentEdgeCapacity))
+   return false;
+  if (!Bytes(1, 1024) || !Bytes(object.mask.runs.size(), 32) || !Bytes(object.mask_points.size(), 32) || !Bytes(object.spline_knots.size(), 256) || !Bytes(object.skeleton_nodes.size(), 96) ||
+      !Bytes(object.skeleton_edges.size(), 32))
+   return false;
+  for (const auto& node : object.skeleton_nodes)
+   if (!Add(node.key.size(), names_, kAnnotationDocumentJointNameBytes) || !Bytes(node.key.size(), 1)) return false;
   if (object.shape == AnnotationShape::Skeleton && object.category < schemas.size()) {
    const auto& schema = schemas[object.category];
    if (schema.names.size() != object.skeleton_nodes.size()) return false;
-   for (std::size_t index = 0; index < schema.names.size(); ++index) if (schema.names[index] != object.skeleton_nodes[index].key) return false;
+   for (std::size_t index = 0; index < schema.names.size(); ++index)
+    if (schema.names[index] != object.skeleton_nodes[index].key) return false;
   }
   return true;
  }
+
 private:
  // Conservative CBOR envelope costs include field names, maximal scalar encodings,
  // and fixed object content. Admission computes these without serializing or
@@ -287,7 +296,8 @@ struct AnnotationSceneContent final {
     if (!budget.AddSchema(schema)) return false;
    }
   } catch (...) { return false; }
-  for (const auto& object : objects) if (!budget.AddObject(object, keypoint_schemas)) return false;
+  for (const auto& object : objects)
+   if (!budget.AddObject(object, keypoint_schemas)) return false;
   if (frame_ready && (frame_width == 0U || frame_height == 0U)) return false;
   const auto point_in_frame = [this](const AnnotationPoint point) { return !frame_ready || (point.x >= 0.0F && point.y >= 0.0F && point.x <= frame_width && point.y <= frame_height); };
   if (!std::ranges::all_of(categories, [](const auto& item) { return item.valid(); }) || !std::ranges::all_of(objects, [this, &point_in_frame](const auto& item) {
@@ -325,9 +335,9 @@ struct AnnotationUiState final {
  std::uint64_t saved_revision = 0U;
  std::uint64_t scene_revision = 0U;
  [[nodiscard]] bool empty() const noexcept {
-  return tool_capabilities.empty() && !can_undo && !can_redo && !source_navigation_available && !scene.document.valid() && scene.categories.empty() && scene.palette.empty() && scene.keypoint_schemas.empty() && scene.objects.empty() &&
-         editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle && save_generation == 0U && interaction_revision == 0U && document_revision == 0U && saved_revision == 0U &&
-         scene_revision == 0U;
+  return tool_capabilities.empty() && !can_undo && !can_redo && !source_navigation_available && !scene.document.valid() && scene.categories.empty() && scene.palette.empty() &&
+         scene.keypoint_schemas.empty() && scene.objects.empty() && editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle && save_generation == 0U &&
+         interaction_revision == 0U && document_revision == 0U && saved_revision == 0U && scene_revision == 0U;
  }
  [[nodiscard]] bool valid() const noexcept {
   if (!scene.document.valid()) return empty();

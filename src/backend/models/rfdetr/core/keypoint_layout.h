@@ -42,6 +42,5 @@ private:
 [[nodiscard]] torch::Tensor refine_keypoints(const torch::Tensor& delta, const torch::Tensor& references);
 // Source/destination compact rows, retaining destination class/joint order.
 [[nodiscard]] std::vector<std::pair<std::int64_t, std::int64_t>> keypoint_transfer_rows(
- const ResolvedClassLayout& source, const KeypointTensorLayout& source_joints,
- const ResolvedClassLayout& destination, const KeypointTensorLayout& destination_joints);
+ const ResolvedClassLayout& source, const KeypointTensorLayout& source_joints, const ResolvedClassLayout& destination, const KeypointTensorLayout& destination_joints);
 }  // namespace mmltk::backend::models::rfdetr

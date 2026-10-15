@@ -369,12 +369,16 @@ impl ApplicationModel {
     pub fn live_start_available(&self) -> bool {
         let analysis_ready = self.settings_snapshot.as_ref().is_some_and(|settings| {
             let configured = &settings.settingsstate;
-            !configured.workflows.predict.liveanalysisenabled || (
-                self.model_selection_matches(configured, FeatureId::Predict)
-                && matches!(configured.workflows.predict.modelinput, crate::generated::ModelArtifactInputKind::Onnx | crate::generated::ModelArtifactInputKind::TensorRt)
-            )
+            !configured.workflows.predict.liveanalysisenabled
+                || (self.model_selection_matches(configured, FeatureId::Predict)
+                    && matches!(
+                        configured.workflows.predict.modelinput,
+                        crate::generated::ModelArtifactInputKind::Onnx
+                            | crate::generated::ModelArtifactInputKind::TensorRt
+                    ))
         });
-        analysis_ready && self.connection == ConnectionState::Connected
+        analysis_ready
+            && self.connection == ConnectionState::Connected
             && !self.native_settings_unsettled()
             && self.window_width != 0
             && self.window_height != 0

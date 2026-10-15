@@ -1312,6 +1312,7 @@ TEST_CASE("validation rendered output applies captured layers masks boxes and in
  CHECK(box[1] == (pb || gb ? (gb ? 255U : 0U) : 64U));
 }
 TEST_CASE("validation saved and interactive skeletons share independent layer joint and uncertainty policy", "[controller][validation][gpu][output][keypoints]") {
+ using namespace mmltk::controller;
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;
  namespace catalog = mmltk::backend::data::catalog;
@@ -1344,14 +1345,19 @@ TEST_CASE("validation saved and interactive skeletons share independent layer jo
  std::filesystem::path saved;
  detail::ValidationSampleOutput output({execution}, {}, [&](const auto& path) { saved = path; });
  output.Begin(directory.path(), options, indices);
- options.overlays = {}; options.overlays.prediction_layer = options.overlays.ground_truth_layer = false;
+ options.overlays = {};
+ options.overlays.prediction_layer = options.overlays.ground_truth_layer = false;
  REQUIRE(output.Capture(sample()));
  output.Finish(true);
  auto [width, height, png] = mmltk::testsupport::read_rgba_image(saved);
- REQUIRE(width == 64); REQUIRE(height == 64);
+ REQUIRE(width == 64);
+ REQUIRE(height == 64);
  std::mutex mutex;
  std::condition_variable changed;
- detail::ValidationSamples interactive({.device = 0, .maximum_width = 512, .maximum_height = 576}, [&] { std::scoped_lock lock(mutex); changed.notify_all(); });
+ detail::ValidationSamples interactive({.device = 0, .maximum_width = 512, .maximum_height = 576}, [&] {
+  std::scoped_lock lock(mutex);
+  changed.notify_all();
+ });
  interactive.SetOverlays(admitted.overlays);
  interactive.SetDisplay(admitted.display);
  interactive.Begin(1, indices);
@@ -1359,21 +1365,29 @@ TEST_CASE("validation saved and interactive skeletons share independent layer jo
  interactive.Settle(1, true);
  await_validation(mutex, changed, [&] { return interactive.snapshot().sample_available[0]; });
  interactive.Select({1, 29});
- await_validation(mutex, changed, [&] { const auto value = interactive.snapshot(); return value.detail && value.frame.extent == VisualExtent{64, 64}; });
+ await_validation(mutex, changed, [&] {
+  const auto value = interactive.snapshot();
+  return value.detail && value.frame.extent == VisualExtent{64, 64};
+ });
  auto image = interactive.BorrowFrame();
- REQUIRE(image.valid()); REQUIRE(image.plane_count() == 2);
+ REQUIRE(image.valid());
+ REQUIRE(image.plane_count() == 2);
  image.plane(0).context().Bind();
  const auto clean = image.plane(0).plane(), semantic = image.plane(1).plane();
  auto composed = mmltk::testsupport::allocate_cuda_test_object<std::array<std::uint8_t, 64U * 64U * 4U>>();
  auto target = clean;
  target.data = reinterpret_cast<std::uintptr_t>(composed.get());
  target.descriptor.pitch_bytes = 64U * 4U;
- REQUIRE(cudaMemcpy2D(reinterpret_cast<void*>(target.data), target.descriptor.pitch_bytes, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes, 64U * 4U, 64U, cudaMemcpyDeviceToDevice) == cudaSuccess);
+ REQUIRE(cudaMemcpy2D(reinterpret_cast<void*>(target.data), target.descriptor.pitch_bytes, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes, 64U * 4U, 64U,
+          cudaMemcpyDeviceToDevice) == cudaSuccess);
  mmltk::backend::imaging::raster::CaptionRaster::Composite(target, semantic, 0);
  std::array<std::uint8_t, 64U * 64U * 4U> pixels;
  REQUIRE(cudaMemcpy(pixels.data(), composed.get(), pixels.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
  CHECK(std::equal(pixels.begin(), pixels.end(), png.get()));
- const auto changed_pixel = [&](unsigned x, unsigned y) { const auto* pixel = png.get() + (y * 64U + x) * 4U; return pixel[0] != 64 || pixel[1] != 64 || pixel[2] != 64; };
+ const auto changed_pixel = [&](unsigned x, unsigned y) {
+  const auto* pixel = png.get() + (y * 64U + x) * 4U;
+  return pixel[0] != 64 || pixel[1] != 64 || pixel[2] != 64;
+ };
  const bool prediction = admitted.overlays.prediction_layer && choice != 6;
  CHECK(changed_pixel(16, 16) == (prediction && admitted.overlays.prediction_keypoints));
  CHECK(changed_pixel(48, 16) == (admitted.overlays.ground_truth_layer && admitted.overlays.ground_truth_keypoints));

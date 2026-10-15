@@ -23,6 +23,7 @@ module;
 #include <vector>
 #include "src/common/io/json_file.h"
 #include "src/frameworks/serialization/serialization.h"
+#include "src/frameworks/serialization/json_wire.h"
 #include "src/backend/data/catalog/class_catalog.h"
 module mmltk.backend.imaging.annotation.core;
 import mmltk.backend.imaging.annotation.renderer;
@@ -153,8 +154,11 @@ json serialize_annotation_shape_payload(const AnnotationFrame& frame, const Anno
    json payload{{"nodes", std::move(nodes)}, {"edges", std::move(edges)}};
    if (!shape.schema.names.empty()) {
     catalog::validate_keypoint_schema(shape.schema);
-    std::vector<std::byte> scratch(128U * 1024U);
-    payload["schema"] = mmltk::frameworks::serialization::reflected_json(shape.schema, scratch, {.max_bytes = scratch.size(), .max_items = scratch.size()});
+    namespace serial = mmltk::frameworks::serialization;
+    constexpr serial::wire::Limits limits{.max_bytes = 128U * 1024U, .max_items = 128U * 1024U};
+    serial::wire::ByteBuffer bytes;
+    if (!serial::encode(shape.schema, bytes, limits)) throw std::runtime_error("annotation keypoint schema exceeds serialization limits");
+    payload["schema"] = serial::json_from_cbor({bytes, {}}, limits);
    }
    return payload;
   } else {
@@ -285,7 +289,12 @@ AnnotationObject annotation_object_from_scene_record(const json& record, Annotat
    AnnotationSkeletonShape skeleton;
    if (nodes->size() > catalog::kKeypointsPerClassCapacity || edges->size() > catalog::kSkeletonEdgeCapacity) fail("skeleton exceeds catalog capacity");
    if (const auto schema = shape_payload.find("schema"); schema != shape_payload.end()) {
-    skeleton.schema = mmltk::frameworks::serialization::decode_reflected_json<catalog::ClassKeypointSchema>(schema->dump(), {.max_bytes = 128U * 1024U, .max_items = 128U * 1024U});
+    namespace serial = mmltk::frameworks::serialization;
+    constexpr serial::wire::Limits limits{.max_bytes = 128U * 1024U, .max_items = 128U * 1024U};
+    const auto bytes = serial::json_to_cbor(schema->dump(), limits);
+    auto decoded = serial::decode<catalog::ClassKeypointSchema>({bytes, {}}, limits);
+    if (!decoded) fail("invalid keypoint schema");
+    skeleton.schema = std::move(*decoded);
     catalog::validate_keypoint_schema(skeleton.schema);
    }
    skeleton.nodes.reserve(nodes->size());
@@ -300,11 +309,14 @@ AnnotationObject annotation_object_from_scene_record(const json& record, Annotat
     if (key == node_entry.end() || !key->is_string()) { fail("skeleton node is missing string `key`"); }
     if (node_entry.contains("visibility") && node_entry.contains("visible")) fail("skeleton node mixes current and old visibility");
     if (node_entry.contains("visibility") && (!node_entry["visibility"].is_number_unsigned() || node_entry["visibility"].get<std::uint64_t>() > std::numeric_limits<std::uint8_t>::max() ||
-        !mmltk::frameworks::reflection::enum_contains(static_cast<catalog::KeypointVisibility>(node_entry["visibility"].get<std::uint8_t>())))) fail("skeleton visibility is invalid");
+                                              !mmltk::frameworks::reflection::enum_contains(static_cast<catalog::KeypointVisibility>(node_entry["visibility"].get<std::uint8_t>()))))
+     fail("skeleton visibility is invalid");
     skeleton.nodes.push_back(AnnotationSkeletonNode{
      key->get<std::string>(),
      annotation_frame_point_to_capture_unclipped(node_point_value, view_x, view_y),
-     node_entry.contains("visibility") ? static_cast<catalog::KeypointVisibility>(node_entry.at("visibility").get<std::uint8_t>()) : node_entry.value("visible", true) ? catalog::KeypointVisibility::Visible : catalog::KeypointVisibility::Unannotated,
+     node_entry.contains("visibility")   ? static_cast<catalog::KeypointVisibility>(node_entry.at("visibility").get<std::uint8_t>())
+     : node_entry.value("visible", true) ? catalog::KeypointVisibility::Visible
+                                         : catalog::KeypointVisibility::Unannotated,
     });
    }
    skeleton.edges.reserve(edges->size());
@@ -317,7 +329,8 @@ AnnotationObject annotation_object_from_scene_record(const json& record, Annotat
    }
    if (!skeleton.schema.names.empty()) {
     if (skeleton.schema.names.size() != skeleton.nodes.size()) fail("skeleton schema count disagrees");
-    for (std::size_t joint = 0; joint < skeleton.nodes.size(); ++joint) if (skeleton.nodes[joint].key != skeleton.schema.names[joint]) fail("skeleton schema joint identity disagrees");
+    for (std::size_t joint = 0; joint < skeleton.nodes.size(); ++joint)
+     if (skeleton.nodes[joint].key != skeleton.schema.names[joint]) fail("skeleton schema joint identity disagrees");
    }
    object.shape = std::move(skeleton);
    if (categories != nullptr && object.category_index < categories->items.size()) {

@@ -38,8 +38,9 @@ struct BackboneConfig final {
 };
 MMLTK_REFLECT_FIELDS(BackboneConfig)
 [[nodiscard]] constexpr bool backbone_config_valid(const BackboneConfig& config) noexcept {
- if (!mmltk::frameworks::reflection::enum_contains(config.kind) || config.dimension == 0U || config.feedforward_dimension == 0U ||
-     config.heads == 0U || config.dimension % config.heads != 0U || config.layers == 0U) return false;
+ if (!mmltk::frameworks::reflection::enum_contains(config.kind) || config.dimension == 0U || config.feedforward_dimension == 0U || config.heads == 0U || config.dimension % config.heads != 0U ||
+     config.layers == 0U)
+  return false;
  const bool zero_based = config.kind == BackboneKind::PeCoreTiny;
  for (std::size_t index = 0U; index < config.features.size(); ++index) {
   const auto feature = config.features[index];

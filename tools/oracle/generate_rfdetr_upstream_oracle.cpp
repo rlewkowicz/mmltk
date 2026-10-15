@@ -37,7 +37,6 @@ namespace fs = std::filesystem;
 namespace support = mmltk::tools;
 using Json = nlohmann::json;  // Sorted object keys, as json.dumps(sort_keys=True).
 using namespace pybind11::literals;
-
 constexpr std::string_view Format = "mmltk.rfdetr.upstream-oracle.v2";
 const fs::path OracleRoot = "/opt/rfdetr-oracle";
 constexpr std::uint64_t MaxManifest = 32ULL * 1024 * 1024;
@@ -45,9 +44,8 @@ constexpr std::uint64_t MaxArchive = 4ULL * 1024 * 1024 * 1024;
 constexpr std::uint64_t ShardTarget = 256ULL * 1024 * 1024;
 constexpr std::uint64_t MaxStepStorage = 64ULL * 1024 * 1024 * 1024;
 constexpr std::size_t MaxShards = 256, MaxTensors = 20000;
-constexpr auto KeypointTopologyFields = std::to_array<std::pair<const char*, const char*>>({
- {"keypoint_dimension_downscale", "grouppose_keypoint_dim_downscale"}, {"keypoint_cross_attention", "keypoint_cross_attn"},
- {"inter_instance_keypoint_attention", "inter_instance_kp_attn"}});
+constexpr auto KeypointTopologyFields = std::to_array<std::pair<const char*, const char*>>(
+ {{"keypoint_dimension_downscale", "grouppose_keypoint_dim_downscale"}, {"keypoint_cross_attention", "keypoint_cross_attn"}, {"inter_instance_keypoint_attention", "inter_instance_kp_attn"}});
 py::module_ module(const char* name) { return py::module_::import(name); }
 py::object object(py::handle value) { return py::reinterpret_borrow<py::object>(value); }
 bool truth(py::handle value) {
@@ -96,16 +94,22 @@ Json sequence_json(py::handle value) {
  return result;
 }
 Json read_json(const fs::path& path) {
- if (!fs::is_regular_file(path) || fs::is_symlink(path) || fs::file_size(path)>MaxManifest) throw std::runtime_error("invalid or oversized evidence JSON");
+ if (!fs::is_regular_file(path) || fs::is_symlink(path) || fs::file_size(path) > MaxManifest) throw std::runtime_error("invalid or oversized evidence JSON");
  std::vector<std::set<std::string>> keys;
- return Json::parse(support::read_text(path),[&](int,Json::parse_event_t event,Json& value) {
-  if (event==Json::parse_event_t::object_start) keys.emplace_back();
-  else if (event==Json::parse_event_t::key && !keys.back().insert(value.get<std::string>()).second) throw std::runtime_error("duplicate evidence JSON key");
-  else if (event==Json::parse_event_t::object_end) keys.pop_back();
+ return Json::parse(support::read_text(path), [&](int, Json::parse_event_t event, Json& value) {
+  if (event == Json::parse_event_t::object_start)
+   keys.emplace_back();
+  else if (event == Json::parse_event_t::key && !keys.back().insert(value.get<std::string>()).second)
+   throw std::runtime_error("duplicate evidence JSON key");
+  else if (event == Json::parse_event_t::object_end)
+   keys.pop_back();
   return true;
  });
 }
-const Json& source_pins() { static const auto pins = read_json(OracleRoot / "sources.json"); return pins; }
+const Json& source_pins() {
+ static const auto pins = read_json(OracleRoot / "sources.json");
+ return pins;
+}
 std::string core_revision() { return source_pins().at("core").at("revision").get<std::string>(); }
 void check_signals() {
  if (PyErr_CheckSignals() < 0) throw py::error_already_set();
@@ -198,10 +202,9 @@ Json check_environment() {
  return current;
 }
 Json precision_capability() {
- const auto cuda=module("torch").attr("cuda");
+ const auto cuda = module("torch").attr("cuda");
  if (!truth(cuda.attr("is_available")())) throw std::runtime_error("required CUDA device unavailable");
- return {{"fp32",true},{"fp16",true},{"bf16",truth(cuda.attr("is_bf16_supported")("including_emulation"_a=false))},
-  {"device_capability",to_json(cuda.attr("get_device_capability")(0))}};
+ return {{"fp32", true}, {"fp16", true}, {"bf16", truth(cuda.attr("is_bf16_supported")("including_emulation"_a = false))}, {"device_capability", to_json(cuda.attr("get_device_capability")(0))}};
 }
 Json verify_source(const fs::path& source, const std::string& kind = "core") {
  const auto& pin = source_pins().at(kind);
@@ -216,7 +219,8 @@ Json verify_source(const fs::path& source, const std::string& kind = "core") {
   if (result.exit_code) throw std::runtime_error("upstream git validation failed with status " + std::to_string(result.exit_code));
   return support::trim(result.out);
  };
- if (git({"rev-parse", "HEAD"}) != pin.at("revision").get<std::string>() || git({"rev-parse", "HEAD^{tree}"}) != pin.at("tree").get<std::string>() || !git({"status", "--porcelain", "--untracked-files=all"}).empty())
+ if (git({"rev-parse", "HEAD"}) != pin.at("revision").get<std::string>() || git({"rev-parse", "HEAD^{tree}"}) != pin.at("tree").get<std::string>() ||
+     !git({"status", "--porcelain", "--untracked-files=all"}).empty())
   throw std::runtime_error("upstream must be the clean pinned " + kind + " source");
  if (!git({"diff", "--name-only", "HEAD"}).empty()) throw std::runtime_error("upstream source changed");
  std::vector<fs::path> files{source / "README.md", source / "LICENSE"};
@@ -293,105 +297,111 @@ private:
  };
  std::vector<Patch> originals_;
 };
-Json file_record(const fs::path& path) {
- return {{"file",path.filename().string()},{"sha256",digest(path)},{"bytes",fs::file_size(path)}};
-}
+Json file_record(const fs::path& path) { return {{"file", path.filename().string()}, {"sha256", digest(path)}, {"bytes", fs::file_size(path)}}; }
 fs::path admitted_file(const fs::path& directory, const std::string& name) {
- if (fs::is_symlink(directory) || name.empty() || name.size()>256 || fs::path(name).filename()!=name || name=="." || name==".." || fs::is_symlink(directory/name))
+ if (fs::is_symlink(directory) || name.empty() || name.size() > 256 || fs::path(name).filename() != name || name == "." || name == ".." || fs::is_symlink(directory / name))
   throw std::runtime_error("invalid evidence filename");
- return directory/name;
+ return directory / name;
 }
 Json authenticated_json(const fs::path& directory, const Json& reference) {
- const auto path=admitted_file(directory,reference.at("file").get<std::string>());
- const auto bytes=reference.at("bytes").get<std::uint64_t>();
- if (!bytes || bytes>MaxManifest || fs::file_size(path)!=bytes || digest(path)!=reference.at("sha256")) throw std::runtime_error("completed evidence index changed");
+ const auto path = admitted_file(directory, reference.at("file").get<std::string>());
+ const auto bytes = reference.at("bytes").get<std::uint64_t>();
+ if (!bytes || bytes > MaxManifest || fs::file_size(path) != bytes || digest(path) != reference.at("sha256")) throw std::runtime_error("completed evidence index changed");
  return read_json(path);
 }
 void publish_file(const fs::path& destination, const std::function<void(const fs::path&)>& write) {
- const fs::path temporary=destination.string()+".partial";
+ const fs::path temporary = destination.string() + ".partial";
  fs::remove(temporary);
  write(temporary);
- support::FileDescriptor file(::open(temporary.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW));
- if (file.get()<0 || ::fsync(file.get())!=0) throw std::system_error(errno,std::generic_category(),"sync evidence product");
+ support::FileDescriptor file(::open(temporary.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+ if (file.get() < 0 || ::fsync(file.get()) != 0) throw std::system_error(errno, std::generic_category(), "sync evidence product");
  file.reset();
- fs::rename(temporary,destination);
+ fs::rename(temporary, destination);
 }
 void verify_archive(const fs::path& directory, const Json& reference) {
- const auto index=authenticated_json(directory,reference);
- if (index.at("format")!="mmltk.rfdetr.step.v2" || index.at("shards").empty() || index.at("shards").size()>MaxShards || index.at("tensor_count").get<std::size_t>()>MaxTensors)
+ const auto index = authenticated_json(directory, reference);
+ if (index.at("format") != "mmltk.rfdetr.step.v2" || index.at("shards").empty() || index.at("shards").size() > MaxShards || index.at("tensor_count").get<std::size_t>() > MaxTensors)
   throw std::runtime_error("invalid completed step index");
- std::uint64_t total=0,metadata=0;
- std::set<std::string> files,names;
- for (const auto& ref:index.at("shards")) {
+ std::uint64_t total = 0, metadata = 0;
+ std::set<std::string> files, names;
+ for (const auto& ref : index.at("shards")) {
   if (!files.insert(ref.at("file").get<std::string>()).second) throw std::runtime_error("duplicate completed shard index");
-  const auto index_bytes=ref.at("bytes").get<std::uint64_t>();
-  if (index_bytes>MaxManifest-metadata) throw std::runtime_error("unbounded completed step metadata");
-  metadata+=index_bytes;
-  const auto shard=authenticated_json(directory,ref);
-  for (const auto& [name,spec]:shard.at("tensors").items())
-   if (!names.insert(name).second || names.size()>MaxTensors) throw std::runtime_error("duplicate completed tensor");
-  const auto path=admitted_file(directory,shard.at("file").get<std::string>());
-  const auto bytes=shard.at("bytes").get<std::uint64_t>();
-  if (!files.insert(path.filename().string()).second || !bytes || bytes>MaxArchive || bytes>MaxStepStorage-total || fs::file_size(path)!=bytes || digest(path)!=shard.at("sha256"))
+  const auto index_bytes = ref.at("bytes").get<std::uint64_t>();
+  if (index_bytes > MaxManifest - metadata) throw std::runtime_error("unbounded completed step metadata");
+  metadata += index_bytes;
+  const auto shard = authenticated_json(directory, ref);
+  for (const auto& [name, spec] : shard.at("tensors").items())
+   if (!names.insert(name).second || names.size() > MaxTensors) throw std::runtime_error("duplicate completed tensor");
+  const auto path = admitted_file(directory, shard.at("file").get<std::string>());
+  const auto bytes = shard.at("bytes").get<std::uint64_t>();
+  if (!files.insert(path.filename().string()).second || !bytes || bytes > MaxArchive || bytes > MaxStepStorage - total || fs::file_size(path) != bytes || digest(path) != shard.at("sha256"))
    throw std::runtime_error("completed tensor shard changed");
-  total+=bytes;
+  total += bytes;
  }
- if (total!=index.at("bytes") || names.size()!=index.at("tensor_count")) throw std::runtime_error("completed step storage differs");
+ if (total != index.at("bytes") || names.size() != index.at("tensor_count")) throw std::runtime_error("completed step storage differs");
 }
 class Archive {
 public:
- Archive(fs::path directory, std::string name):directory_(std::move(directory)),name_(std::move(name)) {}
+ Archive(fs::path directory, std::string name) : directory_(std::move(directory)), name_(std::move(name)) {}
  void add(const std::string& name, py::handle value) {
-  const auto torch=module("torch");
-  if (name.empty() || name.size()>512 || name.starts_with("finite/") || !names_.insert(name).second || names_.size()>MaxTensors) throw std::runtime_error("invalid or duplicate oracle tensor "+name);
-  if (value.is_none()) { inventory_[name]={{"defined",false}}; return; }
-  if (!py::isinstance(value,torch.attr("Tensor"))) throw py::type_error(name);
-  const bool floating=truth(object(value).attr("is_floating_point")());
-  const auto elements=static_cast<std::uint64_t>(integer(object(value).attr("numel")()));
-  const auto width=static_cast<std::uint64_t>(integer(object(value).attr("element_size")()))+floating;
-  if (!width || elements>(MaxArchive-MaxManifest)/width) throw std::runtime_error("unbounded logical tensor");
-  const auto bytes=elements*width;
-  if (!inventory_.empty() && bytes>ShardTarget-std::min(pending_bytes_,ShardTarget)) flush();
-  const auto tensor=object(value).attr("detach")().attr("as_subclass")(torch.attr("Tensor")).attr("cpu")().attr("contiguous")().attr("clone")();
-  const auto finite=floating?torch.attr("isfinite")(tensor):torch.attr("ones_like")(tensor,"dtype"_a=torch.attr("bool"));
-  tensors_[py::str(name)]=tensor;
-  if (floating) tensors_[py::str("finite/"+name)]=finite;
-  inventory_[name]={{"defined",true},{"shape",sequence_json(object(value).attr("shape"))},{"dtype",string(object(value).attr("dtype"))},
-   {"device",string(object(value).attr("device"))},{"stride",sequence_json(object(value).attr("stride")())},
-   {"finite_count",integer(finite.attr("sum")())},{"elements",elements}};
-  pending_bytes_+=bytes;
+  const auto torch = module("torch");
+  if (name.empty() || name.size() > 512 || name.starts_with("finite/") || !names_.insert(name).second || names_.size() > MaxTensors)
+   throw std::runtime_error("invalid or duplicate oracle tensor " + name);
+  if (value.is_none()) {
+   inventory_[name] = {{"defined", false}};
+   return;
+  }
+  if (!py::isinstance(value, torch.attr("Tensor"))) throw py::type_error(name);
+  const bool floating = truth(object(value).attr("is_floating_point")());
+  const auto elements = static_cast<std::uint64_t>(integer(object(value).attr("numel")()));
+  const auto width = static_cast<std::uint64_t>(integer(object(value).attr("element_size")())) + floating;
+  if (!width || elements > (MaxArchive - MaxManifest) / width) throw std::runtime_error("unbounded logical tensor");
+  const auto bytes = elements * width;
+  if (!inventory_.empty() && bytes > ShardTarget - std::min(pending_bytes_, ShardTarget)) flush();
+  const auto tensor = object(value).attr("detach")().attr("as_subclass")(torch.attr("Tensor")).attr("cpu")().attr("contiguous")().attr("clone")();
+  const auto finite = floating ? torch.attr("isfinite")(tensor) : torch.attr("ones_like")(tensor, "dtype"_a = torch.attr("bool"));
+  tensors_[py::str(name)] = tensor;
+  if (floating) tensors_[py::str("finite/" + name)] = finite;
+  inventory_[name] = {
+   {"defined", true}, {"shape", sequence_json(object(value).attr("shape"))}, {"dtype", string(object(value).attr("dtype"))}, {"device", string(object(value).attr("device"))},
+   {"stride", sequence_json(object(value).attr("stride")())}, {"finite_count", integer(finite.attr("sum")())}, {"elements", elements}
+  };
+  pending_bytes_ += bytes;
  }
  Json write() {
   flush();
-  const auto path=directory_/(name_+".json");
-  json_write(path,{{"format","mmltk.rfdetr.step.v2"},{"shards",shards_},{"tensor_count",names_.size()},{"bytes",total_bytes_}});
+  const auto path = directory_ / (name_ + ".json");
+  json_write(path, {{"format", "mmltk.rfdetr.step.v2"}, {"shards", shards_}, {"tensor_count", names_.size()}, {"bytes", total_bytes_}});
   return file_record(path);
  }
+
 private:
  void flush() {
   if (inventory_.empty()) return;
-  if (shards_.size()>=MaxShards) throw std::runtime_error("too many physical shards");
-  const auto path=directory_/(name_+"-shard"+std::to_string(shards_.size())+".pt");
-  publish_file(path,[&](const auto& temporary){module("torch").attr("save")(tensors_,temporary.string());});
-  const auto bytes=fs::file_size(path);
-  if (!bytes || bytes>MaxArchive || bytes>MaxStepStorage-total_bytes_) throw std::runtime_error("unbounded serialized step storage");
-  auto record=file_record(path);
-  record["tensors"]=std::move(inventory_);
-  const fs::path metadata=path.string()+".json";
-  json_write(metadata,record);
-  const auto index_bytes=fs::file_size(metadata);
-  if (index_bytes>MaxManifest-metadata_bytes_) throw std::runtime_error("unbounded step metadata");
-  metadata_bytes_+=index_bytes;
+  if (shards_.size() >= MaxShards) throw std::runtime_error("too many physical shards");
+  const auto path = directory_ / (name_ + "-shard" + std::to_string(shards_.size()) + ".pt");
+  publish_file(path, [&](const auto& temporary) { module("torch").attr("save")(tensors_, temporary.string()); });
+  const auto bytes = fs::file_size(path);
+  if (!bytes || bytes > MaxArchive || bytes > MaxStepStorage - total_bytes_) throw std::runtime_error("unbounded serialized step storage");
+  auto record = file_record(path);
+  record["tensors"] = std::move(inventory_);
+  const fs::path metadata = path.string() + ".json";
+  json_write(metadata, record);
+  const auto index_bytes = fs::file_size(metadata);
+  if (index_bytes > MaxManifest - metadata_bytes_) throw std::runtime_error("unbounded step metadata");
+  metadata_bytes_ += index_bytes;
   shards_.push_back(file_record(metadata));
-  total_bytes_+=bytes;
-  tensors_=py::dict(); inventory_=Json::object(); pending_bytes_=0;
+  total_bytes_ += bytes;
+  tensors_ = py::dict();
+  inventory_ = Json::object();
+  pending_bytes_ = 0;
  }
  fs::path directory_;
  std::string name_;
  py::dict tensors_;
- Json inventory_=Json::object(), shards_=Json::array();
+ Json inventory_ = Json::object(), shards_ = Json::array();
  std::set<std::string> names_;
- std::uint64_t pending_bytes_=0,total_bytes_=0,metadata_bytes_=0;
+ std::uint64_t pending_bytes_ = 0, total_bytes_ = 0, metadata_bytes_ = 0;
 };
 using NamedTensors = std::vector<std::pair<std::string, py::object>>;
 NamedTensors output_tensors(py::dict outputs) {
@@ -606,8 +616,7 @@ py::list targets_for(int batch, int resolution, bool segmentation, const std::ve
    py::list rows;
    for (int row = 0; row < count; ++row) {
     py::list points;
-    for (int joint = 0; joint < joints; ++joint)
-     points.append(py::make_tuple(.2 + .01 * joint + .3 * row, .3 + .008 * joint, joint % 3));
+    for (int joint = 0; joint < joints; ++joint) points.append(py::make_tuple(.2 + .01 * joint + .3 * row, .3 + .008 * joint, joint % 3));
     rows.append(points);
    }
    target["keypoints"] = torch.attr("tensor")(rows, "dtype"_a = torch.attr("float32"), "device"_a = "cuda").attr("reshape")(count, joints, 3);
@@ -812,12 +821,11 @@ Json run_case(const fs::path& directory, py::object model, py::dict initial, py:
    std::vector<std::unique_ptr<PythonContext>> keypoint_observers;
    if (truth(mc.attr("use_grouppose_keypoints"))) {
     for (const auto* name : {"keypoint_query_initializer", "keypoint_query_initializer_enc"}) {
-     const auto handle = model.attr("transformer").attr(name).attr("register_forward_hook")(
-      py::cpp_function([&archive, name](py::object, py::object args, py::object result) {
-       const auto prefix = std::string("grouppose/") + name + "/";
-       archive.add(prefix + "input", index(args, 0));
-       archive.add(prefix + "output", result);
-      }));
+     const auto handle = model.attr("transformer").attr(name).attr("register_forward_hook")(py::cpp_function([&archive, name](py::object, py::object args, py::object result) {
+      const auto prefix = std::string("grouppose/") + name + "/";
+      archive.add(prefix + "input", index(args, 0));
+      archive.add(prefix + "output", result);
+     }));
      keypoint_observers.push_back(std::make_unique<PythonContext>(handle));
     }
    }
@@ -935,11 +943,11 @@ Json run_case(const fs::path& directory, py::object model, py::dict initial, py:
  Json optimizer_settings = Json::object();
  for (const char* key : {"lr", "lr_encoder", "weight_decay", "lr_vit_layer_decay", "lr_component_decay"}) optimizer_settings[key] = to_json(tc.attr(key));
  return {
-  {"id", identity}, {"protocol",protocol}, {"preset", preset}, {"precision", dtype_name}, {"batch", batch}, {"execution_policy", execution_policy},
+  {"id", identity}, {"protocol", protocol}, {"preset", preset}, {"precision", dtype_name}, {"batch", batch}, {"execution_policy", execution_policy},
   {"comparison_policy", fp32 || !training ? "untouched_stock" : "upstream_with_fp32_matcher_boundary"}, {"training", training}, {"resolution", resolution}, {"groups", to_json(mc.attr("group_detr"))},
   {"classes", py::cast<int>(mc.attr("num_classes")) + 1}, {"queries", to_json(mc.attr("num_queries"))}, {"keypoints_per_class", to_json(mc.attr("num_keypoints_per_class"))},
-  {"trainable", trainable_names}, {"parameter_groups", groups}, {"loss_weights", to_json(criterion.attr("weight_dict"))},
-  {"clip_max_norm", to_json(tc.attr("clip_max_norm"))}, {"optimizer", optimizer_settings}, {"steps", records}
+  {"trainable", trainable_names}, {"parameter_groups", groups}, {"loss_weights", to_json(criterion.attr("weight_dict"))}, {"clip_max_norm", to_json(tc.attr("clip_max_norm"))},
+  {"optimizer", optimizer_settings}, {"steps", records}
  };
 }
 Json constructor_evidence(py::object model) {
@@ -988,7 +996,7 @@ Json resize_evidence(const fs::path& directory) {
  constexpr std::array Cases{
   Case{"identity", 13, 17, 13, 17}, Case{"enlarge", 7, 11, 19, 27}, Case{"shrink", 37, 53, 11, 17}, Case{"odd_aspect", 9, 41, 23, 13}, Case{"high_frequency", 64, 65, 13, 17}
  };
- Archive archive(directory,"resize");
+ Archive archive(directory, "resize");
  Json case_records = Json::array();
  for (const auto& entry : Cases) {
   // This is the original bounded RGB8 test-pattern formula. Only the
@@ -1031,10 +1039,10 @@ Json keypoint_evidence(const fs::path& directory) {
  const auto torch = module("torch"), numpy = module("numpy");
  const auto detector = module("rfdetr.models.lwdetr").attr("LWDETR");
  const auto heads = module("rfdetr.models.heads.keypoints");
- Archive archive(directory,"keypoint-boundaries");
+ Archive archive(directory, "keypoint-boundaries");
  Json cases = Json::array();
  // These are fixture inputs, not a parallel native model/task catalog.
- for (const auto& counts : std::vector<std::vector<int>>{{17,0},{0,17},{2,0,3},{3,2,0},{0,0}}) {
+ for (const auto& counts : std::vector<std::vector<int>>{{17, 0}, {0, 17}, {2, 0, 3}, {3, 2, 0}, {0, 0}}) {
   const auto id = std::to_string(cases.size());
   const auto schema = py::cast(counts);
   const int total = std::accumulate(counts.begin(), counts.end(), 0), maximum = *std::ranges::max_element(counts);
@@ -1042,7 +1050,7 @@ Json keypoint_evidence(const fs::path& directory) {
   archive.add(id + "/active", active);
   archive.add(id + "/class_mask", detector.attr("_create_keypoint_class_mask")(schema));
   const auto context = module("types").attr("SimpleNamespace")("use_grouppose_keypoints"_a = true, "num_keypoints_per_class"_a = schema, "_kp_active_mask"_a = active,
-    "class_embed"_a = module("types").attr("SimpleNamespace")("out_features"_a = counts.size()), "_kp_zero_pad_warned"_a = false);
+   "class_embed"_a = module("types").attr("SimpleNamespace")("out_features"_a = counts.size()), "_kp_zero_pad_warned"_a = false);
   const auto compact = torch.attr("arange")(2 * total * 8, "dtype"_a = torch.attr("float32")).attr("reshape")(1, 2, total, 8).attr("__truediv__")(100);
   const auto padded = detector.attr("_format_keypoint_output")(context, compact, 1, 2);
   archive.add(id + "/compact", compact);
@@ -1050,31 +1058,35 @@ Json keypoint_evidence(const fs::path& directory) {
   archive.add(id + "/class_logits", detector.attr("_aggregate_keypoint_class_logits")(context, padded));
   cases.push_back({{"id", id}, {"counts", counts}});
   if (id == "2") {
-   cases.back()["classes"] = Json::array({"tool",nullptr,"hand"});
-   cases.back()["joint_names"] = Json::array({Json::array({"tip","base"}),Json::array(),Json::array({"middle","left","right"})});
+   cases.back()["classes"] = Json::array({"tool", nullptr, "hand"});
+   cases.back()["joint_names"] = Json::array({Json::array({"tip", "base"}), Json::array(), Json::array({"middle", "left", "right"})});
   } else if (id == "3") {
-   cases.back()["classes"] = Json::array({"hand","tool",nullptr});
-   cases.back()["joint_names"] = Json::array({Json::array({"right","middle","left"}),Json::array({"base","tip"}),Json::array()});
+   cases.back()["classes"] = Json::array({"hand", "tool", nullptr});
+   cases.back()["joint_names"] = Json::array({Json::array({"right", "middle", "left"}), Json::array({"base", "tip"}), Json::array()});
   }
   // The real pinned postprocessor owns stable tied-score selection, score
   // fusion, class-specific padded gathering and source-space box/joint output.
-  const auto logits = torch.attr("zeros")(1,2,counts.size());
-  const auto boxes = torch.attr("tensor")(py::make_tuple(py::make_tuple(py::make_tuple(.1,.2,.4,.6),py::make_tuple(.9,.8,.4,.6))));
-  const auto postprocessor = module("rfdetr.models.postprocess").attr("PostProcess")("num_select"_a=2*counts.size(), "num_keypoints_per_class"_a=schema);
-  const auto selected = index(postprocessor(py::dict("pred_logits"_a=logits,"pred_boxes"_a=boxes,"pred_keypoints"_a=padded),torch.attr("tensor")(py::make_tuple(py::make_tuple(200,400)))),0);
-  archive.add(id + "/selection/logits",logits);
-  archive.add(id + "/selection/input_boxes",boxes);
-  archive.add(id + "/selection/queries",index(postprocessor.attr("_select_topk")(logits),2));
-  for (const auto* field : {"scores","labels","boxes","keypoints","keypoint_precision_cholesky"}) archive.add(id + "/selection/" + field,selected[field]);
-  const auto source_shapes = numpy.attr("tile")(numpy.attr("array")(py::make_tuple(200,400)),py::make_tuple(2*counts.size(),1));
-  const auto covariance = module("rfdetr.utilities.keypoints").attr("precision_cholesky_to_pixel_covariance")(object(selected["keypoint_precision_cholesky"]).attr("numpy")(),source_shapes);
-  archive.add(id + "/selection/covariance",torch.attr("from_numpy")(covariance));
+  const auto logits = torch.attr("zeros")(1, 2, counts.size());
+  const auto boxes = torch.attr("tensor")(py::make_tuple(py::make_tuple(py::make_tuple(.1, .2, .4, .6), py::make_tuple(.9, .8, .4, .6))));
+  const auto postprocessor = module("rfdetr.models.postprocess").attr("PostProcess")("num_select"_a = 2 * counts.size(), "num_keypoints_per_class"_a = schema);
+  const auto selected =
+   index(postprocessor(py::dict("pred_logits"_a = logits, "pred_boxes"_a = boxes, "pred_keypoints"_a = padded), torch.attr("tensor")(py::make_tuple(py::make_tuple(200, 400)))), 0);
+  archive.add(id + "/selection/logits", logits);
+  archive.add(id + "/selection/input_boxes", boxes);
+  archive.add(id + "/selection/queries", index(postprocessor.attr("_select_topk")(logits), 2));
+  for (const auto* field : {"scores", "labels", "boxes", "keypoints", "keypoint_precision_cholesky"}) archive.add(id + "/selection/" + field, selected[field]);
+  const auto source_shapes = numpy.attr("tile")(numpy.attr("array")(py::make_tuple(200, 400)), py::make_tuple(2 * counts.size(), 1));
+  const auto covariance = module("rfdetr.utilities.keypoints").attr("precision_cholesky_to_pixel_covariance")(object(selected["keypoint_precision_cholesky"]).attr("numpy")(), source_shapes);
+  archive.add(id + "/selection/covariance", torch.attr("from_numpy")(covariance));
   for (const int n : {0, 2}) {
    const auto prefix = id + "/targets-" + std::to_string(n) + "/";
    const auto predictions = torch.attr("arange")(n * counts.size() * maximum * 8, "dtype"_a = torch.attr("float32"))
-    .attr("reshape")(n, counts.size() * maximum, 8).attr("__mod__")(23).attr("__truediv__")(100).attr("requires_grad_")(true);
+                             .attr("reshape")(n, counts.size() * maximum, 8)
+                             .attr("__mod__")(23)
+                             .attr("__truediv__")(100)
+                             .attr("requires_grad_")(true);
    auto targets = torch.attr("arange")(n * maximum * 3, "dtype"_a = torch.attr("float32")).attr("reshape")(n, maximum, 3).attr("__mod__")(17).attr("__truediv__")(20);
-   targets.attr("select")(-1,2).attr("copy_")(torch.attr("arange")(n*maximum,"dtype"_a=torch.attr("float32")).attr("reshape")(n,maximum).attr("__mod__")(3));
+   targets.attr("select")(-1, 2).attr("copy_")(torch.attr("arange")(n * maximum, "dtype"_a = torch.attr("float32")).attr("reshape")(n, maximum).attr("__mod__")(3));
    const auto labels = torch.attr("arange")(n, "dtype"_a = torch.attr("int64")).attr("__mod__")(counts.size());
    const auto areas = torch.attr("full")(py::make_tuple(n), .2);
    archive.add(prefix + "predictions", predictions);
@@ -1099,17 +1111,21 @@ Json keypoint_evidence(const fs::path& directory) {
   for (py::handle pair : initializer.attr("named_parameters")()) {
    const auto parameter = index(pair, 1);
    // Nonzero modulation exercises every initializer branch and derivative.
-   parameter.attr("copy_")(torch.attr("arange")(integer(parameter.attr("numel")()), "dtype"_a = torch.attr("float32")).attr("reshape")(parameter.attr("shape")).attr("__mod__")(29).attr("__sub__")(14).attr("__truediv__")(100));
+   parameter.attr("copy_")(torch.attr("arange")(integer(parameter.attr("numel")()), "dtype"_a = torch.attr("float32"))
+     .attr("reshape")(parameter.attr("shape"))
+     .attr("__mod__")(29)
+     .attr("__sub__")(14)
+     .attr("__truediv__")(100));
    archive.add("initializer/parameter/" + string(index(pair, 0)), parameter);
   }
  }
- const auto condition = torch.attr("arange")(32, "dtype"_a = torch.attr("float32")).attr("reshape")(2,16).attr("__truediv__")(30).attr("requires_grad_")(true);
+ const auto condition = torch.attr("arange")(32, "dtype"_a = torch.attr("float32")).attr("reshape")(2, 16).attr("__truediv__")(30).attr("requires_grad_")(true);
  const auto initialized = initializer(condition);
  archive.add("initializer/input", condition);
  archive.add("initializer/output", initialized);
  initialized.attr("square")().attr("sum")().attr("backward")();
  archive.add("initializer/input_gradient", condition.attr("grad"));
- for (py::handle pair : initializer.attr("named_parameters")()) archive.add("initializer/gradient/" + string(index(pair,0)), index(pair,1).attr("grad"));
+ for (py::handle pair : initializer.attr("named_parameters")()) archive.add("initializer/gradient/" + string(index(pair, 0)), index(pair, 1).attr("grad"));
  // Use the evaluator imported by pinned RF-DETR, including its actual COCO
  // backend and sigma admission. Record visible/occluded/unannotated variants.
  const auto evaluation = module("rfdetr.evaluation.coco_eval");
@@ -1121,25 +1137,25 @@ Json keypoint_evidence(const fs::path& directory) {
    names.append("joint" + std::to_string(joint));
   }
   const auto gt = evaluation.attr("COCO")();
-  gt.attr("dataset") = py::dict("info"_a = py::dict(), "images"_a = py::make_tuple(py::dict("id"_a=1, "width"_a=100, "height"_a=100)),
-   "categories"_a=py::make_tuple(py::dict("id"_a=1, "name"_a="person", "keypoints"_a=names)),
-   "annotations"_a=py::make_tuple(py::dict("id"_a=1, "image_id"_a=1, "category_id"_a=1, "bbox"_a=py::make_tuple(10,10,50,60), "area"_a=3000.,
-    "iscrowd"_a=0, "keypoints"_a=gt_points, "num_keypoints"_a=(visibility ? 3 : 0))));
+  gt.attr("dataset") = py::dict("info"_a = py::dict(), "images"_a = py::make_tuple(py::dict("id"_a = 1, "width"_a = 100, "height"_a = 100)),
+   "categories"_a = py::make_tuple(py::dict("id"_a = 1, "name"_a = "person", "keypoints"_a = names)),
+   "annotations"_a = py::make_tuple(py::dict("id"_a = 1, "image_id"_a = 1, "category_id"_a = 1, "bbox"_a = py::make_tuple(10, 10, 50, 60), "area"_a = 3000., "iscrowd"_a = 0, "keypoints"_a = gt_points,
+    "num_keypoints"_a = (visibility ? 3 : 0))));
   gt.attr("createIndex")();
-  const auto evaluator = evaluation.attr("CocoEvaluator")(gt, py::make_tuple("keypoints"), "keypoint_oks_sigmas"_a=py::make_tuple(.05,.08,.1), "log_summary"_a=false);
+  const auto evaluator = evaluation.attr("CocoEvaluator")(gt, py::make_tuple("keypoints"), "keypoint_oks_sigmas"_a = py::make_tuple(.05, .08, .1), "log_summary"_a = false);
   py::list detections;
-  detections.append(py::dict("image_id"_a=1, "category_id"_a=1, "keypoints"_a=predicted_points, "score"_a=.9));
+  detections.append(py::dict("image_id"_a = 1, "category_id"_a = 1, "keypoints"_a = predicted_points, "score"_a = .9));
   const auto dt = gt.attr("loadRes")(detections);
   const auto backend = evaluator.attr("coco_eval")["keypoints"];
   backend.attr("cocoDt") = dt;
   backend.attr("_prepare")();
-  archive.add("oks/" + std::to_string(visibility), torch.attr("as_tensor")(backend.attr("computeOks")(1,1), "dtype"_a=torch.attr("float64")));
+  archive.add("oks/" + std::to_string(visibility), torch.attr("as_tensor")(backend.attr("computeOks")(1, 1), "dtype"_a = torch.attr("float64")));
  }
- const auto precision = numpy.attr("array")(py::make_tuple(py::make_tuple(py::make_tuple(.2,.3,-.4))), "dtype"_a=numpy.attr("float32"));
- const auto shape = numpy.attr("array")(py::make_tuple(py::make_tuple(200,400)), "dtype"_a=numpy.attr("float32"));
+ const auto precision = numpy.attr("array")(py::make_tuple(py::make_tuple(py::make_tuple(.2, .3, -.4))), "dtype"_a = numpy.attr("float32"));
+ const auto shape = numpy.attr("array")(py::make_tuple(py::make_tuple(200, 400)), "dtype"_a = numpy.attr("float32"));
  archive.add("covariance/input", torch.attr("from_numpy")(precision));
- archive.add("covariance/output", torch.attr("from_numpy")(module("rfdetr.utilities.keypoints").attr("precision_cholesky_to_pixel_covariance")(precision,shape)));
- return {{"archive", archive.write()}, {"cases",cases}};
+ archive.add("covariance/output", torch.attr("from_numpy")(module("rfdetr.utilities.keypoints").attr("precision_cholesky_to_pixel_covariance")(precision, shape)));
+ return {{"archive", archive.write()}, {"cases", cases}};
 }
 struct Arguments {
  std::string payload_snapshot;
@@ -1161,7 +1177,7 @@ py::object checkpoint_value(py::handle checkpoint, py::handle arguments, const c
  return module("builtins").attr("getattr")(arguments, name, py::none());
 }
 void acquire_inventory_asset(const fs::path& path, py::handle asset) {
- const auto hash = [&] (const fs::path& file) {
+ const auto hash = [&](const fs::path& file) {
   const auto stream = module("builtins").attr("open")(file.string(), "rb");
   PythonContext close(stream);
   return string(module("hashlib").attr("file_digest")(stream, "md5").attr("hexdigest")());
@@ -1195,19 +1211,22 @@ Json encoder_metadata(const Json& topology) {
   const auto size = encoder.substr(std::string_view("dinov2_windowed_").size());
   const auto config = to_json(module("rfdetr.models.backbone.dinov2").attr("get_config")(size, false));
   const auto dimension = config.at("hidden_size").get<std::uint32_t>();
-  return {{"encoder", encoder}, {"dimension", dimension}, {"heads", config.at("num_attention_heads")}, {"layers", config.at("num_hidden_layers")},
-          {"feedforward_dimension", dimension * config.at("mlp_ratio").get<std::uint32_t>()}, {"source", "pinned upstream get_config"}};
+  return {
+   {"encoder", encoder}, {"dimension", dimension}, {"heads", config.at("num_attention_heads")}, {"layers", config.at("num_hidden_layers")},
+   {"feedforward_dimension", dimension * config.at("mlp_ratio").get<std::uint32_t>()}, {"source", "pinned upstream get_config"}
+  };
  }
  const auto pe = module("rfdetr_plus.models.pe_core");
  if (encoder != string(pe.attr("PE_CORE_T_ENCODER"))) throw std::runtime_error("unrecognized pinned upstream encoder: " + encoder);
  PythonContext meta(module("torch").attr("device")("meta"));
- const auto trunk = module("timm").attr("create_model")(pe.attr("PE_CORE_T_TIMM_ARCH"), "pretrained"_a = false,
-    "patch_size"_a = topology.at("patch_size").get<int>(), "img_size"_a = topology.at("positional_encoding_size").get<int>() * topology.at("patch_size").get<int>());
+ const auto trunk = module("timm").attr("create_model")(pe.attr("PE_CORE_T_TIMM_ARCH"), "pretrained"_a = false, "patch_size"_a = topology.at("patch_size").get<int>(),
+  "img_size"_a = topology.at("positional_encoding_size").get<int>() * topology.at("patch_size").get<int>());
  const auto blocks = trunk.attr("blocks");
  const auto first = index(blocks, 0);
- return {{"encoder", encoder}, {"dimension", integer(trunk.attr("embed_dim"))}, {"heads", integer(first.attr("attn").attr("num_heads"))},
-         {"layers", py::len(blocks)}, {"feedforward_dimension", integer(first.attr("mlp").attr("fc1").attr("out_features"))},
-         {"source", string(pe.attr("PE_CORE_T_TIMM_ARCH")) + " metadata on meta device; no forward"}};
+ return {
+  {"encoder", encoder}, {"dimension", integer(trunk.attr("embed_dim"))}, {"heads", integer(first.attr("attn").attr("num_heads"))}, {"layers", py::len(blocks)},
+  {"feedforward_dimension", integer(first.attr("mlp").attr("fc1").attr("out_features"))}, {"source", string(pe.attr("PE_CORE_T_TIMM_ARCH")) + " metadata on meta device; no forward"}
+ };
 }
 void inventory(const Arguments& args) {
  const fs::path source = args.upstream, plus_source = args.plus_upstream, output = args.output;
@@ -1221,12 +1240,15 @@ void inventory(const Arguments& args) {
  const auto core_assets = module("rfdetr.assets.model_weights").attr("ModelWeights");
  const auto plus_assets = module("rfdetr_plus.assets.model_weights").attr("ModelWeights");
  const auto native = Json::parse(rfdetr_native_catalog_json());
- Json manifest{{"format", "mmltk.rfdetr.inventory.v1"}, {"sources", source_pins()}, {"source_hashes", {{"core", core_hashes}, {"plus", plus_hashes}}},
-               {"environment", environment}, {"fingerprint", args.fingerprint}, {"producer_sha256", digest(support::executable_path())},
-               {"dependency_sha256", digest(OracleRoot / "requirements.txt")}, {"source_manifest_sha256", digest(OracleRoot / "sources.json")},
-               {"native_catalog", native}, {"assets", Json::array()}, {"mismatches", Json::array()}};
+ Json manifest{
+  {"format", "mmltk.rfdetr.inventory.v1"}, {"sources", source_pins()}, {"source_hashes", {{"core", core_hashes}, {"plus", plus_hashes}}}, {"environment", environment},
+  {"fingerprint", args.fingerprint}, {"producer_sha256", digest(support::executable_path())}, {"dependency_sha256", digest(OracleRoot / "requirements.txt")},
+  {"source_manifest_sha256", digest(OracleRoot / "sources.json")}, {"native_catalog", native}, {"assets", Json::array()}, {"mismatches", Json::array()}
+ };
  fs::create_directories(output / "assets");
- const auto check = [&](bool condition, const std::string& message) { if (!condition) manifest["mismatches"].push_back(message); };
+ const auto check = [&](bool condition, const std::string& message) {
+  if (!condition) manifest["mismatches"].push_back(message);
+ };
  std::size_t maximum_foregrounds = 0;
  for (const auto& row : native.at("presets")) {
   const auto name = row.at("preset_name").get<std::string>();
@@ -1235,29 +1257,28 @@ void inventory(const Arguments& args) {
   const auto registry = platform ? plus_assets : core_assets;
   const auto asset = registry.attr("from_filename")(filename);
   if (asset.is_none()) throw std::runtime_error("required native asset absent from pinned upstream registry: " + filename);
-  check(string(asset.attr("url")) == row.at("canonical_weight_url").get<std::string>() && string(asset.attr("md5_hash")) == row.at("canonical_weight_md5").get<std::string>(), name + ": registry identity differs");
+  check(string(asset.attr("url")) == row.at("canonical_weight_url").get<std::string>() && string(asset.attr("md5_hash")) == row.at("canonical_weight_md5").get<std::string>(),
+   name + ": registry identity differs");
   const py::object model_type = (platform ? plus : core).attr(row.at("upstream_class").get<std::string>().c_str());
   const auto instance = model_type.attr("__new__")(model_type);
   const auto config = instance.attr("get_model_config")("device"_a = "cpu");
   const auto topology = to_json(config.attr("model_dump")("mode"_a = "json"));
   // This conversion is the external Python configuration format, not a second model registry.
-  for (const auto& [native_field, external_field] : std::to_array<std::pair<const char*, const char*>>({
-         {"resolution", "resolution"}, {"patch_size", "patch_size"}, {"window_count", "num_windows"}, {"positional_encoding_size", "positional_encoding_size"},
-         {"decoder_layer_count", "dec_layers"}, {"query_count", "num_queries"}, {"selected_query_count", "num_select"}, {"configured_class_count", "num_classes"},
-         {"hidden_dimension", "hidden_dim"}, {"group_count", "group_detr"}, {"two_stage", "two_stage"}, {"self_attention_heads", "sa_nheads"},
-         {"cross_attention_heads", "ca_nheads"}, {"sampling_points", "dec_n_points"}, {"feedforward_dimension", "dim_feedforward"}}))
+  for (const auto& [native_field, external_field] : std::to_array<std::pair<const char*, const char*>>(
+        {{"resolution", "resolution"}, {"patch_size", "patch_size"}, {"window_count", "num_windows"}, {"positional_encoding_size", "positional_encoding_size"}, {"decoder_layer_count", "dec_layers"},
+         {"query_count", "num_queries"}, {"selected_query_count", "num_select"}, {"configured_class_count", "num_classes"}, {"hidden_dimension", "hidden_dim"}, {"group_count", "group_detr"},
+         {"two_stage", "two_stage"}, {"self_attention_heads", "sa_nheads"}, {"cross_attention_heads", "ca_nheads"}, {"sampling_points", "dec_n_points"}, {"feedforward_dimension", "dim_feedforward"}}))
    check(row.at(native_field) == topology.at(external_field), name + ": topology differs: " + external_field);
   const auto encoder = encoder_metadata(topology);
   for (const auto* field : {"dimension", "heads", "layers", "feedforward_dimension"}) check(row.at("backbone").at(field) == encoder.at(field), name + ": encoder metadata differs: " + field);
   check(row.at("backbone").at("features") == topology.at("out_feature_indexes"), name + ": encoder feature indexes differ");
-  for (const auto& [native_field, external_field] : KeypointTopologyFields)
-   check(row.at(native_field) == topology.at(external_field), name + ": keypoint topology differs: " + external_field);
+  for (const auto& [native_field, external_field] : KeypointTopologyFields) check(row.at(native_field) == topology.at(external_field), name + ": keypoint topology differs: " + external_field);
   const bool dual = row.at("projector") == "DualKeypointOnly";
   check(dual == topology.at("dual_projector").get<bool>() && dual == topology.at("dual_projector_kp_only").get<bool>(), name + ": projector differs");
   const auto training = to_json(instance.attr("get_train_config")("dataset_dir"_a = ".", "output_dir"_a = ".").attr("model_dump")("mode"_a = "json"));
-  for (const auto& [native_field, external_field] : std::to_array<std::pair<const char*, const char*>>({
-       {"classification_loss_coefficient", "cls_loss_coef"}, {"keypoint_l1_loss_coefficient", "keypoint_l1_loss_coef"},
-       {"keypoint_findable_loss_coefficient", "keypoint_findable_loss_coef"}, {"keypoint_visible_loss_coefficient", "keypoint_visible_loss_coef"}, {"keypoint_nll_loss_coefficient", "keypoint_nll_loss_coef"}}))
+  for (const auto& [native_field, external_field] : std::to_array<std::pair<const char*, const char*>>(
+        {{"classification_loss_coefficient", "cls_loss_coef"}, {"keypoint_l1_loss_coefficient", "keypoint_l1_loss_coef"}, {"keypoint_findable_loss_coefficient", "keypoint_findable_loss_coef"},
+         {"keypoint_visible_loss_coefficient", "keypoint_visible_loss_coef"}, {"keypoint_nll_loss_coefficient", "keypoint_nll_loss_coef"}}))
    check(row.at(native_field) == training.at(external_field), name + ": stock training coefficient differs: " + external_field);
   check((row.at("task") == "Segmentation") == topology.at("segmentation_head").get<bool>(), name + ": segmentation head differs");
   check((row.at("task") == "Keypoints") == topology.at("use_grouppose_keypoints").get<bool>(), name + ": keypoint head differs");
@@ -1301,7 +1322,8 @@ void inventory(const Arguments& args) {
    for (const auto& pair : py::reinterpret_borrow<py::dict>(module("rfdetr.assets.coco_classes").attr("COCO_CLASSES"))) foreground_slots.push_back(integer(pair.first));
   } else if (class_names == Json::array({"person"}) && !active.is_none() && string(active.attr("dtype")) == "torch.bool" && integer(active.attr("dim")()) == 2) {
    const auto counts = to_json(active.attr("sum")(-1).attr("tolist")());
-   for (std::size_t index = 0; index < counts.size(); ++index) if (counts[index].get<std::int64_t>() != 0) foreground_slots.push_back(index);
+   for (std::size_t index = 0; index < counts.size(); ++index)
+    if (counts[index].get<std::int64_t>() != 0) foreground_slots.push_back(index);
    if (foreground_slots == Json::array({0}) && counts.at(0) == 17) layout = "PersonActiveFirst";
    if (foreground_slots == Json::array({1}) && counts.at(1) == 17) layout = "PersonBackgroundFirst";
   }
@@ -1309,11 +1331,12 @@ void inventory(const Arguments& args) {
   check(layout == row.at("official_class_layout").get<std::string>(), name + ": native class layout differs: " + layout);
   check(classifier_width == row.at("class_count").get<std::int64_t>(), name + ": native classifier width differs: " + std::to_string(classifier_width));
   maximum_foregrounds = std::max(maximum_foregrounds, class_names.size());
-  Json evidence{{"preset", name}, {"upstream_class", row.at("upstream_class")}, {"registry", platform ? "rfdetr_plus.assets.model_weights.ModelWeights" : "rfdetr.assets.model_weights.ModelWeights"},
-                {"filename", filename}, {"url", string(asset.attr("url"))}, {"md5", string(asset.attr("md5_hash"))}, {"sha256", sha256}, {"bytes", fs::file_size(weights)},
-                {"configured_topology", topology}, {"encoder_metadata", encoder}, {"training_defaults", training}, {"classifier_width", classifier_width}, {"class_names", class_names}, {"embedded_class_names", to_json(raw_names)},
-                {"class_names_source", names_source}, {"class_layout", layout},
-                {"foreground_slots", foreground_slots}, {"active_keypoint_mask", active_mask}, {"tensors", tensors}};
+  Json evidence{
+   {"preset", name}, {"upstream_class", row.at("upstream_class")}, {"registry", platform ? "rfdetr_plus.assets.model_weights.ModelWeights" : "rfdetr.assets.model_weights.ModelWeights"},
+   {"filename", filename}, {"url", string(asset.attr("url"))}, {"md5", string(asset.attr("md5_hash"))}, {"sha256", sha256}, {"bytes", fs::file_size(weights)}, {"configured_topology", topology},
+   {"encoder_metadata", encoder}, {"training_defaults", training}, {"classifier_width", classifier_width}, {"class_names", class_names}, {"embedded_class_names", to_json(raw_names)},
+   {"class_names_source", names_source}, {"class_layout", layout}, {"foreground_slots", foreground_slots}, {"active_keypoint_mask", active_mask}, {"tensors", tensors}
+  };
   if (!arguments.is_none()) {
    const auto dictionary = PyDict_Check(arguments.ptr()) ? arguments : module("builtins").attr("vars")(arguments);
    evidence["checkpoint_arguments"] = Json::parse(string(module("json").attr("dumps")(dictionary, "default"_a = module("builtins").attr("str"))));
@@ -1321,13 +1344,16 @@ void inventory(const Arguments& args) {
   if (digest(weights) != sha256) throw std::runtime_error("official checkpoint changed during inventory: " + name);
   const auto evidence_path = output / "assets" / (name + ".json");
   json_write(evidence_path, evidence);
-  manifest["assets"].push_back({{"preset", name}, {"path", "assets/" + name + ".json"}, {"sha256", digest(evidence_path)}, {"checkpoint_sha256", sha256},
-                                 {"classifier_width", classifier_width}, {"foreground_count", class_names.size()}, {"class_layout", layout}});
+  manifest["assets"].push_back(
+   {{"preset", name}, {"path", "assets/" + name + ".json"}, {"sha256", digest(evidence_path)}, {"checkpoint_sha256", sha256}, {"classifier_width", classifier_width},
+    {"foreground_count", class_names.size()}, {"class_layout", layout}});
   std::cout << "inventory " << name << ": " << classifier_width << " slots, " << class_names.size() << " foreground names, " << layout << std::endl;
  }
  check(maximum_foregrounds <= native.at("foreground_capacity").get<std::size_t>(), "verified foreground meaning exceeds native catalog capacity");
- manifest["capacity_decision"] = {{"maximum_verified_foregrounds", maximum_foregrounds}, {"foreground_capacity", native.at("foreground_capacity")},
-                                 {"instance_reference_bits", native.at("foreground_capacity").get<std::size_t>() <= 256 ? 8 : 16}, {"physical_output_slot_capacity", native.at("output_slot_capacity")}};
+ manifest["capacity_decision"] = {
+  {"maximum_verified_foregrounds", maximum_foregrounds}, {"foreground_capacity", native.at("foreground_capacity")},
+  {"instance_reference_bits", native.at("foreground_capacity").get<std::size_t>() <= 256 ? 8 : 16}, {"physical_output_slot_capacity", native.at("output_slot_capacity")}
+ };
  if (verify_source(source) != core_hashes || verify_source(plus_source, "plus") != plus_hashes) throw std::runtime_error("source changed during inventory");
  manifest["status"] = manifest["mismatches"].empty() ? "verified_inventory_complete" : "native_catalog_mismatch";
  json_write(output / "manifest.json", manifest);
@@ -1351,19 +1377,16 @@ Json checked_native_configuration(const Json& evidence, const int groups, py::ha
  require(evidence.at("configured_topology").at("resolution"), config.at("resolution"), "stock resolution");
  require(integer(context.attr("resolution")), config.at("resolution"), "actual resolution");
  require(integer(context.attr("postprocess").attr("num_select")), config.at("num_select"), "actual selection count");
- for (const auto* field : {"num_queries", "group_detr", "two_stage", "bbox_reparam", "lite_refpoint_refine"})
-  require(to_json(model.attr(field)), config.at(field), field);
+ for (const auto* field : {"num_queries", "group_detr", "two_stage", "bbox_reparam", "lite_refpoint_refine"}) require(to_json(model.attr(field)), config.at(field), field);
  const auto transformer = model.attr("transformer");
- for (const auto* field : {"num_queries", "group_detr", "two_stage", "dec_layers"})
-  require(to_json(transformer.attr(field)), config.at(field), field);
+ for (const auto* field : {"num_queries", "group_detr", "two_stage", "dec_layers"}) require(to_json(transformer.attr(field)), config.at(field), field);
  require(integer(transformer.attr("d_model")), config.at("hidden_dim"), "actual transformer width");
  const auto query_rows = config.at("num_queries").get<std::int64_t>() * groups;
  require(to_json(object(initial["query_feat.weight"]).attr("shape")), Json::array({query_rows, config.at("hidden_dim")}), "query embedding");
  require(to_json(object(initial["refpoint_embed.weight"]).attr("shape")), Json::array({query_rows, 4}), "reference embedding");
  require(topology.at("encoder"), evidence.at("configured_topology").at("encoder"), "encoder");
  require(topology.at("out_feature_indexes"), config.at("backbone").at("features"), "encoder feature indexes");
- for (const auto* field : {"dimension", "heads", "layers", "feedforward_dimension"})
-  require(evidence.at("encoder_metadata").at(field), config.at("backbone").at(field), field);
+ for (const auto* field : {"dimension", "heads", "layers", "feedforward_dimension"}) require(evidence.at("encoder_metadata").at(field), config.at("backbone").at(field), field);
  const auto patch = config.at("backbone").at("kind") == "PeCoreTiny" ? "backbone.0.encoder.model.patch_embed.proj.weight" : "backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight";
  require(to_json(object(initial[patch]).attr("shape")), Json::array({config.at("backbone").at("dimension"), 3, config.at("patch_size"), config.at("patch_size")}), "actual patch embedding");
  const bool keypoints = config.at("task") == "Keypoints", masks = config.at("task") == "Segmentation";
@@ -1382,7 +1405,8 @@ Json checked_native_configuration(const Json& evidence, const int groups, py::ha
   require(string(active.attr("dtype")), "torch.bool", "active-mask dtype");
   require(to_json(active.attr("sum")(-1).attr("tolist")()), config.at("keypoints_per_class"), "active-mask joint counts");
   require(to_json(active.attr("tolist")()), evidence.at("active_keypoint_mask"), "official active mask");
- } else require(integer(active.attr("numel")()), 0, "non-keypoint active mask");
+ } else
+  require(integer(active.attr("numel")()), 0, "non-keypoint active mask");
  return config;
 }
 void generate(const Arguments& args) {
@@ -1423,8 +1447,8 @@ void generate(const Arguments& args) {
  inventory_args.output = (output / "inventory").string();
  if (!fs::exists(fs::path(inventory_args.output) / "manifest.json")) inventory(inventory_args);
  const auto admitted_inventory = read_json(fs::path(inventory_args.output) / "manifest.json");
- if (admitted_inventory.at("sources") != source_pins() || admitted_inventory.at("fingerprint") != args.fingerprint ||
-     admitted_inventory.at("status") != "verified_inventory_complete" || admitted_inventory.at("native_catalog") != Json::parse(rfdetr_native_catalog_json()))
+ if (admitted_inventory.at("sources") != source_pins() || admitted_inventory.at("fingerprint") != args.fingerprint || admitted_inventory.at("status") != "verified_inventory_complete" ||
+     admitted_inventory.at("native_catalog") != Json::parse(rfdetr_native_catalog_json()))
   throw std::runtime_error("cached inventory provenance differs");
  const py::object build_config = torch.attr("__config__").attr("show")();
  const auto build_config_size = py::len(build_config);
@@ -1441,122 +1465,132 @@ void generate(const Arguments& args) {
   {"gradient_scale", 1}, {"accumulated_microbatches", 1}
  };
  Json manifest = {
-  {"format", Format}, {"revision", core_revision()}, {"source_hashes", source_hashes}, {"producer_sha256", digest(support::executable_path())}, {"dependency_sha256", digest(OracleRoot / "requirements.txt")},
-  {"payload_sha256", digest(OracleRoot / "nvidia-payload.json")}, {"environment", environment}, {"fingerprint", args.fingerprint}, {"cuda_device", string(cuda.attr("get_device_name")())},
-  {"torch_build_config", string(build_config_prefix)}, {"torch_build_config_truncated", build_config_size > 65536}, {"policy", policy}, {"presets", Json::array()}, {"cases", Json::array()},
-  {"unsupported", Json::array()}, {"sources", source_pins()}, {"plus_source_hashes", plus_hashes},
+  {"format", Format}, {"revision", core_revision()}, {"source_hashes", source_hashes}, {"producer_sha256", digest(support::executable_path())},
+  {"dependency_sha256", digest(OracleRoot / "requirements.txt")}, {"payload_sha256", digest(OracleRoot / "nvidia-payload.json")}, {"environment", environment}, {"fingerprint", args.fingerprint},
+  {"cuda_device", string(cuda.attr("get_device_name")())}, {"torch_build_config", string(build_config_prefix)}, {"torch_build_config_truncated", build_config_size > 65536}, {"policy", policy},
+  {"presets", Json::array()}, {"cases", Json::array()}, {"unsupported", Json::array()}, {"sources", source_pins()}, {"plus_source_hashes", plus_hashes},
   {"inventory_sha256", digest(fs::path(inventory_args.output) / "manifest.json")},
   {"preprocessing", "RGB unit float32 -> upstream RFDETR.means/stds; deterministic source pixels and exact normalized input retained"},
-  {"tensor_families", Json::array({"backbone", "grouppose", "forward-operator", "output", "vjp", "assignment", "loss", "gradient", "clipped", "updated", "optimizer", "held", "schema", "selection", "oks"})}
+  {"tensor_families",
+   Json::array({"backbone", "grouppose", "forward-operator", "output", "vjp", "assignment", "loss", "gradient", "clipped", "updated", "optimizer", "held", "schema", "selection", "oks"})}
  };
- const auto capability=precision_capability();
- manifest["precision_capability"]=capability;
- std::vector<std::string> precisions{"fp32","fp16"};
- if (capability.at("bf16").get<bool>()) precisions.emplace_back("bf16");
- else manifest["unsupported"].push_back("bf16: CUDA device does not support BF16");
- const auto defaults=defaults_type("force_no_pretrain"_a=true);
- for (const auto& record:admitted_inventory.at("assets")) {
-  const auto evidence_path=output/"inventory"/record.at("path").get<std::string>();
-  if (digest(evidence_path)!=record.at("sha256")) throw std::runtime_error("cached asset evidence changed");
-  const auto evidence=read_json(evidence_path);
-  const auto name=evidence.at("preset").get<std::string>(), filename=evidence.at("filename").get<std::string>();
-  const auto weights=fs::path(args.weights)/filename;
-  if (digest(weights)!=evidence.at("sha256")) throw std::runtime_error("official asset changed: "+name);
-  const auto original=admitted_file(directory,"original-"+filename);
-  if (!fs::exists(original)) publish_file(original,[&](const auto& temporary){fs::copy_file(weights,temporary);});
-  if (digest(original)!=evidence.at("sha256")) throw std::runtime_error("retained official asset changed: "+name);
-  const bool platform=evidence.at("registry").get<std::string>().starts_with("rfdetr_plus.");
-  const auto model_type=(platform?plus:core).attr(evidence.at("upstream_class").get<std::string>().c_str());
-  for (const std::string protocol:{"controlled-group2","stock"}) {
-   const bool stock=protocol=="stock";
-   const int groups=stock?evidence.at("configured_topology").at("group_detr").get<int>():2;
+ const auto capability = precision_capability();
+ manifest["precision_capability"] = capability;
+ std::vector<std::string> precisions{"fp32", "fp16"};
+ if (capability.at("bf16").get<bool>())
+  precisions.emplace_back("bf16");
+ else
+  manifest["unsupported"].push_back("bf16: CUDA device does not support BF16");
+ const auto defaults = defaults_type("force_no_pretrain"_a = true);
+ for (const auto& record : admitted_inventory.at("assets")) {
+  const auto evidence_path = output / "inventory" / record.at("path").get<std::string>();
+  if (digest(evidence_path) != record.at("sha256")) throw std::runtime_error("cached asset evidence changed");
+  const auto evidence = read_json(evidence_path);
+  const auto name = evidence.at("preset").get<std::string>(), filename = evidence.at("filename").get<std::string>();
+  const auto weights = fs::path(args.weights) / filename;
+  if (digest(weights) != evidence.at("sha256")) throw std::runtime_error("official asset changed: " + name);
+  const auto original = admitted_file(directory, "original-" + filename);
+  if (!fs::exists(original)) publish_file(original, [&](const auto& temporary) { fs::copy_file(weights, temporary); });
+  if (digest(original) != evidence.at("sha256")) throw std::runtime_error("retained official asset changed: " + name);
+  const bool platform = evidence.at("registry").get<std::string>().starts_with("rfdetr_plus.");
+  const auto model_type = (platform ? plus : core).attr(evidence.at("upstream_class").get<std::string>().c_str());
+  for (const std::string protocol : {"controlled-group2", "stock"}) {
+   const bool stock = protocol == "stock";
+   const int groups = stock ? evidence.at("configured_topology").at("group_detr").get<int>() : 2;
    torch.attr("manual_seed")(731);
-   const auto instance=model_type("pretrain_weights"_a=weights.string(),"group_detr"_a=groups,"device"_a="cuda");
-   const auto mc=instance.attr("model_config"), model=instance.attr("model").attr("model");
-   const auto tc=instance.attr("get_train_config")("dataset_dir"_a=".","output_dir"_a=".","lr"_a=1e-4,"lr_encoder"_a=1e-4,
-    "grad_accum_steps"_a=1,"clip_max_norm"_a=.1,"weight_decay"_a=1e-4);
-   if (integer(mc.attr("resolution"))!=evidence.at("configured_topology").at("resolution") || integer(mc.attr("group_detr"))!=groups ||
-       integer(model.attr("class_embed").attr("out_features"))!=evidence.at("classifier_width")) throw std::runtime_error("actual upstream topology differs: "+name);
+   const auto instance = model_type("pretrain_weights"_a = weights.string(), "group_detr"_a = groups, "device"_a = "cuda");
+   const auto mc = instance.attr("model_config"), model = instance.attr("model").attr("model");
+   const auto tc =
+    instance.attr("get_train_config")("dataset_dir"_a = ".", "output_dir"_a = ".", "lr"_a = 1e-4, "lr_encoder"_a = 1e-4, "grad_accum_steps"_a = 1, "clip_max_norm"_a = .1, "weight_decay"_a = 1e-4);
+   if (integer(mc.attr("resolution")) != evidence.at("configured_topology").at("resolution") || integer(mc.attr("group_detr")) != groups ||
+       integer(model.attr("class_embed").attr("out_features")) != evidence.at("classifier_width"))
+    throw std::runtime_error("actual upstream topology differs: " + name);
    py::dict initial;
-   for (const auto& pair:model.attr("state_dict")().cast<py::dict>()) initial[pair.first]=object(pair.second).attr("detach")().attr("cpu")().attr("clone")();
-   const auto configuration=checked_native_configuration(evidence,groups,instance,initial);
-   const auto checkpoint=stock?original:admitted_file(directory,name+".pth");
+   for (const auto& pair : model.attr("state_dict")().cast<py::dict>()) initial[pair.first] = object(pair.second).attr("detach")().attr("cpu")().attr("clone")();
+   const auto configuration = checked_native_configuration(evidence, groups, instance, initial);
+   const auto checkpoint = stock ? original : admitted_file(directory, name + ".pth");
    if (!stock) {
-    const auto make_namespace=module("rfdetr._namespace").attr("_namespace_from_configs");
-    const auto arguments=make_namespace(mc,tc,defaults);
-    const auto namespace_json=[](py::handle value) {
-     return Json::parse(string(module("json").attr("dumps")(module("builtins").attr("vars")(value),"default"_a=module("builtins").attr("str"))));
-    };
+    const auto make_namespace = module("rfdetr._namespace").attr("_namespace_from_configs");
+    const auto arguments = make_namespace(mc, tc, defaults);
+    const auto namespace_json = [](
+                                 py::handle value) { return Json::parse(string(module("json").attr("dumps")(module("builtins").attr("vars")(value), "default"_a = module("builtins").attr("str")))); };
     // Decode the reflected object into Python once; a JSON string here would
     // violate the production bridge's canonical-object contract.
-    const auto native=module("json").attr("loads")(configuration.dump());
+    const auto native = module("json").attr("loads")(configuration.dump());
     if (!PyDict_Check(native.ptr())) throw std::runtime_error("native configuration projection is not an object");
-    if (!fs::exists(checkpoint)) publish_file(checkpoint,[&](const auto& temporary){torch.attr("save")(py::dict("model"_a=initial,"args"_a=arguments,"native_configuration"_a=native),temporary.string());});
-    const auto retained_checkpoint=torch.attr("load")(checkpoint.string(),"map_location"_a="cpu","weights_only"_a=false);
-    if (to_json(retained_checkpoint.attr("get")("native_configuration",py::none()))!=configuration ||
-        namespace_json(retained_checkpoint["args"])!=namespace_json(arguments)) throw std::runtime_error("cached initial configuration changed: "+name);
-    const auto retained=retained_checkpoint["model"].cast<py::dict>();
-    if (py::len(retained)!=py::len(initial)) throw std::runtime_error("cached initial inventory changed: "+name);
-    for (const auto& pair:initial)
-     if (!retained.contains(pair.first) || !py::isinstance(retained[pair.first],torch.attr("Tensor")) ||
-         !object(pair.second).attr("dtype").is(object(retained[pair.first]).attr("dtype")) ||
-         to_json(object(pair.second).attr("shape"))!=to_json(object(retained[pair.first]).attr("shape")) ||
-         to_json(object(pair.second).attr("stride")())!=to_json(object(retained[pair.first]).attr("stride")()) ||
-         !truth(torch.attr("equal")(pair.second,retained[pair.first]))) throw std::runtime_error("cached initial tensor changed: "+name);
-    manifest["presets"].push_back({{"name",name},{"checkpoint",checkpoint.filename().string()},{"sha256",digest(checkpoint)},
-     {"original",original.filename().string()},{"original_sha256",evidence.at("sha256")},{"verified_asset",evidence},
-     {"native_configuration",configuration},
-     {"model_config",to_json(mc.attr("model_dump")("mode"_a="json"))},{"train_config",to_json(tc.attr("model_dump")("mode"_a="json"))},
-     {"constructor",constructor_evidence(module("rfdetr.models.lwdetr").attr("build_model_from_config")(mc,tc,defaults))}});
+    if (!fs::exists(checkpoint))
+     publish_file(checkpoint, [&](const auto& temporary) { torch.attr("save")(py::dict("model"_a = initial, "args"_a = arguments, "native_configuration"_a = native), temporary.string()); });
+    const auto retained_checkpoint = torch.attr("load")(checkpoint.string(), "map_location"_a = "cpu", "weights_only"_a = false);
+    if (to_json(retained_checkpoint.attr("get")("native_configuration", py::none())) != configuration || namespace_json(retained_checkpoint["args"]) != namespace_json(arguments))
+     throw std::runtime_error("cached initial configuration changed: " + name);
+    const auto retained = retained_checkpoint["model"].cast<py::dict>();
+    if (py::len(retained) != py::len(initial)) throw std::runtime_error("cached initial inventory changed: " + name);
+    for (const auto& pair : initial)
+     if (!retained.contains(pair.first) || !py::isinstance(retained[pair.first], torch.attr("Tensor")) || !object(pair.second).attr("dtype").is(object(retained[pair.first]).attr("dtype")) ||
+         to_json(object(pair.second).attr("shape")) != to_json(object(retained[pair.first]).attr("shape")) ||
+         to_json(object(pair.second).attr("stride")()) != to_json(object(retained[pair.first]).attr("stride")()) || !truth(torch.attr("equal")(pair.second, retained[pair.first])))
+      throw std::runtime_error("cached initial tensor changed: " + name);
+    manifest["presets"].push_back(
+     {{"name", name}, {"checkpoint", checkpoint.filename().string()}, {"sha256", digest(checkpoint)}, {"original", original.filename().string()}, {"original_sha256", evidence.at("sha256")},
+      {"verified_asset", evidence}, {"native_configuration", configuration}, {"model_config", to_json(mc.attr("model_dump")("mode"_a = "json"))},
+      {"train_config", to_json(tc.attr("model_dump")("mode"_a = "json"))}, {"constructor", constructor_evidence(module("rfdetr.models.lwdetr").attr("build_model_from_config")(mc, tc, defaults))}});
    }
-   const auto checkpoint_hash=digest(checkpoint);
+   const auto checkpoint_hash = digest(checkpoint);
    // RFDETR's public constructor deliberately keeps its underlying model on
    // CPU. Direct oracle forwards require this explicit real-model placement.
    model.attr("cuda")();
-   for (py::handle parameter:model.attr("parameters")())
+   for (py::handle parameter : model.attr("parameters")())
     if (!truth(object(parameter).attr("is_cuda"))) throw std::runtime_error("upstream parameter was not placed on CUDA");
-   for (const auto& precision:precisions) for (const bool training:{false,true}) for (const int batch:{1,2}) {
-    if (stock && (precision!="fp32" || !training || batch!=1)) continue;
-    const int steps=!stock && training && batch==2?8:1;
-    const auto id=name+"-"+protocol+"-"+precision+"-b"+std::to_string(batch)+(training?"-train":"-eval");
-    const auto completed=admitted_file(directory,id), staging=admitted_file(directory,id+".partial");
-    Json entry;
-    if (fs::exists(completed)) {
-     const auto completion=read_json(admitted_file(completed,"case.json"));
-     entry=authenticated_json(completed,completion.at("index"));
-     if (entry.at("producer_sha256")!=manifest.at("producer_sha256") || entry.at("fingerprint")!=args.fingerprint || entry.at("checkpoint_sha256")!=checkpoint_hash ||
-         entry.at("id")!=id || entry.at("protocol")!=protocol || entry.at("groups")!=groups || entry.at("steps").size()!=steps)
-      throw std::runtime_error("completed numerical case provenance changed: "+id);
-     for (const auto& step:entry.at("steps")) verify_archive(completed,step);
-    } else {
-     fs::remove_all(staging); fs::create_directory(staging);
-     entry=run_case(staging,model,initial,mc,tc,defaults,name,precision,batch,training,steps,protocol);
-     entry["producer_sha256"]=manifest.at("producer_sha256"); entry["fingerprint"]=args.fingerprint; entry["checkpoint_sha256"]=checkpoint_hash;
-     json_write(staging/"index.json",entry);
-     json_write(staging/"case.json",{{"index",file_record(staging/"index.json")}});
-     fs::rename(staging,completed);
-    }
-    auto reference=file_record(completed/"index.json"); reference["directory"]=id;
-    manifest["cases"].push_back(std::move(reference));
-   }
+   for (const auto& precision : precisions)
+    for (const bool training : {false, true})
+     for (const int batch : {1, 2}) {
+      if (stock && (precision != "fp32" || !training || batch != 1)) continue;
+      const int steps = !stock && training && batch == 2 ? 8 : 1;
+      const auto id = name + "-" + protocol + "-" + precision + "-b" + std::to_string(batch) + (training ? "-train" : "-eval");
+      const auto completed = admitted_file(directory, id), staging = admitted_file(directory, id + ".partial");
+      Json entry;
+      if (fs::exists(completed)) {
+       const auto completion = read_json(admitted_file(completed, "case.json"));
+       entry = authenticated_json(completed, completion.at("index"));
+       if (entry.at("producer_sha256") != manifest.at("producer_sha256") || entry.at("fingerprint") != args.fingerprint || entry.at("checkpoint_sha256") != checkpoint_hash || entry.at("id") != id ||
+           entry.at("protocol") != protocol || entry.at("groups") != groups || entry.at("steps").size() != steps)
+        throw std::runtime_error("completed numerical case provenance changed: " + id);
+       for (const auto& step : entry.at("steps")) verify_archive(completed, step);
+      } else {
+       fs::remove_all(staging);
+       fs::create_directory(staging);
+       entry = run_case(staging, model, initial, mc, tc, defaults, name, precision, batch, training, steps, protocol);
+       entry["producer_sha256"] = manifest.at("producer_sha256");
+       entry["fingerprint"] = args.fingerprint;
+       entry["checkpoint_sha256"] = checkpoint_hash;
+       json_write(staging / "index.json", entry);
+       json_write(staging / "case.json", {{"index", file_record(staging / "index.json")}});
+       fs::rename(staging, completed);
+      }
+      auto reference = file_record(completed / "index.json");
+      reference["directory"] = id;
+      manifest["cases"].push_back(std::move(reference));
+     }
   }
  }
- for (const auto* name:{"resize","keypoints"}) {
-  const auto completed=admitted_file(directory,name), staging=admitted_file(directory,std::string(name)+".partial");
+ for (const auto* name : {"resize", "keypoints"}) {
+  const auto completed = admitted_file(directory, name), staging = admitted_file(directory, std::string(name) + ".partial");
   Json evidence;
   if (fs::exists(completed)) {
-   const auto completion=read_json(admitted_file(completed,"complete.json"));
-   evidence=authenticated_json(completed,completion.at("index"));
-   verify_archive(completed,evidence.at("archive"));
+   const auto completion = read_json(admitted_file(completed, "complete.json"));
+   evidence = authenticated_json(completed, completion.at("index"));
+   verify_archive(completed, evidence.at("archive"));
   } else {
-   fs::remove_all(staging); fs::create_directory(staging);
-   evidence=std::string_view(name)=="resize"?resize_evidence(staging):keypoint_evidence(staging);
-   json_write(staging/"index.json",evidence);
-   json_write(staging/"complete.json",{{"index",file_record(staging/"index.json")}});
-   fs::rename(staging,completed);
+   fs::remove_all(staging);
+   fs::create_directory(staging);
+   evidence = std::string_view(name) == "resize" ? resize_evidence(staging) : keypoint_evidence(staging);
+   json_write(staging / "index.json", evidence);
+   json_write(staging / "complete.json", {{"index", file_record(staging / "index.json")}});
+   fs::rename(staging, completed);
   }
-  auto reference=file_record(completed/"index.json"); reference["directory"]=name;
-  manifest[name]=std::move(reference);
+  auto reference = file_record(completed / "index.json");
+  reference["directory"] = name;
+  manifest[name] = std::move(reference);
  }
  if (source_hashes != verify_source(source) || plus_hashes != verify_source(plus_source, "plus")) throw std::runtime_error("upstream source changed during production");
  manifest["status"] = "references_complete_native_comparison_pending";
@@ -1598,7 +1632,9 @@ bool optional_token(std::string_view value) {
 }
 Arguments parse_arguments(int argc, char** argv) {
  Arguments result;
- const std::array<std::string_view, 12> options{"--capabilities", "--payload-snapshot", "--check-environment", "--upstream", "--plus-upstream", "--inventory-only", "--output", "--weights", "--fingerprint", "--sdpa", "--help", "-h"};
+ const std::array<std::string_view, 12> options{
+  "--capabilities", "--payload-snapshot", "--check-environment", "--upstream", "--plus-upstream", "--inventory-only", "--output", "--weights", "--fingerprint", "--sdpa", "--help", "-h"
+ };
  for (int i = 1; i < argc; ++i) {
   const std::string argument = argv[i];
   const auto equals = argument.find('=');
@@ -1651,7 +1687,8 @@ Arguments parse_arguments(int argc, char** argv) {
    result.sdpa = value;
   }
  }
- if (result.payload_snapshot.empty() && !result.check_environment && !result.capabilities && (result.upstream.empty() || result.plus_upstream.empty() || result.output.empty() || result.weights.empty() || result.fingerprint.empty()))
+ if (result.payload_snapshot.empty() && !result.check_environment && !result.capabilities &&
+     (result.upstream.empty() || result.plus_upstream.empty() || result.output.empty() || result.weights.empty() || result.fingerprint.empty()))
   throw support::ToolError("generation requires --upstream, --plus-upstream, --output, --weights and --fingerprint", 2);
  return result;
 }

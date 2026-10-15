@@ -28,7 +28,7 @@ struct ModelArtifactAdmission final {
  std::string artifact;
  mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout{};
  mmltk::backend::models::rfdetr::ModelTask task = mmltk::backend::models::rfdetr::ModelTask::Detection;
- std::optional<mmltk::backend::models::rfdetr::NativeRfDetrConfig> training_config;
+ std::optional<mmltk::backend::models::rfdetr::NativeRfDetrConfig> training_config{};
  mmltk::backend::models::rfdetr::PresetTrainingCapabilities training_capabilities{};
 };
 class ModelRuntime {

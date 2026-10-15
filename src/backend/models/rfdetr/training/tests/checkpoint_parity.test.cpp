@@ -176,115 +176,115 @@ void test_checkpoint_parity_matches_for_all_registered_fixtures() {
 TEST_CASE("Native checkpoint format round-trip matches for all registered fixtures", "[model][rfdetr][checkpoint_parity][roundtrip][integration]") {
  test_checkpoint_parity_matches_for_all_registered_fixtures();
 }
-
 TEST_CASE("All official and controlled assets retain strict topology and checkpoint normalization", "[model][rfdetr][checkpoint_parity][upstream_oracle]") {
- namespace rf=mmltk::backend::models::rfdetr;
- const auto requested=rf::testsupport::UpstreamOracle::requested();
+ namespace rf = mmltk::backend::models::rfdetr;
+ const auto requested = rf::testsupport::UpstreamOracle::requested();
  REQUIRE(requested);
  const rf::testsupport::UpstreamOracle oracle(*requested);
- for (const auto& row:rf::kPresetCatalog) {
+ for (const auto& row : rf::kPresetCatalog) {
   DYNAMIC_SECTION(row.preset_name) {
-   const auto original=oracle.official_checkpoint(row.preset_name);
-   auto admitted=rf::resolve_model_state(original,row.preset_name,row.resolution);
-   const auto& config=admitted.artifacts.config;
-   CHECK(config.task==row.task);
-   CHECK(config.resolution==row.resolution);
-   CHECK(config.num_classes==row.class_count);
-   CHECK(config.num_queries==row.query_count);
-   CHECK(config.num_select==row.selected_query_count);
-   CHECK(config.group_detr==row.group_count);
-   CHECK(config.backbone==row.backbone);
+   const auto original = oracle.official_checkpoint(row.preset_name);
+   auto admitted = rf::resolve_model_state(original, row.preset_name, row.resolution);
+   const auto& config = admitted.artifacts.config;
+   CHECK(config.task == row.task);
+   CHECK(config.resolution == static_cast<int>(row.resolution));
+   CHECK(config.num_classes == row.class_count);
+   CHECK(config.num_queries == row.query_count);
+   CHECK(config.num_select == row.selected_query_count);
+   CHECK(config.group_detr == row.group_count);
+   CHECK(config.backbone == row.backbone);
    const rf::ResolvedClassLayout layout(admitted.artifacts.class_layout);
    REQUIRE(layout.semantic());
    REQUIRE_FALSE(layout.catalog()->empty());
-   const auto& entries=admitted.model_state.entries();
-   const auto classifier=std::ranges::find(entries,std::string("class_embed.weight"),&rf::NormalizedModelStateEntry::name);
-   REQUIRE(classifier!=entries.end());
-   REQUIRE(classifier->tensor.size(0)==row.class_count);
-   const auto active=std::ranges::find(entries,std::string("_kp_active_mask"),&rf::NormalizedModelStateEntry::name);
-   if (row.task==rf::ModelTask::Keypoints) {
-    REQUIRE(active!=entries.end());
-    const auto joints=rf::KeypointTensorLayout::from_active_mask(active->tensor);
-    REQUIRE(std::ranges::equal(joints.counts(),config.keypoints_per_class));
+   const auto& entries = admitted.model_state.entries();
+   const auto classifier = std::ranges::find(entries, std::string("class_embed.weight"), &rf::NormalizedModelStateEntry::name);
+   REQUIRE(classifier != entries.end());
+   REQUIRE(classifier->tensor.size(0) == row.class_count);
+   const auto active = std::ranges::find(entries, std::string("_kp_active_mask"), &rf::NormalizedModelStateEntry::name);
+   if (row.task == rf::ModelTask::Keypoints) {
+    REQUIRE(active != entries.end());
+    const auto joints = rf::KeypointTensorLayout::from_active_mask(active->tensor);
+    REQUIRE(std::ranges::equal(joints.counts(), config.keypoints_per_class));
     joints.require_class_layout(layout);
-    REQUIRE(layout.catalog()->names().size()==1);
-    CHECK(layout.catalog()->names().front()=="person");
-    CHECK(layout.catalog()->keypoints(0)==mmltk::backend::data::catalog::coco_person_keypoint_schema());
-   } else REQUIRE(active==entries.end());
+    REQUIRE(layout.catalog()->names().size() == 1);
+    CHECK(layout.catalog()->names().front() == "person");
+    CHECK(layout.catalog()->keypoints(0) == mmltk::backend::data::catalog::coco_person_keypoint_schema());
+   } else
+    REQUIRE(active == entries.end());
    const mmltk::testsupport::ScopedTempDir root("official-checkpoint-normalization");
-   const auto require_normalization=[&](const fs::path& source_path,const rf::ResolvedModelState& source,const char* filename) {
-    const auto normalized=root.path()/filename;
-    rf::normalize_checkpoint_to_native(source_path,normalized);
-    const auto roundtrip=rf::resolve_model_state(normalized,row.preset_name,row.resolution);
+   const auto require_normalization = [&](const fs::path& source_path, const rf::ResolvedModelState& source, const char* filename) {
+    const auto normalized = root.path() / filename;
+    rf::normalize_checkpoint_to_native(source_path, normalized);
+    const auto roundtrip = rf::resolve_model_state(normalized, row.preset_name, row.resolution);
     REQUIRE_FALSE(roundtrip.model_state.metadata.native_configuration.empty());
-    REQUIRE(roundtrip.artifacts.config==source.artifacts.config);
-    REQUIRE(rf::decode_checkpoint_configuration(roundtrip.model_state.metadata.native_configuration)==source.artifacts.config);
-    REQUIRE(roundtrip.artifacts.class_layout==source.artifacts.class_layout);
+    REQUIRE(roundtrip.artifacts.config == source.artifacts.config);
+    REQUIRE(rf::decode_checkpoint_configuration(roundtrip.model_state.metadata.native_configuration) == source.artifacts.config);
+    REQUIRE(roundtrip.artifacts.class_layout == source.artifacts.class_layout);
     const rf::ResolvedClassLayout source_layout(source.artifacts.class_layout);
     if (source_layout.semantic()) REQUIRE(rf::ResolvedClassLayout(roundtrip.artifacts.class_layout).catalog()->ordered_equal(*source_layout.catalog()));
-    REQUIRE(roundtrip.model_state.entries().size()==source.model_state.entries().size());
-    for (const auto& entry:source.model_state.entries()) {
-     const auto target=std::ranges::find(roundtrip.model_state.entries(),entry.name,&rf::NormalizedModelStateEntry::name);
-     REQUIRE(target!=roundtrip.model_state.entries().end());
+    REQUIRE(roundtrip.model_state.entries().size() == source.model_state.entries().size());
+    for (const auto& entry : source.model_state.entries()) {
+     const auto target = std::ranges::find(roundtrip.model_state.entries(), entry.name, &rf::NormalizedModelStateEntry::name);
+     REQUIRE(target != roundtrip.model_state.entries().end());
      CAPTURE(entry.name);
-     CHECK(target->tensor.scalar_type()==entry.tensor.scalar_type());
-     CHECK(target->tensor.sizes()==entry.tensor.sizes());
-     CHECK(torch::equal(target->tensor,entry.tensor));
+     CHECK(target->tensor.scalar_type() == entry.tensor.scalar_type());
+     CHECK(target->tensor.sizes() == entry.tensor.sizes());
+     CHECK(torch::equal(target->tensor, entry.tensor));
     }
    };
-   require_normalization(original,admitted,"stock.pt");
+   require_normalization(original, admitted, "stock.pt");
    admitted.model_state.release_admission();
    // The derived bytes have their own identity. Official semantic meaning is
    // admitted independently above and attached by UpstreamOracle::model.
-   const auto controlled_path=oracle.checkpoint(row.preset_name);
-   auto controlled=rf::resolve_model_state(controlled_path,row.preset_name,row.resolution);
-   const auto& controlled_config=controlled.artifacts.config;
-   const auto& metadata=controlled.model_state.metadata;
+   const auto controlled_path = oracle.checkpoint(row.preset_name);
+   auto controlled = rf::resolve_model_state(controlled_path, row.preset_name, row.resolution);
+   const auto& controlled_config = controlled.artifacts.config;
+   const auto& metadata = controlled.model_state.metadata;
    REQUIRE_FALSE(metadata.native_configuration.empty());
-   REQUIRE(rf::decode_checkpoint_configuration(metadata.native_configuration)==controlled_config);
-   REQUIRE(controlled_config.group_detr==2);
-   REQUIRE(controlled_config.resolution==config.resolution);
-   REQUIRE(controlled_config.num_classes==config.num_classes);
-   REQUIRE(controlled_config.num_queries==config.num_queries);
-   REQUIRE(controlled_config.num_select==config.num_select);
-   REQUIRE(controlled_config.backbone==config.backbone);
-   REQUIRE(controlled_config.keypoints_per_class==config.keypoints_per_class);
-   auto expected=rf::native_config_from_preset(row);
-   expected.group_detr=2;
-   REQUIRE_NOTHROW(rf::require_checkpoint_model_topology(expected,metadata));
-   REQUIRE(controlled_config.training_supervision==expected.training_supervision);
-   REQUIRE(controlled.artifacts.class_layout.provenance.origin!=rf::ClassLayoutOrigin::VerifiedAsset);
+   REQUIRE(rf::decode_checkpoint_configuration(metadata.native_configuration) == controlled_config);
+   REQUIRE(controlled_config.group_detr == 2);
+   REQUIRE(controlled_config.resolution == config.resolution);
+   REQUIRE(controlled_config.num_classes == config.num_classes);
+   REQUIRE(controlled_config.num_queries == config.num_queries);
+   REQUIRE(controlled_config.num_select == config.num_select);
+   REQUIRE(controlled_config.backbone == config.backbone);
+   REQUIRE(controlled_config.keypoints_per_class == config.keypoints_per_class);
+   auto expected = rf::native_config_from_preset(row);
+   expected.group_detr = 2;
+   REQUIRE_NOTHROW(rf::require_checkpoint_model_topology(expected, metadata));
+   REQUIRE(controlled_config.training_supervision == expected.training_supervision);
+   REQUIRE(controlled.artifacts.class_layout.provenance.origin != rf::ClassLayoutOrigin::VerifiedAsset);
    REQUIRE_FALSE(rf::ResolvedClassLayout(controlled.artifacts.class_layout).semantic());
-   REQUIRE(rf::ResolvedClassLayout(controlled.artifacts.class_layout).output_width()==layout.output_width());
-   const auto external=nlohmann::json::parse(metadata.external_topology);
-   REQUIRE(external.at("group_detr")==2);
-   const auto& controlled_entries=controlled.model_state.entries();
-   for (const auto* name:{"query_feat.weight","refpoint_embed.weight"}) {
-    const auto query=std::ranges::find(controlled_entries,std::string(name),&rf::NormalizedModelStateEntry::name);
-    REQUIRE(query!=controlled_entries.end());
-    REQUIRE(query->tensor.size(0)==controlled_config.num_queries*controlled_config.group_detr);
+   REQUIRE(rf::ResolvedClassLayout(controlled.artifacts.class_layout).output_width() == layout.output_width());
+   const auto external = nlohmann::json::parse(metadata.external_topology);
+   REQUIRE(external.at("group_detr") == 2);
+   const auto& controlled_entries = controlled.model_state.entries();
+   for (const auto* name : {"query_feat.weight", "refpoint_embed.weight"}) {
+    const auto query = std::ranges::find(controlled_entries, std::string(name), &rf::NormalizedModelStateEntry::name);
+    REQUIRE(query != controlled_entries.end());
+    REQUIRE(query->tensor.size(0) == controlled_config.num_queries * controlled_config.group_detr);
    }
-   if (row.task==rf::ModelTask::Keypoints) {
-    const auto mask=std::ranges::find(controlled_entries,std::string("_kp_active_mask"),&rf::NormalizedModelStateEntry::name);
-    REQUIRE(mask!=controlled_entries.end());
-    const auto joints=rf::KeypointTensorLayout::from_active_mask(mask->tensor);
-    REQUIRE(std::ranges::equal(joints.counts(),config.keypoints_per_class));
+   if (row.task == rf::ModelTask::Keypoints) {
+    const auto mask = std::ranges::find(controlled_entries, std::string("_kp_active_mask"), &rf::NormalizedModelStateEntry::name);
+    REQUIRE(mask != controlled_entries.end());
+    const auto joints = rf::KeypointTensorLayout::from_active_mask(mask->tensor);
+    REQUIRE(std::ranges::equal(joints.counts(), config.keypoints_per_class));
     joints.require_class_layout(layout);
    }
-   require_normalization(controlled_path,controlled,"controlled.pt");
-   auto conflicting=metadata;
+   require_normalization(controlled_path, controlled, "controlled.pt");
+   auto conflicting = metadata;
    conflicting.native_configuration.clear();
-   REQUIRE_THROWS_AS(rf::checkpoint_configuration(conflicting),std::invalid_argument);
-   conflicting=metadata;
-   auto wrong_config=controlled_config;
-   wrong_config.group_detr=row.group_count;
-   conflicting.native_configuration=rf::encode_checkpoint_configuration(wrong_config);
-   REQUIRE_THROWS_AS(rf::checkpoint_configuration(conflicting),std::invalid_argument);
-   conflicting=metadata;
-   auto wrong_external=external;
-   wrong_external["group_detr"]=row.group_count;
-   conflicting.external_topology=wrong_external.dump();
-   REQUIRE_THROWS_AS(rf::checkpoint_configuration(conflicting),std::invalid_argument);
+   REQUIRE_THROWS_AS(rf::checkpoint_configuration(conflicting), std::invalid_argument);
+   conflicting = metadata;
+   auto wrong_config = controlled_config;
+   wrong_config.group_detr = row.group_count;
+   conflicting.native_configuration = rf::encode_checkpoint_configuration(wrong_config);
+   REQUIRE_THROWS_AS(rf::checkpoint_configuration(conflicting), std::invalid_argument);
+   conflicting = metadata;
+   auto wrong_external = external;
+   wrong_external["group_detr"] = row.group_count;
+   conflicting.external_topology = wrong_external.dump();
+   REQUIRE_THROWS_AS(rf::checkpoint_configuration(conflicting), std::invalid_argument);
   }
  }
 }

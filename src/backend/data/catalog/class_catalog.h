@@ -26,7 +26,7 @@ struct OrderedClassCatalog final {
  MMLTK_MAX_ITEMS(kClassCatalogCapacity) std::vector<ClassName> names;
  // Absent means no joint schemas, including persisted catalogs predating keypoints.
  // A present schema has exactly one entry per foreground class, including empty classes.
- MMLTK_MAX_ITEMS(kClassCatalogCapacity) std::optional<std::vector<ClassKeypointSchema>> keypoints;
+ MMLTK_MAX_ITEMS(kClassCatalogCapacity) std::optional<std::vector<ClassKeypointSchema>> keypoints {};
  auto operator<=>(const OrderedClassCatalog&) const = default;
 };
 MMLTK_REFLECT_FIELDS(OrderedClassCatalog)

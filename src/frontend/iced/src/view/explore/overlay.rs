@@ -57,7 +57,9 @@ pub(super) fn view(
         ids,
     )
     .map(|message| match message {
-        crate::view::workflow::overlay_controls::Message::Keypoints(value) => Message::KeypointsToggled(value),
+        crate::view::workflow::overlay_controls::Message::Keypoints(value) => {
+            Message::KeypointsToggled(value)
+        }
         crate::view::workflow::overlay_controls::Message::Labels(value) => {
             Message::LabelsToggled(value)
         }

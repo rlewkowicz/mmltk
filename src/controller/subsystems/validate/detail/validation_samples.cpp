@@ -363,9 +363,8 @@ public:
               : VisualRegion{static_cast<std::uint32_t>(index % 2U) * cell_width + contained.x, static_cast<std::uint32_t>(index / 2U) * cell_height + contained.y, contained.width, contained.height};
     regions[region_count++] = {sample->raw, metadata.crop};
    }
-   PredictionPreviewComposition::Draw(runtime, candidate, extent, std::span(regions).first(region_count),
-    PredictionPreviewComposition::Options::Validation(overlays, display.confidence_threshold, !selected),
-    &preparation_);
+   PredictionPreviewComposition::Draw(
+    runtime, candidate, extent, std::span(regions).first(region_count), PredictionPreviewComposition::Options::Validation(overlays, display.confidence_threshold, !selected), &preparation_);
    image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
    image.frame.content = {0U, 0U, extent.width, extent.height};
    image.frame.clean_revision = clean_revision;

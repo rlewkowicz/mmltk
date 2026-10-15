@@ -94,7 +94,8 @@ std::expected<std::size_t, wire::EncodeError> check_measurement_against_encoder(
  const auto encoded = projected ? wire::encode(*projected, bytes, limits) : std::expected<void, wire::EncodeError>(std::unexpected(projected.error()));
  const auto counted = transport ? cbor::measure_transport(source, limits) : cbor::measure(source, limits);
  REQUIRE(counted.has_value() == encoded.has_value());
- if (encoded) CHECK(*counted == bytes.size());
+ if (encoded)
+  CHECK(*counted == bytes.size());
  else {
   CHECK(counted.error().code == encoded.error().code);
   CHECK(counted.error().path == encoded.error().path);
@@ -120,8 +121,7 @@ void check_measurement_boundaries(const T& source) {
   REQUIRE(check_measurement_against_encoder(source, test_limits(*size, reader.items_read()), transport));
   REQUIRE_FALSE(check_measurement_against_encoder(source, test_limits(*size, reader.items_read() - 1U), transport));
   REQUIRE_FALSE(check_measurement_against_encoder(source, test_limits(*size, 0U), transport));
-  for (const auto depth : {0U, 1U, 2U, 3U, 4U})
-   static_cast<void>(check_measurement_against_encoder(source, test_limits(*size, limits.max_items, depth), transport));
+  for (const auto depth : {0U, 1U, 2U, 3U, 4U}) static_cast<void>(check_measurement_against_encoder(source, test_limits(*size, limits.max_items, depth), transport));
  }
 }
 template <std::size_t N>
@@ -200,9 +200,9 @@ static_assert(mmltk::frameworks::reflection::opaque_relation_storage_shape_is_va
 static_assert(!mmltk::frameworks::reflection::opaque_relation_storage_shape_is_valid<mmltk::frameworks::serialization::test::OpaqueFixture>(0x0800U));
 using CborObjectLayout = mmltk::frameworks::serialization::implementation::detail::ObjectLayout;
 template <class Owner, CborObjectLayout Layout, bool Materialize = true>
-concept PublicRawCborAppend = requires(const Owner& source,
- std::conditional_t<Materialize, std::conditional_t<Layout == CborObjectLayout::Named, wire::Value::Object, wire::Value::Array>, std::monostate>& object,
- std::optional<wire::EncodeError>& failure) { mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout, Materialize>(source, object, failure, nullptr, 0U); };
+concept PublicRawCborAppend =
+ requires(const Owner& source, std::conditional_t<Materialize, std::conditional_t<Layout == CborObjectLayout::Named, wire::Value::Object, wire::Value::Array>, std::monostate>& object,
+  std::optional<wire::EncodeError>& failure) { mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout, Materialize>(source, object, failure, nullptr, 0U); };
 template <class Owner>
 concept PublicRawCborValueDecode = requires(Owner& destination, std::span<const mmltk::frameworks::serialization::implementation::detail::NamedFieldMatch> matches, std::size_t& index,
  std::optional<wire::DecodeError>& failure) { mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, matches, index, failure); };
@@ -726,8 +726,10 @@ TEST_CASE("direct reflected measurement matches emitted named and transport cont
 }
 TEST_CASE("direct counts retain canonical integer heads float widths and negative zero", "[frameworks][serialization][reflection][bounds]") {
  namespace cbor = mmltk::frameworks::serialization;
- const std::array<std::uint64_t, 12U> integers{0U, 23U, 24U, 255U, 256U, 65535U, 65536U, 0xffffffffU, 0x100000000ULL,
-  std::uint64_t(std::numeric_limits<std::int64_t>::max()), std::uint64_t(std::numeric_limits<std::int64_t>::max()) + 1U, std::numeric_limits<std::uint64_t>::max()};
+ const std::array<std::uint64_t, 12U> integers{
+  0U, 23U, 24U, 255U, 256U, 65535U, 65536U, 0xffffffffU, 0x100000000ULL, std::uint64_t(std::numeric_limits<std::int64_t>::max()), std::uint64_t(std::numeric_limits<std::int64_t>::max()) + 1U,
+  std::numeric_limits<std::uint64_t>::max()
+ };
  for (const auto value : integers) {
   CAPTURE(value);
   check_measurement_boundaries(value);
@@ -736,9 +738,9 @@ TEST_CASE("direct counts retain canonical integer heads float widths and negativ
    check_measurement_boundaries(-static_cast<std::int64_t>(value) - 1);
   }
  }
- for (const auto [value, size] : std::array<std::pair<double, std::size_t>, 10U>{{
-       {0.0, 3U}, {-0.0, 3U}, {1.5, 3U}, {65504.0, 3U}, {65536.0, 5U}, {0x1p-24, 3U}, {0x1p-25, 5U},
-       {static_cast<double>(1.1F), 5U}, {1.1, 9U}, {std::numeric_limits<double>::max(), 9U}}}) {
+ for (const auto [value, size] : std::array<std::pair<double, std::size_t>, 10U>{
+       {{0.0, 3U}, {-0.0, 3U}, {1.5, 3U}, {65504.0, 3U}, {65536.0, 5U}, {0x1p-24, 3U}, {0x1p-25, 5U}, {static_cast<double>(1.1F), 5U}, {1.1, 9U}, {std::numeric_limits<double>::max(), 9U}}
+      }) {
   CAPTURE(value, size);
   check_measurement_boundaries(value);
   const auto count = cbor::measure_transport(value, test_limits(size));

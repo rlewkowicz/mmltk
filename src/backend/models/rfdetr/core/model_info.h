@@ -63,10 +63,13 @@ public:
   const auto value = indices_[RfdetrOutputSchema::index<Role>()];
   return value == kAbsent ? std::nullopt : std::optional{value};
  }
+
 private:
  friend RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo&);
  template <RfdetrOutputRole Role>
- void resolve(std::size_t index) noexcept { indices_[RfdetrOutputSchema::index<Role>()] = index; }
+ void resolve(std::size_t index) noexcept {
+  indices_[RfdetrOutputSchema::index<Role>()] = index;
+ }
  inline static constexpr auto kAbsent = std::numeric_limits<std::size_t>::max();
  std::array<std::size_t, kRfdetrExecutableOutputCount> indices_ = [] {
   std::array<std::size_t, kRfdetrExecutableOutputCount> result;

@@ -30,6 +30,7 @@
 #include <unordered_map>
 #include <vector>
 #include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/models/rfdetr/core/detail/mask_pack_cuda.h"
 #include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/backend/data/loading/dataset_loader.h"
@@ -292,7 +293,8 @@ void PinnedPredictionBuffers::transition(const PredictionSlotState expected, con
  }
 }
 // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
-StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count, size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog) {
+StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count, size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle,
+ std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_stage_prediction_batch{"rfdetr.native.eval.stage_prediction_batch"};
  if (!lease.buffers) { throw std::runtime_error("stage_prediction_batch requires a valid prediction buffer lease"); }
  if (!batch.scores.defined() || batch.scores.dim() != 2 || !batch.labels.defined() || batch.labels.dim() != 2 || !batch.boxes.defined() || batch.boxes.dim() != 3 || batch.boxes.size(2) != 4) {
@@ -337,7 +339,8 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
   if (batch.keypoints) {
    if (!catalog || catalog->size() != category_count) throw std::invalid_argument("keypoint staging requires an admitted class catalog");
    const auto& source = *batch.keypoints;
-   if (source.dim() != 4 || source.size(0) < batch_count || source.size(1) != prediction_count || source.size(3) != sizeof(KeypointPrediction) / sizeof(float)) throw std::invalid_argument("invalid keypoint staging extent");
+   if (source.dim() != 4 || source.size(0) < batch_count || source.size(1) != prediction_count || source.size(3) != sizeof(KeypointPrediction) / sizeof(float))
+    throw std::invalid_argument("invalid keypoint staging extent");
    static_cast<void>(checked_prediction_extent(source.numel(), source.element_size(), kMaximumPredictionTensorBytes));
    if (!buffers.keypoints_cpu.defined() || buffers.keypoints_cpu.size(0) < batch_count || buffers.keypoints_cpu.size(1) < prediction_count || buffers.keypoints_cpu.size(2) != source.size(2))
     buffers.keypoints_cpu = mmltk::backend::ml::cuda::numa_empty(source.sizes(), torch::kFloat32, device_id);
@@ -443,7 +446,10 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
   }
   const auto match_started = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   std::optional<KeypointPredictionView> keypoints;
-  if (staged.keypoints_cpu) keypoints = KeypointPredictionView{staged.keypoints_cpu->data_ptr<float>() + image_offset * staged.keypoints_cpu->stride(0), staged.keypoints_cpu->stride(1), static_cast<size_t>(staged.keypoints_cpu->size(2))};
+  if (staged.keypoints_cpu)
+   keypoints = KeypointPredictionView{
+    staged.keypoints_cpu->data_ptr<float>() + image_offset * staged.keypoints_cpu->stride(0), staged.keypoints_cpu->stride(1), static_cast<size_t>(staged.keypoints_cpu->size(2))
+   };
   result.evaluation_matches = evaluation_dataset->match_predictions(result.dataset_index, bbox_view, mask_view, staged.max_dets_per_image, {}, keypoints);
   if (profile != nullptr) {
    record_profile_duration(profile, &EvaluationProfileRecord::cpu_match_nanoseconds, match_started);
@@ -465,14 +471,13 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
   if (!staged.class_catalog) throw std::invalid_argument("keypoint sample omitted its catalog");
   for (size_t index = 0; index < selected.predictions.size(); ++index) {
    auto& prediction = selected.predictions[index];
-   const auto count = staged.class_catalog->keypoints(prediction.class_reference).names.size();
+   const auto joint_count = staged.class_catalog->keypoints(prediction.class_reference).names.size();
    const auto& tensor = *staged.keypoints_cpu;
-   if (count > static_cast<size_t>(tensor.size(2))) throw std::invalid_argument("keypoint sample schema exceeds staged capacity");
+   if (joint_count > static_cast<size_t>(tensor.size(2))) throw std::invalid_argument("keypoint sample schema exceeds staged capacity");
    const auto* source = tensor.data_ptr<float>() + image_index * tensor.stride(0) + selected.mask_source_indices[index] * tensor.stride(1);
-   prediction.keypoints.reserve(count);
-   for (size_t joint = 0; joint < count; ++joint) {
-    KeypointPrediction point;
-    std::memcpy(&point, source + joint * sizeof(KeypointPrediction) / sizeof(float), sizeof(point));
+   prediction.keypoints.reserve(joint_count);
+   for (size_t joint = 0; joint < joint_count; ++joint) {
+    const auto point = KeypointPredictionPacket::load(source + joint * KeypointPredictionPacket::size);
     prediction.keypoints.push_back(decode_prediction_keypoint(point));
    }
   }

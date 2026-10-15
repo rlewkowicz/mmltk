@@ -52,7 +52,7 @@ std::vector<std::pair<JointIndex, JointIndex>> joint_correspondence(const ClassK
  if (shared_edges(source, destination_lookup) != shared_edges(destination, source_lookup)) throw std::invalid_argument("keypoint schemas disagree on skeleton meaning for shared joints");
  return result;
 }
-}
+}  // namespace
 JointIndex checked_joint_index(const std::size_t index, const std::size_t count) {
  if (count > kKeypointsPerClassCapacity || index >= count) throw std::invalid_argument("keypoint index exceeds admitted joint count");
  return static_cast<JointIndex>(index);
@@ -116,7 +116,7 @@ ClassKeypointSchema permute_keypoint_schema(const ClassKeypointSchema& source, c
 std::vector<JointIndex> keypoint_permutation(const ClassKeypointSchema& source, const ClassKeypointSchema& destination) {
  const auto pairs = joint_correspondence(source, destination, true);
  std::vector<JointIndex> permutation(source.names.size());
- for (const auto [from, to] : pairs) permutation[from] = to;
+ for (const auto& [from, to] : pairs) permutation[from] = to;
  return permutation;
 }
 std::vector<std::pair<JointIndex, JointIndex>> shared_keypoint_correspondence(const ClassKeypointSchema& source, const ClassKeypointSchema& destination) {
@@ -125,7 +125,9 @@ std::vector<std::pair<JointIndex, JointIndex>> shared_keypoint_correspondence(co
 ClassKeypointSchema coco_person_keypoint_schema() {
  // COCO person category order; edges use zero-based canonical joint references.
  return {
-  .names = {"nose", "left_eye", "right_eye", "left_ear", "right_ear", "left_shoulder", "right_shoulder", "left_elbow", "right_elbow", "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee", "right_knee", "left_ankle", "right_ankle"},
+  .names =
+   {"nose", "left_eye", "right_eye", "left_ear", "right_ear", "left_shoulder", "right_shoulder", "left_elbow", "right_elbow", "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee",
+    "right_knee", "left_ankle", "right_ankle"},
   .skeleton = {{15, 13}, {13, 11}, {16, 14}, {14, 12}, {11, 12}, {5, 11}, {6, 12}, {5, 6}, {5, 7}, {6, 8}, {7, 9}, {8, 10}, {1, 2}, {0, 1}, {0, 2}, {1, 3}, {2, 4}, {3, 5}, {4, 6}},
   .horizontal_flip = {0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15},
   .oks_sigmas = {.026, .025, .025, .035, .035, .079, .079, .072, .072, .062, .062, .107, .107, .087, .087, .089, .089},

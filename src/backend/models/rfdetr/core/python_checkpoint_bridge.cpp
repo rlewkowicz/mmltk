@@ -161,7 +161,8 @@ void populate_metadata_from_manifest(const json& metadata_json, NativeCheckpoint
    if (name.size() > mmltk::backend::data::catalog::kClassNameCapacity || name.find('\0') != std::string::npos) throw std::invalid_argument("oversized upstream class-name evidence");
    names.names.push_back({std::move(name)});
   }
-  if (!metadata.class_layout.class_name_evidence.names.empty() && metadata.class_layout.class_name_evidence.names != names.names) throw std::invalid_argument("conflicting upstream class-name evidence");
+  if (!metadata.class_layout.class_name_evidence.names.empty() && metadata.class_layout.class_name_evidence.names != names.names)
+   throw std::invalid_argument("conflicting upstream class-name evidence");
   names.keypoints = std::move(metadata.class_layout.class_name_evidence.keypoints);
   metadata.class_layout.class_name_evidence = std::move(names);
  }

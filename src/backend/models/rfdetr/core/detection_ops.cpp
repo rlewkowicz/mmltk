@@ -321,7 +321,8 @@ torch::Tensor build_dense_matcher_cost(const OutputLayer& layer, const PreparedT
  if (!config.keypoints_per_class.empty()) {
   if (!layer.pred_keypoints || !targets.all_keypoints.defined()) throw std::invalid_argument("keypoint matcher requires admitted predictions and targets");
   const auto boxes = targets.all_boxes.index_select(0, logical_indices);
-  const auto terms = keypoint_matching_cost(layer.pred_keypoints->to(torch::kFloat32), targets.all_keypoints.index_select(0, logical_indices), tgt_ids, boxes.select(1, 2) * boxes.select(1, 3), KeypointTensorLayout(config.keypoints_per_class));
+  const auto terms = keypoint_matching_cost(layer.pred_keypoints->to(torch::kFloat32), targets.all_keypoints.index_select(0, logical_indices), tgt_ids, boxes.select(1, 2) * boxes.select(1, 3),
+   KeypointTensorLayout(config.keypoints_per_class));
   cost = add_keypoint_matching_cost(cost.reshape(terms.l1.sizes()), terms, config).flatten(0, 1);
  }
  return cost.reshape({bs, num_queries, total_targets}).to(torch::kFloat32);
@@ -568,8 +569,8 @@ torch::Tensor iou_weighted_class_targets(
  cls_targets.index_put_({idx.first, idx.second, target_classes_o}, pos_ious.to(cls_targets.dtype()));
  return cls_targets;
 }
-void loss_labels(CriterionTensors& losses, const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& num_boxes, bool main_output,
- DetectionStatisticsPacket::Tensors* statistics = nullptr) {
+void loss_labels(CriterionTensors& losses, const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& num_boxes,
+ bool main_output, DetectionStatisticsPacket::Tensors* statistics = nullptr) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_loss_labels{"rfdetr.criterion.loss_labels"};
  const auto src_logits = layer.pred_logits;
  const auto device = src_logits.device();
@@ -670,11 +671,13 @@ void loss_masks(CriterionTensors& losses, const OutputLayer& layer, const Prepar
  losses[CriterionTerm::mask_ce] = sigmoid_ce_loss(point_logits, point_labels, num_boxes, config.use_jit_traced_loss_ops);
  losses[CriterionTerm::mask_dice] = dice_loss(point_logits, point_labels, num_boxes, config.use_jit_traced_loss_ops);
 }
-void loss_keypoints(CriterionTensors& losses, const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& normalizer) {
+void loss_keypoints(
+ CriterionTensors& losses, const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& normalizer) {
  if (!layer.pred_keypoints || !targets.all_keypoints.defined()) throw std::invalid_argument("keypoint criterion requires admitted predictions and targets");
  const auto source = layer.pred_keypoints->index({indices.source.first, indices.source.second});
  const auto boxes = targets.all_boxes.index_select(0, indices.global_targets);
- const auto terms = keypoint_losses(source, targets.all_keypoints.index_select(0, indices.global_targets), targets.all_labels.index_select(0, indices.global_targets), boxes.select(1, 2) * boxes.select(1, 3), KeypointTensorLayout(config.keypoints_per_class));
+ const auto terms = keypoint_losses(source, targets.all_keypoints.index_select(0, indices.global_targets), targets.all_labels.index_select(0, indices.global_targets),
+  boxes.select(1, 2) * boxes.select(1, 3), KeypointTensorLayout(config.keypoints_per_class));
  losses[CriterionTerm::keypoint_l1] = terms.l1.sum() / normalizer;
  losses[CriterionTerm::keypoint_findable] = terms.findable.sum() / normalizer;
  losses[CriterionTerm::keypoint_visible] = terms.visible.sum() / normalizer;
@@ -747,8 +750,7 @@ CriterionResult detection_loss_terms(const ModelOutputs& outputs, const Prepared
  losses.auxiliary.resize(outputs.aux_outputs.size());
  if (!outputs.aux_outputs.empty()) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_aux{"rfdetr.criterion.aux"};
-  for (size_t index = 0; index < outputs.aux_outputs.size(); ++index)
-   calculate_layer(losses.auxiliary[index], outputs.aux_outputs[index], index + 1);
+  for (size_t index = 0; index < outputs.aux_outputs.size(); ++index) calculate_layer(losses.auxiliary[index], outputs.aux_outputs[index], index + 1);
  }
  if (outputs.enc_outputs.has_value()) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_encoder{"rfdetr.criterion.encoder"};
@@ -764,8 +766,7 @@ torch::Tensor weighted_detection_loss(const CriterionResult& losses, const Detec
   const auto* found = losses.find(item.key);
   if (!found) continue;
   auto weighted = *found * item.coefficient;
-  if (auxiliary_weighted && item.key.layer.kind() != CriterionLayer::Kind::Main)
-   *auxiliary_weighted = auxiliary_weighted->defined() ? *auxiliary_weighted + weighted : weighted;
+  if (auxiliary_weighted && item.key.layer.kind() != CriterionLayer::Kind::Main) *auxiliary_weighted = auxiliary_weighted->defined() ? *auxiliary_weighted + weighted : weighted;
   if (!has_loss) {
    total = weighted;
    has_loss = true;

@@ -390,7 +390,15 @@ pub(crate) fn validation_image_metadata() -> crate::generated::ValidationImageMe
                     groundtruth: index == 0,
                     confidence: 0.75,
                     name: "paired name".into(),
-                    skeleton: crate::generated::VisualSkeleton { schema: crate::generated::ClassKeypointSchema { names: Vec::new(), skeleton: Vec::new(), horizontalflip: Vec::new(), okssigmas: Vec::new() }, joints: Vec::new() },
+                    skeleton: crate::generated::VisualSkeleton {
+                        schema: crate::generated::ClassKeypointSchema {
+                            names: Vec::new(),
+                            skeleton: Vec::new(),
+                            horizontalflip: Vec::new(),
+                            okssigmas: Vec::new(),
+                        },
+                        joints: Vec::new(),
+                    },
                 }]
             } else {
                 Vec::new()

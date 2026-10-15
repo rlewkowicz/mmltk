@@ -304,7 +304,8 @@ private:
       }
      }
      if (object.shape == domain::AnnotationShape::Skeleton) {
-      for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node) point(object.skeleton_nodes[node].visible() ? description.DrawingNode(index, node) : domain::AnnotationPoint{-100000000.0F, -100000000.0F});
+      for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
+       point(object.skeleton_nodes[node].visible() ? description.DrawingNode(index, node) : domain::AnnotationPoint{-100000000.0F, -100000000.0F});
       geometry.edge_offset = geometry.words.size();
       for (const auto edge : object.skeleton_edges) {
        if (!object.skeleton_nodes[edge.source].visible() || !object.skeleton_nodes[edge.target].visible()) continue;

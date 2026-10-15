@@ -598,7 +598,7 @@ pub(crate) mod tests {
     use iced::{Event, Point, Rectangle, Size, mouse};
     use iced_plot::{PlotUiMessage, PlotWidget};
     const BOX_AP50: catalog::Source = catalog::Source::Evaluation {
-        mask: false,
+        kind: EvaluationMetricKind::Box,
         field: MetricSummaryField::Ap50,
     };
     pub(super) fn source_catalog() -> TrainingSourceCatalog {
@@ -756,8 +756,8 @@ pub(crate) mod tests {
             .position(|m| match (m.source, source) {
                 (catalog::Source::Scalar(a), catalog::Source::Scalar(b)) => a == b,
                 (
-                    catalog::Source::Evaluation { mask: a, field: af },
-                    catalog::Source::Evaluation { mask: b, field: bf },
+                    catalog::Source::Evaluation { kind: a, field: af },
+                    catalog::Source::Evaluation { kind: b, field: bf },
                 ) => a == b && af == bf,
                 _ => false,
             })
@@ -1075,7 +1075,7 @@ pub(crate) mod tests {
                 matches!(
                     m.source,
                     catalog::Source::Evaluation {
-                        mask: false,
+                        kind: EvaluationMetricKind::Box,
                         field: MetricSummaryField::AverageRecall(_)
                     }
                 )

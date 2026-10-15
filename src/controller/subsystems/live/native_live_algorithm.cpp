@@ -61,22 +61,29 @@ public:
   analysis_ = std::move(analysis);
   stop_ = stop;
   media::LiveAnalysisProviderFactory factory;
-  if (analysis_) factory = {this, [](const void* context, mmltk::backend::ml::runtime::BorrowedCommandStream stream) {
-   auto& owner = *const_cast<NativeLiveAlgorithm*>(static_cast<const NativeLiveAlgorithm*>(context));
-   const auto& request = owner.analysis_->request;
-   try { return mmltk::backend::models::rfdetr::MakeRfdetrAnalysisProvider({
-    .artifacts = request, .backend = request.onnx_path.empty() ? "tensorrt" : "onnx", .device = owner.settings_.device,
-    .command_stream = stream, .static_resolution = static_cast<std::uint32_t>(request.resolution),
-    .maximum_detections = request.max_dets_per_image, .allow_fp16 = request.allow_fp16, .stop = owner.stop_}, request.threshold); }
-   catch (const mmltk::backend::models::rfdetr::RfdetrArtifactAdmissionCancelled&) {
-    owner.provider_admission_refused_ = true;
-    throw;
-   }
-   catch (const mmltk::backend::models::rfdetr::RfdetrArtifactAdmissionFailure& error) {
-    owner.provider_admission_refused_ = true;
-    throw std::runtime_error("Live RF-DETR analysis provider for " + (request.onnx_path.empty() ? request.tensorrt_path.string() : request.onnx_path.string()) + ": " + error.what());
-   }
-  }};
+  if (analysis_)
+   factory = {this, [](const void* context, mmltk::backend::ml::runtime::BorrowedCommandStream stream) {
+    auto& owner = *const_cast<NativeLiveAlgorithm*>(static_cast<const NativeLiveAlgorithm*>(context));
+    const auto& analysis_request = owner.analysis_->request;
+    try {
+     return mmltk::backend::models::rfdetr::MakeRfdetrAnalysisProvider({.artifacts = analysis_request,
+                                                                        .backend = analysis_request.onnx_path.empty() ? "tensorrt" : "onnx",
+                                                                        .device = owner.settings_.device,
+                                                                        .command_stream = stream,
+                                                                        .static_resolution = static_cast<std::uint32_t>(analysis_request.resolution),
+                                                                        .maximum_detections = analysis_request.max_dets_per_image,
+                                                                        .allow_fp16 = analysis_request.allow_fp16,
+                                                                        .stop = owner.stop_},
+      analysis_request.threshold);
+    } catch (const mmltk::backend::models::rfdetr::RfdetrArtifactAdmissionCancelled&) {
+     owner.provider_admission_refused_ = true;
+     throw;
+    } catch (const mmltk::backend::models::rfdetr::RfdetrArtifactAdmissionFailure& error) {
+     owner.provider_admission_refused_ = true;
+     throw std::runtime_error(
+      "Live RF-DETR analysis provider for " + (analysis_request.onnx_path.empty() ? analysis_request.tensorrt_path.string() : analysis_request.onnx_path.string()) + ": " + error.what());
+    }
+   }};
   try {
    const auto started = plane_->start(factory);
    if (!started.running()) {
@@ -88,7 +95,8 @@ public:
      static_cast<void>(plane_->stop());
      const auto settlement = plane_->no_custody_start_settlement();
      if (settlement.ok() && !failed_.load(std::memory_order_acquire)) {
-      plane_.reset(); analysis_.reset();
+      plane_.reset();
+      analysis_.reset();
       throw LiveProviderAdmissionFailure(failure);
      }
      if (!settlement.ok()) throw std::runtime_error(failure + "; " + settlement.message);
@@ -113,7 +121,8 @@ public:
   last_revision_ = observed->revision;
   return true;
  }
- bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream_value, media::LiveAnalysisProduct& analysis, const std::stop_token stop) override {
+ bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream_value, media::LiveAnalysisProduct& analysis,
+  const std::stop_token stop) override {
   if (stop.stop_requested()) {
    lease_ = {};
    return false;
@@ -131,35 +140,41 @@ public:
   const auto stream = reinterpret_cast<cudaStream_t>(stream_value);
   words_.clear();
   skeletons_.clear();
-  if (analysis_ && (analysis_->keypoints || analysis_->uncertainty)) for (const auto& region : product.regions()) {
-   if (!region.keypoints_available || !region.class_catalog || region.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground) continue;
-   for (std::size_t instance = 0; instance < region.count; ++instance) {
-    const auto category = region.class_references[instance];
-    if (category < 0 || static_cast<std::size_t>(category) >= region.class_catalog->size()) throw std::runtime_error("Live skeleton class exceeds catalog");
-    const auto& schema = region.class_catalog->keypoints(category);
-    if (schema.names.empty()) continue;
-    if (region.keypoint_counts[instance] != static_cast<std::int32_t>(schema.names.size())) throw std::runtime_error("Live skeleton count disagrees with schema");
-    if (region.confidences[instance] < analysis_->request.threshold) continue;
-    auto skeleton = raster::append_skeleton_projection(words_, schema, [&](std::size_t joint) {
-     const auto& point = region.keypoints[instance * region.keypoint_capacity + joint];
-     return raster::SkeletonSample{point.x, point.y, point.confidence, analysis_->uncertainty ? std::array<float, 3>{point.covariance_xx, point.covariance_xy, point.covariance_yy} : std::array<float, 3>{}};
-    });
-    skeleton.color = region.colors_rgb[instance];
-    skeletons_.push_back(skeleton);
+  if (analysis_ && (analysis_->keypoints || analysis_->uncertainty))
+   for (const auto& region : product.regions()) {
+    if (!region.keypoints_available || !region.class_catalog || region.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground) continue;
+    for (std::size_t instance = 0; instance < region.count; ++instance) {
+     const auto category = region.class_references[instance];
+     if (category < 0 || static_cast<std::size_t>(category) >= region.class_catalog->size()) throw std::runtime_error("Live skeleton class exceeds catalog");
+     const auto& schema = region.class_catalog->keypoints(category);
+     if (schema.names.empty()) continue;
+     if (region.keypoint_counts[instance] != static_cast<std::int32_t>(schema.names.size())) throw std::runtime_error("Live skeleton count disagrees with schema");
+     if (region.confidences[instance] < analysis_->request.threshold) continue;
+     auto skeleton = raster::append_skeleton_projection(words_, schema, [&](std::size_t joint) {
+      const auto& point = region.keypoints[instance * region.keypoint_capacity + joint];
+      return raster::SkeletonSample{
+       point.x, point.y, point.confidence, analysis_->uncertainty ? std::array<float, 3>{point.covariance_xx, point.covariance_xy, point.covariance_yy} : std::array<float, 3>{}
+      };
+     });
+     skeleton.color = region.colors_rgb[instance];
+     skeletons_.push_back(skeleton);
+    }
    }
-  }
   if (words_.empty()) return;
   const auto bytes = words_.size() * sizeof(std::uint32_t);
   if (bytes > geometry_capacity_) {
    if (!geometry_host_) geometry_host_ = gpu::PinnedHostBuffer::ForCurrentDevice();
    geometry_host_->ensure_bytes(bytes);
    if (!geometry_device_.AllocateCandidate([bytes](void*& value) { return cudaMalloc(&value, bytes); }).released() ||
-       !geometry_device_.PromoteCandidate([](void* value) { return cudaFree(value); }).released()) throw std::runtime_error("Live skeleton allocation failed");
+       !geometry_device_.PromoteCandidate([](void* value) { return cudaFree(value); }).released())
+    throw std::runtime_error("Live skeleton allocation failed");
    geometry_capacity_ = bytes;
   }
   std::memcpy(geometry_host_->data(), words_.data(), bytes);
   if (cudaMemcpyAsync(geometry_device_.active(), geometry_host_->data(), bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) throw std::runtime_error("Live skeleton upload failed");
-  raster::MutableBytes target{reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes, static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)};
+  raster::MutableBytes target{
+   reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes, static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)
+  };
   for (const auto& skeleton : skeletons_)
    if (raster::raster_projected_skeleton(target, static_cast<const std::uint32_t*>(geometry_device_.active()), skeleton, {stream}, analysis_->keypoints, analysis_->uncertainty) != cudaSuccess)
     throw std::runtime_error("Live skeleton rendering failed");

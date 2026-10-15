@@ -35,7 +35,12 @@ pub fn view(
                 .on_toggle_maybe(native_enabled.then_some(Message::Boxes))
         )
         .id(ids[2]),
-        container(checkbox(keypoints).label("Skeletons").on_toggle_maybe(native_enabled.then_some(Message::Keypoints))).id(ids[3]),
+        container(
+            checkbox(keypoints)
+                .label("Skeletons")
+                .on_toggle_maybe(native_enabled.then_some(Message::Keypoints))
+        )
+        .id(ids[3]),
     ]
     .spacing(7)
     .align_y(iced::Center)

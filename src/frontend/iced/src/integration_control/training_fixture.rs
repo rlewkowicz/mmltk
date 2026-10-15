@@ -20,8 +20,14 @@ pub(crate) fn metric_source(modelid: u64) -> TrainingMetricSource {
 pub(crate) fn unresolved_class_layout() -> ModelClassLayout {
     ModelClassLayout {
         version: 1,
-        foreground: OrderedClassCatalog { names: Vec::new(), keypoints: None },
-        classnameevidence: OrderedClassCatalog { names: Vec::new(), keypoints: None },
+        foreground: OrderedClassCatalog {
+            names: Vec::new(),
+            keypoints: None,
+        },
+        classnameevidence: OrderedClassCatalog {
+            names: Vec::new(),
+            keypoints: None,
+        },
         slots: Vec::new(),
         scores: ClassScoreEncoding::SigmoidLogits,
         noobject: NoObjectEncoding::AllNegative,

@@ -764,13 +764,39 @@ fn view_with<'a, M: Clone + 'a>(
         let weights_selector = shared_selector(state.workflow, presets, state.settings_enabled);
         column![
             weights_selector,
-            status_text(selected_index.map(|index| {
-                let preset = &crate::generated::RFDETR_PRESET_CATALOG[index];
-                let task_kind = state.model.filter(|model| !model.active && model.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted && model.selection.artifact == state.artifact && model.selection.key.source == state.source).map_or(preset.task, |model| model.selection.task);
-                let task = match task_kind { crate::generated::ModelTask::Detection => "Detection", crate::generated::ModelTask::Segmentation => "Segmentation", crate::generated::ModelTask::Keypoints => "Keypoints" };
-                let license = match preset.license { crate::generated::ModelLicense::Apache20 => "Apache 2.0", crate::generated::ModelLicense::PlatformModel10 => "Roboflow Platform Model License 1.0" };
-                if state.source == ModelSelectionSource::Canonical { format!("{task} · {license}") } else { format!("{task} · Custom artifact") }
-            }).unwrap_or_default()),
+            status_text(
+                selected_index
+                    .map(|index| {
+                        let preset = &crate::generated::RFDETR_PRESET_CATALOG[index];
+                        let task_kind = state
+                            .model
+                            .filter(|model| {
+                                !model.active
+                                    && model.terminal.outcome
+                                        == crate::generated::ModelSelectionOutcome::Accepted
+                                    && model.selection.artifact == state.artifact
+                                    && model.selection.key.source == state.source
+                            })
+                            .map_or(preset.task, |model| model.selection.task);
+                        let task = match task_kind {
+                            crate::generated::ModelTask::Detection => "Detection",
+                            crate::generated::ModelTask::Segmentation => "Segmentation",
+                            crate::generated::ModelTask::Keypoints => "Keypoints",
+                        };
+                        let license = match preset.license {
+                            crate::generated::ModelLicense::Apache20 => "Apache 2.0",
+                            crate::generated::ModelLicense::PlatformModel10 => {
+                                "Roboflow Platform Model License 1.0"
+                            }
+                        };
+                        if state.source == ModelSelectionSource::Canonical {
+                            format!("{task} · {license}")
+                        } else {
+                            format!("{task} · Custom artifact")
+                        }
+                    })
+                    .unwrap_or_default()
+            ),
             status(state.model, state.workflow),
             artifact,
             iced::widget::container(progress)

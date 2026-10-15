@@ -72,8 +72,8 @@ static_assert(mmltk::frameworks::reflection::ingress_policies_are_valid<Training
 [[nodiscard]] constexpr std::optional<std::string_view> training_supervision_admission_error(
  const ModelTask task, const std::int64_t decoder_layers, const TrainingSupervisionConfig& config) noexcept {
  const auto capabilities = model_training_capabilities(task, decoder_layers);
- if (!training_supervision_enabled(config) ||
-     ((config.assignment != TrainAssignmentKind::MatchFree || capabilities.match_free) && (!config.denoising.enabled || capabilities.denoising))) return std::nullopt;
+ if (!training_supervision_enabled(config) || ((config.assignment != TrainAssignmentKind::MatchFree || capabilities.match_free) && (!config.denoising.enabled || capabilities.denoising)))
+  return std::nullopt;
  if (task == ModelTask::Keypoints) return "Keypoint training requires stock Hungarian supervision; Match-Free and denoising are unsupported";
  return "Zero-decoder Atto training does not support Match-Free or denoising supervision";
 }

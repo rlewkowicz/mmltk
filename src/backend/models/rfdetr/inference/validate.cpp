@@ -133,9 +133,12 @@ struct AlignmentSample final {
     for (std::size_t joint = 0; joint < mapping.size(); ++joint) {
      const auto& source = detection.keypoints[joint];
      auto& destination = joint_values[prediction_index * joint_capacity + mapping[joint]];
-     destination.x = source.x; destination.y = source.y;
+     destination.x = source.x;
+     destination.y = source.y;
      destination.findable_logit = std::log(source.confidence / (1 - source.confidence));
-     destination.log_l11 = source.precision_cholesky[0]; destination.l21 = source.precision_cholesky[1]; destination.log_l22 = source.precision_cholesky[2];
+     destination.log_l11 = source.precision_cholesky[0];
+     destination.l21 = source.precision_cholesky[1];
+     destination.log_l22 = source.precision_cholesky[2];
     }
    }
    ++prediction_index;
@@ -143,7 +146,10 @@ struct AlignmentSample final {
   dataset->merge_matches(dataset->match_predictions(record.dataset_index,
    {.image_id = static_cast<int>(record.image_id), .scores = scores.data(), .labels_zero_based = labels.data(), .boxes_xyxy = boxes.data(), .count = scores.size()}, std::nullopt, evaluation_cap,
    masks ? std::span<const Prediction>{record.detections} : std::span<const Prediction>{},
-   keypoints ? std::optional{KeypointPredictionView{reinterpret_cast<const float*>(joint_values.data()), static_cast<std::ptrdiff_t>(joint_capacity * sizeof(KeypointPrediction) / sizeof(float)), joint_capacity}} : std::nullopt));
+   keypoints ? std::optional{KeypointPredictionView{
+                reinterpret_cast<const float*>(joint_values.data()), static_cast<std::ptrdiff_t>(joint_capacity * sizeof(KeypointPrediction) / sizeof(float)), joint_capacity
+               }}
+             : std::nullopt));
   if (delivery.sample && is_sample(record.dataset_index)) {
    ground_truth.clear();
    const auto sample_index = static_cast<std::uint32_t>(record.dataset_index);

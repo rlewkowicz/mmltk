@@ -105,9 +105,11 @@ private:
 TORCH_MODULE(Dinov2PatchEmbeddings);
 class WindowedDinov2EmbeddingsImpl : public torch::nn::Module {
  int64_t dimension_;
+
 public:
  explicit WindowedDinov2EmbeddingsImpl(const NativeRfDetrConfig& config)
-     : dimension_(config.backbone.dimension), cls_token(register_parameter("cls_token", torch::empty({1, 1, dimension_}, torch::kFloat32))),
+     : dimension_(config.backbone.dimension),
+       cls_token(register_parameter("cls_token", torch::empty({1, 1, dimension_}, torch::kFloat32))),
        mask_token(register_parameter("mask_token", torch::zeros({1, dimension_}, torch::kFloat32))),
        position_embeddings(register_parameter("position_embeddings", torch::empty({1, config.positional_encoding_size * config.positional_encoding_size + 1, dimension_}, torch::kFloat32))),
        patch_embeddings(register_module("patch_embeddings", Dinov2PatchEmbeddings(config.patch_size, config.backbone.dimension))),
@@ -167,10 +169,13 @@ TORCH_MODULE(WindowedDinov2Embeddings);
 class Dinov2SelfAttentionImpl : public torch::nn::Module {
  int64_t dimension_;
  int64_t heads_;
+
 public:
  bool force_math_attention_ = false;
  Dinov2SelfAttentionImpl(const BackboneConfig& config)
-     : dimension_(config.dimension), heads_(config.heads), query(register_module("query", torch::nn::Linear(dimension_, dimension_))),
+     : dimension_(config.dimension),
+       heads_(config.heads),
+       query(register_module("query", torch::nn::Linear(dimension_, dimension_))),
        key(register_module("key", torch::nn::Linear(dimension_, dimension_))),
        value(register_module("value", torch::nn::Linear(dimension_, dimension_))) {}
  torch::Tensor forward(const torch::Tensor& hidden_states) {
@@ -194,6 +199,7 @@ private:
 TORCH_MODULE(Dinov2SelfAttention);
 class Dinov2SelfOutputImpl : public torch::nn::Module {
  int64_t dimension_;
+
 public:
  Dinov2SelfOutputImpl(const BackboneConfig& config) : dimension_(config.dimension), dense(register_module("dense", torch::nn::Linear(dimension_, dimension_))) {}
  torch::Tensor forward(const torch::Tensor& hidden_states) { return detail::linear_forward(*dense, hidden_states); }
@@ -212,6 +218,7 @@ private:
 TORCH_MODULE(Dinov2Attention);
 class Dinov2LayerScaleImpl : public torch::nn::Module {
  int64_t dimension_;
+
 public:
  Dinov2LayerScaleImpl(const BackboneConfig& config) : dimension_(config.dimension), lambda1(register_parameter("lambda1", torch::ones({dimension_}, torch::kFloat32))) {}
  torch::Tensor forward(const torch::Tensor& hidden_state) const { return hidden_state * lambda1; }
@@ -220,8 +227,12 @@ public:
 TORCH_MODULE(Dinov2LayerScale);
 class Dinov2MlpImpl : public torch::nn::Module {
  int64_t dimension_;
+
 public:
- Dinov2MlpImpl(const BackboneConfig& config) : dimension_(config.dimension), fc1(register_module("fc1", torch::nn::Linear(dimension_, config.feedforward_dimension))), fc2(register_module("fc2", torch::nn::Linear(config.feedforward_dimension, dimension_))) {}
+ Dinov2MlpImpl(const BackboneConfig& config)
+     : dimension_(config.dimension),
+       fc1(register_module("fc1", torch::nn::Linear(dimension_, config.feedforward_dimension))),
+       fc2(register_module("fc2", torch::nn::Linear(config.feedforward_dimension, dimension_))) {}
  torch::Tensor forward(const torch::Tensor& hidden_state) { return detail::linear_forward(*fc2, torch::gelu(detail::linear_forward(*fc1, hidden_state))); }
 
 private:
@@ -231,9 +242,11 @@ private:
 TORCH_MODULE(Dinov2Mlp);
 class WindowedDinov2LayerImpl : public torch::nn::Module {
  int64_t dimension_;
+
 public:
  explicit WindowedDinov2LayerImpl(const NativeRfDetrConfig& config)
-     : dimension_(config.backbone.dimension), num_windows_(std::max<int64_t>(1, config.num_windows)),
+     : dimension_(config.backbone.dimension),
+       num_windows_(std::max<int64_t>(1, config.num_windows)),
        norm1(register_module("norm1", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dimension_}).eps(1.0e-6)))),
        attention(register_module("attention", Dinov2Attention(config.backbone))),
        layer_scale1(register_module("layer_scale1", Dinov2LayerScale(config.backbone))),
@@ -268,6 +281,7 @@ private:
 TORCH_MODULE(WindowedDinov2Layer);
 class WindowedDinov2EncoderImpl : public torch::nn::Module {
  BackboneConfig topology_;
+
 public:
  explicit WindowedDinov2EncoderImpl(const NativeRfDetrConfig& config) : topology_(config.backbone), layer(register_module("layer", torch::nn::ModuleList())) {
   for (int64_t index = 0; index < topology_.layers; ++index) { layer->push_back(WindowedDinov2Layer(config)); }
@@ -288,13 +302,15 @@ private:
  torch::nn::ModuleList layer{nullptr};
 };
 TORCH_MODULE(WindowedDinov2Encoder);
-
 class WindowedDinov2BackboneImpl : public torch::nn::Module {
  BackboneConfig topology_;
  int64_t dimension_;
+
 public:
  explicit WindowedDinov2BackboneImpl(const NativeRfDetrConfig& config)
-     : topology_(config.backbone), dimension_(config.backbone.dimension), patch_size_(config.patch_size),
+     : topology_(config.backbone),
+       dimension_(config.backbone.dimension),
+       patch_size_(config.patch_size),
        num_windows_(std::max<int64_t>(1, config.num_windows)),
        embeddings(register_module("embeddings", WindowedDinov2Embeddings(config))),
        encoder(register_module("encoder", WindowedDinov2Encoder(config))),
@@ -351,7 +367,10 @@ class DinoV2WrapperImpl final : public detail::BackboneEncoder {
 public:
  explicit DinoV2WrapperImpl(const NativeRfDetrConfig& config) : encoder(register_module("encoder", WindowedDinov2Backbone(config))) {}
  std::vector<torch::Tensor> forward(const torch::Tensor& tensors) override { return encoder->forward(tensors); }
- void set_force_math_attention(bool value) override { for (const auto& module : modules(false)) if (auto* attention = dynamic_cast<Dinov2SelfAttentionImpl*>(module.get())) attention->force_math_attention_ = value; }
+ void set_force_math_attention(bool value) override {
+  for (const auto& module : modules(false))
+   if (auto* attention = dynamic_cast<Dinov2SelfAttentionImpl*>(module.get())) attention->force_math_attention_ = value;
+ }
 
 private:
  WindowedDinov2Backbone encoder{nullptr};
@@ -373,7 +392,7 @@ private:
  torch::nn::ModuleList stages{nullptr};
 };
 TORCH_MODULE(NativeBackboneProjector);
-} // namespace
+}  // namespace
 std::shared_ptr<torch::nn::Module> test_support::ProjectorConvTestAccess::make(int64_t channels) { return std::make_shared<ConvXImpl>(channels, channels, 1, 1, 1, true); }
 torch::Tensor test_support::ProjectorConvTestAccess::invoke(torch::nn::Module& module, const torch::Tensor& input) { return dynamic_cast<ConvXImpl&>(module).forward(input); }
 namespace detail {
@@ -394,5 +413,5 @@ std::inplace_vector<torch::Tensor, 2> NativeBackboneImpl::forward_features(const
  return result;
 }
 void NativeBackboneImpl::set_force_math_attention(bool value) { encoder_->set_force_math_attention(value); }
-} // namespace detail
-} // namespace mmltk::backend::models::rfdetr
+}  // namespace detail
+}  // namespace mmltk::backend::models::rfdetr

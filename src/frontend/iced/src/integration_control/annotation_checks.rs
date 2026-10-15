@@ -141,7 +141,9 @@ pub(super) fn probes(ui: &AnnotationUiState) -> Vec<f64> {
                 for edge in &object.skeletonedges {
                     let a = &object.skeletonnodes[edge.source as usize];
                     let b = &object.skeletonnodes[edge.target as usize];
-                    if a.visible && b.visible {
+                    if a.visibility != crate::generated::KeypointVisibility::Unannotated
+                        && b.visibility != crate::generated::KeypointVisibility::Unannotated
+                    {
                         add(
                             (a.point.x + b.point.x) / 2.0,
                             (a.point.y + b.point.y) / 2.0,

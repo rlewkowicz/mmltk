@@ -290,47 +290,52 @@ TEST_CASE("Oracle comparison collection retains numerical failures and immediate
  REQUIRE_THROWS_AS(comparison.parameter_update("incorrect-update", one, one + 1e-4, one, one), std::runtime_error);
 }
 TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or altered publication", "[rfdetr][parity][oracle_archive]") {
- namespace support=rf::testsupport;
- namespace io=mmltk::common::io;
+ namespace support = rf::testsupport;
+ namespace io = mmltk::common::io;
  static_assert(!std::is_constructible_v<support::OracleArchive, support::OracleArchiveRecord>);
  static_assert(!std::is_constructible_v<support::OracleArchive, support::OracleArchiveRecord, std::function<void(std::size_t)>>);
  const mmltk::testsupport::ScopedTempDir root("oracle-shards");
- const auto reference=[&](const std::string& name) {
-  const auto path=root.path()/name;
-  return Json{{"file",name},{"sha256",io::sha256_hex(io::sha256_file(path))},{"bytes",std::filesystem::file_size(path)}};
+ const auto reference = [&](const std::string& name) {
+  const auto path = root.path() / name;
+  return Json{{"file", name}, {"sha256", io::sha256_hex(io::sha256_file(path))}, {"bytes", std::filesystem::file_size(path)}};
  };
- const auto write=[&](const std::string& name,const Json& value) {
-  std::ofstream file(root.path()/name); file<<value.dump(); file.close();
+ const auto write = [&](const std::string& name, const Json& value) {
+  std::ofstream file(root.path() / name);
+  file << value.dump();
+  file.close();
   return reference(name);
  };
  constexpr std::array families{"gradient/", "stock/gradient/", "updated/"};
  constexpr std::array loss_names{"z", "a", "m"};
- std::array<c10::Dict<std::string,torch::Tensor>, 3> values;
+ std::array<c10::Dict<std::string, torch::Tensor>, 3> values;
  std::array<Json, 3> shards;
  const auto write_shard = [&](std::size_t index) {
-  const auto bytes=torch::pickle_save(c10::IValue(values[index]));
-  const auto filename=std::to_string(index)+".pt";
-  std::ofstream data(root.path()/filename,std::ios::binary); data.write(bytes.data(),bytes.size()); data.close();
+  const auto bytes = torch::pickle_save(c10::IValue(values[index]));
+  const auto filename = std::to_string(index) + ".pt";
+  std::ofstream data(root.path() / filename, std::ios::binary);
+  data.write(bytes.data(), bytes.size());
+  data.close();
   const auto physical = reference(filename);
   for (const auto& [name, value] : physical.items()) shards[index][name] = value;
  };
- for (std::size_t index=0;index<shards.size();++index) {
+ for (std::size_t index = 0; index < shards.size(); ++index) {
   const auto add = [&](const std::string& name, const torch::Tensor& tensor) {
    values[index].insert(name, tensor);
    const auto finite = torch::isfinite(tensor);
    if (tensor.is_floating_point()) values[index].insert("finite/" + name, finite);
-   shards[index]["tensors"][name] = {{"defined",true},{"shape",tensor.sizes().vec()},{"stride",tensor.strides().vec()},
-    {"dtype","torch." + mmltk::backend::ml::serialization::scalar_type_name(tensor.scalar_type())},
-    {"device","cuda:0"},{"finite_count",finite.sum().item<int64_t>()},{"elements",tensor.numel()}};
+   shards[index]["tensors"][name] = {
+    {"defined", true}, {"shape", tensor.sizes().vec()}, {"stride", tensor.strides().vec()}, {"dtype", "torch." + mmltk::backend::ml::serialization::scalar_type_name(tensor.scalar_type())},
+    {"device", "cuda:0"}, {"finite_count", finite.sum().item<int64_t>()}, {"elements", tensor.numel()}
+   };
   };
-  add("loss/" + std::string(loss_names[index]), torch::tensor({float(index+1)}));
+  add("loss/" + std::string(loss_names[index]), torch::tensor({float(index + 1)}));
   const auto backing = torch::arange(4096, torch::kFloat32) + static_cast<float>(5000 * index);
   const std::string family(families[index]);
   add(family + "unused", backing);
   add(family + "z", backing.narrow(0, 3, 4).reshape({2, 2}));
   add(family + "a", backing.narrow(0, 12, 4));
   if (index == 0) {
-   shards[index]["tensors"]["optional"]={{"defined",false}};
+   shards[index]["tensors"]["optional"] = {{"defined", false}};
    add("typed/int64", torch::tensor({int64_t{1} << 54, (int64_t{1} << 54) + 1}, torch::kInt64));
   } else if (index == 1) {
    add("typed/bool", torch::tensor({true, false}, torch::kBool));
@@ -340,23 +345,26 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
   }
   write_shard(index);
  }
- const auto publish=[&] {
-  Json refs=Json::array(); std::uint64_t bytes=0; std::size_t tensors=0;
-  for (std::size_t index=0;index<shards.size();++index) {
-   refs.push_back(write(std::to_string(index)+".json",shards[index])); bytes+=shards[index].at("bytes").get<std::uint64_t>();
+ const auto publish = [&] {
+  Json refs = Json::array();
+  std::uint64_t bytes = 0;
+  std::size_t tensors = 0;
+  for (std::size_t index = 0; index < shards.size(); ++index) {
+   refs.push_back(write(std::to_string(index) + ".json", shards[index]));
+   bytes += shards[index].at("bytes").get<std::uint64_t>();
    tensors += shards[index].at("tensors").size();
   }
-  return write("step.json",{{"format","mmltk.rfdetr.step.v2"},{"shards",refs},{"bytes",bytes},{"tensor_count",tensors}});
+  return write("step.json", {{"format", "mmltk.rfdetr.step.v2"}, {"shards", refs}, {"bytes", bytes}, {"tensor_count", tensors}});
  };
- auto committed=publish();
+ auto committed = publish();
  SECTION("complete multi-shard view retains order and borrowed values") {
-  const support::OracleArchive archive(root.path(),committed);
-  CHECK((archive.ordered_defined_names("loss/")==std::vector<std::string>{"z","a","m"}));
-  const auto first=archive.tensor("loss/z");
-  CHECK(archive.tensor("loss/a").item<float>()==2.F);
-  CHECK(first.item<float>()==1.F);
+  const support::OracleArchive archive(root.path(), committed);
+  CHECK((archive.ordered_defined_names("loss/") == std::vector<std::string>{"z", "a", "m"}));
+  const auto first = archive.tensor("loss/z");
+  CHECK(archive.tensor("loss/a").item<float>() == 2.F);
+  CHECK(first.item<float>() == 1.F);
   CHECK_FALSE(archive.tensor("optional").defined());
-  CHECK((archive.names("loss/")==std::set<std::string>{"a","m","z"}));
+  CHECK((archive.names("loss/") == std::set<std::string>{"a", "m", "z"}));
  }
  SECTION("grouped alternating families decode each required shard at most once") {
   std::array<std::size_t, 3> loads{};
@@ -449,7 +457,7 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
   const support::OracleArchive archive(root.path(), committed);
   const auto retained = archive.read_tensors(std::array<std::string, 1>{"gradient/z"});
   (void)archive.tensor("loss/m");
-  const auto path = root.path()/"0.pt";
+  const auto path = root.path() / "0.pt";
   const auto original_bytes = std::filesystem::file_size(path);
   std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
   char byte = 0;
@@ -470,7 +478,8 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
   CHECK_THROWS_AS(([&] {
    const support::OracleArchive archive(root.path(), committed);
    return archive.read_tensors(std::array<std::string, 1>{"gradient/z"});
-  }()), std::runtime_error);
+  }()),
+   std::runtime_error);
  }
  SECTION("unrequested noncontiguous serialized values fail admission") {
   values[2].insert_or_assign("updated/z", values[2].at("updated/z").transpose(0, 1));
@@ -485,23 +494,63 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
   CHECK_THROWS_AS(support::OracleArchive(root.path(), committed), std::runtime_error);
  }
  SECTION("unpublished leaves do not replace authenticated completion") {
-  write("step.json.partial",{{"incomplete",true}});
-  CHECK_NOTHROW(support::OracleArchive(root.path(),committed));
+  write("step.json.partial", {{"incomplete", true}});
+  CHECK_NOTHROW(support::OracleArchive(root.path(), committed));
  }
- SECTION("missing shard") { std::filesystem::remove(root.path()/"1.pt"); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
- SECTION("changed completed shard") { std::ofstream file(root.path()/"1.pt",std::ios::app); file<<"changed"; file.close(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
- SECTION("changed index") { write("0.json",{{"changed",true}}); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
- SECTION("escaping index") { committed["file"]="../step.json"; CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
- SECTION("symlinked index") { std::filesystem::create_symlink(root.path()/"step.json",root.path()/"linked.json"); committed["file"]="linked.json"; CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("missing shard") {
+  std::filesystem::remove(root.path() / "1.pt");
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
+ SECTION("changed completed shard") {
+  std::ofstream file(root.path() / "1.pt", std::ios::app);
+  file << "changed";
+  file.close();
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
+ SECTION("changed index") {
+  write("0.json", {{"changed", true}});
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
+ SECTION("escaping index") {
+  committed["file"] = "../step.json";
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
+ SECTION("symlinked index") {
+  std::filesystem::create_symlink(root.path() / "step.json", root.path() / "linked.json");
+  committed["file"] = "linked.json";
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
  SECTION("duplicate JSON members") {
-  std::ofstream file(root.path()/"step.json"); file<<"{\"format\":\"mmltk.rfdetr.step.v2\",\"format\":\"mmltk.rfdetr.step.v2\"}"; file.close();
-  committed=reference("step.json"); CHECK_THROWS(support::OracleArchive(root.path(),committed));
+  std::ofstream file(root.path() / "step.json");
+  file << "{\"format\":\"mmltk.rfdetr.step.v2\",\"format\":\"mmltk.rfdetr.step.v2\"}";
+  file.close();
+  committed = reference("step.json");
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
  }
- SECTION("oversized index") { committed["bytes"]=32ULL*1024*1024+1; CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
- SECTION("duplicate tensor across shards") { shards[1]["tensors"]=shards[0]["tensors"]; committed=publish(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
- SECTION("false finite inventory") { shards[0]["tensors"]["loss/z"]["finite_count"]=0; committed=publish(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
- SECTION("invalid source stride") { shards[0]["tensors"]["loss/z"]["stride"]={-1}; committed=publish(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
- SECTION("unbounded storage") { shards[0]["bytes"]=4ULL*1024*1024*1024+1; committed=publish(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("oversized index") {
+  committed["bytes"] = 32ULL * 1024 * 1024 + 1;
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
+ SECTION("duplicate tensor across shards") {
+  shards[1]["tensors"] = shards[0]["tensors"];
+  committed = publish();
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
+ SECTION("false finite inventory") {
+  shards[0]["tensors"]["loss/z"]["finite_count"] = 0;
+  committed = publish();
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
+ SECTION("invalid source stride") {
+  shards[0]["tensors"]["loss/z"]["stride"] = {-1};
+  committed = publish();
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
+ SECTION("unbounded storage") {
+  shards[0]["bytes"] = 4ULL * 1024 * 1024 * 1024 + 1;
+  committed = publish();
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+ }
 }
 TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[rfdetr][parity][upstream_oracle][cuda]") {
  const auto requested = rf::testsupport::UpstreamOracle::requested();
@@ -513,64 +562,65 @@ TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[r
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  for (const auto& entry : oracle.cases()) {
   for (const auto mode : rf::testsupport::oracle_execution_modes(entry)) {
-  DYNAMIC_SECTION(entry.id << " mode=" << static_cast<int>(mode)) {
-   CAPTURE(entry.id);
-   if (entry.dtype() == torch::kBFloat16) REQUIRE(at::cuda::getCurrentDeviceProperties()->major >= 8);
-   auto model = oracle.model(entry);
-   if (mode != rf::CompilationMode::kNone) model.optimize_for_inference(entry.batch, entry.training, mode);
-   const auto archive = oracle.archive(entry, 0);
-   rf::testsupport::OracleComparison comparison(*requested, "core-" + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype(), "actual upstream forward and fixed cotangent VJP; eager native production CUDA");
-   comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
-   comparison.fact("case topology",{{"protocol",entry.protocol},{"groups",entry.groups}});
-   auto input = archive.tensor("input", torch::kCUDA).clone().set_requires_grad(true);
-   const auto mask = archive.tensor("input_mask", torch::kCUDA);
-   if (mode == rf::CompilationMode::kNone) {
-    if (model.config().task == rf::ModelTask::Keypoints) {
-     for (const auto& family : {rf::detail::kKeypointQueryAxis, rf::detail::kEncoderKeypointQueryAxis}) {
-      const auto prefix = "grouppose/" + std::string(family.module_name()) + "/";
-      rf::detail::ConditionalQueryInitializer initializer(model.config().hidden_dim, rf::KeypointTensorLayout(model.config().keypoints_per_class).compact_count(), model.config().hidden_dim / model.config().keypoint_dimension_downscale);
-      initializer.to(torch::kCUDA);
+   DYNAMIC_SECTION(entry.id << " mode=" << static_cast<int>(mode)) {
+    CAPTURE(entry.id);
+    if (entry.dtype() == torch::kBFloat16) REQUIRE(at::cuda::getCurrentDeviceProperties()->major >= 8);
+    auto model = oracle.model(entry);
+    if (mode != rf::CompilationMode::kNone) model.optimize_for_inference(entry.batch, entry.training, mode);
+    const auto archive = oracle.archive(entry, 0);
+    rf::testsupport::OracleComparison comparison(
+     *requested, "core-" + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype(), "actual upstream forward and fixed cotangent VJP; eager native production CUDA");
+    comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
+    comparison.fact("case topology", {{"protocol", entry.protocol}, {"groups", entry.groups}});
+    auto input = archive.tensor("input", torch::kCUDA).clone().set_requires_grad(true);
+    const auto mask = archive.tensor("input_mask", torch::kCUDA);
+    if (mode == rf::CompilationMode::kNone) {
+     if (model.config().task == rf::ModelTask::Keypoints) {
+      for (const auto& family : {rf::detail::kKeypointQueryAxis, rf::detail::kEncoderKeypointQueryAxis}) {
+       const auto prefix = "grouppose/" + std::string(family.module_name()) + "/";
+       rf::detail::ConditionalQueryInitializer initializer(
+        model.config().hidden_dim, rf::KeypointTensorLayout(model.config().keypoints_per_class).compact_count(), model.config().hidden_dim / model.config().keypoint_dimension_downscale);
+       initializer.to(torch::kCUDA);
+       torch::NoGradGuard no_grad;
+       for (const auto& parameter : initializer.named_parameters()) parameter.value().copy_(model.named_parameters()[family.prefix() + parameter.key()]);
+       mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
+       const auto expected = archive.read_tensors(std::array<std::string, 2>{prefix + "input", prefix + "output"});
+       comparison.compare(prefix + "output", initializer.forward(expected.at(prefix + "input").to(torch::kCUDA)), expected.at(prefix + "output"), ComparisonPolicy::Value);
+      }
+     }
+     rf::detail::NativeBackboneImpl backbone(model.config());
+     backbone.to(torch::kCUDA);
+     backbone.train(entry.training);
+     backbone.set_force_math_attention(entry.math_sdpa);
+     {
       torch::NoGradGuard no_grad;
-      for (const auto& parameter : initializer.named_parameters()) parameter.value().copy_(model.named_parameters()[family.prefix() + parameter.key()]);
+      for (const auto& parameter : backbone.named_parameters()) parameter.value().copy_(model.named_parameters()["backbone.0." + parameter.key()]);
+      for (const auto& buffer : backbone.named_buffers()) buffer.value().copy_(model.named_buffers()["backbone.0." + buffer.key()]);
       mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
-      const auto expected = archive.read_tensors(std::array<std::string, 2>{prefix + "input", prefix + "output"});
-      comparison.compare(prefix + "output", initializer.forward(expected.at(prefix + "input").to(torch::kCUDA)), expected.at(prefix + "output"), ComparisonPolicy::Value);
+      const auto features = backbone.forward_features(input);
+      REQUIRE(features.size() == archive.names("backbone/").size());
+      std::vector<std::string> read_names;
+      for (std::size_t index = 0; index < features.size(); ++index) read_names.push_back("backbone/" + std::to_string(index));
+      const auto expected = archive.read_tensors(read_names);
+      for (std::size_t index = 0; index < features.size(); ++index) comparison.compare(read_names[index], features[index], expected.at(read_names[index]), ComparisonPolicy::Value);
      }
     }
-    rf::detail::NativeBackboneImpl backbone(model.config());
-    backbone.to(torch::kCUDA);
-    backbone.train(entry.training);
-    backbone.set_force_math_attention(entry.math_sdpa);
+    std::vector<torch::Tensor> indices;
+    rf::ModelOutputs outputs;
     {
-     torch::NoGradGuard no_grad;
-     for (const auto& parameter : backbone.named_parameters()) parameter.value().copy_(model.named_parameters()["backbone.0." + parameter.key()]);
-     for (const auto& buffer : backbone.named_buffers()) buffer.value().copy_(model.named_buffers()["backbone.0." + buffer.key()]);
+     ForwardOperatorObservation operators(mode == rf::CompilationMode::kNone && archive.contains("forward-operator/linear/0"));
      mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
-     const auto features = backbone.forward_features(input);
-     REQUIRE(features.size() == archive.names("backbone/").size());
-     std::vector<std::string> read_names;
-     for (std::size_t index = 0; index < features.size(); ++index) read_names.push_back("backbone/" + std::to_string(index));
-     const auto expected = archive.read_tensors(read_names);
-     for (std::size_t index = 0; index < features.size(); ++index)
-      comparison.compare(read_names[index], features[index], expected.at(read_names[index]), ComparisonPolicy::Value);
+     comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
+     outputs = mode == rf::CompilationMode::kNone ? model.forward_observed({input, mask}, model.config().has_masks(), indices) : model.forward({input, mask}, model.config().has_masks());
+     if (mode == rf::CompilationMode::kNone) operators.report(comparison, archive);
     }
+    comparison.fact("execution", {{"mode", static_cast<int>(mode)}, {"input", "identical admitted normalized tensor"}, {"training", entry.training}});
+    comparison.compare_all([&] {
+     rf::testsupport::compare_oracle_outputs(comparison, archive, outputs, indices, "", mode == rf::CompilationMode::kNone);
+     rf::testsupport::compare_oracle_vjp(comparison, archive, model, outputs, input, false);
+    });
    }
-   std::vector<torch::Tensor> indices;
-   rf::ModelOutputs outputs;
-   {
-    ForwardOperatorObservation operators(mode == rf::CompilationMode::kNone && archive.contains("forward-operator/linear/0"));
-    mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
-    comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
-    outputs = mode == rf::CompilationMode::kNone ? model.forward_observed({input, mask}, model.config().has_masks(), indices) : model.forward({input, mask}, model.config().has_masks());
-    if (mode == rf::CompilationMode::kNone) operators.report(comparison, archive);
-   }
-   comparison.fact("execution", {{"mode", static_cast<int>(mode)}, {"input", "identical admitted normalized tensor"}, {"training", entry.training}});
-   comparison.compare_all([&] {
-    rf::testsupport::compare_oracle_outputs(comparison, archive, outputs, indices, "", mode == rf::CompilationMode::kNone);
-    rf::testsupport::compare_oracle_vjp(comparison, archive, model, outputs, input, false);
-   });
   }
- }
  }
 }
 TEST_CASE("Independent upstream repetitions measure the numerical noise floor", "[rfdetr][parity][upstream_repeat]") {

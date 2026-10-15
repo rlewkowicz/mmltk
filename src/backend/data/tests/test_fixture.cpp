@@ -607,7 +607,10 @@ void create_keypoint_dataset(const FixtureSpec& spec) {
     joints.push_back(visibility ? 6 + joint : 0);
     joints.push_back(visibility);
    }
-   out << Json{{"class", names[index]}, {"bbox_xyxy", {2, 2, spec.width - 2, spec.height - 2}}, {"keypoints", joints}, {"image_size_wh", {spec.width, spec.height}}, {"id", image * 10 + index}, {"image_id", image}, {"category_id", index + 1}}.dump() << '\n';
+   out
+    << Json{{"class", names[index]}, {"bbox_xyxy", {2, 2, spec.width - 2, spec.height - 2}}, {"keypoints", joints}, {"image_size_wh", {spec.width, spec.height}}, {"id", image * 10 + index}, {"image_id", image}, {"category_id", index + 1}}
+        .dump()
+    << '\n';
   }
  }
 }

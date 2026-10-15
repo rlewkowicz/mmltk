@@ -243,7 +243,8 @@ struct EvaluationPredictionLane {
  std::shared_ptr<PredictionBufferSlotPool> slot_pool;
 };
 using EvaluationLaneWork = std::move_only_function<StagedPredictionBatch(EvaluationPredictionLane&)>;
-StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count, size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog = {});
+StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count, size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle,
+ std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog = {});
 PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(
  mmltk::common::concurrency::WorkerPool& cpu_pool, StagedPredictionBatch&& staged, EvaluationProfileRecord* profile = nullptr, const EvaluationDatasetOwner* evaluation_dataset = nullptr);
 std::vector<PredictionBatchItem> collect_prediction_batch_encoding(PendingPredictionBatchEncoding&& pending);

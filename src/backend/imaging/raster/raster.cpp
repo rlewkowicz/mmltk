@@ -12,10 +12,12 @@ module;
 #include "skeleton_projection.h"
 module mmltk.backend.imaging.raster;
 namespace mmltk::backend::imaging::raster {
-std::int32_t raster_projected_skeleton(MutableBytes overlay, const std::uint32_t* words, const SkeletonProjection& span, NativeStream stream, bool joints, bool uncertainty, bool complementary) noexcept {
+std::int32_t raster_projected_skeleton(
+ MutableBytes overlay, const std::uint32_t* words, const SkeletonProjection& span, NativeStream stream, bool joints, bool uncertainty, bool complementary) noexcept {
  if (!words) return cudaErrorInvalidValue;
  auto color = span.color;
- if (complementary) for (auto& channel : color) channel = 255U - channel;
+ if (complementary)
+  for (auto& channel : color) channel = 255U - channel;
  const PointBuffer points{reinterpret_cast<const int*>(words + span.points), static_cast<int>(span.point_count)};
  if (joints && span.point_count) {
   const auto status = raster_points_rgba({overlay, points, 3, {color[0], color[1], color[2], 255U}, stream});
@@ -25,9 +27,10 @@ std::int32_t raster_projected_skeleton(MutableBytes overlay, const std::uint32_t
    if (edges != cudaSuccess) return edges;
   }
  }
- if (uncertainty && span.uncertainty_edge_count) return raster_skeleton_rgba({overlay,
-  {reinterpret_cast<const int*>(words + span.uncertainty_points), static_cast<int>(span.uncertainty_point_count)},
-  {words + span.uncertainty_edges, static_cast<int>(span.uncertainty_edge_count)}, {color[0], color[1], color[2]}, 1, stream});
+ if (uncertainty && span.uncertainty_edge_count)
+  return raster_skeleton_rgba(
+   {overlay, {reinterpret_cast<const int*>(words + span.uncertainty_points), static_cast<int>(span.uncertainty_point_count)},
+    {words + span.uncertainty_edges, static_cast<int>(span.uncertainty_edge_count)}, {color[0], color[1], color[2]}, 1, stream});
  return cudaSuccess;
 }
 std::int32_t probe_rgba(const ConstBytes source, std::uint32_t* samples, const std::span<const std::uint32_t, 50> coordinates, const std::uintptr_t stream) noexcept {

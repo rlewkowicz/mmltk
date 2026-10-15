@@ -28,7 +28,11 @@ pub enum Message {
     HandleYChanged(String),
     HandleApplied,
     SkeletonSelected(u16),
-    SkeletonConnection { first: u16, second: u16, connected: bool },
+    SkeletonConnection {
+        first: u16,
+        second: u16,
+        connected: bool,
+    },
     MaskCleanup(crate::generated::AnnotationMaskCleanup),
     MaskSamplingChanged(bool),
     MaskChannelChanged {
@@ -228,7 +232,17 @@ impl Component {
                     joint,
                 })
             }
-            Message::SkeletonConnection { first, second, connected } => AnnotationEdit::AnnotationSkeletonConnectionEdit(crate::generated::AnnotationSkeletonConnectionEdit { first, second, connected }),
+            Message::SkeletonConnection {
+                first,
+                second,
+                connected,
+            } => AnnotationEdit::AnnotationSkeletonConnectionEdit(
+                crate::generated::AnnotationSkeletonConnectionEdit {
+                    first,
+                    second,
+                    connected,
+                },
+            ),
             Message::MaskCleanup(operation) => AnnotationEdit::AnnotationMaskCleanupEdit(
                 crate::generated::AnnotationMaskCleanupEdit {
                     operation,
@@ -674,10 +688,13 @@ impl Component {
             .filter(|command| ui.is_some_and(|state| sidebar_available(state, *command)))
             .fold(column![].spacing(4), |row, command| {
                 row.push(
-                    container(button(text(command_label(command))).on_press_maybe(
-                        ui.is_some_and(|state| available && sidebar_available(state, command))
-                            .then_some(Message::Sidebar(command)),
-                    )).id(format!("annotation.command.{command:?}")),
+                    container(
+                        button(text(command_label(command))).on_press_maybe(
+                            ui.is_some_and(|state| available && sidebar_available(state, command))
+                                .then_some(Message::Sidebar(command)),
+                        ),
+                    )
+                    .id(format!("annotation.command.{command:?}")),
                 )
             });
         let specialized: Element<'a, Message> = ui.map_or_else(
@@ -780,7 +797,7 @@ impl Component {
                     |object| {
                         object.splineknots.iter().enumerate().fold(
                             column![].spacing(4),
-                            |row, (index, node)| {
+                            |row, (index, _)| {
                                 row.push(button(text(format!("Knot {index}"))).on_press_maybe(
                                     available.then_some(Message::SplineSelected(index as u16)),
                                 ))
@@ -824,13 +841,47 @@ impl Component {
                         object.skeletonnodes.iter().enumerate().fold(
                             column![].spacing(4),
                             |row, (index, node)| {
-                                let mut controls = iced::widget::row![iced::widget::container(button(text(format!("{} · {:?}", node.key, node.visibility))).on_press_maybe(
-                                    available.then_some(Message::SkeletonSelected(index as u16)),
-                                )).id(format!("annotation.joint.{index}"))].spacing(4);
-                                if let Some(first) = state.editor.selectedskeletonjoint.filter(|first| *first as usize != index) {
+                                let mut controls = iced::widget::row![
+                                    iced::widget::container(
+                                        button(text(format!(
+                                            "{} · {:?}",
+                                            node.key, node.visibility
+                                        )))
+                                        .on_press_maybe(
+                                            available
+                                                .then_some(Message::SkeletonSelected(index as u16)),
+                                        )
+                                    )
+                                    .id(format!("annotation.joint.{index}"))
+                                ]
+                                .spacing(4);
+                                if let Some(first) = state
+                                    .editor
+                                    .selectedskeletonjoint
+                                    .filter(|first| *first as usize != index)
+                                {
                                     let second = index as u16;
-                                    let connected = object.skeletonedges.iter().any(|edge| (edge.source == first && edge.target == second) || (edge.target == first && edge.source == second));
-                                    controls = controls.push(container(button(if connected { "Disconnect" } else { "Connect" }).on_press_maybe(available.then_some(Message::SkeletonConnection { first, second, connected: !connected }))).id(format!("annotation.connection.{first}.{second}")));
+                                    let connected = object.skeletonedges.iter().any(|edge| {
+                                        (edge.source == first && edge.target == second)
+                                            || (edge.target == first && edge.source == second)
+                                    });
+                                    controls = controls.push(
+                                        container(
+                                            button(if connected {
+                                                "Disconnect"
+                                            } else {
+                                                "Connect"
+                                            })
+                                            .on_press_maybe(available.then_some(
+                                                Message::SkeletonConnection {
+                                                    first,
+                                                    second,
+                                                    connected: !connected,
+                                                },
+                                            )),
+                                        )
+                                        .id(format!("annotation.connection.{first}.{second}")),
+                                    );
                                 }
                                 row.push(controls)
                             },
@@ -897,10 +948,13 @@ impl Component {
                             (available && selected_mask.is_some())
                                 .then_some(Message::MaskColorsRequested)
                         ),
-                        iced::widget::container(button("Clear scene objects").on_press_maybe(
-                            (available && !state.scene.objects.is_empty())
-                                .then_some(Message::SceneResetRequested)
-                        )).id("annotation.scene.clear"),
+                        iced::widget::container(
+                            button("Clear scene objects").on_press_maybe(
+                                (available && !state.scene.objects.is_empty())
+                                    .then_some(Message::SceneResetRequested)
+                            )
+                        )
+                        .id("annotation.scene.clear"),
                     ]
                     .spacing(4),
                 ]

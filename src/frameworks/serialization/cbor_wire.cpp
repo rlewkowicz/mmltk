@@ -711,9 +711,7 @@ std::expected<void, EncodeError> Writer::write_object_body(const std::size_t siz
 }
 std::expected<void, EncodeError> Writer::write_body(std::monostate) { return put(std::byte{0xf6}); }
 std::expected<void, EncodeError> Writer::write_body(const bool value) { return put(value ? std::byte{0xf5} : std::byte{0xf4}); }
-std::expected<void, EncodeError> Writer::write_body(const std::int64_t value) {
- return value >= 0 ? head(0U, static_cast<std::uint64_t>(value)) : head(1U, static_cast<std::uint64_t>(-(value + 1)));
-}
+std::expected<void, EncodeError> Writer::write_body(const std::int64_t value) { return value >= 0 ? head(0U, static_cast<std::uint64_t>(value)) : head(1U, static_cast<std::uint64_t>(-(value + 1))); }
 std::expected<void, EncodeError> Writer::write_body(const std::uint64_t value) { return head(0U, value); }
 std::expected<void, EncodeError> Writer::write_body(const double value) {
  const auto encoding = canonical_float_encoding(value);
@@ -825,9 +823,7 @@ void CountingEncoder::bytes(const std::size_t size, const std::size_t depth) {
 void CountingEncoder::text(const std::string_view spelling, const std::size_t size, const std::size_t depth) {
  if (!failure_) accept(writer_.count_text(spelling, size, depth));
 }
-std::expected<std::size_t, EncodeError> CountingEncoder::finish() const {
- return failure_ ? std::unexpected(*failure_) : std::expected<std::size_t, EncodeError>{writer_.bytes_written()};
-}
+std::expected<std::size_t, EncodeError> CountingEncoder::finish() const { return failure_ ? std::unexpected(*failure_) : std::expected<std::size_t, EncodeError>{writer_.bytes_written()}; }
 std::expected<std::size_t, EncodeError> CountingEncoder::measure(const Value& value) {
  // Whole-document measurements remain independent, including repeated calls.
  Writer writer{writer_.limits_, writer_.raw_array_};

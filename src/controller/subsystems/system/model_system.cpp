@@ -63,7 +63,13 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
  }
  if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
  const auto capabilities = training_config ? rfdetr::model_training_capabilities(training_config->task, training_config->dec_layers) : rfdetr::PresetTrainingCapabilities{};
- return {.artifact = artifact.string(), .class_layout = rfdetr::ResolvedClassLayout(std::move(layout)).summary(), .task = task, .training_config = std::move(training_config), .training_capabilities = capabilities};
+ return {
+  .artifact = artifact.string(),
+  .class_layout = rfdetr::ResolvedClassLayout(std::move(layout)).summary(),
+  .task = task,
+  .training_config = std::move(training_config),
+  .training_capabilities = capabilities
+ };
 }
 ModelSystem::ModelSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events) : settings_(settings), factory_(std::move(factory)), events_(std::move(events)) {
  if (!factory_) throw contracts::UnavailableError("model runtime factory is unavailable");
@@ -115,7 +121,15 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
    if (stop.stop_requested()) {
     terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
    } else {
-    selection = {.key = std::move(input.key), .inspection_device = input.inspection_device, .artifact = std::move(artifact.artifact), .class_layout = std::move(artifact.class_layout), .task = artifact.task, .training_config = std::move(artifact.training_config), .training_capabilities = artifact.training_capabilities};
+    selection = {
+     .key = std::move(input.key),
+     .inspection_device = input.inspection_device,
+     .artifact = std::move(artifact.artifact),
+     .class_layout = std::move(artifact.class_layout),
+     .task = artifact.task,
+     .training_config = std::move(artifact.training_config),
+     .training_capabilities = artifact.training_capabilities
+    };
     if (!selection.valid()) throw std::runtime_error("model runtime returned an invalid selection");
     terminal.outcome = contracts::ModelSelectionOutcome::Accepted;
    }

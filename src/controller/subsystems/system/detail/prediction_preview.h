@@ -77,16 +77,28 @@ public:
   bool prediction_keypoints = true, ground_truth_keypoints = false;
   bool prediction_uncertainty = false, ground_truth_uncertainty = false;
   [[nodiscard]] static Options Prediction(const contracts::PredictionRunPreview& preview) {
-   return {.prediction_boxes=preview.boxes,.prediction_masks=preview.masks,.confidence_threshold=preview.confidence_threshold,
-    .prediction_keypoints=preview.keypoints,.prediction_uncertainty=preview.uncertainty};
+   return {
+    .prediction_boxes = preview.boxes,
+    .prediction_masks = preview.masks,
+    .confidence_threshold = preview.confidence_threshold,
+    .prediction_keypoints = preview.keypoints,
+    .prediction_uncertainty = preview.uncertainty
+   };
   }
   [[nodiscard]] static Options Validation(const ValidationOverlays& overlays, float threshold, bool atlas = false) {
-   return {.prediction_boxes=overlays.prediction_layer && overlays.prediction_boxes,
-    .prediction_masks=overlays.prediction_layer && overlays.prediction_masks,
-    .ground_truth_boxes=overlays.ground_truth_layer && overlays.ground_truth_boxes,
-    .ground_truth_masks=overlays.ground_truth_layer && overlays.ground_truth_masks,.complementary_layers=true,.atlas_padding=atlas,.confidence_threshold=threshold,
-    .prediction_keypoints=overlays.prediction_layer && overlays.prediction_keypoints,.ground_truth_keypoints=overlays.ground_truth_layer && overlays.ground_truth_keypoints,
-    .prediction_uncertainty=overlays.prediction_layer && overlays.uncertainty,.ground_truth_uncertainty=overlays.ground_truth_layer && overlays.uncertainty};
+   return {
+    .prediction_boxes = overlays.prediction_layer && overlays.prediction_boxes,
+    .prediction_masks = overlays.prediction_layer && overlays.prediction_masks,
+    .ground_truth_boxes = overlays.ground_truth_layer && overlays.ground_truth_boxes,
+    .ground_truth_masks = overlays.ground_truth_layer && overlays.ground_truth_masks,
+    .complementary_layers = true,
+    .atlas_padding = atlas,
+    .confidence_threshold = threshold,
+    .prediction_keypoints = overlays.prediction_layer && overlays.prediction_keypoints,
+    .ground_truth_keypoints = overlays.ground_truth_layer && overlays.ground_truth_keypoints,
+    .prediction_uncertainty = overlays.prediction_layer && overlays.uncertainty,
+    .ground_truth_uncertainty = overlays.ground_truth_layer && overlays.uncertainty
+   };
   }
   bool operator==(const Options&) const = default;
  };

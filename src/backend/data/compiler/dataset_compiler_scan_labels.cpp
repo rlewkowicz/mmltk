@@ -116,7 +116,8 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
     parsed.schema.oks_sigmas = sigmas.get<std::vector<double>>();
    }
    catalog::validate_keypoint_schema(parsed.schema);
-  } else if (category.contains("skeleton") || category.contains("horizontal_flip") || category.contains("oks_sigmas")) throw std::runtime_error("joint schema requires ordered keypoints names");
+  } else if (category.contains("skeleton") || category.contains("horizontal_flip") || category.contains("oks_sigmas"))
+   throw std::runtime_error("joint schema requires ordered keypoints names");
   parsed_categories.push_back(std::move(parsed));
   min_raw_id = std::min(min_raw_id, parsed_categories.back().raw_id);
  }
@@ -397,12 +398,14 @@ struct DirectoryLabels::Impl {
   }
   if (transformed[2] <= transformed[0] || transformed[3] <= transformed[1]) throw std::runtime_error("transformed bbox loses strict corner ordering");
   const auto joint_count = catalog->keypoints(label.class_id).names.size();
-  if ((record.keypoints && (!record.keypoints->array_size || *record.keypoints->array_size != joint_count * 3)) || (!record.keypoints && joint_count)) throw std::runtime_error("instance keypoints must match the class schema as flattened x,y,visibility triples");
+  if ((record.keypoints && (!record.keypoints->array_size || *record.keypoints->array_size != joint_count * 3)) || (!record.keypoints && joint_count))
+   throw std::runtime_error("instance keypoints must match the class schema as flattened x,y,visibility triples");
   const auto joint_begin = required_joints;
   required_joints = checked_add(required_joints, joint_count, "compiled joint count overflow");
   if (required_joints) {
-   try { (void)annotation_layout(count, required_runs, output.capacity(), required_joints); }
-   catch (const std::runtime_error&) { exceeded = true; }
+   try {
+    (void)annotation_layout(count, required_runs, output.capacity(), required_joints);
+   } catch (const std::runtime_error&) { exceeded = true; }
   }
   if (!exceeded && output.joint_spans.capacity()) {
    output.joint_spans.push_back({checked_cast<std::uint32_t>(joint_begin, "joint offset overflow"), checked_cast<std::uint16_t>(joint_count, "joint count overflow"), 0});
@@ -418,8 +421,10 @@ struct DirectoryLabels::Impl {
    if (visibility != catalog::KeypointVisibility::Unannotated) {
     const double px = x * geometry.resized_width / dimensions.width + geometry.offset_x;
     const double py = y * geometry.resized_height / dimensions.height + geometry.offset_y;
-    if (!std::isfinite(px) || !std::isfinite(py) || std::abs(px) > std::numeric_limits<float>::max() || std::abs(py) > std::numeric_limits<float>::max()) throw std::runtime_error("transformed keypoint overflow");
-    point.x = static_cast<float>(px); point.y = static_cast<float>(py);
+    if (!std::isfinite(px) || !std::isfinite(py) || std::abs(px) > std::numeric_limits<float>::max() || std::abs(py) > std::numeric_limits<float>::max())
+     throw std::runtime_error("transformed keypoint overflow");
+    point.x = static_cast<float>(px);
+    point.y = static_cast<float>(py);
    }
    if (!exceeded) output.joints.push_back(point);
   }
@@ -452,7 +457,8 @@ detail::CompileResources DirectoryLabels::resources(std::uint32_t width, std::si
  const auto opaque = maximum_line > directory_line_window ? parser_bytes(maximum_line) : 0;
  return {
   .bytes = checked_add(detail::CompiledLabelWorkspace::required_bytes(width, label_capacity, keypoints),
-   checked_add(checked_add(input, source, "annotation workspace overflow"), checked_add(stack, joint_bytes, "joint parse workspace overflow"), "annotation workspace overflow"), "annotation workspace overflow"),
+   checked_add(checked_add(input, source, "annotation workspace overflow"), checked_add(stack, joint_bytes, "joint parse workspace overflow"), "annotation workspace overflow"),
+   "annotation workspace overflow"),
   .supplied_workspace = true,
   .completion_workspace = true,
   .workspace_class = detail::CompileWorkClass::Annotations,
@@ -509,8 +515,11 @@ bool DirectoryLabels::step(mmltk::common::concurrency::CancellationObservation c
     checks.max_instances_per_image = UINT16_MAX;
     checks.image_width = value.config->target_width;
     checks.image_height = value.config->target_height;
-    (void)admit_compiled_annotations(
-     value.result, {{value.output.labels.data(), value.output.labels.size()}, {value.output.runs.data(), value.output.runs.size()}, value.output.joints.empty() ? std::span<const PackedJointSpan>{} : std::span<const PackedJointSpan>{value.output.joint_spans.data(), value.output.joint_spans.size()}, {value.output.joints.data(), value.output.joints.size()}}, checks, value.image_index, cancellation);
+    (void)admit_compiled_annotations(value.result,
+     {{value.output.labels.data(), value.output.labels.size()}, {value.output.runs.data(), value.output.runs.size()},
+      value.output.joints.empty() ? std::span<const PackedJointSpan>{} : std::span<const PackedJointSpan>{value.output.joint_spans.data(), value.output.joint_spans.size()},
+      {value.output.joints.data(), value.output.joints.size()}},
+     checks, value.image_index, cancellation);
     value.finished = true;
     return true;
    }

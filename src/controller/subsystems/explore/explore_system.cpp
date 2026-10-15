@@ -894,8 +894,8 @@ private:
   // This worker is the sole issuer. Demand and presentation changes do
   // not invalidate native semantics, and failed candidates cannot recycle
   // an identity previously attached to retained cache pixels.
-  if (semantic_identity_ == 0U || semantic_overlay_.show_boxes != plan.overlay.show_boxes || semantic_overlay_.show_masks != plan.overlay.show_masks || semantic_overlay_.show_keypoints != plan.overlay.show_keypoints ||
-      semantic_overlay_.class_selection != plan.overlay.class_selection) {
+  if (semantic_identity_ == 0U || semantic_overlay_.show_boxes != plan.overlay.show_boxes || semantic_overlay_.show_masks != plan.overlay.show_masks ||
+      semantic_overlay_.show_keypoints != plan.overlay.show_keypoints || semantic_overlay_.class_selection != plan.overlay.class_selection) {
    const auto identity = mmltk::common::types::take_monotonic_identity(next_semantic_identity_);
    semantic_overlay_ = plan.overlay;
    semantic_identity_ = identity;

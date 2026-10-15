@@ -262,7 +262,6 @@ TEST_CASE("Lazy FullTrace rejects target-dependent supervision before recording"
  }
 }
 }  // namespace
-
 TEST_CASE("New backbone and joint families execute every compilation mode with real derivatives", "[rfdetr][compilation][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; native family compilation remains unverified");
  const fixture::FullMatrixPrecision precision;
@@ -272,7 +271,10 @@ TEST_CASE("New backbone and joint families execute every compilation mode with r
   config.resolution = config.patch_size * config.num_windows * 2;
   config.num_queries = config.num_select = 3;
   config.group_detr = 2;
-  if (config.has_keypoints()) { config.num_classes = 4; config.keypoints_per_class = {2, 0, 1}; }
+  if (config.has_keypoints()) {
+   config.num_classes = 4;
+   config.keypoints_per_class = {2, 0, 1};
+  }
   for (const auto mode : {rf::CompilationMode::kNone, rf::CompilationMode::kSelective, rf::CompilationMode::kFullTrace}) {
    CAPTURE(preset, mode);
    torch::manual_seed(918);

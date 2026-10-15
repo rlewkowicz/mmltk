@@ -30,11 +30,15 @@ void VisualDocument::BindResource(contracts::WorkspaceResource resource) {
   constexpr std::string_view hex = "0123456789abcdef";
   std::string result;
   result.reserve(32);
-  for (const auto value : bytes) { result += hex[value >> 4]; result += hex[value & 15]; }
+  for (const auto value : bytes) {
+   result += hex[value >> 4];
+   result += hex[value & 15];
+  }
   return result;
  }();
  if (!resource.valid()) throw contracts::InvalidIntentError("Visual source identity is invalid");
- auto bound = contracts::WorkspaceResource::From(std::string(resource.view()) + "/snapshot-" + incarnation + "-" + std::to_string(::getpid()) + "-" + std::to_string(meaning_identity_) + "-" + std::to_string(resource.revision), resource.revision);
+ auto bound = contracts::WorkspaceResource::From(
+  std::string(resource.view()) + "/snapshot-" + incarnation + "-" + std::to_string(::getpid()) + "-" + std::to_string(meaning_identity_) + "-" + std::to_string(resource.revision), resource.revision);
  if (!bound.valid()) throw contracts::InvalidIntentError("Visual source identity exceeds document capacity");
  scene.document = bound;
 }
@@ -138,7 +142,10 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
   // Two equal-sized crops of one retained source still refer to different
   // pixels. Derived scaling keeps the source resource; this import binds its
   // actual sampling geometry without changing the producer's source facts.
-  scene.document = contracts::WorkspaceResource::From(std::string(scene.document.view()) + "/crop-" + std::to_string(extent.width) + "-" + std::to_string(extent.height) + "-" + std::to_string(crop.x) + "-" + std::to_string(crop.y) + "-" + std::to_string(crop.width) + "-" + std::to_string(crop.height) + "-" + std::to_string(target.width) + "-" + std::to_string(target.height), scene.document.revision);
+  scene.document = contracts::WorkspaceResource::From(std::string(scene.document.view()) + "/crop-" + std::to_string(extent.width) + "-" + std::to_string(extent.height) + "-" +
+                                                       std::to_string(crop.x) + "-" + std::to_string(crop.y) + "-" + std::to_string(crop.width) + "-" + std::to_string(crop.height) + "-" +
+                                                       std::to_string(target.width) + "-" + std::to_string(target.height),
+   scene.document.revision);
   if (!scene.document.valid()) throw contracts::InvalidIntentError("Annotation source geometry identity exceeds document capacity");
  }
  project_spatial_members(scene.objects, {.crop = crop, .target = target});
@@ -149,7 +156,7 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
   const auto& source = document.scene.objects[index];
   for (std::size_t joint = 0; joint < object.skeleton_nodes.size(); ++joint) {
    const auto point = source.skeleton_nodes[joint].point;
-   if (point.x < crop.x || point.y < crop.y || point.x > crop.x + crop.width || point.y > crop.y + crop.height)
+   if (point.x < static_cast<float>(crop.x) || point.y < static_cast<float>(crop.y) || point.x > static_cast<float>(crop.x + crop.width) || point.y > static_cast<float>(crop.y + crop.height))
     object.skeleton_nodes[joint].visibility = mmltk::backend::data::catalog::KeypointVisibility::Unannotated;
   }
  }

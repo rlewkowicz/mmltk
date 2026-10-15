@@ -172,7 +172,6 @@ TEST_CASE("Python artifacts preserve explicit layouts and keep ambiguous names r
  CHECK(native.metadata.class_layout.class_name_evidence == source.metadata.class_layout.class_name_evidence);
  CHECK(native.tensor_count() == raw.tensor_count());
 }
-
 TEST_CASE("All official asset digests admit their exact native topology independently of filename", "[model][rfdetr][checkpoint][official][integration]") {
  namespace r = mmltk::backend::models::rfdetr;
  namespace fixture = r::testsupport;
@@ -224,8 +223,7 @@ TEST_CASE("All official asset digests admit their exact native topology independ
     legacy.metadata.class_layout.provenance = {r::ClassLayoutOrigin::Embedded, "legacy-keypoint-projection", {}};
     const auto external = directory.path() / "malformed-keypoint.pth";
     r::write_upstream_model_state(external, legacy);
-    const auto rejected = mmltk::testsupport::run_subprocess_capture_output(
-     {mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", external.string(), "--output", normalized.string()});
+    const auto rejected = mmltk::testsupport::run_subprocess_capture_output({mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", external.string(), "--output", normalized.string()});
     CHECK(rejected.exit_code != 0);
     CHECK(rejected.output_text.find("legacy GroupPose projection") != std::string::npos);
     CHECK(mmltk::common::io::sha256_file(normalized) == healthy_digest);
@@ -234,7 +232,7 @@ TEST_CASE("All official asset digests admit their exact native topology independ
   if (!preset.decoder_layer_count) {
    auto malformed = admitted.model_state.entries();
    const auto before = model.named_parameters()["class_embed.weight"].clone();
-   auto dormant = std::ranges::find(malformed, "class_embed.weight", &r::NormalizedModelStateEntry::name);
+   auto dormant = std::ranges::find(malformed, std::string_view("class_embed.weight"), &r::NormalizedModelStateEntry::name);
    REQUIRE(dormant != malformed.end());
    dormant->tensor = dormant->tensor.to(torch::kInt64);
    CHECK_THROWS(model.stage_normalized_state(malformed, r::detail::NormalizedModelStateAdmission::RequiredCore));

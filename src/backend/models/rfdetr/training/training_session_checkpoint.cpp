@@ -12,12 +12,15 @@
 #include "src/frameworks/serialization/reflected_json.h"
 #include "src/pch_linux.h"
 namespace mmltk::backend::models::rfdetr {
-std::string training_dataset_identity(const mmltk::backend::data::FileHeader& header, const mmltk::common::io::FileSnapshot& file, std::string_view configuration, std::span<const std::byte> source_metadata) {
+std::string training_dataset_identity(
+ const mmltk::backend::data::FileHeader& header, const mmltk::common::io::FileSnapshot& file, std::string_view configuration, std::span<const std::byte> source_metadata) {
  namespace io = mmltk::common::io;
  static_assert(std::has_unique_object_representations_v<mmltk::backend::data::FileHeader>);
  io::Sha256Hasher identity;
- if (source_metadata.empty()) identity.Update({reinterpret_cast<const std::uint8_t*>(&header), sizeof(header)});
- else identity.Update({reinterpret_cast<const std::uint8_t*>(source_metadata.data()), source_metadata.size()});
+ if (source_metadata.empty())
+  identity.Update({reinterpret_cast<const std::uint8_t*>(&header), sizeof(header)});
+ else
+  identity.Update({reinterpret_cast<const std::uint8_t*>(source_metadata.data()), source_metadata.size()});
  // Exclude inode/device and ctime so moving or copying an immutable dataset
  // with its modification time preserved retains the same session identity.
  const std::array<std::uint64_t, 3> generation{file.bytes, static_cast<std::uint64_t>(file.modified_seconds), static_cast<std::uint64_t>(file.modified_nanoseconds)};
@@ -31,8 +34,7 @@ std::string training_configuration_identity(const NativeRfDetrConfig& config, co
   throw std::invalid_argument("baseline session identity cannot represent the requested model/schema");
  namespace historical = detail::training_identity_v1;
  namespace serial = mmltk::frameworks::serialization;
- if (mmltk::frameworks::reflection::validate_reflected_fields(config.training_supervision))
-  throw std::runtime_error("record violates reflected persistence constraints");
+ if (mmltk::frameworks::reflection::validate_reflected_fields(config.training_supervision)) throw std::runtime_error("record violates reflected persistence constraints");
  // Keep current input admission, but serialize only the frozen historical
  // values. Neither current member additions nor JSON key removal define v1.
  const ResolvedClassLayout validated(layout);
@@ -45,7 +47,8 @@ std::string training_configuration_identity(const NativeRfDetrConfig& config, co
   if constexpr (std::same_as<typename Field::member_type, historical::TrainingSupervisionConfig>) {
    std::array<std::byte, historical::kSupervisionLimits.max_bytes> scratch{};
    signature << serial::reflected_json(value, scratch, historical::kSupervisionLimits).dump();
-  } else signature << fact.member_name << '=' << value << ';';
+  } else
+   signature << fact.member_name << '=' << value << ';';
  });
  serial::wire::ByteBuffer bytes;
  if (!serial::encode(old_layout, bytes, historical::kClassLayoutLimits)) throw std::invalid_argument("cannot encode RF-DETR class record");

@@ -147,32 +147,31 @@ TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame"
  for (const auto& saved : output.at("records")) CHECK(saved.at("detections").at(0).at("mask_rle") == "0:4");
  fs::remove(path);
 }
-
 TEST_CASE("Image and video prediction JSON preserves named original-space joints and source identity", "[model][rfdetr][prediction_json][keypoints]") {
  using namespace mmltk::backend::models::rfdetr;
  namespace catalog = mmltk::backend::data::catalog;
  catalog::OrderedClassCatalog names;
  names.names = {{"marker"}};
- names.keypoints = std::vector{catalog::ClassKeypointSchema{{"left","right"},{{0,1}},{1,0},{.1,.1}}};
+ names.keypoints = std::vector{catalog::ClassKeypointSchema{{"left", "right"}, {{0, 1}}, {1, 0}, {.1, .1}}};
  PredictionRunResult result;
  result.class_catalog = std::make_shared<const catalog::ClassCatalog>(names);
  result.class_domain = catalog::ClassReferenceDomain::Foreground;
  result.artifacts.class_layout = native_training_class_layout(*result.class_catalog);
  result.artifacts.config.task = ModelTask::Keypoints;
  const auto path = fs::temp_directory_path() / ("named-joint-json-" + std::to_string(::getpid()) + ".json");
- for (const auto kind : {PredictSourceKind::ImageFiles,PredictSourceKind::VideoFile}) {
+ for (const auto kind : {PredictSourceKind::ImageFiles, PredictSourceKind::VideoFile}) {
   PredictRequest request;
   request.source_kind = kind;
   request.output_path = path;
   PredictionRecord record;
   record.image_id = 42;
   record.source_name = "source/frame-42";
-  record.original_transform = {2,3,-10,5};
+  record.original_transform = {2, 3, -10, 5};
   Prediction prediction;
   prediction.class_reference = 0;
   prediction.score = .75F;
-  prediction.bbox_xyxy = {1,2,30,40};
-  prediction.keypoints = {{20,10,.8F,{0,.5F,0}},{25,15,.2F,{0,0,0}}};
+  prediction.bbox_xyxy = {1, 2, 30, 40};
+  prediction.keypoints = {{20, 10, .8F, {0, .5F, 0}}, {25, 15, .2F, {0, 0, 0}}};
   record.detections.push_back(prediction);
   PredictionJsonWriter writer(request);
   writer.Begin(result);
@@ -188,7 +187,7 @@ TEST_CASE("Image and video prediction JSON preserves named original-space joints
   CHECK(detection.at("keypoint_space") == "original_image_pixels");
   const auto& left = detection.at("keypoints").at(0);
   CHECK(left.at("name") == "left");
-  CHECK(left.at("xy") == json::array({30,35}));
+  CHECK(left.at("xy") == json::array({30, 35}));
   CHECK(left.at("confidence").get<float>() == Catch::Approx(.8F));
   CHECK(left.at("precision_cholesky").at(0).get<float>() == Catch::Approx(-std::log(2.)));
   CHECK(left.at("precision_cholesky").at(1).get<float>() == Catch::Approx(.5 / 3));

@@ -62,7 +62,10 @@ struct ExploreRenderScratchView final {
  std::uint32_t class_capacity = 0U;
  const ExploreRenderTileDescriptor* tiles = nullptr;
  std::uint32_t tile_capacity = 0U;
- [[nodiscard]] bool valid() const noexcept { return cards != nullptr && annotations != nullptr && (rle_pairs != nullptr || rle_capacity == 0U) && (joints != nullptr || joint_capacity == 0U) && (edges != nullptr || edge_capacity == 0U) && (classes != nullptr || class_capacity == 0U); }
+ [[nodiscard]] bool valid() const noexcept {
+  return cards != nullptr && annotations != nullptr && (rle_pairs != nullptr || rle_capacity == 0U) && (joints != nullptr || joint_capacity == 0U) && (edges != nullptr || edge_capacity == 0U) &&
+         (classes != nullptr || class_capacity == 0U);
+ }
 };
 using ExploreRenderTileBatchView = detail::ExploreRenderTileBatchViewAbi;
 [[nodiscard]] inline bool valid_tile_batch(const ExploreRenderTileBatchView& tiles, const ExploreRenderScratchView& scratch) noexcept {

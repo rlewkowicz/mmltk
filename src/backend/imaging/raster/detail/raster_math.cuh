@@ -105,9 +105,11 @@ __device__ __forceinline__ RgbaPixelU8 composite_rgba_over_rgba(const RgbaPixelU
   if (base.a == 0U) return overlay;
   const float retained = static_cast<float>(base.a) / 255.0f * (1.0f - alpha);
   const float combined = alpha + retained;
-  return {clamp_to_u8((overlay.r * alpha + base.r * retained) / combined),
-   clamp_to_u8((overlay.g * alpha + base.g * retained) / combined),
-   clamp_to_u8((overlay.b * alpha + base.b * retained) / combined), clamp_to_u8(combined * 255.0f)};
+  return {
+   clamp_to_u8((static_cast<float>(overlay.r) * alpha + static_cast<float>(base.r) * retained) / combined),
+   clamp_to_u8((static_cast<float>(overlay.g) * alpha + static_cast<float>(base.g) * retained) / combined),
+   clamp_to_u8((static_cast<float>(overlay.b) * alpha + static_cast<float>(base.b) * retained) / combined), clamp_to_u8(combined * 255.0f)
+  };
  }
  return RgbaPixelU8{
   lerp_u8(base.r, overlay.r, alpha),

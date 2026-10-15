@@ -1,4 +1,5 @@
 #include "evaluator.h"
+#include "keypoint_layout.h"
 #include "src/backend/data/loading/dataset_loader.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -44,8 +45,8 @@ public:
  inline size_t mask_rle_pair_count() const { return ground_truth_mask_runs_ ? ground_truth_mask_runs_->size() : 0U; }
  void limit_images(size_t limit);
  bool has_image(int image_id) const;
- [[nodiscard]] ImageEvaluationMatches match_staged_predictions(
-  std::int64_t dataset_index, const BBoxPredictionView& bbox, const std::optional<PackedMaskPredictionView>& mask, size_t max_dets_per_image, std::span<const Prediction> encoded_masks = {}, std::optional<KeypointPredictionView> keypoints = {}) const;
+ [[nodiscard]] ImageEvaluationMatches match_staged_predictions(std::int64_t dataset_index, const BBoxPredictionView& bbox, const std::optional<PackedMaskPredictionView>& mask,
+  size_t max_dets_per_image, std::span<const Prediction> encoded_masks = {}, std::optional<KeypointPredictionView> keypoints = {}) const;
  void merge_matches(ImageEvaluationMatches&& matches);
  void clear_predictions();
  EvalSummary evaluate(size_t max_dets_per_image, EvaluationDetailRetention retention, mmltk::common::concurrency::WorkerPool* worker_pool = nullptr) const;
@@ -551,7 +552,8 @@ void CocoDataset::rebuild_ground_truth_totals() {
      const bool included = evaluation_area_contains(area, ground_truth_areas_[gt]);
      area_ground_truth_totals_[category_index][area] += included ? 1U : 0U;
      if (metric_set_ == EvaluationMetricSet::BBoxAndKeypoint && area != static_cast<size_t>(EvaluationArea::Small) && included &&
-         std::ranges::any_of(ground_truth_joints_[gt], [](const auto& point) { return point.visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; })) ++keypoint_ground_truth_totals_[category_index][area];
+         std::ranges::any_of(ground_truth_joints_[gt], [](const auto& point) { return point.visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; }))
+      ++keypoint_ground_truth_totals_[category_index][area];
     }
    }
   }
@@ -643,7 +645,8 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
  if (bbox.image_id != image_ids_[image_index]) { throw std::invalid_argument("staged prediction image ID does not match the image matcher index"); }
  const bool mask_mode = metric_set_ == EvaluationMetricSet::BBoxAndMask;
  const bool keypoint_mode = metric_set_ == EvaluationMetricSet::BBoxAndKeypoint;
- if (keypoint_mode != keypoints.has_value() || (keypoints && ((bbox.count && !keypoints->data) || keypoints->joint_capacity > mmltk::backend::data::catalog::kKeypointsPerClassCapacity || keypoints->prediction_stride < static_cast<std::ptrdiff_t>(keypoints->joint_capacity * sizeof(KeypointPrediction) / sizeof(float)))))
+ if (keypoint_mode != keypoints.has_value() || (keypoints && ((bbox.count && !keypoints->data) || keypoints->joint_capacity > mmltk::backend::data::catalog::kKeypointsPerClassCapacity ||
+                                                              keypoints->prediction_stride < static_cast<std::ptrdiff_t>(keypoints->joint_capacity * sizeof(KeypointPrediction) / sizeof(float)))))
   throw std::invalid_argument("keypoint evaluation prediction extent or task differs");
  if (keypoints) static_cast<void>(checked_prediction_extent(bbox.count, keypoints->prediction_stride, kMaximumPredictionTensorBytes / sizeof(float)));
  if ((!mask_mode && (mask || !encoded_masks.empty())) || (mask_mode && bbox.count != 0U && !mask && encoded_masks.size() != bbox.count)) {
@@ -725,23 +728,27 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
    if (schema.names.empty()) continue;
    if (schema.names.size() > keypoints->joint_capacity) throw std::invalid_argument("prediction omitted active keypoints");
    const auto span = category_ground_truth_span(category);
-   const auto annotated = [this, span](size_t index) { return std::ranges::any_of(ground_truth_joints_[span.offset + index], [](const auto& joint) { return joint.visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; }); };
+   const auto annotated = [this, span](size_t index) {
+    return std::ranges::any_of(ground_truth_joints_[span.offset + index], [](const auto& joint) { return joint.visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; });
+   };
    size_t comparisons = 0;
-   match_category_predictions(scratch.predictions_by_category[category], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category), scratch, matches,
-    comparisons, bbox_prediction_score, [&](std::uint32_t prediction, size_t ground_truth) {
-     const auto index = span.offset + ground_truth;
-     return keypoint_oks(*keypoints, prediction, ground_truth_joints_[index], schema.oks_sigmas, ground_truth_boxes_[index], ground_truth_areas_[index], image_source_scale_[image_index]);
-    }, [&](size_t index) { return annotated(index) ? ground_truth_areas_[span.offset + index] : -1.0; }, [&](size_t index) {
-     // COCO keypoint result loading derives area from the active joint bounds.
-     const auto* data = keypoints->data + index * keypoints->prediction_stride;
-     float left = std::numeric_limits<float>::infinity(), top = left, right = -left, bottom = -left;
-     for (size_t joint = 0; joint < schema.names.size(); ++joint) {
-      KeypointPrediction point;
-      std::memcpy(&point, data + joint * sizeof(point) / sizeof(float), sizeof(point));
-      left = std::min(left, point.x); right = std::max(right, point.x); top = std::min(top, point.y); bottom = std::max(bottom, point.y);
-     }
-     return static_cast<double>(right - left) * (bottom - top) * image_area_scale_[image_index];
-    }, [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
+   match_category_predictions(scratch.predictions_by_category[category], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category), scratch, matches, comparisons, bbox_prediction_score,
+    [&](std::uint32_t prediction, size_t ground_truth) {
+    const auto index = span.offset + ground_truth;
+    return keypoint_oks(*keypoints, prediction, ground_truth_joints_[index], schema.oks_sigmas, ground_truth_boxes_[index], ground_truth_areas_[index], image_source_scale_[image_index]);
+   }, [&](size_t index) { return annotated(index) ? ground_truth_areas_[span.offset + index] : -1.0; }, [&](size_t index) {
+    // COCO keypoint result loading derives area from the active joint bounds.
+    const auto* data = keypoints->data + index * keypoints->prediction_stride;
+    float left = std::numeric_limits<float>::infinity(), top = left, right = -left, bottom = -left;
+    for (size_t joint = 0; joint < schema.names.size(); ++joint) {
+     const auto point = KeypointPredictionPacket::load(data + joint * KeypointPredictionPacket::size);
+     left = std::min(left, point.x);
+     right = std::max(right, point.x);
+     top = std::min(top, point.y);
+     bottom = std::max(bottom, point.y);
+    }
+    return static_cast<double>(right - left) * (bottom - top) * image_area_scale_[image_index];
+   }, [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
   }
  }
  result.bbox_iou_candidate_count = bbox_iou_candidate_count;
@@ -765,10 +772,12 @@ void CocoDataset::merge_matches(ImageEvaluationMatches&& matches) {
   }
  }
  if ((metric_set_ == EvaluationMetricSet::BBoxAndKeypoint) != matches.keypoint.has_value()) throw std::invalid_argument("compact keypoint metric mode differs");
- if (matches.keypoint) for (const auto& record : *matches.keypoint)
-  if (record.category_index >= keypoint_matches_by_category_.size()) throw std::out_of_range("keypoint match category differs");
+ if (matches.keypoint)
+  for (const auto& record : *matches.keypoint)
+   if (record.category_index >= keypoint_matches_by_category_.size()) throw std::out_of_range("keypoint match category differs");
  matched_max_dets_per_image_ = matches.max_dets_per_image;
- if (matches.keypoint) for (const auto& record : *matches.keypoint) keypoint_matches_by_category_[record.category_index].push_back(record);
+ if (matches.keypoint)
+  for (const auto& record : *matches.keypoint) keypoint_matches_by_category_[record.category_index].push_back(record);
  for (CompactImageMatchRecord& record : matches.bbox) { bbox_matches_by_category_[record.category_index].push_back(record); }
  if (mask_records != nullptr) {
   for (const CompactImageMatchRecord& record : *mask_records) { (*mask_matches_by_category)[record.category_index].push_back(record); }
@@ -867,7 +876,9 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
     }
     aggregate.ground_truth_count += detail.ground_truth_count;
     if (!detail.available) continue;
-    const double weight = kind == EvaluationMetricKind::Keypoint ? static_cast<double>(joint_groups.at(catalog_->keypoints(category).names.size()).first) / joint_groups.at(catalog_->keypoints(category).names.size()).second : 1.0;
+    const double weight = kind == EvaluationMetricKind::Keypoint ? static_cast<double>(joint_groups.at(catalog_->keypoints(category).names.size()).first) /
+                                                                    static_cast<double>(joint_groups.at(catalog_->keypoints(category).names.size()).second)
+                                                                 : 1.0;
     available_weight += weight;
     for (size_t iou = 0; iou < kIouThresholds.size(); ++iou) {
      aggregate.average_precision[iou] += weight * detail.average_precision[iou];
@@ -943,7 +954,8 @@ void EvaluationDatasetOwner::merge_bbox_predictions(const std::int64_t dataset_i
  impl_->dataset.merge_matches(impl_->dataset.match_staged_predictions(dataset_index, predictions, std::nullopt, max_dets_per_image));
 }
 EvaluationDatasetOwner::ImageMatches EvaluationDatasetOwner::match_predictions(const std::int64_t dataset_index, const BBoxPredictionView predictions,
- const std::optional<PackedMaskPredictionView> masks, const std::size_t max_dets_per_image, const std::span<const Prediction> encoded_masks, const std::optional<KeypointPredictionView> keypoints) const {
+ const std::optional<PackedMaskPredictionView> masks, const std::size_t max_dets_per_image, const std::span<const Prediction> encoded_masks,
+ const std::optional<KeypointPredictionView> keypoints) const {
  return impl_->dataset.match_staged_predictions(dataset_index, predictions, masks, max_dets_per_image, encoded_masks, keypoints);
 }
 void EvaluationDatasetOwner::merge_matches(ImageMatches matches) { impl_->dataset.merge_matches(std::move(matches)); }

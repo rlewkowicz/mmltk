@@ -284,9 +284,7 @@ TrainingScalarPacket::Tensors ordinary_scalar_tensors(const CriterionResult& los
  TrainingScalarPacket::Tensors values;
  TrainingScalarPacket::set<^^TrainingScalars::total>(values, total);
  TrainingScalarPacket::set<^^TrainingScalars::auxiliary_weighted>(values, auxiliary);
- CriterionSchema::visit_metrics<TrainingScalars>([&]<CriterionTerm Term, std::meta::info Member> {
-  TrainingScalarPacket::set<Member>(values, losses.main[Term]);
- });
+ CriterionSchema::visit_metrics<TrainingScalars>([&]<CriterionTerm Term, std::meta::info Member> { TrainingScalarPacket::set<Member>(values, losses.main[Term]); });
  return values;
 }
 RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const TrainingSupervisionRoute route, const ModelOutputs& outputs, const PreparedTargets& targets,

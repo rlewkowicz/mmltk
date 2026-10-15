@@ -141,7 +141,8 @@ FileHeader make_file_header(const FileHeaderInputs& inputs, std::span<const std:
 }
 std::vector<std::byte> encode_compiled_catalog(const catalog::ClassCatalog& catalog) {
  frameworks::serialization::wire::ByteBuffer bytes;
- if (!frameworks::serialization::encode(catalog.record(), bytes, {.max_bytes = COMPILED_CATALOG_LIMIT, .max_items = COMPILED_CATALOG_LIMIT})) throw std::runtime_error("compiled catalog exceeds encoding limits");
+ if (!frameworks::serialization::encode(catalog.record(), bytes, {.max_bytes = COMPILED_CATALOG_LIMIT, .max_items = COMPILED_CATALOG_LIMIT}))
+  throw std::runtime_error("compiled catalog exceeds encoding limits");
  return bytes;
 }
 catalog::ClassCatalog decode_compiled_catalog(std::span<const std::byte> bytes) {

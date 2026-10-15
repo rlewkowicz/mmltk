@@ -57,6 +57,7 @@ function(mmltk_add_backend_imaging_annotation_tests)
     target_link_libraries(mmltk_backend_imaging_annotation_tests PRIVATE
         mmltk_test_support
         mmltk::backend::imaging::annotation
+        mmltk::backend::data::catalog
     )
     catch_discover_tests(
         mmltk_backend_imaging_annotation_tests

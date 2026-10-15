@@ -5,4 +5,4 @@
 namespace mmltk::backend::models::rfdetr {
 // The caller supplies reusable storage; every write remains on its inference stream.
 void write_analysis_keypoints(const PostprocessedSelection&, mmltk::backend::ml::runtime::AnalysisAnnotationStorage&);
-}
+}  // namespace mmltk::backend::models::rfdetr

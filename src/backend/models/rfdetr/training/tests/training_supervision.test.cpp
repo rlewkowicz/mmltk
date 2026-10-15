@@ -2593,9 +2593,18 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
        const auto components = [&]<class Value>(this auto&& self, const Value& actual_value, const Value& expected_value, const std::string& path) -> void {
         if constexpr (std::is_same_v<Value, torch::Tensor>) {
          comparison.compare(path, actual_value, expected_value, ComparisonPolicy::Value);
+        } else if constexpr (std::is_same_v<Value, rfdetr::CriterionTensors>) {
+         rfdetr::CriterionSchema::visit(
+          [&]<rfdetr::CriterionTerm Term>(rfdetr::CriterionTermPolicy facts) { self(actual_value[Term], expected_value[Term], path + "/" + std::string(facts.external_name)); });
         } else if constexpr (std::is_same_v<Value, rfdetr::TensorMap>) {
          REQUIRE(actual_value.size() == expected_value.size());
          for (const auto& [name, tensor] : expected_value) self(actual_value.at(name), tensor, path + "/" + name);
+        } else if constexpr (requires {
+                              actual_value.has_value();
+                              *actual_value;
+                             }) {
+         REQUIRE(actual_value.has_value() == expected_value.has_value());
+         if (expected_value) self(*actual_value, *expected_value, path);
         } else if constexpr (requires {
                               actual_value.begin();
                               actual_value.end();
@@ -2901,9 +2910,10 @@ TEST_CASE("Ordinary criterion telemetry projects raw main terms and detaches onl
   terms.auxiliary.front()[rf::CriterionTerm::classification] = leaves[0] * 10;
   terms.encoder.emplace()[rf::CriterionTerm::keypoint_l1] = leaves[2] * 10;
   rf::DetectionConfig config;
-  config.weights = {{{rf::CriterionTerm::classification}, 2.}, {{rf::CriterionTerm::mask_ce}, 3.},
-   {{rf::CriterionTerm::keypoint_l1}, 4.}, {{rf::CriterionTerm::keypoint_visible}, 5.},
-   {{rf::CriterionTerm::classification, rf::CriterionLayer::auxiliary(0)}, 2.}, {{rf::CriterionTerm::keypoint_l1, rf::CriterionLayer::encoder()}, 4.}};
+  config.weights = {
+   {{rf::CriterionTerm::classification}, 2.}, {{rf::CriterionTerm::mask_ce}, 3.}, {{rf::CriterionTerm::keypoint_l1}, 4.}, {{rf::CriterionTerm::keypoint_visible}, 5.},
+   {{rf::CriterionTerm::classification, rf::CriterionLayer::auxiliary(0)}, 2.}, {{rf::CriterionTerm::keypoint_l1, rf::CriterionLayer::encoder()}, 4.}
+  };
   torch::Tensor auxiliary;
   const auto total = rf::weighted_detection_loss(terms, config, device, &auxiliary);
   const auto scalars = rf::ordinary_scalar_tensors(terms, total, auxiliary);
@@ -2918,7 +2928,8 @@ TEST_CASE("Ordinary criterion telemetry projects raw main terms and detaches onl
   CHECK_FALSE(Packet::get<^^rf::TrainingScalars::mask_dice>(scalars).defined());
   CHECK_FALSE(Packet::get<^^rf::TrainingScalars::keypoint_findable>(scalars).defined());
   CHECK_FALSE(Packet::get<^^rf::TrainingScalars::denoising_weighted>(scalars).defined());
-  for (const auto& value : scalars) if (value.defined()) CHECK_FALSE(value.requires_grad());
+  for (const auto& value : scalars)
+   if (value.defined()) CHECK_FALSE(value.requires_grad());
   total.backward();
   REQUIRE(torch::equal(leaves.grad(), torch::tensor({22.F, 3.F, 44.F, 5.F}, options)));
  }
@@ -2944,10 +2955,10 @@ TEST_CASE("Criterion failure reports retain first nonfinite terms and lexical ex
   report.accumulate(healthy);
   CHECK(report.details({}, {}) == " nonfinite_losses=[class_error=nan, loss_bbox_enc=-inf, loss_ce=inf, loss_ce_10=nan, loss_ce_2=inf]");
   auto changed = healthy;
-  changed.main[rf::CriterionTerm::class_error] = {};
+  changed.main[rf::CriterionTerm::class_error] = torch::Tensor{};
   changed.main[rf::CriterionTerm::cardinality_error] = torch::zeros({}, options);
   REQUIRE_THROWS_WITH(report.accumulate(changed), "training criterion report term changed within an attempt");
-  changed.main[rf::CriterionTerm::cardinality_error] = {};
+  changed.main[rf::CriterionTerm::cardinality_error] = torch::Tensor{};
   REQUIRE_THROWS_WITH(report.accumulate(changed), "training criterion report schema changed within an attempt");
   report.begin_attempt();
   report.accumulate(healthy);
@@ -2966,11 +2977,11 @@ TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusab
  auto record = catalog::ClassCatalog({"person", "marker", "object"}).record();
  record.keypoints = std::vector{catalog::coco_person_keypoint_schema(), catalog::ClassKeypointSchema{{"left", "right"}, {{0, 1}}, {1, 0}, {.1, .1}}, catalog::ClassKeypointSchema{}};
  const auto schema = std::make_shared<const catalog::ClassCatalog>(record);
- const std::array labels{
-  PackedInstance{.class_id = 0, .flags = kAnnotationCrowd, .bbox_x2 = 8, .bbox_y2 = 8},
-  PackedInstance{.class_id = 1, .bbox_x2 = 8, .bbox_y2 = 8},
-  PackedInstance{.class_id = 2, .bbox_x2 = 8, .bbox_y2 = 8},
- };
+ std::array<PackedInstance, 3> labels{};
+ labels[0].flags = kAnnotationCrowd;
+ labels[1].class_id = 1;
+ labels[2].class_id = 2;
+ for (auto& label : labels) label.bbox_x2 = label.bbox_y2 = 8;
  std::array<PackedKeypoint, 19> joints{};
  joints[17] = {2, 4, catalog::KeypointVisibility::Visible};
  joints[18] = {6, 5, catalog::KeypointVisibility::Occluded};
@@ -3000,9 +3011,9 @@ TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusab
   const auto coordinates = values.accessor<float, 3>();
   CHECK(coordinates[0][0][0] == .25F);
   CHECK(coordinates[0][0][1] == .625F);
-  CHECK(coordinates[0][0][2] == 1);
+  CHECK(coordinates[0][0][2] == 1.0F);
   CHECK(coordinates[0][1][0] == .75F);
-  CHECK(coordinates[0][1][2] == 2);
+  CHECK(coordinates[0][1][2] == 2.0F);
   CHECK(values.select(0, 1).count_nonzero().item<std::int64_t>() == 0);
   CHECK(targets.targets[0].keypoints.is_alias_of(targets.all_keypoints));
   CHECK(targets.all_keypoints.is_alias_of(targets.all_boxes));
@@ -3044,10 +3055,10 @@ TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusab
  const auto pasted_coordinates = pasted_values.accessor<float, 3>();
  CHECK(pasted_coordinates[0][0][0] == .0625F);
  CHECK(pasted_coordinates[0][0][1] == .0625F);
- CHECK(pasted_coordinates[0][0][2] == 2);
+ CHECK(pasted_coordinates[0][0][2] == 2.0F);
  CHECK(pasted_coordinates[0][1][0] == .03125F);
  CHECK(pasted_coordinates[0][1][1] == .03125F);
- CHECK(pasted_coordinates[0][1][2] == 1);
+ CHECK(pasted_coordinates[0][1][2] == 1.0F);
  REQUIRE(pasted.packed_masks);
  CHECK(pasted.packed_masks->bits.cpu().sum().item<std::int64_t>() == 1);
 }

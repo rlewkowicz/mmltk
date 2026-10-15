@@ -17,7 +17,8 @@ bool muon_parameter_eligible(const std::string_view name, const torch::Tensor& p
  if ((parameter.dim() != 2 && parameter.dim() != 4) || name.find(".weight") == std::string_view::npos) { return false; }
  if (name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos || name.find("cls_token") != std::string_view::npos ||
      name.find("mask_token") != std::string_view::npos || name.find("query_feat") != std::string_view::npos || name.find("refpoint_embed") != std::string_view::npos ||
-     name.find("class_embed") != std::string_view::npos || name.find("bbox_embed") != std::string_view::npos || name.find("segmentation_head") != std::string_view::npos || name.find("keypoint_embed") != std::string_view::npos) {
+     name.find("class_embed") != std::string_view::npos || name.find("bbox_embed") != std::string_view::npos || name.find("segmentation_head") != std::string_view::npos ||
+     name.find("keypoint_embed") != std::string_view::npos) {
   return false;
  }
  return true;
@@ -1000,13 +1001,18 @@ void NativeOptimizer::load(torch::serialize::InputArchive& archive) {
 }
 bool is_encoder_param(std::string_view name) { return name.find("backbone.0.encoder") != std::string_view::npos; }
 bool encoder_zero_weight_decay(std::string_view name, BackboneKind family) {
- if (family == BackboneKind::PeCoreTiny) return name.find("pos_embed") != std::string_view::npos || name.find("rel_pos") != std::string_view::npos || name.find("bias") != std::string_view::npos || name.find("norm") != std::string_view::npos || name.find("cls_token") != std::string_view::npos || name.find("reg_token") != std::string_view::npos || name.find("patch_embed") != std::string_view::npos;
+ if (family == BackboneKind::PeCoreTiny)
+  return name.find("pos_embed") != std::string_view::npos || name.find("rel_pos") != std::string_view::npos || name.find("bias") != std::string_view::npos ||
+         name.find("norm") != std::string_view::npos || name.find("cls_token") != std::string_view::npos || name.find("reg_token") != std::string_view::npos ||
+         name.find("patch_embed") != std::string_view::npos;
  return name.find("gamma") != std::string_view::npos || name.find("bias") != std::string_view::npos || name.find("norm") != std::string_view::npos ||
         name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos || name.find("rel_pos") != std::string_view::npos;
 }
 int encoder_layer_id(std::string_view name, const BackboneConfig& backbone) {
  const int kNumVitLayers = backbone.features.back() + (backbone.kind == BackboneKind::PeCoreTiny ? 2 : 1);
- if (backbone.kind == BackboneKind::PeCoreTiny && (name.find(".pos_embed") != std::string_view::npos || name.find(".patch_embed") != std::string_view::npos || name.find(".cls_token") != std::string_view::npos || name.find(".reg_token") != std::string_view::npos)) return 0;
+ if (backbone.kind == BackboneKind::PeCoreTiny && (name.find(".pos_embed") != std::string_view::npos || name.find(".patch_embed") != std::string_view::npos ||
+                                                   name.find(".cls_token") != std::string_view::npos || name.find(".reg_token") != std::string_view::npos))
+  return 0;
  if (name.find("embeddings") != std::string_view::npos) { return 0; }
  const auto layer_marker = backbone.kind == BackboneKind::PeCoreTiny ? std::string_view(".blocks.") : std::string_view(".layer.");
  const auto layer_pos = name.find(layer_marker);

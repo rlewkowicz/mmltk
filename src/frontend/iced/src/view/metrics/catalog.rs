@@ -65,7 +65,7 @@ pub(super) struct Metric {
     pub source: Source,
 }
 pub(super) fn catalog() -> Vec<Metric> {
-    let (mut metrics, performance): (Vec<_>, Vec<_>) = crate::generated::TrainingScalars::FIELDS
+    let (metrics, performance): (Vec<_>, Vec<_>) = crate::generated::TrainingScalars::FIELDS
         .iter()
         .map(|(field, name)| {
             let chart = scalar_chart(*field);
@@ -97,9 +97,23 @@ pub(super) fn catalog() -> Vec<Metric> {
             }
         })
         .partition(|metric| !metric.chart.performance());
-    let (mut keypoints, mut metrics): (Vec<_>, Vec<_>) = metrics.into_iter().partition(|metric| matches!(metric.source, Source::Scalar(TrainingScalarsField::KeypointL1 | TrainingScalarsField::KeypointFindable | TrainingScalarsField::KeypointVisible | TrainingScalarsField::KeypointNll)));
+    let (mut keypoints, mut metrics): (Vec<_>, Vec<_>) = metrics.into_iter().partition(|metric| {
+        matches!(
+            metric.source,
+            Source::Scalar(
+                TrainingScalarsField::KeypointL1
+                    | TrainingScalarsField::KeypointFindable
+                    | TrainingScalarsField::KeypointVisible
+                    | TrainingScalarsField::KeypointNll
+            )
+        )
+    });
     for kind in crate::generated::EVALUATION_METRIC_KIND_VALUES {
-        let prefix = match kind { crate::generated::EvaluationMetricKind::Box => "Box", crate::generated::EvaluationMetricKind::Mask => "Mask", crate::generated::EvaluationMetricKind::Keypoint => "OKS" };
+        let prefix = match kind {
+            crate::generated::EvaluationMetricKind::Box => "Box",
+            crate::generated::EvaluationMetricKind::Mask => "Mask",
+            crate::generated::EvaluationMetricKind::Keypoint => "OKS",
+        };
         let mut selected = MetricSummary::FIELDS
             .iter()
             .filter_map(|(field, _)| {
@@ -118,7 +132,11 @@ pub(super) fn catalog() -> Vec<Metric> {
             })
             .collect::<Vec<_>>();
         selected.sort_by_key(|(order, _)| *order);
-        let destination = if *kind == crate::generated::EvaluationMetricKind::Keypoint { &mut keypoints } else { &mut metrics };
+        let destination = if *kind == crate::generated::EvaluationMetricKind::Keypoint {
+            &mut keypoints
+        } else {
+            &mut metrics
+        };
         destination.extend(selected.into_iter().map(|(_, metric)| metric));
     }
     // Keep the metric inventory and color indices stable across chart grouping.
@@ -143,7 +161,11 @@ fn scalar_chart(field: TrainingScalarsField) -> Chart {
         | MaskDice
         | AuxiliaryWeighted
         | DenoisingWeighted
-        | CorrespondenceWeighted | KeypointL1 | KeypointFindable | KeypointVisible | KeypointNll => Chart::Loss,
+        | CorrespondenceWeighted
+        | KeypointL1
+        | KeypointFindable
+        | KeypointVisible
+        | KeypointNll => Chart::Loss,
     }
 }
 // Exhaustive visual policy, deliberately independent of native declaration order.
@@ -303,7 +325,13 @@ mod tests {
         assert_eq!(
             metrics
                 .iter()
-                .filter(|m| matches!(m.source, Source::Evaluation { kind: crate::generated::EvaluationMetricKind::Box, .. }))
+                .filter(|m| matches!(
+                    m.source,
+                    Source::Evaluation {
+                        kind: crate::generated::EvaluationMetricKind::Box,
+                        ..
+                    }
+                ))
                 .count(),
             expected.len()
         );
@@ -321,7 +349,10 @@ mod tests {
         let selected = metrics
             .iter()
             .filter_map(|m| match m.source {
-                Source::Evaluation { kind: crate::generated::EvaluationMetricKind::Box, field } => Some(field),
+                Source::Evaluation {
+                    kind: crate::generated::EvaluationMetricKind::Box,
+                    field,
+                } => Some(field),
                 _ => None,
             })
             .collect::<Vec<_>>();

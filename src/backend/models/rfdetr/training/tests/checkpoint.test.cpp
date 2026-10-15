@@ -610,7 +610,6 @@ TEST_CASE("Direct ONNX export replaces an old automatic companion with embedded 
  CHECK(r::ClassArtifactAdmission(output).Resolve(info.num_classes, info.class_layout) == source.metadata.class_layout);
  CHECK(r::rfdetr_output_roles(info).size() == info.outputs.size());
 }
-
 TEST_CASE("Native format four admits bounded historical topology and normalizes to format five", "[rfdetr][checkpoint]") {
  namespace r = mmltk::backend::models::rfdetr;
  mmltk::testsupport::ScopedTempDir directory("rfdetr-format-four");
@@ -661,7 +660,7 @@ TEST_CASE("Joint Transfer uses named schema entries and exact loading rejects se
  for (const auto* name : axes) {
   auto entry = std::ranges::find(entries, name, &r::NormalizedModelStateEntry::name);
   REQUIRE(entry != entries.end());
-  for (int64_t row = 0; row < entry->tensor.size(0); ++row) entry->tensor[row].fill_(100.0 + row);
+  for (int64_t row = 0; row < entry->tensor.size(0); ++row) entry->tensor[row].fill_(100.0 + static_cast<double>(row));
  }
  config.keypoints_per_class = {4, 0};
  r::NativeRfDetrModel destination(config, layout(destination_schema));
@@ -679,7 +678,7 @@ TEST_CASE("Joint Transfer uses named schema entries and exact loading rejects se
   CHECK(torch::equal(parameters[name][3], torch::full_like(parameters[name][3], 101.0)));
  }
  auto malformed = entries;
- auto mask = std::ranges::find(malformed, "_kp_active_mask", &r::NormalizedModelStateEntry::name);
+ auto mask = std::ranges::find(malformed, std::string_view("_kp_active_mask"), &r::NormalizedModelStateEntry::name);
  mask->tensor = mask->tensor.clone();
  mask->tensor[0][0] = false;
  const auto installed = r::testsupport::clone_normalized_model_state(destination);

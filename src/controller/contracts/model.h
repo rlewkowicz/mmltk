@@ -44,11 +44,10 @@ struct ModelSelection final {
  MMLTK_MAX_BYTES(kModelArtifactCapacity) std::string artifact;
  mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout{};
  mmltk::backend::models::rfdetr::ModelTask task = mmltk::backend::models::rfdetr::ModelTask::Detection;
- std::optional<mmltk::backend::models::rfdetr::NativeRfDetrConfig> training_config;
+ std::optional<mmltk::backend::models::rfdetr::NativeRfDetrConfig> training_config{};
  mmltk::backend::models::rfdetr::PresetTrainingCapabilities training_capabilities{};
  [[nodiscard]] bool valid() const noexcept {
-  return key.valid() && !artifact.empty() && artifact.size() <= kModelArtifactCapacity && mmltk::frameworks::reflection::enum_contains(task) &&
-         (!training_config || training_config->task == task);
+  return key.valid() && !artifact.empty() && artifact.size() <= kModelArtifactCapacity && mmltk::frameworks::reflection::enum_contains(task) && (!training_config || training_config->task == task);
  }
  bool operator==(const ModelSelection&) const = default;
 };

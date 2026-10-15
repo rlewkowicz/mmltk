@@ -38,8 +38,8 @@
 #include <vector>
 #include <unordered_map>
 #include <cmath>
-using mmltk::backend::models::rfdetr::CriterionTerm;
 using mmltk::backend::models::rfdetr::CriterionLayer;
+using mmltk::backend::models::rfdetr::CriterionTerm;
 namespace {
 using mmltk::backend::ml::testsupport::independent_leaf;
 namespace rf = mmltk::backend::models::rfdetr;
@@ -1469,7 +1469,6 @@ TEST_CASE("DN masks use stock direct equations for fixed samples gradients and u
     }
  }
 }
-
 #if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
 TEST_CASE("Pinned upstream GroupPose schema losses initializer and OKS boundaries", "[rfdetr][keypoints][upstream_oracle]") {
  namespace support = rf::testsupport;
@@ -1495,18 +1494,17 @@ TEST_CASE("Pinned upstream GroupPose schema losses initializer and OKS boundarie
    const auto losses = rf::keypoint_losses(predictions, targets, labels, areas, layout);
    const auto costs = rf::keypoint_matching_cost(predictions.unsqueeze(0), targets, labels, areas, layout);
    auto total = predictions.sum() * 0;
-   std::size_t index = 0;
-   template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^rf::KeypointLossTerms, std::meta::access_context::current()))) {
-    const auto suffix = std::to_string(index++);
-    comparison.compare(prefix + "loss/" + suffix, losses.[:member:], archive.tensor(prefix + "loss/" + suffix), Policy::Value);
-    comparison.compare(prefix + "cost/" + suffix, costs.[:member:], archive.tensor(prefix + "cost/" + suffix), Policy::Value);
-    total = total + losses.[:member:].sum();
-   }
+   rf::KeypointLossPacket::visit([&]<auto Member, std::size_t Index> {
+    const auto suffix = std::to_string(Index);
+    comparison.compare(prefix + "loss/" + suffix, losses.*Member, archive.tensor(prefix + "loss/" + suffix), Policy::Value);
+    comparison.compare(prefix + "cost/" + suffix, costs.*Member, archive.tensor(prefix + "cost/" + suffix), Policy::Value);
+    total = total + (losses.*Member).sum();
+   });
    total.backward();
    comparison.compare(prefix + "gradient", predictions.grad(), archive.tensor(prefix + "gradient"), Policy::Derivative);
   }
  }
- rf::detail::ConditionalQueryInitializer initializer(16,5,8);
+ rf::detail::ConditionalQueryInitializer initializer(16, 5, 8);
  {
   torch::NoGradGuard guard;
   for (const auto& parameter : initializer.named_parameters()) parameter.value().copy_(archive.tensor("initializer/parameter/" + parameter.key()));
@@ -1524,21 +1522,24 @@ TEST_CASE("Pinned upstream GroupPose schema losses initializer and OKS boundarie
  comparison.derivatives("initializer/gradient/", actual, expected);
  namespace data = mmltk::backend::data;
  for (const auto visibility : {data::catalog::KeypointVisibility::Unannotated, data::catalog::KeypointVisibility::Occluded, data::catalog::KeypointVisibility::Visible}) {
-  std::array<data::PackedKeypoint,3> targets{};
-  std::array<rf::KeypointPrediction,3> predictions{};
-  for (std::size_t joint=0; joint<3; ++joint) {
-   targets[joint].x=20+3*joint; targets[joint].y=30+joint; targets[joint].visibility=visibility;
-   predictions[joint].x=21+3*joint; predictions[joint].y=32+joint;
+  std::array<data::PackedKeypoint, 3> targets{};
+  std::array<rf::KeypointPrediction, 3> predictions{};
+  for (std::size_t joint = 0; joint < 3; ++joint) {
+   targets[joint].x = static_cast<float>(20 + 3 * joint);
+   targets[joint].y = static_cast<float>(30 + joint);
+   targets[joint].visibility = visibility;
+   predictions[joint].x = static_cast<float>(21 + 3 * joint);
+   predictions[joint].y = static_cast<float>(32 + joint);
   }
   const rf::KeypointPredictionView view{reinterpret_cast<const float*>(predictions.data()), 3 * static_cast<std::ptrdiff_t>(rf::KeypointPredictionPacket::size), 3};
-  const auto oks = rf::keypoint_oks(view,0,targets,std::array<double,3>{.05,.08,.1},{10,10,60,70},3000,{1,1});
-  comparison.compare("oks/" + std::to_string(static_cast<int>(visibility)), torch::tensor({{oks}},torch::kFloat64), archive.tensor("oks/" + std::to_string(static_cast<int>(visibility))), Policy::Value);
+  const auto oks = rf::keypoint_oks(view, 0, targets, std::array<double, 3>{.05, .08, .1}, {10, 10, 60, 70}, 3000, {1, 1});
+  comparison.compare(
+   "oks/" + std::to_string(static_cast<int>(visibility)), torch::tensor({{oks}}, torch::kFloat64), archive.tensor("oks/" + std::to_string(static_cast<int>(visibility))), Policy::Value);
  }
- const auto precision=archive.tensor("covariance/input").reshape({3});
+ const auto precision = archive.tensor("covariance/input").reshape({3});
  rf::PredictedKeypoint point;
- std::copy_n(precision.data_ptr<float>(),3,point.precision_cholesky.begin());
- const auto covariance=rf::keypoint_covariance(rf::map_prediction_keypoint(point,400,200));
- comparison.compare("covariance/pixels",torch::tensor({covariance[0],covariance[1],covariance[1],covariance[2]}).reshape({1,1,2,2}),archive.tensor("covariance/output"),Policy::Value);
+ std::copy_n(precision.data_ptr<float>(), 3, point.precision_cholesky.begin());
+ const auto covariance = rf::keypoint_covariance(rf::map_prediction_keypoint(point, 400, 200));
+ comparison.compare("covariance/pixels", torch::tensor({covariance[0], covariance[1], covariance[1], covariance[2]}).reshape({1, 1, 2, 2}), archive.tensor("covariance/output"), Policy::Value);
 }
-
 #endif

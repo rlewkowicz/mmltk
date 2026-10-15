@@ -1430,8 +1430,10 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   fixture.num_images = static_cast<int>(4 * batches[batch_case] + 1);
   fixture.background_images = 0;
   fixture.pixel_evidence = true;
-  if (config.has_keypoints()) data::testsupport::create_keypoint_dataset(fixture);
-  else data::testsupport::create_synthetic_dataset(fixture);
+  if (config.has_keypoints())
+   data::testsupport::create_keypoint_dataset(fixture);
+  else
+   data::testsupport::create_synthetic_dataset(fixture);
   data::testsupport::compile_existing_fixture(fixture);
   auto runtime_config = resolve_runtime_config(4, 1, 2, {}, device);
   RuntimeContext runtime(runtime_config);
@@ -1469,14 +1471,16 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   const auto initial_draws = *draws.schedule;
   const auto annotations = catalog_loader->describe_batch(*draws.schedule, 0, request.batch_size, slice.begin, slice.count);
   require(!annotations.owner && !annotations.device_images && annotations.image_custody.expired(), "annotation preparation fabricated a raw-image lease");
-
   config.num_classes = static_cast<int>(catalog_loader->num_classes()) + 1;
   config.num_queries = config.num_select = config.has_keypoints() ? 4 : 2;
-  if (preset.empty()) config.dec_layers = config.group_detr = 1;
-  else config.group_detr = 2;
+  if (preset.empty())
+   config.dec_layers = config.group_detr = 1;
+  else
+   config.group_detr = 2;
   if (config.has_keypoints()) {
    config.keypoints_per_class.assign(config.num_classes, 0);
-   for (std::size_t category=0;category<catalog_loader->num_classes();++category) config.keypoints_per_class[category]=catalog_loader->class_catalog()->keypoints(category).names.size();
+   for (std::size_t category = 0; category < catalog_loader->num_classes(); ++category)
+    config.keypoints_per_class[category] = static_cast<std::uint16_t>(catalog_loader->class_catalog()->keypoints(category).names.size());
   }
   config.training_supervision = request.training_supervision;
   request.num_queries = config.num_queries;

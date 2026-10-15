@@ -13,4 +13,4 @@ struct LiveAnalysisConfiguration final {
  mmltk::backend::models::rfdetr::PredictRequest request;
  bool keypoints = true, uncertainty = false;
 };
-}
+}  // namespace mmltk::controller

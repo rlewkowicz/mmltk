@@ -42,7 +42,7 @@ constexpr std::size_t kPredictImageByteBudget = [] consteval {
  if (overhead >= kPredictSnapshotByteBudget) throw "Predict scalar snapshot exceeds its metadata budget";
  return kPredictSnapshotByteBudget - overhead;
 }();
-}
+}  // namespace
 class CudaPredictRuntime::Impl final : public detail::CudaSessionRuntimeState<mmltk::backend::models::rfdetr::PredictionSession> {
 public:
  explicit Impl(DirectComputeConfiguration configuration) : CudaSessionRuntimeState(configuration), config(std::move(configuration)) {}
@@ -493,7 +493,8 @@ private:
      {{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.class_domain, detection.score,
       category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
       detection.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category]
-                                                                                                                                                                        : std::string{}, product.raw->Skeleton(detection)});
+                                                                                                                                                                        : std::string{},
+      product.raw->Skeleton(detection)});
     const auto& label = labels.back();
     if (!label.box.valid() || !label.color.valid() || !std::isfinite(label.confidence) || label.name.size() > mmltk::frameworks::reflection::kMaximumNameBytes)
      throw std::runtime_error("Prediction preview metadata exceeds the visual product limits");
@@ -504,7 +505,8 @@ private:
    if (!visual_metadata_admitted(metadata, kPredictImageByteBudget)) throw std::runtime_error("Prediction preview metadata exceeds the aggregate publication capacity");
    const std::array regions{detail::PredictionPreviewComposition::Region{product.raw, {0U, 0U, product.extent.width, product.extent.height}}};
    detail::PredictionPreviewComposition::Draw(runtime, candidate, product.extent, regions, detail::PredictionPreviewComposition::Options::Prediction(preview));
-   detail::VisualRuntimeOwner::Notification notification = [this, frame, labels = std::move(metadata.labels), identity = product.image_id, content_identity = pending.content_identity, preview, document = std::move(document)]() mutable {
+   detail::VisualRuntimeOwner::Notification notification = [this, frame, labels = std::move(metadata.labels), identity = product.image_id, content_identity = pending.content_identity, preview,
+                                                            document = std::move(document)]() mutable {
     PredictSnapshot changed;
     {
      std::scoped_lock lock(mutex_);

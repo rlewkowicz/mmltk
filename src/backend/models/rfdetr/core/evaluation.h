@@ -107,8 +107,7 @@ struct KeypointPredictionView final {
  std::ptrdiff_t prediction_stride = 0;
  std::size_t joint_capacity = 0;
 };
-[[nodiscard]] double keypoint_oks(const KeypointPredictionView&, std::size_t prediction,
- std::span<const mmltk::backend::data::PackedKeypoint> target, std::span<const double> sigmas,
+[[nodiscard]] double keypoint_oks(const KeypointPredictionView&, std::size_t prediction, std::span<const mmltk::backend::data::PackedKeypoint> target, std::span<const double> sigmas,
  const std::array<float, 4>& target_box, double target_area, const std::array<double, 2>& source_scale);
 struct Prediction {
  int image_id = 0;
@@ -118,8 +117,8 @@ struct Prediction {
  std::array<float, 4> bbox_xyxy{};
  EncodedMask mask{};
  bool has_mask = false;
- std::vector<PredictedKeypoint> keypoints;
- std::vector<mmltk::backend::data::catalog::KeypointVisibility> keypoint_visibility;
+ std::vector<PredictedKeypoint> keypoints{};
+ std::vector<mmltk::backend::data::catalog::KeypointVisibility> keypoint_visibility{};
 };
 struct BBoxPredictionView {
  int image_id = 0;

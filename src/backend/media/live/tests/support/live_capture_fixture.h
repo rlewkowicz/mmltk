@@ -17,6 +17,7 @@ public:
  LiveCaptureFixture& operator=(const LiveCaptureFixture&) = delete;
  [[nodiscard]] mmltk::backend::media::capture::CaptureDeviceApi api() noexcept;
  [[nodiscard]] std::string path() const { return path_.string(); }
+
 private:
  static int Ioctl(void*, int, unsigned long, void*) noexcept;
  int Invoke(int, unsigned long, void*) noexcept;
@@ -28,4 +29,4 @@ private:
  std::uint64_t frame_limit_ = 0, signaled_ = 0;
  bool streaming_ = false;
 };
-}
+}  // namespace mmltk::backend::media::live::test_support

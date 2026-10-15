@@ -202,32 +202,49 @@ impl Component {
                 } else {
                     "validate.pred.layer"
                 }),
-                overlay_controls::view(labels, masks, boxes, if ground_truth { overlays.groundtruthkeypoints } else { overlays.predictionkeypoints }, true, available, ids).map(
-                    move |message| {
-                        let mut next = fine.clone();
-                        match message {
-                            overlay_controls::Message::Keypoints(value) => { if ground_truth { next.groundtruthkeypoints = value; } else { next.predictionkeypoints = value; } }
-                            overlay_controls::Message::Labels(value) => {
-                                return Message::Labels(ground_truth, value);
-                            }
-                            overlay_controls::Message::Masks(value) => {
-                                if ground_truth {
-                                    next.groundtruthmasks = value;
-                                } else {
-                                    next.predictionmasks = value;
-                                }
-                            }
-                            overlay_controls::Message::Boxes(value) => {
-                                if ground_truth {
-                                    next.groundtruthboxes = value;
-                                } else {
-                                    next.predictionboxes = value;
-                                }
+                overlay_controls::view(
+                    labels,
+                    masks,
+                    boxes,
+                    if ground_truth {
+                        overlays.groundtruthkeypoints
+                    } else {
+                        overlays.predictionkeypoints
+                    },
+                    true,
+                    available,
+                    ids
+                )
+                .map(move |message| {
+                    let mut next = fine.clone();
+                    match message {
+                        overlay_controls::Message::Keypoints(value) => {
+                            if ground_truth {
+                                next.groundtruthkeypoints = value;
+                            } else {
+                                next.predictionkeypoints = value;
                             }
                         }
-                        Message::Overlays(next)
+                        overlay_controls::Message::Labels(value) => {
+                            return Message::Labels(ground_truth, value);
+                        }
+                        overlay_controls::Message::Masks(value) => {
+                            if ground_truth {
+                                next.groundtruthmasks = value;
+                            } else {
+                                next.predictionmasks = value;
+                            }
+                        }
+                        overlay_controls::Message::Boxes(value) => {
+                            if ground_truth {
+                                next.groundtruthboxes = value;
+                            } else {
+                                next.predictionboxes = value;
+                            }
+                        }
                     }
-                ),
+                    Message::Overlays(next)
+                }),
             ]
             .spacing(3)
             .into()
@@ -237,7 +254,20 @@ impl Component {
         vec![
             container(gt).id("validate.gt.group").into(),
             container(pred).id("validate.pred.group").into(),
-            container(checkbox(overlays.uncertainty).label("Joint uncertainty").on_toggle_maybe(available.then_some({ let current = overlays.clone(); move |value| { let mut next = current.clone(); next.uncertainty = value; Message::Overlays(next) } }))).id("validate.uncertainty").into(),
+            container(
+                checkbox(overlays.uncertainty)
+                    .label("Joint uncertainty")
+                    .on_toggle_maybe(available.then_some({
+                        let current = overlays.clone();
+                        move |value| {
+                            let mut next = current.clone();
+                            next.uncertainty = value;
+                            Message::Overlays(next)
+                        }
+                    })),
+            )
+            .id("validate.uncertainty")
+            .into(),
         ]
     }
     pub fn atlas<'a>(

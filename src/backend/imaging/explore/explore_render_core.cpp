@@ -43,8 +43,9 @@ static_assert(offsetof(mmltk::backend::data::PackedKeypoint, visibility) == offs
  return view.card_count != 0U && view.card_extent != 0U && view.card_count <= kExploreRenderCardCapacity && view.source_width != 0U && view.source_height != 0U;
 }
 [[nodiscard]] bool semantic_storage_valid(const ExploreRenderSemanticView& semantics, const ExploreRenderScratchView& scratch) noexcept {
- return scratch.joint_capacity <= kExploreRenderJointCapacity && scratch.edge_capacity <= kExploreRenderEdgeCapacity && semantics.annotation_count <= kExploreRenderAnnotationCapacity && semantics.annotation_count <= scratch.annotation_capacity && semantics.rle_count <= kExploreRenderRleCapacity &&
-        semantics.rle_count <= scratch.rle_capacity && semantics.class_count <= kExploreRenderClassCapacity && semantics.class_count <= scratch.class_capacity;
+ return scratch.joint_capacity <= kExploreRenderJointCapacity && scratch.edge_capacity <= kExploreRenderEdgeCapacity && semantics.annotation_count <= kExploreRenderAnnotationCapacity &&
+        semantics.annotation_count <= scratch.annotation_capacity && semantics.rle_count <= kExploreRenderRleCapacity && semantics.rle_count <= scratch.rle_capacity &&
+        semantics.class_count <= kExploreRenderClassCapacity && semantics.class_count <= scratch.class_capacity;
 }
 }  // namespace
 ExploreStorageStatus render_explore_atlas_tiles(const ExploreRenderAtlasView& view, const ExploreRenderTileBatchView& tiles, const ExploreRenderSemanticView& semantics,

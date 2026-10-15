@@ -247,10 +247,10 @@ capture::Status LiveMediaDataPlane::Impl::first_failure() const {
 }
 capture::Status LiveMediaDataPlane::Impl::no_custody_start_settlement() const {
  std::lock_guard lock(lifecycle_);
- if (!worker_joined_ || !startup_ready_ || !start_result_.valid() || start_result_.has_custody() || phase_ != PhysicalPhase::Terminal || resources_ || !output_callbacks_.idle() || raw_readback_.phase != RawReadbackPhase::Idle)
+ if (!worker_joined_ || !startup_ready_ || !start_result_.valid() || start_result_.has_custody() || phase_ != PhysicalPhase::Terminal || resources_ || !output_callbacks_.idle() ||
+     raw_readback_.phase != RawReadbackPhase::Idle)
   return {capture::StatusCode::kNotReady, "Live no-custody startup resources have not settled"};
- if (cleanup_cuda_failure_ != cudaSuccess)
-  return {capture::StatusCode::kCudaError, "Live startup CUDA cleanup failed: " + std::to_string(static_cast<int>(cleanup_cuda_failure_))};
+ if (cleanup_cuda_failure_ != cudaSuccess) return {capture::StatusCode::kCudaError, "Live startup CUDA cleanup failed: " + std::to_string(static_cast<int>(cleanup_cuda_failure_))};
  return capture::Status::Ok();
 }
 std::optional<PhysicalFrameRevision> LiveMediaDataPlane::Impl::newest_revision() const noexcept {
@@ -312,7 +312,10 @@ void LiveMediaDataPlane::Impl::abandon_output(const PhysicalFrameRevision revisi
 }
 void LiveMediaDataPlane::Impl::record_cuda_failure(const cudaError_t failure) noexcept {
  if (failure == cudaSuccess) return;
- { std::lock_guard lock(lifecycle_); if (cleanup_cuda_failure_ == cudaSuccess) cleanup_cuda_failure_ = failure; }
+ {
+  std::lock_guard lock(lifecycle_);
+  if (cleanup_cuda_failure_ == cudaSuccess) cleanup_cuda_failure_ = failure;
+ }
  capture::Status status;
  try {
   status = {capture::StatusCode::kCudaError, "Live CUDA failure " + std::to_string(static_cast<int>(failure))};

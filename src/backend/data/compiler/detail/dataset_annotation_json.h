@@ -108,7 +108,8 @@ inline void consume_dataset_annotation_value(simdjson::ondemand::value source, c
      if (!frame.coordinates->sequence.empty()) {
       if (count >= frame.coordinates->sequence.size()) throw std::runtime_error("keypoint array exceeds admitted capacity");
       scalar = &frame.coordinates->sequence[count];
-     } else if (count < frame.coordinates->coordinates.size()) scalar = &frame.coordinates->coordinates[count];
+     } else if (count < frame.coordinates->coordinates.size())
+      scalar = &frame.coordinates->coordinates[count];
      ++count;
     }
    }
@@ -117,7 +118,8 @@ inline void consume_dataset_annotation_value(simdjson::ondemand::value source, c
   }
  }
 }
-[[nodiscard]] inline DatasetAnnotationJson project_dataset_annotation(simdjson::ondemand::object object, common::types::WorkspaceBuffer<DatasetAnnotationFrame>& stack, std::span<DatasetAnnotationScalar> joints) {
+[[nodiscard]] inline DatasetAnnotationJson project_dataset_annotation(
+ simdjson::ondemand::object object, common::types::WorkspaceBuffer<DatasetAnnotationFrame>& stack, std::span<DatasetAnnotationScalar> joints) {
  DatasetAnnotationJson result;
  for (auto field : object) {
   const auto key = field.unescaped_key().value();

@@ -302,9 +302,10 @@ TEST_CASE("final selection rejects incomplete coefficients and failures preserve
  reject(std::numeric_limits<double>::quiet_NaN());
  reject(std::numeric_limits<double>::infinity());
  candidates[1].coefficient = 1;
+ REQUIRE_THROWS(r::select_training_artifact(
+  candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) -> r::EvalSummary { throw std::runtime_error("selection evaluation failed"); }));
  REQUIRE_THROWS(
-  r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) -> r::EvalSummary { throw std::runtime_error("selection evaluation failed"); }));
- REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(std::numeric_limits<double>::quiet_NaN()); }));
+  r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(std::numeric_limits<double>::quiet_NaN()); }));
  CHECK(r::read_training_selection(temp.path() / "selected.json") == old);
  candidates[1].artifact.weights = r::EvaluatedWeights::Ema;
  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, temp.path(), evaluate));
@@ -413,8 +414,10 @@ TEST_CASE("selection retires unpublished trials and preserves every committed ar
  for (int repeat = 0; repeat < 3; ++repeat) {
   const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(.1); });
   CHECK(inventory().empty());
-  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) -> r::EvalSummary { throw std::runtime_error("evaluation failure"); }));
-  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(std::numeric_limits<double>::quiet_NaN()); }));
+  REQUIRE_THROWS(
+   r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) -> r::EvalSummary { throw std::runtime_error("evaluation failure"); }));
+  REQUIRE_THROWS(
+   r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, temp.path(), [](const auto&) { return evaluation(std::numeric_limits<double>::quiet_NaN()); }));
   CHECK(inventory().empty());
   CHECK(r::read_training_selection(temp.path() / "selected.json") == selected);
  }
@@ -588,35 +591,39 @@ TEST_CASE("last session publication checks include retained candidates and all g
   for (const auto& model : previous.models) CHECK(std::filesystem::exists(temp.path() / model.path));
  }
 }
-
 TEST_CASE("Selection requires the task metric and exact joint topology before averaging", "[rfdetr][training][merge][keypoints]") {
- auto summary=evaluation(.9);
+ auto summary = evaluation(.9);
  summary.keypoint.emplace();
- summary.keypoint->available=true;
- summary.keypoint->ap=.25;
- CHECK(r::training_selection_metric(summary,r::ModelTask::Keypoints)==.25);
- CHECK(r::training_selection_metric(summary,r::ModelTask::Detection)==.9);
- summary.keypoint->available=false;
- REQUIRE_THROWS(r::training_selection_metric(summary,r::ModelTask::Keypoints));
+ summary.keypoint->available = true;
+ summary.keypoint->ap = .25;
+ CHECK(r::training_selection_metric(summary, r::ModelTask::Keypoints) == .25);
+ CHECK(r::training_selection_metric(summary, r::ModelTask::Detection) == .9);
+ summary.keypoint->available = false;
+ REQUIRE_THROWS(r::training_selection_metric(summary, r::ModelTask::Keypoints));
  summary.keypoint.reset();
- REQUIRE_THROWS(r::training_selection_metric(summary,r::ModelTask::Keypoints));
- auto config=r::native_config_from_preset(*r::find_model_preset_by_weight_filename("rf-detr-keypoint-preview-xlarge.pth"));
- config.num_classes=2; config.keypoints_per_class={2,0};
- namespace catalog=mmltk::backend::data::catalog;
+ REQUIRE_THROWS(r::training_selection_metric(summary, r::ModelTask::Keypoints));
+ auto config = r::native_config_from_preset(*r::find_model_preset_by_weight_filename("rf-detr-keypoint-preview-xlarge.pth"));
+ config.num_classes = 2;
+ config.keypoints_per_class = {2, 0};
+ namespace catalog = mmltk::backend::data::catalog;
  catalog::OrderedClassCatalog record;
- record.names={{"marker"}};
- record.keypoints=std::vector{catalog::ClassKeypointSchema{{"left","right"},{{0,1}},{1,0},{.1,.2}}};
- const auto layout=r::native_training_class_layout(catalog::ClassCatalog(record));
+ record.names = {{"marker"}};
+ record.keypoints = std::vector{catalog::ClassKeypointSchema{{"left", "right"}, {{0, 1}}, {1, 0}, {.1, .2}}};
+ const auto layout = r::native_training_class_layout(catalog::ClassCatalog(record));
  r::NativeCheckpointMetadata a;
- a.preset_name=config.preset_name; a.num_classes=config.num_classes; a.num_queries=config.num_queries; a.num_select=config.num_select;
- a.native_configuration=r::encode_checkpoint_configuration(config); a.class_layout=layout;
- auto b=a;
- CHECK(r::same_native_model_semantics(a,b));
- b.class_layout.foreground.keypoints->front().oks_sigmas.front()=.3;
- CHECK_FALSE(r::same_native_model_semantics(a,b));
- b=a;
- config.keypoints_per_class={1,0};
- b.native_configuration=r::encode_checkpoint_configuration(config);
- CHECK_FALSE(r::same_native_model_semantics(a,b));
- REQUIRE_THROWS(r::require_checkpoint_model_topology(config,a));
+ a.preset_name = config.preset_name;
+ a.num_classes = config.num_classes;
+ a.num_queries = config.num_queries;
+ a.num_select = config.num_select;
+ a.native_configuration = r::encode_checkpoint_configuration(config);
+ a.class_layout = layout;
+ auto b = a;
+ CHECK(r::same_native_model_semantics(a, b));
+ b.class_layout.foreground.keypoints->front().oks_sigmas.front() = .3;
+ CHECK_FALSE(r::same_native_model_semantics(a, b));
+ b = a;
+ config.keypoints_per_class = {1, 0};
+ b.native_configuration = r::encode_checkpoint_configuration(config);
+ CHECK_FALSE(r::same_native_model_semantics(a, b));
+ REQUIRE_THROWS(r::require_checkpoint_model_topology(config, a));
 }

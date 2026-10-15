@@ -46,7 +46,8 @@ inline void validate_compiled_header(const FileHeader& header) {
   throw std::runtime_error("compiled dataset format " + std::to_string(header.version) + " is unsupported; expected format " + std::to_string(FORMAT_VERSION) + "; recompile the dataset");
  }
  if ((header.version == 10 && (header.catalog_version || header.catalog_bytes)) || (header.catalog_version != 0 && header.catalog_version != 1) ||
-     ((header.catalog_version == 0) != (header.catalog_bytes == 0)) || header.catalog_bytes > COMPILED_CATALOG_LIMIT) throw std::runtime_error("invalid compiled catalog region");
+     ((header.catalog_version == 0) != (header.catalog_bytes == 0)) || header.catalog_bytes > COMPILED_CATALOG_LIMIT)
+  throw std::runtime_error("invalid compiled catalog region");
  if (!std::ranges::all_of(header._reserved, [](std::uint8_t value) { return value == 0U; })) throw std::runtime_error("compiled header reserved fields are invalid");
  if (header.num_images == 0U || header.num_images > header.num_slots || header.image_width == 0U || header.image_height == 0U || header.channels == 0U) {
   throw std::runtime_error("compiled file has invalid image dimensions");
@@ -94,7 +95,8 @@ class CompiledRecordChecks final {
 public:
  static void metadata(const ImageEntry& entry, const FileHeader& header, std::size_t position = 0) {
   image(entry, position);
-  if (!entry.eligible() || entry.num_instances > header.max_instances_per_image || annotation_layout(entry.num_instances, entry.num_runs).used_bytes > entry.label_bytes || entry.label_bytes % sizeof(RLEPair))
+  if (!entry.eligible() || entry.num_instances > header.max_instances_per_image || annotation_layout(entry.num_instances, entry.num_runs).used_bytes > entry.label_bytes ||
+      entry.label_bytes % sizeof(RLEPair))
    throw std::runtime_error("compiled annotation counts differ at slot " + std::to_string(position));
  }
  static void image(const ImageEntry& entry, std::size_t position = 0) {
@@ -201,10 +203,8 @@ inline void write_compiled_annotations(
   const PackedJointHeader joints{1, common::math::checked_cast<std::uint32_t>(annotations.joints.size(), "compiled joint count overflow")};
   const auto end = payload.joint_offset + annotations.joints.size_bytes();
   const std::array joint_writes{
-   common::io::FileHandle::WriteSpan{&joints, sizeof(joints)},
-   common::io::FileHandle::WriteSpan{annotations.joint_spans.data(), annotations.joint_spans.size_bytes()},
-   common::io::FileHandle::WriteSpan{annotations.joints.data(), annotations.joints.size_bytes()},
-   common::io::FileHandle::WriteSpan{&zero, payload.used_bytes - end}
+   common::io::FileHandle::WriteSpan{&joints, sizeof(joints)}, common::io::FileHandle::WriteSpan{annotations.joint_spans.data(), annotations.joint_spans.size_bytes()},
+   common::io::FileHandle::WriteSpan{annotations.joints.data(), annotations.joints.size_bytes()}, common::io::FileHandle::WriteSpan{&zero, payload.used_bytes - end}
   };
   file.pwritev_all(joint_writes, offset + payload.joint_span_offset - sizeof(joints));
  }

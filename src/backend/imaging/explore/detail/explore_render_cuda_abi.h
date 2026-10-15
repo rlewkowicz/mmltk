@@ -49,8 +49,13 @@ struct ExploreRenderAnnotationDescriptorAbi final {
  std::uint16_t class_id = 0U;
  std::int32_t occluder_index = -1;
 };
-struct ExploreRenderJointAbi final { float x = 0, y = 0; std::uint8_t visibility = 0, reserved[3]{}; };
-struct ExploreRenderEdgeAbi final { std::uint16_t first = 0, second = 0; };
+struct ExploreRenderJointAbi final {
+ float x = 0, y = 0;
+ std::uint8_t visibility = 0, reserved[3]{};
+};
+struct ExploreRenderEdgeAbi final {
+ std::uint16_t first = 0, second = 0;
+};
 struct ExploreRenderClassDescriptorAbi final {
  std::uint32_t edge_offset = 0, edge_count = 0;
  std::uint8_t color[3U]{255U, 0U, 0U};

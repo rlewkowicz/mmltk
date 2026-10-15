@@ -187,8 +187,20 @@ impl App {
             prediction_preview: crate::generated::PredictionRunPreview {
                 labels: true,
                 boxes: true,
-                keypoints: self.settings.draft().unwrap().workflows.predict.showkeypoints,
-                uncertainty: self.settings.draft().unwrap().workflows.predict.showuncertainty,
+                keypoints: self
+                    .settings
+                    .draft()
+                    .unwrap()
+                    .workflows
+                    .predict
+                    .showkeypoints,
+                uncertainty: self
+                    .settings
+                    .draft()
+                    .unwrap()
+                    .workflows
+                    .predict
+                    .showuncertainty,
                 masks: self
                     .settings
                     .draft()
@@ -1145,23 +1157,32 @@ impl App {
         Task::none()
     }
 
-    fn on_product_action(&mut self, action: crate::view::image_viewer::ProductAction) -> Task<Message> {
+    fn on_product_action(
+        &mut self,
+        action: crate::view::image_viewer::ProductAction,
+    ) -> Task<Message> {
         match action {
             crate::view::image_viewer::ProductAction::Annotate => {
-                if self.copy_viewer_to_annotation() { return self.transition_page(FeatureId::Annotate); }
-            },
+                if self.copy_viewer_to_annotation() {
+                    return self.transition_page(FeatureId::Annotate);
+                }
+            }
             crate::view::image_viewer::ProductAction::Upscale(kernel) => {
-                if self.model.upscale_start_available() && let Some(request) = self.model.viewer_upscale_request(kernel) {
+                if self.model.upscale_start_available()
+                    && let Some(request) = self.model.viewer_upscale_request(kernel)
+                {
                     self.model.request_upscale(request);
                     self.dispatch_viewer_desired();
                 }
-            },
+            }
         }
         Task::none()
     }
     pub(super) fn on_predict(&mut self, outcome: crate::view::predict::Outcome) -> Task<Message> {
         match outcome {
-            crate::view::predict::Outcome::Product(action) => return self.on_product_action(action),
+            crate::view::predict::Outcome::Product(action) => {
+                return self.on_product_action(action);
+            }
             crate::view::predict::Outcome::Inspect(path) => {
                 self.submit_intent(ApplicationIntentEndpoint::PredictInspect, |correlation| {
                     crate::generated::encode_predict_Inspect(
@@ -1215,7 +1236,9 @@ impl App {
     pub(super) fn on_live(&mut self, outcome: crate::view::live::Outcome) -> Task<Message> {
         match outcome {
             crate::view::live::Outcome::Product(action) => return self.on_product_action(action),
-            crate::view::live::Outcome::Model(outcome) => return self.on_model(FeatureId::Predict, outcome),
+            crate::view::live::Outcome::Model(outcome) => {
+                return self.on_model(FeatureId::Predict, outcome);
+            }
             crate::view::live::Outcome::StartRequested => {
                 self.model
                     .begin_admission(ApplicationIntentEndpoint::LiveStart);

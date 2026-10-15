@@ -50,10 +50,13 @@ torch::Tensor refine_keypoints(const torch::Tensor& delta, const torch::Tensor& 
  constexpr auto coordinates = KeypointPredictionPacket::index<^^KeypointPrediction::x>();
  constexpr auto logits = KeypointPredictionPacket::index<^^KeypointPrediction::findable_logit>();
  const auto safe = torch::nan_to_num(delta, 0.0, 0.0, 0.0);
- return torch::cat({safe.narrow(-1, coordinates, logits - coordinates) * references.narrow(-1, 2, 2).unsqueeze(-2) + references.narrow(-1, 0, 2).unsqueeze(-2), safe.narrow(-1, logits, KeypointPredictionPacket::size - logits)}, -1);
+ return torch::cat({safe.narrow(-1, coordinates, logits - coordinates) * references.narrow(-1, 2, 2).unsqueeze(-2) + references.narrow(-1, 0, 2).unsqueeze(-2),
+                    safe.narrow(-1, logits, KeypointPredictionPacket::size - logits)},
+  -1);
 }
 torch::Tensor KeypointTensorLayout::pad(const torch::Tensor& compact) const {
- TORCH_CHECK(!counts_.empty() && compact.dim() >= 4 && compact.size(-2) == compact_count() && compact.size(-1) == static_cast<std::int64_t>(KeypointPredictionPacket::size), "GroupPose compact output disagrees with admitted schema");
+ TORCH_CHECK(!counts_.empty() && compact.dim() >= 4 && compact.size(-2) == compact_count() && compact.size(-1) == static_cast<std::int64_t>(KeypointPredictionPacket::size),
+  "GroupPose compact output disagrees with admitted schema");
  std::vector<torch::Tensor> classes;
  classes.reserve(counts_.size());
  for (std::size_t slot = 0; slot < counts_.size(); ++slot) {
@@ -69,8 +72,11 @@ torch::Tensor KeypointTensorLayout::pad(const torch::Tensor& compact) const {
  return torch::cat(classes, -2);
 }
 torch::Tensor KeypointTensorLayout::class_logits(const torch::Tensor& padded, const torch::Tensor& active, std::int64_t classes) const {
- TORCH_CHECK(padded.dim() >= 4 && padded.size(-2) == padded_count_ && padded.size(-1) == static_cast<std::int64_t>(KeypointPredictionPacket::size), "GroupPose padded output disagrees with admitted schema");
- TORCH_CHECK(active.dim() == 2 && active.scalar_type() == torch::kBool && active.size(0) == slot_count() && active.size(1) == maximum_joints_ && classes >= slot_count() && classes <= static_cast<std::int64_t>(kMaximumClassOutputSlots), "GroupPose classifier or active mask disagrees with admitted schema");
+ TORCH_CHECK(
+  padded.dim() >= 4 && padded.size(-2) == padded_count_ && padded.size(-1) == static_cast<std::int64_t>(KeypointPredictionPacket::size), "GroupPose padded output disagrees with admitted schema");
+ TORCH_CHECK(active.dim() == 2 && active.scalar_type() == torch::kBool && active.size(0) == slot_count() && active.size(1) == maximum_joints_ && classes >= slot_count() &&
+              classes <= static_cast<std::int64_t>(kMaximumClassOutputSlots),
+  "GroupPose classifier or active mask disagrees with admitted schema");
  auto shape = padded.sizes().vec();
  shape.resize(shape.size() - 2);
  shape.push_back(slot_count());
@@ -84,7 +90,9 @@ torch::Tensor KeypointTensorLayout::class_logits(const torch::Tensor& padded, co
  return boost;
 }
 KeypointTensorLayout KeypointTensorLayout::from_active_mask(const torch::Tensor& mask) {
- if (!mask.defined() || mask.scalar_type() != torch::kBool || mask.dim() != 2 || mask.size(0) > static_cast<std::int64_t>(kMaximumClassOutputSlots) || mask.size(1) > static_cast<std::int64_t>(catalog::kKeypointsPerClassCapacity)) throw std::invalid_argument("invalid RF-DETR active-keypoint mask shape or dtype");
+ if (!mask.defined() || mask.scalar_type() != torch::kBool || mask.dim() != 2 || mask.size(0) > static_cast<std::int64_t>(kMaximumClassOutputSlots) ||
+     mask.size(1) > static_cast<std::int64_t>(catalog::kKeypointsPerClassCapacity))
+  throw std::invalid_argument("invalid RF-DETR active-keypoint mask shape or dtype");
  const auto cpu = mask.to(torch::kCPU).contiguous();
  const auto* values = cpu.data_ptr<bool>();
  std::vector<std::uint16_t> counts(mask.size(0));
@@ -111,7 +119,8 @@ void KeypointTensorLayout::require_class_layout(const ResolvedClassLayout& layou
   if (actual != expected) throw std::invalid_argument("active-keypoint mask disagrees with named class/joint schema at output slot " + std::to_string(slot));
  }
 }
-std::vector<std::pair<std::int64_t, std::int64_t>> keypoint_transfer_rows(const ResolvedClassLayout& source, const KeypointTensorLayout& source_joints, const ResolvedClassLayout& destination, const KeypointTensorLayout& destination_joints) {
+std::vector<std::pair<std::int64_t, std::int64_t>> keypoint_transfer_rows(
+ const ResolvedClassLayout& source, const KeypointTensorLayout& source_joints, const ResolvedClassLayout& destination, const KeypointTensorLayout& destination_joints) {
  source.require_execution(true);
  destination.require_execution(true);
  source_joints.require_class_layout(source);

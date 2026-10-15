@@ -594,10 +594,16 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
     let paired = metadata::pending(frame)?;
     if let Some(objects) = paired.content.prediction() {
         let source = objects.frame();
-        return (paired.view_ready && paired.surface.frame == Some(frame) && same_allocation(surface, paired.surface)
-            && frame.belongs_to(surface) && metadata::product(frame).as_ref() == Some(source) && frame.matches_content(source)
-            && crop == surface.content_region() && metadata::valid_content(source) && surface.viewer_identity == Some(objects.identity()))
-            .then(|| surface.annotation_request(source));
+        return (paired.view_ready
+            && paired.surface.frame == Some(frame)
+            && same_allocation(surface, paired.surface)
+            && frame.belongs_to(surface)
+            && metadata::product(frame).as_ref() == Some(source)
+            && frame.matches_content(source)
+            && crop == surface.content_region()
+            && metadata::valid_content(source)
+            && surface.viewer_identity == Some(objects.identity()))
+        .then(|| surface.annotation_request(source));
     }
     if let Some(validation) = paired.content.validation() {
         let source = validation.frame();
@@ -1334,7 +1340,17 @@ pub(crate) fn drawable_prediction(
 ) -> Option<(Surface, std::sync::Arc<labels::PredictionContent>)> {
     drawable_content(
         requested,
-        [crate::generated::PresentationSourceKind::Predict, crate::generated::PresentationSourceKind::Live, crate::generated::PresentationSourceKind::Upscale].into_iter().find(|kind| requested.frame.is_some_and(|frame| frame.content_session == crate::generated::presentation_source_session(*kind)))?,
+        [
+            crate::generated::PresentationSourceKind::Predict,
+            crate::generated::PresentationSourceKind::Live,
+            crate::generated::PresentationSourceKind::Upscale,
+        ]
+        .into_iter()
+        .find(|kind| {
+            requested.frame.is_some_and(|frame| {
+                frame.content_session == crate::generated::presentation_source_session(*kind)
+            })
+        })?,
         |pending| pending.content.prediction(),
         |image| image.content.prediction(),
     )

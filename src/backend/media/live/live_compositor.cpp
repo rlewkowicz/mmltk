@@ -124,9 +124,7 @@ bool LiveCompositor::process_latest() {
    try {
     slot->analysis.PrepareDevice(source.frame, source.width, source.height, analysis.annotations);
     status = scope.Record(slot->analysis.EnqueueDeviceCopy(reinterpret_cast<std::uintptr_t>(slot->stream)));
-   } catch (const std::bad_alloc&) {
-    status = scope.Record(cudaErrorMemoryAllocation);
-   } catch (...) {
+   } catch (const std::bad_alloc&) { status = scope.Record(cudaErrorMemoryAllocation); } catch (...) {
     status = scope.Record(cudaErrorInvalidValue);
    }
   }
@@ -145,7 +143,6 @@ bool LiveCompositor::process_latest() {
    };
    status = scope.Record(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba(overlay)));
   }
-
  }
  if (status == cudaSuccess && manual_overlay_ != nullptr && manual_overlay_->try_acquire_latest(&manual_overlay)) {
   if (manual_overlay.has_content) {
@@ -253,14 +250,21 @@ bool LiveCompositor::try_acquire(const PhysicalFrameRevision revision, LiveCompo
  if (output == nullptr || static_cast<bool>(*output) || callback_owner == nullptr || on_complete == nullptr || abandon == nullptr || !revision.valid() || revision.slot >= slot_count_) return false;
  CompositeSlot& slot = slots_[revision.slot];
  if (!transition_slot_state(slot.state, SlotState::Published, SlotState::Acquired)) return false;
- if (slot.revision != revision.revision || slot.metadata.frame != revision.frame || reinterpret_cast<std::uintptr_t>(slot.ready) != revision.ready_event ||
-     !slot.analysis.ready() || slot.analysis.frame() != revision.frame) {
+ if (slot.revision != revision.revision || slot.metadata.frame != revision.frame || reinterpret_cast<std::uintptr_t>(slot.ready) != revision.ready_event || !slot.analysis.ready() ||
+     slot.analysis.frame() != revision.frame) {
   publish_live_slot_state(slot.state, SlotState::Published);
   return false;
  }
  const DeviceFrameView view = slot.metadata.View(slot.index, slot.rgba, slot.rgba_pitch, slot.ready, slot.stream);
  *output = LiveCompositeOutputLease::Create(callback_owner, on_complete, abandon,
-  {.clean = static_cast<std::uintptr_t>(view.pixels), .clean_pitch_bytes = view.pitch_bytes, .semantic = static_cast<std::uintptr_t>(slot.overlay), .semantic_pitch_bytes = slot.overlay_pitch, .width = view.width, .height = view.height, .ready_event = reinterpret_cast<std::uintptr_t>(view.ready), .analysis = &slot.analysis},
+  {.clean = static_cast<std::uintptr_t>(view.pixels),
+   .clean_pitch_bytes = view.pitch_bytes,
+   .semantic = static_cast<std::uintptr_t>(slot.overlay),
+   .semantic_pitch_bytes = slot.overlay_pitch,
+   .width = view.width,
+   .height = view.height,
+   .ready_event = reinterpret_cast<std::uintptr_t>(view.ready),
+   .analysis = &slot.analysis},
   revision);
  return true;
 }

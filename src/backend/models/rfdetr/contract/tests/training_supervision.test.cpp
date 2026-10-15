@@ -190,9 +190,8 @@ TEST_CASE("Catalog capabilities and model and request admission agree for every 
     CHECK(error.has_value() == !admitted);
     if (!admitted) {
      REQUIRE(error.has_value());
-     CHECK(*error == (row.task == ModelTask::Keypoints
-                      ? "Keypoint training requires stock Hungarian supervision; Match-Free and denoising are unsupported"
-                      : "Zero-decoder Atto training does not support Match-Free or denoising supervision"));
+     CHECK(*error == (row.task == ModelTask::Keypoints ? "Keypoint training requires stock Hungarian supervision; Match-Free and denoising are unsupported"
+                                                       : "Zero-decoder Atto training does not support Match-Free or denoising supervision"));
     }
     auto model = native_config_from_preset(row);
     model.training_supervision = request.training_supervision;

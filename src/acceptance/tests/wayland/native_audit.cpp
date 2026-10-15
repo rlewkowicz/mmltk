@@ -239,9 +239,13 @@ auto NativeAudit::consume(const nlohmann::json& record) -> void {
  }
  if (event == "worker.failure") {
   const auto message = record.value("message", "");
-  const bool expected = expected_live_artifact_failure && owner == "live" && message.find("Live RF-DETR analysis provider for " + *expected_live_artifact_failure + ": ") != std::string::npos && message.find("open failed") != std::string::npos && message.find("No such file or directory") != std::string::npos;
-  if (expected) { expected_live_artifact_failure.reset(); ++expected_live_failures; }
-  else worker_failed = true;
+  const bool expected = expected_live_artifact_failure && owner == "live" && message.find("Live RF-DETR analysis provider for " + *expected_live_artifact_failure + ": ") != std::string::npos &&
+                        message.find("open failed") != std::string::npos && message.find("No such file or directory") != std::string::npos;
+  if (expected) {
+   expected_live_artifact_failure.reset();
+   ++expected_live_failures;
+  } else
+   worker_failed = true;
  }
  invalid_message = invalid_message || event == "browser.server.invalid_message";
  peer_replaced = peer_replaced || event == "browser.server.peer_replaced";
@@ -616,9 +620,10 @@ bool NativeAudit::ArmLiveArtifactFailure(std::string artifact) {
 bool NativeAudit::CatalogTrainingCompleted(std::uint64_t generation, std::string_view preset, std::uint32_t resolution) const {
  const auto input = catalog_training_inputs.find(generation), terminal = catalog_training_terminals.find(generation);
  if (input == catalog_training_inputs.end() || terminal == catalog_training_terminals.end()) return false;
- const auto expected = "requested_preset=" + std::string(preset) + " requested_resolution=" + std::to_string(resolution) + " prepared_preset=" + std::string(preset) + " prepared_resolution=" + std::to_string(resolution) + " ";
- return !causal_inconsistent && input->second.value("message", "").starts_with(expected) && scalar(input->second,"detail") == resolution
-     && scalar(terminal->second,"detail") == static_cast<std::uint64_t>(mmltk::controller::contracts::ComputeOperationOutcome::Succeeded);
+ const auto expected = "requested_preset=" + std::string(preset) + " requested_resolution=" + std::to_string(resolution) + " prepared_preset=" + std::string(preset) +
+                       " prepared_resolution=" + std::to_string(resolution) + " ";
+ return !causal_inconsistent && input->second.value("message", "").starts_with(expected) && scalar(input->second, "detail") == resolution &&
+        scalar(terminal->second, "detail") == static_cast<std::uint64_t>(mmltk::controller::contracts::ComputeOperationOutcome::Succeeded);
 }
 auto NativeAudit::failed_before_termination() const noexcept -> bool { return worker_failed || invalid_message || peer_replaced || interaction_rejected || causal_inconsistent; }
 auto NativeAudit::failure_blocker() const noexcept -> std::string_view {

@@ -11,6 +11,7 @@
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/backend/data/catalog/keypoint_schema.h"
 import mmltk.backend.imaging.annotation.core;
 namespace fs = std::filesystem;
 namespace {

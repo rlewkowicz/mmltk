@@ -63,7 +63,7 @@ struct OracleCase final {
 class OracleArchive final {
 public:
  // The optional observation belongs to fixture evidence and never controls reads.
- OracleArchive(const std::filesystem::path& directory,const nlohmann::json& reference, std::function<void(std::size_t)> physical_load = {});
+ OracleArchive(const std::filesystem::path& directory, const nlohmann::json& reference, std::function<void(std::size_t)> physical_load = {});
  // Own only the requested tensor storage, independently of the working shard.
  [[nodiscard]] TensorMap read_tensors(std::span<const std::string> names, torch::Device device = torch::kCPU) const;
  [[nodiscard]] torch::Tensor tensor(const std::string& name, torch::Device device = torch::kCPU) const;
@@ -75,7 +75,7 @@ private:
  explicit OracleArchive(OracleArchiveRecord record, std::function<void(std::size_t)> physical_load);
  void load_shard(std::size_t index, bool remember_order = false) const;
  OracleArchiveRecord record_;
- std::map<std::string,std::size_t> locations_;
+ std::map<std::string, std::size_t> locations_;
  mutable TensorMap tensors_;
  mutable std::optional<std::size_t> loaded_;
  mutable std::vector<std::string> serialized_order_;
@@ -152,6 +152,7 @@ private:
 [[nodiscard]] std::vector<LayerMaskSamples> oracle_samples(const OracleArchive&, std::size_t layers, torch::Device, const std::string& prefix = "");
 [[nodiscard]] DetectionConfig oracle_detection(const NativeRfDetrConfig& config);
 [[nodiscard]] std::vector<CompilationMode> oracle_execution_modes(const OracleCase&);
-void compare_oracle_outputs(OracleComparison&, const OracleArchive&, const ModelOutputs&, const std::vector<torch::Tensor>& encoder_indices, const std::string& prefix = "", bool observed_encoder = true);
+void compare_oracle_outputs(
+ OracleComparison&, const OracleArchive&, const ModelOutputs&, const std::vector<torch::Tensor>& encoder_indices, const std::string& prefix = "", bool observed_encoder = true);
 void compare_oracle_vjp(OracleComparison&, const OracleArchive&, NativeRfDetrModel&, const ModelOutputs&, const torch::Tensor& input, bool retain_graph);
 }  // namespace mmltk::backend::models::rfdetr::testsupport

@@ -133,7 +133,7 @@ struct SkeletonEdge {
 struct SkeletonShape {
  std::vector<SkeletonNode> nodes;
  std::vector<SkeletonEdge> edges;
- mmltk::backend::data::catalog::ClassKeypointSchema schema;
+ mmltk::backend::data::catalog::ClassKeypointSchema schema{};
  bool operator==(const SkeletonShape&) const = default;
 };
 using Shape = std::variant<BoxShape, MaskShape, SplineShape, PointShape, SkeletonShape>;

@@ -32,6 +32,7 @@ public:
  }
  bool force_math = false;
  torch::nn::Linear qkv{nullptr}, proj{nullptr};
+
 private:
  int64_t heads_, dimension_;
 };
@@ -72,10 +73,11 @@ public:
   for (int64_t index = 0; index < config.backbone.layers; ++index) blocks_->push_back(std::make_shared<PeBlock>(config.backbone));
   norm_ = register_module("norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({config.backbone.dimension}).eps(1.e-5)));
   torch::NoGradGuard guard;
-  for (const auto& module : modules(false)) if (auto* linear = dynamic_cast<torch::nn::LinearImpl*>(module.get())) {
-   initialize_backbone_weight(linear->weight);
-   if (linear->bias.defined()) linear->bias.zero_();
-  }
+  for (const auto& module : modules(false))
+   if (auto* linear = dynamic_cast<torch::nn::LinearImpl*>(module.get())) {
+    initialize_backbone_weight(linear->weight);
+    if (linear->bias.defined()) linear->bias.zero_();
+   }
   initialize_backbone_weight(pos_embed_);
   initialize_backbone_weight(cls_token_);
   for (size_t index = 0; index < blocks_->size(); ++index) {
@@ -115,7 +117,8 @@ public:
    rope = torch::cat({no_op.unsqueeze(0).expand({squares, 1, head_dim * 2}), rope}, 1);
    full_rope = rope.reshape({-1, head_dim * 2});
    window_rope = rope.repeat({batch, 1, 1}).unsqueeze(1);
-  } else full_rope = window_rope = torch::cat({no_op, rope}, 0);
+  } else
+   full_rope = window_rope = torch::cat({no_op, rope}, 0);
   std::vector<torch::Tensor> features;
   features.reserve(config_.backbone.features.size());
   for (size_t index = 0; index <= config_.backbone.features.back(); ++index) {
@@ -133,6 +136,7 @@ public:
   }
   return features;
  }
+
 private:
  NativeRfDetrConfig config_;
  torch::nn::Conv2d projection_{nullptr};
@@ -145,11 +149,13 @@ public:
  explicit PeEncoder(const NativeRfDetrConfig& config) : model_(register_module("model", std::make_shared<PeTrunk>(config))) {}
  std::vector<torch::Tensor> forward(const torch::Tensor& pixels) override { return model_->forward(pixels); }
  void set_force_math_attention(bool value) override {
-  for (const auto& module : modules(false)) if (auto* attention = dynamic_cast<PeAttention*>(module.get())) attention->force_math = value;
+  for (const auto& module : modules(false))
+   if (auto* attention = dynamic_cast<PeAttention*>(module.get())) attention->force_math = value;
  }
+
 private:
  std::shared_ptr<PeTrunk> model_;
 };
-}
+}  // namespace
 std::shared_ptr<BackboneEncoder> make_pe_core_encoder(const NativeRfDetrConfig& config) { return std::make_shared<PeEncoder>(config); }
-}
+}  // namespace mmltk::backend::models::rfdetr::detail

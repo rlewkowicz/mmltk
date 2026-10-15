@@ -18,8 +18,9 @@ public:
  explicit NativeBackboneImpl(const NativeRfDetrConfig&);
  [[nodiscard]] std::inplace_vector<torch::Tensor, 2> forward_features(const torch::Tensor&);
  void set_force_math_attention(bool);
+
 private:
  std::shared_ptr<BackboneEncoder> encoder_;
  std::shared_ptr<torch::nn::Module> projector_, cross_projector_;
 };
-}
+}  // namespace mmltk::backend::models::rfdetr::detail

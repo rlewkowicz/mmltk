@@ -36,8 +36,10 @@ struct LiveOutputFrame final {
  std::uintptr_t ready_event = 0U;
  // Borrowed until the output lease completes; its frame equals the lease revision.
  const LiveAnalysisProduct* analysis = nullptr;
- [[nodiscard]] bool valid() const noexcept { return clean != 0U && semantic != 0U && clean != semantic && width != 0U && height != 0U &&
-   clean_pitch_bytes >= static_cast<std::size_t>(width) * 4U && semantic_pitch_bytes >= static_cast<std::size_t>(width) * 4U && ready_event != 0U; }
+ [[nodiscard]] bool valid() const noexcept {
+  return clean != 0U && semantic != 0U && clean != semantic && width != 0U && height != 0U && clean_pitch_bytes >= static_cast<std::size_t>(width) * 4U &&
+         semantic_pitch_bytes >= static_cast<std::size_t>(width) * 4U && ready_event != 0U;
+ }
 };
 struct LiveRawFrameReadback final {
  LiveFrameId frame{};

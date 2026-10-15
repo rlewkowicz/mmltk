@@ -14,7 +14,8 @@ public:
  explicit WorkflowWaylandInputs(const std::filesystem::path& root, bool keypoints = false);
  [[nodiscard]] const auto& fixture() const noexcept { return fixture_; }
  [[nodiscard]] const auto& alternate_model() const noexcept { return alternate_; }
- void VerifyCatalogTraining(const std::filesystem::path& session_root, const std::filesystem::path& output, const std::filesystem::path& checkpoint, std::string_view run_id, std::string_view preset) const;
+ void VerifyCatalogTraining(
+  const std::filesystem::path& session_root, const std::filesystem::path& output, const std::filesystem::path& checkpoint, std::string_view run_id, std::string_view preset) const;
  void Configure(mmltk::controller::contracts::GuiSettingsState&, const std::filesystem::path& output) const;
 
 private:
@@ -32,6 +33,7 @@ public:
  ~WorkflowArtifactMutation();
  void Apply(std::uint32_t index);
  [[nodiscard]] const auto& artifact() const noexcept { return artifact_; }
+
 private:
  void Restore() noexcept;
  std::filesystem::path artifact_, backup_, alternate_;

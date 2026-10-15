@@ -85,14 +85,22 @@ impl ApplicationModel {
     pub(crate) fn viewer_base_source(
         &self,
     ) -> Option<(&VisualFrame, &crate::generated::VisualDocumentFacts)> {
-        let kind = if self.foreground_visual() == Some(PresentationSourceKind::Upscale) { self.requested_upscale.as_ref().map(|request| request.source.source.kind) } else { self.foreground_visual() };
+        let kind = if self.foreground_visual() == Some(PresentationSourceKind::Upscale) {
+            self.requested_upscale
+                .as_ref()
+                .map(|request| request.source.source.kind)
+        } else {
+            self.foreground_visual()
+        };
         if kind == Some(PresentationSourceKind::Predict) {
             let snapshot = self.predict_snapshot.as_ref()?;
-            return Self::valid_visual_source(&snapshot.frame).map(|_| (&snapshot.frame, &snapshot.document));
+            return Self::valid_visual_source(&snapshot.frame)
+                .map(|_| (&snapshot.frame, &snapshot.document));
         }
         if kind == Some(PresentationSourceKind::Live) {
             let snapshot = self.live_snapshot.as_ref()?;
-            return Self::valid_visual_source(&snapshot.frame).map(|_| (&snapshot.frame, &snapshot.document));
+            return Self::valid_visual_source(&snapshot.frame)
+                .map(|_| (&snapshot.frame, &snapshot.document));
         }
         let validation = self.foreground_visual() == Some(PresentationSourceKind::Validation)
             || (self.foreground_visual() == Some(PresentationSourceKind::Upscale)
@@ -1232,7 +1240,15 @@ mod tests {
                 value: 1.0,
             },
             name: "retained".into(),
-            skeleton: crate::generated::VisualSkeleton { schema: crate::generated::ClassKeypointSchema { names: Vec::new(), skeleton: Vec::new(), horizontalflip: Vec::new(), okssigmas: Vec::new() }, joints: Vec::new() },
+            skeleton: crate::generated::VisualSkeleton {
+                schema: crate::generated::ClassKeypointSchema {
+                    names: Vec::new(),
+                    skeleton: Vec::new(),
+                    horizontalflip: Vec::new(),
+                    okssigmas: Vec::new(),
+                },
+                joints: Vec::new(),
+            },
         };
         baseline.labels = vec![label; 4096];
         model.install_predict_snapshot(baseline.clone()).unwrap();

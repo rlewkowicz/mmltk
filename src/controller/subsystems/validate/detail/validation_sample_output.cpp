@@ -84,9 +84,8 @@ public:
   if (overlays.prediction_layer && options_.prediction_labels) append(raw->predictions(), false);
   auto candidate = runtime_->AcquireOutput();
   const std::array regions{PredictionPreviewComposition::Region{raw, {0U, 0U, extent.width, extent.height}}};
-  PredictionPreviewComposition::Draw(*runtime_, candidate, extent, regions,
-   PredictionPreviewComposition::Options::Validation(overlays, options_.display.confidence_threshold),
-   nullptr, [&](auto clean, auto semantic, auto stream) {
+  PredictionPreviewComposition::Draw(
+   *runtime_, candidate, extent, regions, PredictionPreviewComposition::Options::Validation(overlays, options_.display.confidence_threshold), nullptr, [&](auto clean, auto semantic, auto stream) {
    raster::CaptionRaster::Composite(clean, semantic, stream);
    captions_->Draw(clean, labels_, stream);
   });

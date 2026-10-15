@@ -18,20 +18,27 @@ struct CriterionTermPolicy {
  std::string_view coefficient;
  CriterionDomain domain = CriterionDomain::Detection;
 };
+struct CriterionTermDeclaration final {
+ const char* external_name;
+ const char* coefficient;
+ CriterionDomain domain;
+ consteval CriterionTermDeclaration(std::string_view name, std::string_view coefficient_name, CriterionDomain term_domain = CriterionDomain::Detection)
+     : external_name(std::define_static_string(name)), coefficient(std::define_static_string(coefficient_name)), domain(term_domain) {}
+};
 // Declaration order is the stock coefficient order. Identifiers are the native
 // metric vocabulary; upstream spellings and coefficient aliases live here alone.
 enum class CriterionTerm : std::uint8_t {
- classification [[= CriterionTermPolicy{"loss_ce", "cls_loss_coef"}]],
- l1 [[= CriterionTermPolicy{"loss_bbox", "bbox_loss_coef"}]],
- giou [[= CriterionTermPolicy{"loss_giou", "giou_loss_coef"}]],
- mask_ce [[= CriterionTermPolicy{"loss_mask_ce", "mask_ce_loss_coef", CriterionDomain::Masks}]],
- mask_dice [[= CriterionTermPolicy{"loss_mask_dice", "mask_dice_loss_coef", CriterionDomain::Masks}]],
- keypoint_l1 [[= CriterionTermPolicy{"loss_keypoints_l1", "keypoint_l1_loss_coef", CriterionDomain::Keypoints}]],
- keypoint_findable [[= CriterionTermPolicy{"loss_keypoints_findable", "keypoint_findable_loss_coef", CriterionDomain::Keypoints}]],
- keypoint_visible [[= CriterionTermPolicy{"loss_keypoints_visible", "keypoint_visible_loss_coef", CriterionDomain::Keypoints}]],
- keypoint_nll [[= CriterionTermPolicy{"loss_keypoints_nll", "keypoint_nll_loss_coef", CriterionDomain::Keypoints}]],
- class_error [[= CriterionTermPolicy{"class_error", "", CriterionDomain::Statistic}]],
- cardinality_error [[= CriterionTermPolicy{"cardinality_error", "", CriterionDomain::Statistic}]],
+ classification[[= CriterionTermDeclaration{"loss_ce", "cls_loss_coef"}]],
+ l1[[= CriterionTermDeclaration{"loss_bbox", "bbox_loss_coef"}]],
+ giou[[= CriterionTermDeclaration{"loss_giou", "giou_loss_coef"}]],
+ mask_ce[[= CriterionTermDeclaration{"loss_mask_ce", "mask_ce_loss_coef", CriterionDomain::Masks}]],
+ mask_dice[[= CriterionTermDeclaration{"loss_mask_dice", "mask_dice_loss_coef", CriterionDomain::Masks}]],
+ keypoint_l1[[= CriterionTermDeclaration{"loss_keypoints_l1", "keypoint_l1_loss_coef", CriterionDomain::Keypoints}]],
+ keypoint_findable[[= CriterionTermDeclaration{"loss_keypoints_findable", "keypoint_findable_loss_coef", CriterionDomain::Keypoints}]],
+ keypoint_visible[[= CriterionTermDeclaration{"loss_keypoints_visible", "keypoint_visible_loss_coef", CriterionDomain::Keypoints}]],
+ keypoint_nll[[= CriterionTermDeclaration{"loss_keypoints_nll", "keypoint_nll_loss_coef", CriterionDomain::Keypoints}]],
+ class_error[[= CriterionTermDeclaration{"class_error", "", CriterionDomain::Statistic}]],
+ cardinality_error[[= CriterionTermDeclaration{"cardinality_error", "", CriterionDomain::Statistic}]],
 };
 struct CriterionSchema final {
  inline static constexpr auto members = std::define_static_array(std::meta::enumerators_of(^^CriterionTerm));
@@ -40,7 +47,8 @@ struct CriterionSchema final {
  static consteval CriterionTermPolicy policy() {
   constexpr auto annotations = std::define_static_array(std::meta::annotations_of(Member));
   static_assert(annotations.size() == 1);
-  constexpr auto result = std::meta::extract<CriterionTermPolicy>(annotations[0]);
+  constexpr auto declaration = std::meta::extract<CriterionTermDeclaration>(annotations[0]);
+  constexpr CriterionTermPolicy result{declaration.external_name, declaration.coefficient, declaration.domain};
   static_assert(!result.external_name.empty());
   static_assert(result.coefficient.empty() == (result.domain == CriterionDomain::Statistic));
   return result;
@@ -78,14 +86,14 @@ struct CriterionSchema final {
   }
  }
 };
-static_assert([] consteval {
+static_assert([]<class Schema>() consteval {
  std::size_t index = 0;
- template for (constexpr auto member : CriterionSchema::members) {
+ template for (constexpr auto member : Schema::members) {
   if (static_cast<std::size_t>(std::meta::extract<CriterionTerm>(member)) != index++) return false;
-  constexpr auto facts = CriterionSchema::policy<member>();
-  template for (constexpr auto other : CriterionSchema::members) {
+  constexpr auto facts = Schema::template policy<member>();
+  template for (constexpr auto other : Schema::members) {
    if constexpr (member != other) {
-    constexpr auto other_name = CriterionSchema::policy<other>().external_name;
+    constexpr auto other_name = Schema::template policy<other>().external_name;
     if (facts.external_name == other_name) return false;
     // A main spelling must not collide with another term's external layer
     // projection. This is declaration validation, never runtime dispatch.
@@ -102,7 +110,7 @@ static_assert([] consteval {
   }
  }
  return true;
-}());
+}.template operator()<CriterionSchema>());
 class CriterionLayer final {
 public:
  enum class Kind : std::uint8_t { Main, Auxiliary, Encoder };
@@ -112,6 +120,7 @@ public:
  [[nodiscard]] constexpr Kind kind() const noexcept { return kind_; }
  [[nodiscard]] constexpr std::size_t index() const noexcept { return index_; }
  bool operator==(const CriterionLayer&) const = default;
+
 private:
  constexpr CriterionLayer(Kind kind, std::size_t index) : kind_(kind), index_(index) {}
  Kind kind_ = Kind::Main;
@@ -131,7 +140,9 @@ struct CriterionWeight final {
 class CriterionTensors final {
 public:
  template <class Self>
- auto& operator[](this Self&& self, CriterionTerm term) { return self.values_.at(static_cast<std::size_t>(term)); }
+ auto& operator[](this Self&& self, CriterionTerm term) {
+  return self.values_.at(static_cast<std::size_t>(term));
+ }
  template <class Self, class Visitor>
  void for_each(this Self&& self, Visitor&& visitor) {
   CriterionSchema::visit([&]<CriterionTerm Term>(CriterionTermPolicy) {
@@ -139,6 +150,7 @@ public:
    if (value.defined()) visitor(Term, value);
   });
  }
+
 private:
  std::array<torch::Tensor, CriterionSchema::size> values_;
 };
@@ -148,9 +160,7 @@ struct CriterionResult final {
  std::optional<CriterionTensors> encoder;
  template <class Self, class Visitor>
  void for_each(this Self&& self, Visitor&& visitor) {
-  const auto visit_layer = [&](auto& terms, CriterionLayer layer) {
-   terms.for_each([&](CriterionTerm term, auto& value) { visitor(CriterionKey{term, layer}, value); });
-  };
+  const auto visit_layer = [&](auto& terms, CriterionLayer layer) { terms.for_each([&](CriterionTerm term, auto& value) { visitor(CriterionKey{term, layer}, value); }); };
   visit_layer(self.main, {});
   for (std::size_t i = 0; i < self.auxiliary.size(); ++i) visit_layer(self.auxiliary[i], CriterionLayer::auxiliary(i));
   if (self.encoder) visit_layer(*self.encoder, CriterionLayer::encoder());
@@ -159,8 +169,12 @@ struct CriterionResult final {
   const CriterionTensors* terms = nullptr;
   switch (key.layer.kind()) {
    case CriterionLayer::Kind::Main: terms = &main; break;
-   case CriterionLayer::Kind::Auxiliary: if (key.layer.index() < auxiliary.size()) terms = &auxiliary[key.layer.index()]; break;
-   case CriterionLayer::Kind::Encoder: if (encoder) terms = &*encoder; break;
+   case CriterionLayer::Kind::Auxiliary:
+    if (key.layer.index() < auxiliary.size()) terms = &auxiliary[key.layer.index()];
+    break;
+   case CriterionLayer::Kind::Encoder:
+    if (encoder) terms = &*encoder;
+    break;
   }
   if (!terms) return nullptr;
   const auto& value = (*terms)[key.term];

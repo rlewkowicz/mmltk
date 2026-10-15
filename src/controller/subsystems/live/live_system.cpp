@@ -29,7 +29,8 @@ std::optional<LiveImageMetadata> project_live_metadata(const VisualFrame& frame,
    const auto category = region.class_references[index];
    const auto& box = region.boxes_xyxy[index];
    VisualObjectLabel label{.box = {{box[0], box[1]}, {box[2], box[3]}}, .class_reference = category, .class_domain = region.class_domain, .confidence = region.confidences[index]};
-   if (region.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && region.class_catalog && category >= 0 && static_cast<std::size_t>(category) < region.class_catalog->size()) {
+   if (region.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && region.class_catalog && category >= 0 &&
+       static_cast<std::size_t>(category) < region.class_catalog->size()) {
     label.name = region.class_catalog->names()[category];
     label.color = palette[category];
     if (region.keypoints_available) {
@@ -39,9 +40,13 @@ std::optional<LiveImageMetadata> project_live_metadata(const VisualFrame& frame,
      for (int joint = 0; joint < count; ++joint) {
       const auto& point = region.keypoints[index * region.keypoint_capacity + joint];
       VisualKeypoint value{.point = {point.x, point.y}, .confidence = point.confidence};
-      if (!value.point.finite()) { value.point = {}; value.confidence = 0; }
+      if (!value.point.finite()) {
+       value.point = {};
+       value.confidence = 0;
+      }
       if (!std::isfinite(value.confidence)) value.confidence = 0;
-      if (std::isfinite(point.covariance_xx) && std::isfinite(point.covariance_xy) && std::isfinite(point.covariance_yy)) value.covariance = std::array{point.covariance_xx, point.covariance_xy, point.covariance_yy};
+      if (std::isfinite(point.covariance_xx) && std::isfinite(point.covariance_xy) && std::isfinite(point.covariance_yy))
+       value.covariance = std::array{point.covariance_xx, point.covariance_xy, point.covariance_yy};
       label.skeleton.joints.push_back(value);
      }
     }
@@ -56,13 +61,19 @@ std::shared_ptr<const VisualDocument> live_document(const VisualFrame& frame, st
  auto document = std::make_shared<VisualDocument>();
  document->BindResource(contracts::WorkspaceResource::From("live://frame", frame.revision));
  std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog;
- struct Mask final { mmltk::backend::ml::runtime::AnalysisRegion region; std::span<const std::uint8_t> pixels; };
+ struct Mask final {
+  mmltk::backend::ml::runtime::AnalysisRegion region;
+  std::span<const std::uint8_t> pixels;
+ };
  auto masks = std::make_shared<std::vector<Mask>>();
  std::size_t label_index = 0;
  for (const auto& region : product->regions()) {
   if (region.class_catalog) {
    if (catalog && !catalog->ordered_equal(*region.class_catalog)) throw contracts::InvalidIntentError("Live regions disagree on class meaning");
-   if (!catalog) { catalog = region.class_catalog; document->SetCatalog(*catalog); }
+   if (!catalog) {
+    catalog = region.class_catalog;
+    document->SetCatalog(*catalog);
+   }
   }
   for (std::size_t index = 0; index < region.count; ++index, ++label_index) {
    const auto& label = metadata.labels.at(label_index);
@@ -72,8 +83,10 @@ std::shared_ptr<const VisualDocument> live_document(const VisualFrame& frame, st
    object.mask.present = region.masks_available;
    const auto joints = label.skeleton.Annotations();
    const auto& area = region.source_region;
-   document->AppendSourceObject(std::move(object), {float(area.x) / frame.extent.width, float(area.y) / frame.extent.height,
-    float(area.x + area.width) / frame.extent.width, float(area.y + area.height) / frame.extent.height}, joints);
+   document->AppendSourceObject(std::move(object),
+    {static_cast<float>(area.x) / static_cast<float>(frame.extent.width), static_cast<float>(area.y) / static_cast<float>(frame.extent.height),
+     static_cast<float>(area.x + area.width) / static_cast<float>(frame.extent.width), static_cast<float>(area.y + area.height) / static_cast<float>(frame.extent.height)},
+    joints);
    Mask mask{area, {}};
    if (region.masks_available) {
     const auto pixels = static_cast<std::size_t>(area.width) * area.height;
@@ -88,21 +101,27 @@ std::shared_ptr<const VisualDocument> live_document(const VisualFrame& frame, st
  document->mask_contains = [masks, product = std::move(product), extent = frame.extent](std::size_t index, float x, float y) {
   if (index >= masks->size()) return false;
   const auto& mask = masks->at(index);
-  const auto px = std::floor(x * extent.width) - mask.region.x, py = std::floor(y * extent.height) - mask.region.y;
-  return px >= 0 && py >= 0 && px < mask.region.width && py < mask.region.height && !mask.pixels.empty() && mask.pixels[static_cast<std::size_t>(py) * mask.region.width + static_cast<std::size_t>(px)] != 0;
+  const auto px = std::floor(x * static_cast<float>(extent.width)) - static_cast<float>(mask.region.x), py = std::floor(y * static_cast<float>(extent.height)) - static_cast<float>(mask.region.y);
+  return px >= 0 && py >= 0 && px < static_cast<float>(mask.region.width) && py < static_cast<float>(mask.region.height) && !mask.pixels.empty() &&
+         mask.pixels[static_cast<std::size_t>(py) * mask.region.width + static_cast<std::size_t>(px)] != 0;
  };
  return document;
 }
-}
-LiveAnalysisRead::LiveAnalysisRead(VisualFrame frame, mmltk::frameworks::gpu::BorrowedImageProductReadView image,
- std::shared_ptr<const mmltk::backend::media::live::LiveAnalysisProduct> analysis) noexcept
- : frame_(frame), analysis_(std::move(analysis)), image_(std::move(image)) {}
+}  // namespace
+LiveAnalysisRead::LiveAnalysisRead(
+ VisualFrame frame, mmltk::frameworks::gpu::BorrowedImageProductReadView image, std::shared_ptr<const mmltk::backend::media::live::LiveAnalysisProduct> analysis) noexcept
+    : frame_(frame), analysis_(std::move(analysis)), image_(std::move(image)) {}
 class LiveSystem::Impl final {
  WorkspaceInput input_;
 
 public:
  Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics, SettingsSystem* application_settings, ModelSystem* model)
-     : settings_(settings), application_settings_(application_settings), model_(model), events_(std::move(events)), diagnostics_(diagnostics), worker_(std::move(factory), [this](const std::exception_ptr failure) {
+     : settings_(settings),
+       application_settings_(application_settings),
+       model_(model),
+       events_(std::move(events)),
+       diagnostics_(diagnostics),
+       worker_(std::move(factory), [this](const std::exception_ptr failure) {
         pending_output_ = {};
         const auto reported = mmltk::frameworks::gpu::combine_image_failures(failure, worker_.FinishDeferredRetirement());
         auto detail = visual_failure_detail(reported, "Live GPU worker failed");
@@ -131,7 +150,8 @@ public:
     if (!model_) throw contracts::UnavailableError("Live model preparation is unavailable");
     auto selected = subsystems::system::ComputeIntentMaterializer::PredictionModel(settings, model_->selection());
     if (!selected) throw contracts::InvalidIntentError(selected.error().detail);
-    if (selected->onnx_path.empty() && selected->tensorrt_path.empty()) throw contracts::InvalidIntentError("Live analysis requires a prepared ONNX or TensorRT artifact; export and select it in Predict");
+    if (selected->onnx_path.empty() && selected->tensorrt_path.empty())
+     throw contracts::InvalidIntentError("Live analysis requires a prepared ONNX or TensorRT artifact; export and select it in Predict");
     if (selected->device_id != settings_.device) throw contracts::InvalidIntentError("Live analysis and capture must use the same CUDA device");
     analysis = std::make_shared<const LiveAnalysisConfiguration>(std::move(*selected), settings.workflows.predict.show_keypoints, settings.workflows.predict.show_uncertainty);
    }
@@ -145,7 +165,9 @@ public:
   const auto admitted_revision = contracts::next_compute_generation(state_.revision);
   if (!admitted_revision) throw contracts::FailedError("Live observation revision exhausted");
   std::stop_source next_stop;
-  if (!worker_.SubmitDiscrete([this, request, cadence, analysis = std::move(analysis), stop = next_stop.get_token()](mmltk::frameworks::gpu::SystemImageRuntime& runtime, const std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+  if (!worker_.SubmitDiscrete(
+       [this, request, cadence, analysis = std::move(analysis), stop = next_stop.get_token()](
+        mmltk::frameworks::gpu::SystemImageRuntime& runtime, const std::stop_token) -> detail::VisualRuntimeOwner::Notification {
    auto* const algorithm = dynamic_cast<LiveAlgorithm*>(runtime.model());
    if (algorithm == nullptr) throw std::runtime_error("Live capture data plane is unavailable");
    algorithm->SetOutputAvailableSink([this] { static_cast<void>(worker_.NotifyContinuation()); });
@@ -161,13 +183,18 @@ public:
     static_cast<void>(algorithm->Stop());
     throw;
    }
-   if (stop.stop_requested()) { const auto stopped = algorithm->Stop(); if (!stopped.ok()) throw std::runtime_error("Live stop failed: " + stopped.message); return [this] { Settle(nullptr); }; }
+   if (stop.stop_requested()) {
+    const auto stopped = algorithm->Stop();
+    if (!stopped.ok()) throw std::runtime_error("Live stop failed: " + stopped.message);
+    return [this] { Settle(nullptr); };
+   }
    request_ = request;
    cadence_ = cadence;
    next_capture_ = {};
    static_cast<void>(worker_.NotifyContinuation());
    return {};
-  }, [this] { Settle(nullptr); })) {
+  },
+       [this] { Settle(nullptr); })) {
    throw contracts::BusyError("Live is already running");
   }
   state_.running = true;
@@ -228,7 +255,8 @@ public:
    auto detail = visual_failure_detail(failure, "Live operation failed");
    report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Live, settings_.device, detail);
    Publish(event_type{LiveFailed{std::move(settled), std::move(detail)}});
-  } else Publish(event_type{LiveChanged{std::move(settled)}});
+  } else
+   Publish(event_type{LiveChanged{std::move(settled)}});
  }
  void AdvanceRevision() {
   const auto next = contracts::next_compute_generation(state_.revision);
@@ -288,7 +316,10 @@ private:
   const auto frame = visual_frame({PresentationSourceKind::Live, 1U}, request_.extent, candidate.revision());
   auto metadata = project_live_metadata(frame, *analysis);
   std::shared_ptr<const VisualDocument> document;
-  if (metadata) { document = live_document(frame, analysis, *metadata); metadata->document = document->facts(); }
+  if (metadata) {
+   document = live_document(frame, analysis, *metadata);
+   metadata->document = document->facts();
+  }
   if (!metadata || !visual_metadata_admitted(*metadata)) {
    // PublishRetained has settled both receiver planes; the selected product has
    // not changed. Stop this run, but retain its healthy receiver runtime.
@@ -349,7 +380,8 @@ private:
  mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput pending_output_;
  detail::VisualRuntimeOwner worker_;
 };
-LiveSystem::LiveSystem(const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics, SettingsSystem* application_settings, ModelSystem* model)
+LiveSystem::LiveSystem(
+ const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics, SettingsSystem* application_settings, ModelSystem* model)
     : impl_(std::make_unique<Impl>(settings, std::move(factory), std::move(events), diagnostics, application_settings, model)) {}
 LiveSystem::~LiveSystem() = default;
 LiveSnapshot LiveSystem::Start(const LiveStart request) {
@@ -380,7 +412,9 @@ VisualDocumentRead LiveSystem::BorrowDocument(const VisualFrame& frame) const {
   std::scoped_lock lock(impl_->mutex_);
   if (impl_->committed_metadata_.frame != frame) return {};
   document = impl_->committed_document_;
-  value = mmltk::frameworks::serialization::reflected_transport_value(impl_->committed_metadata_);
+  auto encoded = mmltk::frameworks::serialization::reflected_transport_value(impl_->committed_metadata_);
+  if (!encoded) throw contracts::InvalidIntentError("Live image meaning cannot be encoded");
+  value.emplace(std::move(*encoded));
  }
  if (!value || !document) throw contracts::InvalidIntentError("Live image meaning cannot be encoded");
  return {std::move(read.image_), std::move(document), std::make_shared<const mmltk::frameworks::serialization::wire::Value>(std::move(*value))};

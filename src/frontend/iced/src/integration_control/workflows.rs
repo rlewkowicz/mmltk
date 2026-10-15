@@ -2061,7 +2061,10 @@ impl State {
         index: u8,
         outcome: ProbeOutcome,
     ) {
-        if picture == Picture::Keypoints { self.keypoints.pixels(driver, outcome); return; }
+        if picture == Picture::Keypoints {
+            self.keypoints.pixels(driver, outcome);
+            return;
+        }
         if driver.phase != Phase::Workflows(Step::AwaitPixels(picture, index)) {
             return;
         }
@@ -2172,7 +2175,10 @@ impl State {
         let Phase::Workflows(step) = driver.phase else {
             return;
         };
-        if let Step::Keypoints(stage) = step { self.keypoints.located(driver, stage, control, bounds); return; }
+        if let Step::Keypoints(stage) = step {
+            self.keypoints.located(driver, stage, control, bounds);
+            return;
+        }
         if matches!(step, Step::Pixels(Picture::Progress, _)) && self.progress_epoch.is_none() {
             self.retry_progress_capture(driver);
             return;
@@ -2579,7 +2585,11 @@ impl State {
         surface: Option<crate::presentation_surface::Surface>,
         router: &crate::view::router::Router,
     ) -> Task<RootMessage> {
-        if let Step::Keypoints(stage) = step { return self.keypoints.advance(widgets, driver, stage, model, settings, active, surface); }
+        if let Step::Keypoints(stage) = step {
+            return self
+                .keypoints
+                .advance(widgets, driver, stage, model, settings, active, surface);
+        }
         let settled = !settings.has_local_edits();
         let entry = match step {
             Step::StartTrain => Some(FeatureId::Train),

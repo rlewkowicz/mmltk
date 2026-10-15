@@ -208,7 +208,8 @@ struct ObjectAfterView final {
   if (!object || *facts.selected_skeleton_joint >= object->skeleton_nodes.size()) return false;
  }
  domain::AnnotationDocumentBudget budget;
- for (const auto& schema : scene.keypoint_schemas) if (!budget.AddSchema(schema)) return false;
+ for (const auto& schema : scene.keypoint_schemas)
+  if (!budget.AddSchema(schema)) return false;
  for (std::size_t index = 0U; index != objects.size(); ++index) {
   const auto* object = objects.at(index);
   if (!object || !object_valid_for(*object, category_count, scene) || !budget.AddObject(*object, scene.keypoint_schemas)) return false;
@@ -372,7 +373,8 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
    mapped.reserve(count);
    for (const auto& node : object->after.skeleton_nodes) {
     const auto previous = std::ranges::find(object->before.skeleton_nodes, node.key, &domain::AnnotationSkeletonNode::key);
-    mapped.push_back(previous == object->before.skeleton_nodes.end() ? allocate_identity(state) : object->before_identity.elements.at(static_cast<std::size_t>(previous - object->before.skeleton_nodes.begin())));
+    mapped.push_back(
+     previous == object->before.skeleton_nodes.end() ? allocate_identity(state) : object->before_identity.elements.at(static_cast<std::size_t>(previous - object->before.skeleton_nodes.begin())));
    }
    elements = std::move(mapped);
    return;
@@ -1007,7 +1009,10 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
    if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Skeleton) || !before.selected_skeleton_joint) return refused(state);
    const auto index = *before.selected_object;
    return change_object(state, index, before, after, [&before, command](domain::AnnotationObject& changed, AnnotationEditorFacts&) {
-    changed.skeleton_nodes[*before.selected_skeleton_joint].visibility = command == domain::AnnotationSidebarCommand::SkeletonShow ? mmltk::backend::data::catalog::KeypointVisibility::Visible : command == domain::AnnotationSidebarCommand::SkeletonOccluded ? mmltk::backend::data::catalog::KeypointVisibility::Occluded : mmltk::backend::data::catalog::KeypointVisibility::Unannotated;
+    changed.skeleton_nodes[*before.selected_skeleton_joint].visibility = command == domain::AnnotationSidebarCommand::SkeletonShow ? mmltk::backend::data::catalog::KeypointVisibility::Visible
+                                                                         : command == domain::AnnotationSidebarCommand::SkeletonOccluded
+                                                                           ? mmltk::backend::data::catalog::KeypointVisibility::Occluded
+                                                                           : mmltk::backend::data::catalog::KeypointVisibility::Unannotated;
    });
   }
   case domain::AnnotationSidebarCommand::Undo:
@@ -1113,11 +1118,12 @@ public:
     if ((found != object.skeleton_edges.end()) == value.connected) return DocumentOutcome::Applied;
     if (value.connected && object.skeleton_edges.size() == domain::kAnnotationEdgeCapacity) return capacity(state_);
     return change_object(state_, *before.selected_object, before, before, [&](domain::AnnotationObject& changed, AnnotationEditorFacts&) {
-     if (value.connected) changed.skeleton_edges.push_back({value.first, value.second});
-     else std::erase_if(changed.skeleton_edges, matches);
+     if (value.connected)
+      changed.skeleton_edges.push_back({value.first, value.second});
+     else
+      std::erase_if(changed.skeleton_edges, matches);
     });
-   }
-   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskCleanupEdit>)
+   } else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskCleanupEdit>)
     return reduce_mask_cleanup(state_, value.operation, value.radius);
    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskColorsEdit>)
     return reduce_mask_colors(state_, value.sup, value.nosup);

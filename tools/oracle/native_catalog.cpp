@@ -10,9 +10,14 @@ namespace {
 template <class T>
 nlohmann::json project(const T& value) {
  using namespace mmltk::frameworks::reflection;
- if constexpr (std::is_enum_v<T>) return enum_name(value);
- else if constexpr (std::is_arithmetic_v<T> || std::is_convertible_v<T, std::string_view>) return value;
- else if constexpr (requires { value.begin(); value.end(); }) {
+ if constexpr (std::is_enum_v<T>)
+  return enum_name(value);
+ else if constexpr (std::is_arithmetic_v<T> || std::is_convertible_v<T, std::string_view>)
+  return value;
+ else if constexpr (requires {
+                     value.begin();
+                     value.end();
+                    }) {
   auto result = nlohmann::json::array();
   for (const auto& item : value) result.push_back(project(item));
   return result;
@@ -22,7 +27,7 @@ nlohmann::json project(const T& value) {
   return result;
  }
 }
-}
+}  // namespace
 std::string rfdetr_native_catalog_json() {
  using namespace mmltk::backend::models::rfdetr;
  auto result = nlohmann::json::object();

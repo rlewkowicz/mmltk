@@ -101,7 +101,10 @@ private:
 [[nodiscard]] std::filesystem::path document_path(std::filesystem::path path, const contracts::WorkspaceResource& document) {
  if (std::filesystem::is_directory(path)) {
   std::uint64_t identity = 14695981039346656037ULL;
-  for (const auto byte : document.view()) { identity ^= static_cast<unsigned char>(byte); identity *= 1099511628211ULL; }
+  for (const auto byte : document.view()) {
+   identity ^= static_cast<unsigned char>(byte);
+   identity *= 1099511628211ULL;
+  }
   path /= "annotation-" + std::to_string(identity) + ".cbor";
  }
  return path;
@@ -119,8 +122,7 @@ std::optional<LoadedAnnotationDocument> load_annotation_document(const contracts
  // The old directory filename was derived from the constant resource view.
  // Consult it only when no exact bound document exists, never as a fallback
  // from a malformed or mismatched modern document.
- if (std::filesystem::is_directory(requested) && !std::filesystem::exists(path) && !old_resource.empty())
-  path = document_path(requested, contracts::WorkspaceResource::From(old_resource, 1));
+ if (std::filesystem::is_directory(requested) && !std::filesystem::exists(path) && !old_resource.empty()) path = document_path(requested, contracts::WorkspaceResource::From(old_resource, 1));
  std::ifstream input(path, std::ios::binary | std::ios::ate);
  const auto size = input.tellg();
  if (!input || size <= 0 || static_cast<std::uint64_t>(size) > contracts::kAnnotationUiStateByteBudget) return {};
@@ -128,7 +130,8 @@ std::optional<LoadedAnnotationDocument> load_annotation_document(const contracts
  input.seekg(0);
  if (!input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size))) return {};
  auto loaded = contracts::decode_annotation_persistence(bytes);
- if (!loaded || !loaded->scene.frame_ready || paired.frame_width != loaded->scene.frame_width || paired.frame_height != loaded->scene.frame_height || paired.frame_index != loaded->scene.frame_index) return {};
+ if (!loaded || !loaded->scene.frame_ready || paired.frame_width != loaded->scene.frame_width || paired.frame_height != loaded->scene.frame_height || paired.frame_index != loaded->scene.frame_index)
+  return {};
  const bool legacy = !old_resource.empty() && loaded->scene.document.view() == old_resource;
  if (!legacy && paired.document.view() != loaded->scene.document.view()) return {};
  // A legacy constant view never proves historical pixel provenance. The

@@ -106,7 +106,8 @@ void build_instance_colors_async(const std::int32_t* labels, const std::size_t c
  if (labels == nullptr || colors_rgb == nullptr || stream == nullptr) { throw std::invalid_argument("RF-DETR instance color generation requires device buffers and a stream"); }
  ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::build_category_colors_cuda({labels, count, num_classes, colors_rgb, stream})), "RF-DETR instance color generation");
 }
-void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor& result_boxes, const at::Tensor& result_labels, const at::Tensor& result_masks, const RenderSampleOptions& options, const at::Tensor* keypoints) {
+void EvaluationSampleWriter::Draw(
+ const at::Tensor& image_chw, const at::Tensor& result_boxes, const at::Tensor& result_labels, const at::Tensor& result_masks, const RenderSampleOptions& options, const at::Tensor* keypoints) {
  if (image_chw.numel() == 0) { return; }
  const auto device = image_chw.device();
  if (!device.is_cuda()) throw std::invalid_argument("eval sample writer requires a CUDA image");
@@ -176,8 +177,7 @@ void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor&
     if (schema.names.empty()) continue;
     if (schema.names.size() > static_cast<size_t>(packets.size(1))) throw std::invalid_argument("sample joints exceed tensor capacity");
     auto projection = raster::append_skeleton_projection(impl_->skeleton_words, schema, [&](std::size_t joint) {
-     KeypointPrediction packet;
-     std::memcpy(&packet, packets.data_ptr<float>() + (index * packets.size(1) + joint) * KeypointPredictionPacket::size, sizeof(packet));
+     const auto packet = KeypointPredictionPacket::load(packets.data_ptr<float>() + (index * packets.size(1) + joint) * KeypointPredictionPacket::size);
      const auto point = decode_prediction_keypoint(packet);
      return raster::SkeletonSample{point.x, point.y, packet.findable_logit >= 0 ? 1.0F : 0.0F, options.uncertainty ? keypoint_covariance(point) : std::array<float, 3>{}};
     }, {}, {}, raster::SkeletonRounding::ToEven);
@@ -196,12 +196,15 @@ void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor&
     impl_->skeleton_device.narrow(0, 0, words).copy_(impl_->skeleton_host.narrow(0, 0, words), true);
     const raster::MutableBytes surface{overlay.data_ptr<uint8_t>(), static_cast<size_t>(width) * 4U, width, height};
     for (const auto& skeleton : impl_->skeletons)
-     ensure_cuda_ok(static_cast<cudaError_t>(raster::raster_projected_skeleton(surface, reinterpret_cast<const uint32_t*>(impl_->skeleton_device.data_ptr<int>()), skeleton, draw_stream.stream(), options.keypoints, options.uncertainty)), "RF-DETR sample skeleton raster");
+     ensure_cuda_ok(static_cast<cudaError_t>(raster::raster_projected_skeleton(
+                     surface, reinterpret_cast<const uint32_t*>(impl_->skeleton_device.data_ptr<int>()), skeleton, draw_stream.stream(), options.keypoints, options.uncertainty)),
+      "RF-DETR sample skeleton raster");
     impl_->skeleton_device.record_stream(draw_stream);
    }
-   ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::composite_rgba({
-    mmltk::backend::imaging::raster::pitched_rgba_target(rgba.data_ptr<uint8_t>(), static_cast<size_t>(width) * 4U, width, height),
-    {overlay.data_ptr<uint8_t>(), static_cast<size_t>(width) * 4U, width, height}, draw_stream.stream()})), "RF-DETR sample joint composition");
+   ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::composite_rgba(
+                   {mmltk::backend::imaging::raster::pitched_rgba_target(rgba.data_ptr<uint8_t>(), static_cast<size_t>(width) * 4U, width, height),
+                    {overlay.data_ptr<uint8_t>(), static_cast<size_t>(width) * 4U, width, height}, draw_stream.stream()})),
+    "RF-DETR sample joint composition");
    image_u8 = rgba.narrow(-1, 0, 3).contiguous();
    keypoints->record_stream(draw_stream);
    overlay.record_stream(draw_stream);

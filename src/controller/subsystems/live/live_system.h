@@ -47,7 +47,8 @@ public:
  virtual void SetOutputAvailableSink(std::function<void()>) = 0;
  [[nodiscard]] virtual bool AcquireOutput() = 0;
  // Success replaces all active pixels and analysis, and settles receiver reads before returning.
- [[nodiscard]] virtual bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream, mmltk::backend::media::live::LiveAnalysisProduct&, std::stop_token) = 0;
+ [[nodiscard]] virtual bool Capture(
+  mmltk::frameworks::gpu::ImagePlaneView target, mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream, mmltk::backend::media::live::LiveAnalysisProduct&, std::stop_token) = 0;
  virtual void RenderAnalysis(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, const mmltk::backend::media::live::LiveAnalysisProduct&) {}
  [[nodiscard]] virtual mmltk::backend::media::capture::Status Stop() noexcept = 0;
 };
@@ -84,7 +85,7 @@ struct LiveImageMetadata final {
  VisualFrame frame{};
  VisualDocumentFacts document{};
  bool analyzed = false;
- MMLTK_MAX_ITEMS(contracts::kAnnotationObjectCapacity) std::vector<VisualObjectLabel> labels;
+ MMLTK_MAX_ITEMS(contracts::kAnnotationObjectCapacity) std::vector<VisualObjectLabel> labels {};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] LiveFrameCompleted final {
  // CLEANUP-IGNORE: Frame completion is a distinct transient event in the generated Live vocabulary.

@@ -350,7 +350,7 @@ MMLTK_REFLECT_ENUM(WorkspaceAspectRatio)
 struct ExploreSettingsProjection final : mmltk::frameworks::reflection::StaticMemberRelation<
                                           // CLEANUP-IGNORE: Each relation entry identifies a different persisted field and destination; generic
                                           // projection already owns the repeated machinery.
-                                          ExploreViewState, ExploreFilterUpdate, 11U,
+                                          ExploreViewState, ExploreFilterUpdate, 12U,
                                           mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::require_boxes>,
                                            mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::require_boxes>>,
                                           mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::require_masks>,
@@ -384,5 +384,5 @@ struct ExploreSettingsProjection final : mmltk::frameworks::reflection::StaticMe
  using namespace mmltk::frameworks::reflection;
  return ExploreSettingsProjection::valid();
 }
-static_assert(explore_settings_projection_is_complete(), "Explore settings projection must cover eleven unique typed source and destination members");
+static_assert(explore_settings_projection_is_complete(), "Explore settings projection must cover every required unique typed source and destination member");
 }  // namespace mmltk::controller::contracts

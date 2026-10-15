@@ -1848,9 +1848,9 @@ void lower_scaled_dot_product_attention_node(torch::jit::Node* node) {
    // The public SDPA operator uses true for admitted attention. The math
    // primitive receives its already-converted additive mask.
    if (math) throw_lowering_error(node, "math attention requires an additive mask");
-   mask = chain.append(kOnnxWhere, {mask, create_scalar_constant(node, 0.0, accumulator_type),
-    create_scalar_constant(node, -std::numeric_limits<double>::infinity(), accumulator_type)})->output();
-  } else if (*mask_type != accumulator_type) mask = cast(mask, accumulator_type);
+   mask = chain.append(kOnnxWhere, {mask, create_scalar_constant(node, 0.0, accumulator_type), create_scalar_constant(node, -std::numeric_limits<double>::infinity(), accumulator_type)})->output();
+  } else if (*mask_type != accumulator_type)
+   mask = cast(mask, accumulator_type);
   scores = chain.append(kOnnxAdd, {scores->output(), mask});
  }
  auto* softmax = chain.append(kOnnxSoftmax, {scores->output()});
@@ -1949,99 +1949,99 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
 //   SYMBOL(sym, fn, onnx)  -> fn(node, onnx)
 //   CREATE(sym, fill)      -> lower_creation_node(node, fill)
 //   RESIZE(sym, mode)      -> lower_resize_node(node, mode)
-#define MMLTK_ONNX_LOWERING_TABLE(NODE, CTX, SYMBOL, CREATE, RESIZE) \
- NODE(kAtenTo, lower_cast_like_node)                                 \
- NODE(kAtenTypeAs, lower_cast_like_node)                             \
- CTX(kSegmentationDepthwise, lower_convolution_node)                 \
- CTX(kAtenConvolution, lower_convolution_node)                       \
- NODE(kAtenFlatten, lower_static_reshape_node)                       \
- NODE(kAtenView, lower_static_reshape_node)                          \
- NODE(kAtenReshapeAs, lower_static_reshape_node)                    \
- NODE(kAtenViewAs, lower_static_reshape_node)                       \
- NODE(kAtenExpandAs, lower_expand_as_node)                          \
- NODE(kAtenRepeatInterleave, lower_repeat_interleave_node)           \
- NODE(kAtenNanToNum, lower_nan_to_num_node)                          \
- NODE(kAtenReshape, lower_static_reshape_node)                       \
- NODE(kAtenUnsqueeze, lower_static_reshape_node)                     \
- NODE(kAtenSqueeze, lower_static_reshape_node)                       \
- NODE(kAtenT, lower_t_node)                                          \
- NODE(kAtenTranspose, lower_transpose_node)                          \
- NODE(kAtenPermute, lower_permute_node)                              \
- NODE(kAtenContiguous, lower_passthrough_node)                       \
- NODE(kAtenDetach, lower_passthrough_node)                           \
- NODE(kAtenAlias, lower_passthrough_node)                            \
- NODE(kAtenCat, lower_cat_node)                                      \
- NODE(kAtenStack, lower_stack_node)                                  \
- NODE(kAtenExpand, lower_expand_node)                                \
- NODE(kAtenRepeat, lower_repeat_node)                                \
- NODE(kAtenSoftmax, lower_softmax_node)                              \
- SYMBOL(kAtenSigmoid, lower_unary_node, kOnnxSigmoid)                \
- NODE(kAtenSilu, lower_silu_node)                                    \
- SYMBOL(kAtenRelu, lower_unary_node, kOnnxRelu)                      \
- SYMBOL(kAtenTanh, lower_unary_node, kOnnxTanh)                      \
- NODE(kAtenDropout, lower_dropout_node)                              \
- NODE(kAtenLayerNorm, lower_layer_norm_node)                         \
- NODE(kAtenNativeLayerNorm, lower_layer_norm_node)                   \
+#define MMLTK_ONNX_LOWERING_TABLE(NODE, CTX, SYMBOL, CREATE, RESIZE)          \
+ NODE(kAtenTo, lower_cast_like_node)                                          \
+ NODE(kAtenTypeAs, lower_cast_like_node)                                      \
+ CTX(kSegmentationDepthwise, lower_convolution_node)                          \
+ CTX(kAtenConvolution, lower_convolution_node)                                \
+ NODE(kAtenFlatten, lower_static_reshape_node)                                \
+ NODE(kAtenView, lower_static_reshape_node)                                   \
+ NODE(kAtenReshapeAs, lower_static_reshape_node)                              \
+ NODE(kAtenViewAs, lower_static_reshape_node)                                 \
+ NODE(kAtenExpandAs, lower_expand_as_node)                                    \
+ NODE(kAtenRepeatInterleave, lower_repeat_interleave_node)                    \
+ NODE(kAtenNanToNum, lower_nan_to_num_node)                                   \
+ NODE(kAtenReshape, lower_static_reshape_node)                                \
+ NODE(kAtenUnsqueeze, lower_static_reshape_node)                              \
+ NODE(kAtenSqueeze, lower_static_reshape_node)                                \
+ NODE(kAtenT, lower_t_node)                                                   \
+ NODE(kAtenTranspose, lower_transpose_node)                                   \
+ NODE(kAtenPermute, lower_permute_node)                                       \
+ NODE(kAtenContiguous, lower_passthrough_node)                                \
+ NODE(kAtenDetach, lower_passthrough_node)                                    \
+ NODE(kAtenAlias, lower_passthrough_node)                                     \
+ NODE(kAtenCat, lower_cat_node)                                               \
+ NODE(kAtenStack, lower_stack_node)                                           \
+ NODE(kAtenExpand, lower_expand_node)                                         \
+ NODE(kAtenRepeat, lower_repeat_node)                                         \
+ NODE(kAtenSoftmax, lower_softmax_node)                                       \
+ SYMBOL(kAtenSigmoid, lower_unary_node, kOnnxSigmoid)                         \
+ NODE(kAtenSilu, lower_silu_node)                                             \
+ SYMBOL(kAtenRelu, lower_unary_node, kOnnxRelu)                               \
+ SYMBOL(kAtenTanh, lower_unary_node, kOnnxTanh)                               \
+ NODE(kAtenDropout, lower_dropout_node)                                       \
+ NODE(kAtenLayerNorm, lower_layer_norm_node)                                  \
+ NODE(kAtenNativeLayerNorm, lower_layer_norm_node)                            \
  SYMBOL(kAtenNeg, lower_unary_node, c10::Symbol::fromQualString("onnx::Neg")) \
- SYMBOL(kAtenSin, lower_unary_node, kOnnxSin)                        \
- SYMBOL(kAtenCos, lower_unary_node, kOnnxCos)                        \
- SYMBOL(kAtenExp, lower_unary_node, kOnnxExp)                        \
- SYMBOL(kAtenLog, lower_unary_node, kOnnxLog)                        \
- SYMBOL(kAtenAbs, lower_unary_node, kOnnxAbs)                        \
- SYMBOL(kAtenFloor, lower_unary_node, kOnnxFloor)                    \
- NODE(kAtenGelu, lower_gelu_node)                                    \
- NODE(kAtenClampMin, lower_clamp_min_node)                           \
- NODE(kAtenClampMax, lower_clamp_max_node)                           \
- NODE(kAtenClamp, lower_clamp_node)                                  \
- SYMBOL(kAtenAdd, lower_binary_arithmetic_node, kOnnxAdd)            \
- NODE(kAtenAddInplace, lower_inplace_add_node)                       \
- SYMBOL(kAtenSub, lower_binary_arithmetic_node, kOnnxSub)            \
- SYMBOL(kAtenRsub, lower_binary_arithmetic_node, kOnnxSub)           \
- SYMBOL(kAtenMul, lower_binary_arithmetic_node, kOnnxMul)            \
- SYMBOL(kAtenDiv, lower_binary_arithmetic_node, kOnnxDiv)            \
- SYMBOL(kAtenPow, lower_binary_arithmetic_node, kOnnxPow)            \
- SYMBOL(kAtenGt, lower_binary_comparison_node, kOnnxGreater)         \
- SYMBOL(kAtenLt, lower_binary_comparison_node, kOnnxLess)            \
- SYMBOL(kAtenGe, lower_binary_comparison_node, kOnnxGreaterOrEqual)  \
- SYMBOL(kAtenLe, lower_binary_comparison_node, kOnnxLessOrEqual)     \
- SYMBOL(kAtenEq, lower_binary_comparison_node, kOnnxEqual)           \
- NODE(kAtenNe, lower_not_equal_node)                                 \
- NODE(kAtenAnd, lower_bool_and_node)                                 \
- NODE(kAtenBitwiseAnd, lower_bool_and_node)                          \
- NODE(kAtenBitwiseAndInplace, lower_inplace_bool_and_node)           \
- SYMBOL(kAtenLogicalNot, lower_unary_node, kOnnxNot)                 \
- SYMBOL(kAtenBitwiseNot, lower_unary_node, kOnnxNot)                 \
- NODE(kAtenSlice, lower_slice_node)                                  \
- NODE(kAtenSelect, lower_select_node)                                \
- NODE(kAtenNarrow, lower_narrow_node)                                \
- NODE(kAtenGather, lower_gather_node)                                \
- NODE(kAtenIndexSelect, lower_index_select_node)                     \
- NODE(kAtenMaskedFill, lower_masked_fill_node)                       \
- NODE(kAtenArange, lower_arange_node)                                \
- NODE(kAtenEinsum, lower_einsum_node)                                \
- SYMBOL(kAtenSum, lower_reduce_node, kOnnxReduceSum)                 \
- SYMBOL(kAtenMean, lower_reduce_node, kOnnxReduceMean)               \
- SYMBOL(kAtenProd, lower_reduce_node, kOnnxReduceProd)               \
- NODE(kAtenAll, lower_all_node)                                      \
- NODE(kAtenCumsum, lower_cumsum_node)                                \
- NODE(kAtenArgmax, lower_argmax_node)                                \
- NODE(kAtenTopk, lower_topk_node)                                    \
- NODE(kAtenMatmul, lower_matmul_node)                                \
- NODE(kAtenLinear, lower_linear_node)                                \
- NODE(kAtenBmm, lower_matmul_node)                                   \
- CREATE(kAtenOnesLike, 1.0)                                          \
- CREATE(kAtenNewOnes, 1.0)                                           \
- CREATE(kAtenOnes, 1.0)                                              \
- CREATE(kAtenZerosLike, 0.0)                                         \
- CREATE(kAtenNewZeros, 0.0)                                          \
- CREATE(kAtenZeros, 0.0)                                             \
- NODE(kAtenFullLike, lower_full_like_node)                           \
- NODE(kAtenFull, lower_full_node)                                    \
- RESIZE(kAtenUpsampleNearest2d, "nearest")                           \
- RESIZE(kAtenUpsampleBilinear2d, "linear")                           \
- RESIZE(kAtenUpsampleBicubic2dAa, "cubic")                           \
- NODE(kAtenGridSampler, lower_grid_sampler_node)                     \
- NODE(kMathAttention, lower_scaled_dot_product_attention_node)       \
+ SYMBOL(kAtenSin, lower_unary_node, kOnnxSin)                                 \
+ SYMBOL(kAtenCos, lower_unary_node, kOnnxCos)                                 \
+ SYMBOL(kAtenExp, lower_unary_node, kOnnxExp)                                 \
+ SYMBOL(kAtenLog, lower_unary_node, kOnnxLog)                                 \
+ SYMBOL(kAtenAbs, lower_unary_node, kOnnxAbs)                                 \
+ SYMBOL(kAtenFloor, lower_unary_node, kOnnxFloor)                             \
+ NODE(kAtenGelu, lower_gelu_node)                                             \
+ NODE(kAtenClampMin, lower_clamp_min_node)                                    \
+ NODE(kAtenClampMax, lower_clamp_max_node)                                    \
+ NODE(kAtenClamp, lower_clamp_node)                                           \
+ SYMBOL(kAtenAdd, lower_binary_arithmetic_node, kOnnxAdd)                     \
+ NODE(kAtenAddInplace, lower_inplace_add_node)                                \
+ SYMBOL(kAtenSub, lower_binary_arithmetic_node, kOnnxSub)                     \
+ SYMBOL(kAtenRsub, lower_binary_arithmetic_node, kOnnxSub)                    \
+ SYMBOL(kAtenMul, lower_binary_arithmetic_node, kOnnxMul)                     \
+ SYMBOL(kAtenDiv, lower_binary_arithmetic_node, kOnnxDiv)                     \
+ SYMBOL(kAtenPow, lower_binary_arithmetic_node, kOnnxPow)                     \
+ SYMBOL(kAtenGt, lower_binary_comparison_node, kOnnxGreater)                  \
+ SYMBOL(kAtenLt, lower_binary_comparison_node, kOnnxLess)                     \
+ SYMBOL(kAtenGe, lower_binary_comparison_node, kOnnxGreaterOrEqual)           \
+ SYMBOL(kAtenLe, lower_binary_comparison_node, kOnnxLessOrEqual)              \
+ SYMBOL(kAtenEq, lower_binary_comparison_node, kOnnxEqual)                    \
+ NODE(kAtenNe, lower_not_equal_node)                                          \
+ NODE(kAtenAnd, lower_bool_and_node)                                          \
+ NODE(kAtenBitwiseAnd, lower_bool_and_node)                                   \
+ NODE(kAtenBitwiseAndInplace, lower_inplace_bool_and_node)                    \
+ SYMBOL(kAtenLogicalNot, lower_unary_node, kOnnxNot)                          \
+ SYMBOL(kAtenBitwiseNot, lower_unary_node, kOnnxNot)                          \
+ NODE(kAtenSlice, lower_slice_node)                                           \
+ NODE(kAtenSelect, lower_select_node)                                         \
+ NODE(kAtenNarrow, lower_narrow_node)                                         \
+ NODE(kAtenGather, lower_gather_node)                                         \
+ NODE(kAtenIndexSelect, lower_index_select_node)                              \
+ NODE(kAtenMaskedFill, lower_masked_fill_node)                                \
+ NODE(kAtenArange, lower_arange_node)                                         \
+ NODE(kAtenEinsum, lower_einsum_node)                                         \
+ SYMBOL(kAtenSum, lower_reduce_node, kOnnxReduceSum)                          \
+ SYMBOL(kAtenMean, lower_reduce_node, kOnnxReduceMean)                        \
+ SYMBOL(kAtenProd, lower_reduce_node, kOnnxReduceProd)                        \
+ NODE(kAtenAll, lower_all_node)                                               \
+ NODE(kAtenCumsum, lower_cumsum_node)                                         \
+ NODE(kAtenArgmax, lower_argmax_node)                                         \
+ NODE(kAtenTopk, lower_topk_node)                                             \
+ NODE(kAtenMatmul, lower_matmul_node)                                         \
+ NODE(kAtenLinear, lower_linear_node)                                         \
+ NODE(kAtenBmm, lower_matmul_node)                                            \
+ CREATE(kAtenOnesLike, 1.0)                                                   \
+ CREATE(kAtenNewOnes, 1.0)                                                    \
+ CREATE(kAtenOnes, 1.0)                                                       \
+ CREATE(kAtenZerosLike, 0.0)                                                  \
+ CREATE(kAtenNewZeros, 0.0)                                                   \
+ CREATE(kAtenZeros, 0.0)                                                      \
+ NODE(kAtenFullLike, lower_full_like_node)                                    \
+ NODE(kAtenFull, lower_full_node)                                             \
+ RESIZE(kAtenUpsampleNearest2d, "nearest")                                    \
+ RESIZE(kAtenUpsampleBilinear2d, "linear")                                    \
+ RESIZE(kAtenUpsampleBicubic2dAa, "cubic")                                    \
+ NODE(kAtenGridSampler, lower_grid_sampler_node)                              \
+ NODE(kMathAttention, lower_scaled_dot_product_attention_node)                \
  NODE(kAtenScaledDotProductAttention, lower_scaled_dot_product_attention_node)
 #define MMLTK_LOWER_NODE(key, fn) {key, [](torch::jit::Node* node, const LoweringContext&) { fn(node); }},
 #define MMLTK_LOWER_CTX(key, fn) {key, [](torch::jit::Node* node, const LoweringContext& context) { fn(node, context); }},

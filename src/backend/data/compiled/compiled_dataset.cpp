@@ -71,7 +71,8 @@ std::expected<CompiledDataset, std::error_code> CompiledDataset::try_open(
  else
   summarize(0, store.header_.num_slots);
  throw_if_compiled_validation_cancelled(0, options.cancellation);
- store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_, {reinterpret_cast<const std::byte*>(store.mapping_.data()) + sizeof(FileHeader), store.header_.catalog_bytes}));
+ store.catalog_ =
+  std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_, {reinterpret_cast<const std::byte*>(store.mapping_.data()) + sizeof(FileHeader), store.header_.catalog_bytes}));
  return store;
 }
 const std::filesystem::path& CompiledDataset::path() const noexcept { return path_; }

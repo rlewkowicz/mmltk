@@ -46,7 +46,13 @@ pub fn panel<'a, Message: Clone + 'a>(
     upscale_available: bool,
     upscale_requested: impl Fn(crate::generated::UpscaleKernel) -> Message,
 ) -> Element<'a, Message> {
-    let upscale = upscale_controls(ids.upscale, active, pending, upscale_available, upscale_requested);
+    let upscale = upscale_controls(
+        ids.upscale,
+        active,
+        pending,
+        upscale_available,
+        upscale_requested,
+    );
     let panel = container(
         column![
             row![
@@ -101,7 +107,13 @@ pub fn panel<'a, Message: Clone + 'a>(
     )
     .into()
 }
-fn upscale_controls<'a, Message: Clone + 'a>(ids: [&'static str; 3], active: Option<crate::generated::UpscaleKernel>, pending: Option<crate::generated::UpscaleKernel>, upscale_available: bool, upscale_requested: impl Fn(crate::generated::UpscaleKernel) -> Message) -> Element<'a, Message> {
+fn upscale_controls<'a, Message: Clone + 'a>(
+    ids: [&'static str; 3],
+    active: Option<crate::generated::UpscaleKernel>,
+    pending: Option<crate::generated::UpscaleKernel>,
+    upscale_available: bool,
+    upscale_requested: impl Fn(crate::generated::UpscaleKernel) -> Message,
+) -> Element<'a, Message> {
     let upscale = crate::generated::UPSCALE_KERNEL_VALUES
         .iter()
         .copied()
@@ -129,17 +141,60 @@ fn upscale_controls<'a, Message: Clone + 'a>(ids: [&'static str; 3], active: Opt
     upscale.into()
 }
 #[derive(Debug, Clone)]
-pub enum ProductAction { Annotate, Upscale(crate::generated::UpscaleKernel) }
-pub fn product_actions<'a>(page: crate::generated::FeatureId, model: &crate::view_model::ApplicationModel) -> Element<'a, ProductAction> {
+pub enum ProductAction {
+    Annotate,
+    Upscale(crate::generated::UpscaleKernel),
+}
+pub fn product_actions<'a>(
+    page: crate::generated::FeatureId,
+    model: &crate::view_model::ApplicationModel,
+) -> Element<'a, ProductAction> {
     let (annotate, upscale) = match page {
-        crate::generated::FeatureId::Live => ("live.annotate", ["live.upscale.basic", "live.upscale.fast", "live.upscale.neural"]),
-        _ => ("predict.annotate", ["predict.upscale.basic", "predict.upscale.fast", "predict.upscale.neural"]),
+        crate::generated::FeatureId::Live => (
+            "live.annotate",
+            [
+                "live.upscale.basic",
+                "live.upscale.fast",
+                "live.upscale.neural",
+            ],
+        ),
+        _ => (
+            "predict.annotate",
+            [
+                "predict.upscale.basic",
+                "predict.upscale.fast",
+                "predict.upscale.neural",
+            ],
+        ),
     };
-    let pending = model.requested_upscale.as_ref().map(|request| request.kernel).filter(|kernel| Some(*kernel) != model.displayed_upscale_kernel());
+    let pending = model
+        .requested_upscale
+        .as_ref()
+        .map(|request| request.kernel)
+        .filter(|kernel| Some(*kernel) != model.displayed_upscale_kernel());
     column![
-        row![text("Upscale"), upscale_controls(upscale, model.displayed_upscale_kernel(), pending, model.upscale_start_available(), ProductAction::Upscale)].spacing(7),
-        container(button("Open in Annotation").on_press_maybe((model.annotation_import_available() && crate::presentation_surface::viewer_annotation_request().is_some()).then_some(ProductAction::Annotate))).id(annotate),
-    ].spacing(7).into()
+        row![
+            text("Upscale"),
+            upscale_controls(
+                upscale,
+                model.displayed_upscale_kernel(),
+                pending,
+                model.upscale_start_available(),
+                ProductAction::Upscale
+            )
+        ]
+        .spacing(7),
+        container(
+            button("Open in Annotation").on_press_maybe(
+                (model.annotation_import_available()
+                    && crate::presentation_surface::viewer_annotation_request().is_some())
+                .then_some(ProductAction::Annotate)
+            )
+        )
+        .id(annotate),
+    ]
+    .spacing(7)
+    .into()
 }
 pub fn upscale_label(kernel: crate::generated::UpscaleKernel) -> &'static str {
     match kernel {

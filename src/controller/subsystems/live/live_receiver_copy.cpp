@@ -18,15 +18,16 @@ LiveReceiverCopyOperations native_live_receiver_copy_operations() noexcept {
  };
 }
 cudaError_t copy_live_receiver_frame(const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
- mmltk::backend::media::live::LiveCompositeOutputLease& lease, mmltk::backend::media::live::LiveAnalysisProduct& analysis,
- const std::uintptr_t stream, const LiveReceiverCopyOperations& operations) noexcept {
+ mmltk::backend::media::live::LiveCompositeOutputLease& lease, mmltk::backend::media::live::LiveAnalysisProduct& analysis, const std::uintptr_t stream,
+ const LiveReceiverCopyOperations& operations) noexcept {
  if (!clean.valid() || !semantic.valid() || clean.data == semantic.data || !lease || stream == 0U || !operations.valid()) return cudaErrorInvalidValue;
  const auto& source = lease.view();
  if (clean.descriptor.kind != mmltk::frameworks::gpu::ImagePlaneKind::Clean || semantic.descriptor.kind != mmltk::frameworks::gpu::ImagePlaneKind::Semantic ||
-     clean.descriptor.format != mmltk::frameworks::gpu::ImageFormat::Rgba8 || semantic.descriptor.format != mmltk::frameworks::gpu::ImageFormat::Rgba8 ||
-     source.width != clean.descriptor.width || source.height != clean.descriptor.height || source.width != semantic.descriptor.width || source.height != semantic.descriptor.height ||
-     source.ready_event != lease.frame_revision().ready_event || source.clean_pitch_bytes < clean.descriptor.row_bytes() || source.semantic_pitch_bytes < semantic.descriptor.row_bytes() ||
-     (source.analysis && (!source.analysis->ready() || source.analysis->frame() != lease.frame_revision().frame))) return cudaErrorInvalidValue;
+     clean.descriptor.format != mmltk::frameworks::gpu::ImageFormat::Rgba8 || semantic.descriptor.format != mmltk::frameworks::gpu::ImageFormat::Rgba8 || source.width != clean.descriptor.width ||
+     source.height != clean.descriptor.height || source.width != semantic.descriptor.width || source.height != semantic.descriptor.height || source.ready_event != lease.frame_revision().ready_event ||
+     source.clean_pitch_bytes < clean.descriptor.row_bytes() || source.semantic_pitch_bytes < semantic.descriptor.row_bytes() ||
+     (source.analysis && (!source.analysis->ready() || source.analysis->frame() != lease.frame_revision().frame)))
+  return cudaErrorInvalidValue;
  cudaError_t status = operations.wait(stream, source.ready_event);
  if (status == cudaSuccess) status = operations.copy(clean, source.clean, source.clean_pitch_bytes, stream);
  if (status == cudaSuccess) status = operations.copy(semantic, source.semantic, source.semantic_pitch_bytes, stream);
@@ -36,11 +37,11 @@ cudaError_t copy_live_receiver_frame(const mmltk::frameworks::gpu::ImagePlaneVie
  if (settled != cudaSuccess) return settled;
  if (status == cudaSuccess) {
   try {
-   if (source.analysis) analysis.CopyFrom(*source.analysis);
-   else analysis.Reset(lease.frame_revision().frame);
-  } catch (const std::bad_alloc&) {
-   status = cudaErrorMemoryAllocation;
-  } catch (...) {
+   if (source.analysis)
+    analysis.CopyFrom(*source.analysis);
+   else
+    analysis.Reset(lease.frame_revision().frame);
+  } catch (const std::bad_alloc&) { status = cudaErrorMemoryAllocation; } catch (...) {
    status = cudaErrorInvalidValue;
   }
  }

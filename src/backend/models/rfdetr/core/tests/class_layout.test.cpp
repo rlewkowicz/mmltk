@@ -130,15 +130,14 @@ TEST_CASE("Class descriptors admit every canonical named output role", "[model][
   if (entry.value != r::RfdetrOutputRole::Unspecified) descriptor.output_roles.push_back({std::string(entry.name), entry.value});
  }
  CHECK(descriptor.output_roles.size() == r::kMaximumNamedOutputRoles);
- CHECK(r::decode_class_descriptor(r::encode_class_descriptor(descriptor)).output_roles == descriptor.output_roles);
+ CHECK(std::ranges::equal(r::decode_class_descriptor(r::encode_class_descriptor(descriptor)).output_roles, descriptor.output_roles));
  descriptor.output_roles.back().role = descriptor.output_roles.front().role;
  CHECK_THROWS(r::encode_class_descriptor(descriptor));
 }
 TEST_CASE("Artifact output roles preserve persisted identity and all task orderings", "[model][rfdetr][layout]") {
  using Role = r::RfdetrOutputRole;
  constexpr std::array spellings{"Unspecified", "Logits", "Boxes", "Masks", "Keypoints", "KeypointScores", "KeypointPrecision"};
- for (std::size_t index = 0; index < spellings.size(); ++index)
-  CHECK(mmltk::frameworks::reflection::enum_name(static_cast<Role>(index)) == spellings[index]);
+ for (std::size_t index = 0; index < spellings.size(); ++index) CHECK(mmltk::frameworks::reflection::enum_name(static_cast<Role>(index)) == spellings[index]);
  const auto task = GENERATE(r::ModelTask::Detection, r::ModelTask::Segmentation, r::ModelTask::Keypoints);
  const bool renamed = GENERATE(false, true);
  const auto dtype = GENERATE("float32", "float16", "bfloat16", "float64");
@@ -150,8 +149,10 @@ TEST_CASE("Artifact output roles preserve persisted identity and all task orderi
   auto info = original;
   for (std::size_t index = 0; index < info.outputs.size(); ++index) {
    info.outputs[index] = original.outputs[order[index]];
-   if (renamed) info.outputs[index].name = "producer_" + info.outputs[index].name;
-   else info.outputs[index].role = Role::Unspecified;
+   if (renamed)
+    info.outputs[index].name = "producer_" + info.outputs[index].name;
+   else
+    info.outputs[index].role = Role::Unspecified;
   }
   const auto roles = r::validate_rfdetr_output_layout(info);
   CHECK(roles.index<Role::Logits>() == static_cast<std::size_t>(std::ranges::find(order, 0) - order.begin()));
@@ -178,19 +179,24 @@ TEST_CASE("Artifact task roles reject contradictory incomplete and unsupported o
  SECTION("missing logits") { info.outputs.erase(info.outputs.begin()); }
  SECTION("missing boxes") { info.outputs.erase(info.outputs.begin() + 1); }
  SECTION("missing task output or unexpected task") {
-  if (task == r::ModelTask::Detection) info.output_contract->task = r::ModelTask::Segmentation;
-  else info.outputs.pop_back();
+  if (task == r::ModelTask::Detection)
+   info.output_contract->task = r::ModelTask::Segmentation;
+  else
+   info.outputs.pop_back();
  }
  SECTION("extra task tensor") {
-  if (task == r::ModelTask::Segmentation) info.outputs.push_back({"pred_keypoints", {2, 4, 2, 8}, "float32"});
-  else info.outputs.push_back({"pred_masks", {2, 4, 12, 16}, "float32"});
+  if (task == r::ModelTask::Segmentation)
+   info.outputs.push_back({"pred_keypoints", {2, 4, 2, 8}, "float32"});
+  else
+   info.outputs.push_back({"pred_masks", {2, 4, 12, 16}, "float32"});
  }
  SECTION("canonical name conflicts with explicit role") { info.outputs[0].role = Role::Boxes; }
  SECTION("renamed duplicate role") { info.outputs.push_back({"producer_scores", {2, 4, 3}, "float32", Role::Logits}); }
- SECTION("unsupported descriptor role") {
-  info.outputs.push_back({"producer_optional", {2, 4, 2}, "float32", GENERATE(Role::KeypointScores, Role::KeypointPrecision, static_cast<Role>(255))});
+ SECTION("unsupported descriptor role") { info.outputs.push_back({"producer_optional", {2, 4, 2}, "float32", GENERATE(Role::KeypointScores, Role::KeypointPrecision, static_cast<Role>(255))}); }
+ SECTION("unresolved producer name") {
+  info.outputs[0].name = "producer_scores";
+  info.outputs[0].role = Role::Unspecified;
  }
- SECTION("unresolved producer name") { info.outputs[0].name = "producer_scores"; info.outputs[0].role = Role::Unspecified; }
  SECTION("rank") { info.outputs[0].shape.push_back(1); }
  SECTION("zero batch") { info.outputs[0].shape[0] = 0; }
  SECTION("invalid dynamic batch") { info.outputs[0].shape[0] = -2; }
@@ -201,15 +207,16 @@ TEST_CASE("Artifact task roles reject contradictory incomplete and unsupported o
  SECTION("empty terminal extent") { info.outputs.back().shape.back() = 0; }
  SECTION("box width") { info.outputs[1].shape[2] = 5; }
  SECTION("dtype disagreement") { info.outputs[1].dtype = "float16"; }
- SECTION("nonfloating outputs") { for (auto& output : info.outputs) output.dtype = "int32"; }
+ SECTION("nonfloating outputs") {
+  for (auto& output : info.outputs) output.dtype = "int32";
+ }
  CHECK_THROWS_AS(r::validate_rfdetr_output_layout(info), std::invalid_argument);
 }
-
 TEST_CASE("Model schema admission bounds escaped JSON and validates optional raw evidence", "[rfdetr][layout][keypoints]") {
  catalog::ClassKeypointSchema joints;
  for (unsigned index = 0; index < 128; ++index) {
   joints.names.push_back(std::to_string(index) + std::string(190, '\x01'));
-  joints.horizontal_flip.push_back(index);
+  joints.horizontal_flip.push_back(static_cast<catalog::JointIndex>(index));
   joints.oks_sigmas.push_back(.05);
  }
  catalog::OrderedClassCatalog catalog_record;
@@ -242,7 +249,6 @@ TEST_CASE("Model schema admission bounds escaped JSON and validates optional raw
  raw.class_name_evidence.keypoints->front().horizontal_flip[0] = 255;
  CHECK_THROWS(r::encode_class_layout(raw));
 }
-
 TEST_CASE("Joint configurations preserve independent foreground and physical slot capacities", "[rfdetr][layout][keypoints]") {
  auto config = r::native_config_from_preset(*r::find_preset_catalog_entry("rf-detr-keypoint-preview"));
  config.num_classes = r::kMaximumClassOutputSlots;
@@ -265,7 +271,6 @@ TEST_CASE("Joint configurations preserve independent foreground and physical slo
  CHECK(full_joints.compact_count() == 256);
  CHECK(full_joints.maximum_joints() == 256);
 }
-
 TEST_CASE("Joint Transfer projects catalog correspondence through physical slots in destination order", "[rfdetr][layout][keypoints]") {
  const catalog::ClassKeypointSchema pair{{"left", "right"}, {{0, 1}}, {1, 0}, {.1, .1}};
  const catalog::ClassKeypointSchema pin{{"tip"}, {}, {0}, {.2}};
@@ -309,15 +314,15 @@ TEST_CASE("Joint Transfer projects catalog correspondence through physical slots
  CHECK(r::keypoint_transfer_rows(active_first, source_joints, sparse, sparse_joints) == Rows{{2, 0}, {1, 1}, {0, 2}});
  CHECK_THROWS(r::keypoint_transfer_rows(r::ResolvedClassLayout(r::unresolved_class_layout(4)), source_joints, sparse, sparse_joints));
  auto disjoint_record = source_record;
- disjoint_record.keypoints = std::vector{catalog::ClassKeypointSchema{{"new_left", "new_right"}, {{0, 1}}, {1, 0}, {.1, .1}}, catalog::ClassKeypointSchema{{"new_tip"}, {}, {0}, {.2}}, catalog::ClassKeypointSchema{}};
+ disjoint_record.keypoints =
+  std::vector{catalog::ClassKeypointSchema{{"new_left", "new_right"}, {{0, 1}}, {1, 0}, {.1, .1}}, catalog::ClassKeypointSchema{{"new_tip"}, {}, {0}, {.2}}, catalog::ClassKeypointSchema{}};
  const r::ResolvedClassLayout disjoint(r::native_training_class_layout(catalog::ClassCatalog(disjoint_record)));
  CHECK(r::keypoint_transfer_rows(active_first, source_joints, disjoint, source_joints).empty());
 }
-
 TEST_CASE("Keypoint artifact admission requires a typed task and exact physical joint schema", "[model][rfdetr][layout][keypoints]") {
  catalog::OrderedClassCatalog names;
  names.names = {{"marker"}, {"plain"}};
- names.keypoints = std::vector{catalog::ClassKeypointSchema{{"left", "right"}, {{0,1}}, {1,0}, {.1,.1}}, catalog::ClassKeypointSchema{}};
+ names.keypoints = std::vector{catalog::ClassKeypointSchema{{"left", "right"}, {{0, 1}}, {1, 0}, {.1, .1}}, catalog::ClassKeypointSchema{}};
  r::ModelInfo info;
  info.class_layout = r::native_training_class_layout(catalog::ClassCatalog(names));
  info.outputs = {{"pred_keypoints", {1, 4, 2, 8}, "float32"}, {"pred_boxes", {1, 4, 4}, "float32"}, {"pred_logits", {1, 4, 3}, "float32"}};
@@ -344,7 +349,7 @@ TEST_CASE("Keypoint artifact admission requires a typed task and exact physical 
  legacy.output_contract.reset();
  CHECK_NOTHROW(r::validate_rfdetr_output_layout(legacy));
  CHECK(legacy.output_contract->task == r::ModelTask::Detection);
- legacy.outputs.push_back({"pred_masks", {1,4,12,16}, "float32"});
+ legacy.outputs.push_back({"pred_masks", {1, 4, 12, 16}, "float32"});
  legacy.output_contract.reset();
  CHECK_NOTHROW(r::validate_rfdetr_output_layout(legacy));
  CHECK(legacy.output_contract->task == r::ModelTask::Segmentation);

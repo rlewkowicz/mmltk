@@ -156,81 +156,95 @@ TEST_CASE("overwrite raster agrees with forward host painting for overlaps label
       CHECK(actual == expected);
      }
 }
-
 TEST_CASE("Semantic compositing preserves transparent alpha while opaque callers keep their pixels", "[raster][cuda][composite]") {
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  mmltk::testsupport::ScopedTestStream stream;
  struct Planes {
-  std::array<std::uint8_t,20> base{9,8,7,0, 100,0,0,128, 100,0,0,255, 9,8,7,128, 9,8,7,128};
-  std::array<std::uint8_t,20> over{0,100,0,128, 0,100,0,128, 0,100,0,128, 2,3,4,0, 2,3,4,255};
+  std::array<std::uint8_t, 20> base{9, 8, 7, 0, 100, 0, 0, 128, 100, 0, 0, 255, 9, 8, 7, 128, 9, 8, 7, 128};
+  std::array<std::uint8_t, 20> over{0, 100, 0, 128, 0, 100, 0, 128, 0, 100, 0, 128, 2, 3, 4, 0, 2, 3, 4, 255};
  } input;
  auto device = mmltk::testsupport::allocate_cuda_test_object<Planes>();
  const auto draw = [&](bool preserve) {
-  REQUIRE(cudaMemcpyAsync(device.get(),&input,sizeof(input),cudaMemcpyHostToDevice,stream.get()) == cudaSuccess);
+  REQUIRE(cudaMemcpyAsync(device.get(), &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
   auto* bytes = reinterpret_cast<std::uint8_t*>(device.get());
-  REQUIRE(raster::composite_rgba({.base_rgba=raster::pitched_rgba_target(bytes,20,5,1),
-   .overlay_rgba={bytes+offsetof(Planes,over),20,5,1},.stream={stream.get()},.preserve_alpha=preserve}) == cudaSuccess);
+  REQUIRE(
+   raster::composite_rgba(
+    {.base_rgba = raster::pitched_rgba_target(bytes, 20, 5, 1), .overlay_rgba = {bytes + offsetof(Planes, over), 20, 5, 1}, .stream = {stream.get()}, .preserve_alpha = preserve}) == cudaSuccess);
   Planes result;
-  REQUIRE(cudaMemcpyAsync(&result,device.get(),sizeof(result),cudaMemcpyDeviceToHost,stream.get()) == cudaSuccess);
+  REQUIRE(cudaMemcpyAsync(&result, device.get(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
   return result.base;
  };
- CHECK(draw(true) == std::array<std::uint8_t,20>{0,100,0,128, 33,66,0,191, 49,50,0,255, 9,8,7,128, 2,3,4,255});
- CHECK(draw(false) == std::array<std::uint8_t,20>{4,54,3,255, 49,50,0,255, 49,50,0,255, 9,8,7,128, 2,3,4,255});
+ CHECK(draw(true) == std::array<std::uint8_t, 20>{0, 100, 0, 128, 33, 66, 0, 191, 49, 50, 0, 255, 9, 8, 7, 128, 2, 3, 4, 255});
+ CHECK(draw(false) == std::array<std::uint8_t, 20>{4, 54, 3, 255, 49, 50, 0, 255, 49, 50, 0, 255, 9, 8, 7, 128, 2, 3, 4, 255});
 }
 TEST_CASE("Accumulated semantic alpha keeps clean bytes and bounds two-stage composite quantization", "[raster][cuda][alpha]") {
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  mmltk::testsupport::ScopedTestStream stream;
- constexpr std::array<std::uint8_t,9> alphas{0,1,2,64,115,127,128,254,255};
- constexpr std::array<std::array<std::uint8_t,3>,4> colors{{{255,0,0},{0,255,255},{255,255,255},{1,2,3}}};
+ constexpr std::array<std::uint8_t, 9> alphas{0, 1, 2, 64, 115, 127, 128, 254, 255};
+ constexpr std::array<std::array<std::uint8_t, 3>, 4> colors{{{255, 0, 0}, {0, 255, 255}, {255, 255, 255}, {1, 2, 3}}};
  constexpr std::size_t count = alphas.size() * alphas.size() * colors.size();
- using Pixels = std::array<std::uint8_t,count*4>;
- struct Planes { Pixels clean{}, first{}, second{}, prior{}, semantic{}, accumulated{}; } input;
- for (std::size_t color=0; color<colors.size(); ++color) for (std::size_t first=0; first<alphas.size(); ++first) for (std::size_t second=0; second<alphas.size(); ++second) {
-  const auto offset=((color*alphas.size()+first)*alphas.size()+second)*4;
-  for (std::size_t channel=0; channel<3; ++channel) {
-   input.clean[offset+channel]=std::array<std::uint8_t,3>{16,24,96}[channel];
-   input.first[offset+channel]=colors[color][channel];
-   input.second[offset+channel]=std::array<std::uint8_t,3>{0,100,0}[channel];
-  }
-  input.clean[offset+3]=255; input.first[offset+3]=alphas[first]; input.second[offset+3]=alphas[second];
- }
- input.prior=input.clean; input.semantic=input.first;
- auto storage=mmltk::testsupport::allocate_cuda_test_object<Planes>();
- REQUIRE(cudaMemcpyAsync(storage.get(),&input,sizeof(input),cudaMemcpyHostToDevice,stream.get()) == cudaSuccess);
- auto* base=reinterpret_cast<std::uint8_t*>(storage.get());
- const auto layer=[&](std::size_t destination,std::size_t overlay,bool preserve=false) {
-  REQUIRE(raster::composite_rgba({.base_rgba=raster::pitched_rgba_target(base+destination,count*4,count,1),
-   .overlay_rgba={base+overlay,count*4,count,1},.stream={stream.get()},.preserve_alpha=preserve}) == cudaSuccess);
+ using Pixels = std::array<std::uint8_t, count * 4>;
+ struct Planes {
+  Pixels clean{}, first{}, second{}, prior{}, semantic{}, accumulated{};
+ } input;
+ for (std::size_t color = 0; color < colors.size(); ++color)
+  for (std::size_t first = 0; first < alphas.size(); ++first)
+   for (std::size_t second = 0; second < alphas.size(); ++second) {
+    const auto offset = ((color * alphas.size() + first) * alphas.size() + second) * 4;
+    for (std::size_t channel = 0; channel < 3; ++channel) {
+     input.clean[offset + channel] = std::array<std::uint8_t, 3>{16, 24, 96}[channel];
+     input.first[offset + channel] = colors[color][channel];
+     input.second[offset + channel] = std::array<std::uint8_t, 3>{0, 100, 0}[channel];
+    }
+    input.clean[offset + 3] = 255;
+    input.first[offset + 3] = alphas[first];
+    input.second[offset + 3] = alphas[second];
+   }
+ input.prior = input.clean;
+ input.semantic = input.first;
+ auto storage = mmltk::testsupport::allocate_cuda_test_object<Planes>();
+ REQUIRE(cudaMemcpyAsync(storage.get(), &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
+ auto* base = reinterpret_cast<std::uint8_t*>(storage.get());
+ const auto layer = [&](std::size_t destination, std::size_t overlay, bool preserve = false) {
+  REQUIRE(
+   raster::composite_rgba(
+    {.base_rgba = raster::pitched_rgba_target(base + destination, count * 4, count, 1), .overlay_rgba = {base + overlay, count * 4, count, 1}, .stream = {stream.get()}, .preserve_alpha = preserve}) ==
+   cudaSuccess);
  };
  // The original opaque API performs the two successive byte-rounding steps.
- layer(offsetof(Planes,prior),offsetof(Planes,first));
- layer(offsetof(Planes,prior),offsetof(Planes,second));
- layer(offsetof(Planes,semantic),offsetof(Planes,second),true);
- REQUIRE(raster::finalize_rgba({.clean={base+offsetof(Planes,clean),count*4,count,1},.semantic={base+offsetof(Planes,semantic),count*4,count,1},
-  .destination={base+offsetof(Planes,accumulated),count*4,count,1},.stream={stream.get()}}) == cudaSuccess);
+ layer(offsetof(Planes, prior), offsetof(Planes, first));
+ layer(offsetof(Planes, prior), offsetof(Planes, second));
+ layer(offsetof(Planes, semantic), offsetof(Planes, second), true);
+ REQUIRE(raster::finalize_rgba(
+          {.clean = {base + offsetof(Planes, clean), count * 4, count, 1},
+           .semantic = {base + offsetof(Planes, semantic), count * 4, count, 1},
+           .destination = {base + offsetof(Planes, accumulated), count * 4, count, 1},
+           .stream = {stream.get()}}) == cudaSuccess);
  Planes result;
- REQUIRE(cudaMemcpyAsync(&result,storage.get(),sizeof(result),cudaMemcpyDeviceToHost,stream.get()) == cudaSuccess);
+ REQUIRE(cudaMemcpyAsync(&result, storage.get(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
  CHECK(result.clean == input.clean);
- unsigned maximum=0;
- for (std::size_t pixel=0; pixel<count; ++pixel) {
-  const auto first=input.first[pixel*4+3], second=input.second[pixel*4+3];
-  CHECK(result.accumulated[pixel*4+3] == 255);
-  for (std::size_t channel=0; channel<3; ++channel) {
-   const auto before=static_cast<int>(result.prior[pixel*4+channel]), after=static_cast<int>(result.accumulated[pixel*4+channel]);
-   const auto delta=static_cast<unsigned>(before>after?before-after:after-before);
-   maximum=std::max(maximum,delta);
-   if (first==0 || second==0 || first==255 || second==255) CHECK(delta == 0);
+ unsigned maximum = 0;
+ for (std::size_t pixel = 0; pixel < count; ++pixel) {
+  const auto first = input.first[pixel * 4 + 3], second = input.second[pixel * 4 + 3];
+  CHECK(result.accumulated[pixel * 4 + 3] == 255);
+  for (std::size_t channel = 0; channel < 3; ++channel) {
+   const auto before = static_cast<int>(result.prior[pixel * 4 + channel]), after = static_cast<int>(result.accumulated[pixel * 4 + channel]);
+   const auto delta = static_cast<unsigned>(before > after ? before - after : after - before);
+   maximum = std::max(maximum, delta);
+   if (first == 0 || second == 0 || first == 255 || second == 255) CHECK(delta == 0);
   }
  }
  CAPTURE(maximum);
- CHECK(maximum <= 3); // Includes accumulated RGB/alpha and final RGBA8 truncation.
- constexpr auto overlap=(4U*alphas.size()+6U)*4U; // Live's 115-alpha mask, then 128-alpha manual overlay.
- CHECK(result.prior[overlap] == 61); CHECK(result.prior[overlap+2] == 25);
- CHECK(result.accumulated[overlap] == 60); CHECK(result.accumulated[overlap+2] == 26);
+ CHECK(maximum <= 3);                                      // Includes accumulated RGB/alpha and final RGBA8 truncation.
+ constexpr auto overlap = (4U * alphas.size() + 6U) * 4U;  // Live's 115-alpha mask, then 128-alpha manual overlay.
+ CHECK(result.prior[overlap] == 61);
+ CHECK(result.prior[overlap + 2] == 25);
+ CHECK(result.accumulated[overlap] == 60);
+ CHECK(result.accumulated[overlap + 2] == 26);
 }
 TEST_CASE("Shared skeleton projection keeps confidence visibility and covariance in source coordinates", "[raster][keypoints]") {
  namespace catalog = mmltk::backend::data::catalog;
@@ -251,7 +265,6 @@ TEST_CASE("Shared skeleton projection keeps confidence visibility and covariance
  CHECK(truth.uncertainty_point_count == 32);
  CHECK(static_cast<std::int32_t>(words[truth.points + 4]) < 0);
 }
-
 TEST_CASE("Shared skeleton projection retains each producer's half-pixel convention", "[raster][keypoints][boundary]") {
  namespace catalog = mmltk::backend::data::catalog;
  const catalog::ClassKeypointSchema schema{{"a", "b", "c"}, {}, {0, 1, 2}, {.1, .1, .1}};
@@ -265,13 +278,12 @@ TEST_CASE("Shared skeleton projection retains each producer's half-pixel convent
   for (std::size_t index = 0; index < expected.size(); ++index) CHECK(static_cast<std::int32_t>(words[index]) == expected[index]);
  }
 }
-
 TEST_CASE("Skeleton batches admit full catalog schemas without maximum-sized scratch", "[raster][skeleton][boundary]") {
  namespace catalog = mmltk::backend::data::catalog;
  catalog::ClassKeypointSchema schema;
  for (std::size_t joint = 0; joint < catalog::kKeypointsPerClassCapacity; ++joint) {
   schema.names.push_back("joint-" + std::to_string(joint));
-  schema.horizontal_flip.push_back(joint);
+  schema.horizontal_flip.push_back(static_cast<catalog::JointIndex>(joint));
   schema.oks_sigmas.push_back(.1);
  }
  for (std::size_t edge = 0; edge < catalog::kSkeletonEdgeCapacity; ++edge)
@@ -279,7 +291,7 @@ TEST_CASE("Skeleton batches admit full catalog schemas without maximum-sized scr
  std::vector<std::uint32_t> words;
  constexpr std::size_t candidates = 500;
  for (std::size_t index = 0; index < candidates; ++index) {
-  const auto projected = raster::append_skeleton_projection(words, schema, [](std::size_t joint) { return raster::SkeletonSample{float(joint), 16, 1, {4,1,4}}; });
+  const auto projected = raster::append_skeleton_projection(words, schema, [](std::size_t joint) { return raster::SkeletonSample{float(joint), 16, 1, {4, 1, 4}}; });
   CHECK(projected.point_count == 256);
   CHECK(projected.edge_count == 512);
   CHECK(projected.uncertainty_point_count == 256 * 16);
@@ -289,7 +301,7 @@ TEST_CASE("Skeleton batches admit full catalog schemas without maximum-sized scr
  CHECK(words.capacity() < raster::kSkeletonProjectionWordCapacity);
  const auto capacity = words.capacity();
  words.clear();
- const auto projected = raster::append_skeleton_projection(words, schema, [](std::size_t joint) { return raster::SkeletonSample{float(joint),16,1,{}}; });
+ const auto projected = raster::append_skeleton_projection(words, schema, [](std::size_t joint) { return raster::SkeletonSample{float(joint), 16, 1, {}}; });
  CHECK(projected.uncertainty_point_count == 0);
  CHECK(words.capacity() == capacity);
  const auto accepted = words;

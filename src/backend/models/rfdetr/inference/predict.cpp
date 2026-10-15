@@ -125,8 +125,8 @@ void finish_prediction_run(PredictionRunResult& result, const std::chrono::stead
    auto& joints = detection["keypoints"] = nlohmann::json::array();
    for (std::size_t index = 0; index < prediction.keypoints.size(); ++index) {
     const auto point = map_prediction_keypoint(prediction.keypoints[index], transform[0], transform[1], transform[2], transform[3]);
-    joints.push_back({{"name", schema.names[index]}, {"xy", {point.x, point.y}}, {"confidence", point.confidence},
-     {"precision_cholesky", point.precision_cholesky}, {"covariance", keypoint_covariance(point)}});
+    joints.push_back(
+     {{"name", schema.names[index]}, {"xy", {point.x, point.y}}, {"confidence", point.confidence}, {"precision_cholesky", point.precision_cholesky}, {"covariance", keypoint_covariance(point)}});
    }
   }
   if (prediction.has_mask) { detection["mask_rle"] = encode_mask_rle(prediction.mask); }
@@ -472,10 +472,13 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
   };
   if (joints && raw_preview) {
    result.storage[index].keypoint_capacity = joints;
-   result.storage[index].keypoints = {reinterpret_cast<std::uintptr_t>(result.keypoints[index].data_ptr()), capacity * joints * sizeof(runtime::AnalysisKeypoint),
-    {3U, {static_cast<std::uint32_t>(capacity), joints, static_cast<std::uint32_t>(runtime::kAnalysisKeypointChannels)}}, runtime::AnalysisElementType::Float32};
-   result.storage[index].keypoint_counts = {reinterpret_cast<std::uintptr_t>(result.keypoint_counts[index].data_ptr()), capacity * sizeof(int32_t),
-    {1U, {static_cast<std::uint32_t>(capacity)}}, runtime::AnalysisElementType::Int32};
+   result.storage[index].keypoints = {
+    reinterpret_cast<std::uintptr_t>(result.keypoints[index].data_ptr()), capacity * joints * sizeof(runtime::AnalysisKeypoint),
+    {3U, {static_cast<std::uint32_t>(capacity), joints, static_cast<std::uint32_t>(runtime::kAnalysisKeypointChannels)}}, runtime::AnalysisElementType::Float32
+   };
+   result.storage[index].keypoint_counts = {
+    reinterpret_cast<std::uintptr_t>(result.keypoint_counts[index].data_ptr()), capacity * sizeof(int32_t), {1U, {static_cast<std::uint32_t>(capacity)}}, runtime::AnalysisElementType::Int32
+   };
   }
  }
 }
@@ -514,7 +517,8 @@ struct PredictionReadback final {
     if (!batch.selections[index].keypoints) throw std::invalid_argument("prediction batch omitted keypoints");
     keypoint_values[index].copy_((*batch.selections[index].keypoints)[0], true);
    }
-  } else keypoint_values = torch::Tensor{};
+  } else
+   keypoint_values = torch::Tensor{};
  }
  void Read(AnnotationBatch& batch) {
   const auto stream = c10::cuda::getCurrentCUDAStream(batch.boxes.get_device());
@@ -560,7 +564,8 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
   try {
    pixels.custody = std::make_shared<PredictionSourceStorage>(PredictionSourceStorage{
     {annotations.boxes, annotations.labels, annotations.scores, annotations.masks, annotations.compact_boxes, annotations.compact_labels, annotations.compact_scores, readback.device_indices,
-     readback.index_values, annotations.selections[index].query_indices, annotations.selections[index].mask_logits.value_or(torch::Tensor{}), annotations.keypoints, annotations.keypoint_counts, annotations.compact_keypoints, annotations.compact_keypoint_counts},
+     readback.index_values, annotations.selections[index].query_indices, annotations.selections[index].mask_logits.value_or(torch::Tensor{}), annotations.keypoints, annotations.keypoint_counts,
+     annotations.compact_keypoints, annotations.compact_keypoint_counts},
     annotations.runtime_selections[index].custody, std::move(source)
    });
   } catch (...) { pixels = {.preview_failure = "Prediction source custody allocation failed"}; }
@@ -614,8 +619,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
    const auto* source = storage.keypoint_values.data_ptr<float>() + index * storage.keypoint_values.stride(0) + retained[survivor] * storage.keypoint_values.stride(1);
    prediction.keypoints.reserve(joints);
    for (std::size_t joint = 0; joint < joints; ++joint) {
-    KeypointPrediction point;
-    std::memcpy(&point, source + joint * KeypointPredictionPacket::size, sizeof(point));
+    const auto point = KeypointPredictionPacket::load(source + joint * KeypointPredictionPacket::size);
     prediction.keypoints.push_back(decode_prediction_keypoint(point));
    }
   }
@@ -665,10 +669,10 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
    compact(batch.compact_keypoints, batch.keypoints[index]);
    compact(batch.compact_keypoint_counts, batch.keypoint_counts[index]);
    annotation.keypoints.address = reinterpret_cast<std::uintptr_t>(batch.compact_keypoints.data_ptr());
-   annotation.keypoints.shape.extents[0] = result.size();
+   annotation.keypoints.shape.extents[0] = static_cast<std::uint32_t>(result.size());
    annotation.keypoints.capacity_bytes = batch.compact_keypoints.nbytes();
    annotation.keypoint_counts.address = reinterpret_cast<std::uintptr_t>(batch.compact_keypoint_counts.data_ptr());
-   annotation.keypoint_counts.shape.extents[0] = result.size();
+   annotation.keypoint_counts.shape.extents[0] = static_cast<std::uint32_t>(result.size());
    annotation.keypoint_counts.capacity_bytes = batch.compact_keypoint_counts.nbytes();
   }
   annotation.value_capacity = result.size();

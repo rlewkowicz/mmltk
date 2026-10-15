@@ -51,8 +51,8 @@ public:
   std::size_t ground_truth_count = 0U;
   std::size_t mask_rle_pair_count = 0U;
  };
- [[nodiscard]] ImageMatches match_predictions(
-  std::int64_t dataset_index, BBoxPredictionView predictions, std::optional<PackedMaskPredictionView> masks, std::size_t max_dets_per_image, std::span<const Prediction> encoded_masks = {}, std::optional<KeypointPredictionView> keypoints = {}) const;
+ [[nodiscard]] ImageMatches match_predictions(std::int64_t dataset_index, BBoxPredictionView predictions, std::optional<PackedMaskPredictionView> masks, std::size_t max_dets_per_image,
+  std::span<const Prediction> encoded_masks = {}, std::optional<KeypointPredictionView> keypoints = {}) const;
  void merge_matches(ImageMatches matches);
  [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image, EvaluationDetailRetention retention) const;
  [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool& worker_pool, EvaluationDetailRetention retention) const;

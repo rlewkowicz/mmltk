@@ -11,7 +11,8 @@ void validate_rfdetr_output_contract(const RfdetrOutputContract& contract, const
    if (!layout->semantic()) throw std::invalid_argument("keypoint artifact requires named class and joint schema metadata");
    joints.require_class_layout(*layout);
   }
- } else if (!contract.keypoints_per_class.empty()) throw std::invalid_argument("non-keypoint artifact declares joint slots");
+ } else if (!contract.keypoints_per_class.empty())
+  throw std::invalid_argument("non-keypoint artifact declares joint slots");
 }
 RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo& info) {
  RfdetrOutputRoles roles;
@@ -70,7 +71,8 @@ RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo& info) {
    const ResolvedClassLayout resolved(*info.class_layout);
    validate_rfdetr_output_contract(contract, &resolved);
   }
- } else if (!contract.keypoints_per_class.empty()) throw std::invalid_argument("non-keypoint artifact declares joint slots");
+ } else if (!contract.keypoints_per_class.empty())
+  throw std::invalid_argument("non-keypoint artifact declares joint slots");
  for (const auto& output : info.outputs)
   if (output.dtype != info.outputs[*logits].dtype || (output.dtype != "float32" && output.dtype != "float16" && output.dtype != "bfloat16" && output.dtype != "float64"))
    throw std::invalid_argument("RF-DETR output dtypes disagree or are not floating point");
@@ -79,4 +81,4 @@ RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo& info) {
  info.has_masks = roles.index<RfdetrOutputRole::Masks>().has_value();
  return roles;
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

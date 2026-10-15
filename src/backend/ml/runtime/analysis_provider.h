@@ -303,7 +303,8 @@ private:
   if (output.value_capacity > std::numeric_limits<std::uint32_t>::max()) { return false; }
   if (output.value_capacity == 0U) {
    return output.count.empty() && !output.masks_available && output.boxes_xyxy.capacity_bytes == 0U && output.class_references.capacity_bytes == 0U && output.confidences.capacity_bytes == 0U &&
-          output.colors_rgb.capacity_bytes == 0U && output.masks.capacity_bytes == 0U && !output.keypoints_available && output.keypoints.capacity_bytes == 0U && output.keypoint_counts.capacity_bytes == 0U;
+          output.colors_rgb.capacity_bytes == 0U && output.masks.capacity_bytes == 0U && !output.keypoints_available && output.keypoints.capacity_bytes == 0U &&
+          output.keypoint_counts.capacity_bytes == 0U;
   }
   const auto capacity = static_cast<std::uint32_t>(output.value_capacity);
   const std::uint32_t boxes[]{capacity, 4U};
@@ -318,7 +319,8 @@ private:
   if (output.keypoint_capacity) {
    const std::uint32_t joints[]{capacity, output.keypoint_capacity, static_cast<std::uint32_t>(kAnalysisKeypointChannels)};
    if (!ValidateBuffer(output.keypoints, 3U, joints, AnalysisElementType::Float32) || !ValidateBuffer(output.keypoint_counts, 1U, values, AnalysisElementType::Int32)) return false;
-  } else if (output.keypoints_available || output.keypoints.address || output.keypoints.capacity_bytes || output.keypoint_counts.address || output.keypoint_counts.capacity_bytes) return false;
+  } else if (output.keypoints_available || output.keypoints.address || output.keypoints.capacity_bytes || output.keypoint_counts.address || output.keypoint_counts.capacity_bytes)
+   return false;
   if (output.keypoints_available && (!output.class_catalog || !output.class_catalog->has_keypoints())) return false;
   return ValidateBuffer(output.boxes_xyxy, 2U, boxes, AnalysisElementType::Float32) && ValidateBuffer(output.class_references, 1U, values, AnalysisElementType::Int32) &&
          ValidateBuffer(output.confidences, 1U, values, AnalysisElementType::Float32) && ValidateBuffer(output.colors_rgb, 2U, colors, AnalysisElementType::Uint8) &&

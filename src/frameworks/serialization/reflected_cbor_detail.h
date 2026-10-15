@@ -412,8 +412,10 @@ template <ObjectLayout Layout, bool Materialize, class T>
 template <bool Materialize, class T>
 [[nodiscard]] ProjectedValue<Materialize> project_scalar(const T& value, wire::CountingEncoder* counter, std::size_t depth) {
  if constexpr (Materialize) {
-  if constexpr (std::same_as<T, std::string_view>) return wire::Value(std::string(value));
-  else return wire::Value(value);
+  if constexpr (std::same_as<T, std::string_view>)
+   return wire::Value(std::string(value));
+  else
+   return wire::Value(value);
  } else {
   counter->scalar(value, depth);
   return {};
@@ -594,8 +596,10 @@ void append_reflected_object_fields(const T& value, Fields& object, std::optiona
        failure = encoded.error();
        prepend_path(*failure, fact.member_name);
       } else if constexpr (Materialize) {
-       if constexpr (Layout == ObjectLayout::Named) object.emplace_back(std::string(fact.member_name), std::move(*encoded));
-       else object.push_back(std::move(*encoded));
+       if constexpr (Layout == ObjectLayout::Named)
+        object.emplace_back(std::string(fact.member_name), std::move(*encoded));
+       else
+        object.push_back(std::move(*encoded));
       }
      }
     }
@@ -612,9 +616,12 @@ template <ObjectLayout Layout, bool Materialize, class T>
   using Fields = std::conditional_t<Layout == ObjectLayout::Named, wire::Value::Object, wire::Value::Array>;
   std::conditional_t<Materialize, Fields, std::monostate> object;
   const std::size_t count = Layout == ObjectLayout::Named ? reflected_object_present_count(value) : flattened_member_count<T>();
-  if constexpr (Materialize) object.reserve(count);
-  else if constexpr (Layout == ObjectLayout::Named) counter->object(count, depth);
-  else counter->array(count, depth);
+  if constexpr (Materialize)
+   object.reserve(count);
+  else if constexpr (Layout == ObjectLayout::Named)
+   counter->object(count, depth);
+  else
+   counter->array(count, depth);
   std::optional<wire::EncodeError> failure;
   append_reflected_object_fields<Layout, Materialize>(value, object, failure, counter, depth);
   if (failure) return std::unexpected(std::move(*failure));
@@ -736,8 +743,10 @@ template <bool Materialize, class T>
 [[nodiscard]] std::expected<ProjectedValue<Materialize>, wire::EncodeError> OpaqueCborFacade::EncodeObject(const T& value, wire::CountingEncoder* counter, const std::size_t depth) {
  static_assert(mmltk::frameworks::reflection::kOpaqueRelationStorage<T>);
  std::conditional_t<Materialize, wire::Value::Object, std::monostate> object;
- if constexpr (Materialize) object.reserve(declarations<T>().size());
- else counter->object(declarations<T>().size(), depth);
+ if constexpr (Materialize)
+  object.reserve(declarations<T>().size());
+ else
+  counter->object(declarations<T>().size(), depth);
  std::optional<wire::EncodeError> failure;
  mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(value, [&]<std::meta::info Member>(const auto& member_value) {
   if (failure) return;
@@ -815,7 +824,8 @@ template <ObjectLayout Layout, bool Materialize, class Variant>
    object.emplace_back(VariantEnvelope::kind_key, wire::Value(variant_name<Alternative>()));
    object.emplace_back(VariantEnvelope::payload_key, std::move(*encoded));
    return wire::Value(std::move(object));
-  } else return std::monostate{};
+  } else
+   return std::monostate{};
  }, value);
 }
 template <class Variant>
@@ -863,7 +873,8 @@ template <ObjectLayout Layout, bool Materialize, class T>
  using U = RemoveCvRef<T>;
  static_assert(supported_type<U>(), "Attempted to encode an unsupported reflected CBOR type.");
  if constexpr (std::is_same_v<U, wire::Value>) {
-  if constexpr (Materialize) return value;
+  if constexpr (Materialize)
+   return value;
   else {
    counter->value(value, depth);
    return std::monostate{};
@@ -875,10 +886,12 @@ template <ObjectLayout Layout, bool Materialize, class T>
     return project_scalar<Materialize>(leaf, counter, depth);
    } else {
     std::conditional_t<Materialize, wire::Value::Array, std::monostate> encoded;
-    if constexpr (Materialize) encoded.reserve(leaf.size());
-    else counter->array(leaf.size(), depth);
+    if constexpr (Materialize)
+     encoded.reserve(leaf.size());
+    else
+     counter->array(leaf.size(), depth);
     for (const auto& scalar : leaf) {
-     auto item = std::visit([&](const auto& value) { return project_scalar<Materialize>(value, counter, depth + 1U); }, scalar);
+     auto item = std::visit([&](const auto& component) { return project_scalar<Materialize>(component, counter, depth + 1U); }, scalar);
      if constexpr (Materialize) encoded.push_back(std::move(item));
     }
     return ProjectedValue<Materialize>(std::move(encoded));
@@ -900,7 +913,8 @@ template <ObjectLayout Layout, bool Materialize, class T>
  } else if constexpr (std::is_same_v<U, std::string>) {
   return project_scalar<Materialize>(value, counter, depth);
  } else if constexpr (std::is_same_v<U, std::filesystem::path>) {
-  if constexpr (Materialize) return wire::Value(value.generic_string());
+  if constexpr (Materialize)
+   return wire::Value(value.generic_string());
   else {
    count_path(*counter, value, depth);
    return std::monostate{};
@@ -928,8 +942,10 @@ template <ObjectLayout Layout, bool Materialize, class T>
   return encode_variant<Layout, Materialize>(value, counter, depth);
  } else if constexpr (kIsSequence<U>) {
   std::conditional_t<Materialize, wire::Value::Array, std::monostate> array;
-  if constexpr (Materialize) array.reserve(value.size());
-  else counter->array(value.size(), depth);
+  if constexpr (Materialize)
+   array.reserve(value.size());
+  else
+   counter->array(value.size(), depth);
   for (const auto& element : value) {
    auto encoded = project_value<Layout, Materialize>(element, counter, depth + 1U);
    if (!encoded) return std::unexpected(encoded.error());

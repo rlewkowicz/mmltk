@@ -20,7 +20,6 @@
 #include <mutex>
 #include <string>
 #include <nlohmann/json.hpp>
-
 namespace rf = mmltk::backend::models::rfdetr;
 namespace data = mmltk::backend::data;
 namespace {
@@ -28,7 +27,7 @@ std::mutex identity_mutex;
 std::string original_signature;
 bool signature_mismatch = false;
 std::atomic_bool signature_observation_failed = false;
-}
+}  // namespace
 // The linker symbol is derived from the historical archive, not handwritten.
 decltype(rf::training_dataset_identity) original_identity asm(MMLTK_BASELINE_REAL);
 decltype(rf::training_dataset_identity) observed_identity asm(MMLTK_BASELINE_WRAP);
@@ -36,12 +35,13 @@ std::string observed_identity(const data::FileHeader& header, const mmltk::commo
  auto result = original_identity(header, file, signature);
  try {
   std::lock_guard lock(identity_mutex);
-  if (original_signature.empty()) original_signature = signature;
-  else signature_mismatch |= original_signature != signature;
+  if (original_signature.empty())
+   original_signature = signature;
+  else
+   signature_mismatch |= original_signature != signature;
  } catch (...) { signature_observation_failed.store(true, std::memory_order_relaxed); }
  return result;
 }
-
 TEST_CASE("Original application produces immutable continuation evidence", "[historical_producer]") {
  const auto* destination = std::getenv("MMLTK_RFDETR_BASELINE_OUTPUT");
  REQUIRE(destination != nullptr);
@@ -101,9 +101,10 @@ TEST_CASE("Original application produces immutable continuation evidence", "[his
   header.write(reinterpret_cast<const char*>(&dataset.header()), sizeof(data::FileHeader));
   REQUIRE(header.good());
  }
- nlohmann::json record{{"session", original.checkpoint_path.string()}, {"continued_session", continued.checkpoint_path.string()},
-  {"continued_selection", (request.output_dir / "selected.json").string()}, {"configuration_signature", original_signature},
-  {"source_headers", {{"configuration", "source_headers/configuration"}, {"validation", "source_headers/validation"}}}};
+ nlohmann::json record{
+  {"session", original.checkpoint_path.string()}, {"continued_session", continued.checkpoint_path.string()}, {"continued_selection", (request.output_dir / "selected.json").string()},
+  {"configuration_signature", original_signature}, {"source_headers", {{"configuration", "source_headers/configuration"}, {"validation", "source_headers/validation"}}}
+ };
  std::ofstream output(root / "historical.json");
  output << record.dump(2) << '\n';
  REQUIRE(output.good());

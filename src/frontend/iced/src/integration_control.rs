@@ -411,7 +411,17 @@ extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClick)]
     fn click_js(x: f64, y: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationKeypointPixels)]
-    fn keypoint_pixels_js(receipt: &wasm_bindgen::JsValue, source: f64, presentation: f64, patches: &[f64], region: &[f64], empty: bool, stage: &str, oks: &[f64], completed: &wasm_bindgen::JsValue);
+    fn keypoint_pixels_js(
+        receipt: &wasm_bindgen::JsValue,
+        source: f64,
+        presentation: f64,
+        patches: &[f64],
+        region: &[f64],
+        empty: bool,
+        stage: &str,
+        oks: &[f64],
+        completed: &wasm_bindgen::JsValue,
+    );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationWorkflowPixels)]
     fn workflow_pixels_js(
         control: &str,
@@ -1428,8 +1438,18 @@ impl Controller {
                 return Err("invalid capacity control identity");
             }
             if receipt.kind == Kind::ArtifactMutationReady {
-                if self.driver.phase != Phase::Workflows(workflows::Step::Keypoints(workflows::keypoints::Stage::AwaitMutation(receipt.compiledindex))) { self.driver.fail("Uncorrelated artifact mutation completion"); return Err("artifact mutation order"); }
-                self.driver.phase = Phase::Workflows(workflows::Step::Keypoints(workflows::keypoints::Stage::MutationReady(receipt.compiledindex)));
+                if self.driver.phase
+                    != Phase::Workflows(workflows::Step::Keypoints(
+                        workflows::keypoints::Stage::AwaitMutation(receipt.compiledindex),
+                    ))
+                {
+                    self.driver
+                        .fail("Uncorrelated artifact mutation completion");
+                    return Err("artifact mutation order");
+                }
+                self.driver.phase = Phase::Workflows(workflows::Step::Keypoints(
+                    workflows::keypoints::Stage::MutationReady(receipt.compiledindex),
+                ));
                 return Ok(());
             }
             if receipt.kind == Kind::GalleryReadCompletionHeld {
@@ -1532,7 +1552,9 @@ impl Controller {
         use crate::generated::IntegrationControlKind as Kind;
         let kind = match self.driver.phase {
             Phase::Disabled => return,
-            Phase::Workflows(workflows::Step::Keypoints(workflows::keypoints::Stage::AwaitMutation(_))) => Kind::ArtifactMutationRequested,
+            Phase::Workflows(workflows::Step::Keypoints(
+                workflows::keypoints::Stage::AwaitMutation(_),
+            )) => Kind::ArtifactMutationRequested,
             Phase::Complete => Kind::Settled,
             Phase::Failed => Kind::Failed,
             Phase::AwaitCapacityArm => Kind::CapacityArmRequested,
@@ -1564,7 +1586,9 @@ impl Controller {
             },
             compiledindex: match self.driver.phase {
                 Phase::AwaitVisibleReadArm(index) | Phase::VisibleReadRelease(index, _) => index,
-                Phase::Workflows(workflows::Step::Keypoints(workflows::keypoints::Stage::AwaitMutation(index))) => index,
+                Phase::Workflows(workflows::Step::Keypoints(
+                    workflows::keypoints::Stage::AwaitMutation(index),
+                )) => index,
                 _ => 0,
             },
             failure: self.driver.failure.clone(),
@@ -2452,7 +2476,11 @@ impl Driver {
                 });
                 self.reporting
                     .observe(|reporting| reporting.bootstrap(model, settings));
-                if self.viewer_scenario == "keypoints" { return self.advance_to(Phase::Workflows(workflows::Step::Keypoints(workflows::keypoints::Stage::SelectPage))); }
+                if self.viewer_scenario == "keypoints" {
+                    return self.advance_to(Phase::Workflows(workflows::Step::Keypoints(
+                        workflows::keypoints::Stage::SelectPage,
+                    )));
+                }
                 if matches!(self.viewer_scenario.as_str(), "workflows" | "workflows-oom") {
                     return self.advance_to(Phase::Workflows(workflows::Step::Train));
                 }

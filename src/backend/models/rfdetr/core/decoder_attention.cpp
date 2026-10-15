@@ -31,7 +31,8 @@ torch::Tensor keypoint_self_attention(torch::nn::MultiheadAttention& attention, 
  const auto values = target.transpose(0, 1);
  const auto project = [&](const torch::Tensor& input, int64_t part) {
   return torch::linear(input, attention->in_proj_weight.narrow(0, part * width, width), attention->in_proj_bias.narrow(0, part * width, width))
-   .reshape({count, batch, heads, width / heads}).permute({1, 2, 0, 3});
+   .reshape({count, batch, heads, width / heads})
+   .permute({1, 2, 0, 3});
  };
  const auto mask = excluded.defined() ? torch::zeros_like(excluded, target.options()).masked_fill(excluded, -std::numeric_limits<double>::infinity()) : torch::Tensor{};
  auto result = model_scaled_dot_product_attention(project(positioned, 0), project(positioned, 1), project(values, 2), mask, std::nullopt, force_math);
