@@ -64,6 +64,7 @@ mmltk_register_ordinary_sources(
     class_artifact.cpp
     class_tensor_axes.cpp
     class_layout.cpp
+    model_info.cpp
     inference_lanes.cpp
     python_checkpoint_bridge.cpp
     model_state.cpp

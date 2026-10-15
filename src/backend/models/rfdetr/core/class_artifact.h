@@ -27,6 +27,7 @@ public:
  [[nodiscard]] const std::filesystem::path& descriptor_path() const noexcept { return snapshot_.descriptor_path; }
  [[nodiscard]] const std::shared_ptr<const mmltk::common::io::FileDigests>& file() const noexcept { return file_; }
  [[nodiscard]] std::vector<RfdetrNamedOutputRole> output_roles() const;
+ [[nodiscard]] std::optional<RfdetrOutputContract> output_contract() const;
  [[nodiscard]] ModelClassLayout Resolve(std::size_t output_width, const std::optional<ModelClassLayout>& embedded, std::stop_token stop = {}) const;
  void RequireUnchanged(std::stop_token stop = {}) const;
  [[nodiscard]] bool Matches(const std::filesystem::path& artifact, const std::filesystem::path& descriptor = {}) const;

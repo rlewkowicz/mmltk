@@ -8,6 +8,7 @@
 #include <vector>
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/backend/models/rfdetr/contract/output_roles.h"
+#include "src/backend/models/rfdetr/contract/model_topology.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 namespace mmltk::backend::models::rfdetr {
 inline constexpr std::uint32_t kClassLayoutVersion = 1U;
@@ -58,11 +59,21 @@ struct ModelClassLayoutSummary final {
  auto operator<=>(const ModelClassLayoutSummary&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ModelClassLayoutSummary)
+// Explicit packet semantics accompany every new artifact. Missing metadata is
+// admitted only for the historical named detection/segmentation outputs.
+struct RfdetrOutputContract final {
+ std::uint32_t version = 1U;
+ ModelTask task = ModelTask::Detection;
+ MMLTK_MAX_ITEMS(kMaximumClassOutputSlots) std::vector<std::uint16_t> keypoints_per_class;
+ auto operator<=>(const RfdetrOutputContract&) const = default;
+};
+MMLTK_REFLECT_FIELDS(RfdetrOutputContract)
 struct ModelClassDescriptor final {
  std::uint32_t version = 1U;
  MMLTK_MAX_BYTES(64U) std::string artifact_sha256;
  ModelClassLayout layout;
  MMLTK_MAX_ITEMS(kMaximumNamedOutputRoles) std::vector<RfdetrNamedOutputRole> output_roles {};
+ std::optional<RfdetrOutputContract> output_contract;
 };
 MMLTK_REFLECT_FIELDS(ModelClassDescriptor)
 }  // namespace mmltk::backend::models::rfdetr

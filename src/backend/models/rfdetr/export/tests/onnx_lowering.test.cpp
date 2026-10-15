@@ -583,13 +583,47 @@ TEST_CASE("Math SDPA lowering preserves safe empty rows and exceptional operands
   CHECK(torch::allclose(actual, expected, 1e-5, 1e-6, true));
  }
 }
-TEST_CASE("Math SDPA lowering refuses unsupported dropout and masks explicitly", "[model][rfdetr][onnx_lowering]") {
+TEST_CASE("Math SDPA lowering refuses training dropout explicitly", "[model][rfdetr][onnx_lowering]") {
  const auto input = torch::rand({1, 2, 3, 4});
- for (const bool masked : {false, true}) {
-  const auto mask = torch::zeros({3, 3});
-  auto graph = trace_unary_graph(input,
-   [&](const torch::Tensor& value) { return std::get<0>(at::_scaled_dot_product_attention_math(value, value, value, masked ? std::optional<torch::Tensor>{mask} : std::nullopt, masked ? 0.0 : .1)); });
-  mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, masked ? "attention masks are not supported" : "dropout_p must be 0");
+ auto graph = trace_unary_graph(input, [&](const torch::Tensor& value) { return std::get<0>(at::_scaled_dot_product_attention_math(value, value, value, std::nullopt, .1)); });
+ mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, "dropout_p must be 0");
+}
+TEST_CASE("GroupPose attention lowering preserves class masks and fully excluded rows", "[model][rfdetr][onnx_lowering]") {
+ const auto input = torch::sin(torch::arange(24, torch::kFloat)).reshape({1,2,3,4});
+ const auto reversed = input.flip({2});
+ const auto admitted = torch::tensor({{true,false,true},{false,false,false},{false,true,true}}, torch::kBool);
+ const auto additive = torch::zeros({3,3}).masked_fill(~admitted, -std::numeric_limits<float>::infinity());
+ for (const bool math : {false,true}) {
+  CAPTURE(math);
+  const auto operation = [&](const torch::Tensor& value) {
+   if (math) {
+    const auto result = at::_scaled_dot_product_attention_math(value, value, reversed, additive);
+    return torch::cat({std::get<0>(result).flatten(),std::get<1>(result).flatten()});
+   }
+   return at::scaled_dot_product_attention(value, value, reversed, admitted).flatten();
+  };
+  auto graph = trace_unary_graph(input,operation);
+  lower_test_graph(graph);
+  const auto expected = operation(input), actual = execute_unary_onnx(graph,input);
+  CHECK(torch::isfinite(actual).all().item<bool>());
+  CHECK(torch::allclose(actual,expected,1e-5,1e-6));
  }
+}
+TEST_CASE("PE rotary pairs and GroupPose finite refinement survive ONNX lowering", "[model][rfdetr][onnx_lowering]") {
+ const auto input = torch::arange(16,torch::kFloat).reshape({1,2,2,4}) / 10;
+ const auto operation = [](const torch::Tensor& value) {
+  auto angles = value.narrow(-1,0,2).repeat_interleave(2,-1);
+  auto pairs = torch::stack({-value.slice(-1,1,4,2), value.slice(-1,0,4,2)},-1).reshape_as(value);
+  auto rotary = value * angles.cos() + pairs * angles.sin();
+  return rotary + value.narrow(-1,0,1).expand_as(value);
+ };
+ auto graph = trace_unary_graph(input,operation);
+ lower_test_graph(graph);
+ CHECK(torch::allclose(execute_unary_onnx(graph,input),operation(input),1e-5,1e-6));
+ const auto exceptional = torch::tensor({0.F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()});
+ const auto finite = [](const torch::Tensor& value) { return torch::nan_to_num(value,0.,0.,0.); };
+ graph = trace_unary_graph(exceptional,finite);
+ lower_test_graph(graph);
+ CHECK(torch::equal(execute_unary_onnx(graph,exceptional),finite(exceptional)));
 }
 }  // namespace

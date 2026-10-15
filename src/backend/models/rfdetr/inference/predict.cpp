@@ -55,6 +55,7 @@ module;
 #include "stb_image.h"
 #include "src/backend/models/rfdetr/core/gpu_batch_preprocessor.h"
 #include "prediction_capacity.h"
+#include "keypoint_delivery.h"
 #include "prediction_count.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "prediction_raw_preparation.h"
@@ -101,7 +102,8 @@ void finish_prediction_run(PredictionRunResult& result, const std::chrono::stead
  }
  return encoded;
 }
-[[nodiscard]] nlohmann::json prediction_record_json(const PredictionRecord& record, std::span<const std::string> class_names) {
+[[nodiscard]] nlohmann::json prediction_record_json(const PredictionRecord& record, const mmltk::backend::data::catalog::ClassCatalog* catalog) {
+ const auto class_names = catalog ? catalog->names() : std::span<const std::string>{};
  nlohmann::json detections = nlohmann::json::array();
  for (const Prediction& prediction : record.detections) {
   const int class_index = prediction.class_reference;
@@ -114,6 +116,19 @@ void finish_prediction_run(PredictionRunResult& result, const std::chrono::stead
    {"score", prediction.score},
    {"xyxy", prediction.bbox_xyxy},
   };
+  if (!prediction.keypoints.empty()) {
+   if (!catalog || prediction.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground) throw std::invalid_argument("named keypoint JSON requires a semantic catalog");
+   const auto& schema = catalog->keypoints(prediction.class_reference);
+   if (schema.names.size() != prediction.keypoints.size()) throw std::invalid_argument("keypoint JSON schema disagrees with prediction");
+   const auto& transform = record.original_transform;
+   detection["keypoint_space"] = "original_image_pixels";
+   auto& joints = detection["keypoints"] = nlohmann::json::array();
+   for (std::size_t index = 0; index < prediction.keypoints.size(); ++index) {
+    const auto point = map_prediction_keypoint(prediction.keypoints[index], transform[0], transform[1], transform[2], transform[3]);
+    joints.push_back({{"name", schema.names[index]}, {"xy", {point.x, point.y}}, {"confidence", point.confidence},
+     {"precision_cholesky", point.precision_cholesky}, {"covariance", keypoint_covariance(point)}});
+   }
+  }
   if (prediction.has_mask) { detection["mask_rle"] = encode_mask_rle(prediction.mask); }
   detections.push_back(std::move(detection));
  }
@@ -152,10 +167,11 @@ struct AnnotationBatch final {
  torch::Tensor labels;
  torch::Tensor scores;
  torch::Tensor masks;
- torch::Tensor compact_boxes, compact_labels, compact_scores;
+ torch::Tensor keypoints, keypoint_counts;
+ torch::Tensor compact_boxes, compact_labels, compact_scores, compact_keypoints, compact_keypoint_counts;
  std::vector<runtime::AnalysisAnnotationStorage> storage;
  std::vector<PostprocessedSelection> selections;
- std::vector<RfdetrMaskSelection> runtime_selections;
+ std::vector<RfdetrOutputSelection> runtime_selections;
  bool want_masks = false;
  bool encoded_masks = false;
  bool preview_masks = false;
@@ -230,6 +246,8 @@ public:
   artifacts_.artifact_sha256 = runtime_->artifact_sha256();
   const auto& shape = runtime_->logits_shape();
   static_cast<void>(PredictionCapacity::Resolve(maximum_detections_, 1U, shape.extents[1], shape.extents[2], resolution_, resolution_, false));
+  artifacts_.config.task = runtime_->output_contract().task;
+  artifacts_.config.keypoints_per_class = runtime_->output_contract().keypoints_per_class;
   artifacts_.config.num_queries = static_cast<int>(shape.extents[1]);
   artifacts_.config.num_classes = static_cast<int>(shape.extents[2]);
   artifacts_.source_num_queries = artifacts_.config.num_queries;
@@ -281,6 +299,10 @@ public:
  [[nodiscard]] std::size_t capacity(std::size_t batch, std::uint32_t width, std::uint32_t height, bool masks) const {
   return PredictionCapacity::Resolve(maximum_detections_, batch, artifacts_.config.num_queries, artifacts_.config.num_classes, width, height, masks, class_layout()->eligible_count()).candidates;
  }
+ [[nodiscard]] std::uint32_t keypoint_capacity() const noexcept {
+  const auto& counts = artifacts_.config.keypoints_per_class;
+  return counts.empty() ? 0U : *std::max_element(counts.begin(), counts.end());
+ }
  [[nodiscard]] std::size_t candidate_count() const noexcept { return maximum_detections_; }
  [[nodiscard]] const ResolvedModelArtifacts& artifacts() const noexcept { return artifacts_; }
  [[nodiscard]] const std::shared_ptr<const ResolvedClassLayout>& class_layout() const noexcept { return native_ ? native_->class_layout() : runtime_->class_layout(); }
@@ -298,6 +320,10 @@ public:
     };
     auto& destination = annotations.selections[index];
     destination = {.query_indices = view(selected.query_indices, at::kLong)};
+    if (selected.keypoints) {
+     destination.keypoints = view(*selected.keypoints, at::kFloat);
+     destination.keypoint_counts = view(*selected.keypoint_counts, at::kInt);
+    }
     if (annotations.want_masks && selected.mask_logits)
      destination.mask_logits = view(*selected.mask_logits, selected.mask_logits->element_type == runtime::RuntimeElementType::Float16 ? at::kHalf : at::kFloat);
    }
@@ -367,6 +393,7 @@ private:
    annotations.boxes[index].narrow(0, 0, active).copy_(processed.boxes[0].to(at::kFloat));
    annotations.labels[index].narrow(0, 0, active).copy_(processed.labels[0].to(at::kInt));
    annotations.scores[index].narrow(0, 0, active).copy_(processed.scores[0].to(at::kFloat));
+   write_analysis_keypoints(processed, storage);
    annotations.selections[index] = processed;
    count_storage_->Publish(index, processed.counts, storage);
    storage.class_catalog = native_->class_layout()->catalog();
@@ -393,7 +420,7 @@ private:
  std::optional<runtime::RuntimeSubmission> pending_;
  torch::Tensor nested_mask_;
 };
-void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t capacity, std::uint32_t width, std::uint32_t height, int device, bool masks, bool raw_preview) {
+void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t capacity, std::uint32_t width, std::uint32_t height, int device, bool masks, bool raw_preview, std::uint32_t joints) {
  const auto cuda = torch::TensorOptions().device(torch::kCUDA, static_cast<c10::DeviceIndex>(device));
  const auto resize = [&](torch::Tensor& tensor, at::IntArrayRef shape, at::ScalarType type) {
   if (!tensor.defined() || tensor.get_device() != device)
@@ -406,6 +433,11 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
  resize(result.boxes, {count, limit, 4}, at::kFloat);
  resize(result.labels, {count, limit}, at::kInt);
  resize(result.scores, {count, limit}, at::kFloat);
+ if (joints && raw_preview) {
+  static_cast<void>(checked_prediction_extent(batch * capacity, joints * sizeof(runtime::AnalysisKeypoint), kMaximumPredictionTensorBytes));
+  resize(result.keypoints, {count, limit, joints, static_cast<int64_t>(runtime::kAnalysisKeypointChannels)}, at::kFloat);
+  resize(result.keypoint_counts, {count, limit}, at::kInt);
+ }
  result.want_masks = masks;
  result.raw_preview = raw_preview;
  result.preview_failure.clear();
@@ -438,6 +470,13 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
     .element_type = runtime::AnalysisElementType::Float32,
    },
   };
+  if (joints && raw_preview) {
+   result.storage[index].keypoint_capacity = joints;
+   result.storage[index].keypoints = {reinterpret_cast<std::uintptr_t>(result.keypoints[index].data_ptr()), capacity * joints * sizeof(runtime::AnalysisKeypoint),
+    {3U, {static_cast<std::uint32_t>(capacity), joints, static_cast<std::uint32_t>(runtime::kAnalysisKeypointChannels)}}, runtime::AnalysisElementType::Float32};
+   result.storage[index].keypoint_counts = {reinterpret_cast<std::uintptr_t>(result.keypoint_counts[index].data_ptr()), capacity * sizeof(int32_t),
+    {1U, {static_cast<std::uint32_t>(capacity)}}, runtime::AnalysisElementType::Int32};
+  }
  }
 }
 struct PredictionReadback final {
@@ -504,7 +543,7 @@ ResolvedPredictionDemand prediction_demand(
  };
 }
 struct PredictionSourceStorage final {
- std::array<torch::Tensor, 11U> products;
+ std::array<torch::Tensor, 15U> products;
  std::shared_ptr<void> backend_masks;
  std::shared_ptr<void> source;
 };
@@ -521,7 +560,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
   try {
    pixels.custody = std::make_shared<PredictionSourceStorage>(PredictionSourceStorage{
     {annotations.boxes, annotations.labels, annotations.scores, annotations.masks, annotations.compact_boxes, annotations.compact_labels, annotations.compact_scores, readback.device_indices,
-     readback.index_values, annotations.selections[index].query_indices, annotations.selections[index].mask_logits.value_or(torch::Tensor{})},
+     readback.index_values, annotations.selections[index].query_indices, annotations.selections[index].mask_logits.value_or(torch::Tensor{}), annotations.keypoints, annotations.keypoint_counts, annotations.compact_keypoints, annotations.compact_keypoint_counts},
     annotations.runtime_selections[index].custody, std::move(source)
    });
   } catch (...) { pixels = {.preview_failure = "Prediction source custody allocation failed"}; }
@@ -577,7 +616,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
    for (std::size_t joint = 0; joint < joints; ++joint) {
     KeypointPrediction point;
     std::memcpy(&point, source + joint * KeypointPredictionPacket::size, sizeof(point));
-    prediction.keypoints.push_back({point.x, point.y, 1.0F / (1.0F + std::exp(-point.findable_logit)), {point.log_l11, point.l21, point.log_l22}});
+    prediction.keypoints.push_back(decode_prediction_keypoint(point));
    }
   }
  }
@@ -614,15 +653,24 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
   // Reused compact buffers pair the callback metadata with precisely these survivors.
   const auto compact = [&](torch::Tensor& destination, const torch::Tensor& candidates) {
    if (!destination.defined()) destination = torch::empty({0}, candidates.options());
-   if (candidates.dim() == 2)
-    destination.resize_({active, candidates.size(1)});
-   else
-    destination.resize_({active});
+   auto shape = candidates.sizes().vec();
+   shape[0] = active;
+   destination.resize_(shape);
    at::index_select_out(destination, candidates, 0, storage.device_indices);
   };
   compact(batch.compact_boxes, batch.boxes[index]);
   compact(batch.compact_labels, batch.labels[index]);
   compact(batch.compact_scores, batch.scores[index]);
+  if (scalar_layout.keypoints_available) {
+   compact(batch.compact_keypoints, batch.keypoints[index]);
+   compact(batch.compact_keypoint_counts, batch.keypoint_counts[index]);
+   annotation.keypoints.address = reinterpret_cast<std::uintptr_t>(batch.compact_keypoints.data_ptr());
+   annotation.keypoints.shape.extents[0] = result.size();
+   annotation.keypoints.capacity_bytes = batch.compact_keypoints.nbytes();
+   annotation.keypoint_counts.address = reinterpret_cast<std::uintptr_t>(batch.compact_keypoint_counts.data_ptr());
+   annotation.keypoint_counts.shape.extents[0] = result.size();
+   annotation.keypoint_counts.capacity_bytes = batch.compact_keypoint_counts.nbytes();
+  }
   annotation.value_capacity = result.size();
   annotation.boxes_xyxy.address = reinterpret_cast<std::uintptr_t>(batch.compact_boxes.data_ptr());
   annotation.class_references.address = reinterpret_cast<std::uintptr_t>(batch.compact_labels.data_ptr());
@@ -775,7 +823,7 @@ struct PredictionLane final {
    masks = masks || demand.encoded_masks || demand.preview_masks;
    pixels_needed = pixels_needed || demand.pixels_admitted;
   }
-  prepare_annotations(annotations, backend->batch_size(), backend->capacity(backend->batch_size(), width, height, masks), width, height, device, masks, pixels_needed);
+  prepare_annotations(annotations, backend->batch_size(), backend->capacity(backend->batch_size(), width, height, masks), width, height, device, masks, pixels_needed, backend->keypoint_capacity());
   for (std::size_t index = 0; index < pixels.size(); ++index) annotations.storage[index].source_region = {.width = pixels[index].width, .height = pixels[index].height};
  }
  void CopyPixels(std::size_t index, const torch::Tensor& source) {
@@ -1175,6 +1223,11 @@ PredictionRunResult PredictionSession::State::RunResolved(
     const auto dataset_index = batch.image_indices[image];
     if (!loader->eligible(dataset_index)) throw std::runtime_error("RF-DETR dataset image index is out of range");
     lane.records.push_back({.dataset_index = dataset_index, .image_id = static_cast<std::int64_t>(dataset_index) + 1, .source_name = std::to_string(dataset_index)});
+    const auto geometry = loader->geometry(dataset_index);
+    const auto& original_image = loader->image_entry(dataset_index);
+    const auto sx = static_cast<double>(original_image.original_width) / geometry.resized_width;
+    const auto sy = static_cast<double>(original_image.original_height) / geometry.resized_height;
+    lane.records.back().original_transform = {sx, sy, -static_cast<double>(geometry.offset_x) * sx, -static_cast<double>(geometry.offset_y) * sy};
     lane.pixels.push_back({.width = loader->image_width(), .height = loader->image_height(), .device = device, .stream = stream.native_handle});
     lane.annotations.demand[image] = prediction_demand(options, backend, delivery, lane.records.back(), loader->image_width(), loader->image_height());
     if (lane.annotations.demand[image].pixels_admitted) {
@@ -1348,7 +1401,7 @@ void PredictionJsonWriter::Append(const PredictionRecord& record) {
  if (state_->request.output_path.empty()) return;
  if (!state_->begun || state_->committed) throw std::logic_error("prediction JSON is not writable");
  if (!state_->first) state_->stream << ',';
- state_->stream << prediction_record_json(record, state_->class_catalog ? state_->class_catalog->names() : std::span<const std::string>{}).dump();
+ state_->stream << prediction_record_json(record, state_->class_catalog.get()).dump();
  state_->first = false;
 }
 void PredictionJsonWriter::Complete() {

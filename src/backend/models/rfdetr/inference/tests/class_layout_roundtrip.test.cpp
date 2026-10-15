@@ -347,3 +347,28 @@ TEST_CASE("Class admission observes live cancellation at digest and completion b
   CHECK_NOTHROW(admission.RequireUnchanged());
  }
 }
+
+TEST_CASE("Engine companions bind joint task schema and reject competing contracts", "[model][rfdetr][layout][artifact][keypoints]") {
+ const mmltk::testsupport::ScopedTempDir root("joint-engine-contract");
+ const auto artifact = root.path() / "model.engine";
+ { std::ofstream output(artifact); output << "joint engine fixture"; }
+ c::OrderedClassCatalog names;
+ names.names = {{"marker"}};
+ names.keypoints = std::vector{c::ClassKeypointSchema{{"left","right"},{{0,1}},{1,0},{.1,.1}}};
+ r::ModelClassDescriptor descriptor;
+ descriptor.artifact_sha256 = io::sha256_hex(io::sha256_file(artifact));
+ descriptor.layout = r::native_training_class_layout(c::ClassCatalog(names));
+ descriptor.output_roles = {{"pred_logits",r::RfdetrOutputRole::Logits},{"pred_boxes",r::RfdetrOutputRole::Boxes},{"pred_keypoints",r::RfdetrOutputRole::Keypoints}};
+ descriptor.output_contract = r::RfdetrOutputContract{1U,r::ModelTask::Keypoints,{2}};
+ const auto write = [&](const std::filesystem::path& destination) { std::ofstream output(destination); output << r::encode_class_descriptor(descriptor); };
+ write(artifact.string() + ".classes.json");
+ const r::ClassArtifactAdmission admitted(artifact);
+ CHECK(admitted.output_contract() == descriptor.output_contract);
+ CHECK(admitted.Resolve(2,{}) == descriptor.layout);
+ const auto selected = root.path() / "selected.classes.json";
+ descriptor.output_contract->keypoints_per_class.push_back(0);
+ write(selected);
+ CHECK_THROWS(r::ClassArtifactAdmission(artifact,selected).output_contract());
+ descriptor.output_contract->keypoints_per_class = {1};
+ CHECK_THROWS(r::encode_class_descriptor(descriptor));
+}

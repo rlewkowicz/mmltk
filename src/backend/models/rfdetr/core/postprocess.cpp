@@ -8,6 +8,7 @@
 #include <ATen/ops/gt.h>
 #include <ATen/ops/upsample_bilinear2d.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include "keypoint_layout.h"
@@ -24,6 +25,7 @@ struct PostprocessCore {
  torch::Tensor boxes;
  torch::Tensor query_indices;
  torch::Tensor physical_labels;
+ torch::Tensor keypoint_counts;
  torch::Tensor counts;
 };
 torch::Tensor fixed_box_scale(const torch::Tensor& boxes, const int64_t height, const int64_t width, PostprocessLane* lane) {
@@ -103,6 +105,7 @@ std::optional<torch::Tensor> postprocess_keypoints(const OutputTensors& outputs,
  auto selected = shaped.index({batch_indices, core.query_indices, slots}).to(torch::kFloat32);
  const auto active = lane ? lane->KeypointMask(layout, raw.device()) : layout.active_mask().to(raw.device());
  const auto mask = active.index_select(0, slots.flatten()).view({batch, core.scores.size(1), k}) & core.physical_labels.lt(layout.slot_count()).unsqueeze(-1);
+ core.keypoint_counts = mask.sum(-1).to(torch::kInt32);
  const auto a = Packet::select<^^KeypointPrediction::log_l11>(selected, -1), b = Packet::select<^^KeypointPrediction::l21>(selected, -1), c = Packet::select<^^KeypointPrediction::log_l22>(selected, -1);
  const auto weight = Packet::select<^^KeypointPrediction::findable_logit>(selected, -1).sigmoid().clamp_min(1e-12).log().masked_fill(~mask, -std::numeric_limits<float>::infinity());
  const auto trace = torch::logsumexp(torch::stack({-2 * a, -2 * c, 2 * b.abs().clamp_min(1e-12).log() - 2 * a - 2 * c}, -1), -1);
@@ -111,8 +114,7 @@ std::optional<torch::Tensor> postprocess_keypoints(const OutputTensors& outputs,
  fused = torch::minimum(fused, torch::nextafter(torch::ones_like(fused), torch::zeros_like(fused)));
  core.scores = torch::where(core.physical_labels.lt(layout.slot_count()), fused, core.scores);
  selected = selected.masked_fill(~mask.unsqueeze(-1), 0);
- Packet::select<^^KeypointPrediction::x>(selected, -1).mul_(width);
- Packet::select<^^KeypointPrediction::y>(selected, -1).mul_(height);
+ map_prediction_keypoints_(selected, width, height);
  selected.narrow(-1, Packet::index<^^KeypointPrediction::log_l11>(), 3).masked_fill_(~mask.unsqueeze(-1), std::numeric_limits<float>::quiet_NaN());
  return selected;
 }
@@ -128,6 +130,16 @@ torch::Tensor detail::FixedBoxScale::Resolve(const torch::Tensor& boxes, const i
  height_ = height;
  width_ = width;
  return scale_;
+}
+void map_prediction_keypoints_(const torch::Tensor& packets, double scale_x, double scale_y, double offset_x, double offset_y) {
+ if (!(scale_x > 0) || !(scale_y > 0) || !std::isfinite(scale_x) || !std::isfinite(scale_y) || !std::isfinite(offset_x) || !std::isfinite(offset_y))
+  throw std::invalid_argument("invalid keypoint coordinate Jacobian");
+ using Packet = KeypointPredictionPacket;
+ Packet::select<^^KeypointPrediction::x>(packets, -1).mul_(scale_x).add_(offset_x);
+ Packet::select<^^KeypointPrediction::y>(packets, -1).mul_(scale_y).add_(offset_y);
+ Packet::select<^^KeypointPrediction::log_l11>(packets, -1).sub_(std::log(scale_x));
+ Packet::select<^^KeypointPrediction::l21>(packets, -1).div_(scale_y);
+ Packet::select<^^KeypointPrediction::log_l22>(packets, -1).sub_(std::log(scale_y));
 }
 void clip_prediction_boxes_(const torch::Tensor& boxes, double left, double top, double right, double bottom) {
  if (left > right || top > bottom) throw std::invalid_argument("invalid prediction clipping bounds");
@@ -171,7 +183,7 @@ PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outpu
   throw std::invalid_argument("RF-DETR mask logits are incompatible with selected queries");
  if (outputs.pred_masks) static_cast<void>(checked_prediction_extent(outputs.pred_masks->numel(), outputs.pred_masks->element_size(), kMaximumPredictionTensorBytes));
  auto keypoints = postprocess_keypoints(outputs, core, height, width, lane);
- return {std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks, std::move(core.counts), std::move(keypoints)};
+ return {std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks, std::move(core.counts), std::move(keypoints), std::move(core.keypoint_counts)};
 }
 SelectedMaskCapacity SelectedMaskWorkspace::RetainedCapacity(std::size_t host_bytes) const {
  const auto capacity = [](const auto& tensor) -> std::size_t { return tensor.defined() ? tensor.storage().nbytes() : 0U; };

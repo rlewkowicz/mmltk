@@ -1,5 +1,6 @@
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/backend/models/rfdetr/core/sample_output.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <stb_image_write.h>
@@ -99,7 +100,7 @@ void build_instance_colors_async(const std::int32_t* labels, const std::size_t c
  if (labels == nullptr || colors_rgb == nullptr || stream == nullptr) { throw std::invalid_argument("RF-DETR instance color generation requires device buffers and a stream"); }
  ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::build_category_colors_cuda({labels, count, num_classes, colors_rgb, stream})), "RF-DETR instance color generation");
 }
-void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor& result_boxes, const at::Tensor& result_labels, const at::Tensor& result_masks, const RenderSampleOptions& options) {
+void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor& result_boxes, const at::Tensor& result_labels, const at::Tensor& result_masks, const RenderSampleOptions& options, const at::Tensor* keypoints) {
  if (image_chw.numel() == 0) { return; }
  const auto device = image_chw.device();
  if (!device.is_cuda()) throw std::invalid_argument("eval sample writer requires a CUDA image");
@@ -156,6 +157,45 @@ void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor&
                    draw_stream.stream(),
                   })),
     "RF-DETR eval sample raster");
+  }
+  if (keypoints && keypoints->defined()) {
+   if (!options.class_catalog || keypoints->dim() != 3 || keypoints->size(0) != num_instances || keypoints->size(2) != KeypointPredictionPacket::size)
+    throw std::invalid_argument("sample keypoints require their admitted class schema");
+   const auto coordinates = keypoints->narrow(-1, KeypointPredictionPacket::index<^^KeypointPrediction::x>(), 2);
+   const auto findable = KeypointPredictionPacket::select<^^KeypointPrediction::findable_logit>(*keypoints, -1).ge(0) & torch::isfinite(coordinates).all(-1);
+   auto points = torch::nan_to_num(coordinates, -100000000., -100000000., -100000000.).clamp(-100000000, 100000000).round().to(device, torch::kInt32);
+   points.masked_fill_(~findable.unsqueeze(-1), -100000000);
+   auto overlay = torch::zeros({height, width, 4}, image_u8.options());
+   auto rgba = torch::cat({image_u8, torch::full({height, width, 1}, 255, image_u8.options())}, -1);
+   for (int index = 0; index < num_instances; ++index) {
+    const auto& schema = options.class_catalog->keypoints(labels_int[index]);
+    if (schema.names.empty()) continue;
+    if (schema.names.size() > static_cast<size_t>(points.size(1))) throw std::invalid_argument("sample joints exceed tensor capacity");
+    const mmltk::backend::imaging::raster::MutableBytes surface{overlay.data_ptr<uint8_t>(), static_cast<size_t>(width) * 4U, width, height};
+    const mmltk::backend::imaging::raster::PointBuffer view{points[index].data_ptr<int>(), static_cast<int>(schema.names.size())};
+    const auto* color = colors.data() + index * 3;
+    ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::raster_points_rgba({surface, view, 3, {color[0], color[1], color[2], 255U}, draw_stream.stream()})), "RF-DETR sample joint raster");
+    if (!schema.skeleton.empty()) {
+     std::vector<std::int64_t> edge_values;
+     edge_values.reserve(schema.skeleton.size() * 2);
+     for (const auto& edge : schema.skeleton) { edge_values.push_back(edge.first); edge_values.push_back(edge.second); }
+     auto indices = torch::tensor(edge_values, torch::TensorOptions().dtype(torch::kInt64).device(device)).reshape({-1, 2});
+     const auto active = findable[index].index_select(0, indices.select(1, 0)) & findable[index].index_select(0, indices.select(1, 1));
+     // Inactive endpoints use an out-of-range edge, preserving fixed GPU shape.
+     auto edges = indices.masked_fill(~active.unsqueeze(-1), points.size(1)).to(torch::kInt32);
+     ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::raster_skeleton_rgba({surface, view,
+      {reinterpret_cast<const uint32_t*>(edges.data_ptr<int>()), static_cast<int>(schema.skeleton.size())}, {color[0], color[1], color[2]}, 2, draw_stream.stream()})), "RF-DETR sample skeleton raster");
+     edges.record_stream(draw_stream);
+    }
+   }
+   ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::composite_rgba({
+    mmltk::backend::imaging::raster::pitched_rgba_target(rgba.data_ptr<uint8_t>(), static_cast<size_t>(width) * 4U, width, height),
+    {overlay.data_ptr<uint8_t>(), static_cast<size_t>(width) * 4U, width, height}, draw_stream.stream()})), "RF-DETR sample joint composition");
+   image_u8 = rgba.narrow(-1, 0, 3).contiguous();
+   keypoints->record_stream(draw_stream);
+   points.record_stream(draw_stream);
+   overlay.record_stream(draw_stream);
+   rgba.record_stream(draw_stream);
   }
   image_host = mmltk::backend::ml::cuda::numa_empty({height, width, 3}, torch::kUInt8, device.index());
   image_host.copy_(image_u8, true);

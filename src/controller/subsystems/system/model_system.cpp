@@ -44,7 +44,7 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
   layout = rfdetr::resolve_model_state(artifact, key.preset, key.resolution, key.class_layout_path, {}, stop).artifacts.class_layout;
  } else if (key.input == contracts::ModelArtifactInputKind::Onnx) {
   const rfdetr::ClassArtifactAdmission admission(artifact, key.class_layout_path, {}, stop);
-  const auto info = rfdetr::load_onnx_model_info(artifact, admission.output_roles());
+  const auto info = rfdetr::load_onnx_model_info(artifact, admission.output_roles(), admission.output_contract());
   layout = admission.Resolve(info.num_classes, info.class_layout, stop);
  } else {
   rfdetr::ModelArtifactRequest request;

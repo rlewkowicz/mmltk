@@ -1,5 +1,7 @@
 #pragma once
 #include <cuda_runtime_api.h>
+#include "src/backend/media/live/live_types.h"
+#include "src/backend/media/live/live_analysis_product.h"
 #include <cstddef>
 #include <cstdint>
 #include "src/frameworks/gpu/image/image_types.h"
@@ -12,5 +14,6 @@ struct LiveReceiverCopyOperations final {
 };
 [[nodiscard]] LiveReceiverCopyOperations native_live_receiver_copy_operations() noexcept;
 [[nodiscard]] cudaError_t copy_live_receiver_frame(
- mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t source, std::size_t source_pitch, std::uintptr_t ready_event, std::uintptr_t stream, const LiveReceiverCopyOperations&) noexcept;
+ mmltk::frameworks::gpu::ImagePlaneView target, mmltk::backend::media::live::LiveCompositeOutputLease&,
+ mmltk::backend::media::live::LiveAnalysisProduct&, std::uintptr_t stream, const LiveReceiverCopyOperations&) noexcept;
 }  // namespace mmltk::controller::detail

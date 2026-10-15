@@ -25,7 +25,7 @@ public:
  void Start(const LiveStart&) override {}
  void SetOutputAvailableSink(std::function<void()>) override {}
  bool AcquireOutput() override { return true; }
- bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t, const std::stop_token stop) override {
+ bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t, mmltk::backend::media::live::LiveAnalysisProduct& analysis, const std::stop_token stop) override {
   if (!first_stop_)
    first_stop_ = stop;
   else if (*first_stop_ != stop && token_changed_)
@@ -33,6 +33,7 @@ public:
   if (stop.stop_requested()) return false;
   const auto value = captures_->fetch_add(1U, std::memory_order_acq_rel) + 1U;
   Fill(target, static_cast<std::uint8_t>(value));
+  analysis.Reset({1U,value});
   return true;
  }
  void Stop() noexcept override {}

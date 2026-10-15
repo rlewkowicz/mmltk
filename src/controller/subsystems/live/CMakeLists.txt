@@ -20,11 +20,11 @@ target_link_libraries(mmltk_controller_live_system
     PUBLIC
         mmltk::controller::application_boundary
         mmltk::controller::visual_contract
+        mmltk::backend::media::live
         mmltk::frameworks::gpu
     PRIVATE
         mmltk::controller::visual_runtime
-        mmltk::backend::media::capture
-        mmltk::backend::media::live)
+        mmltk::backend::media::capture)
 mmltk_link_declarations(mmltk_controller_live_system PUBLIC
     mmltk::controller::visual_runtime)
 mmltk_register_header_isolation(mmltk_controller_live_system)
@@ -41,7 +41,8 @@ function(mmltk_add_controller_live_tests)
     mmltk_register_ordinary_sources(mmltk_controller_live_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/live_system.test.cpp)
     target_link_libraries(mmltk_controller_live_tests PRIVATE
-        mmltk_controller_live_test_support )
+        mmltk_controller_live_test_support
+        mmltk_backend_media_live_test_support)
     catch_discover_tests(mmltk_controller_live_tests
         TEST_PREFIX "controller::live::" DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)
 endfunction()

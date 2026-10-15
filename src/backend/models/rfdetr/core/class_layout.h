@@ -37,6 +37,8 @@ private:
 [[nodiscard]] ModelClassLayout coco_class_layout(ClassLayoutProvenance provenance);
 [[nodiscard]] std::string encode_class_layout(const ModelClassLayout& layout);
 [[nodiscard]] ModelClassLayout decode_class_layout(std::string_view text);
+[[nodiscard]] std::string encode_output_contract(const RfdetrOutputContract& contract);
+[[nodiscard]] RfdetrOutputContract decode_output_contract(std::string_view text);
 [[nodiscard]] std::string encode_class_descriptor(const ModelClassDescriptor& descriptor);
 [[nodiscard]] ModelClassDescriptor decode_class_descriptor(std::string_view text);
 [[nodiscard]] std::vector<RfdetrNamedOutputRole> class_descriptor_output_roles(std::span<const ModelClassDescriptor> descriptors);

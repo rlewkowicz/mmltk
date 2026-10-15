@@ -72,6 +72,14 @@ ClassArtifactAdmission::ClassArtifactAdmission(
  if (snapshot_ != capture(snapshot_.artifact_path, snapshot_.descriptor_path)) throw std::runtime_error("class artifact changed during descriptor admission");
  check_stop(stop);
 }
+std::optional<RfdetrOutputContract> ClassArtifactAdmission::output_contract() const {
+ std::optional<RfdetrOutputContract> result;
+ for (const auto& descriptor : descriptors_) if (descriptor.output_contract) {
+  if (result && *result != *descriptor.output_contract) throw std::invalid_argument("authoritative output contracts disagree");
+  result = descriptor.output_contract;
+ }
+ return result;
+}
 std::vector<RfdetrNamedOutputRole> ClassArtifactAdmission::output_roles() const { return class_descriptor_output_roles(descriptors_); }
 void ClassArtifactAdmission::RequireUnchanged(std::stop_token stop) const {
  check_stop(stop);

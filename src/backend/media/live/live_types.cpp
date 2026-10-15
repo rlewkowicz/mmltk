@@ -1,4 +1,5 @@
 #include "src/backend/media/live/live_types.h"
+#include "src/backend/media/live/live_analysis_product.h"
 #include <limits>
 #include <utility>
 namespace mmltk::backend::media::live {
@@ -12,6 +13,7 @@ LiveCompositeOutputLease::LiveCompositeOutputLease(
     : owner_(owner), complete_(complete), abandon_(abandon), view_(view), frame_revision_(frame_revision) {}
 LiveCompositeOutputLease LiveCompositeOutputLease::Create(
  void* owner, const CompleteCallback complete, const AbandonCallback abandon, LiveOutputFrame view, const PhysicalFrameRevision frame_revision) noexcept {
+ if (view.analysis && (!view.analysis->ready() || view.analysis->frame() != frame_revision.frame)) return {};
  return LiveCompositeOutputLease{owner, complete, abandon, view, frame_revision};
 }
 LiveCompositeOutputLease::~LiveCompositeOutputLease() noexcept { Abandon(); }

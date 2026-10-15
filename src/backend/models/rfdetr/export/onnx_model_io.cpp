@@ -91,16 +91,29 @@ void run_onnx_simplify(ONNX_NAMESPACE::ModelProto& model) {
  } catch (const std::exception& error) { throw std::runtime_error(std::string("RF-DETR ONNX simplify failed: ") + error.what()); }
 }
 }  // namespace
-void write_onnx_model_bytes(const std::string_view serialized_model, const std::filesystem::path& output_path, const ModelClassLayout& layout) {
+void write_onnx_model_bytes(const std::string_view serialized_model, const std::filesystem::path& output_path, const ModelClassLayout& layout, const RfdetrOutputContract& contract) {
  ONNX_NAMESPACE::ModelProto model;
  if (serialized_model.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) || !model.ParseFromArray(serialized_model.data(), static_cast<int>(serialized_model.size())))
   throw std::invalid_argument("invalid serialized ONNX model");
  auto* metadata = model.add_metadata_props();
  metadata->set_key("mmltk.rfdetr.class_layout");
  metadata->set_value(encode_class_layout(layout));
+ metadata = model.add_metadata_props();
+ metadata->set_key("mmltk.rfdetr.output_contract");
+ metadata->set_value(encode_output_contract(contract));
+ ModelInfo info;
+ info.class_layout = layout;
+ info.output_contract = contract;
+ for (const auto& output : model.graph().output()) info.outputs.push_back(tensor_info_from_value_info(output));
+ static_cast<void>(validate_rfdetr_output_layout(info));
+ for (int index = 0; index < model.graph().output_size(); ++index) {
+  auto* role = model.mutable_graph()->mutable_output(index)->add_metadata_props();
+  role->set_key("mmltk.rfdetr.output_role");
+  role->set_value(std::string(mmltk::frameworks::reflection::enum_name(info.outputs[index].role)));
+ }
  write_onnx_model(model, output_path);
 }
-ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::span<const RfdetrNamedOutputRole> roles) {
+ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::span<const RfdetrNamedOutputRole> roles, std::optional<RfdetrOutputContract> contract) {
  const ONNX_NAMESPACE::ModelProto model = load_onnx_model(model_path);
  const auto& graph = model.graph();
  if (graph.input_size() == 0) { throw std::runtime_error("ONNX model has no graph inputs: " + model_path.string()); }
@@ -121,9 +134,18 @@ ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::spa
  info.outputs.reserve(static_cast<std::size_t>(graph.output_size()));
  for (const auto& output : graph.output()) { info.outputs.push_back(tensor_info_from_value_info(output)); }
  for (const auto& metadata : model.metadata_props()) {
+  if (metadata.key() == "mmltk.rfdetr.output_contract") {
+   if (info.output_contract) throw std::invalid_argument("duplicate ONNX output contract metadata");
+   info.output_contract = decode_output_contract(metadata.value());
+   continue;
+  }
   if (metadata.key() != "mmltk.rfdetr.class_layout") continue;
   if (info.class_layout) throw std::invalid_argument("duplicate ONNX class layout metadata");
   info.class_layout = decode_class_layout(metadata.value());
+ }
+ if (contract) {
+  if (info.output_contract && info.output_contract != contract) throw std::invalid_argument("ONNX task/schema metadata disagrees with descriptor");
+  info.output_contract = std::move(contract);
  }
  apply_rfdetr_output_roles(info, roles);
  static_cast<void>(validate_rfdetr_output_layout(info));
@@ -135,17 +157,17 @@ void simplify_onnx_model_file(const std::filesystem::path& model_path) {
  auto source_lease = publication.LockPreviousArtifact();
  const auto& descriptor = publication.previous_descriptor();
  const auto roles = descriptor ? descriptor->output_roles : std::vector<RfdetrNamedOutputRole>{};
- const auto admitted = load_onnx_model_info(model_path, roles);
+ const auto admitted = load_onnx_model_info(model_path, roles, descriptor ? descriptor->output_contract : std::nullopt);
  const auto expected =
   admit_artifact_class_layout(admitted.num_classes, admitted.class_layout, descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{});
  auto model = load_onnx_model(model_path);
  source_lease = mmltk::common::io::ScopedFd{};
  run_onnx_simplify(model);
  write_onnx_model(model, publication.staged_artifact());
- const auto reopened = load_onnx_model_info(publication.staged_artifact(), roles);
+ const auto reopened = load_onnx_model_info(publication.staged_artifact(), roles, descriptor ? descriptor->output_contract : std::nullopt);
  if (admit_artifact_class_layout(reopened.num_classes, reopened.class_layout, descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{}) !=
       expected ||
-     rfdetr_output_roles(reopened) != rfdetr_output_roles(admitted))
+     rfdetr_output_roles(reopened) != rfdetr_output_roles(admitted) || reopened.output_contract != admitted.output_contract)
   throw std::runtime_error("ONNX simplification changed admitted class metadata");
  publication.Publish(descriptor);
 }

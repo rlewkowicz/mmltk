@@ -28,6 +28,41 @@ namespace {
 void checked(cudaError_t status) {
  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
+struct SkeletonSpan final {
+ std::size_t points = 0, edges = 0;
+ std::uint32_t point_count = 0, edge_count = 0;
+ std::array<std::uint8_t, 3> color{};
+ float score = 0;
+ bool ground_truth = false;
+};
+void append_skeleton(std::vector<std::uint32_t>& words, std::vector<SkeletonSpan>& spans, const rfdetr::Prediction& prediction,
+ const mmltk::backend::data::catalog::ClassCatalog& catalog, int classes, bool ground_truth) {
+ if (prediction.keypoints.empty()) return;
+ const auto& schema = catalog.keypoints(prediction.class_reference);
+ if (schema.names.size() != prediction.keypoints.size() || (!prediction.keypoint_visibility.empty() && prediction.keypoint_visibility.size() != prediction.keypoints.size()))
+  throw std::invalid_argument("preview joint schema differs from the semantic product");
+ SkeletonSpan span{.points = words.size(), .point_count = static_cast<std::uint32_t>(prediction.keypoints.size()),
+  .score = prediction.score, .ground_truth = ground_truth};
+ const auto colors = raster::category_colors(std::array{prediction.class_reference}, classes);
+ std::copy_n(colors.begin(), span.color.size(), span.color.begin());
+ const auto visible = [&](std::size_t joint) {
+  const auto& point = prediction.keypoints[joint];
+  return std::isfinite(point.x) && std::isfinite(point.y) && (ground_truth ? prediction.keypoint_visibility.empty() ||
+   prediction.keypoint_visibility[joint] != mmltk::backend::data::catalog::KeypointVisibility::Unannotated : point.confidence >= 0.5F);
+ };
+ for (std::size_t joint = 0; joint < prediction.keypoints.size(); ++joint) {
+  const auto& point = prediction.keypoints[joint];
+  for (const auto value : {point.x, point.y}) {
+   const auto coordinate = visible(joint) ? static_cast<std::int32_t>(std::clamp<double>(std::round(value), -100000000, 100000000)) : -100000000;
+   words.push_back(static_cast<std::uint32_t>(coordinate));
+  }
+ }
+ span.edges = words.size();
+ for (const auto& edge : schema.skeleton) if (visible(edge.first) && visible(edge.second)) {
+  words.push_back(edge.first); words.push_back(edge.second); ++span.edge_count;
+ }
+ spans.push_back(span);
+}
 std::size_t preview_slot_count(std::size_t slots) {
  if (slots == 0U || slots > PredictionPreviewComposition::kMaximumFrames) throw std::invalid_argument("preview slot capacity is outside its bound");
  return slots;
@@ -83,7 +118,11 @@ struct PredictionPreviewFrame::State final {
  gpu::CudaHighWaterAllocation<void*> storage;
  std::size_t capacity = 0U;
  VisualExtent extent;
- std::size_t boxes_offset{}, confidences_offset{}, labels_offset{}, masks_offset{}, colors_offset{};
+ std::size_t boxes_offset{}, confidences_offset{}, labels_offset{}, masks_offset{}, colors_offset{}, keypoints_offset{}, keypoint_counts_offset{};
+ std::size_t keypoint_bytes = 0;
+ std::vector<std::uint32_t> skeleton_words;
+ std::vector<SkeletonSpan> skeletons;
+ std::size_t skeleton_offset = 0;
  bool masks = false;
  int category_count = 0;
  std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog;
@@ -96,7 +135,7 @@ struct PredictionPreviewFrame::State final {
  decltype(&cudaMemset2DAsync) clear_semantic = &cudaMemset2DAsync;
  std::uint64_t capture = 0U;
  struct Preparation final {
-  bool clean = false, semantic = false, ground_truth = false, colors = false;
+  bool clean = false, semantic = false, ground_truth = false, colors = false, skeletons = false;
   PredictionPreviewComposition::Options options;
  } prepared, pending;
 };
@@ -203,10 +242,18 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   if (gt.mask.runs.size() > rfdetr::kMaximumPredictionMaskRuns - ground_truth_words / 2U) throw std::invalid_argument("preview ground truth RLE exceeds capacity");
   ground_truth_words += gt.mask.runs.size() * 2U;
  }
- const auto raw_bytes = pixel_bytes + count * (5U * sizeof(float) + sizeof(std::int32_t) + 3U) + mask_bytes;
+ std::vector<std::uint32_t> skeleton_words;
+ std::vector<SkeletonSpan> skeletons;
+ for (const auto& prediction : predictions) append_skeleton(skeleton_words, skeletons, prediction, *catalog, classes, false);
+ for (const auto& gt : ground_truth) append_skeleton(skeleton_words, skeletons, gt, *catalog, classes, true);
+ const auto joint_bytes = annotations.keypoints_available ? rfdetr::checked_prediction_extent(count, annotations.keypoint_capacity * sizeof(mmltk::backend::ml::runtime::AnalysisKeypoint), rfdetr::kMaximumPredictionTensorBytes) : 0U;
+ if (joint_bytes && (!annotations.keypoints.address || !annotations.keypoint_counts.address || annotations.keypoints.capacity_bytes < joint_bytes || annotations.keypoint_counts.capacity_bytes < count * sizeof(std::int32_t)))
+  throw std::invalid_argument("preview joint planes exceed the produced storage");
+ const auto joint_storage_bytes = joint_bytes ? joint_bytes + count * sizeof(std::int32_t) + 3U : 0U;
+ const auto raw_bytes = joint_storage_bytes + pixel_bytes + count * (5U * sizeof(float) + sizeof(std::int32_t) + 3U) + mask_bytes;
  const auto layout_after_pixels = [&](std::size_t bytes) {
   const auto ground_truth_offset = (bytes + 3U) & ~std::size_t{3U};
-  const auto scratch_offset = ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
+  const auto scratch_offset = ground_truth_offset + (ground_truth_words + skeleton_words.size()) * sizeof(std::uint32_t);
   return std::array{ground_truth_offset, scratch_offset, scratch_offset + (composition ? pixel_count * 8U : 0U)};
  };
  const auto admitted_bytes = layout_after_pixels(raw_bytes)[2];
@@ -280,7 +327,13 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
    state.confidences_offset = state.boxes_offset + count * 4U * sizeof(float);
    state.labels_offset = state.confidences_offset + count * sizeof(float);
    state.masks_offset = state.labels_offset + count * sizeof(std::int32_t);
-   state.colors_offset = state.masks_offset + mask_bytes;
+   state.keypoints_offset = (state.masks_offset + mask_bytes + 3U) & ~std::size_t{3U};
+   state.keypoint_counts_offset = state.keypoints_offset + joint_bytes;
+   state.keypoint_bytes = joint_bytes;
+   state.colors_offset = joint_bytes ? state.keypoint_counts_offset + count * sizeof(std::int32_t) : state.masks_offset + mask_bytes;
+   state.skeleton_offset = ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
+   state.skeleton_words = std::move(skeleton_words);
+   state.skeletons = std::move(skeletons);
    state.masks = mask_bytes != 0U;
    state.ground_truth.assign(ground_truth.begin(), ground_truth.end());
    state.ground_truth_runs.clear();
@@ -302,7 +355,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
    state.predictions.clear();
    state.predictions.reserve(count);
    for (const auto& prediction : predictions)
-    state.predictions.push_back({.class_reference = prediction.class_reference, .class_domain = prediction.class_domain, .score = prediction.score, .bbox_xyxy = prediction.bbox_xyxy});
+    state.predictions.push_back({.class_reference = prediction.class_reference, .class_domain = prediction.class_domain, .score = prediction.score, .bbox_xyxy = prediction.bbox_xyxy, .keypoints = prediction.keypoints, .keypoint_visibility = prediction.keypoint_visibility});
    auto* destination = static_cast<std::uint8_t*>(state.storage.active());
    bool source_submitted = false;
    try {
@@ -332,6 +385,10 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
       copy(destination + state.confidences_offset, reinterpret_cast<const void*>(annotations.confidences.address), count * sizeof(float));
       copy(destination + state.labels_offset, reinterpret_cast<const void*>(annotations.class_references.address), count * sizeof(std::int32_t));
       if (mask_bytes) copy(destination + state.masks_offset, reinterpret_cast<const void*>(annotations.masks.address), mask_bytes);
+      if (joint_bytes) {
+       copy(destination + state.keypoints_offset, reinterpret_cast<const void*>(annotations.keypoints.address), joint_bytes);
+       copy(destination + state.keypoint_counts_offset, reinterpret_cast<const void*>(annotations.keypoint_counts.address), count * sizeof(std::int32_t));
+      }
      }
      checked(operations_.record(state.source_ready, reinterpret_cast<cudaStream_t>(source_stream)));
      state.source_recorded = true;
@@ -530,10 +587,12 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
    auto* data = static_cast<std::uint8_t*>(state.storage.active());
    state.pending = state.prepared;
    const bool upload_gt = write_semantic && ground_truth_masks && !state.prepared.ground_truth && !state.ground_truth_runs.empty();
-   if ((state.rgb8 || upload_gt) && !state.pinned) state.pinned = std::make_unique<gpu::PinnedHostBuffer>(scope.Current(), state.placement, false, state.register_host);
+   const bool upload_skeletons = write_semantic && !state.prepared.skeletons && !state.skeleton_words.empty();
+   if ((state.rgb8 || upload_gt || upload_skeletons) && !state.pinned) state.pinned = std::make_unique<gpu::PinnedHostBuffer>(scope.Current(), state.placement, false, state.register_host);
    const auto rgb_bytes = state.rgb8 ? static_cast<std::size_t>(state.extent.width) * state.extent.height * 3U : 0U;
    const auto gt_bytes = upload_gt ? state.ground_truth_runs.size() * sizeof(std::uint32_t) : 0U;
-   if (rgb_bytes + gt_bytes != 0U) state.pinned->ensure_bytes(rgb_bytes + gt_bytes);
+   const auto skeleton_bytes = upload_skeletons ? state.skeleton_words.size() * sizeof(std::uint32_t) : 0U;
+   if (rgb_bytes + gt_bytes + skeleton_bytes != 0U) state.pinned->ensure_bytes(rgb_bytes + gt_bytes + skeleton_bytes);
    if (state.rgb8) {
     const auto bytes = rgb_bytes;
     std::memcpy(state.pinned->data(), state.rgb8, bytes);
@@ -589,6 +648,22 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
      std::memcpy(staging, state.ground_truth_runs.data(), bytes);
      checked(state.upload(data + state.ground_truth_offset, staging, bytes, cudaMemcpyHostToDevice, cuda_stream));
      state.pending.ground_truth = true;
+    }
+    if (upload_skeletons) {
+     auto* staging = static_cast<std::uint8_t*>(state.pinned->data()) + rgb_bytes + gt_bytes;
+     std::memcpy(staging, state.skeleton_words.data(), skeleton_bytes);
+     checked(state.upload(data + state.skeleton_offset, staging, skeleton_bytes, cudaMemcpyHostToDevice, cuda_stream));
+     state.pending.skeletons = true;
+    }
+    for (const auto& skeleton : state.skeletons) {
+     if (skeleton.ground_truth ? !ground_truth_boxes : !prediction_boxes || skeleton.score < confidence_threshold.value_or(0.0F)) continue;
+     auto color = skeleton.color;
+     if (skeleton.ground_truth && complementary_layers) for (auto& channel : color) channel = 255U - channel;
+     const raster::PointBuffer points{reinterpret_cast<const int*>(data + state.skeleton_offset) + skeleton.points, static_cast<int>(skeleton.point_count)};
+     checked(static_cast<cudaError_t>(raster::raster_points_rgba({.overlay = overlay, .points = points, .radius = 3, .color = {color[0], color[1], color[2], 255U}, .stream = {reinterpret_cast<void*>(stream)}})));
+     if (skeleton.edge_count) checked(static_cast<cudaError_t>(raster::raster_skeleton_rgba({.overlay = overlay, .points = points,
+      .edges = {reinterpret_cast<const std::uint32_t*>(data + state.skeleton_offset) + skeleton.edges, static_cast<int>(skeleton.edge_count)},
+      .color = {color[0], color[1], color[2]}, .thickness = 2, .stream = {reinterpret_cast<void*>(stream)}})));
     }
     std::size_t word = 0U, gt_index = 0U;
     for (const auto& gt : state.ground_truth) {

@@ -17,6 +17,10 @@
 #include <torch/types.h>
 namespace mmltk::backend::models::rfdetr {
 // Coordinate clipping is independent of corner ordering. Bounds are image content in canvas pixels.
+// Packet precision P = L L^T transforms with the inverse coordinate Jacobian.
+// Coordinates and precision share one domain. Selection converts both from
+// the normalized model domain into the requested pixel canvas exactly once.
+void map_prediction_keypoints_(const torch::Tensor&, double scale_x, double scale_y, double offset_x = 0, double offset_y = 0);
 void clip_prediction_boxes_(const torch::Tensor& boxes, double left, double top, double right, double bottom);
 namespace detail {
 // One immutable allocation for the most recently used device, stream and geometry.
@@ -66,6 +70,7 @@ struct PostprocessedSelection {
  std::optional<torch::Tensor> mask_logits{};
  torch::Tensor counts{};
  std::optional<torch::Tensor> keypoints{};
+ torch::Tensor keypoint_counts{};
 };
 PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false, PostprocessLane* lane = nullptr);
 // Complete concurrently live scratch: gathered logits, expanded logits, device

@@ -195,11 +195,24 @@ TEST_CASE("Evaluation staging preserves categories beyond the per-category evalu
   torch::tensor({.9F, .8F, .7F}).view({1, 3}).to(device), torch::tensor({0L, 1L, -1L}, torch::kInt64).view({1, 3}).to(device),
   torch::tensor({0.F, 0.F, 2.F, 2.F, 3.F, 3.F, 5.F, 5.F, 0.F, 0.F, 0.F, 0.F}).view({1, 3, 4}).to(device), std::nullopt, torch::tensor({2L}, torch::kInt64).to(device)
  };
- auto staged = stage_prediction_batch(std::move(batch), 2, 1, std::move(lease), 0, stream.stream());
+ namespace catalog = mmltk::backend::data::catalog;
+ catalog::OrderedClassCatalog names;
+ names.names = {{"marker"},{"plain"}};
+ names.keypoints = std::vector{catalog::ClassKeypointSchema{{"left","right"},{{0,1}},{1,0},{.1,.1}},catalog::ClassKeypointSchema{}};
+ auto schema = std::make_shared<const catalog::ClassCatalog>(names);
+ batch.keypoints = torch::zeros({1,3,2,static_cast<int64_t>(KeypointPredictionPacket::size)},torch::TensorOptions().device(device));
+ KeypointPredictionPacket::select<^^KeypointPrediction::x>(*batch.keypoints,-1).fill_(7);
+ KeypointPredictionPacket::select<^^KeypointPrediction::y>(*batch.keypoints,-1).fill_(11);
+ auto staged = stage_prediction_batch(std::move(batch), 2, 1, std::move(lease), 0, stream.stream(),schema);
  mmltk::common::concurrency::WorkerPool workers(1);
  const auto images = collect_prediction_batch_encoding(enqueue_prediction_batch_encoding(workers, std::move(staged)));
  REQUIRE(images.size() == 1);
  REQUIRE(images[0].predictions.size() == 2);
  CHECK(images[0].predictions[0].class_reference == 0);
  CHECK(images[0].predictions[1].class_reference == 1);
+ REQUIRE(images[0].predictions[0].keypoints.size() == 2);
+ CHECK(images[0].predictions[0].keypoints[0].x == 7);
+ CHECK(images[0].predictions[0].keypoints[0].y == 11);
+ CHECK(images[0].predictions[0].keypoints[0].confidence == .5F);
+ CHECK(images[0].predictions[1].keypoints.empty());
 }

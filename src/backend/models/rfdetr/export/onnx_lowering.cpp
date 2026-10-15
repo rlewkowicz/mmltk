@@ -66,6 +66,11 @@ const c10::Symbol kAtenT = c10::Symbol::fromQualString("aten::t");
 const c10::Symbol kAtenTranspose = c10::Symbol::fromQualString("aten::transpose");
 const c10::Symbol kAtenPermute = c10::Symbol::fromQualString("aten::permute");
 const c10::Symbol kAtenView = c10::Symbol::fromQualString("aten::view");
+const c10::Symbol kAtenReshapeAs = c10::Symbol::fromQualString("aten::reshape_as");
+const c10::Symbol kAtenViewAs = c10::Symbol::fromQualString("aten::view_as");
+const c10::Symbol kAtenExpandAs = c10::Symbol::fromQualString("aten::expand_as");
+const c10::Symbol kAtenRepeatInterleave = c10::Symbol::fromQualString("aten::repeat_interleave");
+const c10::Symbol kAtenNanToNum = c10::Symbol::fromQualString("aten::nan_to_num");
 const c10::Symbol kAtenReshape = c10::Symbol::fromQualString("aten::reshape");
 const c10::Symbol kAtenUnsqueeze = c10::Symbol::fromQualString("aten::unsqueeze");
 const c10::Symbol kAtenSqueeze = c10::Symbol::fromQualString("aten::squeeze");
@@ -1247,6 +1252,47 @@ void lower_repeat_node(torch::jit::Node* node) {
  auto* tile = node->owningGraph()->create(kOnnxTile, {repeated_input, create_int64s_constant(node, normalized_repeats)}, 1);
  replace_node_with(node, tile);
 }
+void lower_repeat_interleave_node(torch::jit::Node* node) {
+ if (node->inputs().size() < 3) throw_lowering_error(node, "repeat_interleave requires scalar repeats and an axis");
+ const auto repeats = constant_int_value(node->input(1));
+ const auto dimension = constant_int_value(node->input(2));
+ const auto sizes = value_tensor_sizes(node->input(0));
+ if (!repeats || *repeats <= 0 || !dimension || !sizes) throw_lowering_error(node, "repeat_interleave requires static positive repeats and shape");
+ const auto axis = normalize_axis(*dimension, sizes->size(), node);
+ std::vector<int64_t> indices;
+ if (sizes->at(axis) > std::numeric_limits<int64_t>::max() / *repeats) throw_lowering_error(node, "repeat_interleave extent overflows");
+ indices.reserve(sizes->at(axis) * *repeats);
+ for (int64_t index = 0; index < sizes->at(axis); ++index)
+  for (int64_t repeat = 0; repeat < *repeats; ++repeat) indices.push_back(index);
+ auto* gather = node->owningGraph()->create(kOnnxGather, {node->input(0), create_int64s_constant(node, indices)}, 1);
+ gather->i_(kAttrAxis, axis);
+ replace_node_with(node, gather);
+}
+void lower_expand_as_node(torch::jit::Node* node) {
+ const auto sizes = value_tensor_sizes(node->output());
+ if (!sizes) throw_lowering_error(node, "expand_as requires the fixed export shape");
+ auto* expanded = node->owningGraph()->create(kOnnxExpand, {node->input(0), create_int64s_constant(node, *sizes)}, 1);
+ replace_node_with(node, expanded);
+}
+void lower_nan_to_num_node(torch::jit::Node* node) {
+ require_input_count(node, 4);
+ const auto type = value_scalar_type(node->input(0)).value_or(at::kFloat);
+ const double maximum = type == at::kHalf ? 65504.0 : type == at::kDouble ? std::numeric_limits<double>::max() : type == at::kBFloat16 ? std::ldexp(255.0, 120) : std::numeric_limits<float>::max();
+ const auto replacement = [&](size_t index, double fallback) {
+  const auto scalar = is_none_value(node->input(index)) ? std::optional<double>(fallback) : constant_double_value(node->input(index));
+  if (!scalar) throw_lowering_error(node, "nan_to_num requires constant replacements");
+  return create_constant_value(node, make_scalar_tensor(*scalar, type));
+ };
+ LoweredNodeChain chain(node);
+ auto* input = node->input(0);
+ auto* nan = chain.append(c10::Symbol::fromQualString("onnx::IsNaN"), {input});
+ auto* positive = chain.append(kOnnxEqual, {input, create_constant_value(node, make_scalar_tensor(std::numeric_limits<double>::infinity(), type))});
+ auto* negative = chain.append(kOnnxEqual, {input, create_constant_value(node, make_scalar_tensor(-std::numeric_limits<double>::infinity(), type))});
+ auto* selected = chain.append(kOnnxWhere, {nan->output(), replacement(1, 0), input});
+ selected = chain.append(kOnnxWhere, {positive->output(), replacement(2, maximum), selected->output()});
+ selected = chain.append(kOnnxWhere, {negative->output(), replacement(3, -maximum), selected->output()});
+ replace_node_with(node, selected->output());
+}
 void lower_softmax_node(torch::jit::Node* node) {
  require_input_count(node, 3);
  const int64_t axis = require_normalized_axis(node, "softmax");
@@ -1751,7 +1797,6 @@ void lower_scaled_dot_product_attention_node(torch::jit::Node* node) {
  const bool math = node->kind() == kMathAttention;
  require_input_count(node, math ? 9 : 8);
  if (node->outputs().size() != (math ? 2U : 1U)) throw_lowering_error(node, "unexpected attention output inventory");
- if (!is_none_value(node->input(3))) throw_lowering_error(node, "attention masks are not supported yet");
  if (math && !is_none_value(node->input(6))) throw_lowering_error(node, "dropout mask is not supported for export");
  const auto dropout_p = constant_double_value(node->input(4));
  const auto is_causal = constant_bool_value(node->input(5));
@@ -1795,6 +1840,19 @@ void lower_scaled_dot_product_attention_node(torch::jit::Node* node) {
  std::swap(permutation[permutation.size() - 2], permutation.back());
  auto* transposed = chain.append_transpose(key, std::move(permutation));
  auto* scores = chain.append(kOnnxMatMul, {query, transposed->output()});
+ if (!is_none_value(node->input(3))) {
+  auto* mask = node->input(3);
+  const auto mask_type = value_scalar_type(mask);
+  if (!mask_type) throw_lowering_error(node, "attention mask dtype must be known");
+  if (*mask_type == at::kBool) {
+   // The public SDPA operator uses true for admitted attention. The math
+   // primitive receives its already-converted additive mask.
+   if (math) throw_lowering_error(node, "math attention requires an additive mask");
+   mask = chain.append(kOnnxWhere, {mask, create_scalar_constant(node, 0.0, accumulator_type),
+    create_scalar_constant(node, -std::numeric_limits<double>::infinity(), accumulator_type)})->output();
+  } else if (*mask_type != accumulator_type) mask = cast(mask, accumulator_type);
+  scores = chain.append(kOnnxAdd, {scores->output(), mask});
+ }
  auto* softmax = chain.append(kOnnxSoftmax, {scores->output()});
  softmax->i_(kAttrAxis, -1);
  // ATen's safe softmax maps an entirely -infinity row to zeros while
@@ -1898,6 +1956,11 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
  CTX(kAtenConvolution, lower_convolution_node)                       \
  NODE(kAtenFlatten, lower_static_reshape_node)                       \
  NODE(kAtenView, lower_static_reshape_node)                          \
+ NODE(kAtenReshapeAs, lower_static_reshape_node)                    \
+ NODE(kAtenViewAs, lower_static_reshape_node)                       \
+ NODE(kAtenExpandAs, lower_expand_as_node)                          \
+ NODE(kAtenRepeatInterleave, lower_repeat_interleave_node)           \
+ NODE(kAtenNanToNum, lower_nan_to_num_node)                          \
  NODE(kAtenReshape, lower_static_reshape_node)                       \
  NODE(kAtenUnsqueeze, lower_static_reshape_node)                     \
  NODE(kAtenSqueeze, lower_static_reshape_node)                       \
@@ -1919,6 +1982,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
  NODE(kAtenDropout, lower_dropout_node)                              \
  NODE(kAtenLayerNorm, lower_layer_norm_node)                         \
  NODE(kAtenNativeLayerNorm, lower_layer_norm_node)                   \
+ SYMBOL(kAtenNeg, lower_unary_node, c10::Symbol::fromQualString("onnx::Neg")) \
  SYMBOL(kAtenSin, lower_unary_node, kOnnxSin)                        \
  SYMBOL(kAtenCos, lower_unary_node, kOnnxCos)                        \
  SYMBOL(kAtenExp, lower_unary_node, kOnnxExp)                        \

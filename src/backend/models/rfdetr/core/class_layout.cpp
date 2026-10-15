@@ -1,4 +1,5 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/model_info.h"
 #include "src/pch_std.h"
 #include "src/common/io/file_digest.h"
 #include "src/frameworks/serialization/json_wire.h"
@@ -143,6 +144,7 @@ void validate_descriptor(const ModelClassDescriptor& descriptor) {
  if (descriptor.version != 1U) throw std::invalid_argument("unsupported RF-DETR class descriptor version");
  static_cast<void>(mmltk::common::io::parse_sha256_hex(descriptor.artifact_sha256));
  const ResolvedClassLayout validated(descriptor.layout);
+ if (descriptor.output_contract) validate_rfdetr_output_contract(*descriptor.output_contract, &validated);
  if (descriptor.output_roles.size() > kMaximumNamedOutputRoles) throw std::invalid_argument("oversized class descriptor output roles");
  std::array<bool, kMaximumNamedOutputRoles + 1U> roles{};
  for (std::size_t index = 0; index < descriptor.output_roles.size(); ++index) {
@@ -165,6 +167,8 @@ ModelClassLayout decode_class_layout(std::string_view text) {
  const ResolvedClassLayout validated(record);
  return record;
 }
+std::string encode_output_contract(const RfdetrOutputContract& contract) { validate_rfdetr_output_contract(contract); return encode_record(contract); }
+RfdetrOutputContract decode_output_contract(std::string_view text) { auto result = decode_record<RfdetrOutputContract>(text); validate_rfdetr_output_contract(result); return result; }
 std::string encode_class_descriptor(const ModelClassDescriptor& descriptor) {
  validate_descriptor(descriptor);
  return encode_record(descriptor);

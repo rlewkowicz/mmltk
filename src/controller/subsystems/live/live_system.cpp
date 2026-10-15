@@ -4,12 +4,18 @@
 #include "src/frameworks/gpu/image/image_failure.h"
 #include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include <condition_variable>
+#include <algorithm>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 #include "src/controller/contracts/compute.h"
 namespace mmltk::controller {
+LiveAnalysisRead::LiveAnalysisRead(VisualFrame frame, mmltk::frameworks::gpu::BorrowedImageProductReadView image,
+ std::shared_ptr<const mmltk::backend::media::live::LiveAnalysisProduct> analysis) noexcept
+ : frame_(frame), analysis_(std::move(analysis)), image_(std::move(image)) {}
 class LiveSystem::Impl final {
  WorkspaceInput input_;
 
@@ -153,12 +159,25 @@ private:
   auto candidate = worker_.TryAcquireOutput(runtime, pending_output_);
   if (!candidate.valid()) return {};
   if (!algorithm->AcquireOutput()) return {};
+  // Every retained semantic read holds an image slot. Thus this reusable pool
+  // grows only with the image slots actually owned by this runtime and readers,
+  // plus the unpublished replacement; it never accumulates per-frame products.
+  auto available = std::ranges::find_if(analysis_slots_, [](const auto& slot) { return slot.use_count() == 1; });
+  if (available == analysis_slots_.end()) {
+   analysis_slots_.push_back(std::make_shared<mmltk::backend::media::live::LiveAnalysisProduct>());
+   available = std::prev(analysis_slots_.end());
+  }
+  auto analysis = *available;
+  analysis->Reset();
   bool captured = false;
-  runtime.PublishRetained(candidate, request_.extent.width, request_.extent.height, [&](const auto target, const auto, const auto stream) { captured = algorithm->Capture(target, stream, run_stop); });
+  runtime.PublishRetained(candidate, request_.extent.width, request_.extent.height, [&](const auto target, const auto, const auto stream) {
+   captured = algorithm->Capture(target, stream, *analysis, run_stop);
+  });
   if (!captured || run_stop.stop_requested()) {
    static_cast<void>(worker_.NotifyContinuation());
    return {};
   }
+  if (!analysis->ready()) throw std::runtime_error("Live capture did not complete its semantic product");
   static_cast<void>(runtime.CommitOutput(std::move(candidate)));
   {
    std::scoped_lock lock(mutex_);
@@ -166,6 +185,7 @@ private:
    ++state_.completed_frames;
    AdvanceRevision();
    state_.frame = {.source = {PresentationSourceKind::Live, 1U}, .extent = request_.extent, .revision = runtime.OutputFacts().revision};
+   committed_analysis_ = std::move(analysis);
   }
   next_capture_ = std::chrono::steady_clock::now() + cadence_;
   worker_.NotifyContinuationAt(next_capture_);
@@ -187,6 +207,8 @@ private:
   }
   return borrow_matching_visual_product(committed, worker_);
  }
+ std::vector<std::shared_ptr<mmltk::backend::media::live::LiveAnalysisProduct>> analysis_slots_;
+ std::shared_ptr<const mmltk::backend::media::live::LiveAnalysisProduct> committed_analysis_;
  VisualDeviceSettings settings_;
  SystemEventSink<event_type> events_;
  VisualDiagnosticSink diagnostics_{};
@@ -217,6 +239,17 @@ LiveSnapshot LiveSystem::snapshot() const { return impl_->snapshot(); }
 // CLEANUP-IGNORE: Live forwards its sealed source API to its own owner and the existing shared renderer.
 std::optional<VisualImageMetadata> LiveSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView LiveSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
+LiveAnalysisRead LiveSystem::ReadAnalysis(const VisualFrame& frame) const {
+ std::shared_ptr<const mmltk::backend::media::live::LiveAnalysisProduct> analysis;
+ {
+  std::scoped_lock lock(impl_->mutex_);
+  if (!frame.valid() || impl_->state_.frame != frame || !impl_->committed_analysis_) return {};
+  analysis = impl_->committed_analysis_;
+ }
+ auto image = borrow_matching_visual_product(frame, impl_->worker_);
+ if (!image.valid()) return {};
+ return {frame, std::move(image), std::move(analysis)};
+}
 mmltk::frameworks::gpu::BorrowedImageWorkspace LiveSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 mmltk::frameworks::gpu::ImageWorkspaceObservation LiveSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }
 void LiveSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }

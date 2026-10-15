@@ -375,6 +375,7 @@ struct CapturedEvalSample {
  torch::Tensor boxes;
  torch::Tensor labels;
  torch::Tensor masks;
+ torch::Tensor keypoints;
 };
 OutputLayer narrow_output_layer_batch(const OutputLayer& layer, int64_t count) {
  OutputLayer narrowed;
@@ -819,17 +820,18 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     boxes.index_select(0, keep_indices).clone(),
     labels.index_select(0, keep_indices).clone(),
     std::move(filtered_masks),
+    processed.keypoints ? (*processed.keypoints)[image_index].index_select(0, keep_indices).clone() : torch::Tensor{},
    };
   }
   evaluation_run.submit(lane_pool,
    [processed = std::move(processed), processed_ready = std::move(*processed_ready), lease = std::move(prediction_slot), category_count = loader.num_classes(), max_dets = validation.detection_limit(),
-    device_id = options.device_id](auto& lane) mutable {
+    device_id = options.device_id, catalog = model.class_layout()->catalog()](auto& lane) mutable {
    processed_ready.wait(reinterpret_cast<std::uintptr_t>(lane.stream.stream()), "wait for train eval prediction readiness");
    processed_ready.retire();
    c10::InferenceMode lane_inference_mode;
    torch_cuda::TorchCudaDeviceGuard lane_device_guard(torch_cuda::checked_device_index(device_id));
    torch_cuda::TorchCudaStreamGuard stream_guard(lane.stream);
-   return stage_prediction_batch(std::move(processed), category_count, max_dets, std::move(lease), device_id, reinterpret_cast<void*>(lane.stream.stream()));
+   return stage_prediction_batch(std::move(processed), category_count, max_dets, std::move(lease), device_id, reinterpret_cast<void*>(lane.stream.stream()), std::move(catalog));
   },
    batch_timing);
   validation.submitted();
@@ -845,7 +847,8 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
   RenderSampleOptions render_options;
   render_options.num_classes = static_cast<int>(model.class_layout()->catalog()->size());
   render_options.output_path = options.output_dir / "eval_samples" / std::format("epoch_{}.png", *current_epoch + 1);
-  validation.sample_writer().Draw(captured_sample->image, captured_sample->boxes, captured_sample->labels, captured_sample->masks, render_options);
+  render_options.class_catalog = model.class_layout()->catalog();
+  validation.sample_writer().Draw(captured_sample->image, captured_sample->boxes, captured_sample->labels, captured_sample->masks, render_options, &captured_sample->keypoints);
  }
  if (progress) { progress->close(); }
  if (calculate_loss) {

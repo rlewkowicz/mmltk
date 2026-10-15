@@ -43,6 +43,7 @@
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/postprocess.h"
+#include "src/backend/models/rfdetr/core/evaluation.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
@@ -1555,6 +1556,9 @@ TEST_CASE("Joint postprocessing keeps physical class selection and pinned uncert
   REQUIRE(selected.keypoints);
   CHECK(selected.query_indices.cpu().flatten().to(torch::kInt64).equal(torch::tensor({0,1,0,1},torch::kInt64)));
   CHECK(selected.labels.cpu().flatten().equal(torch::tensor({0,0,1,1},torch::kInt64)));
+  CHECK(selected.keypoint_counts.cpu().flatten().equal(torch::tensor({2,2,0,0},torch::kInt32)));
+  CHECK(selected.keypoints->index({0,0,0,r::KeypointPredictionPacket::index<^^r::KeypointPrediction::log_l11>()}).item<float>() == Catch::Approx(-std::log(200.F)));
+  CHECK(selected.keypoints->index({0,0,0,r::KeypointPredictionPacket::index<^^r::KeypointPrediction::log_l22>()}).item<float>() == Catch::Approx(-std::log(100.F)));
   CHECK(selected.keypoints->index({0,0,0,r::KeypointPredictionPacket::index<^^r::KeypointPrediction::x>()}).item<float>()==50);
   CHECK(selected.keypoints->index({0,0,0,r::KeypointPredictionPacket::index<^^r::KeypointPrediction::y>()}).item<float>()==75);
   const double expected=1/(1+std::exp(-(std::log(1/(1+std::exp(-2.)))-.2*std::log(2.))));
@@ -1562,4 +1566,45 @@ TEST_CASE("Joint postprocessing keeps physical class selection and pinned uncert
   CHECK(selected.scores[0][2].item<float>()==Catch::Approx(1./3));
   CHECK(torch::isnan(selected.keypoints->index({0,2,0,r::KeypointPredictionPacket::index<^^r::KeypointPrediction::log_l11>()})).item<bool>());
  }
+}
+
+TEST_CASE("Selected keypoint precision follows anisotropic resize and crop Jacobians", "[rfdetr][postprocess][keypoints]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ using Packet = r::KeypointPredictionPacket;
+ const r::KeypointPrediction raw{.25F,.75F,0.F,0.F,0.F,.5F,0.F,0.F};
+ const auto normalized = r::decode_prediction_keypoint(raw);
+ const auto covariance = r::keypoint_covariance(normalized);
+ CHECK(covariance[0] == Catch::Approx(1.25));
+ CHECK(covariance[1] == Catch::Approx(-.5));
+ CHECK(covariance[2] == Catch::Approx(1));
+ const auto mapped = r::map_prediction_keypoint(normalized, 200, 100, -20, 15);
+ CHECK(mapped.x == Catch::Approx(30));
+ CHECK(mapped.y == Catch::Approx(90));
+ CHECK(mapped.confidence == Catch::Approx(.5));
+ const auto transformed = r::keypoint_covariance(mapped);
+ CHECK(transformed[0] == Catch::Approx(covariance[0] * 200 * 200));
+ CHECK(transformed[1] == Catch::Approx(covariance[1] * 200 * 100));
+ CHECK(transformed[2] == Catch::Approx(covariance[2] * 100 * 100));
+ for (const auto device : mmltk::backend::ml::testsupport::available_devices()) {
+  auto packet = torch::zeros({1,1,1,static_cast<int64_t>(Packet::size)}, torch::TensorOptions().device(device));
+  Packet::select<^^r::KeypointPrediction::x>(packet,-1).fill_(raw.x);
+  Packet::select<^^r::KeypointPrediction::y>(packet,-1).fill_(raw.y);
+  Packet::select<^^r::KeypointPrediction::l21>(packet,-1).fill_(raw.l21);
+  r::map_prediction_keypoints_(packet,200,100,-20,15);
+  CHECK(Packet::select<^^r::KeypointPrediction::x>(packet,-1).item<float>() == Catch::Approx(mapped.x));
+  CHECK(Packet::select<^^r::KeypointPrediction::y>(packet,-1).item<float>() == Catch::Approx(mapped.y));
+  CHECK(Packet::select<^^r::KeypointPrediction::log_l11>(packet,-1).item<float>() == Catch::Approx(mapped.precision_cholesky[0]));
+  CHECK(Packet::select<^^r::KeypointPrediction::l21>(packet,-1).item<float>() == Catch::Approx(mapped.precision_cholesky[1]));
+  CHECK(Packet::select<^^r::KeypointPrediction::log_l22>(packet,-1).item<float>() == Catch::Approx(mapped.precision_cholesky[2]));
+ }
+ CHECK_THROWS(r::map_prediction_keypoint(normalized,0,1));
+ auto very_wide = normalized;
+ very_wide.precision_cholesky = {-50,0,-50};
+ const auto wide = r::keypoint_covariance(very_wide);
+ CHECK(std::isinf(wide[0]));
+ CHECK(wide[1] == 0);
+ CHECK(std::isinf(wide[2]));
+ auto invalid = normalized;
+ invalid.precision_cholesky[1] = std::numeric_limits<float>::quiet_NaN();
+ for (const auto value : r::keypoint_covariance(invalid)) CHECK(std::isnan(value));
 }

@@ -57,6 +57,7 @@ LiveCompositor::~LiveCompositor() { destroy(); }
 void LiveCompositor::start() noexcept { running_.store(true, std::memory_order_release); }
 void LiveCompositor::close_admission() noexcept { running_.store(false, std::memory_order_release); }
 void LiveCompositor::ScrubLogicalProduct(CompositeSlot& slot) noexcept {
+ slot.analysis.Reset();
  slot.metadata = {};
  slot.revision = 0U;
  slot.source_slot = 0U;
@@ -76,6 +77,7 @@ void LiveCompositor::stop() noexcept {
   CompositeSlot& slot = slots_[index];
   bool synchronized = static_cast<bool>(scope);
   if (scope && slot.stream != nullptr) synchronized = scope.Record(cudaStreamSynchronize(slot.stream)) == cudaSuccess;
+  if (synchronized) slot.analysis.SettleDeviceCopy();
   const SlotState current = static_cast<SlotState>(slot.state.load(std::memory_order_acquire));
   if (current == SlotState::Acquired || current == SlotState::Free || current == SlotState::Terminal) continue;
   const bool owned = current == SlotState::Completing || claim_live_slot(slot.state, current);
@@ -95,6 +97,7 @@ bool LiveCompositor::process_latest() {
   dropped_.fetch_add(1U, std::memory_order_relaxed);
   return true;
  }
+ slot->analysis.Reset(source.frame);
  LiveAnalysisOverlayProjection analysis{};
  OverlayView manual_overlay{};
  auto scope = cuda_.scope();
@@ -115,6 +118,16 @@ bool LiveCompositor::process_latest() {
  if (status == cudaSuccess && analyzer_ != nullptr && analyzer_->try_acquire(source.frame, &analysis)) {
   slot->analysis_slot = analysis.slot;
   status = scope.Record(cudaStreamWaitEvent(slot->stream, reinterpret_cast<cudaEvent_t>(analysis.completion.event), 0U));
+  if (status == cudaSuccess) {
+   try {
+    slot->analysis.PrepareDevice(source.frame, source.width, source.height, analysis.annotations);
+    status = scope.Record(slot->analysis.EnqueueDeviceCopy(reinterpret_cast<std::uintptr_t>(slot->stream)));
+   } catch (const std::bad_alloc&) {
+    status = scope.Record(cudaErrorMemoryAllocation);
+   } catch (...) {
+    status = scope.Record(cudaErrorInvalidValue);
+   }
+  }
   if (status == cudaSuccess)
    status = scope.Record(cudaMemset2DAsync(reinterpret_cast<void*>(slot->overlay), slot->overlay_pitch, 0, static_cast<std::size_t>(source.width) * 4U, source.height, slot->stream));
   for (const auto& annotation : analysis.annotations) {
@@ -173,6 +186,7 @@ bool LiveCompositor::process_latest() {
  if (status == cudaSuccess) status = scope.Record(cudaLaunchHostFunc(slot->stream, ProducerComplete, slot));
  if (status == cudaSuccess) return true;
  const bool synchronized = scope.Record(cudaStreamSynchronize(slot->stream)) == cudaSuccess;
+ if (synchronized) slot->analysis.SettleDeviceCopy();
  if (slot->analysis_slot.has_value() && analyzer_ != nullptr) {
   if (synchronized)
    analyzer_->release(*slot->analysis_slot);
@@ -208,6 +222,17 @@ bool LiveCompositor::drain_completions() {
  return progressed;
 }
 void LiveCompositor::complete(CompositeSlot& slot) noexcept {
+ // The existing stream callback proves image and semantic readback completion.
+ bool valid_analysis = true;
+ if (!slot.analysis.ready()) {
+  try {
+   slot.analysis.CompleteDeviceCopy();
+  } catch (...) {
+   valid_analysis = false;
+   cuda_.Record(cudaErrorInvalidValue);
+   close_admission();
+  }
+ }
  fanout_.release_composite(slot.source_slot, nullptr, nullptr);
  if (slot.analysis_slot.has_value() && analyzer_ != nullptr) {
   analyzer_->release(*slot.analysis_slot);
@@ -217,7 +242,8 @@ void LiveCompositor::complete(CompositeSlot& slot) noexcept {
   manual_overlay_->release(*slot.manual_overlay_slot);
   slot.manual_overlay_slot.reset();
  }
- if (!running_.load(std::memory_order_acquire)) {
+ if (!valid_analysis || !running_.load(std::memory_order_acquire)) {
+  if (!valid_analysis) dropped_.fetch_add(1U, std::memory_order_relaxed);
   publish_slot(slot, SlotState::Free);
   return;
  }
@@ -233,13 +259,14 @@ bool LiveCompositor::try_acquire(const PhysicalFrameRevision revision, LiveCompo
  if (output == nullptr || static_cast<bool>(*output) || callback_owner == nullptr || on_complete == nullptr || abandon == nullptr || !revision.valid() || revision.slot >= slot_count_) return false;
  CompositeSlot& slot = slots_[revision.slot];
  if (!transition_slot_state(slot.state, SlotState::Published, SlotState::Acquired)) return false;
- if (slot.revision != revision.revision || slot.metadata.frame != revision.frame || reinterpret_cast<std::uintptr_t>(slot.ready) != revision.ready_event) {
+ if (slot.revision != revision.revision || slot.metadata.frame != revision.frame || reinterpret_cast<std::uintptr_t>(slot.ready) != revision.ready_event ||
+     !slot.analysis.ready() || slot.analysis.frame() != revision.frame) {
   publish_live_slot_state(slot.state, SlotState::Published);
   return false;
  }
  const DeviceFrameView view = slot.metadata.View(slot.index, slot.rgba, slot.rgba_pitch, slot.ready, slot.stream);
  *output = LiveCompositeOutputLease::Create(callback_owner, on_complete, abandon,
-  {.pixels = static_cast<std::uintptr_t>(view.pixels), .pitch_bytes = view.pitch_bytes, .width = view.width, .height = view.height, .ready_event = reinterpret_cast<std::uintptr_t>(view.ready)},
+  {.pixels = static_cast<std::uintptr_t>(view.pixels), .pitch_bytes = view.pitch_bytes, .width = view.width, .height = view.height, .ready_event = reinterpret_cast<std::uintptr_t>(view.ready), .analysis = &slot.analysis},
   revision);
  return true;
 }
@@ -304,7 +331,7 @@ void LiveCompositor::destroy() noexcept {
  if (scope) {
   for (std::uint32_t index = 0; index < slot_count_; ++index) {
    CompositeSlot& slot = slots_[index];
-   synchronize_live_cuda_stream(scope, slot.stream);
+   if (slot.stream != nullptr && scope.Record(cudaStreamSynchronize(slot.stream)) == cudaSuccess) slot.analysis.SettleDeviceCopy();
    destroy_live_cuda_event(scope, slot.ready);
    destroy_live_cuda_stream(scope, slot.stream);
    free_live_cuda_allocation(scope, slot.rgba);

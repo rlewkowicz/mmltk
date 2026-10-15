@@ -95,9 +95,13 @@ inline std::array<float, 4> ordered_xyxy(const float* box_values) {
 }
 struct PredictedKeypoint final {
  float x = 0, y = 0, confidence = 0;
- // Precision Cholesky parameters in the normalized model coordinate domain.
+ // Precision P = L L^T in the same coordinate domain as x/y.
  std::array<float, 3> precision_cholesky{};
 };
+[[nodiscard]] PredictedKeypoint decode_prediction_keypoint(const KeypointPrediction& packet);
+[[nodiscard]] PredictedKeypoint map_prediction_keypoint(PredictedKeypoint point, double scale_x, double scale_y, double offset_x = 0, double offset_y = 0);
+// Symmetric pixel covariance [xx, xy, yy]; unavailable/degenerate input is NaN.
+[[nodiscard]] std::array<float, 3> keypoint_covariance(const PredictedKeypoint& point);
 struct KeypointPredictionView final {
  const float* data = nullptr;
  std::ptrdiff_t prediction_stride = 0;

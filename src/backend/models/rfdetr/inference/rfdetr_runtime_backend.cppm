@@ -49,12 +49,14 @@ struct ResolvedInferenceArtifact final {
 [[nodiscard]] ResolvedInferenceArtifact resolve_inference_artifact(const ModelArtifactRequest& artifacts, std::string backend);
 [[nodiscard]] ModelArtifactRequest select_inference_artifact(const ModelArtifactRequest& artifacts, const ResolvedInferenceArtifact& resolved);
 [[nodiscard]] ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& request, const ResolvedInferenceArtifact& artifact, std::uint32_t resolution);
-// Deferred masks pair selected top-k queries with their model-resolution logits.
+// Selected queries retain deferred model-resolution masks and selected joint packets.
 // Materialize on the lane stream before its next Run. Custody retains the exact
 // allocation through exceptional retirement; it is not a replay or immutable cache.
-struct RfdetrMaskSelection final {
+struct RfdetrOutputSelection final {
  mmltk::backend::ml::runtime::RuntimeTensorBuffer query_indices;
  std::optional<mmltk::backend::ml::runtime::RuntimeTensorBuffer> mask_logits{};
+ std::optional<mmltk::backend::ml::runtime::RuntimeTensorBuffer> keypoints{};
+ std::optional<mmltk::backend::ml::runtime::RuntimeTensorBuffer> keypoint_counts{};
  std::shared_ptr<void> custody;
 };
 class RfdetrRuntimeBackend final {
@@ -71,13 +73,14 @@ public:
  [[nodiscard]] std::int32_t device() const noexcept;
  [[nodiscard]] std::uintptr_t stream() const noexcept;
  [[nodiscard]] bool has_masks() const noexcept;
+ [[nodiscard]] const RfdetrOutputContract& output_contract() const noexcept;
  [[nodiscard]] const std::shared_ptr<const ResolvedClassLayout>& class_layout() const noexcept;
  [[nodiscard]] const mmltk::backend::ml::runtime::RuntimeShape& logits_shape() const noexcept;
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeElementType input_element_type() const noexcept;
  [[nodiscard]] const mmltk::backend::ml::runtime::RuntimeModelInfo& model_info() const noexcept;
  // Mask capacity does not imply demand; availability belongs to each produced result.
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeSubmission Run(const mmltk::backend::ml::runtime::RuntimeTensorBuffer& input,
-  std::span<mmltk::backend::ml::runtime::AnalysisAnnotationStorage> annotations, std::span<RfdetrMaskSelection> selections = {}, bool include_masks = false);
+  std::span<mmltk::backend::ml::runtime::AnalysisAnnotationStorage> annotations, std::span<RfdetrOutputSelection> selections = {}, bool include_masks = false);
  void ReleaseAfterCompletion(mmltk::backend::ml::runtime::RuntimeSubmission&& submission);
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
  [[nodiscard]] std::span<const RfdetrNamedOutputRole> output_roles() const noexcept;
@@ -87,7 +90,7 @@ public:
 private:
  struct State;
  explicit RfdetrRuntimeBackend(std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane, std::string backend_name, std::uint32_t static_resolution, std::size_t maximum_detections,
-  std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission,
+  std::shared_ptr<const ResolvedClassLayout> layout, RfdetrOutputContract output_contract, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission,
   std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations);
  std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane_;
  std::string backend_name_;

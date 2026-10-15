@@ -1,4 +1,7 @@
 #include "src/backend/media/live/live_types.h"
+#include "src/backend/media/live/tests/support/live_analysis_fixture.h"
+#include <cstring>
+#include <new>
 #include "src/backend/media/live/live_session_controller.h"
 #include "src/backend/media/capture/capture_session.h"
 #include "src/backend/media/capture/status.h"
@@ -23,6 +26,179 @@
 #include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
 namespace mmltk::backend::media::live {
 namespace {
+using test_support::LiveAnalysisFixture;
+struct AnalysisAllocationProbe final {
+ static inline std::size_t allocations = 0;
+ static inline bool fail = false;
+ static std::shared_ptr<void> Allocate(std::size_t bytes,LiveAnalysisProduct::Storage) {
+  ++allocations;
+  if (fail) throw std::bad_alloc{};
+  return {::operator new(bytes),[](void* address) { ::operator delete(address); }};
+ }
+};
+TEST_CASE("Live completed semantic copies retain named mixed joints independently of provider storage") {
+ LiveAnalysisFixture source;
+ auto catalog = source.catalog;
+ const std::weak_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog_custody = catalog;
+ const std::weak_ptr<std::int64_t> count_custody = source.count;
+ LiveAnalysisProduct compositor{LiveAnalysisProduct::Storage::Pinned,&AnalysisAllocationProbe::Allocate};
+ source.Deliver(compositor,{4,5});
+ REQUIRE(compositor.ready());
+ REQUIRE(compositor.analyzed());
+ REQUIRE(compositor.regions().size() == 1);
+ const auto& region = compositor.regions()[0];
+ CHECK(region.source_region == mmltk::backend::ml::runtime::AnalysisRegion{1,1,2,2});
+ CHECK(region.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground);
+ CHECK(region.class_catalog == catalog);
+ CHECK(region.count == 2);
+ REQUIRE(region.keypoint_counts.size() == 2);
+ CHECK(region.keypoint_counts[0] == 2);
+ CHECK(region.keypoint_counts[1] == 0);
+ REQUIRE(region.keypoints.size() == 4);
+ CHECK(region.keypoints[0].x == 1.25F);
+ CHECK(region.keypoints[0].covariance_xy == -.5F);
+ CHECK(region.class_catalog->keypoints(0).names[1] == "right");
+ CHECK(region.masks.size() == 8);
+ CHECK(region.masks[3] == 1);
+ source.joints[0] = {};
+ source.count.reset();
+ CHECK(count_custody.expired());
+ LiveAnalysisProduct receiver;
+ receiver.CopyFrom(compositor);
+ compositor.Reset();
+ source.catalog.reset();
+ CHECK(receiver.frame() == LiveFrameId{4,5});
+ CHECK(receiver.regions()[0].keypoints[0].covariance_xy == -.5F);
+ CHECK(receiver.regions()[0].class_catalog == catalog);
+ CHECK_FALSE(compositor.ready());
+ catalog.reset();
+ CHECK_FALSE(catalog_custody.expired());
+ receiver.Reset();
+ CHECK(catalog_custody.expired());
+}
+TEST_CASE("Live distinguishes no analysis from successful zero detections and clears stale values") {
+ const bool pending = GENERATE(false,true);
+ LiveAnalysisFixture source;
+ LiveAnalysisProduct product;
+ source.Deliver(product,{2,1},pending);
+ const auto capacity = product.capacity_bytes();
+ *source.count = 0;
+ source.Deliver(product,{2,2},pending);
+ REQUIRE(product.ready());
+ REQUIRE(product.analyzed());
+ REQUIRE(product.regions().size() == 1);
+ CHECK(product.regions()[0].count == 0);
+ CHECK(product.regions()[0].keypoints.empty());
+ CHECK(product.regions()[0].boxes_xyxy.empty());
+ CHECK(product.regions()[0].class_catalog == source.catalog);
+ CHECK(product.capacity_bytes() == capacity);
+ product.Reset({2,3});
+ CHECK(product.ready());
+ CHECK_FALSE(product.analyzed());
+ CHECK(product.regions().empty());
+ CHECK(product.capacity_bytes() == capacity);
+ product.Reset();
+ CHECK_FALSE(product.ready());
+}
+TEST_CASE("Live semantic capacity is reusable and failed growth preserves receiver publication") {
+ AnalysisAllocationProbe::allocations = 0;
+ AnalysisAllocationProbe::fail = false;
+ LiveAnalysisFixture source;
+ LiveAnalysisProduct compositor,receiver{LiveAnalysisProduct::Storage::Host,&AnalysisAllocationProbe::Allocate};
+ *source.count = 0;
+ source.Deliver(compositor,{3,1},false);
+ receiver.CopyFrom(compositor);
+ const auto capacity = receiver.capacity_bytes();
+ *source.count = 2;
+ source.Deliver(compositor,{3,2},false);
+ AnalysisAllocationProbe::fail = true;
+ CHECK_THROWS_AS(receiver.CopyFrom(compositor),std::bad_alloc);
+ AnalysisAllocationProbe::fail = false;
+ CHECK(receiver.frame() == LiveFrameId{3,1});
+ CHECK(receiver.ready());
+ CHECK(receiver.regions()[0].count == 0);
+ CHECK(receiver.capacity_bytes() == capacity);
+ receiver.CopyFrom(compositor);
+ const auto allocations = AnalysisAllocationProbe::allocations;
+ receiver.CopyFrom(compositor);
+ CHECK(AnalysisAllocationProbe::allocations == allocations);
+ CHECK(receiver.regions()[0].keypoint_counts[1] == 0);
+}
+TEST_CASE("Live semantic admission rejects invalid extents and never publishes invalid completed counts") {
+ LiveAnalysisFixture source;
+ LiveAnalysisProduct product;
+ auto annotation = source.Annotation();
+ SECTION("region outside source") { annotation.source_region.x = 4; }
+ SECTION("rank") { annotation.keypoints.shape.rank = 2; }
+ SECTION("full plane bytes even with a known zero count") {
+  annotation.count.SetKnown(0,2);
+  annotation.keypoints.capacity_bytes -= sizeof(float);
+ }
+ SECTION("task joint capacity") { annotation.keypoint_capacity = 257; }
+ SECTION("named domain") { annotation.class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot; }
+ CHECK_THROWS_AS(product.PrepareDevice({1,1},4,4,std::span{&annotation,1}),std::invalid_argument);
+ CHECK_FALSE(product.ready());
+ CHECK(product.regions().empty());
+}
+TEST_CASE("Live semantic completion validates survivor and named joint counts before publication") {
+ const int invalid = GENERATE(0,1,2);
+ LiveAnalysisFixture source;
+ if (invalid == 0) *source.count = 3;
+ if (invalid == 1) source.joint_counts[0] = 1;
+ if (invalid == 2) source.classes[1] = 2;
+ LiveAnalysisProduct product;
+ CHECK_THROWS_AS(source.Deliver(product,{1,1}),std::invalid_argument);
+ CHECK_FALSE(product.ready());
+ CHECK(product.regions().empty());
+}
+TEST_CASE("Live retains raw detection products without inventing joint or catalog meaning") {
+ LiveAnalysisFixture source;
+ auto annotation = source.Annotation(false);
+ annotation.class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot;
+ annotation.class_catalog.reset();
+ annotation.keypoints_available = false;
+ annotation.keypoint_capacity = 0;
+ annotation.keypoints = annotation.keypoint_counts = {};
+ annotation.masks_available = false;
+ source.classes = {91,365};
+ LiveAnalysisProduct product;
+ product.PrepareDevice({1,1},4,4,std::span{&annotation,1});
+ REQUIRE(product.EnqueueDeviceCopy(1,&LiveAnalysisFixture::Copy) == cudaSuccess);
+ product.CompleteDeviceCopy();
+ const auto& region = product.regions()[0];
+ CHECK(region.class_references[1] == 365);
+ CHECK_FALSE(region.class_catalog);
+ CHECK_FALSE(region.keypoints_available);
+ CHECK(region.keypoints.empty());
+ CHECK_FALSE(region.masks_available);
+ CHECK(region.masks.empty());
+ CHECK(region.boxes_xyxy[1][2] == 3.F);
+}
+struct AnalysisCopyFailure final {
+ static inline std::size_t copies = 0;
+ static cudaError_t Copy(void* target,const void* source,std::size_t bytes,std::uintptr_t stream) noexcept {
+  if (++copies == 3) return cudaErrorLaunchFailure;
+  return LiveAnalysisFixture::Copy(target,source,bytes,stream);
+ }
+};
+TEST_CASE("Live partial semantic submission remains unpublished until its owner settles and resets") {
+ LiveAnalysisFixture source;
+ auto annotation = source.Annotation();
+ LiveAnalysisProduct product;
+ product.PrepareDevice({1,1},4,4,std::span{&annotation,1});
+ CHECK_THROWS_AS(product.CompleteDeviceCopy(),std::logic_error);
+ AnalysisCopyFailure::copies = 0;
+ CHECK(product.EnqueueDeviceCopy(1,&AnalysisCopyFailure::Copy) == cudaErrorLaunchFailure);
+ CHECK_FALSE(product.ready());
+ CHECK(product.regions().empty());
+ CHECK_THROWS_AS(product.CompleteDeviceCopy(),std::logic_error);
+ // The injected copies have already settled. Production uses its slot stream.
+ product.SettleDeviceCopy();
+ product.Reset();
+ source.Deliver(product,{1,2});
+ CHECK(product.ready());
+ CHECK(product.regions()[0].keypoint_counts[0] == 2);
+}
 TEST_CASE("Live rejects placement belonging to a different capture receiver before allocating resources", "[live][numa]") {
  int owner = 0;
  LiveDataPlaneConfig config;
@@ -60,6 +236,23 @@ constexpr LiveOutputFrame kView{
  .height = 2U,
  .ready_event = 6U,
 };
+TEST_CASE("Live output leases admit only completed semantics for their exact physical frame") {
+ LiveAnalysisFixture source;
+ LiveAnalysisProduct product;
+ source.Deliver(product,kRevision.frame);
+ auto view = kView;
+ view.analysis = &product;
+ LeaseProbe probe;
+ auto lease = LiveCompositeOutputLease::Create(&probe,&LeaseProbe::Complete,&LeaseProbe::Abandon,view,kRevision);
+ REQUIRE(lease);
+ CHECK(lease.view().analysis->frame() == lease.frame_revision().frame);
+ CHECK(lease.view().analysis->regions()[0].keypoint_counts[0] == 2);
+ std::move(lease).Complete();
+ CHECK(probe.completions == 1);
+ product.Reset({4,6});
+ CHECK_FALSE(LiveCompositeOutputLease::Create(&probe,&LeaseProbe::Complete,&LeaseProbe::Abandon,view,kRevision));
+ CHECK(probe.abandonments == 0);
+}
 TEST_CASE("completed Live output lease releases its exact source revision once") {
  LeaseProbe probe;
  auto lease = LiveCompositeOutputLease::Create(&probe, &LeaseProbe::Complete, &LeaseProbe::Abandon, kView, kRevision);

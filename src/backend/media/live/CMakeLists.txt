@@ -6,10 +6,11 @@ mmltk_configure_component(mmltk_backend_media_live PUBLIC_DECLARATIONS)
 
 mmltk_register_public_headers(mmltk_backend_media_live
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES live_frame_id.h live_types.h manual_overlay_document.h live_session_controller.h)
+    FILES live_frame_id.h live_types.h live_analysis_product.h manual_overlay_document.h live_session_controller.h)
 mmltk_register_ordinary_sources(
     mmltk_backend_media_live
     live_types.cpp
+    live_analysis_product.cpp
     live_device_types.cpp
     live_state_signal.cpp
     workspace_frame_signal.cpp
@@ -53,6 +54,13 @@ target_link_libraries(mmltk_backend_media_live
         mmltk::common::types
 )
 
+add_library(mmltk_backend_media_live_test_support INTERFACE)
+mmltk_register_public_headers(mmltk_backend_media_live_test_support
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/support/live_analysis_fixture.h)
+target_link_libraries(mmltk_backend_media_live_test_support INTERFACE
+    mmltk::backend::media::live)
+
 function(mmltk_add_backend_media_live_tests)
     add_executable(mmltk_backend_media_live_tests EXCLUDE_FROM_ALL)
     mmltk_configure_component(
@@ -63,7 +71,7 @@ function(mmltk_add_backend_media_live_tests)
     target_link_libraries(
         mmltk_backend_media_live_tests PRIVATE
         mmltk_test_support
-        mmltk::backend::media::live)
+        mmltk_backend_media_live_test_support)
     catch_discover_tests(
         mmltk_backend_media_live_tests
         TEST_PREFIX "backend::media::live::"
@@ -72,3 +80,4 @@ function(mmltk_add_backend_media_live_tests)
 endfunction()
 
 mmltk_register_header_isolation(mmltk_backend_media_live)
+mmltk_register_header_isolation(mmltk_backend_media_live_test_support)

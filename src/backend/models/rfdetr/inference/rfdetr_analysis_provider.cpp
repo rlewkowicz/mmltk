@@ -5,6 +5,7 @@ module;
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <chrono>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -14,6 +15,7 @@ module;
 #include <utility>
 #include "src/backend/imaging/raster/image_operations.h"
 #include "src/backend/models/rfdetr/core/gpu_batch_preprocessor.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
@@ -27,6 +29,7 @@ class RfdetrAnalysisProvider final : public runtime::AnalysisProvider {
 public:
  explicit RfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options);
  ~RfdetrAnalysisProvider() override;
+ [[nodiscard]] std::uint32_t keypoint_capacity() const noexcept override;
 
 protected:
  [[nodiscard]] ProviderWorkResult DoAnalyze(const runtime::AnalysisRequest& request) noexcept override;
@@ -67,6 +70,7 @@ struct RfdetrAnalysisProvider::Impl final {
   for (auto& annotation : active_annotations) {
    annotation.count.Reset();
    annotation.masks_available = false;
+   annotation.keypoints_available = false;
   }
   active_annotations = {};
  }
@@ -76,12 +80,19 @@ struct RfdetrAnalysisProvider::Impl final {
 };
 RfdetrAnalysisProvider::RfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options) : impl_(std::make_unique<Impl>(options)) {}
 RfdetrAnalysisProvider::~RfdetrAnalysisProvider() = default;
+std::uint32_t RfdetrAnalysisProvider::keypoint_capacity() const noexcept {
+ if (!impl_->backend) return 0U;
+ const auto& counts = impl_->backend->output_contract().keypoints_per_class;
+ return counts.empty() ? 0U : *std::max_element(counts.begin(), counts.end());
+}
 std::shared_ptr<runtime::AnalysisProvider> MakeRfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options) { return std::make_shared<RfdetrAnalysisProvider>(options); }
 RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(const runtime::AnalysisRequest& request) noexcept {
  try {
   if (request.source.device != impl_->device || request.source.channels != 3U || request.regions.size() > runtime::kMaximumAnalysisRegions || impl_->active_submission.has_value()) {
    return {.identity = request.identity, .terminal = runtime::AnalysisTerminal::InvalidInput};
   }
+  for (const auto& annotation : request.annotations)
+   if (annotation.keypoint_capacity != keypoint_capacity()) return {.identity = request.identity, .terminal = runtime::AnalysisTerminal::InvalidInput};
   c10::cuda::CUDAGuard device_guard{c10::DeviceIndex(impl_->device)};
   c10::cuda::CUDAStreamGuard stream_guard{impl_->cuda_stream()};
   mmltk::frameworks::gpu::ensure_cuda_ok(cudaStreamWaitEvent(impl_->stream, reinterpret_cast<cudaEvent_t>(request.source_ready.event), 0U), "RF-DETR analysis source readiness");

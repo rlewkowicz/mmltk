@@ -8,6 +8,7 @@
 #include <stop_token>
 #include "src/backend/media/live/live_frame_id.h"
 namespace mmltk::backend::media::live {
+class LiveAnalysisProduct;
 inline constexpr std::size_t kManualOverlayBrushSegments = 64U;
 inline constexpr std::size_t kManualOverlayBrushValueCount = kManualOverlayBrushSegments * 2U;
 struct LiveManualOverlayUploadLimits final {
@@ -31,6 +32,8 @@ struct LiveOutputFrame final {
  std::uint32_t width = 0U;
  std::uint32_t height = 0U;
  std::uintptr_t ready_event = 0U;
+ // Borrowed until the output lease completes; its frame equals the lease revision.
+ const LiveAnalysisProduct* analysis = nullptr;
  [[nodiscard]] bool valid() const noexcept { return pixels != 0U && pitch_bytes != 0U && width != 0U && height != 0U && ready_event != 0U; }
 };
 struct LiveRawFrameReadback final {

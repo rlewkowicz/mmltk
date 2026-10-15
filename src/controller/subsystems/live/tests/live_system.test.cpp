@@ -4,6 +4,7 @@
 #include "src/controller/presentation/tests/support/visual_system_fixture.h"
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/controller/subsystems/live/live_receiver_copy.h"
+#include "src/backend/media/live/tests/support/live_analysis_fixture.h"
 #include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
@@ -20,6 +21,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <stop_token>
 #include <utility>
@@ -28,6 +30,8 @@
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
+namespace media = mmltk::backend::media::live;
+using media::test_support::LiveAnalysisFixture;
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
@@ -38,6 +42,19 @@ struct LiveReceiverCopyProbe final {
  static inline std::size_t waits = 0U;
  static inline std::size_t copies = 0U;
  static inline std::size_t synchronizations = 0U;
+ static inline std::size_t completions = 0U, abandonments = 0U;
+ static inline media::LiveAnalysisProduct* source_product = nullptr;
+ static void Complete(void*,media::PhysicalFrameRevision) noexcept {
+  ++completions;
+  if (source_product) source_product->Reset();
+ }
+ static void Abandon(void*,media::PhysicalFrameRevision) noexcept { ++abandonments; }
+ static media::LiveCompositeOutputLease Lease(media::LiveAnalysisProduct* product = nullptr) {
+  static int owner = 0;
+  return media::LiveCompositeOutputLease::Create(&owner,&Complete,&Abandon,
+   {.pixels=2,.pitch_bytes=16,.width=4,.height=4,.ready_event=3,.analysis=product},
+   {.revision=1,.frame={1,1},.slot=0,.ready_event=3});
+ }
  static void Reset() noexcept {
   wait_status = cudaSuccess;
   copy_status = cudaSuccess;
@@ -45,6 +62,8 @@ struct LiveReceiverCopyProbe final {
   waits = 0U;
   copies = 0U;
   synchronizations = 0U;
+  completions = abandonments = 0U;
+  source_product = nullptr;
  }
  static cudaError_t Wait(std::uintptr_t, std::uintptr_t) noexcept {
   ++waits;
@@ -76,29 +95,60 @@ constexpr detail::LiveReceiverCopyOperations kLiveReceiverCopyProbe{
   },
  };
 }
-TEST_CASE("Live receiver copy completes only after synchronization") {
+TEST_CASE("Live receiver completes image and semantic copies before releasing the media lease") {
  LiveReceiverCopyProbe::Reset();
- const auto target = live_receiver_copy_target();
- CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaSuccess);
- CHECK(LiveReceiverCopyProbe::waits == 1U);
- CHECK(LiveReceiverCopyProbe::copies == 1U);
- CHECK(LiveReceiverCopyProbe::synchronizations == 1U);
+ LiveAnalysisFixture fixture;
+ media::LiveAnalysisProduct source,destination;
+ fixture.Deliver(source,{1,1});
+ LiveReceiverCopyProbe::source_product = &source;
+ auto lease = LiveReceiverCopyProbe::Lease(&source);
+ CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(),lease,destination,4,kLiveReceiverCopyProbe) == cudaSuccess);
+ CHECK(LiveReceiverCopyProbe::waits == 1);
+ CHECK(LiveReceiverCopyProbe::copies == 1);
+ CHECK(LiveReceiverCopyProbe::synchronizations == 1);
+ CHECK(LiveReceiverCopyProbe::completions == 1);
+ CHECK_FALSE(lease);
+ CHECK_FALSE(source.ready());
+ REQUIRE(destination.ready());
+ CHECK(destination.frame() == media::LiveFrameId{1,1});
+ REQUIRE(destination.regions().size() == 1);
+ CHECK(destination.regions()[0].keypoints[0].covariance_xy == -.5F);
+ CHECK(destination.regions()[0].class_catalog == fixture.catalog);
+ LiveReceiverCopyProbe::source_product = nullptr;
 }
-TEST_CASE("Live receiver submission and synchronization failures stop progress") {
- const auto target = live_receiver_copy_target();
+TEST_CASE("Live receiver failures settle prior reads or retain terminal media custody") {
+ const int failure = GENERATE(0,1,2);
  LiveReceiverCopyProbe::Reset();
- LiveReceiverCopyProbe::wait_status = cudaErrorLaunchFailure;
- CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
- CHECK(LiveReceiverCopyProbe::copies == 0U);
- CHECK(LiveReceiverCopyProbe::synchronizations == 0U);
+ if (failure == 0) LiveReceiverCopyProbe::wait_status = cudaErrorLaunchFailure;
+ if (failure == 1) LiveReceiverCopyProbe::copy_status = cudaErrorLaunchFailure;
+ if (failure == 2) LiveReceiverCopyProbe::synchronize_status = cudaErrorLaunchFailure;
+ media::LiveAnalysisProduct destination;
+ destination.Reset({8,9});
+ {
+  auto lease = LiveReceiverCopyProbe::Lease();
+  CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(),lease,destination,4,kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
+  CHECK(LiveReceiverCopyProbe::copies == (failure == 0 ? 0 : 1));
+  CHECK(LiveReceiverCopyProbe::synchronizations == 1);
+  CHECK(LiveReceiverCopyProbe::completions == (failure == 2 ? 0 : 1));
+  CHECK(static_cast<bool>(lease) == (failure == 2));
+  CHECK(destination.frame() == media::LiveFrameId{8,9});
+ }
+ CHECK(LiveReceiverCopyProbe::abandonments == (failure == 2 ? 1 : 0));
+}
+TEST_CASE("Live receiver semantic allocation failure releases only after settled pixels") {
  LiveReceiverCopyProbe::Reset();
- LiveReceiverCopyProbe::copy_status = cudaErrorLaunchFailure;
- CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
- CHECK(LiveReceiverCopyProbe::synchronizations == 0U);
- LiveReceiverCopyProbe::Reset();
- LiveReceiverCopyProbe::synchronize_status = cudaErrorLaunchFailure;
- CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
- CHECK(LiveReceiverCopyProbe::synchronizations == 1U);
+ LiveAnalysisFixture fixture;
+ media::LiveAnalysisProduct source;
+ fixture.Deliver(source,{1,1});
+ media::LiveAnalysisProduct destination{media::LiveAnalysisProduct::Storage::Host,
+  [](std::size_t,media::LiveAnalysisProduct::Storage)->std::shared_ptr<void> { throw std::bad_alloc{}; }};
+ destination.Reset({8,9});
+ auto lease = LiveReceiverCopyProbe::Lease(&source);
+ CHECK(detail::copy_live_receiver_frame(live_receiver_copy_target(),lease,destination,4,kLiveReceiverCopyProbe) == cudaErrorMemoryAllocation);
+ CHECK(LiveReceiverCopyProbe::synchronizations == 1);
+ CHECK(LiveReceiverCopyProbe::completions == 1);
+ CHECK(destination.frame() == media::LiveFrameId{8,9});
+ CHECK_FALSE(lease);
 }
 struct ControlledLiveCapture final {
  EventGate changed;
@@ -108,6 +158,7 @@ struct ControlledLiveCapture final {
  std::atomic_size_t acquisitions{0U}, captures{0U};
  bool result = true;
  std::function<void()> after_capture;
+ std::function<void(media::LiveAnalysisProduct&,std::uint64_t)> fill_analysis;
  void Offer() {
   std::function<void()> notify;
   {
@@ -132,13 +183,25 @@ public:
   state_->changed.Advance();
   return ready;
  }
- bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t, std::stop_token) override {
+ bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t, mmltk::backend::media::live::LiveAnalysisProduct& analysis, std::stop_token) override {
   const auto value = ++state_->captures;
+  analysis.Reset({1U,value});
   for (std::uint32_t y = 0U; y != target.descriptor.height; ++y)
    for (std::uint32_t x = 0U; x != target.descriptor.row_bytes(); ++x)
     *(reinterpret_cast<std::uint8_t*>(target.data) + y * target.descriptor.pitch_bytes + x) = static_cast<std::uint8_t>(value * 31U + y * 7U + x);
-  if (state_->after_capture) state_->after_capture();
-  return state_->result;
+  std::function<void()> after;
+  std::function<void(media::LiveAnalysisProduct&,std::uint64_t)> fill;
+  bool result = false;
+  {
+   std::scoped_lock lock(state_->mutex);
+   after = state_->after_capture;
+   fill = state_->fill_analysis;
+   result = state_->result;
+  }
+  if (fill) fill(analysis,value);
+  state_->changed.Advance();
+  if (after) after();
+  return result;
  }
  void Stop() noexcept override {}
 
@@ -248,12 +311,119 @@ TEST_CASE("Live receiver publication failure does not commit a captured candidat
  CHECK(live.snapshot().completed_frames == 0U);
  CHECK_FALSE(live.BorrowFrame().valid());
 }
+TEST_CASE("Live exact-frame analysis reads retain image and schema across reuse Stop and extent changes") {
+ auto backend = std::make_shared<FakeImageBackend>();
+ auto state = std::make_shared<ControlledLiveCapture>();
+ auto fixture = std::make_shared<LiveAnalysisFixture>();
+ const auto catalog = fixture->catalog;
+ state->fill_analysis = [fixture](media::LiveAnalysisProduct& product,std::uint64_t sequence) {
+  if (sequence == 4) return; // Capture's Reset supplies an explicit no-analysis frame.
+  *fixture->count = sequence == 2 ? 0 : 2;
+  fixture->joints[0].x = static_cast<float>(sequence);
+  fixture->Deliver(product,{1,sequence});
+ };
+ EventGate events;
+ LiveSystem live{kDevice,RuntimeFactory(0,backend,mmltk::frameworks::gpu::ImageProductLayout::Clean,
+  [state] { return std::make_unique<ControlledLiveAlgorithm>(state); },2),[&](LiveSystem::event_type) { events.Advance(); }};
+ const auto await_frame = [&](std::uint64_t count) { REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == count; })); };
+ const auto stop = [&] { static_cast<void>(live.Stop()); REQUIRE(events.Wait([&] { return !live.snapshot().running; })); };
+ state->Offer();
+ static_cast<void>(live.Start({.extent={7,3},.frames_per_second=240}));
+ await_frame(1);
+ const auto first_frame = live.snapshot().frame;
+ auto first = live.ReadAnalysis(first_frame);
+ REQUIRE(first.valid());
+ CHECK(first.frame() == first_frame);
+ CHECK(first.analysis().frame() == media::LiveFrameId{1,1});
+ CHECK(first.analysis().regions()[0].class_catalog == catalog);
+ CHECK(first.analysis().regions()[0].keypoints[0].covariance_xy == -.5F);
+ state->Offer();
+ await_frame(2);
+ auto second = live.ReadAnalysis(live.snapshot().frame);
+ REQUIRE(second.valid());
+ CHECK(second.analysis().analyzed());
+ CHECK(second.analysis().regions()[0].count == 0);
+ CHECK(first.analysis().regions()[0].count == 2);
+ CHECK(first.analysis().regions()[0].keypoints[0].x == 1.F);
+ CHECK_FALSE(live.ReadAnalysis(first_frame).valid());
+ const auto image = first.image().plane(0).plane();
+ CHECK(*reinterpret_cast<const std::uint8_t*>(image.data) == 31);
+ state->Offer();
+ CHECK(live.snapshot().completed_frames == 2);
+ first = {};
+ await_frame(3);
+ CHECK(second.analysis().frame() == media::LiveFrameId{1,2});
+ CHECK(second.analysis().regions()[0].count == 0);
+ second = {};
+ auto third = live.ReadAnalysis(live.snapshot().frame);
+ stop();
+ CHECK(third.valid());
+ CHECK(third.analysis().regions()[0].keypoints[0].x == 3.F);
+ CHECK(live.ReadAnalysis(third.frame()).valid());
+ state->Offer();
+ static_cast<void>(live.Start({.extent={3,5},.frames_per_second=240}));
+ await_frame(4);
+ auto resized = live.ReadAnalysis(live.snapshot().frame);
+ REQUIRE(resized.valid());
+ CHECK(resized.frame().extent == VisualExtent{3,5});
+ CHECK_FALSE(resized.analysis().analyzed());
+ CHECK(resized.analysis().regions().empty());
+ CHECK(third.analysis().regions()[0].class_catalog == catalog);
+ CHECK(third.analysis().regions()[0].keypoints[0].x == 3.F);
+ stop();
+ resized = {};
+ third = {};
+ live.Shutdown();
+}
+TEST_CASE("Live failed and cancelled replacements preserve a retained completed semantic read") {
+ const int outcome = GENERATE(0,1,2);
+ auto backend = std::make_shared<FakeImageBackend>();
+ auto state = std::make_shared<ControlledLiveCapture>();
+ auto fixture = std::make_shared<LiveAnalysisFixture>();
+ state->fill_analysis = [fixture](media::LiveAnalysisProduct& product,std::uint64_t sequence) { fixture->Deliver(product,{1,sequence}); };
+ EventGate events;
+ std::atomic_bool failed{false};
+ LiveSystem live{kDevice,RuntimeFactory(0,backend,mmltk::frameworks::gpu::ImageProductLayout::Clean,
+  [state] { return std::make_unique<ControlledLiveAlgorithm>(state); },2),[&](LiveSystem::event_type event) {
+   if (std::holds_alternative<LiveFailed>(event)) failed = true;
+   events.Advance();
+  }};
+ state->Offer();
+ static_cast<void>(live.Start({.extent={7,3},.frames_per_second=240}));
+ REQUIRE(events.Wait([&] { return live.snapshot().completed_frames == 1; }));
+ auto retained = live.ReadAnalysis(live.snapshot().frame);
+ REQUIRE(retained.valid());
+ {
+  std::scoped_lock lock(state->mutex);
+  state->result = outcome != 0;
+  state->after_capture = [&] {
+   if (outcome == 1) static_cast<void>(live.Stop());
+   if (outcome == 2) throw std::runtime_error("failed Live replacement");
+  };
+ }
+ state->Offer();
+ if (outcome == 0) {
+  REQUIRE(state->changed.Wait([&] { return state->captures.load() == 2 && state->acquisitions.load() >= 3; }));
+  static_cast<void>(live.Stop());
+ }
+ REQUIRE(events.Wait([&] { return !live.snapshot().running; }));
+ // Failure has published its terminal state while this exact image read still
+ // holds deferred retirement; its independently owned semantics remain usable.
+ CHECK(retained.analysis().frame() == media::LiveFrameId{1,1});
+ CHECK(retained.analysis().regions()[0].keypoint_counts[0] == 2);
+ CHECK(retained.analysis().regions()[0].keypoints[0].covariance_xy == -.5F);
+ CHECK(retained.image().valid());
+ retained = {};
+ live.Shutdown();
+ CHECK(live.snapshot().completed_frames == 1);
+ CHECK(failed.load() == (outcome == 2));
+}
 class FailingLiveAlgorithm final : public LiveAlgorithm {
 public:
  void Start(const LiveStart&) override {}
  void SetOutputAvailableSink(std::function<void()>) override {}
  bool AcquireOutput() override { return true; }
- bool Capture(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::stop_token) override { throw std::runtime_error("deterministic Live capture failure"); }
+ bool Capture(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, mmltk::backend::media::live::LiveAnalysisProduct&, std::stop_token) override { throw std::runtime_error("deterministic Live capture failure"); }
  void Stop() noexcept override {}
 };
 TEST_CASE("Live queued discrete cancellation settles without running obsolete work") {

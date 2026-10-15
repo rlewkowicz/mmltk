@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include "src/backend/data/catalog/class_catalog.h"
 namespace mmltk::backend::models::rfdetr {
 struct RenderSampleOptions final {
  std::filesystem::path output_path;
@@ -12,6 +13,7 @@ struct RenderSampleOptions final {
  float box_thickness = 1.0F;
  int label_size = 12;
  float mask_alpha = 0.5F;
+ std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
 };
 class EvaluationSampleWriter final {
 public:
@@ -19,7 +21,7 @@ public:
  ~EvaluationSampleWriter();
  EvaluationSampleWriter(const EvaluationSampleWriter&) = delete;
  EvaluationSampleWriter& operator=(const EvaluationSampleWriter&) = delete;
- void Draw(const at::Tensor& image, const at::Tensor& boxes, const at::Tensor& labels, const at::Tensor& masks, const RenderSampleOptions& options);
+ void Draw(const at::Tensor& image, const at::Tensor& boxes, const at::Tensor& labels, const at::Tensor& masks, const RenderSampleOptions& options, const at::Tensor* keypoints = nullptr);
  void Flush();
 
 private:

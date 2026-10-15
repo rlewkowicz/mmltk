@@ -1,5 +1,6 @@
 #pragma once
 #include "src/frameworks/reflection/reflected_declarations.h"
+#include "src/backend/media/live/live_analysis_product.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/visual_source_projection.h"
 #include <chrono>
@@ -12,6 +13,7 @@
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/frameworks/gpu/image/image_types.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 #include "src/frameworks/gpu/runtime/system_image_model.h"
 namespace mmltk::controller {
 struct LiveStart final {
@@ -37,9 +39,28 @@ public:
  virtual void Start(const LiveStart&) = 0;
  virtual void SetOutputAvailableSink(std::function<void()>) = 0;
  [[nodiscard]] virtual bool AcquireOutput() = 0;
- // Success replaces every active RGBA pixel and settles receiver writes before returning.
- [[nodiscard]] virtual bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream, std::stop_token) = 0;
+ // Success replaces all active pixels and analysis, and settles receiver reads before returning.
+ [[nodiscard]] virtual bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream, mmltk::backend::media::live::LiveAnalysisProduct&, std::stop_token) = 0;
  virtual void Stop() noexcept = 0;
+};
+// A read retains the exact image allocation and its immutable native meaning.
+// The product cannot escape separately and cannot be recycled while this read lives.
+class LiveAnalysisRead final {
+public:
+ LiveAnalysisRead() noexcept = default;
+ LiveAnalysisRead(LiveAnalysisRead&&) noexcept = default;
+ LiveAnalysisRead& operator=(LiveAnalysisRead&&) noexcept = default;
+ [[nodiscard]] bool valid() const noexcept { return image_.valid() && analysis_ && analysis_->ready(); }
+ [[nodiscard]] const VisualFrame& frame() const noexcept { return frame_; }
+ [[nodiscard]] const mmltk::backend::media::live::LiveAnalysisProduct& analysis() const { return *analysis_; }
+ [[nodiscard]] const mmltk::frameworks::gpu::BorrowedImageProductReadView& image() const noexcept { return image_; }
+
+private:
+ LiveAnalysisRead(VisualFrame, mmltk::frameworks::gpu::BorrowedImageProductReadView, std::shared_ptr<const mmltk::backend::media::live::LiveAnalysisProduct>) noexcept;
+ VisualFrame frame_{};
+ std::shared_ptr<const mmltk::backend::media::live::LiveAnalysisProduct> analysis_;
+ mmltk::frameworks::gpu::BorrowedImageProductReadView image_;
+ friend class LiveSystem;
 };
 struct LiveSnapshot final {
  std::uint64_t revision = 0U;
@@ -85,6 +106,7 @@ public:
  [[nodiscard]] std::optional<VisualImageMetadata> ImageSnapshot(const VisualFrame&) const;
  // CLEANUP-IGNORE: Live exposes raw and display reads through its own public API; shared implementation remains private.
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+ [[nodiscard]] LiveAnalysisRead ReadAnalysis(const VisualFrame&) const;
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
  [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
  void RequestWorkspace(VisualWorkspaceRequest);

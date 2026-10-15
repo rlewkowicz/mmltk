@@ -67,7 +67,7 @@ public:
   last_revision_ = observed->revision;
   return true;
  }
- bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream_value, const std::stop_token stop) override {
+ bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream_value, media::LiveAnalysisProduct& analysis, const std::stop_token stop) override {
   if (stop.stop_requested()) {
    lease_ = {};
    return false;
@@ -75,9 +75,8 @@ public:
   if (!lease_) throw std::logic_error("Live capture has no acquired output");
   const auto source = lease_.view();
   if (source.width != target.descriptor.width || source.height != target.descriptor.height) throw std::runtime_error("Live composite extent changed unexpectedly");
-  const cudaError_t status = detail::copy_live_receiver_frame(target, source.pixels, source.pitch_bytes, source.ready_event, stream_value, detail::native_live_receiver_copy_operations());
+  const cudaError_t status = detail::copy_live_receiver_frame(target, lease_, analysis, stream_value, detail::native_live_receiver_copy_operations());
   if (status != cudaSuccess) throw std::runtime_error("Live composite receiver copy failed");
-  std::move(lease_).Complete();
   return true;
  }
  void Stop() noexcept override {

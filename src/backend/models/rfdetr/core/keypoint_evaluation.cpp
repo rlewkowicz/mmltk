@@ -3,6 +3,30 @@
 #include <cstring>
 #include <limits>
 namespace mmltk::backend::models::rfdetr {
+PredictedKeypoint decode_prediction_keypoint(const KeypointPrediction& point) {
+ return {point.x, point.y, 1.0F / (1.0F + std::exp(-point.findable_logit)), {point.log_l11, point.l21, point.log_l22}};
+}
+PredictedKeypoint map_prediction_keypoint(PredictedKeypoint point, double sx, double sy, double ox, double oy) {
+ if (!(sx > 0) || !(sy > 0) || !std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(ox) || !std::isfinite(oy)) throw std::invalid_argument("invalid keypoint coordinate Jacobian");
+ point.x = point.x * sx + ox;
+ point.y = point.y * sy + oy;
+ point.precision_cholesky[0] -= std::log(sx);
+ point.precision_cholesky[1] /= sy;
+ point.precision_cholesky[2] -= std::log(sy);
+ return point;
+}
+std::array<float, 3> keypoint_covariance(const PredictedKeypoint& point) {
+ const auto& precision = point.precision_cholesky;
+ const double a = std::exp(static_cast<double>(precision[0])), b = precision[1], c = std::exp(static_cast<double>(precision[2]));
+ const double inv_det = 1.0 / (a * a * c * c);
+ const std::array<double, 3> covariance{(b * b + c * c) * inv_det, -a * b * inv_det + 0.0, a * a * inv_det};
+ if (!std::ranges::all_of(precision, [](float value) { return std::isfinite(value); }) || !std::ranges::all_of(covariance, [](double value) { return std::isfinite(value); })) {
+  const auto nan = std::numeric_limits<float>::quiet_NaN();
+  return {nan,nan,nan};
+ }
+ // Upstream validates in double before narrowing its pixel product to float.
+ return {static_cast<float>(covariance[0]),static_cast<float>(covariance[1]),static_cast<float>(covariance[2])};
+}
 double keypoint_oks(const KeypointPredictionView& predictions, std::size_t prediction,
  std::span<const mmltk::backend::data::PackedKeypoint> target, std::span<const double> sigmas,
  const std::array<float, 4>& box, double area, const std::array<double, 2>& scale) {

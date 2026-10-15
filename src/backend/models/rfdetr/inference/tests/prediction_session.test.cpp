@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/models/rfdetr/inference/keypoint_delivery.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/frameworks/gpu/tests/terminal_retirement_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/training_artifact.h"
@@ -989,9 +990,9 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
   {.artifacts = artifacts, .backend = "onnx", .device = 0, .command_stream = {reinterpret_cast<std::uintptr_t>(stream), true}, .static_resolution = 8, .maximum_detections = 2, .allow_fp16 = false});
  // Caller storage may retain capacity even though this model has no eligible slots.
  const auto prior_boxes = boxes.clone();
- std::array<rfdetr::RfdetrMaskSelection, 1> selections;
+ std::array<rfdetr::RfdetrOutputSelection, 1> selections;
  for (const bool retain_selection : {false, true}) {
-  auto submission = empty_backend->Run(input_buffer, annotations, retain_selection ? std::span<rfdetr::RfdetrMaskSelection>(selections) : std::span<rfdetr::RfdetrMaskSelection>{}, true);
+  auto submission = empty_backend->Run(input_buffer, annotations, retain_selection ? std::span<rfdetr::RfdetrOutputSelection>(selections) : std::span<rfdetr::RfdetrOutputSelection>{}, true);
   empty_backend->ReleaseAfterCompletion(std::move(submission));
   CHECK(annotations[0].count.value() == 0);
   CHECK(annotations[0].count.device_view() == nullptr);
@@ -1755,6 +1756,20 @@ TEST_CASE("Analysis providers distinguish empty known and pending counts", "[mod
   .identity = {1, 1}, .source = source, .source_ready = {.device = 0, .event = 1, .producer_stream = 1}, .regions = {&region, 1}, .annotations = {&output, 1}, .cancellation = cancellation.get_token()
  };
  auto provider = std::make_shared<Provider>();
+ SECTION("bounded caller joint storage") {
+  output.keypoint_capacity = 2;
+  output.keypoints = {.address=1,.capacity_bytes=2*sizeof(runtime::AnalysisKeypoint),.shape={.rank=3,.extents={1,2,static_cast<uint32_t>(runtime::kAnalysisKeypointChannels)}}};
+  output.keypoint_counts = {.address=1,.capacity_bytes=4,.shape={.rank=1,.extents={1}},.element_type=runtime::AnalysisElementType::Int32};
+  auto result = provider->Analyze(request);
+  REQUIRE(result.terminal() == runtime::AnalysisTerminal::Completed);
+  CHECK(provider->ReleaseAfterCompletion(std::move(result)));
+  output.count.Reset();
+  --output.keypoints.capacity_bytes;
+  CHECK(provider->Analyze(request).terminal() == runtime::AnalysisTerminal::InvalidInput);
+  ++output.keypoints.capacity_bytes;
+  output.keypoint_capacity = 257;
+  CHECK(provider->Analyze(request).terminal() == runtime::AnalysisTerminal::InvalidInput);
+ }
  SECTION("known host provider") {
   auto result = provider->Analyze(request);
   REQUIRE(result.terminal() == runtime::AnalysisTerminal::Completed);
@@ -2328,6 +2343,53 @@ TEST_CASE("Native keypoint validation maps classes and named joints in both metr
   }});
   REQUIRE(result.processed_images == 2);
  }
+ rfdetr::ExportOnnxRequest exported;
+ exported.weights_path = weights;
+ exported.output_path = root.path() / "named-joints.onnx";
+ exported.preset_name = config.preset_name;
+ exported.resolution = config.resolution;
+ rfdetr::export_onnx(exported);
+ const auto inspected = rfdetr::load_onnx_model_info(exported.output_path);
+ REQUIRE(inspected.output_contract);
+ CHECK(inspected.output_contract->task == rfdetr::ModelTask::Keypoints);
+ CHECK(inspected.output_contract->keypoints_per_class == config.keypoints_per_class);
+ CHECK(inspected.class_layout == layout);
+ rfdetr::BuildEngineRequest engine;
+ engine.onnx_path = exported.output_path;
+ engine.output_path = root.path() / "named-joints.engine";
+ engine.allow_fp16 = false;
+ rfdetr::build_tensorrt_engine(engine);
+ CHECK(rfdetr::ClassArtifactAdmission(engine.output_path).output_contract() == inspected.output_contract);
+ for (const bool tensorrt : {false,true}) {
+  auto artifact = predict;
+  artifact.weights_path.clear();
+  artifact.onnx_path = tensorrt ? std::filesystem::path{} : exported.output_path;
+  artifact.tensorrt_path = tensorrt ? engine.output_path : std::filesystem::path{};
+  artifact.backend = tensorrt ? "tensorrt" : "onnx";
+  artifact.lanes = 2;
+  rfdetr::PredictionSession session;
+  for (int pass = 0; pass < 2; ++pass) {
+   std::size_t delivered = 0;
+   const auto actual = session.Run(artifact,command,{.completed = [&](const auto& record,auto,const auto&) {
+    CHECK(record.dataset_index == delivered++);
+    REQUIRE(record.detections.size() == 1);
+    const auto& reference = expected.at(record.dataset_index);
+    const auto& value = record.detections.front();
+    CHECK(value.class_reference == reference.class_reference);
+    CHECK(std::abs(value.score-reference.score) < 1e-3F);
+    REQUIRE(value.keypoints.size() == reference.keypoints.size());
+    for (std::size_t joint=0; joint<value.keypoints.size(); ++joint) {
+     CHECK(std::abs(value.keypoints[joint].x-reference.keypoints[joint].x) < .03F);
+     CHECK(std::abs(value.keypoints[joint].y-reference.keypoints[joint].y) < .03F);
+     CHECK(std::abs(value.keypoints[joint].confidence-reference.keypoints[joint].confidence) < 1e-3F);
+     for (std::size_t channel=0; channel<3; ++channel)
+      CHECK(std::abs(value.keypoints[joint].precision_cholesky[channel]-reference.keypoints[joint].precision_cholesky[channel]) < 1e-3F);
+    }
+   }});
+   CHECK(delivered == 2);
+   CHECK(actual.processed_images == 2);
+  }
+ }
  // The native output becomes exact ground truth in the dataset's original
  // left/right order. Evaluation must reverse it back from model right/left.
  for (std::size_t image = 0; image < expected.size(); ++image) {
@@ -2369,4 +2431,43 @@ TEST_CASE("Native keypoint validation maps classes and named joints in both metr
  CHECK(std::abs(summary.keypoint->ap - 1) < 1e-9);
  CHECK(std::abs(summary.bbox.ap - 1) < 1e-9);
  CHECK(summary.keypoint->available);
+}
+
+TEST_CASE("Caller-owned joint planes preserve source coordinates covariance counts and reuse", "[model][rfdetr][analysis][keypoints][gpu]") {
+ namespace runtime = mmltk::backend::ml::runtime;
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+ const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat);
+ auto points = torch::zeros({1,2,2,static_cast<int64_t>(rfdetr::KeypointPredictionPacket::size)},options);
+ rfdetr::KeypointPredictionPacket::select<^^rfdetr::KeypointPrediction::x>(points,-1).fill_(20);
+ rfdetr::KeypointPredictionPacket::select<^^rfdetr::KeypointPrediction::y>(points,-1).fill_(30);
+ rfdetr::PostprocessedSelection selected;
+ selected.keypoints = points;
+ selected.keypoint_counts = torch::tensor({{2,0}},options.dtype(torch::kInt));
+ auto product = torch::empty({2,2,static_cast<int64_t>(runtime::kAnalysisKeypointChannels)},options);
+ auto counts = torch::empty({2},options.dtype(torch::kInt));
+ runtime::AnalysisAnnotationStorage output;
+ output.source_region = {5,7,100,100};
+ output.value_capacity = 2;
+ output.keypoint_capacity = 2;
+ output.keypoints = {reinterpret_cast<std::uintptr_t>(product.data_ptr()),product.nbytes(),{3U,{2U,2U,static_cast<uint32_t>(runtime::kAnalysisKeypointChannels)}},runtime::AnalysisElementType::Float32};
+ output.keypoint_counts = {reinterpret_cast<std::uintptr_t>(counts.data_ptr()),counts.nbytes(),{1U,{2U}},runtime::AnalysisElementType::Int32};
+ for (int pass=0; pass<2; ++pass) {
+  rfdetr::write_analysis_keypoints(selected,output);
+  REQUIRE(output.keypoints_available);
+  const auto host = product.cpu();
+  using Product = rfdetr::ReflectedTensorPacket<runtime::AnalysisKeypoint>;
+  CHECK(Product::select<^^runtime::AnalysisKeypoint::x>(host,-1)[0][0].item<float>() == 25);
+  CHECK(Product::select<^^runtime::AnalysisKeypoint::y>(host,-1)[0][0].item<float>() == 37);
+  CHECK(Product::select<^^runtime::AnalysisKeypoint::confidence>(host,-1)[0][0].item<float>() == .5F);
+  CHECK(Product::select<^^runtime::AnalysisKeypoint::covariance_xx>(host,-1)[0][0].item<float>() == 1);
+  CHECK(Product::select<^^runtime::AnalysisKeypoint::confidence>(host,-1)[1][0].item<float>() == 0);
+  CHECK(std::isnan(Product::select<^^runtime::AnalysisKeypoint::covariance_yy>(host,-1)[1][0].item<float>()));
+  CHECK(counts.cpu().equal(torch::tensor({2,0},torch::kInt)));
+ }
+ --output.keypoints.capacity_bytes;
+ CHECK_THROWS(rfdetr::write_analysis_keypoints(selected,output));
+ CHECK_FALSE(output.keypoints_available);
+ output.keypoints.capacity_bytes = product.nbytes();
+ output.keypoint_capacity = 1;
+ CHECK_THROWS(rfdetr::write_analysis_keypoints(selected,output));
 }

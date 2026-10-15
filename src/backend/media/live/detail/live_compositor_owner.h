@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/media/live/live_types.h"
+#include "src/backend/media/live/live_analysis_product.h"
 #include "live_device_types.h"
 #include "live_frame_fanout.h"
 #include "live_slot_state.h"
@@ -57,6 +58,7 @@ private:
   std::size_t overlay_pitch = 0U;
   cudaStream_t stream = nullptr;
   cudaEvent_t ready = nullptr;
+  LiveAnalysisProduct analysis{LiveAnalysisProduct::Storage::Pinned};
   DeviceFrameMetadata metadata{};
   std::uint64_t revision = 0U;
   std::uint32_t index = 0U;

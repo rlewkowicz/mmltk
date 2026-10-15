@@ -26,9 +26,10 @@ struct ModelInfo {
  int64_t num_classes = 0;
  bool has_masks = false;
  std::optional<ModelClassLayout> class_layout;
+ std::optional<RfdetrOutputContract> output_contract;
 };
 inline void apply_rfdetr_output_roles(ModelInfo& info, std::span<const RfdetrNamedOutputRole> roles) {
- if (roles.size() > 3) throw std::invalid_argument("too many RF-DETR output roles");
+ if (roles.size() > kMaximumNamedOutputRoles) throw std::invalid_argument("too many RF-DETR output roles");
  for (const auto& declared : roles) {
   auto output = std::ranges::find(info.outputs, declared.name, &TensorInfo::name);
   if (output == info.outputs.end() || declared.role == RfdetrOutputRole::Unspecified || (output->role != RfdetrOutputRole::Unspecified && output->role != declared.role))
@@ -54,37 +55,9 @@ inline void apply_rfdetr_output_roles(ModelInfo& info, std::span<const RfdetrNam
 }
 struct RfdetrOutputRoles final {
  std::size_t logits{}, boxes{};
- std::optional<std::size_t> masks;
+ std::optional<std::size_t> masks, keypoints;
 };
-[[nodiscard]] inline RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo& info) {
- std::optional<std::size_t> logits, boxes, masks;
- for (std::size_t index = 0; index < info.outputs.size(); ++index) {
-  auto& output = info.outputs[index];
-  auto role = output.role;
-  const auto canonical = output.name == "pred_logits"   ? RfdetrOutputRole::Logits
-                         : output.name == "pred_boxes"  ? RfdetrOutputRole::Boxes
-                          : output.name == "pred_masks" ? RfdetrOutputRole::Masks
-                                                        : RfdetrOutputRole::Unspecified;
-  if (role == RfdetrOutputRole::Unspecified)
-   role = canonical;
-  else if (canonical != RfdetrOutputRole::Unspecified && canonical != role)
-   throw std::invalid_argument("RF-DETR output role contradicts canonical tensor name");
-  auto* selected = role == RfdetrOutputRole::Logits ? &logits : role == RfdetrOutputRole::Boxes ? &boxes : role == RfdetrOutputRole::Masks ? &masks : nullptr;
-  if (!selected || *selected) throw std::invalid_argument("ambiguous RF-DETR output roles");
-  *selected = index;
-  output.role = role;
-  const auto rank = role == RfdetrOutputRole::Masks ? 4U : 3U;
-  if (output.shape.size() != rank || output.shape[1] <= 0 || output.shape[2] <= 0 || (role == RfdetrOutputRole::Boxes && output.shape[2] != 4) ||
-      (role == RfdetrOutputRole::Masks && output.shape[3] <= 0))
-   throw std::invalid_argument("invalid RF-DETR output shape");
- }
- if (!logits || !boxes || info.outputs.size() != (masks ? 3U : 2U)) throw std::invalid_argument("RF-DETR requires declared logits and boxes outputs");
- const auto& shape = info.outputs[*logits].shape;
- for (const auto& output : info.outputs)
-  if (output.shape[1] != shape[1] || (output.shape[0] > 0 && shape[0] > 0 && output.shape[0] != shape[0])) throw std::invalid_argument("RF-DETR output batch/query axes disagree");
- info.num_queries = shape[1];
- info.num_classes = shape[2];
- info.has_masks = masks.has_value();
- return {*logits, *boxes, masks};
-}
+class ResolvedClassLayout;
+void validate_rfdetr_output_contract(const RfdetrOutputContract&, const ResolvedClassLayout* layout = nullptr);
+[[nodiscard]] RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo& info);
 }  // namespace mmltk::backend::models::rfdetr

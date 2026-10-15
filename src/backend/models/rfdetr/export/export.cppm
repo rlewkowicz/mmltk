@@ -15,7 +15,7 @@ module;
 #include "src/backend/models/rfdetr/core/model_fwd.h"
 export module mmltk.backend.models.rfdetr.model_export;
 namespace mmltk::backend::models::rfdetr {
-void write_onnx_model_bytes(std::string_view serialized_model, const std::filesystem::path& output_path, const ModelClassLayout& layout);
+void write_onnx_model_bytes(std::string_view serialized_model, const std::filesystem::path& output_path, const ModelClassLayout& layout, const RfdetrOutputContract& contract);
 }
 export namespace mmltk::backend::models::rfdetr {
 using ModelExportStatus = std::int32_t;
@@ -36,6 +36,6 @@ private:
 };
 void export_onnx(const ExportOnnxRequest& request);
 void export_onnx(NativeRfDetrModel& model, const ExportOnnxRequest& request);
-ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::span<const RfdetrNamedOutputRole> roles = {});
+ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::span<const RfdetrNamedOutputRole> roles = {}, std::optional<RfdetrOutputContract> contract = {});
 void simplify_onnx_model_file(const std::filesystem::path& model_path);
 }  // namespace mmltk::backend::models::rfdetr

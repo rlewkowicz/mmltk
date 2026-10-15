@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -226,4 +227,40 @@ TEST_CASE("Joint Transfer projects catalog correspondence through physical slots
  disjoint_record.keypoints = std::vector{catalog::ClassKeypointSchema{{"new_left", "new_right"}, {{0, 1}}, {1, 0}, {.1, .1}}, catalog::ClassKeypointSchema{{"new_tip"}, {}, {0}, {.2}}, catalog::ClassKeypointSchema{}};
  const r::ResolvedClassLayout disjoint(r::native_training_class_layout(catalog::ClassCatalog(disjoint_record)));
  CHECK(r::keypoint_transfer_rows(active_first, source_joints, disjoint, source_joints).empty());
+}
+
+TEST_CASE("Keypoint artifact admission requires a typed task and exact physical joint schema", "[model][rfdetr][layout][keypoints]") {
+ catalog::OrderedClassCatalog names;
+ names.names = {{"marker"}, {"plain"}};
+ names.keypoints = std::vector{catalog::ClassKeypointSchema{{"left", "right"}, {{0,1}}, {1,0}, {.1,.1}}, catalog::ClassKeypointSchema{}};
+ r::ModelInfo info;
+ info.class_layout = r::native_training_class_layout(catalog::ClassCatalog(names));
+ info.outputs = {{"pred_keypoints", {1, 4, 2, 8}, "float32"}, {"pred_boxes", {1, 4, 4}, "float32"}, {"pred_logits", {1, 4, 3}, "float32"}};
+ CHECK_THROWS(r::validate_rfdetr_output_layout(info));
+ // Omitted trailing classifier slots have zero joint contribution.
+ info.output_contract = r::RfdetrOutputContract{1U, r::ModelTask::Keypoints, {2}};
+ const auto roles = r::validate_rfdetr_output_layout(info);
+ CHECK(roles.keypoints == 0U);
+ CHECK(roles.logits == 2U);
+ CHECK_FALSE(roles.masks);
+ CHECK(r::decode_output_contract(r::encode_output_contract(*info.output_contract)) == info.output_contract);
+ const auto admitted = info;
+ SECTION("wrong task") { info.output_contract->task = r::ModelTask::Detection; }
+ SECTION("wrong channel width") { info.outputs[0].shape[3] = 7; }
+ SECTION("wrong padded joints") { info.outputs[0].shape[2] = 3; }
+ SECTION("wrong physical schema") { info.output_contract->keypoints_per_class = {0, 2}; }
+ SECTION("unnamed schema") { info.class_layout = r::unresolved_class_layout(3); }
+ SECTION("invalid dtype") { info.outputs[0].dtype = "int32"; }
+ SECTION("duplicate tensor role") { info.outputs[0].role = r::RfdetrOutputRole::Boxes; }
+ SECTION("unsupported contract version") { info.output_contract->version = 2; }
+ CHECK_THROWS(r::validate_rfdetr_output_layout(info));
+ auto legacy = admitted;
+ legacy.outputs.erase(legacy.outputs.begin());
+ legacy.output_contract.reset();
+ CHECK_NOTHROW(r::validate_rfdetr_output_layout(legacy));
+ CHECK(legacy.output_contract->task == r::ModelTask::Detection);
+ legacy.outputs.push_back({"pred_masks", {1,4,12,16}, "float32"});
+ legacy.output_contract.reset();
+ CHECK_NOTHROW(r::validate_rfdetr_output_layout(legacy));
+ CHECK(legacy.output_contract->task == r::ModelTask::Segmentation);
 }

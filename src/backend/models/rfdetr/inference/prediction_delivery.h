@@ -20,6 +20,9 @@ struct PredictionRecord {
  std::int64_t image_id = 0;
  std::string source_name{};
  std::vector<Prediction> detections{};
+ // Canvas-to-original affine map [scale_x, scale_y, offset_x, offset_y].
+ // Pixels and semantic records retain canvas geometry for existing viewers/metrics.
+ std::array<double, 4> original_transform{1, 1, 0, 0};
 };
 struct PredictionRunResult {
  ResolvedModelArtifacts artifacts{};

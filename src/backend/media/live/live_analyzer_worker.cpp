@@ -2,6 +2,8 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>
+#include <array>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -27,7 +29,7 @@ LiveAnalyzerWorker::LiveAnalyzerWorker(
    slot.index = index;
    slot.owner = this;
    slot.annotations = std::make_unique<runtime::AnalysisAnnotationStorage[]>(regions);
-   slot.allocations = std::make_unique<CUdeviceptr[]>(regions * 5U);
+   slot.allocations = std::make_unique<CUdeviceptr[]>(regions * 7U);
    if (scope.Record(cudaStreamCreateWithFlags(&slot.settlement_stream, cudaStreamNonBlocking)) != cudaSuccess) throw std::runtime_error("create Live analysis settlement stream");
    for (std::uint32_t region = 0; region < regions; ++region) {
     auto& annotation = slot.annotations[region];
@@ -39,13 +41,13 @@ LiveAnalyzerWorker::LiveAnalyzerWorker(
     for (std::size_t plane = 0; plane < 5U; ++plane) {
      void* allocation = nullptr;
      if (scope.Record(cudaMalloc(&allocation, sizes[plane])) != cudaSuccess) throw std::runtime_error("allocate Live annotation storage");
-     slot.allocations[region * 5U + plane] = reinterpret_cast<CUdeviceptr>(allocation);
+     slot.allocations[region * 7U + plane] = reinterpret_cast<CUdeviceptr>(allocation);
     }
-    annotation.boxes_xyxy = {static_cast<std::uintptr_t>(slot.allocations[region * 5U]), sizes[0], {2U, {static_cast<std::uint32_t>(values), 4U}}, runtime::AnalysisElementType::Float32};
-    annotation.class_references = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 1U]), sizes[1], {1U, {static_cast<std::uint32_t>(values)}}, runtime::AnalysisElementType::Int32};
-    annotation.confidences = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 2U]), sizes[2], {1U, {static_cast<std::uint32_t>(values)}}, runtime::AnalysisElementType::Float32};
-    annotation.colors_rgb = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 3U]), sizes[3], {2U, {static_cast<std::uint32_t>(values), 3U}}, runtime::AnalysisElementType::Uint8};
-    annotation.masks = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 4U]), sizes[4], {3U, {static_cast<std::uint32_t>(values), height, width}}, runtime::AnalysisElementType::Uint8};
+    annotation.boxes_xyxy = {static_cast<std::uintptr_t>(slot.allocations[region * 7U]), sizes[0], {2U, {static_cast<std::uint32_t>(values), 4U}}, runtime::AnalysisElementType::Float32};
+    annotation.class_references = {static_cast<std::uintptr_t>(slot.allocations[region * 7U + 1U]), sizes[1], {1U, {static_cast<std::uint32_t>(values)}}, runtime::AnalysisElementType::Int32};
+    annotation.confidences = {static_cast<std::uintptr_t>(slot.allocations[region * 7U + 2U]), sizes[2], {1U, {static_cast<std::uint32_t>(values)}}, runtime::AnalysisElementType::Float32};
+    annotation.colors_rgb = {static_cast<std::uintptr_t>(slot.allocations[region * 7U + 3U]), sizes[3], {2U, {static_cast<std::uint32_t>(values), 3U}}, runtime::AnalysisElementType::Uint8};
+    annotation.masks = {static_cast<std::uintptr_t>(slot.allocations[region * 7U + 4U]), sizes[4], {3U, {static_cast<std::uint32_t>(values), height, width}}, runtime::AnalysisElementType::Uint8};
    }
   }
  } catch (...) {
@@ -59,6 +61,54 @@ LiveAnalyzerWorker::~LiveAnalyzerWorker() {
 }
 void LiveAnalyzerWorker::set_provider(std::shared_ptr<runtime::AnalysisProvider> provider) {
  if (running_.load(std::memory_order_acquire)) throw std::logic_error("cannot replace running Live analysis provider");
+ if (!provider) { provider_.reset(); return; }
+ const auto joints = provider->keypoint_capacity();
+ if (joints > mmltk::backend::data::catalog::kKeypointsPerClassCapacity) throw std::invalid_argument("Live provider joint capacity exceeds catalog bounds");
+ for (std::uint32_t index = 0; index < slot_count_; ++index)
+  if (slots_[index].frame) throw std::logic_error("cannot replace Live provider before analysis readers settle");
+ auto scope = cuda_.scope();
+ if (!scope) throw std::runtime_error("enter Live joint allocation scope");
+ // Prepare every replacement before publishing any capacity. Allocation failure
+ // preserves the prior provider and all of its settled storage.
+ std::vector<std::array<CUdeviceptr, 2>> replacements(slot_count_ * maximum_regions_);
+ try {
+  for (std::uint32_t index = 0; index < slot_count_; ++index) {
+   for (std::uint32_t region = 0; region < maximum_regions_; ++region) {
+    const auto& annotation = slots_[index].annotations[region];
+    if (!joints || annotation.keypoint_capacity == joints) continue;
+    auto& allocation = replacements[index * maximum_regions_ + region];
+    const std::array sizes{annotation.value_capacity * joints * sizeof(runtime::AnalysisKeypoint), annotation.value_capacity * sizeof(std::int32_t)};
+    for (std::size_t plane = 0; plane < allocation.size(); ++plane) {
+     void* address = nullptr;
+     if (scope.Record(cudaMalloc(&address, sizes[plane])) != cudaSuccess) throw std::runtime_error("allocate Live joint storage");
+     allocation[plane] = reinterpret_cast<CUdeviceptr>(address);
+    }
+   }
+  }
+ } catch (...) {
+  for (auto& allocation : replacements)
+   for (auto& address : allocation) free_live_cuda_allocation(scope, address);
+  throw;
+ }
+ for (std::uint32_t index = 0; index < slot_count_; ++index) {
+  auto& slot = slots_[index];
+  for (std::uint32_t region = 0; region < maximum_regions_; ++region) {
+   auto& annotation = slot.annotations[region];
+   if (annotation.keypoint_capacity == joints) continue;
+   auto& allocation = replacements[index * maximum_regions_ + region];
+   for (std::size_t plane = 0; plane < allocation.size(); ++plane) {
+    auto& address = slot.allocations[region * 7U + 5U + plane];
+    free_live_cuda_allocation(scope, address);
+    address = allocation[plane];
+   }
+   annotation.keypoint_capacity = joints;
+   annotation.keypoints_available = false;
+   annotation.keypoints = joints ? runtime::AnalysisDeviceBuffer{static_cast<std::uintptr_t>(allocation[0]), annotation.value_capacity * joints * sizeof(runtime::AnalysisKeypoint),
+    {3U, {static_cast<std::uint32_t>(annotation.value_capacity), joints, static_cast<std::uint32_t>(runtime::kAnalysisKeypointChannels)}}, runtime::AnalysisElementType::Float32} : runtime::AnalysisDeviceBuffer{};
+   annotation.keypoint_counts = joints ? runtime::AnalysisDeviceBuffer{static_cast<std::uintptr_t>(allocation[1]), annotation.value_capacity * sizeof(std::int32_t),
+    {1U, {static_cast<std::uint32_t>(annotation.value_capacity)}}, runtime::AnalysisElementType::Int32} : runtime::AnalysisDeviceBuffer{};
+  }
+ }
  provider_ = std::move(provider);
 }
 void LiveAnalyzerWorker::start() {
@@ -128,6 +178,7 @@ bool LiveAnalyzerWorker::process_latest() {
  const runtime::AnalysisRegion region{0U, 0U, source.width, source.height};
  annotation.source_region = region;
  annotation.count.Reset();
+ annotation.keypoints_available = false;
  annotation.masks.shape = {3U, {static_cast<std::uint32_t>(annotation.value_capacity), region.height, region.width}};
  auto scope = cuda_.scope();
  if (!scope) {
@@ -268,7 +319,7 @@ void LiveAnalyzerWorker::release_storage() noexcept {
   slots_[slot].settlement_stream = nullptr;
   slots_[slot].frame.reset();
   if (slots_[slot].allocations != nullptr) {
-   for (std::uint32_t allocation = 0; allocation < maximum_regions_ * 5U; ++allocation) {
+   for (std::uint32_t allocation = 0; allocation < maximum_regions_ * 7U; ++allocation) {
     if (scope) free_live_cuda_allocation(scope, slots_[slot].allocations[allocation]);
     slots_[slot].allocations[allocation] = 0U;
    }

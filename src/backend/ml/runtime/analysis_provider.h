@@ -62,6 +62,13 @@ struct AnalysisCompletion final {
 // This is the canonical model-neutral annotation storage vocabulary. RF-DETR
 // writes its interpretation into these caller-owned buffers once; Live
 // projects the same storage into its frame/overlay state without mirroring it.
+// Coordinates and symmetric covariance use source-image pixels; crop origins
+// are included in coordinates and do not change covariance.
+// Padding has zero confidence and NaN covariance; counts explicitly name active joints.
+struct AnalysisKeypoint final {
+ float x, y, confidence, covariance_xx, covariance_xy, covariance_yy;
+};
+inline constexpr std::size_t kAnalysisKeypointChannels = sizeof(AnalysisKeypoint) / sizeof(float);
 struct AnalysisAnnotationStorage final {
  AnalysisRegion source_region{};
  std::size_t value_capacity = 0U;
@@ -73,6 +80,10 @@ struct AnalysisAnnotationStorage final {
  AnalysisDeviceBuffer masks{};
  // Capacity does not establish that a provider initialized a mask product.
  bool masks_available = false;
+ std::uint32_t keypoint_capacity = 0;
+ AnalysisDeviceBuffer keypoints{};
+ AnalysisDeviceBuffer keypoint_counts{};
+ bool keypoints_available = false;
  mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot;
  std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog{};
 };
@@ -148,6 +159,8 @@ public:
  }
  AnalysisProvider(const AnalysisProvider&) = delete;
  AnalysisProvider& operator=(const AnalysisProvider&) = delete;
+ // Admitted task capacity, independent of the number of prediction candidates.
+ [[nodiscard]] virtual std::uint32_t keypoint_capacity() const noexcept { return 0; }
  [[nodiscard]] AnalysisResult Analyze(const AnalysisRequest& request) noexcept {
   std::shared_ptr<AnalysisProvider> owner = weak_from_this().lock();
   if (!owner) { return Terminal(request.identity, AnalysisTerminal::DependencyFailure); }
@@ -290,7 +303,7 @@ private:
   if (output.value_capacity > std::numeric_limits<std::uint32_t>::max()) { return false; }
   if (output.value_capacity == 0U) {
    return output.count.empty() && !output.masks_available && output.boxes_xyxy.capacity_bytes == 0U && output.class_references.capacity_bytes == 0U && output.confidences.capacity_bytes == 0U &&
-          output.colors_rgb.capacity_bytes == 0U && output.masks.capacity_bytes == 0U;
+          output.colors_rgb.capacity_bytes == 0U && output.masks.capacity_bytes == 0U && !output.keypoints_available && output.keypoints.capacity_bytes == 0U && output.keypoint_counts.capacity_bytes == 0U;
   }
   const auto capacity = static_cast<std::uint32_t>(output.value_capacity);
   const std::uint32_t boxes[]{capacity, 4U};
@@ -301,6 +314,12 @@ private:
    output.source_region.height,
    output.source_region.width,
   };
+  if (output.keypoint_capacity > mmltk::backend::data::catalog::kKeypointsPerClassCapacity) return false;
+  if (output.keypoint_capacity) {
+   const std::uint32_t joints[]{capacity, output.keypoint_capacity, static_cast<std::uint32_t>(kAnalysisKeypointChannels)};
+   if (!ValidateBuffer(output.keypoints, 3U, joints, AnalysisElementType::Float32) || !ValidateBuffer(output.keypoint_counts, 1U, values, AnalysisElementType::Int32)) return false;
+  } else if (output.keypoints_available || output.keypoints.address || output.keypoints.capacity_bytes || output.keypoint_counts.address || output.keypoint_counts.capacity_bytes) return false;
+  if (output.keypoints_available && (!output.class_catalog || !output.class_catalog->has_keypoints())) return false;
   return ValidateBuffer(output.boxes_xyxy, 2U, boxes, AnalysisElementType::Float32) && ValidateBuffer(output.class_references, 1U, values, AnalysisElementType::Int32) &&
          ValidateBuffer(output.confidences, 1U, values, AnalysisElementType::Float32) && ValidateBuffer(output.colors_rgb, 2U, colors, AnalysisElementType::Uint8) &&
          ValidateBuffer(output.masks, 3U, masks, AnalysisElementType::Uint8, true);

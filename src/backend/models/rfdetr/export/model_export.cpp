@@ -45,12 +45,13 @@ std::string export_member_name(std::string name) {
 void erase_unused_module_self_input(const std::shared_ptr<torch::jit::Graph>& graph) {
  if (!graph->inputs().empty() && graph->inputs().front()->type()->kind() == c10::TypeKind::ClassType) { graph->eraseInput(0); }
 }
-void assign_onnx_tensor_names(const std::shared_ptr<torch::jit::Graph>& graph, const bool has_masks) {
- constexpr std::array<std::string_view, 3> output_names{"pred_logits", "pred_boxes", "pred_masks"};
- const std::size_t expected_outputs = has_masks ? output_names.size() : output_names.size() - 1U;
- if (graph->inputs().size() != 1U || graph->outputs().size() != expected_outputs) { throw std::runtime_error("RF-DETR ONNX graph does not expose the expected image and prediction tensors"); }
+void assign_onnx_tensor_names(const std::shared_ptr<torch::jit::Graph>& graph, const ModelTask task) {
+ const std::size_t expected_outputs = task == ModelTask::Detection ? 2U : 3U;
+ if (graph->inputs().size() != 1U || graph->outputs().size() != expected_outputs) throw std::runtime_error("RF-DETR ONNX graph does not expose the task prediction tensors");
  graph->inputs().front()->setDebugName("pixel_values");
- for (std::size_t index = 0U; index < expected_outputs; ++index) { graph->outputs()[index]->setDebugName(std::string(output_names[index])); }
+ graph->outputs()[0]->setDebugName("pred_logits");
+ graph->outputs()[1]->setDebugName("pred_boxes");
+ if (task != ModelTask::Detection) graph->outputs()[2]->setDebugName(task == ModelTask::Segmentation ? "pred_masks" : "pred_keypoints");
 }
 }  // namespace
 void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& output_path, const int opset_version, const int batch_size, const bool simplify,
@@ -84,10 +85,14 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
    const auto name = export_member_name(buffer.key());
    export_module.register_buffer(name, buffer.value());
   }
-  const bool has_masks = model.config().has_masks();
-  auto traced = torch::jit::tracer::trace({dummy_pixels}, [&technical_model, dummy_mask, has_masks](torch::jit::Stack args) {
+  const auto task = model.config().task;
+  auto traced = torch::jit::tracer::trace({dummy_pixels}, [&technical_model, dummy_mask, task](torch::jit::Stack args) {
    const auto outputs = technical_model.forward(NestedTensor{args[0].toTensor(), dummy_mask}, true);
-   if (has_masks && outputs.main.pred_masks) { return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks}; }
+   if (task == ModelTask::Keypoints) {
+    if (!outputs.main.pred_keypoints) throw std::runtime_error("keypoint export omitted its task output");
+    return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_keypoints};
+   }
+   if (task == ModelTask::Segmentation && outputs.main.pred_masks) { return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks}; }
    return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes};
   }, [](const torch::autograd::Variable&) { return ""; }, false, false, &export_module);
   detail::install_recorded_forward(export_module, *compilation_unit, traced.first->graph);
@@ -107,13 +112,13 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
    .readback = &readback,
   });
   erase_unused_module_self_input(graph);
-  assign_onnx_tensor_names(graph, has_masks);
+  assign_onnx_tensor_names(graph, task);
   std::unordered_map<std::string, std::unordered_map<std::int64_t, std::string>> dynamic_axes;
   auto exported =
    torch::jit::export_onnx(graph, {}, static_cast<std::int64_t>(opset_version), dynamic_axes, false, ::torch::onnx::OperatorExportTypes::ONNX, true, false, {}, true, false, staged_model.string());
   const auto& model_proto = std::get<0>(exported);
   if (model_proto == nullptr) { throw std::runtime_error("torch::jit::export_onnx returned a null ONNX model"); }
-  write_onnx_model_bytes(torch::jit::serialize_model_proto_to_string(model_proto), staged_model, model.class_layout()->record());
+  write_onnx_model_bytes(torch::jit::serialize_model_proto_to_string(model_proto), staged_model, model.class_layout()->record(), {1U, task, model.config().keypoints_per_class});
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   if (simplify) { simplify_onnx_model_file(staged_model); }
   const auto reopened = load_onnx_model_info(staged_model);

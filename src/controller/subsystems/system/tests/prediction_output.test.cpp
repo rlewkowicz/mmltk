@@ -329,4 +329,45 @@ TEST_CASE("video samples use actual decoded population despite AVI count metadat
   CHECK(saved == 2U);
  }
 }
+TEST_CASE("Saved prediction samples retain named joints and render their skeleton from one result", "[controller][prediction][output][keypoints][gpu]") {
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+ const auto execution = gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
+ const mmltk::testsupport::ScopedTempDir directory("prediction-joint-samples");
+ namespace catalog = mmltk::backend::data::catalog;
+ catalog::OrderedClassCatalog names;
+ names.names = {{"marker"}};
+ names.keypoints = std::vector{catalog::ClassKeypointSchema{{"left","right"},{{0,1}},{1,0},{.1,.1}}};
+ const auto schema = std::make_shared<const catalog::ClassCatalog>(names);
+ PredictionRunOutput options{.directory = directory.path(),.population = 1};
+ options.saving.single_enabled = true;
+ contracts::WorkflowOutputFacts facts;
+ options.progress = [&](const auto& value) { facts=value; };
+ detail::PredictionOutput output({execution},rfdetr::PredictSourceKind::ImageFiles,options,{});
+ output.Begin({.class_catalog = schema,.class_domain = catalog::ClassReferenceDomain::Foreground,.source_images = 1});
+ rfdetr::Prediction detection;
+ detection.class_reference = 0;
+ detection.score = .9F;
+ detection.bbox_xyxy = {4,4,60,44};
+ detection.keypoints = {{16,30,.9F,{}},{48,30,.9F,{}}};
+ const std::vector<rfdetr::Prediction> predictions{detection};
+ std::vector<float> pixels(64U*48U*3U,.25F);
+ auto source = PredictionSource::Device(execution,{64,48},pixels,predictions,schema);
+ const auto frame = output.Capture({.detections = predictions},{.chw = source.pixels(),.width = 64,.height = 48,.device = 0,.custody = source.custody()},source.annotations());
+ REQUIRE(frame);
+ REQUIRE(frame->predictions().size() == 1);
+ REQUIRE(frame->predictions()[0].keypoints.size() == 2);
+ CHECK(frame->predictions()[0].keypoints[1].x == 48);
+ output.Finish(true);
+ REQUIRE(facts.completed_samples == 1);
+ int width=0,height=0,channels=0;
+ std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> saved(stbi_load(facts.recent_sample.c_str(),&width,&height,&channels,4),stbi_image_free);
+ REQUIRE(saved);
+ REQUIRE(width == 64);
+ REQUIRE(height == 48);
+ const auto pixel = [&](unsigned x,unsigned y) { const auto* rgb=saved.get()+(y*64U+x)*4U; return rgb[0]!=64U || rgb[1]!=64U || rgb[2]!=64U; };
+ CHECK(pixel(16,30));
+ CHECK(pixel(32,30));
+ CHECK(pixel(48,30));
+ CHECK_FALSE(pixel(32,36));
+}
 }  // namespace
