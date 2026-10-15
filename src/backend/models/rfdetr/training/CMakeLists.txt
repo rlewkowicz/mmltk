@@ -61,6 +61,7 @@ mmltk_register_private_headers(
     detail/training_model.h
     detail/model_merging.h
     detail/training_session_checkpoint.h
+    detail/training_identity_v1.h
     detail/training_artifact.h
     detail/training_gradient_reducer.h
     detail/training_data_plan.h

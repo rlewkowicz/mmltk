@@ -3,6 +3,7 @@
 #include "detail/training_snapshot.h"
 #include "detail/training_artifact.h"
 #include "detail/training_session_checkpoint.h"
+#include "detail/training_identity_v1.h"
 #include "detail/checkpoint_private.h"
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
@@ -18,12 +19,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <concepts>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 namespace mmltk::backend::models::rfdetr::testsupport {
@@ -641,21 +645,244 @@ TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][trai
  REQUIRE_THROWS(r::ModelEma::from_cpu_shadow(parameters, malformed, 0.5, 0.0, ema.completed_updates()));
 }
 
+namespace {
+namespace identity_v1 = r::detail::training_identity_v1;
+namespace reflection = mmltk::frameworks::reflection;
+template <class Owner, auto Member, class Type>
+consteval bool historical_field(std::size_t index) {
+ return std::same_as<std::remove_cvref_t<decltype(std::declval<Owner>().*Member)>, Type> && reflection::member_index<Member>(reflection::field_declarations<Owner>()) == index;
+}
+// Independent persisted shape assertions, transcribed from 1c13fec8. These do
+// not derive expected bytes from the converter or today's configuration.
+using HistoricalConfig = identity_v1::Configuration;
+static_assert(reflection::field_declarations<HistoricalConfig>().size() == 35U);
+static_assert(
+ historical_field<HistoricalConfig, &HistoricalConfig::preset_name, std::string>(0) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::resolution, int>(1) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::segmentation, bool>(2) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::num_classes, int>(3) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::num_queries, int>(4) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::num_select, int>(5) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::dec_layers, int>(6) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::group_detr, int>(7) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::two_stage, bool>(8) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::hidden_dim, int>(9) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::patch_size, int>(10) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::num_windows, int>(11) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::positional_encoding_size, int>(12) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::sa_nheads, int>(13) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::ca_nheads, int>(14) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::dec_n_points, int>(15) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::dim_feedforward, int>(16) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::bbox_reparam, bool>(17) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::lite_refpoint_refine, bool>(18) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::cls_loss_coef, double>(19) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::bbox_loss_coef, double>(20) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::giou_loss_coef, double>(21) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::mask_ce_loss_coef, double>(22) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::mask_dice_loss_coef, double>(23) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::sum_group_losses, bool>(24) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::use_varifocal_loss, bool>(25) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::use_position_supervised_loss, bool>(26) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::ia_bce_loss, bool>(27) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::aux_loss, bool>(28) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::mask_point_sample_ratio, std::int64_t>(29) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::focal_alpha, double>(30) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::set_cost_class, double>(31) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::set_cost_bbox, double>(32) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::set_cost_giou, double>(33) &&
+ historical_field<HistoricalConfig, &HistoricalConfig::training_supervision, identity_v1::TrainingSupervisionConfig>(34));
+using HistoricalMatchFree = identity_v1::MatchFreeSupervisionConfig;
+using HistoricalDenoising = identity_v1::DenoisingSupervisionConfig;
+using HistoricalSupervision = identity_v1::TrainingSupervisionConfig;
+static_assert(reflection::field_declarations<HistoricalMatchFree>().size() == 3U &&
+ historical_field<HistoricalMatchFree, &HistoricalMatchFree::rho, float>(0) &&
+ historical_field<HistoricalMatchFree, &HistoricalMatchFree::correspondence_weight, float>(1) &&
+ historical_field<HistoricalMatchFree, &HistoricalMatchFree::query_weight, float>(2));
+static_assert(reflection::field_declarations<HistoricalDenoising>().size() == 5U &&
+ historical_field<HistoricalDenoising, &HistoricalDenoising::enabled, bool>(0) &&
+ historical_field<HistoricalDenoising, &HistoricalDenoising::groups, std::uint16_t>(1) &&
+ historical_field<HistoricalDenoising, &HistoricalDenoising::label_noise_ratio, float>(2) &&
+ historical_field<HistoricalDenoising, &HistoricalDenoising::center_noise_scale, float>(3) &&
+ historical_field<HistoricalDenoising, &HistoricalDenoising::size_noise_scale, float>(4));
+static_assert(reflection::field_declarations<HistoricalSupervision>().size() == 3U &&
+ historical_field<HistoricalSupervision, &HistoricalSupervision::assignment, identity_v1::TrainAssignmentKind>(0) &&
+ historical_field<HistoricalSupervision, &HistoricalSupervision::match_free, HistoricalMatchFree>(1) &&
+ historical_field<HistoricalSupervision, &HistoricalSupervision::denoising, HistoricalDenoising>(2));
+using HistoricalName = identity_v1::ClassName;
+using HistoricalCatalog = identity_v1::OrderedClassCatalog;
+using HistoricalSlot = identity_v1::ModelClassSlot;
+using HistoricalProvenance = identity_v1::ClassLayoutProvenance;
+using HistoricalLayout = identity_v1::ModelClassLayout;
+static_assert(reflection::field_declarations<HistoricalName>().size() == 1U && historical_field<HistoricalName, &HistoricalName::value, std::string>(0));
+static_assert(reflection::field_declarations<HistoricalCatalog>().size() == 1U && historical_field<HistoricalCatalog, &HistoricalCatalog::names, std::vector<HistoricalName>>(0));
+static_assert(reflection::field_declarations<HistoricalSlot>().size() == 2U &&
+ historical_field<HistoricalSlot, &HistoricalSlot::role, identity_v1::ClassSlotRole>(0) &&
+ historical_field<HistoricalSlot, &HistoricalSlot::foreground_index, std::optional<std::uint32_t>>(1));
+static_assert(reflection::field_declarations<HistoricalProvenance>().size() == 3U &&
+ historical_field<HistoricalProvenance, &HistoricalProvenance::origin, identity_v1::ClassLayoutOrigin>(0) &&
+ historical_field<HistoricalProvenance, &HistoricalProvenance::producer, std::string>(1) &&
+ historical_field<HistoricalProvenance, &HistoricalProvenance::artifact_sha256, std::string>(2));
+static_assert(reflection::field_declarations<HistoricalLayout>().size() == 8U &&
+ historical_field<HistoricalLayout, &HistoricalLayout::version, std::uint32_t>(0) &&
+ historical_field<HistoricalLayout, &HistoricalLayout::foreground, HistoricalCatalog>(1) &&
+ historical_field<HistoricalLayout, &HistoricalLayout::class_name_evidence, HistoricalCatalog>(2) &&
+ historical_field<HistoricalLayout, &HistoricalLayout::slots, std::vector<HistoricalSlot>>(3) &&
+ historical_field<HistoricalLayout, &HistoricalLayout::scores, identity_v1::ClassScoreEncoding>(4) &&
+ historical_field<HistoricalLayout, &HistoricalLayout::no_object, identity_v1::NoObjectEncoding>(5) &&
+ historical_field<HistoricalLayout, &HistoricalLayout::provenance, HistoricalProvenance>(6) &&
+ historical_field<HistoricalLayout, &HistoricalLayout::supervision_in_foreground_order, bool>(7));
+static_assert(identity_v1::kSupervisionLimits.max_bytes == 4096U && identity_v1::kSupervisionLimits.max_items == 128U && identity_v1::kSupervisionLimits.max_depth == 16U);
+static_assert(identity_v1::kClassLayoutLimits.max_bytes == 1048576U && identity_v1::kClassLayoutLimits.max_items == 1048576U && identity_v1::kClassLayoutLimits.max_depth == 64U);
+static_assert(reflection::policy_of_member<&HistoricalName::value>().maximum_bytes == 256U);
+static_assert(reflection::policy_of_member<&HistoricalCatalog::names>().maximum_items == 256U);
+static_assert(reflection::policy_of_member<&HistoricalLayout::slots>().maximum_items == 4096U);
+static_assert(reflection::policy_of_member<&HistoricalProvenance::producer>().maximum_bytes == 1024U);
+static_assert(reflection::policy_of_member<&HistoricalProvenance::artifact_sha256>().maximum_bytes == 64U);
+template <class Enum, std::size_t Count>
+consteval bool historical_enum(const std::array<std::string_view, Count>& spellings) {
+ if constexpr (!std::same_as<std::underlying_type_t<Enum>, std::uint8_t> || reflection::enum_entries<Enum>().size() != Count) return false;
+ const auto entries = reflection::enum_entries<Enum>();
+ for (std::size_t index = 0; index < Count; ++index)
+  if (entries[index].name != spellings[index] || static_cast<std::uint8_t>(entries[index].value) != index) return false;
+ return true;
+}
+static_assert(historical_enum<identity_v1::TrainAssignmentKind>(std::array<std::string_view, 2>{"Hungarian", "MatchFree"}));
+static_assert(historical_enum<identity_v1::ClassSlotRole>(std::array<std::string_view, 4>{"Foreground", "Background", "Unused", "Unresolved"}));
+static_assert(historical_enum<identity_v1::ClassScoreEncoding>(std::array<std::string_view, 2>{"SigmoidLogits", "SoftmaxLogits"}));
+static_assert(historical_enum<identity_v1::NoObjectEncoding>(std::array<std::string_view, 3>{"AllNegative", "ExplicitBackground", "Unspecified"}));
+static_assert(historical_enum<identity_v1::ClassLayoutOrigin>(std::array<std::string_view, 5>{"Unresolved", "NativeTraining", "Embedded", "DigestDescriptor", "VerifiedAsset"}));
+
+r::NativeRfDetrConfig historical_identity_configuration() {
+ return {
+  .preset_name = "identity-fixture", .resolution = 384, .task = r::ModelTask::Detection,
+  .num_classes = 3, .num_queries = 7, .num_select = 5, .dec_layers = 3, .group_detr = 2, .two_stage = true,
+  .hidden_dim = 256, .patch_size = 16, .num_windows = 2, .positional_encoding_size = 24, .sa_nheads = 8, .ca_nheads = 16,
+  .dec_n_points = 4, .dim_feedforward = 1024, .bbox_reparam = false, .lite_refpoint_refine = true,
+  .cls_loss_coef = 1.25, .bbox_loss_coef = 6.5, .giou_loss_coef = 2.25, .mask_ce_loss_coef = 0.75, .mask_dice_loss_coef = 1.5,
+  .sum_group_losses = true, .use_varifocal_loss = true, .use_position_supervised_loss = true, .ia_bce_loss = false, .aux_loss = false,
+  .mask_point_sample_ratio = 32, .focal_alpha = 0.125, .set_cost_class = 2.5, .set_cost_bbox = 5.5, .set_cost_giou = 3.0,
+  .training_supervision = {
+   .assignment = r::TrainAssignmentKind::Hungarian, .match_free = {.rho = 0.5F, .correspondence_weight = 1.0F, .query_weight = 2.0F},
+   .denoising = {.enabled = false, .groups = 5U, .label_noise_ratio = 0.2F, .center_noise_scale = 0.4F, .size_noise_scale = 0.4F}}
+ };
+}
+}  // namespace
+
 TEST_CASE("Session identities bind joint metadata while baseline identities preserve original vocabulary", "[rfdetr][training][session][keypoints]") {
- auto config=r::native_config_from_preset(r::model_presets().front());
- auto layout=r::testsupport::synthetic_training_layout(2);
- config.num_classes=3;
- const auto baseline=r::training_configuration_identity(config,layout,1);
- CHECK(baseline.find("segmentation=0;")!=std::string::npos);
- CHECK(baseline.find("backbone=")==std::string::npos);
- CHECK(baseline.find("keypoints")==std::string::npos);
- CHECK(r::training_configuration_identity(config,layout,2)!=baseline);
+ // Fixed independent bytes follow the original train.cpp hexfloat stream and
+ // sorted JSON encoding. The genuine old-application session case separately
+ // compares this conversion against its retained producer signature.
+ const bool segmentation = GENERATE(false, true);
+ const unsigned supervision = GENERATE(0U, 1U, 2U, 3U);
+ CAPTURE(segmentation, supervision);
+ auto config = historical_identity_configuration();
+ config.task = segmentation ? r::ModelTask::Segmentation : r::ModelTask::Detection;
+ auto layout = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog(segmentation ? std::vector<std::string>{"ant", "zebra"} : std::vector<std::string>{"zebra", "ant"}));
+ layout.class_name_evidence.names = {{""}, {"raw\"name"}, {"raw\"name"}};
+ layout.slots = {{r::ClassSlotRole::Foreground, 1U}, {r::ClassSlotRole::Unused, std::nullopt}, {r::ClassSlotRole::Foreground, 0U}};
+ layout.provenance = {.origin = r::ClassLayoutOrigin::VerifiedAsset, .producer = "original/\"asset\"\nprovider", .artifact_sha256 = std::string(64, 'a')};
+ layout.supervision_in_foreground_order = false;
+ std::string expected_supervision =
+  R"({"assignment":"Hungarian","denoising":{"center_noise_scale":0.4000000059604645,"enabled":false,"groups":5,"label_noise_ratio":0.20000000298023224,"size_noise_scale":0.4000000059604645},"match_free":{"correspondence_weight":1.0,"query_weight":2.0,"rho":0.5}})";
+ if (supervision == 1U || supervision == 3U) {
+  config.training_supervision.assignment = r::TrainAssignmentKind::MatchFree;
+  config.training_supervision.match_free = {.rho = 0.25F, .correspondence_weight = 0.5F, .query_weight = 1.5F};
+  config.training_supervision.denoising = {.enabled = supervision == 3U, .groups = 7U, .label_noise_ratio = 0.125F, .center_noise_scale = 0.25F, .size_noise_scale = 0.75F};
+  expected_supervision = supervision == 1U
+   ? R"({"assignment":"MatchFree","denoising":{"center_noise_scale":0.25,"enabled":false,"groups":7,"label_noise_ratio":0.125,"size_noise_scale":0.75},"match_free":{"correspondence_weight":0.5,"query_weight":1.5,"rho":0.25}})"
+   : R"({"assignment":"MatchFree","denoising":{"center_noise_scale":0.25,"enabled":true,"groups":7,"label_noise_ratio":0.125,"size_noise_scale":0.75},"match_free":{"correspondence_weight":0.5,"query_weight":1.5,"rho":0.25}})";
+ } else if (supervision == 2U) {
+  config.training_supervision.denoising = {.enabled = true, .groups = 3U, .label_noise_ratio = 0.5F, .center_noise_scale = 0.25F, .size_noise_scale = 0.75F};
+  expected_supervision =
+   R"({"assignment":"Hungarian","denoising":{"center_noise_scale":0.25,"enabled":true,"groups":3,"label_noise_ratio":0.5,"size_noise_scale":0.75},"match_free":{"correspondence_weight":1.0,"query_weight":2.0,"rho":0.5}})";
+ }
+ std::string expected_layout =
+  R"({"class_name_evidence":{"names":[{"value":""},{"value":"raw\"name"},{"value":"raw\"name"}]},"foreground":{"names":[{"value":"zebra"},{"value":"ant"}]},"no_object":"AllNegative","provenance":{"artifact_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","origin":"VerifiedAsset","producer":"original/\"asset\"\nprovider"},"scores":"SigmoidLogits","slots":[{"foreground_index":1,"role":"Foreground"},{"role":"Unused"},{"foreground_index":0,"role":"Foreground"}],"supervision_in_foreground_order":false,"version":1})";
+ if (segmentation) {
+  layout.slots = {{r::ClassSlotRole::Background, std::nullopt}, {r::ClassSlotRole::Foreground, 1U}, {r::ClassSlotRole::Foreground, 0U}};
+  layout.scores = r::ClassScoreEncoding::SoftmaxLogits;
+  layout.no_object = r::NoObjectEncoding::ExplicitBackground;
+  layout.provenance = {.origin = r::ClassLayoutOrigin::DigestDescriptor, .producer = "original\\descriptor", .artifact_sha256 = std::string(64, 'b')};
+  layout.supervision_in_foreground_order = true;
+  expected_layout =
+   R"({"class_name_evidence":{"names":[{"value":""},{"value":"raw\"name"},{"value":"raw\"name"}]},"foreground":{"names":[{"value":"ant"},{"value":"zebra"}]},"no_object":"ExplicitBackground","provenance":{"artifact_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","origin":"DigestDescriptor","producer":"original\\descriptor"},"scores":"SoftmaxLogits","slots":[{"role":"Background"},{"foreground_index":1,"role":"Foreground"},{"foreground_index":0,"role":"Foreground"}],"supervision_in_foreground_order":true,"version":1})";
+ }
+ const std::string expected = std::string(segmentation ? "preset_name=identity-fixture;resolution=384;segmentation=1;" : "preset_name=identity-fixture;resolution=384;segmentation=0;") +
+  "num_classes=3;num_queries=7;num_select=5;dec_layers=3;group_detr=2;two_stage=1;hidden_dim=256;patch_size=16;num_windows=2;"
+  "positional_encoding_size=24;sa_nheads=8;ca_nheads=16;dec_n_points=4;dim_feedforward=1024;bbox_reparam=0;lite_refpoint_refine=1;"
+  "cls_loss_coef=0x1.4p+0;bbox_loss_coef=0x1.ap+2;giou_loss_coef=0x1.2p+1;mask_ce_loss_coef=0x1.8p-1;mask_dice_loss_coef=0x1.8p+0;"
+  "sum_group_losses=1;use_varifocal_loss=1;use_position_supervised_loss=1;ia_bce_loss=0;aux_loss=0;mask_point_sample_ratio=32;"
+  "focal_alpha=0x1p-3;set_cost_class=0x1.4p+1;set_cost_bbox=0x1.6p+2;set_cost_giou=0x1.8p+1;" + expected_supervision + expected_layout;
+ const auto baseline = r::training_configuration_identity(config, layout, 1);
+ CHECK(baseline == expected);
+ const auto unresolved = r::unresolved_class_layout(3);
+ CHECK(r::training_configuration_identity(config, unresolved, 1) == expected.substr(0, expected.size() - expected_layout.size()) +
+  R"({"class_name_evidence":{"names":[]},"foreground":{"names":[]},"no_object":"Unspecified","provenance":{"artifact_sha256":"","origin":"Unresolved","producer":""},"scores":"SigmoidLogits","slots":[{"role":"Unresolved"},{"role":"Unresolved"},{"role":"Unresolved"}],"supervision_in_foreground_order":false,"version":1})");
+ const auto current = r::training_configuration_identity(config, layout, 2);
+ CHECK(current == r::encode_checkpoint_configuration(config) + r::encode_class_layout(layout));
+ CHECK(current != baseline);
+
+ std::array current_only_changes{config, config, config};
+ current_only_changes[0].keypoint_l1_loss_coef = 0.5;
+ current_only_changes[1].backbone.dimension = 768U;
+ current_only_changes[2].backbone.features = {2U, 5U, 8U, 11U};
+ for (const auto& changed : current_only_changes) {
+  CHECK(r::training_configuration_identity(changed, layout, 1) == baseline);
+  CHECK(r::training_configuration_identity(changed, layout, 2) != current);
+ }
+ auto changed = config;
+ auto changed_layout = layout;
+ std::swap(changed_layout.foreground.names[0], changed_layout.foreground.names[1]);
+ CHECK(r::training_configuration_identity(config, changed_layout, 1) != baseline);
+ changed_layout = layout;
+ changed_layout.provenance.producer += "-changed";
+ CHECK(r::training_configuration_identity(config, changed_layout, 1) != baseline);
+
  mmltk::backend::data::FileHeader header{};
- mmltk::common::io::FileSnapshot file{.bytes=1024,.modified_seconds=7};
- std::array<std::byte,4> metadata{std::byte{1},std::byte{2},std::byte{3},std::byte{4}};
- const auto identity=r::training_dataset_identity(header,file,baseline,metadata);
- metadata.back()=std::byte{5};
- CHECK(r::training_dataset_identity(header,file,baseline,metadata)!=identity);
- config.task=r::ModelTask::Keypoints;
- REQUIRE_THROWS(r::training_configuration_identity(config,layout,1));
+ mmltk::common::io::FileSnapshot file{.bytes = 1024, .modified_seconds = 7};
+ std::array<std::byte, 4> metadata{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+ const auto identity = r::training_dataset_identity(header, file, baseline, metadata);
+ metadata.back() = std::byte{5};
+ CHECK(r::training_dataset_identity(header, file, baseline, metadata) != identity);
+ REQUIRE_THROWS(r::training_configuration_identity(config, layout, 0));
+ REQUIRE_THROWS(r::training_configuration_identity(config, layout, 3));
+ for (const auto task : {r::ModelTask::Keypoints, static_cast<r::ModelTask>(255)}) {
+  changed = config;
+  changed.task = task;
+  REQUIRE_THROWS(r::training_configuration_identity(changed, layout, 1));
+ }
+ for (const auto backbone : {r::BackboneKind::DinoV2Base, r::BackboneKind::PeCoreTiny}) {
+  changed = config;
+  changed.backbone.kind = backbone;
+  REQUIRE_THROWS(r::training_configuration_identity(changed, layout, 1));
+ }
+ using KeypointSchema = mmltk::backend::data::catalog::ClassKeypointSchema;
+ for (const bool evidence : {false, true}) {
+  changed_layout = layout;
+  auto& catalog = evidence ? changed_layout.class_name_evidence : changed_layout.foreground;
+  catalog.keypoints = std::vector<KeypointSchema>(catalog.names.size());
+  catalog.keypoints->front() = {.names = {"joint"}, .horizontal_flip = {0U}, .oks_sigmas = {0.05}};
+  REQUIRE_THROWS(r::training_configuration_identity(config, changed_layout, 1));
+  const auto with_joints = r::training_configuration_identity(config, changed_layout, 2);
+  CHECK(with_joints != current);
+  catalog.keypoints->front().names.front() = "renamed-joint";
+  CHECK(r::training_configuration_identity(config, changed_layout, 2) != with_joints);
+ }
+
+ changed = config;
+ changed.training_supervision.denoising.groups = 65U;
+ REQUIRE_THROWS(r::training_configuration_identity(changed, layout, 1));
+ changed = config;
+ changed.training_supervision.match_free.rho = 1.0F;
+ REQUIRE_THROWS(r::training_configuration_identity(changed, layout, 1));
+ changed = config;
+ changed.training_supervision.assignment = static_cast<r::TrainAssignmentKind>(255);
+ REQUIRE_THROWS(r::training_configuration_identity(changed, layout, 1));
+ changed_layout = layout;
+ changed_layout.provenance.producer.assign(1025U, 'x');
+ REQUIRE_THROWS(r::training_configuration_identity(config, changed_layout, 1));
+ changed_layout = layout;
+ changed_layout.slots.front().role = static_cast<r::ClassSlotRole>(255);
+ REQUIRE_THROWS(r::training_configuration_identity(config, changed_layout, 1));
 }
