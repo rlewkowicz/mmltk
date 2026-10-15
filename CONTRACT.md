@@ -103,6 +103,9 @@ these boundaries.
 
 ## Product interface
 
+Detection, segmentation, and keypoint models use Train, Validate, Predict, and
+Export with task-aware admission and outputs.
+
 Train, Validate, Predict, and Export share model preparation, artifact selection,
 and output presentation while retaining independent admission and execution.
 Explicit start actions capture validated settings, inputs, destinations, and
@@ -177,7 +180,11 @@ Readers settle before model weights change or lane pools retire.
 
 ## Data and model meaning
 
-An immutable data catalog defines class meaning independently of model execution.
+An immutable data catalog defines class and keypoint meaning independently of
+model execution. Named joints, skeleton connections, horizontal-flip correspondence,
+and evaluation meaning belong to each class. Source-visible, occluded, and
+unannotated joints remain distinct through data preparation, training, evaluation,
+prediction, presentation, and annotation editing.
 Dataset categories, catalog references, model output slots, and external identities
 remain distinct. Admission validates artifact identity and class meaning.
 Unresolved external identities remain raw and are excluded from semantic

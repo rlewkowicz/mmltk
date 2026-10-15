@@ -82,6 +82,7 @@ void normalize_model_artifacts(ModelArtifactSelectionState& state, const ModelAr
   state = ModelArtifactSelectionState{};
   return;
  }
+ state.preset_name = preset->preset_name;
  if (state.resolution <= 0) { state.resolution = static_cast<int>(preset->resolution); }
  if (state.input == ModelArtifactInputKind::None) {
   state.weights_path.clear();

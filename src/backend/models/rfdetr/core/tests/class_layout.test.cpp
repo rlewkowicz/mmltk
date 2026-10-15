@@ -92,12 +92,24 @@ TEST_CASE("Output names distinguish four-wide logits from boxes", "[rfdetr][layo
  info.outputs[0].shape[1] = 299;
  CHECK_THROWS(r::validate_rfdetr_output_layout(info));
 }
-TEST_CASE("Admitted preset candidate defaults agree across detection and segmentation", "[model][rfdetr][layout]") {
+TEST_CASE("Admitted preset candidate defaults agree across all model tasks", "[model][rfdetr][layout]") {
  namespace r = mmltk::backend::models::rfdetr;
- const std::array expected{300, 300, 300, 300, 100, 100, 200, 200, 300, 300};
+ const std::array expected{300, 300, 300, 300, 100, 100, 200, 200, 300, 300, 300, 200, 200, 300, 300, 100};
  REQUIRE(r::kPresetCatalog.size() == expected.size());
  for (std::size_t index = 0; index < expected.size(); ++index) {
   CHECK(r::kPresetCatalog[index].selected_query_count == expected[index]);
   CHECK(r::native_config_from_preset(r::kPresetCatalog[index]).num_select == expected[index]);
  }
+}
+TEST_CASE("Class descriptors admit every canonical named output role", "[model][rfdetr][layout]") {
+ r::ModelClassDescriptor descriptor;
+ descriptor.artifact_sha256 = std::string(64U, 'a');
+ descriptor.layout = r::native_training_class_layout(catalog::ClassCatalog({"person"}));
+ for (const auto& entry : mmltk::frameworks::reflection::enum_entries<r::RfdetrOutputRole>()) {
+  if (entry.value != r::RfdetrOutputRole::Unspecified) descriptor.output_roles.push_back({std::string(entry.name), entry.value});
+ }
+ CHECK(descriptor.output_roles.size() == r::kMaximumNamedOutputRoles);
+ CHECK(r::decode_class_descriptor(r::encode_class_descriptor(descriptor)).output_roles == descriptor.output_roles);
+ descriptor.output_roles.back().role = descriptor.output_roles.front().role;
+ CHECK_THROWS(r::encode_class_descriptor(descriptor));
 }

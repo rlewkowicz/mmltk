@@ -2188,7 +2188,7 @@ TEST_CASE("Model-taking export isolates eager selective and full source executio
   config.num_classes = 3;
   config.num_queries = config.num_select = 3;
   config.group_detr = 2;
-  config.segmentation = true;
+  config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
   rfdetr::NativeRfDetrModel source(config);
   source.to(torch::Device(torch::kCUDA, 0));
   const bool reference = mode == rfdetr::CompilationMode::kSelective;

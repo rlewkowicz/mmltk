@@ -14,7 +14,7 @@ namespace mmltk::backend::models::rfdetr {
 inline constexpr std::size_t kDefaultEvaluationMaxDets = 500U;
 [[nodiscard]] constexpr std::size_t resolve_evaluation_max_dets(std::size_t requested) noexcept { return requested == 0 ? kDefaultEvaluationMaxDets : requested; }
 inline constexpr std::size_t kValidationSampleCapacity = 6U;
-enum class EvaluationMetricKind : std::uint8_t { Box, Mask };
+enum class EvaluationMetricKind : std::uint8_t { Box, Mask, Keypoint };
 enum class EvaluationArea : std::uint8_t { All, Small, Medium, Large };
 MMLTK_REFLECT_ENUM(EvaluationMetricKind)
 MMLTK_REFLECT_ENUM(EvaluationArea)
@@ -89,6 +89,7 @@ struct EvalSummary final {
  bool operator==(const EvalSummary&) const = default;
  MetricSummary bbox;
  std::optional<MetricSummary> mask;
+ std::optional<MetricSummary> keypoint;
  std::uint32_t model_detection_budget = 0U;
 };
 MMLTK_REFLECT_FIELDS(EvalSummary)

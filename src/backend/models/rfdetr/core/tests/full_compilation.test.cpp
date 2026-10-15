@@ -25,7 +25,7 @@ rf::NativeRfDetrConfig compilation_config(bool masks = false) {
  config.group_detr = 2;
  config.dec_layers = 2;
  config.aux_loss = true;
- config.segmentation = masks;
+ config.task = (masks) ? mmltk::backend::models::rfdetr::ModelTask::Segmentation : mmltk::backend::models::rfdetr::ModelTask::Detection;
  return config;
 }
 bool contains_operation(const torch::jit::Block* block, std::string_view operation) {

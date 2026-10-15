@@ -276,7 +276,7 @@ public:
   if (runtime_ && runtime_->model_info().input.element_type == runtime::RuntimeElementType::Float16) { return at::kHalf; }
   return native_ ? native_input_type_ : at::kFloat;
  }
- [[nodiscard]] bool has_masks() const noexcept { return native_ ? artifacts_.config.segmentation : runtime_->has_masks(); }
+ [[nodiscard]] bool has_masks() const noexcept { return native_ ? artifacts_.config.has_masks() : runtime_->has_masks(); }
  [[nodiscard]] std::size_t capacity(std::size_t batch, std::uint32_t width, std::uint32_t height, bool masks) const {
   return PredictionCapacity::Resolve(maximum_detections_, batch, artifacts_.config.num_queries, artifacts_.config.num_classes, width, height, masks, class_layout()->eligible_count()).candidates;
  }

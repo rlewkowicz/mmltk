@@ -133,8 +133,8 @@ void validate_descriptor(const ModelClassDescriptor& descriptor) {
  if (descriptor.version != 1U) throw std::invalid_argument("unsupported RF-DETR class descriptor version");
  static_cast<void>(mmltk::common::io::parse_sha256_hex(descriptor.artifact_sha256));
  const ResolvedClassLayout validated(descriptor.layout);
- if (descriptor.output_roles.size() > 3) throw std::invalid_argument("oversized class descriptor output roles");
- std::array<bool, 4> roles{};
+ if (descriptor.output_roles.size() > kMaximumNamedOutputRoles) throw std::invalid_argument("oversized class descriptor output roles");
+ std::array<bool, kMaximumNamedOutputRoles + 1U> roles{};
  for (std::size_t index = 0; index < descriptor.output_roles.size(); ++index) {
   const auto& output = descriptor.output_roles[index];
   const auto role = static_cast<std::size_t>(output.role);
@@ -175,7 +175,7 @@ std::vector<RfdetrNamedOutputRole> class_descriptor_output_roles(std::span<const
    else if (previous->role != declared.role)
     throw std::invalid_argument("authoritative output roles disagree");
   }
- if (roles.size() > 3) throw std::invalid_argument("too many artifact output roles");
+ if (roles.size() > kMaximumNamedOutputRoles) throw std::invalid_argument("too many artifact output roles");
  return roles;
 }
 ModelClassLayout admit_artifact_class_layout(std::size_t output_width, const std::optional<ModelClassLayout>& embedded, std::span<const ModelClassDescriptor> descriptors) {

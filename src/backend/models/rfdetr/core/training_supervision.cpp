@@ -324,7 +324,7 @@ TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& confi
   query_mlp_ = register_module("query_mlp", std::make_shared<ProbeMlpImpl>(config.hidden_dim, config.hidden_dim));
   query_projection_ = register_module("query_projection", torch::nn::Linear(torch::nn::LinearOptions(config.hidden_dim, config.hidden_dim).bias(false)));
   key_projection_ = register_module("key_projection", torch::nn::Linear(torch::nn::LinearOptions(config.hidden_dim, config.hidden_dim).bias(false)));
-  if (config.segmentation) mask_projection_ = register_module("mask_projection", torch::nn::Linear(torch::nn::LinearOptions(config.hidden_dim, config.hidden_dim).bias(false)));
+  if (config.has_masks()) mask_projection_ = register_module("mask_projection", torch::nn::Linear(torch::nn::LinearOptions(config.hidden_dim, config.hidden_dim).bias(false)));
  }
  if (config.training_supervision.denoising.enabled) {
   const int64_t object_classes = foreground_count_;
@@ -545,7 +545,7 @@ void TrainingSupervisionImpl::configure_timing(const SupervisionTimingSetup& set
   config_.aux_loss ? mmltk::common::math::checked_add(static_cast<std::uint64_t>(config_.dec_layers), config_.two_stage ? 1U : 0U, "RF-DETR supervision timing layer capacity overflow") : 1U;
  std::uint64_t scopes_per_loss = 2U;
  if (match_free_enabled()) {
-  const bool masks = config_.segmentation && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
+  const bool masks = config_.has_masks() && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
   auto projection_scopes = mmltk::common::math::checked_multiply(masks ? std::uint64_t{5} : std::uint64_t{4}, supervised_layers, "RF-DETR supervision timing scope capacity overflow");
   projection_scopes = mmltk::common::math::checked_add(projection_scopes, 1U, "RF-DETR supervision timing scope capacity overflow");
   scopes_per_loss = mmltk::common::math::checked_add(scopes_per_loss, projection_scopes, "RF-DETR supervision timing scope capacity overflow");
@@ -660,8 +660,8 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(
  }
  // CLEANUP-ON
  if (!mask_samples.empty() && mask_samples.size() != layers.size()) throw std::invalid_argument("DN mask samples must cover every selected decoder layer");
- const bool reconstruct_masks = config_.segmentation && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
- if (config_.segmentation) {
+ const bool reconstruct_masks = config_.has_masks() && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
+ if (config_.has_masks()) {
   result.mask_ce = zero;
   result.mask_dice = zero;
  }
@@ -719,7 +719,7 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(
    result.classification = result.classification + config_.cls_loss_coef * classification.sum() / divisor;
    result.box = result.box + config_.bbox_loss_coef * box.sum() / divisor;
    result.giou = result.giou + config_.giou_loss_coef * giou.sum() / divisor;
-   if (config_.segmentation) {
+   if (config_.has_masks()) {
     // Keep the stock mask projection/grid dispatch under the forward AMP
     // policy while DN class/box reconstruction remains explicitly FP32.
     mmltk::backend::ml::cuda::TorchAutocastScope mask_scope(mask_autocast, mask_dtype);
@@ -763,7 +763,7 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(
    }
   }
   result.total = result.classification + result.box + result.giou;
-  if (config_.segmentation) result.total = result.total + result.mask_ce + result.mask_dice;
+  if (config_.has_masks()) result.total = result.total + result.mask_ce + result.mask_dice;
   result.denoising = result.total;
  };
  if (!timing_) {
@@ -799,7 +799,7 @@ TrainingLoss TrainingSupervisionImpl::loss(
   if (!timing_) { return operation(); }
   return timing_->measure(stage, std::forward<decltype(operation)>(operation));
  };
- const bool use_masks = config_.segmentation && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
+ const bool use_masks = config_.has_masks() && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
  torch::Tensor encoding, box_probes;
  if (padded.maximum_count != 0)
   timed(TimingState::Stage::GroundTruthProjection, [&] {
@@ -810,7 +810,7 @@ TrainingLoss TrainingSupervisionImpl::loss(
  TrainingLoss result = empty_loss(outputs);
  result.mask_ce = zero;
  result.mask_dice = zero;
- if (config_.segmentation) {
+ if (config_.has_masks()) {
   result.main.mask_ce = zero;
   result.main.mask_dice = zero;
  }
@@ -883,7 +883,7 @@ TrainingLoss TrainingSupervisionImpl::loss(
   result.mask_ce = result.mask_ce + ce_term;
   result.mask_dice = result.mask_dice + dice_term;
   if (layer == &outputs.main)
-   result.main = {terms.classification + background, terms.box, terms.giou, config_.segmentation ? ce_term : torch::Tensor{}, config_.segmentation ? dice_term : torch::Tensor{}};
+   result.main = {terms.classification + background, terms.box, terms.giou, config_.has_masks() ? ce_term : torch::Tensor{}, config_.has_masks() ? dice_term : torch::Tensor{}};
   if (layer != &outputs.main) {
    auto auxiliary = terms.classification + terms.box + terms.giou + ce_term + dice_term;
    result.auxiliary = result.auxiliary.defined() ? result.auxiliary + auxiliary : auxiliary;
@@ -897,7 +897,7 @@ TrainingLoss TrainingSupervisionImpl::loss(
   const auto dn = denoising_loss(*outputs.denoising, targets, normalizer, mask_samples, selective_[training_mode ? 1 : 0]);
   result.total = result.total + dn.total;
   add_detection_losses(result, dn);
-  if (config_.segmentation) {
+  if (config_.has_masks()) {
    result.mask_ce = result.mask_ce + dn.mask_ce;
    result.mask_dice = result.mask_dice + dn.mask_dice;
   }

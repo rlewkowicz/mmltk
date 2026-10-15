@@ -111,7 +111,7 @@ void test_request_and_model_boundaries_reject_unsupported_feature_combinations()
  NativeRfDetrConfig model = native_config_from_preset(*find_preset_catalog_entry("rf-detr-nano"));
  model.training_supervision.assignment = TrainAssignmentKind::MatchFree;
  CHECK(training_supervision_model_config_valid(model));
- model.segmentation = true;
+ model.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  for (const double coefficient : {-1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
   model.mask_ce_loss_coef = coefficient;
   CHECK_FALSE(training_supervision_model_config_valid(model));
@@ -136,7 +136,7 @@ void test_request_and_model_boundaries_reject_unsupported_feature_combinations()
  model.giou_loss_coef = 0.0;
  CHECK_FALSE(training_supervision_model_config_valid(model));
  model.cls_loss_coef = 1.0;
- model.segmentation = true;
+ model.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  CHECK(training_supervision_model_config_valid(model));
  model.mask_ce_loss_coef = -1.0;
  CHECK_FALSE(training_supervision_model_config_valid(model));
@@ -165,3 +165,16 @@ TEST_CASE("test_request_and_model_boundaries_reject_unsupported_feature_combinat
  test_request_and_model_boundaries_reject_unsupported_feature_combinations();
 }
 TEST_CASE("test_query_layout_capacity_checks_each_product_and_sum", "[model][rfdetr][training_supervision]") { test_query_layout_capacity_checks_each_product_and_sum(); }
+TEST_CASE("Task admission retains stock keypoint and zero-decoder training", "[model][rfdetr][training_supervision]") {
+ using namespace mmltk::backend::models::rfdetr;
+ for (const auto name : {"rf-detr-keypoint-preview", "rf-detr-atto"}) {
+  auto request = valid_train_request();
+  request.preset_name = name;
+  CHECK_NOTHROW(validate_train_request(request));
+  request.training_supervision.assignment = TrainAssignmentKind::MatchFree;
+  CHECK_THROWS(validate_train_request(request));
+  request.training_supervision.assignment = TrainAssignmentKind::Hungarian;
+  request.training_supervision.denoising.enabled = true;
+  CHECK_THROWS(validate_train_request(request));
+ }
+}

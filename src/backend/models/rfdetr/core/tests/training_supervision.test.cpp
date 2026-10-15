@@ -83,7 +83,7 @@ rfdetr::NativeRfDetrConfig denoising_config(int64_t object_classes = 3) {
 rfdetr::NativeRfDetrConfig production_denoising_config(const rfdetr::TrainAssignmentKind assignment, const bool bbox_reparam, const bool segmentation = false) {
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  config.resolution = 64;
- config.segmentation = segmentation;
+ config.task = (segmentation) ? mmltk::backend::models::rfdetr::ModelTask::Segmentation : mmltk::backend::models::rfdetr::ModelTask::Detection;
  config.num_queries = 3;
  config.num_select = 3;
  config.group_detr = 1;
@@ -565,7 +565,7 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
  REQUIRE(reused_handoff.completed_leases == 7);
  REQUIRE(reused_handoff.outstanding_leases == 0);
  auto mask_config = config;
- mask_config.segmentation = true;
+ mask_config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  mask_config.aux_loss = true;
  mask_config.two_stage = true;
  mask_config.dec_layers = 2;
@@ -699,7 +699,7 @@ void test_production_match_free_boundary_captures_layers_and_empty_gradient_anch
  const auto run_case = [](const bool include_auxiliary_and_encoder) {
   auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
   config.resolution = 64;
-  config.segmentation = false;
+  config.task = mmltk::backend::models::rfdetr::ModelTask::Detection;
   config.num_queries = 3;
   config.num_select = 3;
   config.group_detr = 1;
@@ -782,7 +782,7 @@ void test_conditional_model_construction_preserves_rng_and_default_state_topolog
  auto inactive_config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  inactive_config.aux_loss = false;
  inactive_config.two_stage = false;
- inactive_config.segmentation = false;
+ inactive_config.task = mmltk::backend::models::rfdetr::ModelTask::Detection;
  auto active_config = inactive_config;
  active_config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
  active_config.training_supervision.denoising.enabled = true;
@@ -1352,7 +1352,7 @@ void test_dn_reference_conventions_inference_removal_and_disabled_exact_path() {
  REQUIRE(torch::equal(reparameterized_result, reparameterized_reference));
  auto inactive_config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  inactive_config.resolution = 64;
- inactive_config.segmentation = false;
+ inactive_config.task = mmltk::backend::models::rfdetr::ModelTask::Detection;
  inactive_config.aux_loss = false;
  inactive_config.two_stage = false;
  inactive_config.group_detr = 1;
@@ -1406,7 +1406,7 @@ void test_dn_all_empty_loss_is_finite_and_parameter_anchored() {
 void test_active_empty_loss_anchors_every_selected_mask_operand() {
  const auto run_case = [](const bool auxiliary_and_encoder) {
   auto config = denoising_config();
-  config.segmentation = true;
+  config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
   config.aux_loss = auxiliary_and_encoder;
   config.two_stage = auxiliary_and_encoder;
   config.dec_layers = auxiliary_and_encoder ? 2 : 1;
@@ -1612,7 +1612,7 @@ TEST_CASE("Pairwise mask contractions match independent dense values and gradien
 }
 TEST_CASE("Sampled mask content distinguishes probes and retains projection gradients", "[rfdetr][training_supervision][parity]") {
  auto config = match_free_config();
- config.segmentation = true;
+ config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  config.mask_point_sample_ratio = 1;
  rfdetr::TrainingSupervisionImpl owner(config, 2);
  owner.initialize(812);
@@ -1701,7 +1701,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
   for (const bool sum_groups : {false, true})
    for (const int mode : {0, 1, 2, 3, 4}) {
     auto config = match_free_config();
-    config.segmentation = mode != 0;
+    config.task = (mode != 0) ? mmltk::backend::models::rfdetr::ModelTask::Segmentation : mmltk::backend::models::rfdetr::ModelTask::Detection;
     config.group_detr = groups;
     config.sum_group_losses = sum_groups;
     config.aux_loss = true;
@@ -1714,7 +1714,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
     rfdetr::TrainingSupervisionImpl owner(config, 2);
     owner.initialize(817);
     install_oracle_projections(owner);
-    if (config.segmentation) set_parameter(owner, "mask_projection.weight", torch::tensor({{0.7F, -0.2F}, {0.1F, 0.9F}}));
+    if (config.has_masks()) set_parameter(owner, "mask_projection.weight", torch::tensor({{0.7F, -0.2F}, {0.1F, 0.9F}}));
     set_parameter(owner, "query_projection.weight", torch::tensor({{0.8F, 0.3F}, {-0.2F, 1.1F}}));
     auto parameters = owner.named_parameters();
     torch::OrderedDict<std::string, torch::Tensor> reference_parameters;
@@ -1725,7 +1725,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
      layer.pred_logits = layer.pred_logits.detach().repeat({1, groups, 1}).set_requires_grad(true);
      layer.pred_boxes = layer.pred_boxes.detach().repeat({1, groups, 1}).set_requires_grad(true);
      layer.query_layout = rfdetr::SupervisedQueryLayout{groups, 3};
-     if (config.segmentation)
+     if (config.has_masks())
       layer.sparse_pred_masks = rfdetr::SparsePredMasks{
        torch::tensor({content, 0.4F - content}).view({1, 2, 1, 1}).set_requires_grad(true), features.detach().squeeze(1).reshape({1, groups * 3, 2}).clone().set_requires_grad(true),
        torch::zeros({1}).set_requires_grad(true)
@@ -1773,7 +1773,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
      const auto features = clone(*layer->query_features), logits = clone(layer->pred_logits), boxes = clone(layer->pred_boxes);
      auto probe = base;
      torch::Tensor mask_logits;
-     if (config.segmentation) {
+     if (config.has_masks()) {
       const auto spatial = clone(layer->sparse_pred_masks->spatial_features);
       const auto query = clone(layer->sparse_pred_masks->query_features);
       const auto bias = clone(layer->sparse_pred_masks->bias);
@@ -1836,7 +1836,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
      expected_dice = expected_dice + dice;
      if (layer == &outputs.main) {
       REQUIRE(torch::allclose(loss.main.classification, cls, 1e-5, 1e-6));
-      if (config.segmentation) {
+      if (config.has_masks()) {
        REQUIRE(torch::allclose(loss.main.mask_ce, ce, 1e-5, 1e-6));
        REQUIRE(torch::allclose(loss.main.mask_dice, dice, 1e-5, 1e-6));
       }
@@ -1851,7 +1851,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
     REQUIRE(torch::allclose(loss.mask_ce, expected_ce, 1e-5, 1e-6));
     REQUIRE(torch::allclose(loss.mask_dice, expected_dice, 1e-5, 1e-6));
     REQUIRE(torch::allclose(
-     loss.total, loss.main.classification + loss.main.box + loss.main.giou + loss.auxiliary + (config.segmentation ? loss.main.mask_ce + loss.main.mask_dice : torch::zeros({})), 1e-5, 1e-6));
+     loss.total, loss.main.classification + loss.main.box + loss.main.giou + loss.auxiliary + (config.has_masks() ? loss.main.mask_ce + loss.main.mask_dice : torch::zeros({})), 1e-5, 1e-6));
     loss.total.backward();
     second.total.backward();
     (expected * 2).backward();
@@ -1877,7 +1877,7 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
 TEST_CASE("Inactive mask scalars retain full correspondence nonfinite and gradient edges", "[rfdetr][training_supervision]") {
  for (const bool nonfinite : {false, true}) {
   auto config = match_free_config();
-  config.segmentation = true;
+  config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
   config.mask_ce_loss_coef = 0;
   config.mask_dice_loss_coef = 0;
   rfdetr::TrainingSupervisionImpl owner(config, 2);
@@ -1911,7 +1911,7 @@ TEST_CASE("Foreground-free focal classification uses one explicit group divisor 
  for (const int groups : {1, 2})
   for (const bool sum_groups : {false, true}) {
    auto config = match_free_config();
-   config.segmentation = true;
+   config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
    config.group_detr = groups;
    config.sum_group_losses = sum_groups;
    config.aux_loss = true;
@@ -2006,7 +2006,7 @@ TEST_CASE("Direct mask sampling preserves explicit operands and default or priva
 }
 TEST_CASE("DN private mask sampling replays owned outputs without changing ordinary draws", "[rfdetr][training_supervision]") {
  auto config = denoising_config();
- config.segmentation = true;
+ config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  config.aux_loss = true;
  config.dec_layers = 2;
  config.mask_ce_loss_coef = 1.3;
@@ -2187,7 +2187,7 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
 TEST_CASE("Disabled DN masks admit missing target masks in direct and combined objectives", "[rfdetr][training_supervision]") {
  for (const auto assignment : {rfdetr::TrainAssignmentKind::Hungarian, rfdetr::TrainAssignmentKind::MatchFree}) {
   auto config = denoising_config();
-  config.segmentation = true;
+  config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
   config.aux_loss = true;
   config.dec_layers = 2;
   config.training_supervision.assignment = assignment;

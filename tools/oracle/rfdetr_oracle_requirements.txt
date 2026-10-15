@@ -1,6 +1,6 @@
 # Validation only. Installed with --no-deps; donor Torch/torchvision/CUDA and
 # their dependencies remain authoritative. Every added distribution is pinned.
-# Upstream e9a138f requires transformers 5.x, Lightning 2.6 (not 2.6.2/.3),
+# Sources pinned in rfdetr_sources.json require transformers 5.x, Lightning 2.6 (not 2.6.2/.3),
 # TorchMetrics 1.8.x and the pure Python/Triton torch-hungarian release.
 # Primary registry: https://pypi.org/project/torch-hungarian/0.1.0rc0/
 transformers==5.1.0
@@ -74,3 +74,4 @@ typeshed-client==2.8.2
 importlib-resources==6.5.2
 webdataset==1.0.2
 braceexpand==0.1.7
+timm==1.0.27

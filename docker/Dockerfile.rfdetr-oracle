@@ -2,15 +2,17 @@
 ARG MMLTK_NVIDIA_DONOR_IMAGE
 FROM mmltk_tools_build AS tools_build
 FROM ${MMLTK_NVIDIA_DONOR_IMAGE}
-ARG MMLTK_IMAGE_FINGERPRINT
-LABEL com.mmltk.input-fingerprint=${MMLTK_IMAGE_FINGERPRINT}
 COPY docker/nvidia-payload.json /opt/rfdetr-oracle/nvidia-payload.json
 COPY tools/oracle/rfdetr_oracle_requirements.txt /opt/rfdetr-oracle/requirements.txt
+COPY tools/oracle/rfdetr_sources.json /opt/rfdetr-oracle/sources.json
 COPY --from=tools_build /opt/gcc-16.2 /opt/gcc-16.2
 COPY --from=tools_build /opt/cmake /opt/cmake
 ENV PATH=/opt/gcc-16.2/bin:/opt/cmake/bin:${PATH} LD_LIBRARY_PATH=/opt/gcc-16.2/lib64:${LD_LIBRARY_PATH}
 RUN apt-get update && apt-get install -y --no-install-recommends ninja-build mold libssl-dev python3-dev && rm -rf /var/lib/apt/lists/*
 COPY tools /tmp/native-tools/tools
+COPY src/frameworks/reflection /tmp/native-tools/src/frameworks/reflection
+COPY src/backend/models/rfdetr/contract /tmp/native-tools/src/backend/models/rfdetr/contract
+COPY src/backend/data/catalog /tmp/native-tools/src/backend/data/catalog
 COPY third_party/json/include /tmp/native-tools/third_party/json/include
 RUN cmake -S /tmp/native-tools/tools -B /tmp/oracle-build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DMMLTK_TOOLS_BUILD_DRIVER=OFF -DMMLTK_TOOLS_BUILD_ORACLE=ON \
@@ -26,3 +28,6 @@ RUN /opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle --payload-snapshot /opt/rfde
  && python3 -m pip install --target /opt/rfdetr-oracle/python --no-cache-dir --no-deps --only-binary=:all: -r /opt/rfdetr-oracle/requirements.txt \
  && /opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle --check-environment
 ENV PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+ARG MMLTK_IMAGE_FINGERPRINT
+LABEL com.mmltk.input-fingerprint=${MMLTK_IMAGE_FINGERPRINT}

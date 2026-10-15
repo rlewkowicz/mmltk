@@ -1,4 +1,5 @@
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/class_layout.h"
 #include <algorithm>
 #include <array>
 #include <meta>
@@ -8,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/weight_catalog.h"
 #include "src/common/types/string_utils.h"
@@ -50,6 +52,9 @@ void consider_known_aliases(const PresetCatalogEntry& preset, const std::string_
   Alias{"rf-detr-seg-large", "seg-l"},
   Alias{"rf-detr-seg-xlarge", "seg-xl"},
   Alias{"rf-detr-seg-xxlarge", "seg-2xl"},
+  Alias{"rf-detr-seg-xxlarge", "seg-2xlarge"},
+  Alias{"rf-detr-xxlarge", "rf-detr-2xlarge"},
+  Alias{"rf-detr-xxlarge", "rfdetr-2xlarge"},
   Alias{"rf-detr-seg-xxlarge", "seg-xxl"},
  };
  for (const Alias& alias : aliases) {
@@ -59,6 +64,10 @@ void consider_known_aliases(const PresetCatalogEntry& preset, const std::string_
 }  // namespace
 std::span<const PresetCatalogEntry> model_presets() noexcept { return kPresetCatalog; }
 const PresetCatalogEntry* find_model_preset_by_weight_filename(const std::string_view filename) noexcept {
+ if (filename.ends_with(".pth") || filename.ends_with(".pt")) {
+  const auto stem = filename.substr(0U, filename.find_last_of('.'));
+  if (const auto* alias = find_preset_catalog_entry(stem); alias && stem != alias->preset_name) return alias;
+ }
  const PresetCatalogEntry* match = nullptr;
  for (const auto& preset : kPresetCatalog) {
   if (preset.canonical_weight_filename == filename) return &preset;
@@ -84,6 +93,7 @@ const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::pa
   if (preset.preset_name.starts_with("rf-detr-")) {
    consider_candidate(preset, normalized, mmltk::common::types::to_lower(preset.preset_name.substr(std::string_view{"rf-detr-"}.size())), 1500U, best, best_score);
   }
+  consider_candidate(preset, normalized, mmltk::common::types::to_lower(preset.upstream_class), 2800U, best, best_score);
   consider_known_aliases(preset, normalized, best, best_score);
  }
  return best;
@@ -91,8 +101,9 @@ const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::pa
 void apply_stock_training_coefficients(NativeRfDetrConfig& config) {
  // Weight metadata describes its artifact. A fresh run takes the current recipe;
  // exact Resume never enters this operation.
- const auto task = config.segmentation ? ModelTask::Segmentation : ModelTask::Detection;
+ const auto task = config.task;
  const auto preset = std::ranges::find(kPresetCatalog, task, &PresetCatalogEntry::task);
+ if (preset == kPresetCatalog.end()) throw std::invalid_argument("RF-DETR training task is invalid");
  const auto stock = native_config_from_preset(*preset);
  project_loss_coefficients(config, stock);
 }
@@ -100,7 +111,14 @@ NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset) {
  return {
   .preset_name = std::string(preset.preset_name),
   .resolution = static_cast<int>(preset.resolution),
-  .segmentation = preset.task == ModelTask::Segmentation,
+  .task = preset.task,
+  .backbone = preset.backbone,
+  .projector = preset.projector,
+  .keypoint_head = preset.keypoint_head,
+  .keypoint_dimension_downscale = preset.keypoint_dimension_downscale,
+  .keypoint_cross_attention = preset.keypoint_cross_attention,
+  .inter_instance_keypoint_attention = preset.inter_instance_keypoint_attention,
+  .keypoints_per_class = preset.default_person_keypoints == 0U ? std::vector<std::uint16_t>{} : std::vector<std::uint16_t>{preset.default_person_keypoints},
   .num_classes = preset.class_count,
   .num_queries = preset.query_count,
   .num_select = preset.selected_query_count,
@@ -111,10 +129,10 @@ NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset) {
   .patch_size = preset.patch_size,
   .num_windows = preset.window_count,
   .positional_encoding_size = preset.positional_encoding_size,
-  .sa_nheads = 8,
-  .ca_nheads = 16,
-  .dec_n_points = 2,
-  .dim_feedforward = 2048,
+  .sa_nheads = preset.self_attention_heads,
+  .ca_nheads = preset.cross_attention_heads,
+  .dec_n_points = preset.sampling_points,
+  .dim_feedforward = preset.feedforward_dimension,
   .bbox_reparam = true,
   .lite_refpoint_refine = true,
   .cls_loss_coef = preset.classification_loss_coefficient,
@@ -122,8 +140,40 @@ NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset) {
   .giou_loss_coef = preset.generalized_iou_loss_coefficient,
   .mask_ce_loss_coef = preset.mask_cross_entropy_loss_coefficient,
   .mask_dice_loss_coef = preset.mask_dice_loss_coefficient,
+  .keypoint_l1_loss_coef = preset.keypoint_l1_loss_coefficient,
+  .keypoint_findable_loss_coef = preset.keypoint_findable_loss_coefficient,
+  .keypoint_visible_loss_coef = preset.keypoint_visible_loss_coefficient,
+  .keypoint_nll_loss_coef = preset.keypoint_nll_loss_coefficient,
   .training_supervision = {},
  };
+}
+bool native_model_config_valid(const NativeRfDetrConfig& config) noexcept {
+ if (!mmltk::frameworks::reflection::enum_contains(config.task) || !mmltk::frameworks::reflection::enum_contains(config.backbone.kind) ||
+     !mmltk::frameworks::reflection::enum_contains(config.projector) || !mmltk::frameworks::reflection::enum_contains(config.keypoint_head) ||
+     config.resolution <= 0 || config.num_classes <= 0 || static_cast<std::size_t>(config.num_classes) > kMaximumClassOutputSlots || config.num_queries <= 0 || config.num_select <= 0 || config.num_select > config.num_queries ||
+     config.dec_layers < 0 || (config.dec_layers == 0 && (config.task != ModelTask::Detection || !config.two_stage)) || config.group_detr <= 0 ||
+     config.hidden_dim <= 0 || config.sa_nheads <= 0 || config.ca_nheads <= 0 || config.hidden_dim % config.sa_nheads != 0 || config.hidden_dim % config.ca_nheads != 0 ||
+     config.dim_feedforward <= 0 || config.dec_n_points <= 0 || config.patch_size <= 0 || config.num_windows <= 0 || config.positional_encoding_size <= 0 ||
+     config.resolution / config.patch_size == 0 || (config.resolution / config.patch_size) % config.num_windows != 0 ||
+     (config.backbone.kind == BackboneKind::PeCoreTiny && config.resolution % config.patch_size != 0) ||
+     !backbone_config_valid(config.backbone) || !training_supervision_model_config_valid(config)) return false;
+ if (config.has_keypoints()) {
+  if (config.keypoint_head != KeypointHeadKind::GroupPose || config.projector != ProjectorKind::DualKeypointOnly || config.keypoint_dimension_downscale <= 0 ||
+      config.hidden_dim % config.keypoint_dimension_downscale != 0 || (config.hidden_dim / config.keypoint_dimension_downscale) % config.sa_nheads != 0 ||
+      config.keypoints_per_class.empty() || config.keypoints_per_class.size() > static_cast<std::size_t>(config.num_classes) ||
+      config.keypoints_per_class.size() > mmltk::backend::data::catalog::kClassCatalogCapacity) return false;
+  bool any = false;
+  for (const auto count : config.keypoints_per_class) {
+   if (count > mmltk::backend::data::catalog::kKeypointsPerClassCapacity) return false;
+   any = any || count != 0U;
+  }
+  if (!any) return false;
+ } else if (config.keypoint_head != KeypointHeadKind::None || config.projector != ProjectorKind::Single || !config.keypoints_per_class.empty()) return false;
+ for (const auto coefficient : {config.cls_loss_coef, config.bbox_loss_coef, config.giou_loss_coef, config.mask_ce_loss_coef, config.mask_dice_loss_coef,
+                               config.set_cost_class, config.set_cost_bbox, config.set_cost_giou, config.keypoint_l1_loss_coef, config.keypoint_findable_loss_coef,
+                               config.keypoint_visible_loss_coef, config.keypoint_nll_loss_coef})
+  if (!std::isfinite(coefficient) || coefficient < 0.0) return false;
+ return true;
 }
 }  // namespace mmltk::backend::models::rfdetr
 #include "src/backend/models/rfdetr/contract/contract.h"

@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "src/backend/models/rfdetr/contract/cli.h"
 #include "src/backend/models/rfdetr/contract/contract.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
@@ -29,15 +30,15 @@ constexpr std::array kRetiredPresetNames{
 };
 TEST_CASE("RF-DETR weight assets derive from the preset authority", "[backend][models][rfdetr][contract]") {
  using namespace mmltk::backend::models::rfdetr;
- REQUIRE(weight_catalog().size() == 10U);
+ REQUIRE(weight_catalog().size() == 16U);
  const auto* seg_medium = find_weight_asset("rf-detr-seg-medium.pt");
  REQUIRE(seg_medium != nullptr);
  REQUIRE(seg_medium->filename == std::string_view{"rf-detr-seg-medium.pt"});
- REQUIRE(seg_medium->download_url == std::string_view{"https://storage.googleapis.com/rfdetr/rf-detr-seg-m-ft.pth"});
+ REQUIRE(seg_medium->download_url == std::string_view{"https://repo.roboflow.com/rfdetr/rf-detr-seg-m-ft.pth"});
  REQUIRE(seg_medium->md5_hash == std::string_view{"a49af1562c3719227ad43d0ca53b4c7a"});
  const auto* nano = find_weight_asset("rf-detr-nano.pth");
  REQUIRE(nano != nullptr);
- REQUIRE(nano->download_url == std::string_view{"https://storage.googleapis.com/rfdetr/nano_coco/"
+ REQUIRE(nano->download_url == std::string_view{"https://repo.roboflow.com/rfdetr/nano_coco/"
                                                 "checkpoint_best_regular.pth"});
  for (const auto* filename : kRetiredWeightFilenames) {
   REQUIRE(find_weight_asset(filename) == nullptr);
@@ -57,13 +58,13 @@ TEST_CASE("RF-DETR weight path lookup preserves membership semantics", "[backend
 TEST_CASE("RF-DETR preset projection preserves every architecture field", "[backend][models][rfdetr][contract]") {
  using namespace mmltk::backend::models::rfdetr;
  REQUIRE(kRfdetrContract.model_id == std::string_view{"rfdetr"});
- REQUIRE(kRfdetrContract.presets.size() == 10U);
+ REQUIRE(kRfdetrContract.presets.size() == 16U);
  REQUIRE(model_presets().size() == kRfdetrContract.presets.size());
  const auto* preset = find_preset_catalog_entry("rf-detr-seg-medium");
  REQUIRE(preset != nullptr);
  REQUIRE(preset == &kPresetCatalog[6U]);
  REQUIRE(preset->preset_name == "rf-detr-seg-medium");
- REQUIRE(preset->encoder == "dinov2_windowed_small");
+ REQUIRE(backbone_encoder_name(preset->backbone.kind) == "dinov2_windowed_small");
  REQUIRE(preset->canonical_weight_filename == "rf-detr-seg-medium.pt");
  REQUIRE(preset->resolution == 432);
  REQUIRE(preset->patch_size == 12);
@@ -129,6 +130,7 @@ TEST_CASE("RF-DETR enum projections make unknown values observable", "[backend][
  using namespace mmltk::backend::models::rfdetr;
  REQUIRE(model_task_name(ModelTask::Detection) == std::string_view{"detection"});
  REQUIRE(model_task_name(ModelTask::Segmentation) == std::string_view{"segmentation"});
+ REQUIRE(model_task_name(ModelTask::Keypoints) == std::string_view{"keypoints"});
  REQUIRE_FALSE(model_task_name(static_cast<ModelTask>(std::numeric_limits<std::uint8_t>::max())).has_value());
 }
 TEST_CASE("RF-DETR reflected scalar policy precedes relationship admission", "[backend][models][rfdetr][contract]") {
@@ -146,3 +148,60 @@ TEST_CASE("RF-DETR reflected scalar policy precedes relationship admission", "[b
  REQUIRE_THROWS_AS(validate_train_request(request), std::runtime_error);
 }
 }  // namespace
+TEST_CASE("RF-DETR complete catalog projects task-aware topology and stock coefficients", "[backend][models][rfdetr][contract]") {
+ using namespace mmltk::backend::models::rfdetr;
+ for (const auto& row : kPresetCatalog) {
+  const auto config = native_config_from_preset(row);
+  INFO(row.preset_name);
+  CHECK(native_model_config_valid(config));
+  CHECK(config.task == row.task);
+  CHECK(config.backbone == row.backbone);
+  CHECK(config.sa_nheads == row.self_attention_heads);
+  CHECK(config.ca_nheads == row.cross_attention_heads);
+  CHECK(config.dim_feedforward == row.feedforward_dimension);
+  CHECK(config.dec_n_points == row.sampling_points);
+  CHECK(config.has_masks() == (row.task == ModelTask::Segmentation));
+  CHECK(config.has_keypoints() == (row.task == ModelTask::Keypoints));
+  const auto* asset = find_weight_asset(row.canonical_weight_filename);
+  REQUIRE(asset);
+  CHECK(asset->classifier_width == row.class_count);
+  CHECK(asset->class_layout == row.official_class_layout);
+ }
+ auto atto = native_config_from_preset(*find_preset_catalog_entry("rf-detr-atto"));
+ CHECK(atto.dec_layers == 0);
+ CHECK(atto.num_queries == 300);
+ CHECK(atto.hidden_dim == 128);
+ atto.two_stage = false;
+ CHECK_FALSE(native_model_config_valid(atto));
+ auto pose = native_config_from_preset(*find_preset_catalog_entry("rf-detr-keypoint-preview"));
+ CHECK(pose.keypoints_per_class == std::vector<std::uint16_t>{17U});
+ CHECK(find_preset_catalog_entry("rf-detr-keypoint-preview")->official_class_layout == OfficialClassLayout::PersonBackgroundFirst);
+ CHECK(pose.cls_loss_coef == 2.0);
+ CHECK(pose.keypoint_l1_loss_coef == 1.0);
+ CHECK(pose.keypoint_findable_loss_coef == 1.0);
+ CHECK(pose.keypoint_visible_loss_coef == 1.0);
+ CHECK(pose.keypoint_nll_loss_coef == 1.0);
+ pose.keypoint_head = KeypointHeadKind::None;
+ CHECK_FALSE(native_model_config_valid(pose));
+ CHECK(find_preset_catalog_entry("rf-detr-2xlarge") == find_preset_catalog_entry("rf-detr-xxlarge"));
+ CHECK(find_preset_catalog_entry("rf-detr-seg-2xlarge") == find_preset_catalog_entry("rf-detr-seg-xxlarge"));
+ CHECK(infer_model_preset_from_path("/models/rf-detr-2xlarge.pth") == find_preset_catalog_entry("rf-detr-xxlarge"));
+ CHECK(infer_model_preset_from_path("/models/rf-detr-seg-2xlarge.pt") == find_preset_catalog_entry("rf-detr-seg-xxlarge"));
+}
+TEST_CASE("RF-DETR configuration admission validates backbone patch grids", "[backend][models][rfdetr][contract]") {
+ using namespace mmltk::backend::models::rfdetr;
+ auto nano = native_config_from_preset(*find_preset_catalog_entry("rf-detr-nano"));
+ nano.resolution = 385;
+ CHECK(native_model_config_valid(nano));
+ nano.resolution = 400;
+ CHECK_FALSE(native_model_config_valid(nano));
+ nano.resolution = 15;
+ CHECK_FALSE(native_model_config_valid(nano));
+ auto xlarge = native_config_from_preset(*find_preset_catalog_entry("rf-detr-xlarge"));
+ xlarge.resolution = 701;
+ CHECK(native_model_config_valid(xlarge));
+ auto atto = native_config_from_preset(*find_preset_catalog_entry("rf-detr-atto"));
+ CHECK(native_model_config_valid(atto));
+ atto.resolution = 381;
+ CHECK_FALSE(native_model_config_valid(atto));
+}

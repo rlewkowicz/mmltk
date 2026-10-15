@@ -19,9 +19,11 @@ TEST_CASE("catalog is derived from the RF-DETR contract", "[backend][models][cat
  REQUIRE(rfdetr->capabilities.tensorrt);
  REQUIRE(rfdetr->capabilities.training);
  REQUIRE(rfdetr->capabilities.live);
- REQUIRE(rfdetr->presets.size() == 10U);
+ REQUIRE(rfdetr->presets.size() == 16U);
  REQUIRE(find_model("missing") == nullptr);
  REQUIRE(find_model_for_preset("rf-detr-seg-medium") == rfdetr);
+ REQUIRE(find_model_for_preset("rf-detr-keypoint-preview") == rfdetr);
+ REQUIRE(find_model_for_preset("rf-detr-atto") == rfdetr);
  REQUIRE(find_model_for_preset("missing") == nullptr);
  REQUIRE(find_model_for_artifact_path(std::filesystem::path{"/tmp/rf-detr-seg-medium.pt"}) == rfdetr);
  REQUIRE(find_model_for_artifact_path(std::filesystem::path{"/tmp/unrelated.bin"}) == nullptr);

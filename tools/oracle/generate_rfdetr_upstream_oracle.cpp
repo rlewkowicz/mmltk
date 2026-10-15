@@ -25,6 +25,7 @@ module;
 #include <cstdlib>
 #include <fcntl.h>
 #include <unistd.h>
+#include "native_catalog.h"
 export module mmltk.tools.generate_rfdetr_upstream_oracle;
 import std;
 import mmltk.tools.cpp_digest;
@@ -36,7 +37,7 @@ namespace fs = std::filesystem;
 namespace support = mmltk::tools;
 using Json = nlohmann::json;  // Sorted object keys, as json.dumps(sort_keys=True).
 using namespace pybind11::literals;
-constexpr std::string_view Revision = "e9a138f70cc14e3fddca029a0683055e34ab8f35";
+
 constexpr std::string_view Format = "mmltk.rfdetr.upstream-oracle.v1";
 const fs::path OracleRoot = "/opt/rfdetr-oracle";
 constexpr std::uint64_t MaxManifest = 32ULL * 1024 * 1024;
@@ -89,6 +90,8 @@ Json sequence_json(py::handle value) {
  return result;
 }
 Json read_json(const fs::path& path) { return Json::parse(support::read_text(path)); }
+const Json& source_pins() { static const auto pins = read_json(OracleRoot / "sources.json"); return pins; }
+std::string core_revision() { return source_pins().at("core").at("revision").get<std::string>(); }
 void check_signals() {
  if (PyErr_CheckSignals() < 0) throw py::error_already_set();
 }
@@ -179,22 +182,24 @@ Json check_environment() {
  for (const auto& [name, extra] : seen) current["dependency_closure"][name] = string(metadata.attr("version")(name));
  return current;
 }
-Json verify_source(const fs::path& source) {
+Json verify_source(const fs::path& source, const std::string& kind = "core") {
+ const auto& pin = source_pins().at(kind);
  const auto git = [&](std::initializer_list<std::string> arguments) {
   std::vector<std::string> command{"git", "-c", "safe.directory=" + source.string(), "-C", source.string()};
   command.insert(command.end(), arguments.begin(), arguments.end());
   support::RunOptions options;
   options.capture_stdout = true;
+  options.env = {{"GIT_DIR", source.string() + "-git"}, {"GIT_COMMON_DIR", source.string() + "-common"}, {"GIT_WORK_TREE", source.string()}};
   const auto result = support::run(command, options);
   check_signals();
   if (result.exit_code) throw std::runtime_error("upstream git validation failed with status " + std::to_string(result.exit_code));
   return support::trim(result.out);
  };
- if (git({"rev-parse", "HEAD"}) != Revision || !git({"status", "--porcelain", "--untracked-files=all"}).empty())
-  throw std::runtime_error("upstream must be a clean checkout of " + std::string(Revision));
+ if (git({"rev-parse", "HEAD"}) != pin.at("revision").get<std::string>() || git({"rev-parse", "HEAD^{tree}"}) != pin.at("tree").get<std::string>() || !git({"status", "--porcelain", "--untracked-files=all"}).empty())
+  throw std::runtime_error("upstream must be the clean pinned " + kind + " source");
  if (!git({"diff", "--name-only", "HEAD"}).empty()) throw std::runtime_error("upstream source changed");
- std::vector<fs::path> files;
- const auto package = source / "src/rfdetr";
+ std::vector<fs::path> files{source / "README.md", source / "LICENSE"};
+ const auto package = source / "src" / pin.at("package").get<std::string>();
  if (fs::exists(package)) {
   for (const auto& entry : fs::recursive_directory_iterator(package))
    if (entry.is_regular_file()) files.push_back(entry.path());
@@ -910,12 +915,194 @@ struct Arguments {
  std::string payload_snapshot;
  bool check_environment = false;
  std::string upstream;
+ std::string plus_upstream;
+ bool inventory_only = false;
  std::string output;
  std::string weights;
  std::string fingerprint;
  std::string sdpa = "default";
  bool help = false;
 };
+py::object checkpoint_value(py::handle checkpoint, py::handle arguments, const char* name) {
+ const auto direct = object(checkpoint).attr("get")(name, py::none());
+ if (!direct.is_none()) return direct;
+ if (PyDict_Check(arguments.ptr())) return object(arguments).attr("get")(name, py::none());
+ return module("builtins").attr("getattr")(arguments, name, py::none());
+}
+void acquire_inventory_asset(const fs::path& path, py::handle asset) {
+ const auto hash = [&] (const fs::path& file) {
+  const auto stream = module("builtins").attr("open")(file.string(), "rb");
+  PythonContext close(stream);
+  return string(module("hashlib").attr("file_digest")(stream, "md5").attr("hexdigest")());
+ };
+ if (!fs::exists(path)) {
+  const auto temporary = path.string() + ".inventory-partial";
+  const auto response = module("requests").attr("get")(object(asset).attr("url"), "stream"_a = true, "timeout"_a = 60);
+  PythonContext close(response);
+  response.attr("raise_for_status")();
+  std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+  if (!output) throw std::runtime_error("cannot stage official asset: " + temporary);
+  std::uint64_t bytes = 0;
+  for (py::handle chunk : response.attr("iter_content")("chunk_size"_a = 1024 * 1024)) {
+   check_signals();
+   const auto data = py::cast<std::string>(chunk);
+   bytes += data.size();
+   if (bytes > MaxArchive) throw std::runtime_error("official checkpoint exceeds inventory byte bound");
+   output.write(data.data(), static_cast<std::streamsize>(data.size()));
+   if (!output) throw std::runtime_error("official checkpoint write failed: " + temporary);
+  }
+  output.close();
+  if (!output || hash(temporary) != string(object(asset).attr("md5_hash"))) throw std::runtime_error("downloaded official checkpoint digest mismatch: " + path.string());
+  fs::rename(temporary, path);
+ }
+ if (!fs::is_regular_file(path) || fs::file_size(path) > MaxArchive || hash(path) != string(object(asset).attr("md5_hash")))
+  throw std::runtime_error("cached official checkpoint digest mismatch: " + path.string());
+}
+Json encoder_metadata(const Json& topology) {
+ const auto encoder = topology.at("encoder").get<std::string>();
+ if (encoder.starts_with("dinov2_windowed_")) {
+  const auto size = encoder.substr(std::string_view("dinov2_windowed_").size());
+  const auto config = to_json(module("rfdetr.models.backbone.dinov2").attr("get_config")(size, false));
+  const auto dimension = config.at("hidden_size").get<std::uint32_t>();
+  return {{"encoder", encoder}, {"dimension", dimension}, {"heads", config.at("num_attention_heads")}, {"layers", config.at("num_hidden_layers")},
+          {"feedforward_dimension", dimension * config.at("mlp_ratio").get<std::uint32_t>()}, {"source", "pinned upstream get_config"}};
+ }
+ const auto pe = module("rfdetr_plus.models.pe_core");
+ if (encoder != string(pe.attr("PE_CORE_T_ENCODER"))) throw std::runtime_error("unrecognized pinned upstream encoder: " + encoder);
+ PythonContext meta(module("torch").attr("device")("meta"));
+ const auto trunk = module("timm").attr("create_model")(pe.attr("PE_CORE_T_TIMM_ARCH"), "pretrained"_a = false,
+    "patch_size"_a = topology.at("patch_size").get<int>(), "img_size"_a = topology.at("positional_encoding_size").get<int>() * topology.at("patch_size").get<int>());
+ const auto blocks = trunk.attr("blocks");
+ const auto first = index(blocks, 0);
+ return {{"encoder", encoder}, {"dimension", integer(trunk.attr("embed_dim"))}, {"heads", integer(first.attr("attn").attr("num_heads"))},
+         {"layers", py::len(blocks)}, {"feedforward_dimension", integer(first.attr("mlp").attr("fc1").attr("out_features"))},
+         {"source", string(pe.attr("PE_CORE_T_TIMM_ARCH")) + " metadata on meta device; no forward"}};
+}
+void inventory(const Arguments& args) {
+ const fs::path source = args.upstream, plus_source = args.plus_upstream, output = args.output;
+ const auto core_hashes = verify_source(source);
+ const auto plus_hashes = verify_source(plus_source, "plus");
+ const auto environment = check_environment();
+ if (string(module("importlib.metadata").attr("version")("timm")) != source_pins().at("timm").get<std::string>()) throw std::runtime_error("timm source pin disagrees with installed dependency");
+ module("sys").attr("path").attr("insert")(0, (plus_source / "src").string());
+ module("sys").attr("path").attr("insert")(0, (source / "src").string());
+ const auto core = module("rfdetr"), plus = module("rfdetr_plus"), torch = module("torch");
+ const auto core_assets = module("rfdetr.assets.model_weights").attr("ModelWeights");
+ const auto plus_assets = module("rfdetr_plus.assets.model_weights").attr("ModelWeights");
+ const auto native = Json::parse(rfdetr_native_catalog_json());
+ Json manifest{{"format", "mmltk.rfdetr.inventory.v1"}, {"sources", source_pins()}, {"source_hashes", {{"core", core_hashes}, {"plus", plus_hashes}}},
+               {"environment", environment}, {"fingerprint", args.fingerprint}, {"producer_sha256", digest(support::executable_path())},
+               {"dependency_sha256", digest(OracleRoot / "requirements.txt")}, {"source_manifest_sha256", digest(OracleRoot / "sources.json")},
+               {"native_catalog", native}, {"assets", Json::array()}, {"mismatches", Json::array()}};
+ fs::create_directories(output / "assets");
+ const auto check = [&](bool condition, const std::string& message) { if (!condition) manifest["mismatches"].push_back(message); };
+ std::size_t maximum_foregrounds = 0;
+ for (const auto& row : native.at("presets")) {
+  const auto name = row.at("preset_name").get<std::string>();
+  const auto filename = row.at("canonical_weight_filename").get<std::string>();
+  const bool platform = row.at("license") == "PlatformModel10";
+  const auto registry = platform ? plus_assets : core_assets;
+  const auto asset = registry.attr("from_filename")(filename);
+  if (asset.is_none()) throw std::runtime_error("required native asset absent from pinned upstream registry: " + filename);
+  check(string(asset.attr("url")) == row.at("canonical_weight_url").get<std::string>() && string(asset.attr("md5_hash")) == row.at("canonical_weight_md5").get<std::string>(), name + ": registry identity differs");
+  const py::object model_type = (platform ? plus : core).attr(row.at("upstream_class").get<std::string>().c_str());
+  const auto instance = model_type.attr("__new__")(model_type);
+  const auto config = instance.attr("get_model_config")("device"_a = "cpu");
+  const auto topology = to_json(config.attr("model_dump")("mode"_a = "json"));
+  // This conversion is the external Python configuration format, not a second model registry.
+  for (const auto& [native_field, external_field] : std::to_array<std::pair<const char*, const char*>>({
+         {"resolution", "resolution"}, {"patch_size", "patch_size"}, {"window_count", "num_windows"}, {"positional_encoding_size", "positional_encoding_size"},
+         {"decoder_layer_count", "dec_layers"}, {"query_count", "num_queries"}, {"selected_query_count", "num_select"}, {"configured_class_count", "num_classes"},
+         {"hidden_dimension", "hidden_dim"}, {"group_count", "group_detr"}, {"two_stage", "two_stage"}, {"self_attention_heads", "sa_nheads"},
+         {"cross_attention_heads", "ca_nheads"}, {"sampling_points", "dec_n_points"}, {"feedforward_dimension", "dim_feedforward"}}))
+   check(row.at(native_field) == topology.at(external_field), name + ": topology differs: " + external_field);
+  const auto encoder = encoder_metadata(topology);
+  for (const auto* field : {"dimension", "heads", "layers", "feedforward_dimension"}) check(row.at("backbone").at(field) == encoder.at(field), name + ": encoder metadata differs: " + field);
+  check(row.at("backbone").at("features") == topology.at("out_feature_indexes"), name + ": encoder feature indexes differ");
+  for (const auto& [native_field, external_field] : std::to_array<std::pair<const char*, const char*>>({
+       {"keypoint_dimension_downscale", "grouppose_keypoint_dim_downscale"}, {"keypoint_cross_attention", "keypoint_cross_attn"}, {"inter_instance_keypoint_attention", "inter_instance_kp_attn"}}))
+   check(row.at(native_field) == topology.at(external_field), name + ": keypoint topology differs: " + external_field);
+  const bool dual = row.at("projector") == "DualKeypointOnly";
+  check(dual == topology.at("dual_projector").get<bool>() && dual == topology.at("dual_projector_kp_only").get<bool>(), name + ": projector differs");
+  const auto training = to_json(instance.attr("get_train_config")("dataset_dir"_a = ".", "output_dir"_a = ".").attr("model_dump")("mode"_a = "json"));
+  for (const auto& [native_field, external_field] : std::to_array<std::pair<const char*, const char*>>({
+       {"classification_loss_coefficient", "cls_loss_coef"}, {"keypoint_l1_loss_coefficient", "keypoint_l1_loss_coef"},
+       {"keypoint_findable_loss_coefficient", "keypoint_findable_loss_coef"}, {"keypoint_visible_loss_coefficient", "keypoint_visible_loss_coef"}, {"keypoint_nll_loss_coefficient", "keypoint_nll_loss_coef"}}))
+   check(row.at(native_field) == training.at(external_field), name + ": stock training coefficient differs: " + external_field);
+  check((row.at("task") == "Segmentation") == topology.at("segmentation_head").get<bool>(), name + ": segmentation head differs");
+  check((row.at("task") == "Keypoints") == topology.at("use_grouppose_keypoints").get<bool>(), name + ": keypoint head differs");
+  const fs::path weights = fs::path(args.weights) / filename;
+  std::cout << "inventory " << name << ": acquiring verified asset" << std::endl;
+  acquire_inventory_asset(weights, asset);
+  const auto sha256 = digest(weights);
+  const auto checkpoint = torch.attr("load")(weights.string(), "map_location"_a = "cpu", "weights_only"_a = false);
+  const auto state = checkpoint.attr("get")("model", py::none());
+  if (!PyDict_Check(state.ptr())) throw std::runtime_error("official checkpoint has no model dictionary: " + name);
+  Json tensors = Json::object();
+  std::int64_t classifier_width = 0;
+  for (const auto& pair : py::reinterpret_borrow<py::dict>(state)) {
+   if (!PyUnicode_Check(pair.first.ptr()) || !py::isinstance(pair.second, torch.attr("Tensor"))) throw std::runtime_error("invalid official state entry: " + name);
+   const auto tensor_name = string(pair.first);
+   const auto tensor = object(pair.second);
+   tensors[tensor_name] = {{"shape", to_json(tensor.attr("shape"))}, {"dtype", string(tensor.attr("dtype"))}};
+   if (tensor_name == "class_embed.weight") classifier_width = integer(index(tensor.attr("shape"), 0));
+  }
+  if (classifier_width <= 0) throw std::runtime_error("missing official classifier evidence: " + name);
+  const auto arguments = checkpoint.attr("get")("args", py::none());
+  const auto raw_names = checkpoint_value(checkpoint, arguments, "class_names");
+  const auto ns = module("types").attr("SimpleNamespace");
+  const auto context = ns("model"_a = ns("class_names"_a = raw_names));
+  const auto names = core.attr("RFDETR").attr("class_names").attr("fget")(context);
+  Json class_names = to_json(names);
+  std::string names_source = raw_names.is_none() ? "pinned RFDETR.class_names default" : "checkpoint class_names";
+  if (raw_names.is_none() && topology.at("use_grouppose_keypoints").get<bool>()) {
+   const auto declaration = "with `" + string(model_type.attr("__name__")) + "`, pretrained on COCO person keypoints.";
+   if (support::read_text(source / "README.md").find(declaration) == std::string::npos) throw std::runtime_error("official keypoint asset lacks authoritative foreground meaning");
+   class_names = Json::array({"person"});
+   names_source = "pinned README stock COCO-person declaration; active mask establishes output slots";
+  }
+  const auto active = state.attr("get")("_kp_active_mask", py::none());
+  Json active_mask = nullptr;
+  if (!active.is_none()) active_mask = to_json(active.attr("tolist")());
+  std::string layout = "Unresolved";
+  Json foreground_slots = Json::array();
+  if (class_names == to_json(module("rfdetr.assets.coco_classes").attr("COCO_CLASS_NAMES")) && classifier_width == 91 && row.at("task") != "Keypoints") {
+   layout = "CocoSparse";
+   for (const auto& pair : py::reinterpret_borrow<py::dict>(module("rfdetr.assets.coco_classes").attr("COCO_CLASSES"))) foreground_slots.push_back(integer(pair.first));
+  } else if (class_names == Json::array({"person"}) && !active.is_none() && string(active.attr("dtype")) == "torch.bool" && integer(active.attr("dim")()) == 2) {
+   const auto counts = to_json(active.attr("sum")(-1).attr("tolist")());
+   for (std::size_t index = 0; index < counts.size(); ++index) if (counts[index].get<std::int64_t>() != 0) foreground_slots.push_back(index);
+   if (foreground_slots == Json::array({0}) && counts.at(0) == 17) layout = "PersonActiveFirst";
+   if (foreground_slots == Json::array({1}) && counts.at(1) == 17) layout = "PersonBackgroundFirst";
+  }
+  check(layout != "Unresolved", name + ": ambiguous checkpoint class meaning");
+  check(layout == row.at("official_class_layout").get<std::string>(), name + ": native class layout differs: " + layout);
+  check(classifier_width == row.at("class_count").get<std::int64_t>(), name + ": native classifier width differs: " + std::to_string(classifier_width));
+  maximum_foregrounds = std::max(maximum_foregrounds, class_names.size());
+  Json evidence{{"preset", name}, {"upstream_class", row.at("upstream_class")}, {"registry", platform ? "rfdetr_plus.assets.model_weights.ModelWeights" : "rfdetr.assets.model_weights.ModelWeights"},
+                {"filename", filename}, {"url", string(asset.attr("url"))}, {"md5", string(asset.attr("md5_hash"))}, {"sha256", sha256}, {"bytes", fs::file_size(weights)},
+                {"configured_topology", topology}, {"encoder_metadata", encoder}, {"training_defaults", training}, {"classifier_width", classifier_width}, {"class_names", class_names}, {"embedded_class_names", to_json(raw_names)},
+                {"class_names_source", names_source}, {"class_layout", layout},
+                {"foreground_slots", foreground_slots}, {"active_keypoint_mask", active_mask}, {"tensors", tensors}};
+  if (!arguments.is_none()) {
+   const auto dictionary = PyDict_Check(arguments.ptr()) ? arguments : module("builtins").attr("vars")(arguments);
+   evidence["checkpoint_arguments"] = Json::parse(string(module("json").attr("dumps")(dictionary, "default"_a = module("builtins").attr("str"))));
+  }
+  if (digest(weights) != sha256) throw std::runtime_error("official checkpoint changed during inventory: " + name);
+  const auto evidence_path = output / "assets" / (name + ".json");
+  json_write(evidence_path, evidence);
+  manifest["assets"].push_back({{"preset", name}, {"path", "assets/" + name + ".json"}, {"sha256", digest(evidence_path)}, {"checkpoint_sha256", sha256},
+                                 {"classifier_width", classifier_width}, {"foreground_count", class_names.size()}, {"class_layout", layout}});
+  std::cout << "inventory " << name << ": " << classifier_width << " slots, " << class_names.size() << " foreground names, " << layout << std::endl;
+ }
+ check(maximum_foregrounds <= native.at("foreground_capacity").get<std::size_t>(), "verified foreground meaning exceeds native catalog capacity");
+ manifest["capacity_decision"] = {{"maximum_verified_foregrounds", maximum_foregrounds}, {"foreground_capacity", native.at("foreground_capacity")},
+                                 {"instance_reference_bits", native.at("foreground_capacity").get<std::size_t>() <= 256 ? 8 : 16}, {"physical_output_slot_capacity", native.at("output_slot_capacity")}};
+ if (verify_source(source) != core_hashes || verify_source(plus_source, "plus") != plus_hashes) throw std::runtime_error("source changed during inventory");
+ manifest["status"] = manifest["mismatches"].empty() ? "verified_inventory_complete" : "native_catalog_mismatch";
+ json_write(output / "manifest.json", manifest);
+ if (!manifest["mismatches"].empty()) throw std::runtime_error("native catalog differs from verified inventory: " + manifest["mismatches"].dump());
+}
 void generate(const Arguments& args) {
  const auto torch = module("torch");
  const auto source = fs::weakly_canonical(fs::absolute(args.upstream));
@@ -967,7 +1154,7 @@ void generate(const Arguments& args) {
   {"gradient_scale", 1}, {"accumulated_microbatches", 1}
  };
  Json manifest = {
-  {"format", Format}, {"revision", Revision}, {"source_hashes", source_hashes}, {"producer_sha256", digest(support::executable_path())}, {"dependency_sha256", digest(OracleRoot / "requirements.txt")},
+  {"format", Format}, {"revision", core_revision()}, {"source_hashes", source_hashes}, {"producer_sha256", digest(support::executable_path())}, {"dependency_sha256", digest(OracleRoot / "requirements.txt")},
   {"payload_sha256", digest(OracleRoot / "nvidia-payload.json")}, {"environment", environment}, {"fingerprint", args.fingerprint}, {"cuda_device", string(cuda.attr("get_device_name")())},
   {"torch_build_config", string(build_config_prefix)}, {"torch_build_config_truncated", build_config_size > 65536}, {"policy", policy}, {"presets", Json::array()}, {"cases", Json::array()},
   {"unsupported", Json::array()}
@@ -1017,7 +1204,7 @@ void generate(const Arguments& args) {
   if (original_sha256 != verified_sha256) throw std::runtime_error("verified pretrained artifact changed during production: " + weights.string());
   manifest["presets"].push_back(
    {{"name", preset.name}, {"checkpoint", checkpoint.filename().string()}, {"sha256", digest(checkpoint)}, {"original", original.filename().string()}, {"original_sha256", original_sha256},
-    {"verified_asset", {{"registry", "rfdetr.assets.model_weights.ModelWeights"}, {"revision", Revision}, {"filename", to_json(asset.attr("filename"))}, {"url", to_json(asset.attr("url"))},
+    {"verified_asset", {{"registry", "rfdetr.assets.model_weights.ModelWeights"}, {"revision", core_revision()}, {"filename", to_json(asset.attr("filename"))}, {"url", to_json(asset.attr("url"))},
                         {"md5", to_json(asset.attr("md5_hash"))}, {"sha256", verified_sha256}}},
     {"model_config", to_json(mc.attr("model_dump")("mode"_a = "json"))}, {"train_config", to_json(tc.attr("model_dump")("mode"_a = "json"))}, {"constructor", invariants}});
   model.attr("cuda")();
@@ -1071,7 +1258,7 @@ bool optional_token(std::string_view value) {
 }
 Arguments parse_arguments(int argc, char** argv) {
  Arguments result;
- const std::array<std::string_view, 9> options{"--payload-snapshot", "--check-environment", "--upstream", "--output", "--weights", "--fingerprint", "--sdpa", "--help", "-h"};
+ const std::array<std::string_view, 11> options{"--payload-snapshot", "--check-environment", "--upstream", "--plus-upstream", "--inventory-only", "--output", "--weights", "--fingerprint", "--sdpa", "--help", "-h"};
  for (int i = 1; i < argc; ++i) {
   const std::string argument = argv[i];
   const auto equals = argument.find('=');
@@ -1095,9 +1282,9 @@ Arguments parse_arguments(int argc, char** argv) {
    result.help = true;
    return result;
   }
-  if (option == "--check-environment") {
+  if (option == "--check-environment" || option == "--inventory-only") {
    if (equals != std::string::npos) throw support::ToolError("argument " + option + ": ignored explicit argument", 2);
-   result.check_environment = true;
+   (option == "--inventory-only" ? result.inventory_only : result.check_environment) = true;
    continue;
   }
   std::string value;
@@ -1111,6 +1298,8 @@ Arguments parse_arguments(int argc, char** argv) {
    result.payload_snapshot = value;
   else if (option == "--upstream")
    result.upstream = value;
+  else if (option == "--plus-upstream")
+   result.plus_upstream = value;
   else if (option == "--output")
    result.output = value;
   else if (option == "--weights")
@@ -1122,8 +1311,8 @@ Arguments parse_arguments(int argc, char** argv) {
    result.sdpa = value;
   }
  }
- if (result.payload_snapshot.empty() && !result.check_environment && (result.upstream.empty() || result.output.empty() || result.weights.empty() || result.fingerprint.empty()))
-  throw support::ToolError("generation requires --upstream, --output, --weights and --fingerprint", 2);
+ if (result.payload_snapshot.empty() && !result.check_environment && (result.upstream.empty() || result.plus_upstream.empty() || result.output.empty() || result.weights.empty() || result.fingerprint.empty()))
+  throw support::ToolError("generation requires --upstream, --plus-upstream, --output, --weights and --fingerprint", 2);
  return result;
 }
 int execute(const Arguments& args) {
@@ -1135,6 +1324,8 @@ int execute(const Arguments& args) {
    json_write(args.payload_snapshot, payload());
   else if (args.check_environment)
    check_environment();
+  else if (args.inventory_only)
+   inventory(args);
   else
    generate(args);
   return 0;

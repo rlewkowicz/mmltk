@@ -299,7 +299,7 @@ TEST_CASE("Actual pinned upstream Nano and SegNano forward and fixed cotangent V
     ForwardOperatorObservation operators(archive.contains("forward-operator/linear/0"));
     mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
     comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
-    outputs = model.forward_observed({input, mask}, model.config().segmentation, indices);
+    outputs = model.forward_observed({input, mask}, model.config().has_masks(), indices);
     operators.report(comparison, archive);
    }
    comparison.fact("execution", {{"mode", "eager"}, {"input", "identical admitted normalized tensor"}, {"training", entry.training}});

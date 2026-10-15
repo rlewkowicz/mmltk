@@ -47,15 +47,17 @@ using namespace std::literals;
 constexpr std::array bin_entries{"mmltk"sv, "mmltk-browser-bundle-contract"sv, "mmltk-browser-host"sv, "?mmltk-rfdetr-onnx-info"sv, "?mmltk-rfdetr-onnx-simplify"sv};
 constexpr std::array gcc_entries{"libstdc++.so.6"sv, "libgcc_s.so.1"sv};
 constexpr std::array firefox_entries{"firefox"sv, "firefox-bin"sv, "libmozgtk.so"sv, "libxul.so"sv};
+constexpr std::array application_license_entries{"LICENSE"sv, "NOTICE"sv};
 constexpr std::array gdrcopy_entries{"LICENSE"sv, "UPSTREAM.md"sv};
 constexpr std::array arrow_entries{"LICENSE.txt"sv, "NOTICE.txt"sv, "snappy"sv, "zstd"sv, "zlib"sv, "xsimd"sv, "thrift"sv, "rapidjson"sv};
 constexpr std::array model_entries{"ShiftLUT_fp32.onnx"sv, "RealPLKSR_fp16.onnx"sv};
 constexpr std::array python_entries{"rfdetr_checkpoint_bridge.py"sv};
 constexpr std::array browser_entries{"index.html"sv, "browser_protocol.marker"sv};
-constexpr std::array<Row, 8> rows{{
+constexpr std::array<Row, 9> rows{{
  {"bin", "/opt/mmltk/bin", "release", ".", bin_entries},
  {"lib/gcc-16.2", "/opt/gcc-16.2/lib64", "image", ".", gcc_entries},
  {"lib/mmltk/firefox", "/opt/mmltk/lib/mmltk/firefox", "firefox", ".", firefox_entries},
+ {"share/mmltk/licenses/application", "/opt/mmltk/share/mmltk/licenses/application", "repository", ".", application_license_entries},
  {"share/mmltk/licenses/gdrcopy", "/opt/mmltk/share/mmltk/licenses/gdrcopy", "repository", "third_party/gdrcopy", gdrcopy_entries},
  {"share/mmltk/licenses/arrow", "/opt/mmltk/share/mmltk/licenses/arrow", "image", ".", arrow_entries},
  {"models", "/opt/mmltk/models", "repository", "src/backend/imaging/upscale/assets", model_entries},

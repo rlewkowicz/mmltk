@@ -222,7 +222,7 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
       torch::Tensor total;
       step.forward([&] {
        comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
-       outputs = model.forward_observed({input, mask}, model.config().segmentation, encoder);
+       outputs = model.forward_observed({input, mask}, model.config().has_masks(), encoder);
        support::compare_oracle_outputs(comparison, archive, outputs, encoder);
        total = compare_loss(comparison, archive, outputs, targets, config, true, "");
       });
@@ -265,7 +265,7 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
       {
        torch::NoGradGuard no_grad;
        step.forward([&] {
-        auto held = model.forward_observed({archive.tensor("held/input", torch::kCUDA), mask}, model.config().segmentation, encoder);
+        auto held = model.forward_observed({archive.tensor("held/input", torch::kCUDA), mask}, model.config().has_masks(), encoder);
         support::compare_oracle_outputs(comparison, archive, held, encoder, "held/");
         (void)compare_loss(comparison, archive, held, targets, config, false, "held/");
        });

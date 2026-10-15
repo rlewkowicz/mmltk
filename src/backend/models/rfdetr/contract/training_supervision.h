@@ -1,5 +1,6 @@
 #pragma once
 #include "src/frameworks/reflection/reflected_declarations.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -58,6 +59,12 @@ static_assert(mmltk::frameworks::reflection::ingress_policies_are_valid<Training
  return !mmltk::frameworks::reflection::validate_reflected_fields(config).has_value() && mmltk::frameworks::reflection::enum_contains(config.assignment) && selected_objective;
 }
 [[nodiscard]] constexpr bool training_supervision_enabled(const TrainingSupervisionConfig& config) noexcept { return config.assignment == TrainAssignmentKind::MatchFree || config.denoising.enabled; }
+[[nodiscard]] constexpr std::optional<std::string_view> training_supervision_admission_error(const PresetCatalogEntry& preset, const TrainingSupervisionConfig& config) noexcept {
+ if (!training_supervision_enabled(config) ||
+     ((config.assignment != TrainAssignmentKind::MatchFree || preset.training_capabilities.match_free) && (!config.denoising.enabled || preset.training_capabilities.denoising))) return std::nullopt;
+ if (preset.task == ModelTask::Keypoints) return "Keypoint training requires stock Hungarian supervision; Match-Free and denoising are unsupported";
+ return "Zero-decoder Atto training does not support Match-Free or denoising supervision";
+}
 [[nodiscard]] constexpr bool training_supervision_query_layout_valid(
  const TrainingSupervisionConfig& config, const std::size_t ordinary_queries, const std::size_t ordinary_groups, const std::size_t maximum_targets) noexcept {
  if (ordinary_groups != 0U && ordinary_queries > std::numeric_limits<std::size_t>::max() / ordinary_groups) return false;

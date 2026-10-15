@@ -144,7 +144,7 @@ rfdetr::NativeRfDetrConfig tiny_native_training_config() {
 rfdetr::DetectionConfig training_detection_fixture(const rfdetr::NativeRfDetrConfig& config) {
  auto detection = rfdetr::testsupport::detection_fixture_base(config);
  rfdetr::project_loss_coefficients(detection, config);
- detection.include_masks = config.segmentation;
+ detection.include_masks = config.has_masks();
  detection.mask_point_sample_ratio = config.mask_point_sample_ratio;
  rfdetr::populate_default_detection_weight_dict(detection);
  return detection;
@@ -219,7 +219,7 @@ rfdetr::NativeRfDetrConfig supervision_config() {
 }
 void test_training_supervision_runtime_replication_is_one_shot() {
  auto config = supervision_config();
- config.segmentation = true;
+ config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  rfdetr::TrainingSupervisionImpl source(config, config.num_classes - 1);
  rfdetr::TrainingSupervisionImpl replica(config, config.num_classes - 1);
  source.initialize(71U);
@@ -1453,7 +1453,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
  config.num_classes = static_cast<int>(compile_plan.class_catalog.size()) + 1;
  config.num_queries = 2;
  config.num_select = 2;
- config.segmentation = false;
+ config.task = mmltk::backend::models::rfdetr::ModelTask::Detection;
  rfdetr::NativeRfDetrModel seed_model(config, rfdetr::native_training_class_layout(compile_plan.class_catalog));
  rfdetr::DecodedNativeModelState checkpoint;
  checkpoint.metadata = rfdetr::testsupport::model_checkpoint_metadata(seed_model, "training-route-test", (root / "seed.pt").string());
@@ -2108,7 +2108,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
     torch::manual_seed(910);
     CAPTURE(mode, dn, dtype);
     auto config = tiny_native_training_config();
-    config.segmentation = mode != 0;
+    config.task = (mode != 0) ? mmltk::backend::models::rfdetr::ModelTask::Segmentation : mmltk::backend::models::rfdetr::ModelTask::Detection;
     config.mask_ce_loss_coef = mode == 2 || mode == 4 ? 1.7 : 0.0;
     config.mask_dice_loss_coef = mode == 3 || mode == 4 ? 2.3 : 0.0;
     config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
@@ -2137,10 +2137,10 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
      step.forward([&] {
       auto outputs = dn ? model.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image[0], image[1]}), targets, {910, 0, 0, micro})
                         : model.forward_for_match_free(rfdetr::nested_tensor_from_tensor_list({image[0], image[1]}));
-      REQUIRE(outputs.main.sparse_pred_masks.has_value() == config.segmentation);
-      REQUIRE(outputs.aux_outputs.front().sparse_pred_masks.has_value() == config.segmentation);
-      REQUIRE(outputs.enc_outputs->sparse_pred_masks.has_value() == config.segmentation);
-      if (dn && config.segmentation) {
+      REQUIRE(outputs.main.sparse_pred_masks.has_value() == config.has_masks());
+      REQUIRE(outputs.aux_outputs.front().sparse_pred_masks.has_value() == config.has_masks());
+      REQUIRE(outputs.enc_outputs->sparse_pred_masks.has_value() == config.has_masks());
+      if (dn && config.has_masks()) {
        REQUIRE(outputs.denoising->main.sparse_pred_masks.has_value());
        REQUIRE(outputs.denoising->aux_outputs.front().sparse_pred_masks.has_value());
        dn_mask_queries[micro] = {outputs.denoising->main.sparse_pred_masks->query_features, outputs.denoising->aux_outputs.front().sparse_pred_masks->query_features};
@@ -2168,7 +2168,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
      {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight", "training_supervision.mask_projection.weight",
       "training_supervision.ground_truth_mlp.linear1.weight", "class_embed.weight", "bbox_embed.layers.2.weight"}) {
      const bool mask_parameter = is_mask_parameter(name);
-     if (!config.segmentation && mask_parameter) continue;
+     if (!config.has_masks() && mask_parameter) continue;
      before_update.emplace(name, capture_update_parameter(parameters, built.optimizer, name, !mask_parameter || mode >= 2));
     }
     check_parameter_update(built.optimizer, parameters, before_update, [&](std::string_view name) { return !is_mask_parameter(name) || mode >= 2; });
@@ -2182,7 +2182,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
     auto candidate = resumed.stage_normalized_state(state, rfdetr::detail::NormalizedModelStateAdmission::Exact);
     resumed.commit_normalized_state(std::move(candidate));
     const auto restored = resumed.named_parameters(true);
-    const auto state_parameter = config.segmentation ? "training_supervision.mask_projection.weight" : "training_supervision.ground_truth_mlp.linear1.weight";
+    const auto state_parameter = config.has_masks() ? "training_supervision.mask_projection.weight" : "training_supervision.ground_truth_mlp.linear1.weight";
     REQUIRE(torch::equal(*restored.find(state_parameter), *parameters.find(state_parameter)));
     if (dn && mode == 4) {
      resumed.train(true);
@@ -2226,7 +2226,7 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
   torch::manual_seed(815);
   const double tolerance = dtype == torch::kBFloat16 ? 0.03 : 0.002;
   auto config = tiny_native_training_config();
-  config.segmentation = true;
+  config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
   config.training_supervision.denoising.enabled = true;
   config.training_supervision.denoising.groups = 2;
   rfdetr::NativeRfDetrModel active(config, rfdetr::testsupport::synthetic_training_layout(2));
@@ -2342,7 +2342,7 @@ TEST_CASE("Native compiled training retains routed objectives gradients optimize
        CAPTURE(segmentation, match_free, denoising, dtype, reference_attention, compilation);
        torch::manual_seed(937);
        auto config = tiny_native_training_config();
-       config.segmentation = segmentation;
+       config.task = (segmentation) ? mmltk::backend::models::rfdetr::ModelTask::Segmentation : mmltk::backend::models::rfdetr::ModelTask::Detection;
        config.training_supervision.assignment = match_free ? rfdetr::TrainAssignmentKind::MatchFree : rfdetr::TrainAssignmentKind::Hungarian;
        // CLEANUP-IGNORE: AMP and compiled-training scenarios explicitly configure their independent denoising inputs and model owners.
        config.training_supervision.denoising.enabled = denoising;

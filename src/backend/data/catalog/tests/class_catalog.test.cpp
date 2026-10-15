@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/backend/data/catalog/coco_catalog.h"
+#include "src/frameworks/serialization/json_wire.h"
+#include "src/frameworks/serialization/serialization.h"
 #include <string>
 #include <vector>
 namespace catalog = mmltk::backend::data::catalog;
@@ -39,4 +41,20 @@ TEST_CASE("COCO source IDs retain their sparse external domain", "[catalog]") {
  CHECK_FALSE(catalog::coco_foreground_index(12));
  CHECK(catalog::kCocoCategories[79].source_id == 90U);
  CHECK(catalog::kCocoNames[11] == "stop sign");
+}
+TEST_CASE("Class catalogs admit persisted names without a joint schema", "[catalog][keypoint]") {
+ namespace serial = mmltk::frameworks::serialization;
+ const auto bytes = serial::json_to_cbor(R"({"names":[{"value":"person"},{"value":"car"}]})", {});
+ const auto decoded = serial::decode<catalog::OrderedClassCatalog>({bytes, {}}, {});
+ REQUIRE(decoded);
+ CHECK_FALSE(decoded->keypoints.has_value());
+ const catalog::ClassCatalog admitted(*decoded);
+ CHECK(admitted.size() == 2U);
+ CHECK_FALSE(admitted.has_keypoints());
+ CHECK(admitted.keypoints(0U).names.empty());
+ auto explicit_empty = *decoded;
+ explicit_empty.keypoints.emplace(2U);
+ const catalog::ClassCatalog normalized(explicit_empty);
+ CHECK(normalized.ordered_equal(admitted));
+ CHECK_FALSE(normalized.record().keypoints.has_value());
 }

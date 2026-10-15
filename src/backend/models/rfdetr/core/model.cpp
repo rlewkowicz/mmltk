@@ -1007,7 +1007,7 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
  backbone_->push_back(PositionEmbeddingSine(config_.hidden_dim / 2, 10000.0, true, 2.0 * M_PI));
  transformer_ = register_module(std::string(detail::kTransformerModule), std::make_shared<NativeTransformerImpl>(config_));
  bbox_embed_ = register_module("bbox_embed", std::make_shared<RfDetrMlpImpl>(config_.hidden_dim, config_.hidden_dim, 4, 3));
- if (config_.segmentation) { segmentation_head_ = register_module("segmentation_head", std::make_shared<SegmentationHeadImpl>(config_.hidden_dim, std::max<int64_t>(1, config_.dec_layers))); }
+ if (config_.has_masks()) { segmentation_head_ = register_module("segmentation_head", std::make_shared<SegmentationHeadImpl>(config_.hidden_dim, std::max<int64_t>(1, config_.dec_layers))); }
  if (auto transformer = std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)) {
   if (!config_.lite_refpoint_refine) { transformer->set_decoder_bbox_embed(std::dynamic_pointer_cast<RfDetrMlpImpl>(bbox_embed_)); }
  }
@@ -1054,7 +1054,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_for_match_free(const NestedTensor&
  if (!training_supervision_ || !training_supervision_->match_free_enabled() || !training_supervision_->initialized()) {
   throw std::runtime_error("Match-Free forward requires active initialized supervision");
  }
- return forward_impl(batch, config_.segmentation, true);
+ return forward_impl(batch, config_.has_masks(), true);
 }
 ModelOutputs NativeRfDetrModel::Impl::forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity) {
  if (!is_training() || !training_supervision_ || !training_supervision_->denoising_enabled() || !training_supervision_->initialized()) {
@@ -1062,7 +1062,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_with_denoising(const NestedTensor&
  }
  if (full_trace_.enabled(true)) { throw std::runtime_error("full-trace RF-DETR cannot consume target-dependent DN queries"); }
  auto denoising = training_supervision_->prepare_denoising(targets, identity, batch.tensors.device(), query_feat->weight.scalar_type());
- return forward_impl(batch, config_.segmentation, training_supervision_->match_free_enabled(), denoising ? &*denoising : nullptr);
+ return forward_impl(batch, config_.has_masks(), training_supervision_->match_free_enabled(), denoising ? &*denoising : nullptr);
 }
 void NativeRfDetrModel::Impl::initialize_training_supervision(const std::uint64_t request_seed) {
  if (training_supervision_) { training_supervision_->initialize(request_seed); }

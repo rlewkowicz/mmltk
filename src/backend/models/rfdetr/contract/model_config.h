@@ -10,6 +10,8 @@
 #include <type_traits>
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/backend/data/catalog/class_catalog.h"
+#include <vector>
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::models::rfdetr {
@@ -30,7 +32,14 @@ MMLTK_REFLECT_ENUM(CompilationMode)
 struct NativeRfDetrConfig {
  std::string preset_name;
  int resolution = 0;
- bool segmentation = false;
+ ModelTask task = ModelTask::Detection;
+ BackboneConfig backbone{};
+ ProjectorKind projector = ProjectorKind::Single;
+ KeypointHeadKind keypoint_head = KeypointHeadKind::None;
+ int keypoint_dimension_downscale = 1;
+ bool keypoint_cross_attention = true;
+ bool inter_instance_keypoint_attention = false;
+ MMLTK_MAX_ITEMS(mmltk::backend::data::catalog::kClassCatalogCapacity) std::vector<std::uint16_t> keypoints_per_class;
  int num_classes = 0;
  int num_queries = 0;
  int num_select = 0;
@@ -62,16 +71,25 @@ struct NativeRfDetrConfig {
  double set_cost_class = 2.0;
  double set_cost_bbox = 5.0;
  double set_cost_giou = 2.0;
+ double keypoint_l1_loss_coef = 0.0;
+ double keypoint_findable_loss_coef = 0.0;
+ double keypoint_visible_loss_coef = 0.0;
+ double keypoint_nll_loss_coef = 0.0;
  TrainingSupervisionConfig training_supervision;
+ [[nodiscard]] bool has_masks() const noexcept { return task == ModelTask::Segmentation; }
+ [[nodiscard]] bool has_keypoints() const noexcept { return task == ModelTask::Keypoints; }
 };
+MMLTK_REFLECT_FIELDS(NativeRfDetrConfig)
+[[nodiscard]] bool native_model_config_valid(const NativeRfDetrConfig& config) noexcept;
 [[nodiscard]] inline bool training_supervision_model_config_valid(const NativeRfDetrConfig& config) noexcept {
  if (!training_supervision_config_valid(config.training_supervision)) return false;
+ if (training_supervision_enabled(config.training_supervision) && (config.task == ModelTask::Keypoints || config.dec_layers == 0)) return false;
  if (training_supervision_enabled(config.training_supervision) &&
      (config.num_queries < 0 || config.group_detr <= 0 ||
       !training_supervision_query_layout_valid(config.training_supervision, static_cast<std::size_t>(config.num_queries), static_cast<std::size_t>(config.group_detr), 0U))) {
   return false;
  }
- if (config.segmentation && training_supervision_enabled(config.training_supervision) &&
+ if (config.has_masks() && training_supervision_enabled(config.training_supervision) &&
      (!std::isfinite(config.mask_ce_loss_coef) || config.mask_ce_loss_coef < 0.0 || !std::isfinite(config.mask_dice_loss_coef) || config.mask_dice_loss_coef < 0.0 ||
       config.mask_point_sample_ratio <= 0))
   return false;

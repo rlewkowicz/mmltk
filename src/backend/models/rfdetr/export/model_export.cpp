@@ -84,7 +84,7 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
    const auto name = export_member_name(buffer.key());
    export_module.register_buffer(name, buffer.value());
   }
-  const bool has_masks = model.config().segmentation;
+  const bool has_masks = model.config().has_masks();
   auto traced = torch::jit::tracer::trace({dummy_pixels}, [&technical_model, dummy_mask, has_masks](torch::jit::Stack args) {
    const auto outputs = technical_model.forward(NestedTensor{args[0].toTensor(), dummy_mask}, true);
    if (has_masks && outputs.main.pred_masks) { return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks}; }

@@ -152,3 +152,6 @@ install(FILES
     "${MMLTK_GCC16_LIBGCC_RUNTIME}"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/gcc-16.2"
     RENAME "libgcc_s.so.1")
+
+install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" "${CMAKE_SOURCE_DIR}/NOTICE"
+    DESTINATION share/mmltk/licenses/application)

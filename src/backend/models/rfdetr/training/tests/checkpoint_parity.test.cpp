@@ -121,7 +121,7 @@ void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, 
   mmltk::backend::models::rfdetr::apply_stock_training_coefficients(admitted.artifacts.config);
   REQUIRE(admitted.artifacts.config.cls_loss_coef == 1.0);
   REQUIRE(admitted.artifacts.config.bbox_loss_coef == 5.0);
-  REQUIRE(admitted.artifacts.config.mask_ce_loss_coef == (admitted.artifacts.config.segmentation ? 5.0 : 1.0));
+  REQUIRE(admitted.artifacts.config.mask_ce_loss_coef == (admitted.artifacts.config.has_masks() ? 5.0 : 1.0));
   REQUIRE(admitted.model_state.metadata.cls_loss_coef == 7.3);
  }
  // Both executions are native: this is checkpoint storage/admission evidence,

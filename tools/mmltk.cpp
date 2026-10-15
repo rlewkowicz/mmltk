@@ -2228,7 +2228,10 @@ class Wrapper {
  }
  std::pair<std::string, std::string> ensure_oracle_image(const std::string& revision) {
   const auto input = fingerprint({revision, donor, trim(read_optional(repo + "/build/tools/.inputs.sha256"))},
-              {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp",
+              {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp", "tools/oracle/native_catalog.cpp", "tools/oracle/native_catalog.h", "tools/oracle/rfdetr_sources.json",
+               "src/backend/models/rfdetr/contract/preset_catalog.h", "src/backend/models/rfdetr/contract/class_layout.h", "src/backend/models/rfdetr/contract/output_roles.h",
+               "src/backend/data/catalog/class_catalog.h", "src/backend/data/catalog/keypoint_schema.h", "src/frameworks/reflection/include/mmltk/frameworks/reflection/materializer.h", "src/frameworks/reflection/reflection_metadata.h",
+               "src/frameworks/reflection/reflected_field_policy.h", "src/frameworks/reflection/field_policy.h", "src/frameworks/reflection/declaration_annotations.h", "src/frameworks/reflection/reflected_declarations.h",
                "tools/support/cpp_support.cpp", "tools/support/cpp_text.cpp", "tools/support/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake",
                "tools/cmake/StdModules.cmake"}),
              image = image_name + "-rfdetr-oracle";
@@ -2246,7 +2249,8 @@ class Wrapper {
    std::cout << commands::oracle_help;
    return 0;
   }
-  const std::string revision = "e9a138f70cc14e3fddca029a0683055e34ab8f35";
+  const auto sources = support::json::parse(read_text(repo + "/tools/oracle/rfdetr_sources.json"));
+  const std::string revision = sources.at("core").at("revision").get<std::string>();
   if (arguments == Args{"--build-only"}) {
    mode = "build-rfdetr-oracle";
    prepare_logging(env("MMLTK_BUILD_LOG_FILE"));
@@ -2258,42 +2262,54 @@ class Wrapper {
    release_mutation();
    return 0;
   }
-  std::string upstream, output, sdpa = "default";
-  for (std::size_t i = 0; i < arguments.size(); i += 2) {
+  std::string upstream, plus_upstream, output, sdpa = "default";
+  bool inventory_only = false;
+  for (std::size_t i = 0; i < arguments.size(); ++i) {
    const auto& option = arguments[i];
-   if (option == "--upstream" || option == "--output") {
+   if (option == "--inventory-only") {
+    inventory_only = true;
+   } else if (option == "--upstream" || option == "--plus-upstream" || option == "--output") {
     require(i + 1 < arguments.size() && !arguments[i + 1].empty(), option + " requires a path");
-    (option == "--upstream" ? upstream : output) = arguments[i + 1];
+    (option == "--upstream" ? upstream : option == "--plus-upstream" ? plus_upstream : output) = arguments[++i];
    } else if (option == "--sdpa") {
     require(i + 1 < arguments.size() && (arguments[i + 1] == "default" || arguments[i + 1] == "math"), "--sdpa requires default or math");
-    sdpa = arguments[i + 1];
+    sdpa = arguments[++i];
    } else
     die("unknown RF-DETR oracle option '" + option + "'");
   }
-  require(!upstream.empty() && !output.empty(), "RF-DETR oracle requires --upstream and --output");
+  require(!upstream.empty() && !plus_upstream.empty() && !output.empty(), "RF-DETR oracle requires --upstream, --plus-upstream and --output");
   upstream = existing(upstream);
+  plus_upstream = existing(plus_upstream);
   output = normalized(output);
-  require(upstream.find(':') == std::string::npos && output.find(':') == std::string::npos, "oracle mount paths cannot contain colons");
-  require(fs::is_regular_file(upstream + "/src/rfdetr/models/lwdetr.py"), "oracle source must be the RF-DETR checkout root");
-  const Args git_prefix{"git", "--no-optional-locks", "-c", "safe.directory=" + upstream, "-C", upstream};
-  auto source_git = [&](const Args& command, const std::string& message) {
-   auto args = git_prefix;
-   append(args, command);
-   const auto result = capture(args);
-   require(!result.status, message);
-   return mmltk::tools::text::trim_newlines(result.out);
-  };
-  require(source_git({"rev-parse", "HEAD"}, "cannot read oracle upstream revision") == revision, "oracle requires pinned upstream " + revision);
-  require(source_git({"status", "--porcelain", "--untracked-files=all"}, "cannot inspect oracle upstream worktree").empty(), "oracle upstream checkout must be clean, including untracked files");
-  const auto git_dir = source_git({"rev-parse", "--absolute-git-dir"}, "cannot resolve oracle upstream Git directory"),
-             common_dir = source_git({"rev-parse", "--path-format=absolute", "--git-common-dir"}, "cannot resolve oracle upstream common Git directory"),
-             tree = source_git({"rev-parse", "HEAD^{tree}"}, "cannot read oracle upstream tree");
-  require(git_dir.find(':') == std::string::npos && common_dir.find(':') == std::string::npos, "oracle Git mount paths cannot contain colons");
-  require(!within(output, upstream), "oracle output must be outside the read-only upstream checkout");
+  require(upstream.find(':') == std::string::npos && plus_upstream.find(':') == std::string::npos && output.find(':') == std::string::npos, "oracle mount paths cannot contain colons");
+  Args source_mounts;
+  std::string source_trees;
+  for (const auto& [kind, source] : std::array{std::pair{std::string("core"), upstream}, std::pair{std::string("plus"), plus_upstream}}) {
+   const auto& pin = sources.at(kind);
+   require(fs::is_regular_file(source + "/src/" + pin.at("package").get<std::string>() + "/__init__.py"), "oracle source package missing: " + kind);
+   const auto source_git = [&](Args command) {
+    Args invocation{"git", "--no-optional-locks", "-c", "safe.directory=" + source, "-C", source};
+    append(invocation, command);
+    const auto result = capture(invocation);
+    require(!result.status, "cannot inspect oracle source: " + kind);
+    return mmltk::tools::text::trim_newlines(result.out);
+   };
+   require(source_git({"rev-parse", "HEAD"}) == pin.at("revision").get<std::string>(), "oracle requires pinned " + kind + " revision");
+   require(source_git({"status", "--porcelain", "--untracked-files=all"}).empty(), "oracle source must be clean: " + kind);
+   const auto git_dir = source_git({"rev-parse", "--absolute-git-dir"});
+   const auto common_dir = source_git({"rev-parse", "--path-format=absolute", "--git-common-dir"});
+   const auto tree = source_git({"rev-parse", "HEAD^{tree}"});
+   require(tree == pin.at("tree").get<std::string>(), "oracle source tree disagrees with manifest: " + kind);
+   require(git_dir.find(':') == std::string::npos && common_dir.find(':') == std::string::npos, "oracle Git mount paths cannot contain colons");
+   require(!within(output, source), "oracle output must be outside read-only source checkouts");
+   const auto mount = kind == "core" ? "/upstream" : "/plus-upstream";
+   append(source_mounts, {"--volume", source + ":" + mount + ":ro", "--volume", git_dir + ":" + mount + "-git:ro", "--volume", common_dir + ":" + mount + "-common:ro"});
+   source_trees += tree + "\n";
+  }
   require(!present(output + "/manifest.json") && !present(output + "/verdict.json") && !present(output + "/references"), "oracle output already contains evidence; choose a fresh directory");
   const auto weights = repository_cache + "/mmltk/weights";
-  require(fs::is_regular_file(weights + "/rf-detr-nano.pth") && fs::is_regular_file(weights + "/rf-detr-seg-nano.pt"),
-   "oracle requires the cached official rf-detr-nano.pth and rf-detr-seg-nano.pt artifacts");
+  if (!inventory_only) require(fs::is_regular_file(weights + "/rf-detr-nano.pth") && fs::is_regular_file(weights + "/rf-detr-seg-nano.pt"), "numerical oracle requires cached official Nano weights");
+  owned_dirs({weights});
   owned_dirs({output});
   prepare_logging(output + "/wrapper.log");
   acquire_mutation();
@@ -2301,24 +2317,30 @@ class Wrapper {
   cache_layout();
   nvidia_inputs();
   const auto [image_input, image] = ensure_oracle_image(revision);
-  const auto input = sha(image_input + "\n" + tree + "\n" + sdpa), name = container_name + "-upstream";
+  const auto input = sha(image_input + "\n" + source_trees + "\n" + sdpa), name = container_name + "-upstream";
   Args args{
-   "run", "--rm", "--init", "--name", name, "--gpus", "all", "--ipc", "host", "--network", "none", "--read-only", "--user", user(), "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-   "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=4g", "--env", "HOME=/tmp", "--env", "NVIDIA_DRIVER_CAPABILITIES=compute,utility", "--env", "GIT_DIR=/upstream-git", "--env",
-   "GIT_COMMON_DIR=/upstream-common", "--env", "GIT_WORK_TREE=/upstream", "--env", "GIT_OPTIONAL_LOCKS=0", "--env", "HF_HOME=/tmp/huggingface", "--env", "TRITON_CACHE_DIR=/tmp/triton", "--volume",
-   upstream + ":/upstream:ro", "--volume", weights + ":/weights:ro", "--volume", git_dir + ":/upstream-git:ro", "--volume", common_dir + ":/upstream-common:ro", "--volume", output + ":/evidence:rw",
+   "run", "--rm", "--init", "--name", name, "--gpus", "all", "--ipc", "host", "--network", inventory_only ? "bridge" : "none", "--read-only", "--user", user(), "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+   "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=4g", "--env", "HOME=/tmp", "--env", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+   "--env", "GIT_OPTIONAL_LOCKS=0", "--env", "HF_HOME=/tmp/huggingface", "--env", "TRITON_CACHE_DIR=/tmp/triton", "--volume",
+   weights + (inventory_only ? ":/weights:rw" : ":/weights:ro"), "--volume", output + ":/evidence:rw",
    "--workdir", "/tmp", "--entrypoint", "/usr/bin/timeout"
   };
+  append(args, source_mounts);
   execution_policy(args);
   labels(args, mode);
   diagnostic_tools(args);
-  append(args, {image, "--signal=TERM", "--kill-after=15s", "7200s", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "--upstream", "/upstream", "--output", "/evidence", "--weights", "/weights",
+  append(args, {image, "--signal=TERM", "--kill-after=15s", "7200s", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "--upstream", "/upstream", "--plus-upstream", "/plus-upstream", "--output", "/evidence", "--weights", "/weights",
                 "--fingerprint", input, "--sdpa", sdpa});
+  if (inventory_only) args.emplace_back("--inventory-only");
   const int status = owned_docker(name, args).status;
   release_mutation();
   if (status) {
    log("upstream reference production failed (exit " + std::to_string(status) + "); evidence retained in " + output);
    return status;
+  }
+  if (inventory_only) {
+   log("hash-bound RF-DETR catalog inventory complete: " + output + "/manifest.json");
+   return 0;
   }
   int failure = 0;
   for (const auto* target : {"mmltk_backend_models_rfdetr_core_tests", "mmltk_backend_models_rfdetr_training_tests"}) {

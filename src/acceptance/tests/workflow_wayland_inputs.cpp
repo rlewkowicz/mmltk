@@ -75,7 +75,7 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
  config.num_classes = static_cast<int>(compiled.class_catalog()->size()) + 1;
  config.num_queries = 6;
  config.num_select = 6;
- config.segmentation = false;
+ config.task = mmltk::backend::models::rfdetr::ModelTask::Detection;
  rfdetr::NativeRfDetrModel model{config, rfdetr::native_training_class_layout(*compiled.class_catalog())};
  prepare_caption_model(model, *compiled.class_catalog());
  rfdetr::DecodedNativeModelState checkpoint;

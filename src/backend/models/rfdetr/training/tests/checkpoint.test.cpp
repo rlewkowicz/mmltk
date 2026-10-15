@@ -374,7 +374,7 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
  namespace rfdetr = mmltk::backend::models::rfdetr;
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  config.resolution = 64;
- config.segmentation = true;
+ config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  config.aux_loss = false;
  config.two_stage = false;
  config.dec_layers = 1;
@@ -455,7 +455,7 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
  config.num_queries = config.num_select = 3;
  config.group_detr = 1;
  config.dec_layers = 1;
- config.segmentation = true;
+ config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  config.training_supervision.assignment = r::TrainAssignmentKind::MatchFree;
  config.training_supervision.denoising.enabled = true;
  const r::ResolvedClassLayout source_layout(r::native_training_class_layout(c::ClassCatalog({"a", "b", "c"})));

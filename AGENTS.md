@@ -192,7 +192,7 @@ the next agent.
   while actionable. Replace every surviving reference to removed phases
   (dependencies, actions, risks, handoffs) with concrete implemented APIs, owners,
   artifacts, or invariants, never removed phase numbers, titles, or prose.
-- After each implementation phase's first pass, spawn exactly one new sol xhigh
+- After each implementation phase's first pass, spawn exactly one new astra xhigh
   reviewer with the relevant complete diff. Wait for and use its report before
   updating the executor; reuse that reviewer for follow-ups. Closure requires
   `COMPLETE`.

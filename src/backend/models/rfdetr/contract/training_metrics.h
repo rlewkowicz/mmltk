@@ -50,6 +50,10 @@ struct TrainingScalars final : mmltk::frameworks::gpu::CudaDeviceTelemetry {
  std::optional<double> giou;
  std::optional<double> mask_ce;
  std::optional<double> mask_dice;
+ std::optional<double> keypoint_l1;
+ std::optional<double> keypoint_findable;
+ std::optional<double> keypoint_visible;
+ std::optional<double> keypoint_nll;
  std::optional<double> auxiliary_weighted;
  std::optional<double> denoising_weighted;
  std::optional<double> correspondence_weighted;

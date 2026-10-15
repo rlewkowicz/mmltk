@@ -89,7 +89,7 @@ void apply_detection_scale(DetectionConfig& detection_config, const NativeRfDetr
 }
 // Mask supervision: whether it runs at all, and how it is sampled and weighted.
 void apply_detection_mask_supervision(DetectionConfig& detection_config, const NativeRfDetrConfig& config) {
- detection_config.include_masks = config.segmentation;
+ detection_config.include_masks = config.has_masks();
  detection_config.mask_point_sample_ratio = config.mask_point_sample_ratio;
 }
 // Which classification loss formulation the criterion evaluates, and how its ops are executed.
@@ -381,9 +381,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   [&]<class Config>(const Config& config) {
    template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Config, std::meta::access_context::current()))) {
     const auto& value = config.[:member:];
-    if constexpr (std::same_as<std::remove_cvref_t<decltype(value)>, TrainingSupervisionConfig>) {
-     std::array<std::byte, 4096> scratch{};
-     resolved_signature << mmltk::frameworks::serialization::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 128, .max_depth = 16}).dump();
+    if constexpr (std::same_as<std::remove_cvref_t<decltype(value)>, TrainingSupervisionConfig> || !requires { resolved_signature << value; }) {
+     constexpr bool supervision = std::same_as<std::remove_cvref_t<decltype(value)>, TrainingSupervisionConfig>;
+     if constexpr (!supervision) resolved_signature << std::define_static_string(std::meta::identifier_of(member)) << '=';
+     std::array<std::byte, 16384> scratch{};
+     resolved_signature << mmltk::frameworks::serialization::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 1024, .max_depth = 16}).dump();
+     if constexpr (!supervision) resolved_signature << ';';
     } else
      resolved_signature << std::define_static_string(std::meta::identifier_of(member)) << '=' << value << ';';
    }

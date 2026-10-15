@@ -266,6 +266,7 @@ function(mmltk_add_backend_data_tests)
     mmltk_register_ordinary_sources(mmltk_backend_data_tests
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/coconut_dataset.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/catalog/tests/class_catalog.test.cpp
+        ${CMAKE_SOURCE_DIR}/src/backend/data/catalog/tests/keypoint_schema.test.cpp
         ${CMAKE_SOURCE_DIR}/src/common/io/tests/file_digest.test.cpp
         ${CMAKE_SOURCE_DIR}/src/common/io/tests/path_publication.test.cpp)
     mmltk_configure_component(
@@ -288,6 +289,7 @@ function(mmltk_add_backend_data_tests)
         mmltk::common::system
         mmltk::frameworks::gpu
         mmltk_backend_data_test_support
+        mmltk::frameworks::serialization
         CUDA::cudart
         CUDA::cuda_driver
         nlohmann_json

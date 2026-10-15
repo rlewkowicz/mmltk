@@ -691,7 +691,7 @@ TEST_CASE("native inference requests valid optional mask outputs", "[model][rfde
  namespace rfdetr = mmltk::backend::models::rfdetr;
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  config.resolution = 64;
- config.segmentation = true;
+ config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
  config.num_queries = 3;
  config.num_select = 3;
  config.group_detr = 1;
@@ -717,7 +717,7 @@ TEST_CASE("Ordinary auxiliary publication controls criterion inventory and mask 
  const bool selective = GENERATE(false, true);
  auto config = rf::native_config_from_preset(rf::model_presets().front());
  config.resolution = 32;
- config.segmentation = segmentation;
+ config.task = (segmentation) ? mmltk::backend::models::rfdetr::ModelTask::Segmentation : mmltk::backend::models::rfdetr::ModelTask::Detection;
  config.num_classes = 3;
  config.num_queries = config.num_select = 3;
  config.group_detr = 1;

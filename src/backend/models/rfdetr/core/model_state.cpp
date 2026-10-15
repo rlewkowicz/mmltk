@@ -222,12 +222,32 @@ DecodedNativeModelState decode_model_state(
    result.metadata.class_layout = unresolved_class_layout(static_cast<std::size_t>(result.metadata.num_classes));
    result.metadata.class_layout.class_name_evidence = std::move(evidence);
    for (const auto& asset : weight_catalog()) {
-    if (asset.coco_sparse_slots && asset.md5_hash == digests->md5) {
-     auto source_evidence = std::move(result.metadata.class_layout.class_name_evidence);
-     result.metadata.class_layout = coco_class_layout({ClassLayoutOrigin::VerifiedAsset, std::string(asset.filename), mmltk::common::io::sha256_hex(digests->sha256)});
-     result.metadata.class_layout.class_name_evidence = std::move(source_evidence);
-     break;
+    if (asset.md5_hash != digests->md5) continue;
+    if (asset.classifier_width != result.metadata.num_classes) throw std::invalid_argument("verified asset classifier width disagrees with its hash-bound evidence");
+    auto source_evidence = std::move(result.metadata.class_layout.class_name_evidence);
+    const ClassLayoutProvenance provenance{ClassLayoutOrigin::VerifiedAsset, std::string(asset.filename), mmltk::common::io::sha256_hex(digests->sha256)};
+    switch (asset.class_layout) {
+     case OfficialClassLayout::CocoSparse: result.metadata.class_layout = coco_class_layout(provenance); break;
+     case OfficialClassLayout::PersonActiveFirst:
+     case OfficialClassLayout::PersonBackgroundFirst: {
+      auto& layout = result.metadata.class_layout;
+      layout.foreground.names = {{"person"}};
+      layout.foreground.keypoints.emplace(1U, mmltk::backend::data::catalog::coco_person_keypoint_schema());
+      layout.slots.assign(asset.classifier_width, {ClassSlotRole::Unused, std::nullopt});
+      const auto foreground_slot = asset.class_layout == OfficialClassLayout::PersonActiveFirst ? 0U : 1U;
+      if (foreground_slot >= layout.slots.size()) throw std::invalid_argument("verified person asset has an invalid foreground slot");
+      layout.slots[foreground_slot] = {ClassSlotRole::Foreground, 0U};
+      const auto background_slot = asset.class_layout == OfficialClassLayout::PersonActiveFirst ? 1U : 0U;
+      if (background_slot >= layout.slots.size()) throw std::invalid_argument("verified person asset has an invalid background slot");
+      layout.slots[background_slot] = {ClassSlotRole::Background, std::nullopt};
+      layout.no_object = NoObjectEncoding::ExplicitBackground;
+      layout.provenance = provenance;
+      break;
+     }
+     case OfficialClassLayout::Unresolved: throw std::invalid_argument("registered official asset has ambiguous class evidence");
     }
+    result.metadata.class_layout.class_name_evidence = std::move(source_evidence);
+    break;
    }
   }
   const ResolvedClassLayout layout(result.metadata.class_layout);
@@ -299,6 +319,7 @@ ResolvedModelArtifacts resolve_admitted_model_artifacts(
  if (resolution > 0) { result.config.resolution = resolution; }
  validate_checkpoint_topology(result.config, state.metadata);
  apply_checkpoint_detection_overrides(result.config, state.metadata);
+ if (!native_model_config_valid(result.config)) throw std::invalid_argument("RF-DETR artifact has invalid task or head configuration");
  return result;
 }
 NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArtifacts& artifacts, const int64_t num_classes) {

@@ -134,6 +134,10 @@ if(MMLTK_TOOLS_BUILD_ORACLE)
     mmltk_tools_register_process(mmltk_rfdetr_upstream_oracle
         "${CMAKE_CURRENT_SOURCE_DIR}/oracle/generate_rfdetr_upstream_oracle.cpp"
         mmltk.tools.generate_rfdetr_upstream_oracle mmltk_tool_generate_rfdetr_upstream_oracle)
+    target_sources(mmltk_rfdetr_upstream_oracle PRIVATE oracle/native_catalog.cpp)
+    target_include_directories(mmltk_rfdetr_upstream_oracle PRIVATE
+        "${MMLTK_TOOLS_REPOSITORY}"
+        "${MMLTK_TOOLS_REPOSITORY}/src/frameworks/reflection/include")
     target_include_directories(mmltk_rfdetr_upstream_oracle SYSTEM PRIVATE "${MMLTK_TOOLS_PYBIND11_INCLUDE_DIR}")
     target_link_libraries(mmltk_rfdetr_upstream_oracle PRIVATE mmltk_tool_support Python3::Python)
     set_target_properties(mmltk_rfdetr_upstream_oracle PROPERTIES OUTPUT_NAME mmltk-rfdetr-upstream-oracle)

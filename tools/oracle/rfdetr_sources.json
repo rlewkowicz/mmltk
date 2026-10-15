@@ -1,0 +1,18 @@
+{
+  "format": "mmltk.rfdetr.sources.v1",
+  "core": {
+    "repository": "https://github.com/roboflow/rf-detr.git",
+    "revision": "e2b5f09663e6444acfac1acfaf82c2f00a4842c8",
+    "tree": "8a39e22ca0996cdd54ce0afad4a5dd352156afe4",
+    "package": "rfdetr",
+    "license": "Apache-2.0"
+  },
+  "plus": {
+    "repository": "https://github.com/roboflow/rf-detr_plus.git",
+    "revision": "df2d02ae7dd850bff2e5ca3472f86f196c120fd9",
+    "tree": "2191061dcd6e5e853786a8bc371464b0bf51cc7d",
+    "package": "rfdetr_plus",
+    "license": "PML-1.0"
+  },
+  "timm": "1.0.27"
+}

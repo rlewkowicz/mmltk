@@ -745,6 +745,8 @@ void test_persistence_repairs_catalog_and_compiled_directory_defaults() {
  document["workflows"]["predict"]["model_artifacts"]["preset_name"] = "removed-preset";
  document["workflows"]["predict"]["model_artifacts"]["input"] = static_cast<int>(ModelArtifactInputKind::TensorRt);
  document["workflows"]["predict"]["model_artifacts"]["tensorrt_path"] = "/old/model.engine";
+ document["workflows"]["validate"]["model_artifacts"]["preset_name"] = "rf-detr-seg-2xlarge";
+ document["workflows"]["validate"]["model_artifacts"]["resolution"] = 768;
  document["workflows"]["train"]["dataset_paths"]["use_compiled_directory_defaults"] = true;
  document["workflows"]["train"]["dataset_paths"]["train_compiled_path"] = "/custom/train.bin";
  mmltk::testsupport::write_text_file(settings_path, document.dump(2));
@@ -757,6 +759,7 @@ void test_persistence_repairs_catalog_and_compiled_directory_defaults() {
  CHECK(state.workflows.predict.model_source == ModelSelectionSource::Canonical);
  CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
  CHECK(state.workflows.predict.request.tensorrt_path.empty());
+ CHECK(state.workflows.validate.request.preset_name == "rf-detr-seg-xxlarge");
  CHECK_FALSE(state.workflows.train.use_compiled_directory_defaults);
  std::error_code cleanup_error;
  std::filesystem::remove(settings_path, cleanup_error);

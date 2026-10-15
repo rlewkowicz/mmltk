@@ -31,11 +31,15 @@ TEST_CASE("fresh stock coefficients are independent of interpreted weight metada
   artifact.mask_ce_loss_coef = 8.2;
   auto fresh = artifact;
   rfdetr::apply_stock_training_coefficients(fresh);
-  REQUIRE(fresh.cls_loss_coef == 1.0);
+  REQUIRE(fresh.cls_loss_coef == (fresh.has_keypoints() ? 2.0 : 1.0));
   REQUIRE(fresh.bbox_loss_coef == 5.0);
   REQUIRE(fresh.giou_loss_coef == 2.0);
-  REQUIRE(fresh.mask_ce_loss_coef == (fresh.segmentation ? 5.0 : 1.0));
-  REQUIRE(fresh.mask_dice_loss_coef == (fresh.segmentation ? 5.0 : 1.0));
+  REQUIRE(fresh.mask_ce_loss_coef == (fresh.has_masks() ? 5.0 : 1.0));
+  REQUIRE(fresh.mask_dice_loss_coef == (fresh.has_masks() ? 5.0 : 1.0));
+  REQUIRE(fresh.keypoint_l1_loss_coef == (fresh.has_keypoints() ? 1.0 : 0.0));
+  REQUIRE(fresh.keypoint_findable_loss_coef == (fresh.has_keypoints() ? 1.0 : 0.0));
+  REQUIRE(fresh.keypoint_visible_loss_coef == (fresh.has_keypoints() ? 1.0 : 0.0));
+  REQUIRE(fresh.keypoint_nll_loss_coef == (fresh.has_keypoints() ? 1.0 : 0.0));
   REQUIRE(artifact.cls_loss_coef == 7.3);
   REQUIRE(artifact.bbox_loss_coef == 9.1);
   REQUIRE(artifact.mask_ce_loss_coef == 8.2);

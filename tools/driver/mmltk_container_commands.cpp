@@ -243,10 +243,14 @@ Test options:
   --gdb                       Run the selected executable through containerized GDB
   --gdb-command <command>     Add an ordered GDB command (repeatable)
 )MMLTK";
- inline const std::string oracle_help = R"MMLTK(Usage: ./mmltk --diagnose-rfdetr-upstream --upstream PATH --output PATH [--sdpa default|math]
+ inline const std::string oracle_help = R"MMLTK(Usage: ./mmltk --diagnose-rfdetr-upstream --upstream PATH --plus-upstream PATH --output PATH [--inventory-only] [--sdpa default|math]
        ./mmltk --diagnose-rfdetr-upstream --build-only
 --build-only builds the isolated native oracle image without weights, upstream checkout, or numerical execution.
-Requires clean upstream e9a138f70cc14e3fddca029a0683055e34ab8f35 and cached official Nano weights.
+Requires clean core and Plus source pins from tools/oracle/rfdetr_sources.json.
+--inventory-only verifies/downloads the catalog's official assets through the pinned upstream registries,
+then records topology, class evidence, active joint masks and tensor metadata. No product build,
+forward, training or numerical comparisons run. Only the managed weights cache and evidence are writable.
+Numerical execution requires cached official Nano weights.
 Builds a validation-only cached image from the pinned full NGC donor.
 Executes upstream Nano/SegNano FP32 and supported AMP evidence, then core/training [upstream_oracle] cases.
 --sdpa math selects ATen math attention on both sides; default retains accelerated backend selection.

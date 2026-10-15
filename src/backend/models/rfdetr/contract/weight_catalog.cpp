@@ -18,7 +18,8 @@ consteval auto make_weight_catalog() {
    .filename = preset.canonical_weight_filename,
    .download_url = preset.canonical_weight_url,
    .md5_hash = preset.canonical_weight_md5,
-   .coco_sparse_slots = true,
+   .class_layout = preset.official_class_layout,
+   .classifier_width = preset.class_count,
   };
  }
  return assets;

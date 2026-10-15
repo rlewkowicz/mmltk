@@ -1314,7 +1314,7 @@ TEST_CASE("DN masks use stock direct equations for fixed samples gradients and u
      config.num_queries = 3;
      config.hidden_dim = 4;
      config.group_detr = 1;
-     config.segmentation = true;
+     config.task = mmltk::backend::models::rfdetr::ModelTask::Segmentation;
      config.aux_loss = true;
      config.dec_layers = 2;
      config.two_stage = true;

@@ -545,7 +545,7 @@ std::vector<LayerMaskSamples> oracle_samples(const OracleArchive& archive, std::
 DetectionConfig oracle_detection(const NativeRfDetrConfig& config) {
  auto result = detection_fixture_base(config);
  project_loss_coefficients(result, config);
- result.include_masks = config.segmentation;
+ result.include_masks = config.has_masks();
  result.mask_point_sample_ratio = config.mask_point_sample_ratio;
  populate_default_detection_weight_dict(result);
  return result;
