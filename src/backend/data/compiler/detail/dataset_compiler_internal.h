@@ -59,7 +59,7 @@ public:
  ~DirectoryLabels();
  DirectoryLabels(const DirectoryLabels&) = delete;
  DirectoryLabels& operator=(const DirectoryLabels&) = delete;
- [[nodiscard]] static detail::CompileResources resources(std::uint32_t width, std::size_t maximum_line, std::size_t label_capacity = COMPILED_LABEL_CAPACITY);
+ [[nodiscard]] static detail::CompileResources resources(std::uint32_t width, std::size_t maximum_line, std::size_t label_capacity = COMPILED_LABEL_CAPACITY, bool keypoints = false);
  void begin(std::uint32_t image_index, detail::CompileAllowance, std::span<const std::uint8_t> input, std::size_t maximum_line, const detail::CompileImageHeader&, const CompilerConfig&,
   const catalog::ClassCatalog&, std::uint8_t category_base, std::filesystem::path annotation, std::filesystem::path image);
  [[nodiscard]] bool step(mmltk::common::concurrency::CancellationObservation);
@@ -76,6 +76,6 @@ int resolve_num_workers(int configured_workers, std::span<const int> worker_cpus
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits, mmltk::common::concurrency::CancellationObservation cancellation = {});
-void write_metadata_blocks(const mmltk::common::io::FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
+void write_metadata_blocks(const mmltk::common::io::FileHandle& fd, const FileLayout& layout, const FileHeader& header, std::span<const std::byte> catalog, const LabelBlocks& label_blocks,
  mmltk::common::concurrency::CancellationObservation cancel_requested = {});
 }  // namespace mmltk::backend::data::compiler_internal

@@ -24,25 +24,31 @@ class CompiledLabelWorkspace final {
 public:
  common::types::WorkspaceBuffer<PackedInstance> labels;
  common::types::WorkspaceBuffer<RLEPair> runs;
+ common::types::WorkspaceBuffer<PackedJointSpan> joint_spans;
+ common::types::WorkspaceBuffer<PackedKeypoint> joints;
  struct OutputLease {
   CompileAllowance custody;
   std::shared_ptr<const Memory> owned;
   std::span<const PackedInstance> labels;
   std::span<const RLEPair> runs;
+  std::span<const PackedJointSpan> joint_spans;
+  std::span<const PackedKeypoint> joints;
   OutputLease() = default;
   OutputLease(OutputLease&&) noexcept = default;
   OutputLease& operator=(OutputLease&&) noexcept = default;
   OutputLease(const OutputLease&) = delete;
   OutputLease& operator=(const OutputLease&) = delete;
  };
- [[nodiscard]] static std::size_t required_bytes(std::uint32_t source_width, std::size_t capacity = COMPILED_LABEL_CAPACITY) {
+ [[nodiscard]] static std::size_t required_bytes(std::uint32_t source_width, std::size_t capacity = COMPILED_LABEL_CAPACITY, bool keypoints = false) {
   if (capacity > COMPILED_LABEL_LIMIT || capacity % sizeof(RLEPair)) throw std::invalid_argument("invalid compiled label capacity");
   const auto intervals = common::math::checked_multiply<std::size_t>((std::uint64_t{source_width} + 1) / 2, sizeof(std::pair<std::uint32_t, std::uint32_t>), "mask interval workspace overflow");
-  return common::math::checked_add(aligned(capacity / sizeof(PackedInstance) * sizeof(PackedInstance)),
-   common::math::checked_add(aligned(capacity / sizeof(RLEPair) * sizeof(RLEPair)), aligned(intervals), "label workspace overflow"), "label workspace overflow");
+  return common::math::checked_add(
+   keypoints ? common::math::checked_add(aligned(capacity / sizeof(PackedInstance) * sizeof(PackedJointSpan)), aligned(capacity / sizeof(PackedKeypoint) * sizeof(PackedKeypoint)), "joint workspace overflow") : 0,
+   common::math::checked_add(aligned(capacity / sizeof(PackedInstance) * sizeof(PackedInstance)),
+   common::math::checked_add(aligned(capacity / sizeof(RLEPair) * sizeof(RLEPair)), aligned(intervals), "label workspace overflow"), "label workspace overflow"), "joint workspace overflow");
  }
- void prepare(std::uint32_t width, CompileAllowance custody = {}, std::size_t capacity = COMPILED_LABEL_CAPACITY) {
-  const auto bytes = required_bytes(width, capacity);
+ void prepare(std::uint32_t width, CompileAllowance custody = {}, std::size_t capacity = COMPILED_LABEL_CAPACITY, bool keypoints = false) {
+  const auto bytes = required_bytes(width, capacity, keypoints);
   std::span<std::byte> storage;
   if (custody) {
    storage = custody.workspace();
@@ -59,6 +65,8 @@ public:
   };
   bind(labels, capacity / sizeof(PackedInstance));
   bind(runs, capacity / sizeof(RLEPair));
+  bind(joint_spans, keypoints ? capacity / sizeof(PackedInstance) : 0);
+  bind(joints, keypoints ? capacity / sizeof(PackedKeypoint) : 0);
   bind(scratch_.intervals, (std::uint64_t{width} + 1) / 2);
   prepared_ = true;
   capacity_ = capacity;
@@ -77,6 +85,8 @@ public:
   result.owned = owned_;
   result.labels = {labels.data(), labels.size()};
   result.runs = {runs.data(), runs.size()};
+  if (!joints.empty()) result.joint_spans = {joint_spans.data(), joint_spans.size()};
+  result.joints = {joints.data(), joints.size()};
   prepared_ = false;
   return result;
  }

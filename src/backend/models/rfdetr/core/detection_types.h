@@ -12,6 +12,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <memory>
+#include "src/backend/data/catalog/class_catalog.h"
+#include "reflected_tensor_packet.h"
 namespace mmltk::backend::models::rfdetr {
 using TensorMap = std::map<std::string, torch::Tensor>;
 struct PreparedTarget {
@@ -22,8 +25,12 @@ struct PreparedTarget {
  torch::Tensor labels;
  torch::Tensor area;
  torch::Tensor iscrowd;
+ // Normalized x,y plus source annotation visibility (0/1/2); padded rows are zero.
+ torch::Tensor keypoints;
+ torch::Tensor keypoint_counts;
 };
 struct PackedTargetMasks {
+ static constexpr bool tensor_packet = true;
  PackedTargetMasks() = default;
  PackedTargetMasks(torch::Tensor packed_bits, int64_t mask_height, int64_t mask_width, torch::Tensor transforms = {}, torch::Tensor occluder_indices = {}, torch::Tensor occluder_transforms = {},
   torch::Tensor spatial_erasure = {})
@@ -54,6 +61,9 @@ struct PreparedTargets {
  torch::Tensor all_labels;
  torch::Tensor all_area;
  torch::Tensor all_iscrowd;
+ torch::Tensor all_keypoints;
+ torch::Tensor all_keypoint_counts;
+ std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
  torch::Tensor target_offsets;
  torch::Tensor target_counts;
  torch::Tensor target_indices;
@@ -66,24 +76,8 @@ struct PreparedTargets {
   const auto record = [&stream](const torch::Tensor& tensor) {
    if (tensor.defined() && tensor.device().is_cuda()) { tensor.record_stream(stream); }
   };
-  record(sampling_keys);
-  record(all_image_ids);
-  record(orig_sizes);
-  record(nested_mask);
-  record(all_boxes);
-  record(all_labels);
-  record(all_area);
-  record(all_iscrowd);
-  record(target_offsets);
-  record(target_counts);
-  record(target_indices);
-  if (packed_masks) {
-   record(packed_masks->bits);
-   record(packed_masks->inverse_transforms);
-   record(packed_masks->occluder_mask_indices);
-   record(packed_masks->occluder_inverse_transforms);
-   record(packed_masks->erasure);
-  }
+  // Per-image targets are aliases of the aggregate tensors, already recorded.
+  visit_tensor_packet<false>(*this, record);
  }
 };
 struct SupervisedQueryLayout {

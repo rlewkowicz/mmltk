@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/backend/data/compiled/compiled_format.h"
 namespace mmltk::backend::data {
 struct FileHeaderInputs {
@@ -23,6 +25,7 @@ struct FileLayout {
  size_t label_pitch = 0;
  size_t pixel_block_bytes = 0;
  size_t block_bytes = 0;
+ size_t catalog_bytes = 0;
  size_t data_offset = 0;
  size_t index_size = 0;
  size_t index_offset = 0;
@@ -35,16 +38,25 @@ struct FileLayout {
 };
 struct AnnotationLayout {
  size_t run_offset = 0;
+ size_t joint_span_offset = 0;
+ size_t joint_offset = 0;
  size_t used_bytes = 0;
 };
 struct ImageAnnotations {
  std::span<const PackedInstance> labels;
  std::span<const RLEPair> runs;
+ std::span<const PackedJointSpan> joint_spans;
+ std::span<const PackedKeypoint> joints;
+ void validate_joints(const catalog::ClassCatalog* schema = nullptr) const;
+ [[nodiscard]] std::span<const PackedKeypoint> instance_joints(std::size_t instance) const;
  [[nodiscard]] std::span<const RLEPair> instance_rle(const PackedInstance& instance) const;
 };
 [[nodiscard]] size_t compiled_align_up(size_t value, size_t alignment);
-[[nodiscard]] AnnotationLayout annotation_layout(size_t labels, size_t runs, size_t capacity = COMPILED_LABEL_LIMIT);
-[[nodiscard]] ImageAnnotations annotation_view(const ImageEntry&, std::span<const std::byte> payload);
-[[nodiscard]] FileLayout compute_file_layout(uint32_t num_slots, size_t image_stride, size_t label_capacity = COMPILED_LABEL_CAPACITY);
+[[nodiscard]] AnnotationLayout annotation_layout(size_t labels, size_t runs, size_t capacity = COMPILED_LABEL_LIMIT, size_t joints = 0);
+[[nodiscard]] ImageAnnotations annotation_view(const ImageEntry&, std::span<const std::byte> payload, const catalog::ClassCatalog* schema = nullptr);
+[[nodiscard]] FileLayout compute_file_layout(uint32_t num_slots, size_t image_stride, size_t label_capacity = COMPILED_LABEL_CAPACITY, size_t catalog_bytes = 0);
 [[nodiscard]] FileHeader make_file_header(const FileHeaderInputs&, std::span<const std::string> class_names, const FileLayout&);
+// Canonical reflected catalog encoded once at the persisted boundary.
+[[nodiscard]] std::vector<std::byte> encode_compiled_catalog(const catalog::ClassCatalog&);
+[[nodiscard]] catalog::ClassCatalog decode_compiled_catalog(std::span<const std::byte>);
 }  // namespace mmltk::backend::data

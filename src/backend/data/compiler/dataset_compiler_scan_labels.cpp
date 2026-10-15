@@ -74,6 +74,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  struct ParsedCategory {
   std::string name;
   int raw_id = -1;
+  catalog::ClassKeypointSchema schema;
  };
  std::vector<ParsedCategory> parsed_categories;
  parsed_categories.reserve(categories["classes"].size());
@@ -86,6 +87,34 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
   if (!id.is_number_integer() || (!id.is_number_unsigned() && id.get<std::int64_t>() < 0) || id.get<std::uint64_t>() > MAX_CLASSES)
    throw std::runtime_error("class id must be an exact nonnegative integer in the supported range");
   parsed.raw_id = static_cast<int>(id.get<std::uint64_t>());
+  if (category.contains("keypoints")) {
+   const auto& names = category.at("keypoints");
+   if (!names.is_array() || names.size() > catalog::kKeypointsPerClassCapacity) throw std::runtime_error("category keypoints must be a bounded name array");
+   parsed.schema.names = names.get<std::vector<std::string>>();
+   const auto index = [&](const json& value) {
+    if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<std::int64_t>() < 0)) throw std::runtime_error("joint indexes must be nonnegative integers");
+    return catalog::checked_joint_index(value.get<std::uint64_t>(), names.size());
+   };
+   if (category.contains("skeleton")) {
+    const auto& edges = category.at("skeleton");
+    if (!edges.is_array() || edges.size() > catalog::kSkeletonEdgeCapacity) throw std::runtime_error("category skeleton exceeds capacity");
+    for (const auto& edge : edges) {
+     if (!edge.is_array() || edge.size() != 2) throw std::runtime_error("skeleton edges require two zero-based indexes");
+     parsed.schema.skeleton.push_back({index(edge[0]), index(edge[1])});
+    }
+   }
+   if (category.contains("horizontal_flip")) {
+    const auto& flip = category.at("horizontal_flip");
+    if (!flip.is_array() || flip.size() != names.size()) throw std::runtime_error("horizontal_flip must match joint count");
+    for (const auto& value : flip) parsed.schema.horizontal_flip.push_back(index(value));
+   }
+   if (category.contains("oks_sigmas")) {
+    const auto& sigmas = category.at("oks_sigmas");
+    if (!sigmas.is_array() || sigmas.size() != names.size()) throw std::runtime_error("oks_sigmas must match joint count");
+    parsed.schema.oks_sigmas = sigmas.get<std::vector<double>>();
+   }
+   catalog::validate_keypoint_schema(parsed.schema);
+  } else if (category.contains("skeleton") || category.contains("horizontal_flip") || category.contains("oks_sigmas")) throw std::runtime_error("joint schema requires ordered keypoints names");
   parsed_categories.push_back(std::move(parsed));
   min_raw_id = std::min(min_raw_id, parsed_categories.back().raw_id);
  }
@@ -94,6 +123,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  if (parsed_categories.size() > MAX_CLASSES) throw std::runtime_error("too many classes in categories.json");
  scan.source_category_base = static_cast<std::uint8_t>(class_id_base);
  std::vector<std::string> ordered_names(parsed_categories.size());
+ std::vector<catalog::ClassKeypointSchema> ordered_schemas(parsed_categories.size());
  std::array<bool, MAX_CLASSES> seen_ids{};
  for (const auto& category : parsed_categories) {
   compiler_internal::check_compilation_cancelled(cancellation);
@@ -103,8 +133,11 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
   if (seen_ids[class_id]) { throw std::runtime_error("duplicate class id in categories.json"); }
   seen_ids[class_id] = true;
   ordered_names[class_id] = category.name;
+  ordered_schemas[class_id] = category.schema;
  }
- scan.class_catalog = catalog::ClassCatalog(std::move(ordered_names), COMPILED_CLASS_NAME_CAPACITY);
+ auto catalog_record = catalog::ClassCatalog(std::move(ordered_names), COMPILED_CLASS_NAME_CAPACITY).record();
+ catalog_record.keypoints = std::move(ordered_schemas);
+ scan.class_catalog = catalog::ClassCatalog(catalog_record);
  scan.splits.reserve(splits.size());
  for (const std::string& split : splits) {
   compiler_internal::check_compilation_cancelled(cancellation);
@@ -170,6 +203,7 @@ struct DirectoryLabels::Impl {
  simdjson::ondemand::parser* parser = nullptr;
  common::types::WorkspaceBuffer<RLEPair> source_runs;
  common::types::WorkspaceBuffer<DatasetAnnotationFrame> json_stack;
+ common::types::WorkspaceBuffer<DatasetAnnotationScalar> joint_values;
  std::span<char> line_buffer;
  std::span<const std::uint8_t> input;
  const CompilerConfig* config = nullptr;
@@ -180,7 +214,7 @@ struct DirectoryLabels::Impl {
  dataset::MaskDimensions dimensions;
  imaging::resample::ImageResizeGeometry geometry;
  ImageEntry result{};
- std::size_t cursor = 0, line_number = 0, labels = 0, required_runs = 0;
+ std::size_t cursor = 0, line_number = 0, labels = 0, required_runs = 0, required_joints = 0;
  DatasetAnnotationJson record;
  PackedInstance label{};
  std::string_view class_name, rle;
@@ -198,7 +232,7 @@ struct DirectoryLabels::Impl {
   std::memcpy(line_buffer.data(), input.data() + cursor, bytes);
   try {
    auto document = parser->iterate(simdjson::padded_string_view(line_buffer.data(), bytes, line_buffer.size()));
-   record = project_dataset_annotation(document.get_object().value(), json_stack);
+   record = project_dataset_annotation(document.get_object().value(), json_stack, {joint_values.data(), joint_values.size()});
    if (!document.at_end()) throw std::runtime_error("trailing JSON content");
   } catch (const std::exception&) { throw std::runtime_error("invalid JSON annotation record in " + annotation.string() + " at line " + std::to_string(line_number)); }
   if (record.image_size_wh) {
@@ -360,6 +394,32 @@ struct DirectoryLabels::Impl {
    transformed[i] = static_cast<float>(value);
   }
   if (transformed[2] <= transformed[0] || transformed[3] <= transformed[1]) throw std::runtime_error("transformed bbox loses strict corner ordering");
+  const auto joint_count = catalog->keypoints(label.class_id).names.size();
+  if ((record.keypoints && (!record.keypoints->array_size || *record.keypoints->array_size != joint_count * 3)) || (!record.keypoints && joint_count)) throw std::runtime_error("instance keypoints must match the class schema as flattened x,y,visibility triples");
+  const auto joint_begin = required_joints;
+  required_joints = checked_add(required_joints, joint_count, "compiled joint count overflow");
+  if (required_joints) {
+   try { (void)annotation_layout(count, required_runs, output.capacity(), required_joints); }
+   catch (const std::runtime_error&) { exceeded = true; }
+  }
+  if (!exceeded && output.joint_spans.capacity()) {
+   output.joint_spans.push_back({checked_cast<std::uint32_t>(joint_begin, "joint offset overflow"), checked_cast<std::uint16_t>(joint_count, "joint count overflow"), 0});
+  }
+  for (std::size_t joint = 0; joint < joint_count; ++joint) {
+   const auto& values = record.keypoints->sequence;
+   const double x = numeric(values[joint * 3], "keypoint x must be numeric"), y = numeric(values[joint * 3 + 1], "keypoint y must be numeric");
+   const auto visibility = identity(values[joint * 3 + 2], "keypoint visibility must be an integer 0, 1 or 2");
+   if (!std::isfinite(x) || !std::isfinite(y) || visibility > 2) throw std::runtime_error("invalid keypoint coordinates or visibility");
+   PackedKeypoint point;
+   point.visibility = static_cast<std::uint8_t>(visibility);
+   if (visibility) {
+    const double px = x * geometry.resized_width / dimensions.width + geometry.offset_x;
+    const double py = y * geometry.resized_height / dimensions.height + geometry.offset_y;
+    if (!std::isfinite(px) || !std::isfinite(py) || std::abs(px) > std::numeric_limits<float>::max() || std::abs(py) > std::numeric_limits<float>::max()) throw std::runtime_error("transformed keypoint overflow");
+    point.x = static_cast<float>(px); point.y = static_cast<float>(py);
+   }
+   if (!exceeded) output.joints.push_back(point);
+  }
   labels = count;
   if (!exceeded) {
    label.bbox_x1 = transformed[0];
@@ -378,17 +438,18 @@ struct DirectoryLabels::Impl {
 };
 DirectoryLabels::DirectoryLabels(detail::CompileExecution& execution) : parser_(std::make_unique<Parser>(execution)) {}
 DirectoryLabels::~DirectoryLabels() = default;
-detail::CompileResources DirectoryLabels::resources(std::uint32_t width, std::size_t maximum_line, std::size_t label_capacity) {
+detail::CompileResources DirectoryLabels::resources(std::uint32_t width, std::size_t maximum_line, std::size_t label_capacity, bool keypoints) {
  const auto input = padded_line_bytes(maximum_line);
  const auto source = aligned_bytes(checked_multiply(source_run_capacity(maximum_line), sizeof(RLEPair), "source mask workspace overflow"));
+ const auto joint_bytes = keypoints ? aligned_bytes(std::min(maximum_line / 2 + 1, catalog::kKeypointsPerClassCapacity * 3) * sizeof(DatasetAnnotationScalar)) : 0;
  const auto stack = aligned_bytes(checked_multiply(json_stack_capacity(maximum_line), sizeof(DatasetAnnotationFrame), "JSON traversal workspace overflow"));
  // simdjson owns its decoded strings, structural indexes and depth stack.
  // Payload buffers we control are supplied; the parser's fixed opaque allocation
  // is separately charged for the full lifetime of this context, including yields.
  const auto opaque = maximum_line > directory_line_window ? parser_bytes(maximum_line) : 0;
  return {
-  .bytes = checked_add(detail::CompiledLabelWorkspace::required_bytes(width, label_capacity),
-   checked_add(checked_add(input, source, "annotation workspace overflow"), stack, "annotation workspace overflow"), "annotation workspace overflow"),
+  .bytes = checked_add(detail::CompiledLabelWorkspace::required_bytes(width, label_capacity, keypoints),
+   checked_add(checked_add(input, source, "annotation workspace overflow"), checked_add(stack, joint_bytes, "joint parse workspace overflow"), "annotation workspace overflow"), "annotation workspace overflow"),
   .supplied_workspace = true,
   .completion_workspace = true,
   .workspace_class = detail::CompileWorkClass::Annotations,
@@ -400,8 +461,8 @@ void DirectoryLabels::begin(std::uint32_t image_index, detail::CompileAllowance 
  impl_ = std::make_unique<Impl>();
  auto& value = *impl_;
  value.custody = allowance;
- value.output.prepare(header.width, allowance, config.max_label_bytes);
- auto memory = allowance.workspace().subspan(detail::CompiledLabelWorkspace::required_bytes(header.width, config.max_label_bytes));
+ value.output.prepare(header.width, allowance, config.max_label_bytes, catalog.has_keypoints());
+ auto memory = allowance.workspace().subspan(detail::CompiledLabelWorkspace::required_bytes(header.width, config.max_label_bytes, catalog.has_keypoints()));
  const auto padded = padded_line_bytes(maximum_line);
  value.line_buffer = {reinterpret_cast<char*>(memory.data()), padded};
  memory = memory.subspan(padded);
@@ -409,6 +470,10 @@ void DirectoryLabels::begin(std::uint32_t image_index, detail::CompileAllowance 
  value.source_runs.bind({reinterpret_cast<RLEPair*>(memory.data()), source_run_capacity(maximum_line)});
  memory = memory.subspan(aligned_bytes(checked_multiply(source_run_capacity(maximum_line), sizeof(RLEPair), "source mask workspace overflow")));
  value.json_stack.bind({reinterpret_cast<DatasetAnnotationFrame*>(memory.data()), json_stack_capacity(maximum_line)});
+ memory = memory.subspan(aligned_bytes(json_stack_capacity(maximum_line) * sizeof(DatasetAnnotationFrame)));
+ const auto joint_capacity = catalog.has_keypoints() ? std::min(maximum_line / 2 + 1, catalog::kKeypointsPerClassCapacity * 3) : 0;
+ value.joint_values.bind({reinterpret_cast<DatasetAnnotationScalar*>(memory.data()), joint_capacity});
+ value.joint_values.resize(joint_capacity);
  value.parser = &parser_->value;
  if (maximum_line > directory_line_window) {
   value.exceptional_parser = std::make_unique<simdjson::ondemand::parser>();
@@ -435,14 +500,14 @@ bool DirectoryLabels::step(mmltk::common::concurrency::CancellationObservation c
   compiler_internal::check_compilation_cancelled(cancellation);
   if (!value.record_active) {
    if (value.cursor == value.input.size()) {
-    set_annotation_extent(value.result, value.labels, value.required_runs, value.image.string(), value.output.capacity());
+    set_annotation_extent(value.result, value.labels, value.required_runs, value.image.string(), value.output.capacity(), value.required_joints);
     FileHeader checks{};
     checks.num_classes = checked_cast<std::uint32_t>(value.catalog->size(), "class count overflow");
     checks.max_instances_per_image = UINT16_MAX;
     checks.image_width = value.config->target_width;
     checks.image_height = value.config->target_height;
     (void)admit_compiled_annotations(
-     value.result, {{value.output.labels.data(), value.output.labels.size()}, {value.output.runs.data(), value.output.runs.size()}}, checks, value.image_index, cancellation);
+     value.result, {{value.output.labels.data(), value.output.labels.size()}, {value.output.runs.data(), value.output.runs.size()}, value.output.joints.empty() ? std::span<const PackedJointSpan>{} : std::span<const PackedJointSpan>{value.output.joint_spans.data(), value.output.joint_spans.size()}, {value.output.joints.data(), value.output.joints.size()}}, checks, value.image_index, cancellation);
     value.finished = true;
     return true;
    }

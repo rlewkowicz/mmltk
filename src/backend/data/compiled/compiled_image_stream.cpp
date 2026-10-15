@@ -666,15 +666,6 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
   if (!current.cancelled.load(std::memory_order_acquire) && (!current.observer.before || current.observer.before(current.observer.context, index))) {
    // All physical order and range metadata are ready before touching labels.
    if (!std::ranges::is_sorted(current.reads, {}, &CompiledImageRead::index)) std::ranges::sort(current.reads, {}, &CompiledImageRead::index);
-   for (const auto& read : current.reads) {
-    const auto& entry = source.image_entry(read.index);
-    if (!current.annotations.empty()) {
-     const auto position = read.destination_offset / source.header().image_stride;
-     auto* destination = static_cast<std::byte*>(current.labels.data());
-     if (entry.label_bytes) destination += position * current.label_pitch;
-     current.annotations[position] = annotation_view(entry, {destination, entry.label_bytes});
-    }
-   }
    const auto labels = current.annotations.empty() ? std::optional<std::size_t>{} : current.label_pitch;
    current.cursor = source.used_ranges(current.reads, labels);
    current.preparation = source.used_ranges(current.reads, labels, true);
@@ -854,6 +845,20 @@ void CompiledImageStream::finish_read(const std::size_t index) noexcept {
  bool read = !failure && !current.cancelled.load(std::memory_order_acquire);
  bool transfer_submitted = false;
  try {
+  if (read) {
+   // The versioned joint section is interpreted only after every gather has
+   // returned. Views borrow this slot until its ordinary consumer settlement.
+   const auto& source = *current.source;
+   for (const auto& request : current.reads) {
+    const auto& entry = source.image_entry(request.index);
+    if (!current.annotations.empty()) {
+     const auto position = request.destination_offset / source.header().image_stride;
+     auto* destination = static_cast<std::byte*>(current.labels.data());
+     if (entry.label_bytes) destination += position * current.label_pitch;
+     current.annotations[position] = annotation_view(entry, {destination, entry.label_bytes}, source.class_catalog().get());
+    }
+   }
+  }
   if (read)
    on_context(impl_->context, [&] {
     if (impl_->config.loading.h2d_dataloader) {

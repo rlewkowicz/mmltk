@@ -38,10 +38,12 @@ GpuBatchAugmenter::GpuBatchAugmenter(const GpuAugmentationConfig& config, const 
  resources_->output_ = torch::empty({batch_capacity_, 3, height_, width_}, float_options);
  batch_plan_.images.resize(static_cast<std::size_t>(batch_capacity_));
  donor_support_.resize(static_cast<std::size_t>(batch_capacity_));
+ donor_joints_.resize(static_cast<std::size_t>(batch_capacity_));
  donor_metadata_.resize(static_cast<std::size_t>(batch_capacity_));
  planned_donor_metadata_.resize(static_cast<std::size_t>(batch_capacity_));
  materialized_donors_.resize(static_cast<std::size_t>(batch_capacity_));
  planned_support_.resize(static_cast<std::size_t>(batch_capacity_));
+ planned_joints_.resize(static_cast<std::size_t>(batch_capacity_));
  planned_keys_.reserve(static_cast<std::size_t>(batch_capacity_));
  planned_donors_.reserve(static_cast<std::size_t>(batch_capacity_));
  executor_ = std::make_unique<GpuAugmentationExecutor>(config_, static_cast<std::size_t>(batch_capacity_), height_, width_, resources_->context, retirement_);
@@ -165,6 +167,7 @@ void GpuBatchAugmenter::materialize_donors(const mmltk::backend::data::DatasetLo
    donor_metadata_[slot] = planned_donor_metadata_[slot];
    const auto support = planned_support_[slot];
    donor_support_[slot].assign(support.begin(), support.end());
+   donor_joints_[slot].assign(planned_joints_[slot].begin(), planned_joints_[slot].end());
    if (descriptor.valid) {
     auto* image = resources_->donor_images_cpu_.data_ptr<float>() + slot * image_values;
     const bool image_changed = !materialized_donors_[slot].valid || materialized_donors_[slot].image_index != descriptor.image_index;
@@ -237,6 +240,7 @@ void GpuBatchAugmenter::prepare(const mmltk::backend::data::Batch& batch, const 
    const auto donor = resolve_training_donor(*source, supplied_donors[slot]);
    planned_donor_metadata_[slot] = donor.metadata;
    planned_support_[slot] = donor.support;
+   planned_joints_[slot] = donor.joints;
   }
  }
  current_epoch_ = epoch;
@@ -255,6 +259,9 @@ void GpuBatchAugmenter::prepare(const mmltk::backend::data::Batch& batch, const 
   const auto support = logical_donors_ ? planned_support_[slot] : std::span<const mmltk::backend::data::RLEPair>{donor_support_[slot]};
   image.paste_support = support.data();
   image.paste_support_count = support.size();
+  const auto joints = logical_donors_ ? planned_joints_[slot] : std::span<const mmltk::backend::data::PackedKeypoint>{donor_joints_[slot]};
+  image.paste_joints = joints.data();
+  image.paste_joint_count = joints.size();
  }
  planned_keys_.assign(batch.draw_keys.begin(), batch.draw_keys.end());
  planned_donors_.assign(supplied_donors.begin(), supplied_donors.end());
@@ -370,6 +377,7 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
    require(!instance.is_crowd(), "crowd annotation cannot enter the donor cache");
    (void)entry.instance_rle(instance);
    donor_support_[static_cast<std::size_t>(image)].reserve(instance.mask_rle_pairs);
+   donor_joints_[static_cast<std::size_t>(image)].reserve(entry.instance_joints(plan.cache_source_ordinal).size());
   }
   auto* replacements = resources_->replacement_indices_cpu_.data_ptr<std::int64_t>();
   auto* packed_support = resources_->donor_masks_cpu_.data_ptr<std::int64_t>();
@@ -388,6 +396,8 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
     const auto& instance = entry.labels[plan.cache_source_ordinal];
     auto& support = donor_support_[static_cast<std::size_t>(image)];
     support.clear();
+    const auto joints = entry.instance_joints(plan.cache_source_ordinal);
+    donor_joints_[static_cast<std::size_t>(image)].assign(joints.begin(), joints.end());
     if (instance.mask_rle_pairs != 0) {
      const auto runs = entry.instance_rle(instance);
      support.assign(runs.begin(), runs.end());

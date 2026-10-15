@@ -11,7 +11,7 @@
 #include "src/backend/data/compiled/compiled_format_limits.h"
 namespace mmltk::backend::data {
 inline constexpr uint64_t MAGIC = 0x46415354'4C445232ULL;
-inline constexpr uint32_t FORMAT_VERSION = 10;
+inline constexpr uint32_t FORMAT_VERSION = 11;
 inline constexpr size_t PAGE_SIZE = 4096;
 inline constexpr size_t HUGE_PAGE_SIZE = size_t{2} * 1024 * 1024;
 using PackedCoordinate = float;
@@ -70,6 +70,23 @@ inline std::string decode_open_images_category(std::uint64_t encoded) {
  return mid;
 }
 static_assert(sizeof(PackedInstance) == 60);
+// Format 11 appends a versioned joint section after the unchanged labels/runs.
+// Offsets count joint records, not bytes; the table follows instance order.
+struct PackedJointSpan {
+ std::uint32_t offset = 0;
+ std::uint16_t count = 0;
+ std::uint16_t reserved = 0;
+};
+struct PackedKeypoint {
+ float x = 0, y = 0;
+ std::uint8_t visibility = 0;
+ std::array<std::uint8_t, 3> reserved{};
+};
+struct PackedJointHeader {
+ std::uint32_t version = 1;
+ std::uint32_t count = 0;
+};
+static_assert(sizeof(PackedJointSpan) == 8 && sizeof(PackedKeypoint) == 12 && sizeof(PackedJointHeader) == 8);
 enum class ImageStatus : std::uint8_t { Inactive = 0, Eligible = 1 };
 struct __attribute__((packed)) ImageEntry {
  uint16_t num_instances = 0;
@@ -111,10 +128,12 @@ struct __attribute__((packed)) FileHeader {
  uint32_t max_instances_per_image;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
  uint32_t max_label_bytes = 0;
- std::array<uint8_t, 51> _reserved{};
+ std::uint32_t catalog_version = 0;
+ std::uint32_t catalog_bytes = 0;
+ std::array<uint8_t, 43> _reserved{};
 };
 inline constexpr std::size_t COMPILED_CLASS_NAME_CAPACITY = FileHeader{}.class_names[0].size() - 1U;
-static_assert(sizeof(FileHeader) == 8320, "Format 10 header layout changed");
+static_assert(sizeof(FileHeader) == 8320, "Compiled header identity layout changed");
 struct __attribute__((packed)) RLEPair {
  uint32_t start;
  uint32_t length;

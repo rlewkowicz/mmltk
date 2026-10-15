@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <nlohmann/json.hpp>
 #include <cuda.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -1835,4 +1836,148 @@ TEST_CASE("Torch compiler methods preserve labels catalog and stored geometry", 
   CHECK(std::memcmp(native.image_pixels(1), selected.image_pixels(1), native.header().image_stride) != 0);
 #endif
  }
+}
+TEST_CASE("compiled keypoint catalogs and contiguous payloads survive resize and compaction", "[backend][data][keypoints]") {
+ const mmltk::testsupport::ScopedTempDir root("compiled-keypoints");
+ FixtureSpec fixture{.root_dir = root.path().string(), .width = 64, .height = 48, .num_images = 2};
+ create_keypoint_dataset(fixture);
+ auto config = compiler_config(fixture);
+ config.target_width = config.target_height = 32;
+ config.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
+ config.num_workers = 1;
+ const auto plan = DatasetCompiler::prepare(config, {fixture.split});
+ DatasetCompiler::compile(plan, 0);
+ const auto source = CompiledDataset::open(compiled_bin_path(fixture));
+ REQUIRE(source.header().version == 11);
+ REQUIRE(source.header().catalog_version == 1);
+ CHECK(source.source_header().version == 11);
+ CHECK(source.source_metadata_bytes().size() == sizeof(FileHeader) + source.source_header().catalog_bytes);
+ auto malformed_header = source.source_header();
+ malformed_header.catalog_version = 2;
+ CHECK_THROWS(validate_compiled_header(malformed_header));
+ malformed_header.catalog_version = 1;
+ malformed_header.catalog_bytes = COMPILED_CATALOG_LIMIT + 1;
+ CHECK_THROWS(validate_compiled_header(malformed_header));
+ auto catalog_bytes = encode_compiled_catalog(*source.class_catalog());
+ CHECK_THROWS(decode_compiled_catalog(std::span{catalog_bytes}.first(catalog_bytes.size() - 1)));
+ REQUIRE(source.class_catalog()->keypoints(0) == catalog::coco_person_keypoint_schema());
+ CHECK(source.class_catalog()->keypoints(1).names.size() == 2);
+ CHECK(source.class_catalog()->keypoints(2).names.empty());
+ CHECK(source.annotations(0).labels.empty());
+ const auto annotations = source.annotations(1);
+ REQUIRE(annotations.labels.size() == 3);
+ REQUIRE(annotations.joints.size() == 19);
+ CHECK(annotations.instance_joints(2).empty());
+ const auto person = annotations.instance_joints(0);
+ REQUIRE(person.size() == 17);
+ CHECK(person[0].x == 2.F);
+ CHECK(person[0].y == 7.F);
+ CHECK(person[0].visibility == 2);
+ CHECK(person[1].x == 2.5F);
+ CHECK(person[1].y == 7.5F);
+ CHECK(person[1].visibility == 1);
+ CHECK(person[2].x == 0);
+ CHECK(person[2].y == 0);
+ CHECK(person[2].visibility == 0);
+ CHECK(person[16].x == 10.F);
+ CHECK(annotations.labels[0].annotation_id == 20);
+ CHECK(annotations.labels[0].source_category_id == 1);
+ CHECK(annotations.labels[0].class_id == 0);
+ CHECK(annotations.labels[2].source_ordinal == 3);
+ CHECK(source.header().max_label_bytes == source.image_entry(1).label_bytes);
+ CHECK(inspect_compiled_dataset(compiled_bin_path(fixture)).class_catalog->ordered_equal(*source.class_catalog()));
+
+ auto payload = std::vector<std::byte>(source.label_payload(1).begin(), source.label_payload(1).end());
+ const auto entry = source.image_entry(1);
+ CHECK_THROWS(annotation_view(entry, std::span{payload}.first(payload.size() - 1)));
+ const auto layout = annotation_layout(entry.num_instances, entry.num_runs, COMPILED_LABEL_LIMIT, annotations.joints.size());
+ const auto corrupt = GENERATE(0, 1, 2, 3);
+ if (corrupt == 0) {
+  PackedJointHeader header{1, UINT32_MAX};
+  std::memcpy(payload.data() + layout.joint_span_offset - sizeof(header), &header, sizeof(header));
+ } else if (corrupt == 1) {
+  PackedJointSpan span{UINT32_MAX, 17, 0};
+  std::memcpy(payload.data() + layout.joint_span_offset, &span, sizeof(span));
+ } else if (corrupt == 2) {
+  payload[layout.joint_offset + offsetof(PackedKeypoint, visibility)] = std::byte{3};
+ } else {
+  PackedJointSpan span{0, 18, 0};
+  std::memcpy(payload.data() + layout.joint_span_offset, &span, sizeof(span));
+ }
+ CHECK_THROWS(annotation_view(entry, payload, source.class_catalog().get()));
+}
+TEST_CASE("format ten admission retains exact header identity and eight-bit foreground endpoints", "[backend][data][keypoints][compatibility]") {
+ const mmltk::testsupport::ScopedTempDir root("compiled-format-ten");
+ std::vector<std::string> names;
+ for (int index = 0; index != 256; ++index) names.push_back("class-" + std::to_string(index));
+ const auto layout = compute_file_layout(1, 12, 120);
+ auto header = make_file_header({1, 1, 1, 3, 2, 12}, names, layout);
+ header.version = 10;
+ const auto path = root.path() / "legacy.bin";
+ const auto file = mmltk::common::io::FileHandle::create_output(path.string(), layout.total_size);
+ const std::array labels{PackedInstance{.class_id = 0, .bbox_x2 = 1, .bbox_y2 = 1}, PackedInstance{.class_id = 255, .bbox_x2 = 1, .bbox_y2 = 1}};
+ ImageEntry entry{.status = ImageStatus::Eligible, .original_width = 1, .original_height = 1};
+ set_annotation_extent(entry, labels.size(), 0, "legacy");
+ file.pwrite_all(&header, sizeof(header), 0);
+ file.pwrite_all(&entry, sizeof(entry), layout.index_offset);
+ write_compiled_annotations(file, layout, 0, entry, {labels, {}});
+ const auto source = CompiledDataset::open(path);
+ CHECK(source.header().version == 11);
+ CHECK(std::memcmp(&source.source_header(), &header, sizeof(header)) == 0);
+ CHECK(source.source_metadata_bytes().size() == sizeof(FileHeader));
+ CHECK(std::memcmp(source.source_metadata_bytes().data(), &header, sizeof(header)) == 0);
+ CHECK_FALSE(source.class_catalog()->has_keypoints());
+ const auto admitted = source.annotations(0);
+ CHECK(admitted.labels.front().class_id == 0);
+ CHECK(admitted.labels.back().class_id == 255);
+ CHECK(admitted.joints.empty());
+ CHECK(std::memcmp(admitted.labels.data(), labels.data(), sizeof(labels)) == 0);
+}
+TEST_CASE("keypoint streaming borrows gathered joint payloads until batch release", "[backend][data][keypoints][cuda]") {
+ const mmltk::testsupport::ScopedTempDir root("keypoint-stream");
+ FixtureSpec fixture{.root_dir = root.path().string(), .num_images = 3};
+ create_keypoint_dataset(fixture);
+ compile_existing_fixture(fixture);
+ DatasetLoader loader({.compiled_path = compiled_bin_path(fixture), .batch_size = 3, .shuffle = false, .prefetch_factor = 1, .loading = data_loading_options(true)});
+ const PackedKeypoint* retained = nullptr;
+ for (int epoch = 0; epoch != 2; ++epoch) {
+  loader.begin_epoch();
+  Batch batch;
+  REQUIRE(loader.next_batch(batch));
+  loader.wait_batch(batch);
+  REQUIRE(batch.num_images == 3);
+  REQUIRE(batch.class_catalog()->has_keypoints());
+  CHECK(batch.annotations(0).joints.empty());
+  const auto joints = batch.annotations(1).instance_joints(0);
+  REQUIRE(joints.size() == 17);
+  CHECK(joints.back().x == 20.F);
+  if (retained) CHECK(retained == joints.data());
+  retained = joints.data();
+  loader.release_batch(batch);
+  loader.synchronize();
+ }
+}
+
+TEST_CASE("Directory keypoint admission rejects malformed late triples without replacing a valid artifact", "[backend][data][keypoints][admission]") {
+ const mmltk::testsupport::ScopedTempDir root("keypoint-source-admission");
+ FixtureSpec fixture{.root_dir = root.path().string(), .num_images = 2};
+ create_keypoint_dataset(fixture);
+ compile_existing_fixture(fixture);
+ const auto original = read_compiled_header(compiled_bin_path(fixture));
+ const auto path = fs::path(dataset_dir(fixture)) / fixture.split / "000002.jsonl";
+ std::ifstream input(path);
+ std::string line;
+ REQUIRE(static_cast<bool>(std::getline(input, line)));
+ auto record = nlohmann::json::parse(line);
+ input.close();
+ const auto invalid = GENERATE(0, 1, 2, 3);
+ if (invalid == 0) record["keypoints"].erase(record["keypoints"].end() - 1);
+ if (invalid == 1) record["keypoints"][50] = 3;
+ if (invalid == 2) record["keypoints"][49] = "not a coordinate";
+ if (invalid == 3) record["keypoints"][50] = 1.5;
+ std::ofstream(path) << record.dump() << '\n';
+ CHECK_THROWS(compile_existing_fixture(fixture));
+ const auto retained = read_compiled_header(compiled_bin_path(fixture));
+ CHECK(std::memcmp(&original, &retained, sizeof(original)) == 0);
+ CHECK(CompiledDataset::open(compiled_bin_path(fixture)).annotations(1).joints.size() == 19);
 }

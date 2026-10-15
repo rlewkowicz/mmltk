@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdint>
 #include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/catalog/keypoint_schema.h"
 #include "src/common/math/deterministic_sampling.h"
 #include <span>
 #include "augmentation_plan.h"
@@ -15,6 +16,11 @@ struct AugmentationAnnotationSupport {
  bool present = false;
  std::array<float, 4> mask_bounds{};
 };
+// Uses the exact image plan and support/erasure rules. Output remains in compiled
+// pixel coordinates; cropped points become unannotated, covered points occluded.
+void map_augmentation_keypoints(std::span<const mmltk::backend::data::PackedKeypoint> source,
+ const mmltk::backend::data::catalog::ClassKeypointSchema& schema, int width, int height,
+ const AugmentationImagePlan* plan, std::span<mmltk::backend::data::PackedKeypoint> destination, bool donor = false);
 [[nodiscard]] bool augmentation_changes_support(const AugmentationImagePlan* plan) noexcept;
 [[nodiscard]] AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std::array<float, 4>& source_box, std::span<const mmltk::backend::data::RLEPair> source_mask, int width,
  int height, const AugmentationImagePlan* plan, bool donor = false, bool mask_present = false);

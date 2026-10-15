@@ -25,7 +25,7 @@ std::uint32_t CompiledSlotStorage::reserve_slot() {
  const std::lock_guard lock(mutex_);
  if (closed_) throw std::logic_error("compiled slot admission after seal");
  const auto slot = layout_.num_slots;
- const auto next = compute_file_layout(common::math::checked_add(slot, 1U, "compiled slot overflow"), layout_.image_stride, layout_.label_capacity);
+ const auto next = compute_file_layout(common::math::checked_add(slot, 1U, "compiled slot overflow"), layout_.image_stride, layout_.label_capacity, layout_.catalog_bytes);
  if (next.block_count() > slots_.size()) slots_.push_back(std::make_unique<SlotBlock>());
  layout_ = next;
  return slot;
@@ -130,7 +130,7 @@ CompiledSlotStorage::LabelLease CompiledSlotStorage::labels(std::uint32_t index)
 }
 void CompiledSlotStorage::LabelLease::write(const ImageEntry& entry, CompiledLabelWorkspace::OutputLease output, std::uint64_t ordinal_base) {
  owner_->prepare(index_, entry.label_bytes, false);
- write_compiled_annotations(owner_->artifact_.file(), owner_->layout(), index_, entry, {output.labels, output.runs}, ordinal_base);
+ write_compiled_annotations(owner_->artifact_.file(), owner_->layout(), index_, entry, {output.labels, output.runs, output.joint_spans, output.joints}, ordinal_base);
 }
 void CompiledSlotStorage::LabelLease::settle_ordinals(std::size_t count, std::uint64_t base, bool incomplete) {
  write_compiled_label_ordinals(owner_->artifact_.file(), owner_->layout().label_offset(index_), count, {}, base, incomplete);

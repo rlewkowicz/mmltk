@@ -33,6 +33,7 @@ struct TrainingDonorSource final {
  GpuAugmentationDonor metadata;
  // Borrowed from the loader mapping; consume or copy before its owner retires.
  std::span<const mmltk::backend::data::RLEPair> support;
+ std::span<const mmltk::backend::data::PackedKeypoint> joints;
 };
 [[nodiscard]] TrainingDonorSource resolve_training_donor(const mmltk::backend::data::DatasetLoader&, const TrainingDonorDescriptor&);
 class TrainingDataPlan final {

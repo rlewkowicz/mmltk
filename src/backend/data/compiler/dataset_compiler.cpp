@@ -219,6 +219,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  const auto worker_cpus = std::span<const int>(effective_config.worker_cpus).first(static_cast<std::size_t>(configured_workers));
  mmltk::common::logging::profile_set_value("compiler.num_workers", static_cast<std::size_t>(configured_workers));
  const auto& class_catalog = plan.class_catalog;
+ const auto catalog_bytes = encode_compiled_catalog(class_catalog);
  if (class_catalog.empty() || plan.source_category_base > 1U) throw std::runtime_error("invalid generic compile catalog");
  const uint32_t num_images = plan.splits[split_index].image_count;
  mmltk::common::logging::profile_set_value("compiler.num_images", num_images);
@@ -236,7 +237,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  FileLayout layout;
  {
   mmltk::common::logging::ScopedProfile layout_profile{"compiler.compute_file_layout"};
-  layout = compute_file_layout(num_images, image_stride, effective_config.max_label_bytes);
+  layout = compute_file_layout(num_images, image_stride, effective_config.max_label_bytes, catalog_bytes.size());
  }
  mmltk::common::logging::debug([&](spdlog::logger& log) {
   log.debug("[compile] Pixel layout: pixel_offset={} ({:.1f} MB aligned), pixels={:.2f} GB", layout.data_offset, static_cast<double>(layout.data_offset) / (1024.0 * 1024.0),
@@ -248,7 +249,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  auto& fd = staged.file();
  detail::CompiledSlotStorage storage(staged, layout);
  constexpr std::array classes{detail::CompileWorkClass::Extraction, detail::CompileWorkClass::Annotations, detail::CompileWorkClass::Pixels, detail::CompileWorkClass::Output};
- const auto label_window = compiler_internal::DirectoryLabels::resources(2048, compiler_internal::directory_line_window, effective_config.max_label_bytes).bytes;
+ const auto label_window = compiler_internal::DirectoryLabels::resources(2048, compiler_internal::directory_line_window, effective_config.max_label_bytes, class_catalog.has_keypoints()).bytes;
  detail::CompileExecutionLimits limits;
  limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(
   detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers), {width, height, effective_config.resize_mode, effective_config.perceptual_downscale, effective_config.resize_method},
@@ -285,7 +286,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
     ? CompiledCompactionObserver{[&](const auto& value) { effective_config.observation->compaction(effective_config.observation->context, value); }}
     : CompiledCompactionObserver{});
   mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
-  staged.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
+  staged.allocate_range(0, compiled_align_up(sizeof(FileHeader) + catalog_bytes.size(), PAGE_SIZE));
   staged.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));
   staged.resize_sparse(layout.total_size);
   const FileHeader header = make_file_header(
@@ -301,7 +302,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
    class_catalog.names(), layout);
   validate_compiled_header(header);
   compiler_internal::check_compilation_cancelled(cancellation);
-  compiler_internal::write_metadata_blocks(fd, layout, header, label_blocks, cancellation);
+  compiler_internal::write_metadata_blocks(fd, layout, header, catalog_bytes, label_blocks, cancellation);
   compiler_internal::check_compilation_cancelled(cancellation);
   if (telemetry != nullptr) { telemetry->enter_syncing(); }
   fd.sync_data();

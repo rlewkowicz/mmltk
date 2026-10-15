@@ -45,6 +45,8 @@ struct TargetStagingSlot {
  torch::Tensor labels;
  torch::Tensor area;
  torch::Tensor iscrowd;
+ torch::Tensor keypoints;
+ torch::Tensor keypoint_counts;
  torch::Tensor inverse_transforms;
  torch::Tensor occluder_mask_indices;
  torch::Tensor occluder_inverse_transforms;
@@ -88,7 +90,7 @@ struct TargetScratch {
  void ensure_instance_capacity(int64_t instances);
  void ensure_packed_mask_capacity(int64_t instances, int height, int width);
  void ensure_copy_resources(int target_device_id);
- TargetStagingSlot& acquire_staging_slot(std::size_t batch_size, int64_t instances, bool include_masks, int height, int width);
+ TargetStagingSlot& acquire_staging_slot(std::size_t batch_size, int64_t instances, bool include_masks, int height, int width, int64_t joint_capacity = 0);
  void upload_staging(const TargetStagingSlot& staging, int64_t instances, bool include_masks);
  [[nodiscard]] torch::Tensor device_view(const TargetStagingSlot& staging, const torch::Tensor& host) const;
  [[nodiscard]] torch::Tensor device_masks(int64_t instances) const;

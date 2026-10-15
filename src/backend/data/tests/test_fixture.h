@@ -105,6 +105,8 @@ struct FixtureSpec {
 std::string dataset_dir(const FixtureSpec& spec);
 std::string compiled_dir(const FixtureSpec& spec);
 std::string compiled_bin_path(const FixtureSpec& spec);
+// Three classes (COCO person, two-joint marker, no-joint object) plus background.
+void create_keypoint_dataset(const FixtureSpec& spec);
 void create_synthetic_dataset(const FixtureSpec& spec);
 [[nodiscard]] CompilerConfig compiler_config(const FixtureSpec& spec);
 void compile_existing_fixture(const FixtureSpec& spec);

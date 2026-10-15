@@ -34,7 +34,7 @@ int resolve_num_workers(int configured_workers, const std::span<const int> worke
  return static_cast<int>(allowed.size());
 }
 void write_metadata_blocks(
- const FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+ const FileHandle& fd, const FileLayout& layout, const FileHeader& header, std::span<const std::byte> catalog, const LabelBlocks& label_blocks, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  constexpr size_t kWriteChunkBytes = size_t{16U} * 1024U * 1024U;
  const auto write_block = [&](const void* source, const size_t bytes, const size_t offset) {
   const auto* source_bytes = static_cast<const std::uint8_t*>(source);
@@ -48,7 +48,7 @@ void write_metadata_blocks(
  };
  {
   mmltk::common::logging::ScopedProfile profile{"compiler.write_header"};
-  write_block(&header, sizeof(header), 0);
+  write_compiled_header(fd, header, catalog);
  }
  {
   mmltk::common::logging::ScopedProfile profile{"compiler.write_index"};

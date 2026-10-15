@@ -81,6 +81,7 @@ private:
  std::vector<GpuAugmentationDonor> planned_donor_metadata_;
  std::vector<TrainingDonorDescriptor> materialized_donors_;
  std::vector<std::span<const mmltk::backend::data::RLEPair>> planned_support_;
+ std::vector<std::span<const mmltk::backend::data::PackedKeypoint>> planned_joints_;
  std::vector<std::uint64_t> planned_keys_;
  std::vector<TrainingDonorDescriptor> planned_donors_;
  const mmltk::backend::data::DatasetLoader* planned_source_ = nullptr;
@@ -89,6 +90,7 @@ private:
  std::size_t next_staging_slot_ = 0;
  bool logical_donors_ = false;
  std::vector<std::vector<mmltk::backend::data::RLEPair>> donor_support_;
+ std::vector<std::vector<mmltk::backend::data::PackedKeypoint>> donor_joints_;
  std::unique_ptr<GpuAugmentationExecutor> executor_;
  bool cache_upload_pending_ = false;
  std::int64_t batch_capacity_ = 0;

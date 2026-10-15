@@ -2886,3 +2886,95 @@ TEST_CASE("Partial target DMA failure retains staging and permits bounded recove
  scratch.wait_for_pending_copy();
  REQUIRE(scratch.device_masks(128).cpu().sum().item<int64_t>() == 0);
 }
+TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusable target custody", "[rfdetr][training_supervision][keypoints][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+ c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
+ using namespace mmltk::backend::data;
+ auto record = catalog::ClassCatalog({"person", "marker", "object"}).record();
+ record.keypoints = std::vector{catalog::coco_person_keypoint_schema(), catalog::ClassKeypointSchema{{"left", "right"}, {{0, 1}}, {1, 0}, {.1, .1}}, catalog::ClassKeypointSchema{}};
+ const auto schema = std::make_shared<const catalog::ClassCatalog>(record);
+ const std::array labels{
+  PackedInstance{.class_id = 0, .flags = kAnnotationCrowd, .bbox_x2 = 8, .bbox_y2 = 8},
+  PackedInstance{.class_id = 1, .bbox_x2 = 8, .bbox_y2 = 8},
+  PackedInstance{.class_id = 2, .bbox_x2 = 8, .bbox_y2 = 8},
+ };
+ std::array<PackedKeypoint, 19> joints{};
+ joints[17] = {2, 4, 2};
+ joints[18] = {6, 5, 1};
+ const std::array spans{PackedJointSpan{0, 17}, PackedJointSpan{17, 2}, PackedJointSpan{19, 0}};
+ const std::array annotations{ImageAnnotations{labels, {}, spans, joints}};
+ const std::array<std::uint32_t, 1> identities{0};
+ Batch batch{.num_images = 1, .annotation_views = annotations.data(), .image_indices = identities.data(), .annotation_catalog = schema};
+ rfdetr::TargetScratch scratch(1);
+ rfdetr::AugmentationBatchPlan plan;
+ plan.images.resize(1);
+ plan.active_size = 1;
+ plan.transforms_geometry = true;
+ plan.images[0].horizontal_flip = true;
+ plan.images[0].forward = {-1, 0, 1, 0, 1, 0};
+ plan.images[0].inverse = plan.images[0].forward;
+ const void* allocation = nullptr;
+ for (int step = 0; step < 2; ++step) {
+  auto targets = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 8, {}, 3, &plan);
+  rfdetr::TargetConsumerLease lease(scratch, targets, 0);
+  lease.handoff();
+  REQUIRE(targets.counts == std::vector<std::int64_t>{2});
+  CHECK(targets.class_catalog == schema);
+  CHECK(targets.all_keypoint_counts.cpu().equal(torch::tensor({2, 0}, torch::kInt64)));
+  REQUIRE(targets.all_keypoints.size(0) == 2);
+  REQUIRE(targets.all_keypoints.size(1) == 2);
+  const auto values = targets.all_keypoints.cpu();
+  const auto coordinates = values.accessor<float, 3>();
+  CHECK(coordinates[0][0][0] == .25F);
+  CHECK(coordinates[0][0][1] == .625F);
+  CHECK(coordinates[0][0][2] == 1);
+  CHECK(coordinates[0][1][0] == .75F);
+  CHECK(coordinates[0][1][2] == 2);
+  CHECK(values.select(0, 1).count_nonzero().item<std::int64_t>() == 0);
+  CHECK(targets.targets[0].keypoints.is_alias_of(targets.all_keypoints));
+  CHECK(targets.all_keypoints.is_alias_of(targets.all_boxes));
+  if (allocation) CHECK(allocation == targets.all_keypoints.data_ptr());
+  allocation = targets.all_keypoints.data_ptr();
+  targets.record_stream(c10::cuda::getCurrentCUDAStream());
+  lease.retire();
+ }
+ const ImageAnnotations empty{};
+ batch.annotation_views = &empty;
+ auto targets = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 8, {}, 3);
+ rfdetr::TargetConsumerLease lease(scratch, targets, 0);
+ lease.handoff();
+ CHECK(targets.all_keypoints.numel() == 0);
+ CHECK(targets.all_keypoint_counts.numel() == 0);
+ lease.retire();
+ // Masked donors retain joint support outside their independent detection box.
+ const std::array donor_mask{RLEPair{0, 1}};
+ const std::array donor_joints{PackedKeypoint{.5F, .5F, 2}, PackedKeypoint{.25F, .25F, 1}};
+ plan.copy_paste_enabled = true;
+ auto& image = plan.images[0];
+ image = {};
+ image.paste_donor_slot = 0;
+ image.paste_label = 1;
+ image.paste_masked = true;
+ image.paste_source_box = {.5F, .5F, 1, 1};
+ image.paste_output_box = image.paste_source_box;
+ image.paste_support = donor_mask.data();
+ image.paste_support_count = donor_mask.size();
+ image.paste_joints = donor_joints.data();
+ image.paste_joint_count = donor_joints.size();
+ auto pasted = rfdetr::build_targets(batch, 8, 8, true, true, 0, scratch, "train", 8, {}, 3, &plan);
+ rfdetr::TargetConsumerLease pasted_lease(scratch, pasted, 0);
+ pasted_lease.handoff();
+ REQUIRE(pasted.counts == std::vector<std::int64_t>{1});
+ CHECK(pasted.all_labels.cpu().item<std::int64_t>() == 1);
+ CHECK(pasted.all_keypoint_counts.cpu().item<std::int64_t>() == 2);
+ const auto pasted_values = pasted.all_keypoints.cpu();
+ const auto pasted_coordinates = pasted_values.accessor<float, 3>();
+ CHECK(pasted_coordinates[0][0][0] == .0625F);
+ CHECK(pasted_coordinates[0][0][1] == .0625F);
+ CHECK(pasted_coordinates[0][0][2] == 2);
+ CHECK(pasted_coordinates[0][1][0] == .03125F);
+ CHECK(pasted_coordinates[0][1][1] == .03125F);
+ CHECK(pasted_coordinates[0][1][2] == 1);
+ REQUIRE(pasted.packed_masks);
+ CHECK(pasted.packed_masks->bits.cpu().sum().item<std::int64_t>() == 1);
+}

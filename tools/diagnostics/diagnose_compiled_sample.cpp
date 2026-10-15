@@ -29,17 +29,20 @@ export int mmltk_tool_diagnose_compiled_sample(int argc, char** argv) try {
  file.pread_all(&entry, sizeof(entry), sections.index_offset + std::size_t{slot} * sizeof(entry));
  if (!entry.eligible()) throw std::invalid_argument("sample slot is not eligible");
  const auto extent = data::annotation_layout(entry.num_instances, entry.num_runs);
- if (entry.label_bytes != extent.used_bytes || entry.label_bytes > header.max_label_bytes) throw std::invalid_argument("compiled label extent differs");
+ if (entry.label_bytes < extent.used_bytes || entry.label_bytes > header.max_label_bytes) throw std::invalid_argument("compiled label extent differs");
  auto payload = mmltk::common::io::OwnedBuffer<std::byte>::allocate(header.max_label_bytes);
- file.pread_all(payload.data(), extent.used_bytes, sections.layout.label_offset(slot));
- const auto annotations = data::annotation_view(entry, {payload.data(), extent.used_bytes});
- const auto catalog = data::compiled_class_catalog(header);
+ file.pread_all(payload.data(), entry.label_bytes, sections.layout.label_offset(slot));
+ const auto catalog = data::read_compiled_catalog(file, header);
+ const auto annotations = data::annotation_view(entry, {payload.data(), entry.label_bytes}, &catalog);
  auto labels = nlohmann::json::array();
+ std::size_t ordinal = 0;
  for (const auto& label : annotations.labels) {
+  auto joints = nlohmann::json::array();
+  for (const auto& joint : annotations.instance_joints(ordinal++)) joints.push_back({joint.x, joint.y, joint.visibility});
   labels.push_back(
    {{"class_id", +label.class_id}, {"class_name", catalog.names()[label.class_id]}, {"flags", +label.flags}, {"bbox", {+label.bbox_x1, +label.bbox_y1, +label.bbox_x2, +label.bbox_y2}},
     {"mask_pairs", +label.mask_rle_pairs}, {"annotation_id", +label.annotation_id}, {"source_category_id", +label.source_category_id}, {"original_area", +label.original_area},
-    {"source_ordinal", +label.source_ordinal}});
+    {"source_ordinal", +label.source_ordinal}, {"keypoint_names", catalog.keypoints(label.class_id).names}, {"keypoints", std::move(joints)}});
  }
  nlohmann::json result{
   {"kind", "compiled_sample"}, {"path", argv[1]}, {"sample", slot}, {"image_count", +header.num_images}, {"slot_count", +header.num_slots}, {"width", +header.image_width},

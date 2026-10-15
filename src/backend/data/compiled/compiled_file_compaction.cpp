@@ -60,13 +60,13 @@ FileLayout compact_compiled_file(const common::io::FileHandle& file, const FileL
    if (entry.status != ImageStatus::Inactive || entry.label_bytes || entry.num_instances || entry.num_runs) throw std::runtime_error("invalid inactive compaction slot");
    continue;
   }
-  if (entry.label_bytes != annotation_layout(entry.num_instances, entry.num_runs).used_bytes || entry.label_bytes > staging.label_capacity)
+  if (entry.label_bytes < annotation_layout(entry.num_instances, entry.num_runs).used_bytes || entry.label_bytes % sizeof(RLEPair) || entry.label_bytes > staging.label_capacity)
    throw std::runtime_error("compiled compaction label extent differs");
   maximum = std::max(maximum, std::size_t{entry.label_bytes});
   if (progress || facts) total = checked_add(total, checked_add(staging.image_stride, std::size_t{entry.label_bytes}, "compiled compaction sample overflow"), "compiled compaction total overflow");
  }
  if (facts) facts->live_bytes = total;
- const auto compact = compute_file_layout(staging.num_slots, staging.image_stride, maximum);
+ const auto compact = compute_file_layout(staging.num_slots, staging.image_stride, maximum, staging.catalog_bytes);
  if (compact.total_size > staging.total_size) throw std::logic_error("compiled compaction cannot grow its layout");
  const auto prior_window = compact.label_pitch == staging.label_pitch ? 0U : std::min(COMPILED_COMPACTION_SCRATCH_BYTES, compiled_align_up(std::max(staging.image_stride, maximum), PAGE_SIZE));
  std::optional<common::system::NumaMemory> owned;

@@ -1,8 +1,11 @@
 #include "src/backend/data/compiled/compiled_file_layout.h"
 #include <limits>
+#include <cmath>
+#include <algorithm>
 #include <sys/types.h>
 #include <cstring>
 #include <stdexcept>
+#include "src/frameworks/serialization/serialization.h"
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data {
 using namespace mmltk::common::math;
@@ -10,12 +13,41 @@ size_t compiled_align_up(size_t value, size_t alignment) {
  if (!alignment || (alignment & (alignment - 1U))) throw std::invalid_argument("compiled alignment must be a power of two");
  return checked_add(value, alignment - 1U, "compiled alignment overflow") & ~(alignment - 1U);
 }
-AnnotationLayout annotation_layout(size_t labels, size_t runs, size_t capacity) {
+AnnotationLayout annotation_layout(size_t labels, size_t runs, size_t capacity, size_t joints) {
  if (capacity > COMPILED_LABEL_LIMIT || capacity % sizeof(RLEPair)) throw std::invalid_argument("invalid compiled label capacity");
- const auto offset = compiled_align_up(checked_multiply(labels, sizeof(PackedInstance), "compiled labels overflow"), sizeof(RLEPair));
- const auto bytes = checked_add(offset, checked_multiply(runs, sizeof(RLEPair), "compiled runs overflow"), "compiled label payload overflow");
+ AnnotationLayout layout;
+ layout.run_offset = compiled_align_up(checked_multiply(labels, sizeof(PackedInstance), "compiled labels overflow"), sizeof(RLEPair));
+ auto bytes = checked_add(layout.run_offset, checked_multiply(runs, sizeof(RLEPair), "compiled runs overflow"), "compiled label payload overflow");
+ if (joints) {
+  layout.joint_span_offset = checked_add(bytes, sizeof(PackedJointHeader), "compiled joint header overflow");
+  layout.joint_offset = checked_add(layout.joint_span_offset, checked_multiply(labels, sizeof(PackedJointSpan), "compiled joint spans overflow"), "compiled joint offset overflow");
+  bytes = compiled_align_up(checked_add(layout.joint_offset, checked_multiply(joints, sizeof(PackedKeypoint), "compiled joints overflow"), "compiled joint extent overflow"), sizeof(RLEPair));
+ }
  if (bytes > capacity) throw std::runtime_error("compiled label capacity exceeded: required " + std::to_string(bytes) + " bytes, capacity " + std::to_string(capacity));
- return {offset, bytes};
+ layout.used_bytes = bytes;
+ return layout;
+}
+void ImageAnnotations::validate_joints(const catalog::ClassCatalog* schema) const {
+ if (joints.empty() && joint_spans.empty() && (!schema || !schema->has_keypoints())) return;
+ if ((!joints.empty() && joint_spans.size() != labels.size()) || (joints.empty() && !joint_spans.empty())) throw std::runtime_error("compiled joint span count differs");
+ std::size_t consumed = 0;
+ for (std::size_t index = 0; index < labels.size(); ++index) {
+  const auto points = instance_joints(index);
+  if ((!joint_spans.empty() && joint_spans[index].offset != consumed) || points.size() > catalog::kKeypointsPerClassCapacity) throw std::runtime_error("invalid compiled joint span");
+  if (schema && points.size() != schema->keypoints(labels[index].class_id).names.size()) throw std::runtime_error("compiled joints disagree with class schema");
+  consumed += points.size();
+ }
+ if (consumed != joints.size()) throw std::runtime_error("unreferenced compiled joints");
+ for (const auto& joint : joints)
+  if (!std::isfinite(joint.x) || !std::isfinite(joint.y) || joint.visibility > 2 || (!joint.visibility && (joint.x != 0 || joint.y != 0)) || !std::ranges::all_of(joint.reserved, [](auto value) { return value == 0; })) throw std::runtime_error("invalid compiled keypoint");
+}
+std::span<const PackedKeypoint> ImageAnnotations::instance_joints(std::size_t instance) const {
+ if (instance >= labels.size()) throw std::out_of_range("compiled joint instance");
+ if (joint_spans.empty()) return {};
+ if (instance >= joint_spans.size()) throw std::out_of_range("compiled joint span index");
+ const auto& span = joint_spans[instance];
+ if (span.reserved || span.offset > joints.size() || span.count > joints.size() - span.offset) throw std::runtime_error("compiled joint span exceeds payload");
+ return joints.subspan(span.offset, span.count);
 }
 std::span<const RLEPair> ImageAnnotations::instance_rle(const PackedInstance& instance) const {
  if (instance.mask_rle_offset % sizeof(RLEPair)) throw std::runtime_error("unaligned compiled run offset");
@@ -23,13 +55,25 @@ std::span<const RLEPair> ImageAnnotations::instance_rle(const PackedInstance& in
  if (begin > runs.size() || instance.mask_rle_pairs > runs.size() - begin) throw std::out_of_range("compiled instance run span");
  return runs.subspan(begin, instance.mask_rle_pairs);
 }
-ImageAnnotations annotation_view(const ImageEntry& entry, std::span<const std::byte> payload) {
- const auto layout = annotation_layout(entry.num_instances, entry.num_runs);
- if (entry.label_bytes != layout.used_bytes || payload.size() < layout.used_bytes) throw std::runtime_error("compiled label payload extent differs");
- if (!layout.used_bytes) return {};
- return {{reinterpret_cast<const PackedInstance*>(payload.data()), entry.num_instances}, {reinterpret_cast<const RLEPair*>(payload.data() + layout.run_offset), entry.num_runs}};
+ImageAnnotations annotation_view(const ImageEntry& entry, std::span<const std::byte> payload, const catalog::ClassCatalog* schema) {
+ auto layout = annotation_layout(entry.num_instances, entry.num_runs);
+ if (payload.size() < entry.label_bytes || entry.label_bytes < layout.used_bytes) throw std::runtime_error("compiled label payload extent differs");
+ if (!entry.label_bytes) return {};
+ ImageAnnotations result{{reinterpret_cast<const PackedInstance*>(payload.data()), entry.num_instances}, {reinterpret_cast<const RLEPair*>(payload.data() + layout.run_offset), entry.num_runs}};
+ if (entry.label_bytes > layout.used_bytes) {
+  if (entry.label_bytes - layout.used_bytes < sizeof(PackedJointHeader)) throw std::runtime_error("truncated compiled joint header");
+  PackedJointHeader header;
+  std::memcpy(&header, payload.data() + layout.used_bytes, sizeof(header));
+  if (header.version != 1 || !header.count) throw std::runtime_error("invalid compiled joint header");
+  layout = annotation_layout(entry.num_instances, entry.num_runs, COMPILED_LABEL_LIMIT, header.count);
+  if (entry.label_bytes != layout.used_bytes) throw std::runtime_error("compiled joint payload extent differs");
+  result.joint_spans = {reinterpret_cast<const PackedJointSpan*>(payload.data() + layout.joint_span_offset), entry.num_instances};
+  result.joints = {reinterpret_cast<const PackedKeypoint*>(payload.data() + layout.joint_offset), header.count};
+ }
+ result.validate_joints(schema);
+ return result;
 }
-FileLayout compute_file_layout(uint32_t slots, size_t stride, size_t label_capacity) {
+FileLayout compute_file_layout(uint32_t slots, size_t stride, size_t label_capacity, size_t catalog_bytes) {
  FileLayout layout;
  layout.num_slots = slots;
  layout.image_stride = stride;
@@ -41,7 +85,9 @@ FileLayout compute_file_layout(uint32_t slots, size_t stride, size_t label_capac
  layout.pixel_block_bytes = checked_multiply(COMPILED_BLOCK_SLOTS, layout.pixel_pitch, "compiled pixel block overflow");
  layout.block_bytes =
   compiled_align_up(checked_multiply(COMPILED_BLOCK_SLOTS, checked_add(layout.pixel_pitch, layout.label_pitch, "compiled slot extent overflow"), "compiled block overflow"), HUGE_PAGE_SIZE);
- layout.data_offset = compiled_align_up(sizeof(FileHeader), HUGE_PAGE_SIZE);
+ if (catalog_bytes > COMPILED_CATALOG_LIMIT) throw std::runtime_error("compiled catalog exceeds byte limit");
+ layout.catalog_bytes = catalog_bytes;
+ layout.data_offset = compiled_align_up(checked_add(sizeof(FileHeader), catalog_bytes, "compiled metadata overflow"), HUGE_PAGE_SIZE);
  layout.index_size = checked_multiply(size_t{slots}, sizeof(ImageEntry), "compiled index overflow");
  if (layout.index_size > COMPILED_METADATA_CAPACITY) throw std::runtime_error("compiled resident metadata exceeds 1000000000 bytes");
  const auto blocks = layout.block_count();
@@ -65,6 +111,8 @@ FileHeader make_file_header(const FileHeaderInputs& inputs, std::span<const std:
  FileHeader header{};
  header.magic = MAGIC;
  header.version = FORMAT_VERSION;
+ header.catalog_version = layout.catalog_bytes ? 1 : 0;
+ header.catalog_bytes = checked_cast<std::uint32_t>(layout.catalog_bytes, "compiled catalog overflow");
  header.resize_mode = inputs.resize_mode;
  header.num_images = inputs.num_images;
  header.num_slots = layout.num_slots;
@@ -87,5 +135,15 @@ FileHeader make_file_header(const FileHeaderInputs& inputs, std::span<const std:
   std::memcpy(header.class_names[id].data(), name.data(), name.size());
  }
  return header;
+}
+std::vector<std::byte> encode_compiled_catalog(const catalog::ClassCatalog& catalog) {
+ frameworks::serialization::wire::ByteBuffer bytes;
+ if (!frameworks::serialization::encode(catalog.record(), bytes, {.max_bytes = COMPILED_CATALOG_LIMIT, .max_items = COMPILED_CATALOG_LIMIT})) throw std::runtime_error("compiled catalog exceeds encoding limits");
+ return bytes;
+}
+catalog::ClassCatalog decode_compiled_catalog(std::span<const std::byte> bytes) {
+ auto record = frameworks::serialization::decode<catalog::OrderedClassCatalog>({bytes, {}}, {.max_bytes = COMPILED_CATALOG_LIMIT, .max_items = COMPILED_CATALOG_LIMIT});
+ if (!record) throw std::runtime_error("invalid compiled catalog schema");
+ return catalog::ClassCatalog(*record);
 }
 }  // namespace mmltk::backend::data

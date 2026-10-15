@@ -101,6 +101,7 @@ struct BenchmarkSplitWriter::Impl {
  FileLayout layout;
  std::uint32_t resolution;
  std::vector<std::string> class_names;
+ std::vector<std::byte> catalog_bytes;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode;
  mmltk::backend::imaging::resample::RgbResizeMethod resize_method;
  common_concurrency::CancellationObservation cancellation;
@@ -130,7 +131,7 @@ struct BenchmarkSplitWriter::Impl {
   if (request.trace) try {
     trace = request.trace;
    } catch (...) {}
-  (void)catalog::ClassCatalog(class_names, COMPILED_CLASS_NAME_CAPACITY);
+  catalog_bytes = encode_compiled_catalog(catalog::ClassCatalog(class_names, COMPILED_CLASS_NAME_CAPACITY));
   if (class_names.empty() || class_names.size() > MAX_CLASSES) throw std::runtime_error("benchmark split exceeds the compiled class limit");
   execution = request.execution;
   if (!request.worker_cpus.empty()) output_cpu = request.worker_cpus.front();
@@ -140,7 +141,7 @@ struct BenchmarkSplitWriter::Impl {
    writer_handles = output_execution->reserve(CompileResources::handles(1));
   }
   if (resolution == 0 || resolution > MAX_IMAGE_EXTENT) throw std::runtime_error("benchmark pixel membership is incomplete");
-  layout = compute_file_layout(common_math::checked_cast<std::uint32_t>(images.size(), "benchmark image count overflow"), stride);
+  layout = compute_file_layout(common_math::checked_cast<std::uint32_t>(images.size(), "benchmark image count overflow"), stride, COMPILED_LABEL_CAPACITY, catalog_bytes.size());
   (void)common_io::ensure_parent_directory(request.output_path);
   detail::StorageReservationPool storage(request.output_path, {}, execution ? &execution->storage() : nullptr);
   staging = detail::StagedArtifact::create(storage, request.output_path, 0, "benchmark sparse staging");
@@ -211,7 +212,7 @@ std::uint32_t BenchmarkSplitWriter::allocate_slot(EncodedImageRecord image, cons
  auto& state = *impl_;
  const std::lock_guard lock(state.facts_mutex);
  const auto slot = common_math::checked_cast<std::uint32_t>(state.images.size(), "benchmark slot overflow");
- const auto layout = compute_file_layout(common_math::checked_add(slot, 1U, "benchmark slot overflow"), state.stride);
+ const auto layout = compute_file_layout(common_math::checked_add(slot, 1U, "benchmark slot overflow"), state.stride, COMPILED_LABEL_CAPACITY, state.catalog_bytes.size());
  auto found = std::ranges::find(state.sources, source.root, &CachedImageSource::root);
  if (found == state.sources.end()) {
   image.source_index = common_math::checked_cast<std::uint16_t>(state.sources.size(), "benchmark source count overflow");
@@ -634,10 +635,10 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
  const auto header =
   make_file_header({common_math::checked_cast<std::uint32_t>(slots.size(), "benchmark image count overflow"), state.resolution, state.resolution, 3U, maximum, state.stride, state.resize_mode},
    class_catalog->names(), state.layout);
- state.staging.allocate_range(0, compiled_align_up(sizeof(header), PAGE_SIZE));
+ state.staging.allocate_range(0, compiled_align_up(sizeof(header) + state.catalog_bytes.size(), PAGE_SIZE));
  state.staging.allocate_range(state.layout.index_offset, compiled_align_up(state.layout.index_size, PAGE_SIZE));
  auto& output = state.staging.file();
- output.pwrite_all(&header, sizeof(header), 0);
+ write_compiled_header(output, header, state.catalog_bytes);
  output.pwrite_all(index.data(), state.layout.index_size, state.layout.index_offset);
  state.staging.resize_sparse(state.layout.total_size);
  trace_benchmark_event(request.trace, "benchmark.split_sync.started", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}}; });

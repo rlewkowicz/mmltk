@@ -97,7 +97,7 @@ private:
 // One layout is shared by pinned packing and device views. Each field remains
 // contiguous for the existing tensor and CUDA consumers; a single metadata DMA
 // replaces the small per-field copies. Masks retain their independent extent.
-int64_t bind_target_metadata(TargetStagingSlot& slot, const torch::Tensor& storage, int64_t batch, int64_t instances, bool masks) {
+int64_t bind_target_metadata(TargetStagingSlot& slot, const torch::Tensor& storage, int64_t batch, int64_t instances, bool masks, int64_t joints) {
  int64_t offset = 0;
  const auto take = [&](at::IntArrayRef shape, at::ScalarType type) {
   int64_t bytes = static_cast<int64_t>(c10::elementSize(type));
@@ -120,6 +120,8 @@ int64_t bind_target_metadata(TargetStagingSlot& slot, const torch::Tensor& stora
  slot.labels = take({instances}, torch::kInt64);
  slot.area = take({instances}, torch::kFloat32);
  slot.iscrowd = take({instances}, torch::kInt64);
+ slot.keypoints = take({instances, joints, 3}, torch::kFloat32);
+ slot.keypoint_counts = take({instances}, torch::kInt64);
  slot.inverse_transforms = take({masks ? instances : 0, 6}, torch::kFloat32);
  slot.occluder_mask_indices = take({masks ? instances : 0}, torch::kInt64);
  slot.occluder_inverse_transforms = take({masks ? instances : 0, 6}, torch::kFloat32);
@@ -296,7 +298,7 @@ void TargetScratch::ensure_packed_mask_capacity(int64_t instances, int height, i
  mask_words_per_instance = packed_mask_words_for_shape(mask_height, mask_width);
  static_cast<void>(instances);
 }
-TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_size, const int64_t instances, const bool include_masks, const int height, const int width) {
+TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_size, const int64_t instances, const bool include_masks, const int height, const int width, const int64_t joint_capacity) {
  require(!staging_slot_acquired_, "target staging slot is already acquired");
  require(copy_stream_device_id_ >= 0, "target staging slot acquisition requires configured copy resources");
  torch_cuda::TorchCudaDeviceGuard device_guard(mmltk::backend::ml::cuda::checked_device_index(copy_stream_device_id_));
@@ -328,7 +330,7 @@ TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_s
  const int64_t slot_instance_capacity = std::max(slot.instance_capacity, required_instances);
  const int64_t mask_words = include_masks ? packed_mask_words_for_shape(height, width) : 0;
  // The common shape keeps the already-bound views as well as its allocations.
- if (slot.metadata.defined() && slot.image_ids.size(0) == required_batch && slot.boxes.size(0) == required_instances && slot.erasure.size(0) == (include_masks ? required_instances : 0) &&
+ if (slot.metadata.defined() && slot.image_ids.size(0) == required_batch && slot.boxes.size(0) == required_instances && slot.keypoints.size(1) == joint_capacity && slot.erasure.size(0) == (include_masks ? required_instances : 0) &&
      (!include_masks || (slot.packed_masks.defined() && slot.mask_height == height && slot.mask_width == width && slot.packed_masks.size(0) == required_instances))) {
   active_staging_slot_ = index;
   next_staging_slot_ = (index + 1) % staging_slots_.size();
@@ -336,11 +338,11 @@ TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_s
   return slot;
  }
  TargetStagingSlot replacement;
- const auto metadata_bytes = bind_target_metadata(replacement, {}, required_batch, required_instances, include_masks);
+ const auto metadata_bytes = bind_target_metadata(replacement, {}, required_batch, required_instances, include_masks, joint_capacity);
  replacement.metadata_owner =
   slot.metadata_owner && slot.metadata_owner->capacity_bytes() >= static_cast<std::size_t>(metadata_bytes) ? slot.metadata_owner : std::make_shared<torch_cuda::NumaHostTensor>(copy_stream_device_id_);
  replacement.metadata = replacement.metadata_owner->view({metadata_bytes}, torch::kUInt8);
- (void)bind_target_metadata(replacement, replacement.metadata, required_batch, required_instances, include_masks);
+ (void)bind_target_metadata(replacement, replacement.metadata, required_batch, required_instances, include_masks, joint_capacity);
  replacement.mask_owner = slot.mask_owner;
  if (include_masks) {
   const auto mask_bytes = static_cast<std::size_t>(required_instances) * static_cast<std::size_t>(mask_words) * sizeof(std::int64_t);
@@ -597,6 +599,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
  prepared.split = split;
  prepared.resolved_query_count = resolved_query_count;
  prepared.targets.reserve(batch.num_images);
+ prepared.class_catalog = batch.class_catalog();
  scratch.ensure_batch(batch.num_images, image_height, image_width, device_id);
  mmltk::common::logging::profile_add_value("rfdetr.targets.images", batch.num_images);
  const auto device = mmltk::backend::ml::cuda::cuda_device(device_id);
@@ -604,15 +607,28 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
  auto& offsets = scratch.offsets;
  auto& counts = scratch.counts;
  int64_t maximum_instances = 0;
+ int64_t joint_capacity = 0;
  for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
   const auto entry = batch.annotations(image_pos);
   maximum_instances += static_cast<int64_t>(entry.labels.size());
+  if (!entry.joints.empty() || (prepared.class_catalog && prepared.class_catalog->has_keypoints())) for (std::size_t instance = 0; instance < entry.labels.size(); ++instance) {
+   const auto joints = entry.instance_joints(instance);
+   if ((!joints.empty() && !prepared.class_catalog) || (prepared.class_catalog && joints.size() != prepared.class_catalog->keypoints(entry.labels[instance].class_id).names.size())) throw std::runtime_error("target keypoint count differs from class schema");
+   if (!entry.labels[instance].is_crowd()) joint_capacity = std::max(joint_capacity, static_cast<int64_t>(joints.size()));
+  }
+  if (augmentation_plan) {
+   const auto& plan = augmentation_plan->images[image_pos];
+   if (plan.paste_donor_slot >= 0) {
+    if ((!prepared.class_catalog && plan.paste_joint_count) || (prepared.class_catalog && plan.paste_joint_count != prepared.class_catalog->keypoints(plan.paste_label).names.size())) throw std::runtime_error("donor keypoint count differs from class schema");
+    joint_capacity = std::max(joint_capacity, static_cast<int64_t>(plan.paste_joint_count));
+   }
+  }
  }
  if (augmentation_plan != nullptr && augmentation_plan->copy_paste_enabled) { maximum_instances += static_cast<int64_t>(batch.num_images); }
  scratch.ensure_instance_capacity(std::max<int64_t>(maximum_instances, 1));
  if (include_masks) { scratch.ensure_packed_mask_capacity(std::max<int64_t>(maximum_instances, 1), image_height, image_width); }
  scratch.ensure_copy_resources(device_id);
- auto& staging = scratch.acquire_staging_slot(batch.num_images, maximum_instances, include_masks, image_height, image_width);
+ auto& staging = scratch.acquire_staging_slot(batch.num_images, maximum_instances, include_masks, image_height, image_width, joint_capacity);
  StagingSubmissionGuard staging_submission(scratch);
  auto image_ids_cpu = staging.image_ids.narrow(0, 0, static_cast<int64_t>(batch.num_images));
  auto offsets_cpu = staging.offsets.narrow(0, 0, static_cast<int64_t>(batch.num_images));
@@ -636,6 +652,20 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   std::memset(staging.iscrowd.data_ptr<int64_t>(), 0, static_cast<size_t>(maximum_instances) * sizeof(int64_t));
   if (include_masks) std::fill_n(staging.occluder_mask_indices.data_ptr<int64_t>(), maximum_instances, int64_t{-1});
  }
+ if (staging.keypoints.numel()) std::memset(staging.keypoints.data_ptr<float>(), 0, staging.keypoints.numel() * sizeof(float));
+ std::memset(staging.keypoint_counts.data_ptr<int64_t>(), 0, staging.keypoint_counts.numel() * sizeof(int64_t));
+ const auto pack_joints = [&](int64_t row, std::span<const mmltk::backend::data::PackedKeypoint> source, std::size_t label, const AugmentationImagePlan* plan, bool donor) {
+  staging.keypoint_counts.data_ptr<int64_t>()[row] = static_cast<int64_t>(source.size());
+  if (source.empty()) return;
+  std::array<mmltk::backend::data::PackedKeypoint, mmltk::backend::data::catalog::kKeypointsPerClassCapacity> transformed;
+  map_augmentation_keypoints(source, prepared.class_catalog->keypoints(label), image_width, image_height, plan, std::span{transformed}.first(source.size()), donor);
+  auto* output = staging.keypoints.data_ptr<float>() + row * joint_capacity * 3;
+  for (std::size_t joint = 0; joint < source.size(); ++joint) {
+   output[joint * 3] = transformed[joint].x / image_width;
+   output[joint * 3 + 1] = transformed[joint].y / image_height;
+   output[joint * 3 + 2] = transformed[joint].visibility;
+  }
+ };
  auto boxes = staging.boxes.accessor<float, 2>();
  auto labels = staging.labels.accessor<int64_t, 1>();
  auto areas = staging.area.accessor<float, 1>();
@@ -684,6 +714,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
      staging.sampling_keys.data_ptr<std::int64_t>()[target_index] = std::bit_cast<std::int64_t>(training_stochastic_key(image_key, instance.source_ordinal, instance_index, 0, 0x544152));
     write_cxcywh_box(boxes, target_index, transformed);
     labels[target_index] = static_cast<int64_t>(instance.class_id);
+    pack_joints(target_index, entry.instance_joints(instance_index), instance.class_id, image_plan, false);
     if (erasure_bytes != nullptr) { std::memcpy(erasure_bytes + target_index * sizeof(erasure), &erasure, sizeof(erasure)); }
     if (include_masks) {
      std::copy(inverse.begin(), inverse.end(), &inverse_transforms[target_index][0]);
@@ -724,6 +755,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
     const auto& paste_box = donor_support.box_xyxy;
     write_cxcywh_box(boxes, paste_index, paste_box);
     labels[paste_index] = paste_plan->paste_label;
+    pack_joints(paste_index, {paste_plan->paste_joints, paste_plan->paste_joint_count}, paste_plan->paste_label, paste_plan, true);
     if (erasure_bytes != nullptr) { std::memcpy(erasure_bytes + paste_index * sizeof(erasure), &erasure, sizeof(erasure)); }
     areas[paste_index] = donor_support.area_pixels;
     if (include_masks) {
@@ -770,6 +802,8 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   labels_gpu = scratch.device_view(staging, staging.labels).narrow(0, 0, total_instances);
   area_gpu = scratch.device_view(staging, staging.area).narrow(0, 0, total_instances);
   iscrowd_gpu = scratch.device_view(staging, staging.iscrowd).narrow(0, 0, total_instances);
+  prepared.all_keypoints = scratch.device_view(staging, staging.keypoints).narrow(0, 0, total_instances);
+  prepared.all_keypoint_counts = scratch.device_view(staging, staging.keypoint_counts).narrow(0, 0, total_instances);
   if (total_instances > 0) {
    if (!batch.draw_keys.empty()) prepared.sampling_keys = scratch.device_view(staging, staging.sampling_keys).narrow(0, 0, total_instances);
    if (include_masks) {
@@ -827,6 +861,8 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
    target.labels = labels_gpu.narrow(0, offsets[image_pos], counts[image_pos]);
    target.area = area_gpu.narrow(0, offsets[image_pos], counts[image_pos]);
    target.iscrowd = iscrowd_gpu.narrow(0, offsets[image_pos], counts[image_pos]);
+   target.keypoints = prepared.all_keypoints.narrow(0, offsets[image_pos], counts[image_pos]);
+   target.keypoint_counts = prepared.all_keypoint_counts.narrow(0, offsets[image_pos], counts[image_pos]);
    prepared.targets.push_back(std::move(target));
   }
  }

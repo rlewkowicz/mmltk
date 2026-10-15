@@ -35,6 +35,8 @@ struct Batch {
  const void* owner = nullptr;
  std::weak_ptr<const void> image_custody{};
  std::size_t image_capacity_bytes = 0;
+ std::shared_ptr<const catalog::ClassCatalog> annotation_catalog{};
+ [[nodiscard]] std::shared_ptr<const catalog::ClassCatalog> class_catalog() const noexcept { return annotation_catalog ? annotation_catalog : source ? source->class_catalog() : nullptr; }
  [[nodiscard]] ImageAnnotations annotations(std::size_t image) const {
   if (image >= num_images) throw std::out_of_range("batch annotation image");
   if (annotation_views) return annotation_views[image];

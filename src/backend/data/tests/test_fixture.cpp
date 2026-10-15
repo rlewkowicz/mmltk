@@ -579,6 +579,38 @@ void create_synthetic_dataset(const FixtureSpec& spec) {
  }
  for (int i = 1; i <= spec.num_images; ++i) { write_synthetic_sample(split_dir, i, spec.width, spec.height, background_images, spec.pixel_evidence); }
 }
+void create_keypoint_dataset(const FixtureSpec& spec) {
+ if (spec.num_images < 2 || spec.width < 32 || spec.height < 32) throw std::invalid_argument("keypoint fixture requires two images and a 32-pixel extent");
+ create_synthetic_dataset(spec);
+ const auto person = catalog::coco_person_keypoint_schema();
+ const catalog::ClassKeypointSchema marker{{"left", "right"}, {{0, 1}}, {1, 0}, {.1, .1}};
+ Json classes = Json::array();
+ const std::array<std::string, 3> names{"person", "marker", "object"};
+ const std::array schemas{person, marker, catalog::ClassKeypointSchema{}};
+ for (std::size_t index = 0; index < names.size(); ++index) {
+  const auto& schema = schemas[index];
+  Json edges = Json::array();
+  for (const auto& edge : schema.skeleton) edges.push_back({edge.first, edge.second});
+  classes.push_back({{"id", index}, {"name", names[index]}, {"keypoints", schema.names}, {"skeleton", edges}, {"horizontal_flip", schema.horizontal_flip}, {"oks_sigmas", schema.oks_sigmas}});
+ }
+ std::ofstream(fs::path(dataset_dir(spec)) / "categories.json") << Json{{"classes", classes}, {"splits", {{spec.split, {{"total", spec.num_images}}}}}}.dump();
+ for (int image = 1; image <= spec.num_images; ++image) {
+  char name[32];
+  std::snprintf(name, sizeof(name), "%06d.jsonl", image);
+  std::ofstream out(fs::path(dataset_dir(spec)) / spec.split / name);
+  if (image == 1) continue;
+  for (std::size_t index = 0; index < names.size(); ++index) {
+   Json joints = Json::array();
+   for (std::size_t joint = 0; joint < schemas[index].names.size(); ++joint) {
+    const auto visibility = joint % 3 == 0 ? 2 : joint % 3 == 1 ? 1 : 0;
+    joints.push_back(visibility ? 4 + joint : 0);
+    joints.push_back(visibility ? 6 + joint : 0);
+    joints.push_back(visibility);
+   }
+   out << Json{{"class", names[index]}, {"bbox_xyxy", {2, 2, spec.width - 2, spec.height - 2}}, {"keypoints", joints}, {"image_size_wh", {spec.width, spec.height}}, {"id", image * 10 + index}, {"image_id", image}, {"category_id", index + 1}}.dump() << '\n';
+  }
+ }
+}
 void replace_synthetic_image(const FixtureSpec& spec, const int image_index, const int width, const int height) {
  if (image_index < 1 || image_index > spec.num_images || width <= 30 || height <= 30) throw std::invalid_argument("synthetic replacement image is invalid");
  write_synthetic_sample(fs::path(dataset_dir(spec)) / spec.split, image_index, width, height, std::clamp(spec.background_images, 0, spec.num_images), spec.pixel_evidence);

@@ -1164,6 +1164,9 @@ TEST_CASE("Preview presence and raster bounds stay independent through geometry 
  plan.erasure.y1 = .25F;
  build();
  CHECK(std::ranges::none_of(output, [](const auto& item) { return item.source_ordinal == 0; }));
+ const mmltk::backend::data::catalog::ClassKeypointSchema joint_schema{{"point"}, {}, {0}, {.1}};
+ const std::array donor_joints{mmltk::backend::data::PackedKeypoint{.5F, .5F, 2}};
+ std::array<mmltk::backend::data::PackedKeypoint, 1> mapped_joints{};
  for (bool masked : {false, true}) {
   plan = {};
   plan.paste_donor_slot = 0;
@@ -1174,8 +1177,13 @@ TEST_CASE("Preview presence and raster bounds stay independent through geometry 
   plan.paste_support_count = runs.size();
   build_augmentation_preview_annotations({}, &instances[0], &plan, 8, 4, output, {});
   REQUIRE(output.size() == 1);
+  CHECK(output[0].class_id == instances[0].class_id);
+  map_augmentation_keypoints(donor_joints, joint_schema, 8, 4, &plan, mapped_joints, true);
+  CHECK(mapped_joints[0].visibility == (masked ? 2 : 0));
   CHECK(output[0].mask_present == masked);
   if (masked) {
+   CHECK(mapped_joints[0].x == .5F);
+   CHECK(mapped_joints[0].y == .5F);
    CHECK(output[0].mask_bounds[0] == 0.0F);
    CHECK(output[0].mask_bounds[2] >= .125F);
    CHECK(output[0].mask_bounds[3] >= .25F);
@@ -1368,6 +1376,67 @@ TEST_CASE("Augmentation host staging retires before delayed pixel consumers", "[
  gate.release();
  executor.Finish();
  CHECK(retained.expired());
+}
+TEST_CASE("joint identity visibility and geometry follow the admitted augmentation plan", "[backend][rfdetr][augmentation][keypoints]") {
+ using namespace mmltk::backend::data;
+ const catalog::ClassKeypointSchema schema{{"left", "right", "missing"}, {{0, 1}}, {1, 0, 2}, {.1, .1, .2}};
+ const std::array source{PackedKeypoint{2, 4, 2}, PackedKeypoint{6, 5, 1}, PackedKeypoint{}};
+ std::array<PackedKeypoint, 3> once{}, twice{};
+ AugmentationImagePlan plan;
+ plan.horizontal_flip = true;
+ plan.forward = {-1, 0, 1, 0, 1, 0};
+ plan.inverse = plan.forward;
+ map_augmentation_keypoints(source, schema, 8, 8, &plan, once);
+ CHECK(once[0].x == 2);
+ CHECK(once[0].y == 5);
+ CHECK(once[0].visibility == 1);
+ CHECK(once[1].x == 6);
+ CHECK(once[1].y == 4);
+ CHECK(once[1].visibility == 2);
+ map_augmentation_keypoints(once, schema, 8, 8, &plan, twice);
+ for (std::size_t joint = 0; joint < source.size(); ++joint) {
+  CHECK(twice[joint].x == source[joint].x);
+  CHECK(twice[joint].y == source[joint].y);
+  CHECK(twice[joint].visibility == source[joint].visibility);
+ }
+ plan = {};
+ plan.forward = {1, 0, .5F, 0, 1, 0};
+ map_augmentation_keypoints(source, schema, 8, 8, &plan, once);
+ CHECK(once[0].x == 6);
+ CHECK(once[1].visibility == 0);
+ CHECK(once[1].x == 0);
+ plan = {};
+ plan.forward = {0, -1, 1, 1, 0, 0};
+ map_augmentation_keypoints(source, schema, 8, 8, &plan, once);
+ CHECK(once[0].x == 4);
+ CHECK(once[0].y == 2);
+ CHECK(once[1].x == 3);
+ CHECK(once[1].y == 6);
+ plan = {};
+ plan.erasure = {.x0 = 0, .y0 = 0, .x1 = .5F, .y1 = 1, .rectangular = 1};
+ map_augmentation_keypoints(source, schema, 8, 8, &plan, once);
+ CHECK(once[0].x == 2);
+ CHECK(once[0].visibility == 1);
+ CHECK(once[1].visibility == 1);
+ CHECK(once[2].visibility == 0);
+ plan = {};
+ plan.paste_donor_slot = 0;
+ plan.paste_source_box = {0, 0, .5F, 1};
+ plan.paste_inverse = {1, 0, 0, 0, 1, 0};
+ map_augmentation_keypoints(source, schema, 8, 8, &plan, once);
+ CHECK(once[0].visibility == 1);
+ plan.paste_source_box = {0, 0, 1, 1};
+ plan.paste_inverse = {2, 0, 0, 0, 2, 0};
+ map_augmentation_keypoints(source, schema, 8, 8, &plan, once, true);
+ CHECK(once[0].x == 1);
+ CHECK(once[0].y == 2);
+ CHECK(once[0].visibility == 2);
+ CHECK(once[1].x == 3);
+ CHECK(once[1].visibility == 1);
+ map_augmentation_keypoints(source, schema, 8, 8, nullptr, once);
+ CHECK(once[0].x == source[0].x);
+ CHECK(once[0].visibility == source[0].visibility);
+ CHECK_NOTHROW(map_augmentation_keypoints({}, {}, 8, 8, nullptr, {}));
 }
 }  // namespace
 }  // namespace mmltk::backend::models::rfdetr

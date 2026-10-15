@@ -28,6 +28,8 @@ std::expected<CompiledDataset, std::error_code> CompiledDataset::try_open(
  if (store.header_.num_images > image_limit) { throw std::runtime_error("compiled dataset exceeds the caller image limit"); }
  const mmltk::backend::data::CompiledFileSections sections = mmltk::backend::data::validate_compiled_file_sections(store.header_, store.mapping_.size());
  store.layout_ = sections.layout;
+ store.source_header_ = store.header_;
+ store.header_.version = FORMAT_VERSION;
  const int advice = access == AccessPattern::Normal ? MADV_NORMAL : access == AccessPattern::Sequential ? MADV_SEQUENTIAL : MADV_RANDOM;
  store.mapping_.advise_aligned_range(store.layout_.data_offset, store.layout_.index_offset - store.layout_.data_offset, advice);
  store.image_entries_.resize(store.header_.num_slots);
@@ -69,11 +71,15 @@ std::expected<CompiledDataset, std::error_code> CompiledDataset::try_open(
  else
   summarize(0, store.header_.num_slots);
  throw_if_compiled_validation_cancelled(0, options.cancellation);
- store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_));
+ store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_, {reinterpret_cast<const std::byte*>(store.mapping_.data()) + sizeof(FileHeader), store.header_.catalog_bytes}));
  return store;
 }
 const std::filesystem::path& CompiledDataset::path() const noexcept { return path_; }
 const mmltk::backend::data::FileHeader& CompiledDataset::header() const noexcept { return header_; }
+std::span<const std::byte> CompiledDataset::source_metadata_bytes() const noexcept {
+ if (!catalog_) return {};
+ return {reinterpret_cast<const std::byte*>(mapping_.data()), sizeof(FileHeader) + source_header_.catalog_bytes};
+}
 std::span<const std::string> CompiledDataset::class_names() const noexcept { return catalog_ ? catalog_->names() : std::span<const std::string>{}; }
 std::span<const mmltk::backend::data::ImageEntry> CompiledDataset::image_entries() const noexcept { return image_entries_; }
 bool CompiledDataset::masks_available() const {
@@ -93,7 +99,7 @@ std::span<const std::byte> CompiledDataset::label_payload(std::uint32_t slot) co
  if (entry.label_bytes > header_.max_label_bytes) throw std::runtime_error("compiled label payload exceeds recorded maximum");
  return {reinterpret_cast<const std::byte*>(mapping_.data() + layout_.label_offset(slot)), entry.label_bytes};
 }
-ImageAnnotations CompiledDataset::annotations(std::uint32_t slot) const { return annotation_view(image_entry(slot), label_payload(slot)); }
+ImageAnnotations CompiledDataset::annotations(std::uint32_t slot) const { return annotation_view(image_entry(slot), label_payload(slot), catalog_.get()); }
 std::span<const PackedInstance> CompiledDataset::image_labels(std::uint32_t slot) const { return annotations(slot).labels; }
 std::span<const RLEPair> CompiledDataset::instance_rle(std::uint32_t slot, const PackedInstance& instance) const { return annotations(slot).instance_rle(instance); }
 const float* CompiledDataset::image_pixels(std::uint32_t slot) const {

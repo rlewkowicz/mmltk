@@ -42,9 +42,11 @@ struct CompiledDatasetInfo {
 };
 inline void validate_compiled_header(const FileHeader& header) {
  if (header.magic != MAGIC) { throw std::runtime_error("Bad magic in compiled file"); }
- if (header.version != FORMAT_VERSION) {
+ if (header.version != FORMAT_VERSION && header.version != 10) {
   throw std::runtime_error("compiled dataset format " + std::to_string(header.version) + " is unsupported; expected format " + std::to_string(FORMAT_VERSION) + "; recompile the dataset");
  }
+ if ((header.version == 10 && (header.catalog_version || header.catalog_bytes)) || (header.catalog_version != 0 && header.catalog_version != 1) ||
+     ((header.catalog_version == 0) != (header.catalog_bytes == 0)) || header.catalog_bytes > COMPILED_CATALOG_LIMIT) throw std::runtime_error("invalid compiled catalog region");
  if (!std::ranges::all_of(header._reserved, [](std::uint8_t value) { return value == 0U; })) throw std::runtime_error("compiled header reserved fields are invalid");
  if (header.num_images == 0U || header.num_images > header.num_slots || header.image_width == 0U || header.image_height == 0U || header.channels == 0U) {
   throw std::runtime_error("compiled file has invalid image dimensions");
@@ -69,6 +71,12 @@ inline FileHeader read_compiled_header(const std::string& path) {
  const mmltk::common::io::FileHandle file = mmltk::common::io::FileHandle::open_readonly(path);
  return read_compiled_header(file);
 }
+inline void write_compiled_header(const common::io::FileHandle& file, const FileHeader& header, std::span<const std::byte> catalog) {
+ validate_compiled_header(header);
+ if (header.version != FORMAT_VERSION || catalog.size() != header.catalog_bytes) throw std::runtime_error("compiled catalog write extent differs");
+ const std::array spans{common::io::FileHandle::WriteSpan{&header, sizeof(header)}, common::io::FileHandle::WriteSpan{catalog.data(), catalog.size()}};
+ file.pwritev_all(spans, 0);
+}
 // Aborts compiled-file validation loops when cancellation is requested; the flag is sampled every
 // 4096 iterations so hot loops stay cheap.
 inline void throw_if_compiled_validation_cancelled(const size_t index, mmltk::common::concurrency::CancellationObservation cancel_requested) {
@@ -76,7 +84,7 @@ inline void throw_if_compiled_validation_cancelled(const size_t index, mmltk::co
 }
 inline CompiledFileSections validate_compiled_file_sections(const FileHeader& header, size_t file_size) {
  validate_compiled_header(header);
- const auto layout = compute_file_layout(header.num_slots, mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"), header.max_label_bytes);
+ const auto layout = compute_file_layout(header.num_slots, mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"), header.max_label_bytes, header.catalog_bytes);
  if (header.total_file_size != file_size || header.total_file_size != layout.total_size || header.index_offset != layout.index_offset || header.data_offset != layout.data_offset)
   throw std::runtime_error("compiled fixed slot layout or file size is invalid");
  return {layout.index_offset, layout.index_size, layout};
@@ -86,7 +94,7 @@ class CompiledRecordChecks final {
 public:
  static void metadata(const ImageEntry& entry, const FileHeader& header, std::size_t position = 0) {
   image(entry, position);
-  if (!entry.eligible() || entry.num_instances > header.max_instances_per_image || annotation_layout(entry.num_instances, entry.num_runs).used_bytes != entry.label_bytes)
+  if (!entry.eligible() || entry.num_instances > header.max_instances_per_image || annotation_layout(entry.num_instances, entry.num_runs).used_bytes > entry.label_bytes || entry.label_bytes % sizeof(RLEPair))
    throw std::runtime_error("compiled annotation counts differ at slot " + std::to_string(position));
  }
  static void image(const ImageEntry& entry, std::size_t position = 0) {
@@ -124,6 +132,9 @@ public:
  CompiledRecordChecks::metadata(entry, header, slot);
  if (annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs) throw std::runtime_error("compiled annotation counts differ at slot " + std::to_string(slot));
  const auto pixels = mmltk::common::math::checked_multiply<std::size_t>(header.image_width, header.image_height, "compiled mask size overflow");
+ const auto extent = annotation_layout(entry.num_instances, entry.num_runs, header.max_label_bytes ? header.max_label_bytes : COMPILED_LABEL_LIMIT, annotations.joints.size());
+ if (entry.label_bytes != extent.used_bytes) throw std::runtime_error("compiled joint extent differs");
+ annotations.validate_joints();
  std::size_t consumed = 0;
  bool masks = false;
  for (std::size_t i = 0; i < annotations.labels.size(); ++i) {
@@ -140,9 +151,9 @@ public:
  if (consumed != annotations.runs.size_bytes()) throw std::runtime_error("compiled image has unreferenced mask runs");
  return masks;
 }
-inline void set_annotation_extent(ImageEntry& entry, std::size_t labels, std::size_t runs, std::string_view identity, std::size_t capacity = COMPILED_LABEL_LIMIT) {
+inline void set_annotation_extent(ImageEntry& entry, std::size_t labels, std::size_t runs, std::string_view identity, std::size_t capacity = COMPILED_LABEL_LIMIT, std::size_t joints = 0) {
  try {
-  const auto payload = annotation_layout(labels, runs, capacity);
+  const auto payload = annotation_layout(labels, runs, capacity, joints);
   entry.num_instances = mmltk::common::math::checked_cast<std::uint16_t>(labels, "compiled instance count overflow");
   entry.num_runs = mmltk::common::math::checked_cast<std::uint32_t>(runs, "compiled run count overflow");
   entry.label_bytes = mmltk::common::math::checked_cast<std::uint32_t>(payload.used_bytes, "compiled label size overflow");
@@ -173,9 +184,10 @@ inline void write_compiled_label_ordinals(
 }
 inline void write_compiled_annotations(
  const mmltk::common::io::FileHandle& file, const FileLayout& layout, std::uint32_t slot, const ImageEntry& entry, ImageAnnotations annotations, std::uint64_t ordinal_base = 0) {
- const auto payload = annotation_layout(entry.num_instances, entry.num_runs);
+ const auto payload = annotation_layout(entry.num_instances, entry.num_runs, layout.label_capacity, annotations.joints.size());
  if (annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs || entry.label_bytes != payload.used_bytes || entry.label_bytes > layout.label_capacity)
   throw std::runtime_error("compiled annotation write extent differs");
+ annotations.validate_joints();
  const auto offset = layout.label_offset(slot);
  const std::uint64_t zero = 0;
  if (ordinal_base) write_compiled_label_ordinals(file, offset, annotations.labels.size(), annotations.labels, ordinal_base);
@@ -185,6 +197,17 @@ inline void write_compiled_annotations(
   mmltk::common::io::FileHandle::WriteSpan{annotations.runs.data(), annotations.runs.size_bytes()}
  };
  file.pwritev_all(spans, offset + (ordinal_base ? annotations.labels.size_bytes() : 0));
+ if (!annotations.joints.empty()) {
+  const PackedJointHeader joints{1, common::math::checked_cast<std::uint32_t>(annotations.joints.size(), "compiled joint count overflow")};
+  const auto end = payload.joint_offset + annotations.joints.size_bytes();
+  const std::array joint_writes{
+   common::io::FileHandle::WriteSpan{&joints, sizeof(joints)},
+   common::io::FileHandle::WriteSpan{annotations.joint_spans.data(), annotations.joint_spans.size_bytes()},
+   common::io::FileHandle::WriteSpan{annotations.joints.data(), annotations.joints.size_bytes()},
+   common::io::FileHandle::WriteSpan{&zero, payload.used_bytes - end}
+  };
+  file.pwritev_all(joint_writes, offset + payload.joint_span_offset - sizeof(joints));
+ }
 }
 inline constexpr std::size_t COMPILED_COMPACTION_SCRATCH_BYTES = 4U * 1024U * 1024U;
 namespace detail {
@@ -217,7 +240,7 @@ using CompiledCompactionProgress = std::function<void(std::size_t completed_byte
 // a failed or cancelled compaction is discarded by its existing publication owner.
 [[nodiscard]] FileLayout compact_compiled_file(const mmltk::common::io::FileHandle&, const FileLayout&, std::span<const ImageEntry>, mmltk::common::concurrency::CancellationObservation = {},
  CompiledCompactionProgress = {}, CompiledStorageMutation = {}, std::span<std::byte> scratch = {}, CompiledCompactionObserver = {});
-inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
+inline std::vector<std::string> compiled_class_names(const FileHeader& header) {
  std::vector<std::string> names;
  names.reserve(header.num_classes);
  for (std::uint32_t index = 0U; index < header.num_classes; ++index) {
@@ -227,7 +250,20 @@ inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
   std::string name(stored_name.data(), length);
   names.push_back(std::move(name));
  }
- return catalog::ClassCatalog(std::move(names), COMPILED_CLASS_NAME_CAPACITY);
+ return names;
+}
+inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header, std::span<const std::byte> region) {
+ if (!header.catalog_bytes) return catalog::ClassCatalog(compiled_class_names(header), COMPILED_CLASS_NAME_CAPACITY);
+ if (region.size() != header.catalog_bytes) throw std::runtime_error("compiled catalog extent differs");
+ auto result = decode_compiled_catalog(region);
+ const auto names = compiled_class_names(header);
+ if (!std::ranges::equal(result.names(), names)) throw std::runtime_error("compiled catalog names differ from header");
+ return result;
+}
+inline catalog::ClassCatalog read_compiled_catalog(const common::io::FileHandle& file, const FileHeader& header) {
+ std::vector<std::byte> bytes(header.catalog_bytes);
+ if (!bytes.empty()) file.pread_all(bytes.data(), bytes.size(), sizeof(FileHeader));
+ return compiled_class_catalog(header, bytes);
 }
 inline CompiledDatasetInfo inspect_compiled_dataset(const std::filesystem::path& path) {
  const mmltk::common::io::FileHandle file = mmltk::common::io::FileHandle::open_readonly(path.string());
@@ -240,7 +276,7 @@ inline CompiledDatasetInfo inspect_compiled_dataset(const std::filesystem::path&
  info.height = header.image_height;
  info.channels = header.channels;
  info.max_instances_per_image = header.max_instances_per_image;
- info.class_catalog = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(header));
+ info.class_catalog = std::make_shared<const catalog::ClassCatalog>(read_compiled_catalog(file, header));
  return info;
 }
 }  // namespace mmltk::backend::data

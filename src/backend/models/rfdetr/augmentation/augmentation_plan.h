@@ -12,6 +12,7 @@ struct AugmentationImagePlan {
  AugmentationSpatialErasure erasure;
  std::array<float, kAugmentationTransformSize> forward{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
  std::array<float, kAugmentationTransformSize> inverse{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
+ bool horizontal_flip = false;
  float area_scale = 1.0F;
  float resize_scale = 1.0F;
  float resize_offset_x = 0.0F;
@@ -25,6 +26,8 @@ struct AugmentationImagePlan {
  // Borrowed original host support, retained by the adapter until target preparation finishes.
  const mmltk::backend::data::RLEPair* paste_support = nullptr;
  std::size_t paste_support_count = 0;
+ const mmltk::backend::data::PackedKeypoint* paste_joints = nullptr;
+ std::size_t paste_joint_count = 0;
  bool paste_masked = false;
  std::int64_t paste_donor_slot = -1;
  std::int64_t paste_label = -1;

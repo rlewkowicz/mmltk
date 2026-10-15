@@ -47,6 +47,11 @@ public:
  [[nodiscard]] static std::expected<CompiledDataset, std::error_code> open_source(const std::filesystem::path& path, std::size_t image_limit, const CompiledDatasetOpenOptions& = {});
  [[nodiscard]] const std::filesystem::path& path() const noexcept;
  [[nodiscard]] const mmltk::backend::data::FileHeader& header() const noexcept;
+ // Exact source bytes remain authoritative for versioned complete-session identity.
+ [[nodiscard]] const FileHeader& source_header() const noexcept { return source_header_; }
+ // Header plus the versioned catalog, borrowed from this immutable mapping.
+ // Format 10 is exactly its original header; format 11 also binds joint meaning.
+ [[nodiscard]] std::span<const std::byte> source_metadata_bytes() const noexcept;
  [[nodiscard]] std::span<const std::string> class_names() const noexcept;
  [[nodiscard]] const std::shared_ptr<const catalog::ClassCatalog>& class_catalog() const noexcept { return catalog_; }
  [[nodiscard]] std::span<const mmltk::backend::data::ImageEntry> image_entries() const noexcept;
@@ -108,6 +113,7 @@ private:
  std::filesystem::path path_;
  mmltk::common::io::MappedFile mapping_;
  mmltk::backend::data::FileHeader header_{};
+ FileHeader source_header_{};
  std::vector<ImageEntry> image_entries_;
  FileLayout layout_;
  std::size_t label_count_ = 0, run_count_ = 0;

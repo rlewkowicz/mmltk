@@ -188,7 +188,9 @@ TrainingDonorSource resolve_training_donor(const mmltk::backend::data::DatasetLo
  TrainingDonorSource result;
  if (!descriptor.valid) return result;
  const auto& instance = donor_instance(loader, descriptor);
- result.support = loader.annotations(descriptor.image_index).instance_rle(instance);
+ const auto annotations = loader.annotations(descriptor.image_index);
+ result.support = annotations.instance_rle(instance);
+ result.joints = annotations.instance_joints(descriptor.annotation_index);
  const auto source_box = augmentation_instance_box(instance, loader.image_width(), loader.image_height());
  result.metadata = {
   instance.class_id, descriptor.image_index, augmentation_box_area(source_box) * static_cast<float>(loader.image_width()) * static_cast<float>(loader.image_height()), source_box, instance.has_mask(),

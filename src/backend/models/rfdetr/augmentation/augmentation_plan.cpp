@@ -17,6 +17,7 @@ void prepare_image_plan(AugmentationImagePlan& plan, const GpuAugmentationLaunch
  std::copy_n(geometry.forward, plan.forward.size(), plan.forward.begin());
  std::copy_n(geometry.inverse, plan.inverse.size(), plan.inverse.begin());
  plan.area_scale = geometry.area_scale;
+ plan.horizontal_flip = geometry.flip_x;
 }
 }  // namespace
 GpuAugmentationLaunchConfig detail::augmentation_launch_config(const GpuAugmentationConfig& config) {
