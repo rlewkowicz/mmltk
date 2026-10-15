@@ -52,6 +52,7 @@ public:
 private:
  struct CompositeSlot final {
   std::atomic<std::uint32_t> state{slot_state_value(SlotState::Free)};
+  // Capture and semantics share this slot and its completion/output lease.
   CUdeviceptr rgba = 0U;
   std::size_t rgba_pitch = 0U;
   CUdeviceptr overlay = 0U;

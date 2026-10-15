@@ -42,7 +42,7 @@ public:
  PreparedWaylandInputs();
  [[nodiscard]] const auto& square() const noexcept { return square_; }
  [[nodiscard]] const auto& mixed() const noexcept { return mixed_; }
- [[nodiscard]] const mmltk::testsupport::WorkflowWaylandInputs& workflows();
+ [[nodiscard]] const mmltk::testsupport::WorkflowWaylandInputs& workflows(bool keypoints = false);
  [[nodiscard]] const mmltk::backend::data::testsupport::FixtureSpec& probe();
  [[nodiscard]] const std::filesystem::path& sparse();
 
@@ -53,6 +53,7 @@ private:
  mmltk::backend::data::testsupport::FixtureSpec probe_;
  std::filesystem::path sparse_compiled_;
  std::unique_ptr<mmltk::testsupport::WorkflowWaylandInputs> workflows_;
+ std::unique_ptr<mmltk::testsupport::WorkflowWaylandInputs> keypoints_;
 };
 // One owner retains the process, resources, physical evidence and byte cursors.
 // RunScenario contains domain assertions; Advance is acknowledged only after

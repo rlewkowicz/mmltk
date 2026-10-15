@@ -140,8 +140,8 @@ if(BUILD_RFDETR_NATIVE)
     add_executable(mmltk_workspace_wayland_integration EXCLUDE_FROM_ALL)
     mmltk_configure_component(
         mmltk_workspace_wayland_integration PRIVATE_DECLARATIONS)
+    mmltk_register_retained_module_importers(mmltk_workspace_wayland_integration tests/workflow_wayland_inputs.cpp)
     mmltk_register_ordinary_sources(mmltk_workspace_wayland_integration
-        tests/workflow_wayland_inputs.cpp
         tests/wayland/session.cpp
         tests/wayland/audit_facts.cpp
         tests/wayland/artifact_cursor.cpp
@@ -177,7 +177,9 @@ if(BUILD_RFDETR_NATIVE)
         mmltk::controller::direct_services
         mmltk::controller::upscale_system
         mmltk::controller::visual_contract
+        mmltk::backend::models::rfdetr::core
         mmltk::backend::models::rfdetr::training
+        mmltk::backend::models::rfdetr::export
         mmltk::backend::ml::torch_dependencies
         mmltk_backend_data_test_support
         CUDA::cuda_driver

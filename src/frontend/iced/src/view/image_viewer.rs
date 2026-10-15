@@ -46,30 +46,7 @@ pub fn panel<'a, Message: Clone + 'a>(
     upscale_available: bool,
     upscale_requested: impl Fn(crate::generated::UpscaleKernel) -> Message,
 ) -> Element<'a, Message> {
-    let upscale = crate::generated::UPSCALE_KERNEL_VALUES
-        .iter()
-        .copied()
-        .fold(row![].spacing(5), |row, kernel| {
-            row.push(
-                container(
-                    button(text(if pending == Some(kernel) {
-                        format!("{}…", upscale_label(kernel))
-                    } else {
-                        upscale_label(kernel).to_owned()
-                    }))
-                    .style(if active == Some(kernel) {
-                        crate::fluent_theme::button_primary
-                    } else {
-                        crate::fluent_theme::button_secondary
-                    })
-                    .on_press_maybe(upscale_available.then(|| upscale_requested(kernel))),
-                )
-                .id(ids.upscale[crate::generated::UPSCALE_KERNEL_VALUES
-                    .iter()
-                    .position(|value| *value == kernel)
-                    .expect("canonical kernel")]),
-            )
-        });
+    let upscale = upscale_controls(ids.upscale, active, pending, upscale_available, upscale_requested);
     let panel = container(
         column![
             row![
@@ -123,6 +100,46 @@ pub fn panel<'a, Message: Clone + 'a>(
             }),
     )
     .into()
+}
+fn upscale_controls<'a, Message: Clone + 'a>(ids: [&'static str; 3], active: Option<crate::generated::UpscaleKernel>, pending: Option<crate::generated::UpscaleKernel>, upscale_available: bool, upscale_requested: impl Fn(crate::generated::UpscaleKernel) -> Message) -> Element<'a, Message> {
+    let upscale = crate::generated::UPSCALE_KERNEL_VALUES
+        .iter()
+        .copied()
+        .fold(row![].spacing(5), |row, kernel| {
+            row.push(
+                container(
+                    button(text(if pending == Some(kernel) {
+                        format!("{}…", upscale_label(kernel))
+                    } else {
+                        upscale_label(kernel).to_owned()
+                    }))
+                    .style(if active == Some(kernel) {
+                        crate::fluent_theme::button_primary
+                    } else {
+                        crate::fluent_theme::button_secondary
+                    })
+                    .on_press_maybe(upscale_available.then(|| upscale_requested(kernel))),
+                )
+                .id(ids[crate::generated::UPSCALE_KERNEL_VALUES
+                    .iter()
+                    .position(|value| *value == kernel)
+                    .expect("canonical kernel")]),
+            )
+        });
+    upscale.into()
+}
+#[derive(Debug, Clone)]
+pub enum ProductAction { Annotate, Upscale(crate::generated::UpscaleKernel) }
+pub fn product_actions<'a>(page: crate::generated::FeatureId, model: &crate::view_model::ApplicationModel) -> Element<'a, ProductAction> {
+    let (annotate, upscale) = match page {
+        crate::generated::FeatureId::Live => ("live.annotate", ["live.upscale.basic", "live.upscale.fast", "live.upscale.neural"]),
+        _ => ("predict.annotate", ["predict.upscale.basic", "predict.upscale.fast", "predict.upscale.neural"]),
+    };
+    let pending = model.requested_upscale.as_ref().map(|request| request.kernel).filter(|kernel| Some(*kernel) != model.displayed_upscale_kernel());
+    column![
+        row![text("Upscale"), upscale_controls(upscale, model.displayed_upscale_kernel(), pending, model.upscale_start_available(), ProductAction::Upscale)].spacing(7),
+        container(button("Open in Annotation").on_press_maybe((model.annotation_import_available() && crate::presentation_surface::viewer_annotation_request().is_some()).then_some(ProductAction::Annotate))).id(annotate),
+    ].spacing(7).into()
 }
 pub fn upscale_label(kernel: crate::generated::UpscaleKernel) -> &'static str {
     match kernel {

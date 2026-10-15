@@ -1,5 +1,7 @@
 #pragma once
 #include <cstddef>
+#include <array>
+#include "src/backend/data/catalog/class_catalog.h"
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -30,6 +32,7 @@ private:
   Buffer cards_device_;
   Buffer annotations_device_;
   Buffer rle_device_;
+  Buffer joints_device_, edges_device_;
   Buffer classes_device_;
   Buffer tiles_device_;
   Buffer descriptors_{Memory::PinnedHost};
@@ -42,7 +45,7 @@ private:
  struct DescriptorLayout final {
   StorageSpan cards{};
   StorageSpan annotations{};
-  StorageSpan rle{};
+  StorageSpan rle{}, joints{}, edges{};
   StorageSpan classes{};
   StorageSpan tiles{};
   std::size_t bytes = 0U;
@@ -57,7 +60,8 @@ private:
  std::uint32_t augmentation_height_ = 0U;
  DescriptorLayout descriptor_layout_{};
  bool descriptors_pending_ = false;
- void PrepareDescriptors(std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, VisualDiagnosticSink, int, std::uint64_t);
+ std::array<StorageSpan, mmltk::backend::data::catalog::kClassCatalogCapacity> class_edges_{};
+ void PrepareDescriptors(std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, VisualDiagnosticSink, int, std::uint64_t, std::size_t, const mmltk::backend::data::catalog::ClassCatalog&);
  void UploadDescriptors(cudaStream_t, bool, const ExploreDemandCheck&, std::uint64_t);
  void UploadDescriptor(Buffer&, std::size_t, std::size_t, cudaStream_t, const ExploreDemandCheck&, std::uint64_t);
 };

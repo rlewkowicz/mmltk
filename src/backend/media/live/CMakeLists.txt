@@ -54,6 +54,17 @@ target_link_libraries(mmltk_backend_media_live
         mmltk::common::types
 )
 
+# The opt-in desktop acceptance ingress and owning media cases share one fixture.
+add_library(mmltk_backend_media_live_capture_fixture STATIC EXCLUDE_FROM_ALL)
+mmltk_configure_component(mmltk_backend_media_live_capture_fixture PUBLIC_DECLARATIONS)
+mmltk_register_public_headers(mmltk_backend_media_live_capture_fixture
+    BASE_DIRS ${CMAKE_SOURCE_DIR} FILES tests/support/live_capture_fixture.h)
+mmltk_register_ordinary_sources(mmltk_backend_media_live_capture_fixture
+    tests/support/live_capture_fixture.cpp)
+target_link_libraries(mmltk_backend_media_live_capture_fixture PUBLIC
+    mmltk::backend::media::capture)
+mmltk_register_header_isolation(mmltk_backend_media_live_capture_fixture)
+
 add_library(mmltk_backend_media_live_test_support INTERFACE)
 mmltk_register_public_headers(mmltk_backend_media_live_test_support
     BASE_DIRS ${CMAKE_SOURCE_DIR}
@@ -65,13 +76,16 @@ function(mmltk_add_backend_media_live_tests)
     add_executable(mmltk_backend_media_live_tests EXCLUDE_FROM_ALL)
     mmltk_configure_component(
         mmltk_backend_media_live_tests PRIVATE_DECLARATIONS)
-    mmltk_register_ordinary_sources(
+    mmltk_register_retained_module_importers(
         mmltk_backend_media_live_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/live_output_lease.test.cpp)
     target_link_libraries(
         mmltk_backend_media_live_tests PRIVATE
         mmltk_test_support
-        mmltk_backend_media_live_test_support)
+        mmltk_backend_media_live_test_support
+        mmltk_backend_media_live_capture_fixture
+        mmltk::backend::imaging::raster
+        CUDA::cudart)
     catch_discover_tests(
         mmltk_backend_media_live_tests
         TEST_PREFIX "backend::media::live::"

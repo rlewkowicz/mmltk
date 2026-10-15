@@ -44,8 +44,15 @@ impl GalleryContent {
 }
 
 pub(crate) struct PredictionContent {
-    pub(super) metadata: std::sync::Arc<crate::generated::PredictImageMetadata>,
+    metadata: ObjectMetadata,
     labels: Vec<CachedLabel>,
+    indices: Vec<usize>,
+    bounds: Vec<crate::generated::AnnotationBox>,
+    upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
+}
+enum ObjectMetadata {
+    Prediction(std::sync::Arc<crate::generated::PredictImageMetadata>),
+    Live(std::sync::Arc<crate::generated::LiveImageMetadata>),
 }
 struct CachedLabel {
     text: String,
@@ -134,26 +141,54 @@ impl CachedLabel {
     }
 }
 impl PredictionContent {
-    pub(crate) fn new(
-        metadata: impl Into<std::sync::Arc<crate::generated::PredictImageMetadata>>,
-    ) -> Self {
-        let metadata = metadata.into();
-        let labels = metadata
-            .labels
-            .iter()
-            .map(|item| {
-                let text = match item.classdomain {
-                    crate::generated::ClassReferenceDomain::Foreground => {
-                        format!("{} {}", item.name, item.confidence)
-                    }
-                    crate::generated::ClassReferenceDomain::RawOutputSlot => {
-                        format!("Raw slot {} {}", item.classreference, item.confidence)
-                    }
-                };
-                CachedLabel::new(text, class_color(&item.color))
-            })
-            .collect();
-        Self { metadata, labels }
+    pub(crate) fn new(metadata: impl Into<std::sync::Arc<crate::generated::PredictImageMetadata>>) -> Self {
+        Self::prepare(ObjectMetadata::Prediction(metadata.into()))
+    }
+    pub(crate) fn from_live(metadata: std::sync::Arc<crate::generated::LiveImageMetadata>) -> Self {
+        Self::prepare(ObjectMetadata::Live(metadata))
+    }
+    fn prepare(metadata: ObjectMetadata) -> Self {
+        let source = match &metadata { ObjectMetadata::Prediction(value) => &value.labels, ObjectMetadata::Live(value) => &value.labels };
+        let indices: Vec<usize> = source.iter().enumerate().filter_map(|(index, item)| {
+            let visible = match &metadata {
+                ObjectMetadata::Prediction(value) => value.preview.labels && item.confidence >= value.preview.confidencethreshold,
+                ObjectMetadata::Live(_) => true,
+            };
+            visible.then_some(index)
+        }).collect();
+        let labels = indices.iter().map(|index| {
+            let item = &source[*index];
+            let text = match item.classdomain {
+                crate::generated::ClassReferenceDomain::Foreground => format!("{} {}", item.name, item.confidence),
+                crate::generated::ClassReferenceDomain::RawOutputSlot => format!("Raw slot {} {}", item.classreference, item.confidence),
+            };
+            CachedLabel::new(text, class_color(&item.color))
+        }).collect();
+        let bounds = indices.iter().map(|index| source[*index].box_.clone()).collect();
+        Self { metadata, labels, indices, bounds, upscale: None }
+    }
+    pub(crate) fn objects(&self) -> &[crate::generated::VisualObjectLabel] {
+        match &self.metadata { ObjectMetadata::Prediction(value) => &value.labels, ObjectMetadata::Live(value) => &value.labels }
+    }
+    pub(crate) fn analyzed(&self) -> Option<bool> {
+        match &self.metadata { ObjectMetadata::Live(value) => Some(value.analyzed), _ => None }
+    }
+    pub(crate) fn input_frame(&self) -> &crate::generated::VisualFrame {
+        match &self.metadata { ObjectMetadata::Prediction(value) => &value.frame, ObjectMetadata::Live(value) => &value.frame }
+    }
+    pub(crate) fn frame(&self) -> &crate::generated::VisualFrame {
+        self.upscale.as_ref().map_or_else(|| self.input_frame(), |value| &value.frame)
+    }
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        let frame = match &self.metadata { ObjectMetadata::Prediction(value) => &value.frame, ObjectMetadata::Live(value) => &value.frame };
+        (crate::generated::presentation_source_session(frame.source.kind), match &self.metadata { ObjectMetadata::Prediction(value) => value.contentidentity, ObjectMetadata::Live(value) => value.frame.revision })
+    }
+    pub(crate) fn with_upscale(mut self, upscale: std::sync::Arc<crate::generated::UpscaleImageMetadata>) -> Self {
+        let scale_x = upscale.frame.extent.width as f32 / self.frame().extent.width as f32;
+        let scale_y = upscale.frame.extent.height as f32 / self.frame().extent.height as f32;
+        for bounds in &mut self.bounds { for point in [&mut bounds.first, &mut bounds.second] { point.x *= scale_x; point.y *= scale_y; } }
+        self.upscale = Some(upscale);
+        self
     }
 }
 
@@ -371,10 +406,11 @@ impl Source {
                 }
             }
             Self::Prediction(snapshot) => {
-                for (item, cached) in snapshot.metadata.labels.iter().zip(&snapshot.labels) {
+                for ((index, cached), bounds) in snapshot.indices.iter().zip(&snapshot.labels).zip(&snapshot.bounds) {
+                    let item = &snapshot.objects()[*index];
                     label(
                         item.classreference as u16,
-                        &item.box_,
+                        bounds,
                         &cached.text,
                         &item.color,
                         0,
@@ -1142,7 +1178,7 @@ mod tests {
         let model = crate::view_model::test_support::bootstrapped();
         let mut snapshot = model.predict_snapshot.unwrap();
         snapshot.labels = (0..4096)
-            .map(|index| crate::generated::PredictLabel {
+            .map(|index| crate::generated::VisualObjectLabel {
                 box_: crate::generated::AnnotationBox {
                     first: crate::generated::AnnotationPoint {
                         x: index as f32,
@@ -1165,6 +1201,7 @@ mod tests {
                     saturation: 1.0,
                     value: 0.8,
                 },
+                skeleton: crate::generated::VisualSkeleton { schema: crate::generated::ClassKeypointSchema { names: Vec::new(), skeleton: Vec::new(), horizontalflip: Vec::new(), okssigmas: Vec::new() }, joints: Vec::new() },
                 name: if index == 0 {
                     "person".into()
                 } else {
@@ -1195,13 +1232,57 @@ mod tests {
         assert_eq!(replacement.labels[0].text, "changed 0.75");
         assert_eq!(retained.labels[0].text, "person 0.75");
         assert_eq!(
-            replacement.metadata.frame.source,
-            retained.metadata.frame.source
+            replacement.frame().source,
+            retained.frame().source
         );
         assert_ne!(
-            replacement.metadata.contentidentity,
-            retained.metadata.contentidentity
+            replacement.identity(),
+            retained.identity()
         );
+    }
+
+    #[test]
+    fn prediction_captions_use_paired_policy_original_indices_and_derived_bounds() {
+        use crate::generated::*;
+        let model = crate::view_model::test_support::bootstrapped();
+        let mut snapshot = model.predict_snapshot.unwrap();
+        snapshot.frame.extent.width = 64; snapshot.frame.extent.height = 64;
+        snapshot.frame.content.width = 64; snapshot.frame.content.height = 64;
+        snapshot.preview.labels = true;
+        snapshot.preview.confidencethreshold = 0.5;
+        snapshot.labels = [0.49, 0.5, 1.0].into_iter().enumerate().map(|(index, confidence)| VisualObjectLabel {
+            box_: AnnotationBox { first: AnnotationPoint { x: 10.0 * index as f32, y: 2.0 }, second: AnnotationPoint { x: 10.0 * index as f32 + 5.0, y: 7.0 } },
+            classreference: index as i32, classdomain: ClassReferenceDomain::Foreground, confidence,
+            color: AnnotationColor { hue: 60.0 * index as f32, saturation: 1.0, value: 1.0 },
+            skeleton: VisualSkeleton { schema: ClassKeypointSchema { names: Vec::new(), skeleton: Vec::new(), horizontalflip: Vec::new(), okssigmas: Vec::new() }, joints: Vec::new() },
+            name: format!("object-{index}"),
+        }).collect();
+        let paired = PredictionContent::new(PredictImageMetadata::from(&snapshot));
+        assert_eq!(paired.indices, vec![1, 2]);
+        assert_eq!(paired.objects(), snapshot.labels);
+        // A pending draft/new run cannot affect the completed product's policy.
+        snapshot.preview.labels = false;
+        snapshot.preview.confidencethreshold = 1.0;
+        assert!(PredictionContent::new(PredictImageMetadata::from(&snapshot)).labels.is_empty());
+        let mut derived = UpscaleImageMetadata {
+            preparedextent: paired.frame().extent.clone(), preparedcontent: paired.frame().content.clone(), input: paired.frame().clone(),
+            frame: paired.frame().clone(), scene: model.annotation.snapshot.unwrap().ui.scene,
+        };
+        derived.frame.source.kind = PresentationSourceKind::Upscale;
+        derived.frame.extent = derived.frame.extent.checked_scale(UpscaleImageMetadata::OUTPUT_SCALE).unwrap();
+        derived.frame.content = derived.frame.content.checked_scale(UpscaleImageMetadata::OUTPUT_SCALE).unwrap();
+        let scale = UpscaleImageMetadata::OUTPUT_SCALE as f32;
+        let derived = paired.with_upscale(std::sync::Arc::new(derived));
+        assert_eq!(derived.objects(), snapshot.labels);
+        let mut seen = Vec::new();
+        Source::Prediction(std::sync::Arc::new(derived)).visit(|category, bounds, caption, color, _, _, _| {
+            seen.push((category, bounds.first.x, caption.to_owned(), color.hue));
+        });
+        assert_eq!(seen, vec![(1, 10.0 * scale, "object-1 0.5".into(), 60.0), (2, 20.0 * scale, "object-2 1".into(), 120.0)]);
+        snapshot.preview.labels = true;
+        assert_eq!(PredictionContent::new(PredictImageMetadata::from(&snapshot)).indices, vec![2]);
+        snapshot.preview.confidencethreshold = 0.0;
+        assert_eq!(PredictionContent::new(PredictImageMetadata::from(&snapshot)).indices, vec![0, 1, 2]);
     }
 
     #[test]

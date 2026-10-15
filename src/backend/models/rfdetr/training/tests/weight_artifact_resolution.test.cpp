@@ -105,3 +105,36 @@ TEST_CASE("admitted native state resolves complete metadata without reopening it
  std::filesystem::rename(replacement, path);
  REQUIRE_THROWS(rfdetr::resolve_admitted_model_artifacts(admitted, path, {}, 0));
 }
+
+TEST_CASE("Native configuration preserves admitted long custom names within its checkpoint envelope", "[model][rfdetr][checkpoint_resolution][boundary]") {
+ auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
+ config.preset_name.assign(60000, 'p');
+ SECTION("Long custom name") {}
+ SECTION("Maximum classifier slots") {
+  config = rfdetr::native_config_from_preset(*rfdetr::find_model_preset_by_weight_filename("rf-detr-keypoint-preview-xlarge.pth"));
+  config.preset_name.assign(52000, 'p');
+  config.num_classes = rfdetr::kMaximumClassOutputSlots;
+  config.keypoints_per_class.resize(rfdetr::kMaximumClassOutputSlots);
+ }
+ REQUIRE(rfdetr::native_model_config_valid(config));
+ const auto encoded = rfdetr::encode_checkpoint_configuration(config);
+ REQUIRE(encoded.size() <= 65536);
+ const auto decoded = rfdetr::decode_checkpoint_configuration(encoded);
+ REQUIRE(decoded.preset_name == config.preset_name);
+ CHECK(rfdetr::encode_checkpoint_configuration(decoded) == encoded);
+ mmltk::testsupport::ScopedTempDir root("long-custom-configuration");
+ const auto path = root.path() / "weights.pt";
+ rfdetr::DecodedNativeModelState source;
+ source.metadata.preset_name = config.preset_name;
+ source.metadata.native_configuration = encoded;
+ source.metadata.num_classes = config.num_classes;
+ source.metadata.class_layout = rfdetr::unresolved_class_layout(config.num_classes);
+ source.metadata.num_queries = config.num_queries;
+ source.metadata.num_select = config.num_select;
+ source.replace_entries({{"value", torch::ones({2})}});
+ rfdetr::save_native_checkpoint(path, source);
+ const auto admitted = rfdetr::decode_native_model_state(path);
+ const auto resolved = rfdetr::resolve_admitted_model_artifacts(admitted, path, {}, 0);
+ CHECK(resolved.config.preset_name == config.preset_name);
+ CHECK(rfdetr::encode_checkpoint_configuration(resolved.config) == encoded);
+}

@@ -28,6 +28,7 @@ capture::CaptureSessionStartResult LiveMediaDataPlane::start(const LiveAnalysisP
 capture::Status LiveMediaDataPlane::stop() noexcept { return impl_->stop(); }
 std::shared_ptr<const LivePhysicalTerminal> LiveMediaDataPlane::admitted_run_terminal() const noexcept { return impl_->admitted_run_terminal(); }
 capture::Status LiveMediaDataPlane::first_failure() const { return impl_->first_failure(); }
+capture::Status LiveMediaDataPlane::no_custody_start_settlement() const { return impl_->no_custody_start_settlement(); }
 std::optional<PhysicalFrameRevision> LiveMediaDataPlane::newest_revision() const noexcept { return impl_->newest_revision(); }
 bool LiveMediaDataPlane::try_acquire_output(const PhysicalFrameRevision revision, LiveCompositeOutputLease* const output) { return impl_->try_acquire_output(revision, output); }
 bool LiveMediaDataPlane::request_raw_readback(LiveRawFrameReadback request) { return impl_->request_raw_readback(std::move(request)); }
@@ -192,6 +193,8 @@ capture::CaptureSessionStartResult LiveMediaDataPlane::Impl::start(const LiveAna
  start_result_ = {};
  terminal_.reset();
  first_failure_ = capture::Status::Ok();
+ cleanup_cuda_failure_ = cudaSuccess;
+ worker_joined_ = false;
  phase_ = PhysicalPhase::Starting;
  startup_ready_ = false;
  wake_pending_ = true;
@@ -225,6 +228,7 @@ capture::Status LiveMediaDataPlane::Impl::stop() noexcept {
  }
  ingestion_thread_.join();
  std::lock_guard lock(lifecycle_);
+ worker_joined_ = true;
  if (terminal_.has_value()) return terminal_->status();
  if (!first_failure_.ok()) return first_failure_;
  return capture::Status::Ok();
@@ -240,6 +244,14 @@ capture::Status LiveMediaDataPlane::Impl::first_failure() const {
  std::lock_guard lock(lifecycle_);
  if (terminal_.has_value()) return terminal_->status();
  return first_failure_;
+}
+capture::Status LiveMediaDataPlane::Impl::no_custody_start_settlement() const {
+ std::lock_guard lock(lifecycle_);
+ if (!worker_joined_ || !startup_ready_ || !start_result_.valid() || start_result_.has_custody() || phase_ != PhysicalPhase::Terminal || resources_ || !output_callbacks_.idle() || raw_readback_.phase != RawReadbackPhase::Idle)
+  return {capture::StatusCode::kNotReady, "Live no-custody startup resources have not settled"};
+ if (cleanup_cuda_failure_ != cudaSuccess)
+  return {capture::StatusCode::kCudaError, "Live startup CUDA cleanup failed: " + std::to_string(static_cast<int>(cleanup_cuda_failure_))};
+ return capture::Status::Ok();
 }
 std::optional<PhysicalFrameRevision> LiveMediaDataPlane::Impl::newest_revision() const noexcept {
  std::lock_guard lock(lifecycle_);
@@ -300,6 +312,7 @@ void LiveMediaDataPlane::Impl::abandon_output(const PhysicalFrameRevision revisi
 }
 void LiveMediaDataPlane::Impl::record_cuda_failure(const cudaError_t failure) noexcept {
  if (failure == cudaSuccess) return;
+ { std::lock_guard lock(lifecycle_); if (cleanup_cuda_failure_ == cudaSuccess) cleanup_cuda_failure_ = failure; }
  capture::Status status;
  try {
   status = {capture::StatusCode::kCudaError, "Live CUDA failure " + std::to_string(static_cast<int>(failure))};

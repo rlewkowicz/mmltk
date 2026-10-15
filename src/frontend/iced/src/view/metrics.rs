@@ -692,6 +692,10 @@ pub(crate) mod tests {
                     giou: None,
                     maskce: None,
                     maskdice: None,
+                    keypointl1: None,
+                    keypointfindable: None,
+                    keypointvisible: None,
+                    keypointnll: None,
                     auxiliaryweighted: None,
                     denoisingweighted: None,
                     correspondenceweighted: None,
@@ -731,6 +735,7 @@ pub(crate) mod tests {
                 confidencethreshold: 0.5,
             },
             mask: None,
+            keypoint: None,
             modeldetectionbudget: 300,
         }
     }

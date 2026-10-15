@@ -4,5 +4,5 @@ module;
 export module mmltk.backend.models.rfdetr.inference.analysis_provider;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
 export namespace mmltk::backend::models::rfdetr {
-[[nodiscard]] std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider> MakeRfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options);
+[[nodiscard]] std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider> MakeRfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options, float confidence_threshold = 0.0F);
 }  // namespace mmltk::backend::models::rfdetr

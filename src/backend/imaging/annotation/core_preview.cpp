@@ -227,14 +227,14 @@ EffectiveObjectSeed effective_object_seed(const AnnotationFrame& frame, const An
     std::vector<AnnotationPoint> node_points_capture;
     node_points_capture.reserve(shape.nodes.size());
     for (const AnnotationSkeletonNode& node : shape.nodes) {
-     if (node.visible) { node_points_capture.push_back(node.point); }
+     if (node.visible()) { node_points_capture.push_back(node.point); }
     }
     seed.points_xy = capture_points_to_frame(frame, node_points_capture);
     for (const AnnotationSkeletonEdge& edge : shape.edges) {
      if (edge.source_index >= shape.nodes.size() || edge.target_index >= shape.nodes.size()) { continue; }
      const AnnotationSkeletonNode& source = shape.nodes[edge.source_index];
      const AnnotationSkeletonNode& target = shape.nodes[edge.target_index];
-     if (!source.visible || !target.visible) { continue; }
+     if (!source.visible() || !target.visible()) { continue; }
      const std::optional<AnnotationPoint> source_frame = capture_point_to_frame(frame, source.point);
      const std::optional<AnnotationPoint> target_frame = capture_point_to_frame(frame, target.point);
      if (!source_frame.has_value() || !target_frame.has_value()) { continue; }

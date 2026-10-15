@@ -95,6 +95,10 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
  if (!selected) return std::unexpected(selected.error());
  const auto training = current_training_split(settings, artifact);
  if (!training) return std::unexpected(training.error());
+ if (model.task == mmltk::backend::models::rfdetr::ModelTask::Keypoints && !(*training)->has_keypoints) return std::unexpected(refused("Keypoint training requires a dataset with class joint schemas"));
+ if (model.training_config) {
+  if (const auto error = mmltk::backend::models::rfdetr::training_supervision_admission_error(model.task, model.training_config->dec_layers, request.training_supervision)) return std::unexpected(refused(*error));
+ }
  const auto validation = current_artifact_split(artifact, request.val_compiled_path, "validation artifact is unavailable");
  if (!validation) return std::unexpected(validation.error());
  if ((*training)->class_names != (*validation)->class_names) return std::unexpected(refused("training and validation class order differs"));
@@ -132,6 +136,7 @@ ComputeIntentMaterializer::ValidationMaterialization ComputeIntentMaterializer::
  if (!selected) return std::unexpected(selected.error());
  const auto compiled = current_artifact_split(artifact, mmltk::controller::contracts::resolve_validation_source(settings), "selected validation artifact is unavailable");
  if (!compiled) return std::unexpected(compiled.error());
+ if (model.task == mmltk::backend::models::rfdetr::ModelTask::Keypoints && !(*compiled)->has_keypoints) return std::unexpected(refused("Keypoint validation requires a dataset with class joint schemas"));
  request.compiled_path = (*compiled)->path;
  assign_model_artifact(request, model);
  request.save_engine_path.clear();
@@ -166,10 +171,10 @@ ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Expo
 // model and artifact primitives have validated their inputs.
 ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::Predict(
  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
- auto request = settings.workflows.predict.request;
+ auto admitted = PredictionModel(settings, model);
+ if (!admitted) return std::unexpected(admitted.error());
+ auto request = std::move(*admitted);
  request.output_path = settings.workflows.predict.write_report_json ? "predictions.json" : "";
- const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Predict, model);
- if (!selected) return std::unexpected(selected.error());
  request.compiled_path.clear();
  request.image_inputs.clear();
  request.video_path.clear();
@@ -191,6 +196,17 @@ ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::
  } else {
   return std::unexpected(refused("select a compiled dataset, image, or local video file"));
  }
+ return request;
+}
+ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::PredictionModel(
+ const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ModelSelection& model) noexcept {
+ const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Predict, model);
+ if (!selected) return std::unexpected(selected.error());
+ auto request = settings.workflows.predict.request;
+ request.compiled_path.clear();
+ request.image_inputs.clear();
+ request.video_path.clear();
+ request.output_path.clear();
  assign_model_artifact(request, model);
  request.backend = "auto";
  request.batch_size = 1U;

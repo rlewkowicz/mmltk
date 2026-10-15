@@ -162,6 +162,7 @@ impl Component {
                         "validate.gt.labels",
                         "validate.gt.masks",
                         "validate.gt.boxes",
+                        "validate.gt.keypoints",
                     ],
                     "Groundtruth",
                 )
@@ -175,6 +176,7 @@ impl Component {
                         "validate.pred.labels",
                         "validate.pred.masks",
                         "validate.pred.boxes",
+                        "validate.pred.keypoints",
                     ],
                     "Detections",
                 )
@@ -200,10 +202,11 @@ impl Component {
                 } else {
                     "validate.pred.layer"
                 }),
-                overlay_controls::view(labels, masks, boxes, true, available, ids).map(
+                overlay_controls::view(labels, masks, boxes, if ground_truth { overlays.groundtruthkeypoints } else { overlays.predictionkeypoints }, true, available, ids).map(
                     move |message| {
                         let mut next = fine.clone();
                         match message {
+                            overlay_controls::Message::Keypoints(value) => { if ground_truth { next.groundtruthkeypoints = value; } else { next.predictionkeypoints = value; } }
                             overlay_controls::Message::Labels(value) => {
                                 return Message::Labels(ground_truth, value);
                             }
@@ -234,6 +237,7 @@ impl Component {
         vec![
             container(gt).id("validate.gt.group").into(),
             container(pred).id("validate.pred.group").into(),
+            container(checkbox(overlays.uncertainty).label("Joint uncertainty").on_toggle_maybe(available.then_some({ let current = overlays.clone(); move |value| { let mut next = current.clone(); next.uncertainty = value; Message::Overlays(next) } }))).id("validate.uncertainty").into(),
         ]
     }
     pub fn atlas<'a>(

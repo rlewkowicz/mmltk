@@ -311,7 +311,8 @@ std::uintptr_t RfdetrRuntimeBackend::stream() const noexcept { return lane_->com
 runtime::RuntimeElementType RfdetrRuntimeBackend::input_element_type() const noexcept { return lane_->model_info().input.element_type; }
 const runtime::RuntimeModelInfo& RfdetrRuntimeBackend::model_info() const noexcept { return lane_->model_info(); }
 runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
- const runtime::RuntimeTensorBuffer& input, std::span<runtime::AnalysisAnnotationStorage> annotations, std::span<RfdetrOutputSelection> selections, bool include_masks) {
+ const runtime::RuntimeTensorBuffer& input, std::span<runtime::AnalysisAnnotationStorage> annotations, std::span<RfdetrOutputSelection> selections, bool include_masks, float confidence_threshold) {
+ if (!(confidence_threshold >= 0.0F && confidence_threshold <= 1.0F)) throw std::invalid_argument("RF-DETR confidence threshold must be finite and between zero and one");
  if (input.shape.rank != 4U || input.shape.extents[0] <= 0 || annotations.size() != static_cast<std::size_t>(input.shape.extents[0])) {
   throw std::invalid_argument("RF-DETR annotation count must equal the input batch");
  }
@@ -343,7 +344,8 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
   std::span<runtime::AnalysisAnnotationStorage> annotations;
   std::span<RfdetrOutputSelection> selections;
   bool include_masks;
- } context{this, output_storage.get(), batch, annotations, selections, include_masks};
+  float confidence_threshold;
+ } context{this, output_storage.get(), batch, annotations, selections, include_masks, confidence_threshold};
  const runtime::RuntimeOutputBinding binding{
   .context = &context,
   .bind = [](void* opaque, std::int32_t device, std::uintptr_t stream_value, std::span<runtime::RuntimeTensorBuffer> buffers) {
@@ -404,6 +406,9 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
     tensors.keypoints_per_class = bound_owner.state_->output_contract.keypoints_per_class;
     auto selected = select_output_batch_fixed_size(tensors,
      region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->postprocess.get());
+    // Selection is score ordered. Keep the valid prefix on the lane and publish
+    // its count through the existing completion-owned readback storage.
+    if (bound_call.confidence_threshold > 0.0F) selected.counts = torch::minimum(selected.counts, (selected.scores >= bound_call.confidence_threshold).sum(1).to(selected.counts.options()));
     bound_call.outputs->counts->Publish(index, selected.counts, annotation);
     write_analysis_keypoints(selected, annotation);
     PostprocessedBatch processed{selected.scores, selected.labels, selected.boxes, std::nullopt};
@@ -500,7 +505,7 @@ std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane(
   state_->admission, retirement ? std::move(retirement) : state_->retirement, state_->operations));
 }
 std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options) {
- if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};
+ if (options.stop.stop_requested()) throw RfdetrArtifactAdmissionCancelled{};
  if (!options.command_stream) { throw std::invalid_argument("RF-DETR runtime command stream is invalid"); }
  const auto artifact = resolve_inference_artifact(options.artifacts, options.backend);
  runtime::RuntimeBackendKind kind;
@@ -511,9 +516,14 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
   default: throw_invalid_artifact_kind();
  }
  auto admission = options.admission;
- if (!admission) admission = std::make_shared<const ClassArtifactAdmission>(artifact.path, options.artifacts.class_layout_path, nullptr, options.stop);
+ if (!admission) {
+  try { admission = std::make_shared<const ClassArtifactAdmission>(artifact.path, options.artifacts.class_layout_path, nullptr, options.stop); }
+  catch (const ArtifactPublicationCancelled&) { throw RfdetrArtifactAdmissionCancelled{}; }
+  catch (const std::runtime_error& error) { throw RfdetrArtifactAdmissionFailure(error.what()); }
+ }
  if (!admission->Matches(artifact.path, options.artifacts.class_layout_path)) throw std::runtime_error("runtime admission does not match selected artifact");
- admission->RequireUnchanged(options.stop);
+ try { admission->RequireUnchanged(options.stop); }
+ catch (const ArtifactPublicationCancelled&) { throw RfdetrArtifactAdmissionCancelled{}; }
  std::optional<ModelClassLayout> embedded;
  auto output_roles = admission->output_roles();
  auto output_contract = admission->output_contract();
@@ -530,7 +540,7 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
   publication = std::make_unique<ClassArtifactPublication>(options.save_compiled_model_path, options.artifacts.class_layout_path);
   staged_engine = publication->staged_artifact();
  }
- if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};
+ if (options.stop.stop_requested()) throw RfdetrArtifactAdmissionCancelled{};
  auto lane = runtime::make_runtime_backend(
   {.kind = kind, .model_path = artifact.path, .save_compiled_model_path = staged_engine, .device = options.device, .command_stream = options.command_stream, .allow_fp16 = options.allow_fp16});
  if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};

@@ -697,6 +697,9 @@ void convert(JsonWrite<PredictViewState> value) {
  const auto& s = value.state;
  j = snapshot_fields(s.request, predict_flat_fields);
  j["source"] = s.source;
+ j["live_analysis_enabled"] = s.live_analysis_enabled;
+ j["show_keypoints"] = s.show_keypoints;
+ j["show_uncertainty"] = s.show_uncertainty;
  j["live_split_count"] = s.live_split_count;
  j["write_report_json"] = s.write_report_json;
  add_workflow_selection_json(j, s);
@@ -707,6 +710,9 @@ void convert(JsonRead<PredictViewState> value) {
  predict_flat_fields(s.request, JsonFieldReader{j});
  s.request.batch_size = 1U;
  get_optional(j, "source", s.source);
+ get_optional(j, "live_analysis_enabled", s.live_analysis_enabled);
+ get_optional(j, "show_keypoints", s.show_keypoints);
+ get_optional(j, "show_uncertainty", s.show_uncertainty);
  get_optional(j, "live_split_count", s.live_split_count);
  get_optional(j, "write_report_json", s.write_report_json);
  apply_workflow_selection_json(j, s);
@@ -765,6 +771,9 @@ nlohmann::json snapshot_workflows(const GuiSettingsState& settings) {
   predict_json["source"] = s.source;
   predict_json["saving"] = snapshot_fields(s.saving, prediction_output_fields);
   predict_json[kPredictKey] = snapshot_fields(s.request, predict_fields);
+  predict_json[kPredictKey]["live_analysis_enabled"] = s.live_analysis_enabled;
+  predict_json[kPredictKey]["show_keypoints"] = s.show_keypoints;
+  predict_json[kPredictKey]["show_uncertainty"] = s.show_uncertainty;
   predict_json[kPredictKey]["live_split_count"] = s.live_split_count;
   predict_json[kPredictKey]["write_report_json"] = s.write_report_json;
   predict_json["output"] = snapshot_fields(s.output, output_selection_fields);
@@ -816,6 +825,9 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
   apply_workflow_artifacts_and_execution(predict, s, ModelArtifactsShape{}, s.request, predict_execution_fields);
   apply_workflow_section(predict, s.request, kPredictKey, predict_fields);
   if (const nlohmann::json* values = find_object(predict, kPredictKey)) {
+   get_optional(*values, "live_analysis_enabled", s.live_analysis_enabled);
+   get_optional(*values, "show_keypoints", s.show_keypoints);
+   get_optional(*values, "show_uncertainty", s.show_uncertainty);
    get_optional(*values, "live_split_count", s.live_split_count);
    get_optional(*values, "write_report_json", s.write_report_json);
   }

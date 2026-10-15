@@ -143,6 +143,7 @@ struct CompositeRgbaOverRgbaPitchedLaunch {
  MutableSurfaceU8 base_rgba;
  ConstSurfaceU8 overlay_rgba;
  cudaStream_t stream = nullptr;
+ bool preserve_alpha = false;
 };
 struct FinalizeRgbaLaunch {
  ConstSurfaceU8 clean;
@@ -155,6 +156,7 @@ struct CompositeRgbaLaunchAbi {
  RgbaTargetViewAbi base_rgba;
  ConstSurfaceU8 overlay_rgba;
  cudaStream_t stream = nullptr;
+ bool preserve_alpha = false;
 };
 struct CopyBgrToRgbaPitchedLaunch {
  ConstSurfaceU8 source_bgr;

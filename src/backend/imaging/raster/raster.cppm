@@ -4,6 +4,7 @@ module;
 #include <span>
 #include <vector>
 #include "detail/raster_cuda_abi.h"
+#include "skeleton_projection.h"
 export module mmltk.backend.imaging.raster;
 export namespace mmltk::backend::imaging::raster {
 template <class Pixel>
@@ -90,6 +91,7 @@ struct CompositeRgbaWork final {
  RgbaTargetView base_rgba{};
  ConstBytes overlay_rgba{};
  NativeStream stream{};
+ bool preserve_alpha = false;
 };
 // Coordinates are half-open and clipped to the image. Empty coverage writes nothing.
 struct FinalizeRgbaWork final {
@@ -188,5 +190,6 @@ struct BoolMaskPackWork final {
 [[nodiscard]] std::int32_t raster_polyline_rgba(const PolylineRgbaWork& work) noexcept;
 [[nodiscard]] std::int32_t raster_points_rgba(const PointsRgbaWork& work) noexcept;
 [[nodiscard]] std::int32_t raster_skeleton_rgba(const SkeletonRgbaWork& work) noexcept;
+[[nodiscard]] std::int32_t raster_projected_skeleton(MutableBytes, const std::uint32_t* words, const SkeletonProjection&, NativeStream, bool joints = true, bool uncertainty = false, bool complementary = false) noexcept;
 [[nodiscard]] std::int32_t pack_bool_masks(const BoolMaskPackWork& work) noexcept;
 }  // namespace mmltk::backend::imaging::raster

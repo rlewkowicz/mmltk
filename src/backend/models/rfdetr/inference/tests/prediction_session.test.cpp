@@ -44,6 +44,7 @@
 #include "src/backend/models/rfdetr/inference/dataset_batch_lease.h"
 #include <spdlog/sinks/callback_sink.h>
 #include <array>
+#include <limits>
 #include <atomic>
 #include <cmath>
 #include <algorithm>
@@ -924,6 +925,46 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
  CHECK(retirement->admission_open() == (failure == 0));
  if (failure != 0) CHECK_THROWS(session.Run(request, stream, delivery));
 }
+TEST_CASE("RF artifact startup cancellation keeps its pre-runtime stage and existing cancellation contract", "[model][rfdetr][runtime][cancellation]") {
+ std::stop_source stop;
+ stop.request_stop();
+ rfdetr::RfdetrRuntimeBackendOptions options;
+ options.stop = stop.get_token();
+ // The first check runs before artifact IO, lane creation or CUDA allocation.
+ CHECK_THROWS_AS(rfdetr::make_rfdetr_runtime_backend(options), rfdetr::RfdetrArtifactAdmissionCancelled);
+ CHECK_THROWS_AS(rfdetr::make_rfdetr_runtime_backend(options), rfdetr::ArtifactPublicationCancelled);
+}
+TEST_CASE("RF cancellation after admitted runtime construction is not a pre-runtime refusal", "[model][rfdetr][runtime][cancellation][gpu]") {
+ const mmltk::testsupport::ScopedTempDir root{"runtime-cancel-stage"};
+ const auto model = root.path() / "rf-detr-nano.onnx";
+ write_prediction_model(model);
+ const mmltk::testsupport::ScopedTestStream stream(0);
+ std::stop_source stop;
+ bool published = false, cancelled = false;
+ rfdetr::RfdetrRuntimeBackendOptions options;
+ options.artifacts.onnx_path = model;
+ options.backend = "tensorrt";
+ options.command_stream = {reinterpret_cast<std::uintptr_t>(stream.get()),true};
+ options.static_resolution = 8;
+ options.maximum_detections = 2;
+ options.allow_fp16 = false;
+ options.save_compiled_model_path = root.path() / "compiled.engine";
+ options.stop = stop.get_token();
+ options.artifact_published = [&](const auto&) {
+  published = true;
+  stop.request_stop();
+  // This existing callback runs only after the real lane, RF postprocessing
+  // and artifact publication have completed. Its cancellation retains the
+  // general cancellation contract, never the pre-runtime recovery marker.
+  throw rfdetr::ArtifactPublicationCancelled{};
+ };
+ try { static_cast<void>(rfdetr::make_rfdetr_runtime_backend(options)); }
+ catch (const rfdetr::RfdetrArtifactAdmissionCancelled&) { FAIL("post-runtime cancellation was classified as recoverable artifact admission"); }
+ catch (const rfdetr::ArtifactPublicationCancelled&) { cancelled = true; }
+ CHECK(published);
+ CHECK(cancelled);
+ REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+}
 TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "[model][rfdetr][prediction][gpu]") {
  namespace runtime = mmltk::backend::ml::runtime;
  const mmltk::testsupport::ScopedTempDir files{"prediction-bbox-consumer"};
@@ -1019,6 +1060,20 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
   CHECK(torch::equal(boxes, prior_boxes));
   CHECK(torch::equal(masks, produced));
  }
+ // The admitted Live threshold only changes the selected valid prefix. Default
+ // Run retains every prior detector/mask outcome and exact inclusive ties.
+ const auto reference_scores = scores.to(torch::kCPU).contiguous();
+ const auto* confidence = reference_scores.data_ptr<float>();
+ for (const float threshold : {0.0F, confidence[0], confidence[1], 1.0F}) {
+  auto submission = backend->Run(input_buffer, annotations, {}, false, threshold);
+  backend->ReleaseAfterCompletion(std::move(submission));
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+  annotations[0].count.SettleAfterCompletion(annotations[0].value_capacity);
+  CHECK(annotations[0].count.value() == static_cast<std::uint32_t>((confidence[0] >= threshold) + (confidence[1] >= threshold)));
+  CHECK(torch::equal(scores.to(torch::kCPU), reference_scores));
+ }
+ for (const float threshold : {-0.1F, 1.1F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()})
+  CHECK_THROWS_AS(backend->Run(input_buffer, annotations, {}, false, threshold), std::invalid_argument);
  CHECK(empty_backend->Close() == runtime::kRuntimeSuccess);
  CHECK(bbox_backend->Close() == runtime::kRuntimeSuccess);
  CHECK(backend->Close() == runtime::kRuntimeSuccess);
@@ -2389,6 +2444,41 @@ TEST_CASE("Native keypoint validation maps classes and named joints in both metr
   CHECK(renamed_info.class_layout == inspected.class_layout);
   CHECK(renamed_info.outputs.front().name == "producer_pred_keypoints");
   CHECK(renamed_info.outputs.front().role == rfdetr::RfdetrOutputRole::Keypoints);
+ }
+ {
+  namespace runtime = mmltk::backend::ml::runtime;
+  c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream.get(), 0));
+  const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat);
+  constexpr std::uint32_t candidates = 12, joints = 17;
+  auto input = torch::zeros({1,3,config.resolution,config.resolution}, options);
+  auto boxes = torch::empty({candidates,4}, options), scores = torch::empty({candidates}, options);
+  auto classes = torch::empty({candidates}, options.dtype(torch::kInt)), counts = torch::empty({candidates}, options.dtype(torch::kInt));
+  auto points = torch::empty({candidates,joints,runtime::kAnalysisKeypointChannels}, options);
+  std::array<runtime::AnalysisAnnotationStorage, 1> annotations{{{.source_region = {.width=32,.height=32}, .value_capacity=candidates,
+   .boxes_xyxy={reinterpret_cast<std::uintptr_t>(boxes.data_ptr()), boxes.nbytes(), {2,{candidates,4}}, runtime::AnalysisElementType::Float32},
+   .class_references={reinterpret_cast<std::uintptr_t>(classes.data_ptr()), classes.nbytes(), {1,{candidates}}, runtime::AnalysisElementType::Int32},
+   .confidences={reinterpret_cast<std::uintptr_t>(scores.data_ptr()), scores.nbytes(), {1,{candidates}}, runtime::AnalysisElementType::Float32},
+   .keypoint_capacity=joints,
+   .keypoints={reinterpret_cast<std::uintptr_t>(points.data_ptr()), points.nbytes(), {3,{candidates,joints,static_cast<std::uint32_t>(runtime::kAnalysisKeypointChannels)}}, runtime::AnalysisElementType::Float32},
+   .keypoint_counts={reinterpret_cast<std::uintptr_t>(counts.data_ptr()), counts.nbytes(), {1,{candidates}}, runtime::AnalysisElementType::Int32}}}};
+  rfdetr::ModelArtifactRequest artifact;
+  artifact.onnx_path = exported.output_path;
+  auto backend = rfdetr::make_rfdetr_runtime_backend({.artifacts=artifact, .backend="onnx", .device=0, .command_stream=command, .static_resolution=static_cast<std::uint32_t>(config.resolution), .maximum_detections=candidates, .allow_fp16=false});
+  const runtime::RuntimeTensorBuffer input_buffer{input.data_ptr(),input.nbytes(),{4,{1,3,config.resolution,config.resolution}},runtime::RuntimeElementType::Float32};
+  torch::Tensor original_scores;
+  for (const float threshold : {0.F, 1.F, 0.F}) {
+   auto submitted = backend->Run(input_buffer, annotations, {}, false, threshold);
+   backend->ReleaseAfterCompletion(std::move(submitted));
+   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+   annotations[0].count.SettleAfterCompletion(candidates);
+   CHECK(annotations[0].count.value() == (threshold == 1.F ? 0 : candidates));
+   CHECK(annotations[0].keypoints_available);
+   const auto host_counts = counts.to(torch::kCPU).contiguous();
+   CHECK(std::set<std::int32_t>(host_counts.data_ptr<std::int32_t>(),host_counts.data_ptr<std::int32_t>()+candidates) == std::set<std::int32_t>{0,2,17});
+   if (!original_scores.defined()) original_scores = scores.to(torch::kCPU).clone();
+   else CHECK(torch::equal(original_scores, scores.to(torch::kCPU)));
+  }
+  CHECK(backend->Close() == runtime::kRuntimeSuccess);
  }
  rfdetr::BuildEngineRequest engine;
  engine.onnx_path = exported.output_path;

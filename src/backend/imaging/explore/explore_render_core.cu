@@ -272,6 +272,55 @@ __global__ void detail_box_kernel(const ExploreRenderTargetView target_view_valu
  draw_box_edges(target, annotations[annotation_index], 0U, 0U, MMLTK_FLOAT(target.width), MMLTK_FLOAT(target.height), MMLTK_FLOAT(view.crop_x) / source_width, MMLTK_FLOAT(view.crop_y) / source_height,
   MMLTK_FLOAT(view.crop_width) / source_width, MMLTK_FLOAT(view.crop_height) / source_height, 0U, 0U, target.width, target.height, classes, semantics.class_count);
 }
+__device__ void draw_skeleton(const Target target, const ExploreRenderAnnotationDescriptor& annotation, const ExploreRenderScratchView scratch,
+ const ExploreRenderSemanticView semantics, const float origin_x, const float origin_y, const float extent_x, const float extent_y,
+ const std::uint32_t destination_x, const std::uint32_t destination_y, const std::uint32_t width, const std::uint32_t height) {
+ if (!class_visible(scratch.classes, semantics.class_count, annotation.class_id) || !scratch.joints || annotation.joint_count == 0 ||
+     annotation.joint_offset > scratch.capacities.joints || annotation.joint_count > scratch.capacities.joints - annotation.joint_offset) return;
+ const auto* joints = static_cast<const ExploreRenderJointAbi*>(scratch.joints) + annotation.joint_offset;
+ const auto category = scratch.classes[annotation.class_id];
+ if (category.edge_offset > scratch.capacities.edges || category.edge_count > scratch.capacities.edges - category.edge_offset) return;
+ const auto color = class_colour(scratch.classes, annotation.class_id);
+ const auto active = [&](const ExploreRenderJointAbi point) {
+  return point.visibility != 0 && isfinite(point.x) && isfinite(point.y) && point.x >= origin_x && point.y >= origin_y && point.x <= origin_x + extent_x && point.y <= origin_y + extent_y;
+ };
+ const auto pixel = [&](const ExploreRenderJointAbi point) { return make_int2(__float2int_rn(destination_x + (point.x - origin_x) * width / extent_x), __float2int_rn(destination_y + (point.y - origin_y) * height / extent_y)); };
+ const auto write = [&](int x, int y) {
+  if (x >= MMLTK_INT(destination_x) && y >= MMLTK_INT(destination_y) && x < MMLTK_INT(destination_x + width) && y < MMLTK_INT(destination_y + height) && x < MMLTK_INT(target.width) && y < MMLTK_INT(target.height)) store(target, x, y, color);
+ };
+ for (std::uint32_t joint = threadIdx.x; joint < annotation.joint_count; joint += blockDim.x) {
+  if (!active(joints[joint])) continue;
+  const auto point = pixel(joints[joint]);
+  for (int y = -2; y <= 2; ++y) for (int x = -2; x <= 2; ++x) if (x*x + y*y <= 4 && (joints[joint].visibility == 2 || x*x + y*y >= 2)) write(point.x + x, point.y + y);
+ }
+ for (std::uint32_t edge = threadIdx.x; edge < category.edge_count; edge += blockDim.x) {
+  const auto indices = scratch.edges[category.edge_offset + edge];
+  if (indices.first >= annotation.joint_count || indices.second >= annotation.joint_count || !active(joints[indices.first]) || !active(joints[indices.second])) continue;
+  const auto first = pixel(joints[indices.first]), second = pixel(joints[indices.second]);
+  const int steps = max(abs(second.x - first.x), abs(second.y - first.y));
+  for (int step = 0; step <= steps; ++step) {
+   const float amount = steps == 0 ? 0 : MMLTK_FLOAT(step) / steps;
+   write(__float2int_rn(first.x + amount * (second.x - first.x)), __float2int_rn(first.y + amount * (second.y - first.y)));
+  }
+ }
+}
+__global__ void atlas_skeleton_kernel(const ExploreRenderTargetView target_value, const ExploreRenderScratchView scratch, const ExploreRenderAtlasView view,
+ const ExploreRenderTileBatchView batch, const ExploreRenderSemanticView semantics) {
+ const auto index = blockIdx.x;
+ if (index >= batch.tile_count) return;
+ const auto target = target_view(target_value);
+ const auto tile = tile_for_plane(scratch.tiles[index], view);
+ if (tile.placeholder || tile.generation.viewport != batch.viewport_generation || tile.card_index >= scratch.capacities.cards) return;
+ const auto card = scratch.cards[tile.card_index];
+ if (card.placeholder || card.crop_width == 0 || card.crop_height == 0 || card.annotation_offset > scratch.capacities.annotations || card.annotation_count > scratch.capacities.annotations - card.annotation_offset) return;
+ for (std::uint32_t instance = 0; instance < card.annotation_count; ++instance)
+  draw_skeleton(target, scratch.annotations[card.annotation_offset + instance], scratch, semantics, card.crop_x, card.crop_y, card.crop_width, card.crop_height,
+   tile.destination_x + card.image_x, tile.destination_y + card.image_y, min(card.image_width, tile.destination_width - min(card.image_x, tile.destination_width)), min(card.image_height, tile.destination_height - min(card.image_y, tile.destination_height)));
+}
+__global__ void detail_skeleton_kernel(const ExploreRenderTargetView target_value, const ExploreRenderScratchView scratch, const ExploreRenderDetailView view, const ExploreRenderSemanticView semantics) {
+ if (blockIdx.x >= semantics.annotation_count) return;
+ draw_skeleton(target_view(target_value), scratch.annotations[blockIdx.x], scratch, semantics, view.crop_x, view.crop_y, view.crop_width, view.crop_height, 0, 0, target_value.width, target_value.height);
+}
 __global__ void count_nonzero_alpha_kernel(const ExploreRenderTargetView target_view_value, unsigned long long* count) {
  const Target target = target_view(target_view_value);
  std::uint64_t index;
@@ -369,6 +418,7 @@ cudaError_t render_explore_atlas_tiles_cuda(const ExploreRenderAtlasView& view, 
  if (demand.valid() && semantics.show_boxes != 0U && semantics.annotation_count != 0U) {
   atlas_tile_box_kernel<<<tile_box_grid, threads, 0U, stream>>>(target, cards, annotations, classes, tile_descriptors, view, tiles, semantics, scratch.capacities.annotations);
  }
+ if (demand.valid() && semantics.show_keypoints && semantics.annotation_count) atlas_skeleton_kernel<<<tiles.tile_count, threads, 0U, stream>>>(target, scratch, view, tiles, semantics);
  return cudaPeekAtLastError();
 }
 cudaError_t render_explore_detail_cuda(const ExploreRenderDetailView& view, const ExploreRenderSemanticView& semantics, const ExploreRenderScratchView& scratch, const ExploreRenderTargetView& target,
@@ -383,6 +433,7 @@ cudaError_t render_explore_detail_cuda(const ExploreRenderDetailView& view, cons
  if (demand.valid() && semantics.show_boxes != 0U && semantics.annotation_count != 0U) {
   detail_box_kernel<<<semantics.annotation_count, threads, 0U, stream>>>(target, annotations, classes, view, semantics);
  }
+ if (demand.valid() && semantics.show_keypoints && semantics.annotation_count) detail_skeleton_kernel<<<semantics.annotation_count, threads, 0U, stream>>>(target, scratch, view, semantics);
  return cudaPeekAtLastError();
 }
 cudaError_t count_explore_nonzero_alpha_cuda(const ExploreRenderTargetView& target, std::uint64_t* const count, const cudaStream_t stream) noexcept {

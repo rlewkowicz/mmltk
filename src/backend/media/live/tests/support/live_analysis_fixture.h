@@ -9,6 +9,8 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <utility>
 namespace mmltk::backend::media::live::test_support {
 // Device-copy injection uses ordinary memory; all layout, count, schema,
 // allocation, and publication logic remains in LiveAnalysisProduct.
@@ -30,10 +32,10 @@ struct LiveAnalysisFixture final {
    {.names={"left","right"},.skeleton={{0,1}},.horizontal_flip={1,0},.oks_sigmas={.1,.1}}, {}}};
   return std::make_shared<ClassCatalog>(record);
  }
- template<class T,std::size_t N> static mmltk::backend::ml::runtime::AnalysisDeviceBuffer Buffer(std::array<T,N>& values,
+ template<class Range> static mmltk::backend::ml::runtime::AnalysisDeviceBuffer Buffer(Range& values,
   std::initializer_list<std::uint32_t> extents, Element type) {
   mmltk::backend::ml::runtime::AnalysisDeviceBuffer result{
-   .address=reinterpret_cast<std::uintptr_t>(values.data()),.capacity_bytes=sizeof(values),.shape={.rank=static_cast<std::uint8_t>(extents.size())},.element_type=type};
+   .address=reinterpret_cast<std::uintptr_t>(values.data()),.capacity_bytes=std::as_bytes(std::span{values}).size(),.shape={.rank=static_cast<std::uint8_t>(extents.size())},.element_type=type};
   std::size_t axis=0;
   for (const auto extent : extents) result.shape.extents[axis++]=extent;
   return result;
@@ -50,6 +52,32 @@ struct LiveAnalysisFixture final {
   if (pending) result.count.PublishPending(count.get(),count.get(),count,2);
   else result.count.SetKnown(static_cast<std::size_t>(*count),2);
   return result;
+ }
+ static void DeliverLargeSchema(LiveAnalysisProduct& product, LiveFrameId frame, std::uint32_t count) {
+  namespace catalog = mmltk::backend::data::catalog;
+  catalog::ClassKeypointSchema schema;
+  for (std::size_t joint = 0; joint < catalog::kKeypointsPerClassCapacity; ++joint) {
+   auto name = std::to_string(joint); name.append(catalog::kKeypointNameCapacity - name.size(), 'j');
+   schema.names.push_back(std::move(name)); schema.horizontal_flip.push_back(joint); schema.oks_sigmas.push_back(.1);
+  }
+  for (std::size_t edge = 0; edge < catalog::kSkeletonEdgeCapacity; ++edge)
+   schema.skeleton.push_back({static_cast<catalog::JointIndex>(edge % 256), static_cast<catalog::JointIndex>((edge % 256 + 1 + edge / 256) % 256)});
+  auto classes = std::make_shared<const catalog::ClassCatalog>(catalog::OrderedClassCatalog{{{"custom"}}, std::vector{schema}});
+  std::vector<std::array<float,4>> boxes(count, {0,0,3,3});
+  std::vector<std::int32_t> categories(count,0), counts(count,256);
+  std::vector<float> scores(count,.9F);
+  std::vector<std::array<std::uint8_t,3>> colors(count,{255,0,0});
+  std::vector<Joint> joints(std::size_t(count)*256,{2,2,.9F,1,0,1});
+  RuntimeAnnotation annotation{.source_region={0,0,4,4},.value_capacity=count,
+   .boxes_xyxy=Buffer(boxes,{count,4},Element::Float32),.class_references=Buffer(categories,{count},Element::Int32),
+   .confidences=Buffer(scores,{count},Element::Float32),.colors_rgb=Buffer(colors,{count,3},Element::Uint8),
+   .keypoint_capacity=256,.keypoints=Buffer(joints,{count,256,static_cast<std::uint32_t>(mmltk::backend::ml::runtime::kAnalysisKeypointChannels)},Element::Float32),
+   .keypoint_counts=Buffer(counts,{count},Element::Int32),.keypoints_available=true,
+   .class_domain=catalog::ClassReferenceDomain::Foreground,.class_catalog=std::move(classes)};
+  annotation.count.SetKnown(count,count);
+  product.PrepareDevice(frame,4,4,std::span{&annotation,1});
+  if (product.EnqueueDeviceCopy(1,&Copy) != cudaSuccess) throw std::runtime_error("fixture copy failed");
+  product.CompleteDeviceCopy();
  }
  static cudaError_t Copy(void* target,const void* source,std::size_t bytes,std::uintptr_t) noexcept {
   std::memcpy(target,source,bytes);

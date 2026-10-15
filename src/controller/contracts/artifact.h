@@ -28,6 +28,7 @@ struct ArtifactSplitFact final {
  std::uint32_t height = 0U;
  std::uint32_t channels = 0U;
  std::uint32_t max_instances_per_image = 0U;
+ bool has_keypoints = false;
  MMLTK_MAX_ITEMS(mmltk::backend::data::catalog::kClassCatalogCapacity) std::vector<mmltk::backend::data::catalog::ClassName> class_names;
  [[nodiscard]] bool valid() const noexcept {
   if (path.empty() || path.size() > kArtifactPathCapacity || image_count == 0U || width == 0U || height == 0U || channels == 0U || class_names.empty() ||

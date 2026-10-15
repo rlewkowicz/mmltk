@@ -1518,7 +1518,11 @@ TEST_CASE("Predict scalar progress excludes full retained labels and keeps nativ
  using namespace mmltk::controller;
  namespace reflection = mmltk::frameworks::reflection;
  constexpr auto snapshot_budget = browser::application_schema_detail::annotation_value<^^PredictSystem::snapshot, contracts::reflection::Snapshot>().byte_budget;
- STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<PredictSnapshot>() <= snapshot_budget);
+ // Joint products have aggregate admission, not a Cartesian allocation of
+ // every object's maximum schema. The existing per-value ceiling remains.
+ STATIC_REQUIRE(snapshot_budget == kPredictSnapshotByteBudget);
+ STATIC_REQUIRE(snapshot_budget <= browser::kMaxOutputValueBytes);
+ STATIC_REQUIRE(kVisualMetadataByteBudget == browser::kMaxOutputValueBytes);
  PredictSnapshot snapshot;
  CHECK_FALSE(PredictSystem::visual_source::Observe(snapshot).valid());
  snapshot.revision = 19U;

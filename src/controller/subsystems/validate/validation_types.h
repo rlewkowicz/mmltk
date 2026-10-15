@@ -28,6 +28,7 @@ struct ValidationLabel final {
  bool ground_truth = false;
  float confidence = 0.0F;
  MMLTK_MAX_BYTES(256U) std::string name;
+ VisualSkeleton skeleton;
 };
 struct ValidationSampleMetadata final {
  ValidationSampleIdentity identity{};

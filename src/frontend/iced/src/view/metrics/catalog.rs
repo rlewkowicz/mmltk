@@ -55,7 +55,7 @@ impl Chart {
 pub(super) enum Source {
     Scalar(TrainingScalarsField),
     Evaluation {
-        mask: bool,
+        kind: crate::generated::EvaluationMetricKind,
         field: MetricSummaryField,
     },
 }
@@ -81,6 +81,10 @@ pub(super) fn catalog() -> Vec<Metric> {
                 TrainingScalarsField::Giou => "Box GIoU".into(),
                 TrainingScalarsField::MaskCe => "Mask CE".into(),
                 TrainingScalarsField::MaskDice => "Mask Dice".into(),
+                TrainingScalarsField::KeypointL1 => "Keypoint L1".into(),
+                TrainingScalarsField::KeypointFindable => "Keypoint findability".into(),
+                TrainingScalarsField::KeypointVisible => "Keypoint visibility".into(),
+                TrainingScalarsField::KeypointNll => "Keypoint NLL".into(),
                 TrainingScalarsField::AuxiliaryWeighted => "Auxiliary (weighted)".into(),
                 TrainingScalarsField::DenoisingWeighted => "Denoising (weighted)".into(),
                 TrainingScalarsField::CorrespondenceWeighted => "Correspondence (weighted)".into(),
@@ -93,8 +97,9 @@ pub(super) fn catalog() -> Vec<Metric> {
             }
         })
         .partition(|metric| !metric.chart.performance());
-    for mask in [false, true] {
-        let prefix = if mask { "Mask" } else { "Box" };
+    let (mut keypoints, mut metrics): (Vec<_>, Vec<_>) = metrics.into_iter().partition(|metric| matches!(metric.source, Source::Scalar(TrainingScalarsField::KeypointL1 | TrainingScalarsField::KeypointFindable | TrainingScalarsField::KeypointVisible | TrainingScalarsField::KeypointNll)));
+    for kind in crate::generated::EVALUATION_METRIC_KIND_VALUES {
+        let prefix = match kind { crate::generated::EvaluationMetricKind::Box => "Box", crate::generated::EvaluationMetricKind::Mask => "Mask", crate::generated::EvaluationMetricKind::Keypoint => "OKS" };
         let mut selected = MetricSummary::FIELDS
             .iter()
             .filter_map(|(field, _)| {
@@ -105,7 +110,7 @@ pub(super) fn catalog() -> Vec<Metric> {
                         chart,
                         label: format!("{prefix} {label}"),
                         source: Source::Evaluation {
-                            mask,
+                            kind: *kind,
                             field: *field,
                         },
                     },
@@ -113,10 +118,12 @@ pub(super) fn catalog() -> Vec<Metric> {
             })
             .collect::<Vec<_>>();
         selected.sort_by_key(|(order, _)| *order);
-        metrics.extend(selected.into_iter().map(|(_, metric)| metric));
+        let destination = if *kind == crate::generated::EvaluationMetricKind::Keypoint { &mut keypoints } else { &mut metrics };
+        destination.extend(selected.into_iter().map(|(_, metric)| metric));
     }
     // Keep the metric inventory and color indices stable across chart grouping.
     metrics.extend(performance);
+    metrics.extend(keypoints);
     metrics
 }
 fn scalar_chart(field: TrainingScalarsField) -> Chart {
@@ -136,7 +143,7 @@ fn scalar_chart(field: TrainingScalarsField) -> Chart {
         | MaskDice
         | AuxiliaryWeighted
         | DenoisingWeighted
-        | CorrespondenceWeighted => Chart::Loss,
+        | CorrespondenceWeighted | KeypointL1 | KeypointFindable | KeypointVisible | KeypointNll => Chart::Loss,
     }
 }
 // Exhaustive visual policy, deliberately independent of native declaration order.
@@ -189,6 +196,10 @@ mod tests {
             (Giou, Some(Chart::Loss)),
             (MaskCe, Some(Chart::Loss)),
             (MaskDice, Some(Chart::Loss)),
+            (KeypointL1, Some(Chart::Loss)),
+            (KeypointFindable, Some(Chart::Loss)),
+            (KeypointVisible, Some(Chart::Loss)),
+            (KeypointNll, Some(Chart::Loss)),
             (AuxiliaryWeighted, Some(Chart::Loss)),
             (DenoisingWeighted, Some(Chart::Loss)),
             (CorrespondenceWeighted, Some(Chart::Loss)),
@@ -269,7 +280,7 @@ mod tests {
             assert_eq!(summary.value(field), value, "{field:?}");
         }
         for (field, _) in MetricSummary::FIELDS {
-            let selected = metrics.iter().filter(|m| matches!(m.source, Source::Evaluation { mask: false, field: candidate } if candidate == field)).count();
+            let selected = metrics.iter().filter(|m| matches!(m.source, Source::Evaluation { kind: crate::generated::EvaluationMetricKind::Box, field: candidate } if candidate == field)).count();
             assert_eq!(
                 selected,
                 usize::from(evaluation_presentation(field).is_some())
@@ -292,7 +303,7 @@ mod tests {
         assert_eq!(
             metrics
                 .iter()
-                .filter(|m| matches!(m.source, Source::Evaluation { mask: false, .. }))
+                .filter(|m| matches!(m.source, Source::Evaluation { kind: crate::generated::EvaluationMetricKind::Box, .. }))
                 .count(),
             expected.len()
         );
@@ -310,7 +321,7 @@ mod tests {
         let selected = metrics
             .iter()
             .filter_map(|m| match m.source {
-                Source::Evaluation { mask: false, field } => Some(field),
+                Source::Evaluation { kind: crate::generated::EvaluationMetricKind::Box, field } => Some(field),
                 _ => None,
             })
             .collect::<Vec<_>>();

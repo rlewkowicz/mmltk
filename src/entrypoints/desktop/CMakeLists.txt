@@ -29,6 +29,7 @@ if(BUILD_MMLTK_BROWSER_HOST OR BUILD_TESTS)
     mmltk_register_retained_module_importers(
         mmltk_entrypoints_desktop_host browser_runtime_entry.cpp)
     mmltk_register_private_headers(mmltk_entrypoints_desktop_host browser_runtime_options.h)
+    target_link_libraries(mmltk_entrypoints_desktop_host PRIVATE mmltk_backend_media_live_capture_fixture)
     target_include_directories(mmltk_entrypoints_desktop_host
         SYSTEM PRIVATE
             ${CMAKE_SOURCE_DIR}/third_party/uWebSockets/src

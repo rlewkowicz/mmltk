@@ -85,6 +85,15 @@ impl ApplicationModel {
     pub(crate) fn viewer_base_source(
         &self,
     ) -> Option<(&VisualFrame, &crate::generated::VisualDocumentFacts)> {
+        let kind = if self.foreground_visual() == Some(PresentationSourceKind::Upscale) { self.requested_upscale.as_ref().map(|request| request.source.source.kind) } else { self.foreground_visual() };
+        if kind == Some(PresentationSourceKind::Predict) {
+            let snapshot = self.predict_snapshot.as_ref()?;
+            return Self::valid_visual_source(&snapshot.frame).map(|_| (&snapshot.frame, &snapshot.document));
+        }
+        if kind == Some(PresentationSourceKind::Live) {
+            let snapshot = self.live_snapshot.as_ref()?;
+            return Self::valid_visual_source(&snapshot.frame).map(|_| (&snapshot.frame, &snapshot.document));
+        }
         let validation = self.foreground_visual() == Some(PresentationSourceKind::Validation)
             || (self.foreground_visual() == Some(PresentationSourceKind::Upscale)
                 && self.requested_upscale.as_ref().is_some_and(|request| {
@@ -1209,7 +1218,7 @@ mod tests {
         baseline.video = true;
         baseline.contentidentity = 1_u64 << 40;
         baseline.frame = visual_frame(PresentationSourceKind::Predict, 4);
-        let label = crate::generated::PredictLabel {
+        let label = crate::generated::VisualObjectLabel {
             box_: crate::generated::AnnotationBox {
                 first: crate::generated::AnnotationPoint { x: 0.0, y: 0.0 },
                 second: crate::generated::AnnotationPoint { x: 4.0, y: 4.0 },
@@ -1223,6 +1232,7 @@ mod tests {
                 value: 1.0,
             },
             name: "retained".into(),
+            skeleton: crate::generated::VisualSkeleton { schema: crate::generated::ClassKeypointSchema { names: Vec::new(), skeleton: Vec::new(), horizontalflip: Vec::new(), okssigmas: Vec::new() }, joints: Vec::new() },
         };
         baseline.labels = vec![label; 4096];
         model.install_predict_snapshot(baseline.clone()).unwrap();

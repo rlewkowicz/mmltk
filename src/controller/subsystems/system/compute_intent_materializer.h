@@ -22,6 +22,7 @@ struct ComputeIntentMaterializer final {
  using ValidationMaterialization = std::expected<mmltk::backend::models::rfdetr::ValidateRequest, Refusal>;
  using ExportMaterialization = std::expected<mmltk::controller::ExportRunRequest, Refusal>;
  using PredictionMaterialization = std::expected<mmltk::backend::models::rfdetr::PredictRequest, Refusal>;
+ [[nodiscard]] static PredictionMaterialization PredictionModel(const mmltk::controller::contracts::GuiSettingsState&, const mmltk::controller::contracts::ModelSelection&) noexcept;
  // Validated selection settings plus native acquisition parameters.
  struct ModelInput final {
   mmltk::controller::contracts::ModelSelectionKey key{};

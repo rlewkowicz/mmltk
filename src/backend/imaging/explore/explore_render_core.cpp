@@ -20,23 +20,30 @@ namespace {
   .cards = value.cards,
   .annotations = value.annotations,
   .rle_pairs = value.rle_pairs,
+  .joints = value.joints,
+  .edges = value.edges,
   .classes = value.classes,
   .tiles = value.tiles,
   .capacities = {
    .cards = value.card_capacity,
    .annotations = value.annotation_capacity,
    .rle_pairs = value.rle_capacity,
+   .joints = value.joint_capacity,
+   .edges = value.edge_capacity,
    .classes = value.class_capacity,
    .tiles = value.tile_capacity,
   },
  };
 }
 static_assert(rle_abi_layout_matches());
+static_assert(sizeof(mmltk::backend::data::PackedKeypoint) == sizeof(detail::ExploreRenderJointAbi));
+static_assert(alignof(mmltk::backend::data::PackedKeypoint) == alignof(detail::ExploreRenderJointAbi));
+static_assert(offsetof(mmltk::backend::data::PackedKeypoint, visibility) == offsetof(detail::ExploreRenderJointAbi, visibility));
 [[nodiscard]] bool atlas_view_valid(const ExploreRenderAtlasView& view) noexcept {
  return view.card_count != 0U && view.card_extent != 0U && view.card_count <= kExploreRenderCardCapacity && view.source_width != 0U && view.source_height != 0U;
 }
 [[nodiscard]] bool semantic_storage_valid(const ExploreRenderSemanticView& semantics, const ExploreRenderScratchView& scratch) noexcept {
- return semantics.annotation_count <= kExploreRenderAnnotationCapacity && semantics.annotation_count <= scratch.annotation_capacity && semantics.rle_count <= kExploreRenderRleCapacity &&
+ return scratch.joint_capacity <= kExploreRenderJointCapacity && scratch.edge_capacity <= kExploreRenderEdgeCapacity && semantics.annotation_count <= kExploreRenderAnnotationCapacity && semantics.annotation_count <= scratch.annotation_capacity && semantics.rle_count <= kExploreRenderRleCapacity &&
         semantics.rle_count <= scratch.rle_capacity && semantics.class_count <= kExploreRenderClassCapacity && semantics.class_count <= scratch.class_capacity;
 }
 }  // namespace

@@ -134,7 +134,7 @@ pub(super) fn probes(ui: &AnnotationUiState) -> Vec<f64> {
             }
             AnnotationShape::Skeleton => {
                 for node in &object.skeletonnodes {
-                    if node.visible {
+                    if node.visibility != crate::generated::KeypointVisibility::Unannotated {
                         add(node.point.x, node.point.y, color);
                     }
                 }

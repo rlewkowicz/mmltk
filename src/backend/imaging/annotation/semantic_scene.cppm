@@ -1,4 +1,5 @@
 module;
+#include "src/backend/data/catalog/keypoint_schema.h"
 #include "src/backend/imaging/annotation/manual_mask_mapping.h"
 #include <cstddef>
 #include <cstdint>
@@ -120,7 +121,8 @@ struct PointShape {
 struct SkeletonNode {
  std::string key;
  Point point{};
- bool visible = true;
+ mmltk::backend::data::catalog::KeypointVisibility visibility = mmltk::backend::data::catalog::KeypointVisibility::Visible;
+ [[nodiscard]] bool visible() const noexcept { return visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; }
  bool operator==(const SkeletonNode&) const = default;
 };
 struct SkeletonEdge {
@@ -131,6 +133,7 @@ struct SkeletonEdge {
 struct SkeletonShape {
  std::vector<SkeletonNode> nodes;
  std::vector<SkeletonEdge> edges;
+ mmltk::backend::data::catalog::ClassKeypointSchema schema;
  bool operator==(const SkeletonShape&) const = default;
 };
 using Shape = std::variant<BoxShape, MaskShape, SplineShape, PointShape, SkeletonShape>;

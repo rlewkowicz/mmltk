@@ -1,4 +1,6 @@
 #include <filesystem>
+#include <fstream>
+#include <stdexcept>
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -96,7 +98,45 @@ private:
  }
  return backend.sync_parent(destination) ? DocumentSaveEffect::Committed : DocumentSaveEffect::Uncertain;
 }
+[[nodiscard]] std::filesystem::path document_path(std::filesystem::path path, const contracts::WorkspaceResource& document) {
+ if (std::filesystem::is_directory(path)) {
+  std::uint64_t identity = 14695981039346656037ULL;
+  for (const auto byte : document.view()) { identity ^= static_cast<unsigned char>(byte); identity *= 1099511628211ULL; }
+  path /= "annotation-" + std::to_string(identity) + ".cbor";
+ }
+ return path;
+}
 }  // namespace
+std::optional<LoadedAnnotationDocument> load_annotation_document(const contracts::AnnotationSceneContent& paired, const std::string_view source) {
+ if (!paired.valid() || !paired.frame_ready || source.empty()) return {};
+ const auto old_resource = [&]() -> std::string_view {
+  for (const std::string_view old : {"explore://image", "predict://image", "validation://sample", "live://frame"})
+   if (paired.document.view() == old || paired.document.view().starts_with(std::string(old) + "/snapshot-")) return old;
+  return {};
+ }();
+ const std::filesystem::path requested{source};
+ auto path = document_path(requested, paired.document);
+ // The old directory filename was derived from the constant resource view.
+ // Consult it only when no exact bound document exists, never as a fallback
+ // from a malformed or mismatched modern document.
+ if (std::filesystem::is_directory(requested) && !std::filesystem::exists(path) && !old_resource.empty())
+  path = document_path(requested, contracts::WorkspaceResource::From(old_resource, 1));
+ std::ifstream input(path, std::ios::binary | std::ios::ate);
+ const auto size = input.tellg();
+ if (!input || size <= 0 || static_cast<std::uint64_t>(size) > contracts::kAnnotationUiStateByteBudget) return {};
+ std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+ input.seekg(0);
+ if (!input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size))) return {};
+ auto loaded = contracts::decode_annotation_persistence(bytes);
+ if (!loaded || !loaded->scene.frame_ready || paired.frame_width != loaded->scene.frame_width || paired.frame_height != loaded->scene.frame_height || paired.frame_index != loaded->scene.frame_index) return {};
+ const bool legacy = !old_resource.empty() && loaded->scene.document.view() == old_resource;
+ if (!legacy && paired.document.view() != loaded->scene.document.view()) return {};
+ // A legacy constant view never proves historical pixel provenance. The
+ // explicit Load operation attaches its checked geometry to the current ready
+ // receiver image and exposes that conversion in the ordinary result facts.
+ if (legacy) loaded->scene.document = contracts::WorkspaceResource::From(paired.document.view(), loaded->scene.document.revision);
+ return LoadedAnnotationDocument{std::move(loaded->scene), legacy};
+}
 DocumentSaveEffect save_annotation_document(const domain::AnnotationUiState& state, const std::string_view destination, const std::uint64_t generation) noexcept {
  if (!state.valid() || destination.empty() || generation == 0U) return DocumentSaveEffect::NotApplied;
  std::vector<std::byte> bytes;
@@ -108,14 +148,8 @@ DocumentSaveEffect save_annotation_document(const domain::AnnotationUiState& sta
   const bool missing_directory = !std::filesystem::exists(path, error) && path.extension() != ".cbor";
   if (directory || missing_directory) {
    if (missing_directory && !std::filesystem::create_directories(path, error)) return DocumentSaveEffect::NotApplied;
-   // Stable FNV identity gives each imported document its own destination.
-   std::uint64_t identity = 14695981039346656037ULL;
-   for (auto byte : state.scene.document.view()) {
-    identity ^= static_cast<unsigned char>(byte);
-    identity *= 1099511628211ULL;
-   }
-   path /= "annotation-" + std::to_string(identity) + ".cbor";
   }
+  path = document_path(std::move(path), state.scene.document);
   return atomic_save(bytes, path.string(), state.document_revision, generation);
  } catch (...) { return DocumentSaveEffect::NotApplied; }
 }

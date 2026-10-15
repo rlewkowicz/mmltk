@@ -38,6 +38,7 @@ pub enum Message {
     TextFocused,
     OpenRequested,
     SaveRequested,
+    LoadRequested,
     CancelRequested,
     FitRequested,
     DialogRequested(u64),
@@ -52,6 +53,7 @@ pub enum Outcome {
     ShortcutRequested(Shortcut),
     OpenRequested,
     SaveRequested,
+    LoadRequested,
     StopRequested,
     DialogRequested(u64),
     EditRequested(crate::generated::AnnotationEditRequest),
@@ -138,6 +140,7 @@ impl Component {
             }
             Message::OpenRequested => Outcome::OpenRequested,
             Message::SaveRequested => Outcome::SaveRequested,
+            Message::LoadRequested => Outcome::LoadRequested,
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
             Message::OutputDirectoryChanged(value) => Outcome::SettingsEdited(
                 settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
@@ -271,12 +274,14 @@ impl Component {
                 .on_input_maybe(settings_edit_available.then_some(Message::OutputDirectoryChanged))
             ],
             dialogs,
+            text(model.annotation.snapshot.as_ref().filter(|snapshot| snapshot.legacysourceattached).map_or("", |_| "Legacy document attached to current image; historical source identity is unavailable.")).size(12),
             button("Open")
                 .on_press_maybe(
                     (settings_settled && model.annotation_open_available())
                         .then_some(Message::OpenRequested)
                 )
                 .style(crate::fluent_theme::button_secondary),
+            container(button("Reload saved annotations").on_press_maybe((settings_settled && model.annotation_save_available()).then_some(Message::LoadRequested))).id("annotation.load"),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Annotate,
                 model.primary_action_active(crate::generated::FeatureId::Annotate),

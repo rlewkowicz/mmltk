@@ -85,6 +85,7 @@ struct ExploreDatasetFacts final {
  ExploreClassCatalogIdentity class_catalog_identity = 0U;
  MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<mmltk::backend::data::catalog::ClassName> class_names {};
  MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<contracts::AnnotationColor> palette {};
+ MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<mmltk::backend::data::catalog::ClassKeypointSchema> keypoint_schemas;
 };
 struct ExploreLabel final {
  contracts::AnnotationBox box{};
@@ -411,6 +412,7 @@ public:
   ArmNativeCompletion = 32U,
   ReleaseNativeCompletion = 64U,
   ReleasePendingSupersession = 65U,
+  ArtifactMutationReady = 66U,
  };
  [[nodiscard]] std::uint64_t FrontendSequence() const noexcept;
  void SetCompletionCommand(std::function<bool(ControlCommand)>);

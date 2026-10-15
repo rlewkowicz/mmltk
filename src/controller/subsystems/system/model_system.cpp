@@ -40,12 +40,18 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
  if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
  namespace rfdetr = mmltk::backend::models::rfdetr;
  rfdetr::ModelClassLayout layout;
+ rfdetr::ModelTask task = rfdetr::ModelTask::Detection;
+ std::optional<rfdetr::NativeRfDetrConfig> training_config;
  if (key.input == contracts::ModelArtifactInputKind::Weights) {
-  layout = rfdetr::resolve_model_state(artifact, key.preset, key.resolution, key.class_layout_path, {}, stop).artifacts.class_layout;
+  auto resolved = rfdetr::resolve_model_state(artifact, key.preset, key.resolution, key.class_layout_path, {}, stop);
+  layout = std::move(resolved.artifacts.class_layout);
+  training_config = std::move(resolved.artifacts.config);
+  task = training_config->task;
  } else if (key.input == contracts::ModelArtifactInputKind::Onnx) {
   const rfdetr::ClassArtifactAdmission admission(artifact, key.class_layout_path, {}, stop);
   const auto info = rfdetr::load_onnx_model_info(artifact, admission.output_roles(), admission.output_contract());
   layout = admission.Resolve(info.num_classes, info.class_layout, stop);
+  task = info.output_contract ? info.output_contract->task : info.has_masks ? rfdetr::ModelTask::Segmentation : rfdetr::ModelTask::Detection;
  } else {
   rfdetr::ModelArtifactRequest request;
   request.tensorrt_path = artifact;
@@ -53,9 +59,11 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
   const auto info = rfdetr::inspect_tensorrt_model(request, inspection_device, stop);
   if (!info.class_layout) throw std::runtime_error("TensorRT class inspection is unavailable");
   layout = *info.class_layout;
+  task = info.output_contract ? info.output_contract->task : info.has_masks ? rfdetr::ModelTask::Segmentation : rfdetr::ModelTask::Detection;
  }
  if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
- return {.artifact = artifact.string(), .class_layout = rfdetr::ResolvedClassLayout(std::move(layout)).summary()};
+ const auto capabilities = training_config ? rfdetr::model_training_capabilities(training_config->task, training_config->dec_layers) : rfdetr::PresetTrainingCapabilities{};
+ return {.artifact = artifact.string(), .class_layout = rfdetr::ResolvedClassLayout(std::move(layout)).summary(), .task = task, .training_config = std::move(training_config), .training_capabilities = capabilities};
 }
 ModelSystem::ModelSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events) : settings_(settings), factory_(std::move(factory)), events_(std::move(events)) {
  if (!factory_) throw contracts::UnavailableError("model runtime factory is unavailable");
@@ -107,7 +115,7 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
    if (stop.stop_requested()) {
     terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
    } else {
-    selection = {.key = std::move(input.key), .inspection_device = input.inspection_device, .artifact = std::move(artifact.artifact), .class_layout = std::move(artifact.class_layout)};
+    selection = {.key = std::move(input.key), .inspection_device = input.inspection_device, .artifact = std::move(artifact.artifact), .class_layout = std::move(artifact.class_layout), .task = artifact.task, .training_config = std::move(artifact.training_config), .training_capabilities = artifact.training_capabilities};
     if (!selection.valid()) throw std::runtime_error("model runtime returned an invalid selection");
     terminal.outcome = contracts::ModelSelectionOutcome::Accepted;
    }

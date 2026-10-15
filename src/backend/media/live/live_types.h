@@ -27,14 +27,17 @@ struct PhysicalFrameRevision final {
  [[nodiscard]] bool valid() const noexcept { return revision != 0U && frame.valid() && ready_event != 0U; }
 };
 struct LiveOutputFrame final {
- std::uintptr_t pixels = 0U;
- std::size_t pitch_bytes = 0U;
+ std::uintptr_t clean = 0U;
+ std::size_t clean_pitch_bytes = 0U;
+ std::uintptr_t semantic = 0U;
+ std::size_t semantic_pitch_bytes = 0U;
  std::uint32_t width = 0U;
  std::uint32_t height = 0U;
  std::uintptr_t ready_event = 0U;
  // Borrowed until the output lease completes; its frame equals the lease revision.
  const LiveAnalysisProduct* analysis = nullptr;
- [[nodiscard]] bool valid() const noexcept { return pixels != 0U && pitch_bytes != 0U && width != 0U && height != 0U && ready_event != 0U; }
+ [[nodiscard]] bool valid() const noexcept { return clean != 0U && semantic != 0U && clean != semantic && width != 0U && height != 0U &&
+   clean_pitch_bytes >= static_cast<std::size_t>(width) * 4U && semantic_pitch_bytes >= static_cast<std::size_t>(width) * 4U && ready_event != 0U; }
 };
 struct LiveRawFrameReadback final {
  LiveFrameId frame{};

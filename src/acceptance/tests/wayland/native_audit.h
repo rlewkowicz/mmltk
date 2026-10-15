@@ -6,6 +6,7 @@
 #include <optional>
 #include <set>
 #include <string_view>
+#include <string>
 #include <utility>
 #include <vector>
 #include <sys/types.h>
@@ -34,6 +35,12 @@ struct NativeAudit final {
  bool annotation_edited = false;
  bool presentation_ready = false;
  bool worker_failed = false;
+ std::optional<std::string> expected_live_artifact_failure;
+ std::uint32_t expected_live_failures = 0;
+ std::uint64_t live_completed_frames = 0;
+ [[nodiscard]] bool ArmLiveArtifactFailure(std::string artifact);
+ std::map<std::uint64_t, nlohmann::json> catalog_training_inputs, catalog_training_terminals;
+ [[nodiscard]] bool CatalogTrainingCompleted(std::uint64_t generation, std::string_view preset, std::uint32_t resolution) const;
  bool invalid_message = false;
  bool peer_replaced = false;
  // CLEANUP-IGNORE: Native audit flags and browser UI state are separate acceptance evidence records.

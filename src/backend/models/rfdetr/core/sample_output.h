@@ -13,6 +13,7 @@ struct RenderSampleOptions final {
  float box_thickness = 1.0F;
  int label_size = 12;
  float mask_alpha = 0.5F;
+ bool keypoints = true, uncertainty = false;
  std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
 };
 class EvaluationSampleWriter final {

@@ -29,6 +29,14 @@ impl App {
             crate::view::annotation::Outcome::OpenRequested => {
                 let _ = self.open_annotation();
             }
+            crate::view::annotation::Outcome::LoadRequested => {
+                if self.settings.has_local_edits() || !self.model.annotation_save_available() { return Task::none(); }
+                let Some(settings) = self.model.settings_snapshot.as_ref() else { return Task::none(); };
+                let source = settings.settingsstate.workflows.annotate.outputdir.clone();
+                self.submit_intent(ApplicationIntentEndpoint::AnnotationLoad, move |correlation| {
+                    crate::generated::encode_annotation_Load(correlation, crate::generated::AnnotationLoad { source })
+                });
+            }
             crate::view::annotation::Outcome::SaveRequested => {
                 self.model
                     .begin_admission(ApplicationIntentEndpoint::AnnotationSave);
@@ -39,7 +47,7 @@ impl App {
                     );
                     return Task::none();
                 }
-                if self.settings_unsettled() {
+                if self.settings.has_local_edits() {
                     self.model.report_admission_error(
                         ApplicationIntentEndpoint::AnnotationSave,
                         UiError::busy("Wait for Annotation settings to finish saving."),

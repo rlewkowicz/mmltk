@@ -211,6 +211,10 @@ public:
    if (receipt.compiled_index != visible_index_) return reject("visible_index_mismatch");
    if (std::exchange(visible_release_requested_, true)) return reject("duplicate_visible_release");
   }
+  if (receipt.kind == Kind::ArtifactMutationRequested) {
+   if (artifact_mutation_pending_ || receipt.compiled_index != artifact_mutation_next_) return reject("artifact_mutation_order");
+   artifact_mutation_pending_ = true;
+  }
   if (receipt.kind == Kind::Progress) {
    if (receipt.progress <= frontend_progress_) return reject("nonincreasing_progress");
    if ((receipt.progress & 3U) == 0U) return reject("invalid_progress_class");
@@ -219,7 +223,7 @@ public:
   if (receipt.kind == Kind::PressureEntered && std::exchange(frontend_pressure_, true)) return reject("duplicate_pressure");
   if (receipt.kind == Kind::Settled) frontend_settled_ = true;
   const bool sent = SendControlObservation(
-   {.event = ControlEvent::Frontend, .generation = receipt.sequence, .slot = static_cast<std::uint64_t>(receipt.kind), .compiled_index = receipt.progress, .staging_bytes = receipt.failureline},
+   {.event = ControlEvent::Frontend, .generation = receipt.sequence, .slot = static_cast<std::uint64_t>(receipt.kind), .compiled_index = receipt.kind == Kind::ArtifactMutationRequested ? receipt.compiled_index : receipt.progress, .staging_bytes = receipt.failureline},
    &receipt);
   if (!sent || receipt.kind == Kind::Failed) {
    terminal_ = true;
@@ -318,6 +322,7 @@ private:
    std::shared_ptr<const std::function<bool()>> redraw;
    std::shared_ptr<const std::function<bool(ControlCommand)>> completion;
    std::uint64_t sequence = 0U;
+   std::uint32_t artifact_mutation_index = 0U;
    auto frontend_kind = contracts::IntegrationControlKind::Advance;
    {
     std::scoped_lock lock(mutex_);
@@ -343,6 +348,12 @@ private:
     } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ && initial_released_generation_ == 0U && redraw_command_) {
      redraw_claimed_ = true;
      redraw = redraw_command_;
+    } else if (command == static_cast<std::uint8_t>(ControlCommand::ArtifactMutationReady) && artifact_mutation_pending_ && frontend_command_) {
+     artifact_mutation_pending_ = false;
+     artifact_mutation_index = artifact_mutation_next_++;
+     sequence = frontend_sequence_;
+     callback = frontend_command_;
+     frontend_kind = contracts::IntegrationControlKind::ArtifactMutationReady;
     } else if (command == 8U && frontend_settled_ && waiters_ == 0U && !held_pending_ && frontend_command_ && frontend_sequence_ != std::numeric_limits<std::uint64_t>::max()) {
      release_all_ = false;
      release_one_ = false;
@@ -356,6 +367,8 @@ private:
      visible_requested_ = false;
      visible_release_requested_ = false;
      capacity_requested_ = false;
+     artifact_mutation_pending_ = false;
+     artifact_mutation_next_ = 0U;
      sequence = ++frontend_sequence_;
      callback = frontend_command_;
     } else {
@@ -366,7 +379,7 @@ private:
    }
    if (redraw || callback || completion) {
     try {
-     const bool accepted = completion ? (*completion)(static_cast<ControlCommand>(command)) : redraw ? (*redraw)() : (*callback)({.kind = frontend_kind, .sequence = sequence});
+     const bool accepted = completion ? (*completion)(static_cast<ControlCommand>(command)) : redraw ? (*redraw)() : (*callback)({.kind = frontend_kind, .sequence = sequence, .compiled_index = artifact_mutation_index});
      if (accepted) continue;
     } catch (...) {}
     Terminal();
@@ -404,6 +417,8 @@ private:
  bool visible_requested_ = false;
  bool visible_release_requested_ = false;
  bool capacity_requested_ = false;
+ bool artifact_mutation_pending_ = false;
+ std::uint32_t artifact_mutation_next_ = 0U;
  bool visible_armed_ = false;
  bool visible_held_ = false;
  bool visible_released_ = false;
@@ -594,6 +609,7 @@ public:
   dataset.class_names.reserve(store.class_names().size());
   dataset.palette = mmltk::controller::annotation_class_palette(store.class_names().size());
   for (const auto& name : store.class_names()) dataset.class_names.push_back({.value = name});
+  dataset.keypoint_schemas = store.class_catalog()->record().keypoints.value_or(std::vector<mmltk::backend::data::catalog::ClassKeypointSchema>{});
   if (stop.stop_requested()) return {};
   DatasetState candidate{
    .store = std::move(store),

@@ -5,6 +5,7 @@ pub enum Message {
     LabelsToggled(bool),
     MasksToggled(bool),
     BoxesToggled(bool),
+    KeypointsToggled(bool),
 }
 
 pub(super) fn update(
@@ -20,6 +21,7 @@ pub(super) fn update(
         Message::LabelsToggled(value) => request.overlay.showlabels = value,
         Message::MasksToggled(value) => request.overlay.showmasks = value,
         Message::BoxesToggled(value) => request.overlay.showboxes = value,
+        Message::KeypointsToggled(value) => request.overlay.showkeypoints = value,
     }
     state.record_submission(request.clone());
     Ok(request.overlay)
@@ -35,23 +37,27 @@ pub(super) fn view(
             super::DETAIL_LABELS_ID,
             super::DETAIL_MASKS_ID,
             super::DETAIL_BOXES_ID,
+            "explore.detail.keypoints",
         ]
     } else {
         [
             super::GALLERY_LABELS_ID,
             super::GALLERY_MASKS_ID,
             super::GALLERY_BOXES_ID,
+            "explore.gallery.keypoints",
         ]
     };
     crate::view::workflow::overlay_controls::view(
         overlay.showlabels,
         overlay.showmasks,
         overlay.showboxes,
+        overlay.showkeypoints,
         available,
         available,
         ids,
     )
     .map(|message| match message {
+        crate::view::workflow::overlay_controls::Message::Keypoints(value) => Message::KeypointsToggled(value),
         crate::view::workflow::overlay_controls::Message::Labels(value) => {
             Message::LabelsToggled(value)
         }

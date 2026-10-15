@@ -38,6 +38,7 @@ target_link_libraries(mmltk_backend_imaging_annotation
         mmltk::backend::data::catalog
         CUDA::cudart
         mmltk::common::io
+        mmltk::frameworks::serialization
         nlohmann_json
         stb
 )

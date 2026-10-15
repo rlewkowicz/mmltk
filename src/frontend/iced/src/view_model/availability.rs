@@ -367,7 +367,14 @@ impl ApplicationModel {
     }
 
     pub fn live_start_available(&self) -> bool {
-        self.connection == ConnectionState::Connected
+        let analysis_ready = self.settings_snapshot.as_ref().is_some_and(|settings| {
+            let configured = &settings.settingsstate;
+            !configured.workflows.predict.liveanalysisenabled || (
+                self.model_selection_matches(configured, FeatureId::Predict)
+                && matches!(configured.workflows.predict.modelinput, crate::generated::ModelArtifactInputKind::Onnx | crate::generated::ModelArtifactInputKind::TensorRt)
+            )
+        });
+        analysis_ready && self.connection == ConnectionState::Connected
             && !self.native_settings_unsettled()
             && self.window_width != 0
             && self.window_height != 0
@@ -553,6 +560,7 @@ impl ApplicationModel {
 
     pub fn annotation_save_available(&self) -> bool {
         !self.has_pending(ApplicationIntentEndpoint::AnnotationSave)
+            && !self.has_pending(ApplicationIntentEndpoint::AnnotationLoad)
             && !self.annotation.save_active()
             && self.connection == ConnectionState::Connected
             && !self.native_settings_unsettled()

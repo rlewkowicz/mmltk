@@ -403,7 +403,7 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
  mmltk::testsupport::open_annotation(annotation, annotation_events, explore.snapshot().frame);
  auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
  LiveSystem live{
-  kDevice, RuntimeFactory(0, backend, gpu::ImageProductLayout::Clean, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); }, 1U, fixture::FakeWorkspaceFinalizer(backend)),
+  kDevice, RuntimeFactory(0, backend, gpu::ImageProductLayout::CleanAndSemantic, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); }, 1U, fixture::FakeWorkspaceFinalizer(backend)),
   [&](LiveSystem::event_type) { live_events.Advance(); }
  };
  static_cast<void>(live.Start({.extent = {32U, 32U}, .frames_per_second = 120U}));

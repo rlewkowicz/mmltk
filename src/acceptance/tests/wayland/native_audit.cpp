@@ -1,3 +1,4 @@
+#include "src/controller/contracts/compute.h"
 #include "audit_facts.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include <algorithm>
@@ -227,7 +228,21 @@ auto NativeAudit::consume(const nlohmann::json& record) -> void {
  firefox_terminal = firefox_terminal || event == "shutdown.firefox_terminal";
  shutdown_complete = shutdown_complete || event == "shutdown.complete";
  shutdown_incomplete = shutdown_incomplete || event == "shutdown.incomplete";
- worker_failed = worker_failed || event == "worker.failure";
+ if (owner == "training" && (event == "training.inputs" || event == "training.operation.settled")) {
+  auto& records = event == "training.inputs" ? catalog_training_inputs : catalog_training_terminals;
+  const auto generation = scalar(record, "sequence");
+  if (generation == 0 || records.size() >= 256 || !records.emplace(generation, record).second) causal_inconsistent = true;
+ }
+ if (owner == "live" && event == "frame.completed") {
+  ++live_completed_frames;
+  if (expected_live_artifact_failure) causal_inconsistent = true;
+ }
+ if (event == "worker.failure") {
+  const auto message = record.value("message", "");
+  const bool expected = expected_live_artifact_failure && owner == "live" && message.find("Live RF-DETR analysis provider for " + *expected_live_artifact_failure + ": ") != std::string::npos && message.find("open failed") != std::string::npos && message.find("No such file or directory") != std::string::npos;
+  if (expected) { expected_live_artifact_failure.reset(); ++expected_live_failures; }
+  else worker_failed = true;
+ }
  invalid_message = invalid_message || event == "browser.server.invalid_message";
  peer_replaced = peer_replaced || event == "browser.server.peer_replaced";
  if (event == "browser.server.peer_closed") {
@@ -592,6 +607,18 @@ auto NativeAudit::product_completed(const FinalCursorGenerations final, const bo
 }
 auto NativeAudit::product_ready(const FinalCursorGenerations final, const bool seeded_augmentation_ready, const bool require_overlay_pixel_probes) const noexcept -> bool {
  return product_completed(final, seeded_augmentation_ready, require_overlay_pixel_probes) && active_peer();
+}
+bool NativeAudit::ArmLiveArtifactFailure(std::string artifact) {
+ if (artifact.empty() || expected_live_artifact_failure || expected_live_failures != 0 || worker_failed) return false;
+ expected_live_artifact_failure = std::move(artifact);
+ return true;
+}
+bool NativeAudit::CatalogTrainingCompleted(std::uint64_t generation, std::string_view preset, std::uint32_t resolution) const {
+ const auto input = catalog_training_inputs.find(generation), terminal = catalog_training_terminals.find(generation);
+ if (input == catalog_training_inputs.end() || terminal == catalog_training_terminals.end()) return false;
+ const auto expected = "requested_preset=" + std::string(preset) + " requested_resolution=" + std::to_string(resolution) + " prepared_preset=" + std::string(preset) + " prepared_resolution=" + std::to_string(resolution) + " ";
+ return !causal_inconsistent && input->second.value("message", "").starts_with(expected) && scalar(input->second,"detail") == resolution
+     && scalar(terminal->second,"detail") == static_cast<std::uint64_t>(mmltk::controller::contracts::ComputeOperationOutcome::Succeeded);
 }
 auto NativeAudit::failed_before_termination() const noexcept -> bool { return worker_failed || invalid_message || peer_replaced || interaction_rejected || causal_inconsistent; }
 auto NativeAudit::failure_blocker() const noexcept -> std::string_view {

@@ -11,20 +11,23 @@ mmltk_register_public_headers(
     FILES live_system.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_live_system
-    native_live_algorithm.cpp
     live_receiver_copy.cpp
     live_system.cpp)
+mmltk_register_retained_module_importers(mmltk_controller_live_system native_live_algorithm.cpp)
 mmltk_register_private_headers(
-    mmltk_controller_live_system live_receiver_copy.h)
+    mmltk_controller_live_system live_receiver_copy.h live_analysis_configuration.h)
 target_link_libraries(mmltk_controller_live_system
     PUBLIC
         mmltk::controller::application_boundary
         mmltk::controller::visual_contract
         mmltk::backend::media::live
+        mmltk::backend::media::capture
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::controller::data_compute_systems
+        mmltk::backend::models::rfdetr::inference
         mmltk::controller::visual_runtime
-        mmltk::backend::media::capture)
+        mmltk::backend::imaging::raster)
 mmltk_link_declarations(mmltk_controller_live_system PUBLIC
     mmltk::controller::visual_runtime)
 mmltk_register_header_isolation(mmltk_controller_live_system)
@@ -42,6 +45,7 @@ function(mmltk_add_controller_live_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/live_system.test.cpp)
     target_link_libraries(mmltk_controller_live_tests PRIVATE
         mmltk_controller_live_test_support
+        mmltk::controller::data_compute_systems
         mmltk_backend_media_live_test_support)
     catch_discover_tests(mmltk_controller_live_tests
         TEST_PREFIX "controller::live::" DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)

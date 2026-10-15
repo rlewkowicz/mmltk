@@ -239,11 +239,17 @@ pub(crate) fn install(
                             .with_upscale(snapshot.clone()),
                     ))
                 }
+                Some(WorkspaceImageProduct::Predict(source)) if source.frame == snapshot.input && source.contentidentity != 0 => {
+                    Prepared::Prediction(Arc::new(super::labels::PredictionContent::new(source.clone()).with_upscale(snapshot.clone())))
+                }
+                Some(WorkspaceImageProduct::Live(source)) if source.frame == snapshot.input => {
+                    Prepared::Prediction(Arc::new(super::labels::PredictionContent::from_live(source.clone()).with_upscale(snapshot.clone())))
+                }
                 _ => return Err("graphics detail source identity mismatch".into()),
             }
         }
         WorkspaceImageProduct::Predict(snapshot)
-            if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 =>
+            if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 && valid_content(&snapshot.frame) =>
         {
             Prepared::Prediction(Arc::new(super::labels::PredictionContent::new(
                 snapshot.clone(),
@@ -259,7 +265,7 @@ pub(crate) fn install(
                 snapshot.clone(),
             )))
         }
-        WorkspaceImageProduct::Live(snapshot) if snapshot.frame == metadata.frame => Prepared::None,
+        WorkspaceImageProduct::Live(snapshot) if snapshot.frame == metadata.frame && valid_content(&snapshot.frame) => Prepared::Prediction(Arc::new(super::labels::PredictionContent::from_live(snapshot.clone()))),
         _ => return Err("graphics metadata does not describe this visual product".into()),
     };
     let content = Content {
@@ -277,7 +283,7 @@ pub(crate) fn install(
         viewer_identity: content
             .prediction()
             .as_ref()
-            .map(|content| (frame.content_session, content.metadata.contentidentity))
+            .map(|content| content.identity())
             .or_else(|| {
                 content.validation().as_ref().map(|content| {
                     (

@@ -1,9 +1,12 @@
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "audit_facts.h"
+#include "src/acceptance/tests/workflow_wayland_inputs.h"
 #include "src/backend/data/compiler/dataset_compile_progress.h"
 #include <nlohmann/json.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <stb_image_write.h>
 #include <fstream>
+#include <iterator>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/subprocess_test_utils.hpp"
 #include <cctype>
@@ -2939,4 +2942,122 @@ TEST_CASE("training source pixels require stable identity and original observati
  SECTION("reconnect retains nondefault selection") { audit.training_sources[2][1] = 1; }
  SECTION("synchronized records have their own identity") { audit.training_sources[3][1] = 2; }
  CHECK_FALSE(audit.training_sources_complete());
+}
+
+namespace mmltk::acceptance::wayland {
+TEST_CASE("Keypoint evidence requires current paired catalog retained derived and clean pixels", "[workspace][audit][keypoints]") {
+ BrowserAudit audit;
+ for (const auto stage : {"keypoint-explore", "keypoint-validate", "keypoint-predict", "keypoint-predict-upscale", "live-capture-only", "live-production-analysis", "live-zero-detections", "live-new-model-restart", "live-failure-retained", "live-upscale", "live-import-clean", "catalog-pe-image"}) {
+  const std::string_view name(stage);
+  const bool empty = name == "live-capture-only" || name == "live-zero-detections" || name == "live-failure-retained";
+  const bool clean = name == "live-import-clean", catalog = name == "catalog-pe-image";
+  const auto control = name == "keypoint-explore" ? "explore.detail.workspace" : name == "keypoint-validate" ? "validate.samples.atlas" : clean ? "annotation.workspace.surface" : "workflow.visual.workspace";
+  audit.consume({{"event","integration.workflow.pixels"},{"detail",stage},{"control",control},{"a",3U},{"b",8U},{"c",empty?100U:17U},{"d",empty?80U:17U},{"native_joints",empty||clean||catalog?0U:17U},{"analyzed_empty",empty},{"matched",true},{"oks_pixels",24U},
+   {"current_receipt",true},{"drawn_source",3U},{"drawn_presentation",8U},{"clean_import",clean},{"catalog_image",catalog},{"source_samples",clean||catalog?17U:0U},{"variation",30U}});
+ }
+ REQUIRE(audit.keypoint_pixels_complete());
+ SECTION("wrong image") { audit.keypoint_pixels["keypoint-predict"]["a"] = 0; }
+ SECTION("wrong control") { audit.keypoint_pixels["keypoint-validate"]["control"] = "predict"; }
+ SECTION("missing joint") { audit.keypoint_pixels["live-production-analysis"]["d"] = 16; }
+ SECTION("only background") { audit.keypoint_pixels["live-zero-detections"]["d"] = 0; }
+ SECTION("lost analyzed empty distinction") { audit.keypoint_pixels["live-zero-detections"]["analyzed_empty"] = false; }
+ SECTION("no OKS pixels") { audit.keypoint_pixels["keypoint-validate"]["oks_pixels"] = 0; }
+ SECTION("missing path") { audit.keypoint_pixels.erase("live-new-model-restart"); }
+ SECTION("missing failure pixels") { audit.keypoint_pixels.erase("live-failure-retained"); }
+ SECTION("failure read another product") { audit.keypoint_pixels["live-failure-retained"]["a"] = 4; audit.keypoint_pixels["live-failure-retained"]["drawn_source"] = 4; }
+ SECTION("stale receipt") { audit.keypoint_pixels["live-failure-retained"]["current_receipt"] = false; }
+ SECTION("stale presentation") { audit.keypoint_pixels["live-upscale"]["drawn_presentation"] = 7; }
+ SECTION("missing Live derived pixels") { audit.keypoint_pixels.erase("live-upscale"); }
+ SECTION("burned imported object") { audit.keypoint_pixels["live-import-clean"]["d"] = 16; }
+ SECTION("blank catalog image") { audit.keypoint_pixels["catalog-pe-image"]["variation"] = 0; }
+ CHECK_FALSE(audit.keypoint_pixels_complete());
+}
+TEST_CASE("Catalog workflow evidence joins canonical prepared models to actual native operations", "[workspace][audit][keypoints][model]") {
+ namespace rfdetr = mmltk::backend::models::rfdetr;
+ BrowserAudit audit;
+ std::string pe, pose;
+ for (std::size_t row=0; row<rfdetr::kPresetCatalog.size(); ++row) {
+  const auto& preset = rfdetr::kPresetCatalog[row];
+  const bool keypoints = preset.task == rfdetr::ModelTask::Keypoints;
+  if (!keypoints && (preset.backbone.kind != rfdetr::BackboneKind::PeCoreTiny || !pe.empty())) continue;
+  (keypoints ? pose : pe) = preset.preset_name;
+  const auto model = keypoints ? 12U : 11U, generation = keypoints ? 2U : 3U;
+  for (const auto stage : {"prepared", "completed"}) audit.consume({{"event","integration.keypoint.catalog"},{"control",preset.preset_name},{"detail",stage},{"a",model},{"b",std::string_view(stage)=="prepared"?0U:generation},{"c",preset.resolution},{"d",row}});
+  audit.consume_native_gpu({{"event","workflow.gpu_execution"},{"owner",keypoints?"training":"prediction"},{"participant",keypoints?"train":"predict"},{"sequence",generation},{"value",0U},{"detail",1U},{"device",0}});
+ }
+ audit.consume({{"event","integration.keypoint.training-artifact"},{"control","/session/training/catalog-keypoint/model.pt"},{"detail","actual-run"},{"a",12U},{"b",2U},{"c",4U},{"d",.5}});
+ REQUIRE(audit.keypoint_catalog_complete());
+ SECTION("selection only") { audit.keypoint_catalog.erase({pe,"completed"}); }
+ SECTION("custom compact model") { audit.keypoint_catalog.at({pose,"prepared"})["control"] = "rf-detr-nano"; }
+ SECTION("wrong resolution") { audit.keypoint_catalog.at({pose,"completed"})["c"] = 64; }
+ SECTION("old operation") { audit.keypoint_catalog.at({pe,"completed"})["b"] = 1; }
+ SECTION("wrong prepared model") { audit.keypoint_catalog.at({pose,"completed"})["a"] = 11; }
+ SECTION("no native execution") { audit.workflow_gpu_runs.erase({"train",2}); }
+ SECTION("wrong artifact run") { audit.keypoint_training_artifact["b"] = 1; }
+ CHECK_FALSE(audit.keypoint_catalog_complete());
+}
+TEST_CASE("Catalog keypoint training requires matching native admission and successful settlement", "[workspace][audit][keypoints][model]") {
+ NativeAudit audit;
+ const auto& preset = *std::ranges::find_if(mmltk::backend::models::rfdetr::kPresetCatalog, [](const auto& value) { return value.task == mmltk::backend::models::rfdetr::ModelTask::Keypoints; });
+ const auto message = "requested_preset=" + std::string(preset.preset_name) + " requested_resolution=" + std::to_string(preset.resolution) + " prepared_preset=" + std::string(preset.preset_name) + " prepared_resolution=" + std::to_string(preset.resolution) + " validation=input test=";
+ audit.consume({{"kind","gui_runtime"},{"owner","training"},{"event","training.inputs"},{"sequence",2U},{"detail",preset.resolution},{"message",message}});
+ REQUIRE_FALSE(audit.CatalogTrainingCompleted(2,preset.preset_name,preset.resolution));
+ audit.consume({{"kind","gui_runtime"},{"owner","training"},{"event","training.operation.settled"},{"sequence",2U},{"detail",static_cast<unsigned>(mmltk::controller::contracts::ComputeOperationOutcome::Succeeded)}});
+ REQUIRE(audit.CatalogTrainingCompleted(2,preset.preset_name,preset.resolution));
+ SECTION("wrong generation") { CHECK_FALSE(audit.CatalogTrainingCompleted(1,preset.preset_name,preset.resolution)); }
+ SECTION("wrong architecture") { CHECK_FALSE(audit.CatalogTrainingCompleted(2,"rf-detr-nano",preset.resolution)); }
+ SECTION("wrong resolution") { CHECK_FALSE(audit.CatalogTrainingCompleted(2,preset.preset_name,64)); }
+ SECTION("cancelled") { audit.catalog_training_terminals.at(2)["detail"] = static_cast<unsigned>(mmltk::controller::contracts::ComputeOperationOutcome::Cancelled); CHECK_FALSE(audit.CatalogTrainingCompleted(2,preset.preset_name,preset.resolution)); }
+}
+TEST_CASE("Expected Live provider failure is armed for one exact component artifact and cause", "[workspace][audit][live]") {
+ const std::string artifact = "/retained/fixture/export/model.onnx";
+ nlohmann::json failure{{"kind","gui_runtime"},{"owner","live"},{"event","worker.failure"},{"message","Live capture session failed to start: Live RF-DETR analysis provider for " + artifact + ": open failed: " + artifact + ": No such file or directory"}};
+ NativeAudit audit;
+ REQUIRE(audit.ArmLiveArtifactFailure(artifact));
+ REQUIRE_FALSE(audit.ArmLiveArtifactFailure(artifact));
+ SECTION("one exact occurrence") {
+  audit.consume(failure);
+  CHECK_FALSE(audit.failed_before_termination());
+  CHECK(audit.expected_live_failures == 1);
+  CHECK_FALSE(audit.expected_live_artifact_failure);
+  audit.consume(failure);
+  CHECK(audit.failed_before_termination());
+  return;
+ }
+ SECTION("unrelated component") { failure["owner"] = "predict"; }
+ SECTION("unrelated artifact") { failure["message"] = "Live RF-DETR analysis provider for /user/model.onnx: open failed: No such file or directory"; }
+ SECTION("GPU failure") { failure["message"] = "Live RF-DETR analysis provider for " + artifact + ": CUDA completion failed"; }
+ SECTION("capture started before refusal") { audit.consume({{"kind","gui_runtime"},{"owner","live"},{"event","frame.completed"}}); }
+ audit.consume(failure);
+ CHECK(audit.failed_before_termination());
+}
+}
+
+TEST_CASE("Acceptance artifact mutation restores only its session export on failure and scope exit", "[workspace][fixture][live]") {
+ const mmltk::testsupport::ScopedTempDir root{"live-artifact-custody"};
+ const auto exported = root.path() / "export" / "model.onnx";
+ const auto alternate = root.path() / "alternate.onnx";
+ std::filesystem::create_directories(exported.parent_path());
+ mmltk::testsupport::write_text_file(exported, "original model");
+ mmltk::testsupport::write_text_file(exported.string() + ".classes.json", "original meaning");
+ mmltk::testsupport::write_text_file(alternate, "alternate model");
+ mmltk::testsupport::write_text_file(alternate.string() + ".classes.json", "alternate meaning");
+ {
+  mmltk::testsupport::WorkflowArtifactMutation mutation(root.path(), alternate);
+  REQUIRE_THROWS(mutation.Apply(2));
+  mutation.Apply(0);
+  CHECK_FALSE(std::filesystem::exists(exported));
+  SECTION("restores removed export on cancellation") {}
+  SECTION("restores replacement export on completion") { mutation.Apply(1); mutation.Apply(2); }
+  SECTION("restores original after replacement copy failure") {
+   mutation.Apply(1);
+   std::filesystem::remove(alternate);
+   CHECK_THROWS(mutation.Apply(2));
+  }
+ }
+ const auto read = [](const auto& path) { std::ifstream file(path); return std::string(std::istreambuf_iterator<char>(file), {}); };
+ CHECK(read(exported) == "original model");
+ CHECK(read(exported.string() + ".classes.json") == "original meaning");
+ CHECK_FALSE(std::filesystem::exists(exported.string() + ".acceptance-retained"));
+ CHECK_FALSE(std::filesystem::exists(exported.string() + ".acceptance-retained.classes.json"));
 }

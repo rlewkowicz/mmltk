@@ -142,7 +142,7 @@ private:
   };
   VisitSplineHandles(description, index, point);
   for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
-   if (object.skeleton_nodes[node].visible) point(description.DrawingNode(index, node));
+   if (object.skeleton_nodes[node].visible()) point(description.DrawingNode(index, node));
   // Geometry includes the existing outline thickness and selection/vertex
   // handles. Runs are independent drawing primitives for every named shape.
   x1 = std::floor(x1) - 9;
@@ -304,10 +304,10 @@ private:
       }
      }
      if (object.shape == domain::AnnotationShape::Skeleton) {
-      for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node) point(description.DrawingNode(index, node));
+      for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node) point(object.skeleton_nodes[node].visible() ? description.DrawingNode(index, node) : domain::AnnotationPoint{-100000000.0F, -100000000.0F});
       geometry.edge_offset = geometry.words.size();
       for (const auto edge : object.skeleton_edges) {
-       if (!object.skeleton_nodes[edge.source].visible || !object.skeleton_nodes[edge.target].visible) continue;
+       if (!object.skeleton_nodes[edge.source].visible() || !object.skeleton_nodes[edge.target].visible()) continue;
        geometry.words.push_back(edge.source);
        geometry.words.push_back(edge.target);
        ++geometry.edges;
@@ -320,7 +320,7 @@ private:
      };
      if (object.shape == domain::AnnotationShape::Skeleton)
       for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
-       if (object.skeleton_nodes[node].visible) handle(description.DrawingNode(index, node));
+       if (object.skeleton_nodes[node].visible()) handle(description.DrawingNode(index, node));
      if (object.shape == domain::AnnotationShape::Spline) VisitSplineHandles(description, index, handle);
      if (!geometry.source) geometry.source.emplace();
      geometry.source->shape = object.shape;

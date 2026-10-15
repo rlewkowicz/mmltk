@@ -15,6 +15,9 @@
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
 #include "src/controller/presentation/visual_system_types.h"
+#include "src/controller/presentation/visual_document.h"
+#include "src/controller/contracts/validation_display.h"
+#include "src/controller/contracts/prediction_output.h"
 #include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/frameworks/gpu/image/image_types.h"
 #include "src/frameworks/gpu/image/image_buffer.h"
@@ -33,15 +36,18 @@ public:
  [[nodiscard]] std::span<const mmltk::backend::models::rfdetr::Prediction> ground_truth() const noexcept;
  [[nodiscard]] std::span<const mmltk::backend::models::rfdetr::Prediction> predictions() const noexcept;
  [[nodiscard]] std::span<const std::string> classes() const noexcept;
+ [[nodiscard]] const mmltk::backend::data::catalog::ClassCatalog& catalog() const noexcept;
  [[nodiscard]] int class_count() const noexcept;
  [[nodiscard]] int receiver_device() const noexcept;
+ [[nodiscard]] VisualSkeleton Skeleton(const mmltk::backend::models::rfdetr::Prediction&, bool ground_truth = false) const;
+ [[nodiscard]] std::shared_ptr<const VisualDocument> Document(contracts::WorkspaceResource, std::uint32_t frame_index, bool ground_truth = false) const;
 
 private:
  friend class PredictionPreviewPool;
  friend class PredictionPreviewComposition;
  void DrawRegion(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream,
   bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers, bool write_clean, bool write_semantic,
-  std::optional<float> confidence_threshold) const;
+  std::optional<float> confidence_threshold, bool prediction_keypoints, bool ground_truth_keypoints, bool prediction_uncertainty, bool ground_truth_uncertainty) const;
  struct State;
  PredictionPreviewFrame(
   const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>, std::shared_ptr<void>, mmltk::frameworks::gpu::CudaContextApi);
@@ -68,6 +74,20 @@ public:
   bool complementary_layers = false;
   bool atlas_padding = false;
   std::optional<float> confidence_threshold{};
+  bool prediction_keypoints = true, ground_truth_keypoints = false;
+  bool prediction_uncertainty = false, ground_truth_uncertainty = false;
+  [[nodiscard]] static Options Prediction(const contracts::PredictionRunPreview& preview) {
+   return {.prediction_boxes=preview.boxes,.prediction_masks=preview.masks,.confidence_threshold=preview.confidence_threshold,
+    .prediction_keypoints=preview.keypoints,.prediction_uncertainty=preview.uncertainty};
+  }
+  [[nodiscard]] static Options Validation(const ValidationOverlays& overlays, float threshold, bool atlas = false) {
+   return {.prediction_boxes=overlays.prediction_layer && overlays.prediction_boxes,
+    .prediction_masks=overlays.prediction_layer && overlays.prediction_masks,
+    .ground_truth_boxes=overlays.ground_truth_layer && overlays.ground_truth_boxes,
+    .ground_truth_masks=overlays.ground_truth_layer && overlays.ground_truth_masks,.complementary_layers=true,.atlas_padding=atlas,.confidence_threshold=threshold,
+    .prediction_keypoints=overlays.prediction_layer && overlays.prediction_keypoints,.ground_truth_keypoints=overlays.ground_truth_layer && overlays.ground_truth_keypoints,
+    .prediction_uncertainty=overlays.prediction_layer && overlays.uncertainty,.ground_truth_uncertainty=overlays.ground_truth_layer && overlays.uncertainty};
+  }
   bool operator==(const Options&) const = default;
  };
  static void Draw(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&, VisualExtent, std::span<const Region>, Options,

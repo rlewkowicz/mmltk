@@ -18,6 +18,8 @@ inline constexpr std::size_t kExploreRenderClassCapacity = mmltk::backend::data:
 inline constexpr std::size_t kExploreRenderCardCapacity = 256U;
 inline constexpr std::size_t kExploreRenderTileCapacity = kExploreWorkCapacity;
 inline constexpr std::size_t kExploreRenderAnnotationCapacity = 4096U;
+inline constexpr std::size_t kExploreRenderJointCapacity = 32768U;
+inline constexpr std::size_t kExploreRenderEdgeCapacity = 256U * 512U;
 inline constexpr std::size_t kExploreRenderRleCapacity = 1U << 22U;
 using ExploreRenderCardDescriptor = detail::ExploreRenderCardDescriptorAbi;
 using ExploreRenderAnnotationDescriptor = detail::ExploreRenderAnnotationDescriptorAbi;
@@ -52,11 +54,15 @@ struct ExploreRenderScratchView final {
  std::uint32_t annotation_capacity = 0U;
  const mmltk::backend::data::RLEPair* rle_pairs = nullptr;
  std::uint32_t rle_capacity = 0U;
+ const mmltk::backend::data::PackedKeypoint* joints = nullptr;
+ std::uint32_t joint_capacity = 0U;
+ const detail::ExploreRenderEdgeAbi* edges = nullptr;
+ std::uint32_t edge_capacity = 0U;
  const ExploreRenderClassDescriptor* classes = nullptr;
  std::uint32_t class_capacity = 0U;
  const ExploreRenderTileDescriptor* tiles = nullptr;
  std::uint32_t tile_capacity = 0U;
- [[nodiscard]] bool valid() const noexcept { return cards != nullptr && annotations != nullptr && (rle_pairs != nullptr || rle_capacity == 0U) && (classes != nullptr || class_capacity == 0U); }
+ [[nodiscard]] bool valid() const noexcept { return cards != nullptr && annotations != nullptr && (rle_pairs != nullptr || rle_capacity == 0U) && (joints != nullptr || joint_capacity == 0U) && (edges != nullptr || edge_capacity == 0U) && (classes != nullptr || class_capacity == 0U); }
 };
 using ExploreRenderTileBatchView = detail::ExploreRenderTileBatchViewAbi;
 [[nodiscard]] inline bool valid_tile_batch(const ExploreRenderTileBatchView& tiles, const ExploreRenderScratchView& scratch) noexcept {

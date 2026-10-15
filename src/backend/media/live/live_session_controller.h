@@ -77,6 +77,9 @@ public:
  [[nodiscard]] mmltk::backend::media::capture::Status stop() noexcept;
  [[nodiscard]] std::shared_ptr<const LivePhysicalTerminal> admitted_run_terminal() const noexcept;
  [[nodiscard]] mmltk::backend::media::capture::Status first_failure() const;
+ // No-custody startup recovery requires Stop's actual join and clean physical
+ // resource release. The original operation failure remains first_failure().
+ [[nodiscard]] mmltk::backend::media::capture::Status no_custody_start_settlement() const;
  [[nodiscard]] std::optional<PhysicalFrameRevision> newest_revision() const noexcept;
  [[nodiscard]] bool try_acquire_output(PhysicalFrameRevision revision, LiveCompositeOutputLease* output);
  [[nodiscard]] bool request_raw_readback(LiveRawFrameReadback request);

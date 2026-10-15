@@ -125,6 +125,29 @@ pub fn view<'a>(
         return card(text("Training settings unavailable"));
     };
     let request = &train.request;
+    let prepared = settings.draft.as_ref().filter(|draft| model.model_selection_matches(draft, crate::generated::FeatureId::Train)).and(model.model_snapshot.as_ref()).map(|value| &value.selection);
+    let mut losses = column![].spacing(4);
+    if let Some(config) = prepared.and_then(|selection| selection.trainingconfig.as_ref()) {
+        losses = losses.push(text("Admitted artifact coefficients").size(12)).push(text(format!("Classification {} · Box L1 {} · GIoU {}", config.clslosscoef, config.bboxlosscoef, config.gioulosscoef)));
+        match config.task {
+            crate::generated::ModelTask::Detection => {},
+            crate::generated::ModelTask::Segmentation => { losses = losses.push(text(format!("Mask CE {} · Dice {}", config.maskcelosscoef, config.maskdicelosscoef))); },
+            crate::generated::ModelTask::Keypoints => { losses = losses.push(text(format!("Joint L1 {} · Findability {} · Visibility {} · NLL {}", config.keypointl1losscoef, config.keypointfindablelosscoef, config.keypointvisiblelosscoef, config.keypointnlllosscoef))); },
+        }
+    }
+    let stock_task = prepared.map(|selection| selection.task).or_else(|| {
+        (train.modelsource == crate::generated::ModelSelectionSource::Canonical).then(|| crate::generated::RFDETR_PRESET_CATALOG.iter().find(|preset| preset.presetname.as_ref() == request.presetname).map(|preset| preset.task)).flatten()
+    });
+    if let Some(preset) = crate::generated::RFDETR_PRESET_CATALOG.iter().find(|preset| Some(preset.task) == stock_task) {
+        losses = losses.push(text("Fresh training uses stock task coefficients; Resume retains the saved run configuration.").size(12));
+        losses = losses.push(text(format!("Classification {} · Box L1 {} · GIoU {}", preset.classificationlosscoefficient, preset.boundingboxlosscoefficient, preset.generalizedioulosscoefficient)));
+        match preset.task {
+            crate::generated::ModelTask::Detection => {},
+            crate::generated::ModelTask::Segmentation => { losses = losses.push(text(format!("Mask CE {} · Dice {}", preset.maskcrossentropylosscoefficient, preset.maskdicelosscoefficient))); },
+            crate::generated::ModelTask::Keypoints => { losses = losses.push(text(format!("Joint L1 {} · Findability {} · Visibility {} · NLL {}", preset.keypointl1losscoefficient, preset.keypointfindablelosscoefficient, preset.keypointvisiblelosscoefficient, preset.keypointnlllosscoefficient))).push(text("Joint names, connections, flip pairs, and OKS sigmas come from the admitted dataset schema.").size(12)); },
+        }
+    }
+
     let scoped_recipe = settings
         .recipe_model
         .and_then(|id| {
@@ -327,7 +350,9 @@ pub fn view<'a>(
                 .id(crate::generated::constraint_workflowstrainrequestgpuaugmentationperceptualdownscale().stable_field_id.to_string()),
             ].spacing(crate::view::workflow::FIELD_SPACING)),
             divider(),
-            supervision::view(train, enabled).map(Message::Supervision),
+            card_section("Task loss weights", CardHeading::H2, losses),
+            divider(),
+            supervision::view(train, enabled, prepared.map(|selection| &selection.trainingcapabilities)).map(Message::Supervision),
             divider(),
             super::lanes::merging(request, enabled).map(Message::Lanes),
         ]

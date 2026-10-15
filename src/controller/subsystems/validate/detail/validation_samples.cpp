@@ -202,7 +202,7 @@ public:
      for (auto& channel : rgb) channel = 255U - channel;
     metadata.labels.push_back(
      {{{prediction.bbox_xyxy[0], prediction.bbox_xyxy[1]}, {prediction.bbox_xyxy[2], prediction.bbox_xyxy[3]}}, palette[category], rgb, static_cast<std::uint32_t>(category), ground_truth,
-      prediction.score, raw->classes()[category]});
+      prediction.score, raw->classes()[category], raw->Skeleton(prediction, ground_truth)});
    }
   };
   labels(raw->predictions(), false);
@@ -215,36 +215,7 @@ public:
    if (found == current_->samples.end()) throw std::logic_error("validation captured an unselected sample");
    if ((*found)->raw) return;  // A delivery identity owns one immutable sample.
    metadata.identity = (*found)->metadata.identity;
-   auto document = std::make_shared<VisualDocument>();
-   document->scene.document = contracts::WorkspaceResource::From("validation://sample", (*found)->content_identity);
-   document->scene.frame_width = static_cast<std::uint16_t>(metadata.pixel_extent.width);
-   document->scene.frame_height = static_cast<std::uint16_t>(metadata.pixel_extent.height);
-   document->scene.frame_ready = true;
-   document->scene.frame_index = metadata.identity.dataset_index;
-   document->scene.palette = palette;
-   for (const auto& name : raw->classes()) document->scene.categories.push_back({.value = name});
-   for (const auto& gt : raw->ground_truth()) {
-    contracts::AnnotationObject object;
-    object.name = contracts::AnnotationText::From("object " + std::to_string(document->scene.objects.size() + 1U));
-    object.category = static_cast<std::uint16_t>(gt.class_reference);
-    object.box = {{gt.bbox_xyxy[0], gt.bbox_xyxy[1]}, {gt.bbox_xyxy[2], gt.bbox_xyxy[3]}};
-    object.mask.present = gt.has_mask;
-    document->AppendSourceObject(
-     std::move(object), gt.has_mask ? mmltk::backend::imaging::sampling::rle_support_bounds(std::span{gt.mask.runs}, gt.mask.width, gt.mask.height) : std::array<float, 4>{});
-   }
-   auto masks = std::make_shared<std::vector<rfdetr::EncodedMask>>();
-   masks->reserve(raw->ground_truth().size());
-   for (const auto& gt : raw->ground_truth()) masks->push_back(gt.mask);
-   document->mask_contains = [masks](std::size_t index, float x, float y) {
-    if (index >= masks->size()) return false;
-    const auto& mask = (*masks)[index];
-    if (!(x >= 0.0F && x < 1.0F && y >= 0.0F && y < 1.0F)) return false;
-    const auto offset = static_cast<std::uint32_t>(y * static_cast<float>(mask.height)) * mask.width + static_cast<std::uint32_t>(x * static_cast<float>(mask.width));
-    const auto after = std::ranges::upper_bound(mask.runs, offset, {}, &std::pair<std::uint32_t, std::uint32_t>::first);
-    if (after == mask.runs.begin()) return false;
-    const auto& run = *std::prev(after);
-    return offset - run.first < run.second;
-   };
+   auto document = raw->Document(contracts::WorkspaceResource::From("validation://sample", (*found)->content_identity), metadata.identity.dataset_index, true);
    auto captured = std::make_shared<Sample>();
    captured->metadata = std::move(metadata);
    captured->resize_mode = sample.resize_mode;
@@ -393,8 +364,7 @@ public:
     regions[region_count++] = {sample->raw, metadata.crop};
    }
    PredictionPreviewComposition::Draw(runtime, candidate, extent, std::span(regions).first(region_count),
-    {overlays.prediction_layer && overlays.prediction_boxes, overlays.prediction_layer && overlays.prediction_masks, overlays.ground_truth_layer && overlays.ground_truth_boxes,
-     overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected, display.confidence_threshold},
+    PredictionPreviewComposition::Options::Validation(overlays, display.confidence_threshold, !selected),
     &preparation_);
    image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
    image.frame.content = {0U, 0U, extent.width, extent.height};
@@ -405,6 +375,7 @@ public:
     image.frame.source_extent = (*found)->metadata.source_extent;
     image.frame.resize_mode = (*found)->resize_mode;
    }
+   if (!visual_metadata_admitted(image)) throw contracts::InvalidIntentError("Validation image metadata exceeds the aggregate publication capacity");
    {
     std::scoped_lock lock(mutex_);
     if (attempt != request_revision_) return {};

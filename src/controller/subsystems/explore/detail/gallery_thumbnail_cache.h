@@ -52,6 +52,7 @@ struct GalleryTileMeaning final {
  mmltk::backend::imaging::explore::detail::ExploreRenderCardDescriptorAbi card{};
  std::vector<mmltk::backend::imaging::explore::detail::ExploreRenderAnnotationDescriptorAbi> annotations;
  std::vector<mmltk::backend::imaging::explore::detail::ExploreRenderRlePairAbi> runs;
+ std::vector<mmltk::backend::data::PackedKeypoint> joints;
 };
 // Pixel identities occupy retained physical slots. Demand positions only map to
 // those slots; reorder and viewport size are not pixel identity. The product

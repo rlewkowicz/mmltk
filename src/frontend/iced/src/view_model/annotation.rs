@@ -259,6 +259,7 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
             ApplicationReply::AnnotationOpen(snapshot)
             | ApplicationReply::AnnotationEdit(snapshot)
             | ApplicationReply::AnnotationSave(snapshot)
+            | ApplicationReply::AnnotationLoad(snapshot)
             | ApplicationReply::AnnotationStop(snapshot) => snapshot,
             _ => unreachable!("generated Annotation dispatch supplied another system reply"),
         };

@@ -104,7 +104,7 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
  annotation_ = std::make_unique<AnnotationSystem>(configuration.output_visual, make_native_annotation_runtime_factory(configuration.output_visual), borrow_exact,
   browser::ApplicationEventPublisher<&ApplicationSystems::annotation>(events_, continuity_, source_changed), diagnostics);
  live_ = std::make_unique<LiveSystem>(configuration.base_visual, make_native_live_runtime_factory(configuration.base_visual, std::move(configuration.live)),
-  browser::ApplicationEventPublisher<&ApplicationSystems::live>(events_, continuity_, source_changed), diagnostics);
+  browser::ApplicationEventPublisher<&ApplicationSystems::live>(events_, continuity_, source_changed), diagnostics, settings_.get(), model_.get());
  systems_.settings = settings_.get();
  systems_.file_dialog = file_dialog_.get();
  systems_.dataset = dataset_.get();
@@ -134,6 +134,8 @@ ApplicationSystemStorage::~ApplicationSystemStorage() { presentation_notificatio
 VisualDocumentRead ApplicationSystemStorage::BorrowDocument(const VisualFrame& frame) const {
  if (frame.source.kind == PresentationSourceKind::Explore) return explore_->BorrowDocument(frame);
  if (frame.source.kind == PresentationSourceKind::Validation) return validation_->BorrowDocument(frame);
+ if (frame.source.kind == PresentationSourceKind::Predict) return predict_->BorrowDocument(frame);
+ if (frame.source.kind == PresentationSourceKind::Live) return live_->BorrowDocument(frame);
  if (frame.source.kind == PresentationSourceKind::Upscale) return upscale_->BorrowDocument(frame);
  auto pixels = BorrowExactFrame(frame);
  if (!pixels.valid()) return {};

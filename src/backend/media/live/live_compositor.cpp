@@ -115,6 +115,8 @@ bool LiveCompositor::process_latest() {
   };
   status = scope.Record(static_cast<cudaError_t>(raster::copy_bgr_to_rgba(copy)));
  }
+ if (status == cudaSuccess)
+  status = scope.Record(cudaMemset2DAsync(reinterpret_cast<void*>(slot->overlay), slot->overlay_pitch, 0, static_cast<std::size_t>(source.width) * 4U, source.height, slot->stream));
  if (status == cudaSuccess && analyzer_ != nullptr && analyzer_->try_acquire(source.frame, &analysis)) {
   slot->analysis_slot = analysis.slot;
   status = scope.Record(cudaStreamWaitEvent(slot->stream, reinterpret_cast<cudaEvent_t>(analysis.completion.event), 0U));
@@ -128,8 +130,6 @@ bool LiveCompositor::process_latest() {
     status = scope.Record(cudaErrorInvalidValue);
    }
   }
-  if (status == cudaSuccess)
-   status = scope.Record(cudaMemset2DAsync(reinterpret_cast<void*>(slot->overlay), slot->overlay_pitch, 0, static_cast<std::size_t>(source.width) * 4U, source.height, slot->stream));
   for (const auto& annotation : analysis.annotations) {
    const auto capacity = annotation.count.device_view() ? annotation.value_capacity : annotation.count.value();
    if (status != cudaSuccess || capacity == 0U) continue;
@@ -145,14 +145,7 @@ bool LiveCompositor::process_latest() {
    };
    status = scope.Record(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba(overlay)));
   }
-  if (status == cudaSuccess) {
-   const raster::CompositeRgbaWork composite{
-    .base_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->rgba), slot->rgba_pitch, static_cast<int>(source.width), static_cast<int>(source.height)),
-    .overlay_rgba = {reinterpret_cast<const std::uint8_t*>(slot->overlay), slot->overlay_pitch, static_cast<int>(source.width), static_cast<int>(source.height)},
-    .stream = slot->stream
-   };
-   status = scope.Record(static_cast<cudaError_t>(raster::composite_rgba(composite)));
-  }
+
  }
  if (status == cudaSuccess && manual_overlay_ != nullptr && manual_overlay_->try_acquire_latest(&manual_overlay)) {
   if (manual_overlay.has_content) {
@@ -166,9 +159,10 @@ bool LiveCompositor::process_latest() {
    if (status == cudaSuccess) {
     const CUdeviceptr manual_region = manual_overlay.rgba + static_cast<std::size_t>(source.region.y) * manual_overlay.pitch_bytes + static_cast<std::size_t>(source.region.x) * 4U;
     const raster::CompositeRgbaWork composite{
-     .base_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->rgba), slot->rgba_pitch, static_cast<int>(source.width), static_cast<int>(source.height)),
+     .base_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->overlay), slot->overlay_pitch, static_cast<int>(source.width), static_cast<int>(source.height)),
      .overlay_rgba = {reinterpret_cast<const std::uint8_t*>(manual_region), manual_overlay.pitch_bytes, static_cast<int>(source.width), static_cast<int>(source.height)},
-     .stream = slot->stream
+     .stream = slot->stream,
+     .preserve_alpha = true
     };
     status = scope.Record(static_cast<cudaError_t>(raster::composite_rgba(composite)));
    }
@@ -266,7 +260,7 @@ bool LiveCompositor::try_acquire(const PhysicalFrameRevision revision, LiveCompo
  }
  const DeviceFrameView view = slot.metadata.View(slot.index, slot.rgba, slot.rgba_pitch, slot.ready, slot.stream);
  *output = LiveCompositeOutputLease::Create(callback_owner, on_complete, abandon,
-  {.pixels = static_cast<std::uintptr_t>(view.pixels), .pitch_bytes = view.pitch_bytes, .width = view.width, .height = view.height, .ready_event = reinterpret_cast<std::uintptr_t>(view.ready), .analysis = &slot.analysis},
+  {.clean = static_cast<std::uintptr_t>(view.pixels), .clean_pitch_bytes = view.pitch_bytes, .semantic = static_cast<std::uintptr_t>(slot.overlay), .semantic_pitch_bytes = slot.overlay_pitch, .width = view.width, .height = view.height, .ready_event = reinterpret_cast<std::uintptr_t>(view.ready), .analysis = &slot.analysis},
   revision);
  return true;
 }

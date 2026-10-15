@@ -1,6 +1,8 @@
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/controller/subsystems/system/detail/prediction_output.h"
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
+#include "src/controller/subsystems/system/tests/application_data_test_support.h"
+#include "src/frameworks/serialization/reflected_cbor.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
@@ -9,6 +11,10 @@
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include <fstream>
+#include <array>
+#include <atomic>
+#include <future>
+#include <stdexcept>
 #include <cmath>
 #include <iterator>
 #include <memory>
@@ -30,6 +36,120 @@ void capture_decoded_sample(detail::PredictionOutput& output, int index, const s
  std::vector<std::uint8_t> pixels(16U * 16U * 3U, 80U);
  auto source = PredictionSource::Decoded({16, 16}, pixels, catalog);
  REQUIRE(output.Capture({.dataset_index = index}, {.width = 16, .height = 16, .device = 0, .rgb8 = source.rgb8(), .custody = source.custody()}, source.annotations()));
+}
+TEST_CASE("Predict publishes full custom schemas and refuses aggregate excess before replacing its paired product", "[controller][prediction][metadata][keypoints][gpu]") {
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+ const auto replacement_count = GENERATE(std::size_t{64}, std::size_t{128});
+ namespace catalog = mmltk::backend::data::catalog;
+ namespace serial = mmltk::frameworks::serialization;
+ catalog::ClassKeypointSchema schema;
+ for (std::size_t index = 0; index < catalog::kKeypointsPerClassCapacity; ++index) {
+  auto name = std::to_string(index);
+  name.append(catalog::kKeypointNameCapacity - name.size(), 'j');
+  schema.names.push_back(std::move(name));
+  schema.horizontal_flip.push_back(index);
+  schema.oks_sigmas.push_back(.1);
+ }
+ for (std::size_t edge = 0; edge < catalog::kSkeletonEdgeCapacity; ++edge)
+  schema.skeleton.push_back({static_cast<catalog::JointIndex>(edge % 256), static_cast<catalog::JointIndex>((edge % 256 + 1 + edge / 256) % 256)});
+ const auto catalog_ptr = std::make_shared<const catalog::ClassCatalog>(catalog::OrderedClassCatalog{{{"custom"}}, std::vector{schema}});
+ auto count = std::make_shared<std::atomic_size_t>(32);
+ class Runtime final : public PredictRuntime {
+ public:
+  Runtime(std::shared_ptr<std::atomic_size_t> count, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog) : count_(std::move(count)), catalog_(std::move(catalog)) {}
+  contracts::ComputeTerminal Run(rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink& products, const PlaybackGate&, VisualExtent,
+   const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t, const ExecutionSink&) override {
+   const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+   const auto context = current_context();
+   if (!context) throw std::runtime_error("Predict publication test has no receiver context");
+   if (!pool_) pool_ = std::make_unique<detail::PredictionPreviewPool>(execution, *context, PredictionReceiverFault::Operations(), retirement);
+   rfdetr::Prediction detection;
+   detection.class_reference = 0; detection.score = .9F; detection.bbox_xyxy = {0, 0, 3, 3};
+   detection.keypoints.resize(256, {2, 2, .9F, {}});
+   std::array<float, 48> pixels; pixels.fill(1);
+   auto source = PredictionSource::Device(execution, {4, 4}, pixels, std::vector<rfdetr::Prediction>(count_->load(), detection), catalog_);
+   auto raw = pool_->Capture(source.pixels(), source.extent(), 0, source.detections(), source.annotations(), source.classes(), 1, nullptr, source.custody());
+   products(Product{.extent = source.extent(), .raw = std::move(raw), .image_id = 1});
+   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
+  }
+ private:
+  std::shared_ptr<std::atomic_size_t> count_;
+  std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog_;
+  std::unique_ptr<detail::PredictionPreviewPool> pool_;
+ };
+ ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("prediction-schema-publication")};
+ auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
+ std::promise<void> first, first_done, refused, second_done;
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64, .maximum_height = 64}, [count, catalog_ptr](DirectComputeConfiguration) {
+  return std::make_unique<Runtime>(count, catalog_ptr);
+ }, [&](PredictSystem::event_type event) {
+  if (const auto* changed = std::get_if<PredictChanged>(&event)) {
+   const auto& snapshot = changed->snapshot;
+   if (snapshot.frame.valid() && snapshot.operation.generation_frontier == 1) mmltk::testsupport::release_test_promise(first);
+   if (!snapshot.operation.active && snapshot.operation.generation_frontier == 1) mmltk::testsupport::release_test_promise(first_done);
+   if (!snapshot.operation.active && snapshot.operation.generation_frontier == 2) mmltk::testsupport::release_test_promise(second_done);
+  }
+  if (const auto* failure = std::get_if<PredictFailed>(&event); failure && failure->snapshot.operation.generation_frontier == 2) mmltk::testsupport::release_test_promise(refused);
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
+ contracts::PredictWorkflowIntent intent;
+ intent.preview = {.labels = false, .boxes = true, .masks = false, .keypoints = true, .uncertainty = true, .confidence_threshold = .9F};
+ static_cast<void>(prediction.Start(intent));
+ mmltk::testsupport::await_test_promise(first, "complete custom skeleton publication");
+ mmltk::testsupport::await_test_promise(first_done, "custom skeleton inference completion");
+ const auto accepted = prediction.snapshot();
+ REQUIRE(accepted.labels.size() == 32);
+ CHECK(accepted.preview == intent.preview);
+ CHECK(PredictSystem::visual_source::ImageOf(accepted).preview == intent.preview);
+ CHECK(accepted.labels.front().skeleton.schema == schema);
+ const serial::wire::Limits limits{.max_bytes = kVisualMetadataByteBudget, .max_items = kVisualMetadataByteBudget};
+ std::vector<std::byte> bytes;
+ REQUIRE(serial::encode(accepted, bytes, limits));
+ CHECK(bytes.size() > 2U * 1024U * 1024U);
+ const auto transport = serial::reflected_transport_value(accepted);
+ REQUIRE(transport);
+ const auto transported = serial::wire::CountingEncoder({.max_bytes = kPredictSnapshotByteBudget, .max_items = kVisualMetadataByteBudget}).measure(*transport);
+ REQUIRE(transported);
+ CHECK(*transported > 2U * 1024U * 1024U);
+ const auto decoded = serial::decode<PredictSnapshot>({.first = bytes}, limits);
+ REQUIRE(decoded);
+ CHECK(decoded->labels.back().skeleton.schema == schema);
+ CHECK(decoded->labels.back().skeleton.joints.size() == 256);
+ auto oversized = accepted;
+ oversized.labels.resize(replacement_count, accepted.labels.front());
+ CHECK(visual_metadata_admitted(PredictSystem::visual_source::ImageOf(oversized)) == (replacement_count == 64));
+ const auto replacement = serial::reflected_transport_value(oversized);
+ REQUIRE(replacement);
+ const auto previous_bytes = bytes;
+ CHECK_FALSE(serial::wire::encode(*replacement, bytes, {.max_bytes = kPredictSnapshotByteBudget, .max_items = kVisualMetadataByteBudget}));
+ CHECK(bytes == previous_bytes);
+ auto held = prediction.BorrowDocument(accepted.frame);
+ REQUIRE(held.valid());
+ REQUIRE(held.image_metadata);
+ CHECK(std::holds_alternative<serial::wire::Value::Array>(held.image_metadata->storage));
+ const auto read_pixels = [](const auto& read) {
+  const auto plane = read.pixels.plane(0).plane();
+  std::array<std::uint8_t, 64> pixels{};
+  REQUIRE(cudaMemcpy2D(pixels.data(), 16, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, 16, 4, cudaMemcpyDeviceToHost) == cudaSuccess);
+  return pixels;
+ };
+ const auto pixels = read_pixels(held);
+ count->store(replacement_count);
+ intent.preview = {.labels = true, .boxes = false, .masks = true, .keypoints = false, .uncertainty = false, .confidence_threshold = 1.0F};
+ static_cast<void>(prediction.Start(intent));
+ mmltk::testsupport::await_test_promise(refused, "oversized skeleton metadata refusal");
+ mmltk::testsupport::await_test_promise(second_done, "inference completion after metadata refusal");
+ const auto retained = prediction.snapshot();
+ CHECK(retained.frame == accepted.frame);
+ CHECK(retained.document == accepted.document);
+ CHECK(retained.labels.size() == accepted.labels.size());
+ CHECK(retained.preview == accepted.preview);
+ CHECK(retained.preview != intent.preview);
+ CHECK(PredictSystem::visual_source::ImageOf(retained).preview == accepted.preview);
+ CHECK(retained.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+ auto current = prediction.BorrowDocument(retained.frame);
+ REQUIRE(current.valid());
+ CHECK(read_pixels(current) == pixels);
+ CHECK(read_pixels(held) == pixels);
 }
 TEST_CASE("prediction samples capture native pixels independently of browser and inference population", "[controller][prediction][output][gpu]") {
  // CLEANUP-IGNORE: The hardware admission guard and device selection precede independent prediction-output scenarios.

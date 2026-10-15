@@ -176,6 +176,8 @@ struct ValidateViewState {
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
 };
 struct PredictViewState {
+ bool live_analysis_enabled = false;
+ bool show_keypoints = true, show_uncertainty = false;
  PredictionOutputSettings saving{};
  bool write_report_json = true;
  PredictViewState() {
@@ -252,6 +254,7 @@ struct ExploreViewState : mmltk::backend::data::DataLoadingOptions {
  std::array<bool, kExploreClassCapacity> overlay_classes{};
  bool show_boxes = true;
  bool show_masks = true;
+ bool show_keypoints = true;
  bool show_labels = true;
  bool show_original_dimensions = false;
  ExploreDetailScaleMode detail_scale_mode = ExploreDetailScaleMode::Basic;
@@ -368,6 +371,8 @@ struct ExploreSettingsProjection final : mmltk::frameworks::reflection::StaticMe
                                            mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_boxes>>,
                                           mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::show_masks>,
                                            mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_masks>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::show_keypoints>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_keypoints>>,
                                           mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::show_labels>,
                                            mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_labels>>> {
  template <class Visitor>

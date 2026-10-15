@@ -106,19 +106,20 @@ void GalleryProductState::Clear() noexcept {
 namespace {
 struct DescriptorBudget final {
  std::size_t annotations = 0U;
- std::size_t runs = 0U;
- [[nodiscard]] bool Admit(const std::size_t added_annotations, const std::size_t added_runs) noexcept {
-  if (added_annotations > explore::kExploreRenderAnnotationCapacity - annotations || added_runs > explore::kExploreRenderRleCapacity - runs) return false;
+ std::size_t runs = 0U, joints = 0U;
+ [[nodiscard]] bool Admit(const std::size_t added_annotations, const std::size_t added_runs, const std::size_t added_joints) noexcept {
+  if (added_annotations > explore::kExploreRenderAnnotationCapacity - annotations || added_runs > explore::kExploreRenderRleCapacity - runs || added_joints > explore::kExploreRenderJointCapacity - joints) return false;
   annotations += added_annotations;
   runs += added_runs;
+  joints += added_joints;
   return true;
  }
- [[nodiscard]] bool AdmitDonor(const std::size_t source_annotations, const std::size_t source_runs, const std::size_t donor_runs) noexcept {
+ [[nodiscard]] bool AdmitDonor(const std::size_t source_annotations, const std::size_t source_runs, const std::size_t donor_runs, const std::size_t donor_joints) noexcept {
   // A render batch has its own staging ceiling; each image additionally
   // retains the bounded editable-document contract across copy/upscale.
   if (source_annotations >= contracts::kAnnotationObjectCapacity || source_runs > contracts::kAnnotationMaskRunCapacity || donor_runs > contracts::kAnnotationMaskRunCapacity - source_runs)
    return false;
-  return Admit(1U, donor_runs);
+  return Admit(1U, donor_runs, donor_joints);
  }
 };
 }  // namespace
@@ -296,6 +297,7 @@ private:
  NativeExploreStorage storage_;
  GalleryDescriptorStorage descriptors_;
  std::vector<rfdetr::AugmentationPreviewAnnotation> projected_annotations_;
+ std::size_t assembled_joints_ = 0U;
  std::uint32_t maximum_height_ = 0U;
  int device_ = 0;
  // Only the GPU owner clears this after an explicit stream boundary; an
@@ -852,7 +854,7 @@ ExploreStorageFootprint GalleryStream::Impl::StorageFootprint() const {
  for (const auto* family : {&storage_.storage_.buffers_.cached_clean_, &storage_.storage_.buffers_.cached_semantic_})
   for (const auto& allocation : *family) cache_bytes += allocation.capacity_bytes();
  const auto descriptor_bytes = descriptors_.storage_.buffers_.descriptors_.capacity_bytes() + descriptors_.storage_.buffers_.cards_device_.capacity_bytes() +
-                               descriptors_.storage_.buffers_.annotations_device_.capacity_bytes() + descriptors_.storage_.buffers_.rle_device_.capacity_bytes() +
+                               descriptors_.storage_.buffers_.annotations_device_.capacity_bytes() + descriptors_.storage_.buffers_.rle_device_.capacity_bytes() + descriptors_.storage_.buffers_.joints_device_.capacity_bytes() + descriptors_.storage_.buffers_.edges_device_.capacity_bytes() +
                                descriptors_.storage_.buffers_.classes_device_.capacity_bytes() + descriptors_.storage_.buffers_.tiles_device_.capacity_bytes();
  return {
   .host_bytes = host_bytes,
@@ -972,16 +974,17 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
   auto& slots = descriptors_.semantic_slots_;
   slots.clear();
   std::size_t annotation_count = 0U;
-  std::size_t run_count = 0U;
+  std::size_t run_count = 0U, joint_count = 0U;
   while (cursor < State().tile_meanings.size()) {
    const auto& meaning = State().tile_meanings[cursor];
    if (!meaning) {
     ++cursor;
     continue;
    }
-   if (meaning->annotations.size() > explore::kExploreRenderAnnotationCapacity - annotation_count || meaning->runs.size() > explore::kExploreRenderRleCapacity - run_count) break;
+   if (meaning->annotations.size() > explore::kExploreRenderAnnotationCapacity - annotation_count || meaning->runs.size() > explore::kExploreRenderRleCapacity - run_count || meaning->joints.size() > explore::kExploreRenderJointCapacity - joint_count) break;
    annotation_count += meaning->annotations.size();
    run_count += meaning->runs.size();
+   joint_count += meaning->joints.size();
    slots.push_back(static_cast<std::uint32_t>(cursor++));
   }
   if (slots.empty()) {
@@ -989,9 +992,9 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
    throw contracts::InvalidIntentError("Explore cached semantic batch exceeds capacity");
   }
   SettleDescriptors();
-  descriptors_.PrepareDescriptors(slots.size(), annotation_count, run_count, State().active_classes.size(), slots.size(), diagnostics_, device_, State().plan.generation);
+  descriptors_.PrepareDescriptors(slots.size(), annotation_count, run_count, State().active_classes.size(), slots.size(), diagnostics_, device_, State().plan.generation, joint_count, *State().store->class_catalog());
   std::size_t annotation_offset = 0U;
-  std::size_t run_offset = 0U;
+  std::size_t run_offset = 0U, joint_offset = 0U;
   for (std::size_t index = 0U; index < slots.size(); ++index) {
    const auto slot = slots[index];
    const auto& meaning = *State().tile_meanings[slot];
@@ -1000,12 +1003,15 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
    store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.cards.offset + index * sizeof(card), card);
    for (auto annotation : meaning.annotations) {
     annotation.rle_offset += static_cast<std::uint32_t>(run_offset);
+    annotation.joint_offset += static_cast<std::uint32_t>(joint_offset);
     annotation.card_index = static_cast<std::uint32_t>(index);
     if (annotation.occluder_index >= 0) annotation.occluder_index += static_cast<std::int32_t>(card.annotation_offset);
     store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.annotations.offset + annotation_offset++ * sizeof(annotation), annotation);
    }
    store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.rle.offset + run_offset * sizeof(data::RLEPair), std::span{meaning.runs});
    run_offset += meaning.runs.size();
+   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.joints.offset + joint_offset * sizeof(data::PackedKeypoint), std::span{meaning.joints});
+   joint_offset += meaning.joints.size();
    const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
    const explore::ExploreRenderTileDescriptor tile{
     .card_index = static_cast<std::uint32_t>(index),
@@ -1146,7 +1152,7 @@ const rfdetr::AugmentationBatchPlan* GalleryStream::Impl::PrepareImages(const st
    const Lane& lane = *ready_lanes[slot];
    // Aligned donors are optional. Reserve their complete semantic
    // footprint before either image paste or mask transformation.
-   if (!lane.donor_instance || !donor_budget.AdmitDonor(lane.layout.annotations.count, lane.layout.rle.count, lane.layout.donor_rle.count)) continue;
+   if (!lane.donor_instance || !donor_budget.AdmitDonor(lane.layout.annotations.count, lane.layout.rle.count, lane.layout.donor_rle.count, lane.layout.donor_joints.count)) continue;
    if (lane.layout.donor_mask_words != mask_words) throw std::logic_error("Explore prepared donor payload is unavailable");
    if (!donor_storage_ready) {
     ensure_gallery_buffer(descriptors_.storage_.buffers_.donor_boxes_device_, donor_box_bytes, "Explore donor box high-water allocation failed", diagnostics_, device_, State().plan.generation);
@@ -1226,6 +1232,16 @@ explore::ExploreRenderCardDescriptor GalleryStream::Impl::AssembleImageMeaning(
   std::copy(projected.box_xyxy.begin(), projected.box_xyxy.end(), std::begin(annotation.box_xyxy));
   std::copy(projected.inverse.begin(), projected.inverse.end(), std::begin(annotation.inverse));
   std::copy(projected.mask_bounds.begin(), projected.mask_bounds.end(), std::begin(annotation.mask_bounds));
+  const auto source_joint_offset = source ? lane.layout.joints.offset + annotation.joint_offset * sizeof(data::PackedKeypoint) : lane.layout.donor_joints.offset;
+  const auto source_joint_count = source ? annotation.joint_count : lane.layout.donor_joints.count;
+  if (source_joint_count > descriptors_.descriptor_layout_.joints.count - assembled_joints_) throw std::length_error("Explore joint projection exceeds staging");
+  const auto source_joints = std::span{reinterpret_cast<const data::PackedKeypoint*>(static_cast<const std::byte*>(lane.pinned.data()) + source_joint_offset), source_joint_count};
+  auto output_joints = std::span{reinterpret_cast<data::PackedKeypoint*>(static_cast<std::byte*>(descriptors_.storage_.buffers_.descriptors_.data()) + descriptors_.descriptor_layout_.joints.offset), descriptors_.descriptor_layout_.joints.count}.subspan(assembled_joints_, source_joint_count);
+  rfdetr::map_augmentation_keypoints(source_joints, State().store->class_catalog()->keypoints(projected.class_id), card.source_width, card.source_height,
+   image_plan != nullptr ? &support_plan : nullptr, output_joints, !source);
+  annotation.joint_offset = static_cast<std::uint32_t>(assembled_joints_);
+  annotation.joint_count = static_cast<std::uint32_t>(source_joint_count);
+  assembled_joints_ += source_joint_count;
   annotation.mask_present = projected.mask_present;
   annotation.class_id = projected.class_id;
   annotation.card_index = static_cast<std::uint32_t>(card_index);
@@ -1268,7 +1284,7 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(
    [&](const Lane* left, const Lane* right) { return scheduler_.priority_rank_[State().cache.Slot(left->position)] < scheduler_.priority_rank_[State().cache.Slot(right->position)]; });
   std::size_t admitted = 0U;
   for (auto* lane : std::span{ready}.first(ready_count)) {
-   if (!source_budget.Admit(lane->layout.annotations.count, lane->layout.rle.count)) break;
+   if (!source_budget.Admit(lane->layout.annotations.count, lane->layout.rle.count, lane->layout.joints.count)) break;
    ready[admitted++] = lane;
   }
   ready_count = admitted;
@@ -1310,6 +1326,7 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(
  }
  std::size_t ready_annotation_count = source_budget.annotations;
  std::size_t ready_rle_count = source_budget.runs;
+ std::size_t ready_joint_count = source_budget.joints;
  std::size_t donor_annotation_count = 0U;
  std::size_t donor_rle_count = 0U;
  const bool diagnostics_enabled = diagnostics_.valid();
@@ -1319,6 +1336,7 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(
    ++ready_annotation_count;
    const auto card_donor_rle_count = ready_lanes[slot]->layout.donor_rle.count;
    ready_rle_count += card_donor_rle_count;
+   ready_joint_count += ready_lanes[slot]->layout.donor_joints.count;
    if (diagnostics_enabled) {
     ++donor_annotation_count;
     donor_rle_count += card_donor_rle_count;
@@ -1326,7 +1344,8 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(
   }
  }
  // CLEANUP-IGNORE: Descriptor allocation already has one owner; cached tile meanings and ready lanes supply different counts and packing.
- descriptors_.PrepareDescriptors(ready_lanes.size(), ready_annotation_count, ready_rle_count, State().active_classes.size(), ready_lanes.size(), diagnostics_, device_, State().plan.generation);
+ descriptors_.PrepareDescriptors(ready_lanes.size(), ready_annotation_count, ready_rle_count, State().active_classes.size(), ready_lanes.size(), diagnostics_, device_, State().plan.generation, ready_joint_count, *State().store->class_catalog());
+ assembled_joints_ = 0U;
  std::size_t annotation_count = 0U;
  std::size_t rle_count = 0U;
  std::size_t tile_count = 0U;
@@ -1360,6 +1379,7 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(
    descriptors_, diagnostics_, device_, generation, lane->destination_slot, card_annotation_offset, annotation_count - card_annotation_offset, rle_count - card_rle_offset);
   ++ready_slot;
  }
+ descriptors_.descriptor_layout_.joints.count = assembled_joints_;
  descriptors_.descriptor_layout_.annotations.count = annotation_count;
  descriptors_.descriptor_layout_.rle.count = rle_count;
  descriptors_.descriptor_layout_.tiles.count = tile_count;
@@ -1437,6 +1457,10 @@ std::shared_ptr<const GalleryStream::Impl::TileMeaning> GalleryStream::Impl::Cap
    descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.annotations.offset + index * sizeof(explore::ExploreRenderAnnotationDescriptor));
   annotation.rle_offset -= static_cast<std::uint32_t>(run_begin);
   if (annotation.occluder_index >= 0) annotation.occluder_index -= static_cast<std::int32_t>(annotation_begin);
+  const auto joint_offset = meaning->joints.size();
+  const auto* joints = reinterpret_cast<const data::PackedKeypoint*>(static_cast<const std::byte*>(descriptors_.storage_.buffers_.descriptors_.data()) + descriptors_.descriptor_layout_.joints.offset);
+  meaning->joints.insert(meaning->joints.end(), joints + annotation.joint_offset, joints + annotation.joint_offset + annotation.joint_count);
+  annotation.joint_offset = static_cast<std::uint32_t>(joint_offset);
   meaning->annotations.push_back(annotation);
  }
  meaning->runs.resize(run_end - run_begin);
@@ -1468,10 +1492,11 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
   if (unchanged) return;
   stream_ = reinterpret_cast<cudaStream_t>(stream);
   const auto& meaning = *State().detail_meaning;
-  descriptors_.PrepareDescriptors(1U, meaning.annotations.size(), meaning.runs.size(), classes.size(), 0U, diagnostics_, device_, State().plan.generation);
+  descriptors_.PrepareDescriptors(1U, meaning.annotations.size(), meaning.runs.size(), classes.size(), 0U, diagnostics_, device_, State().plan.generation, meaning.joints.size(), *State().store->class_catalog());
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.cards.offset, meaning.card);
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.annotations.offset, std::span{meaning.annotations});
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.rle.offset, std::span{meaning.runs});
+  store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.joints.offset, std::span{meaning.joints});
   UploadPendingDescriptors(reinterpret_cast<cudaStream_t>(stream), classes);
   if (!scheduler_.current_demand_(plan.generation)) return;
   RenderDetailPlane(State().detail_view, plan.overlay, semantic, stream, true);
@@ -1505,7 +1530,7 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
  }
  auto* const cuda_stream = reinterpret_cast<cudaStream_t>(stream);
  const std::array ready_lanes{&lane};
- const auto* augmentation_plan = PrepareImages(ready_lanes, {lane.layout.annotations.count, lane.layout.rle.count}, cuda_stream);
+ const auto* augmentation_plan = PrepareImages(ready_lanes, {lane.layout.annotations.count, lane.layout.rle.count, lane.layout.joints.count}, cuda_stream);
  if (!scheduler_.current_demand_(plan.generation)) {
   descriptors_.descriptors_pending_ = true;
   return;
@@ -1515,12 +1540,14 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
  const auto* const donor_rle = reinterpret_cast<const data::RLEPair*>(static_cast<const std::byte*>(lane.pinned.data()) + lane.layout.donor_rle.offset);
  const auto donor_runs = has_paste ? std::span{donor_rle, lane.layout.donor_rle.count} : std::span<const data::RLEPair>{};
  descriptors_.PrepareDescriptors(
-  1U, lane.layout.annotations.count + (has_paste ? 1U : 0U), lane.layout.rle.count + donor_runs.size(), classes.size(), 0U, diagnostics_, device_, State().plan.generation);
+  1U, lane.layout.annotations.count + (has_paste ? 1U : 0U), lane.layout.rle.count + donor_runs.size(), classes.size(), 0U, diagnostics_, device_, State().plan.generation, lane.layout.joints.count + (has_paste ? lane.layout.donor_joints.count : 0U), *State().store->class_catalog());
+ assembled_joints_ = 0U;
  std::size_t annotation_count = 0U;
  std::size_t rle_count = 0U;
  const auto card = AssembleImageMeaning(lane, augmentation_plan != nullptr ? &augmentation_plan->images.front() : nullptr,
   static_cast<const float*>(preview_active ? descriptors_.storage_.buffers_.augmented_batch_.data() : scheduler_.image_stream_.device_storage(lane.index).data()), 0U, annotation_count, rle_count);
  store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.cards.offset, card);
+ descriptors_.descriptor_layout_.joints.count = assembled_joints_;
  descriptors_.descriptor_layout_.annotations.count = annotation_count;
  descriptors_.descriptor_layout_.rle.count = rle_count;
  GalleryStreamProbe::DiagnoseDescriptors(
@@ -1541,9 +1568,9 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
  State().detail_meaning = CaptureMeaning(card, 0U, annotation_count, 0U, rle_count);
  RenderDetailPlane(detail, plan.overlay, semantic, stream, true);
  auto document = std::make_shared<VisualDocument>();
- document->scene.document = contracts::WorkspaceResource::From("explore://image", plan.generation);
+ document->BindResource(contracts::WorkspaceResource::From("explore://image", plan.generation));
  document->scene.frame_index = *plan.selected_image;
- for (const auto& name : State().store->class_names()) document->scene.categories.push_back({.value = name});
+ document->SetCatalog(*State().store->class_catalog());
  document->scene.palette = mmltk::controller::annotation_class_palette(document->scene.categories.size());
  const float document_width = static_cast<float>(detail.source_width);
  const float document_height = static_cast<float>(detail.source_height);
@@ -1554,7 +1581,10 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
   object.category = annotation.class_id;
   object.box = {{annotation.box_xyxy[0] * document_width, annotation.box_xyxy[1] * document_height}, {annotation.box_xyxy[2] * document_width, annotation.box_xyxy[3] * document_height}};
   object.mask.present = annotation.mask_present;
-  document->AppendSourceObject(std::move(object), {annotation.mask_bounds[0], annotation.mask_bounds[1], annotation.mask_bounds[2], annotation.mask_bounds[3]});
+  std::vector<data::catalog::KeypointAnnotation> joints;
+  joints.reserve(annotation.joint_count);
+  for (const auto& joint : std::span{State().detail_meaning->joints}.subspan(annotation.joint_offset, annotation.joint_count)) joints.push_back({joint.x, joint.y, joint.visibility});
+  document->AppendSourceObject(std::move(object), {annotation.mask_bounds[0], annotation.mask_bounds[1], annotation.mask_bounds[2], annotation.mask_bounds[3]}, joints);
  }
  document->mask_contains = [meaning = State().detail_meaning, width = detail.source_width, height = detail.source_height, erasure = detail.erasure](std::size_t index, float x, float y) {
   const auto& annotations = meaning->annotations;
@@ -1603,7 +1633,7 @@ void GalleryStream::Impl::SeedPlaceholders(const std::span<const explore::Explor
   }
  }
  if (placeholders.empty() || !scheduler_.Current(State().plan.generation)) return;
- descriptors_.PrepareDescriptors(placeholders.size(), 0U, 0U, classes.size(), placeholders.size(), diagnostics_, device_, State().plan.generation);
+ descriptors_.PrepareDescriptors(placeholders.size(), 0U, 0U, classes.size(), placeholders.size(), diagnostics_, device_, State().plan.generation, 0U, *State().store->class_catalog());
  for (std::size_t index = 0U; index < placeholders.size(); ++index) {
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.cards.offset + index * sizeof(explore::ExploreRenderCardDescriptor),
    explore::ExploreRenderCardDescriptor{.placeholder = 1U});
@@ -1687,6 +1717,10 @@ explore::ExploreRenderScratchView GalleryStream::Impl::Scratch() const {
   .annotation_capacity = static_cast<std::uint32_t>(descriptors_.descriptor_layout_.annotations.count),
   .rle_pairs = static_cast<const data::RLEPair*>(descriptors_.storage_.buffers_.rle_device_.data()),
   .rle_capacity = static_cast<std::uint32_t>(descriptors_.descriptor_layout_.rle.count),
+  .joints = static_cast<const data::PackedKeypoint*>(descriptors_.storage_.buffers_.joints_device_.data()),
+  .joint_capacity = static_cast<std::uint32_t>(descriptors_.descriptor_layout_.joints.count),
+  .edges = static_cast<const explore::detail::ExploreRenderEdgeAbi*>(descriptors_.storage_.buffers_.edges_device_.data()),
+  .edge_capacity = static_cast<std::uint32_t>(descriptors_.descriptor_layout_.edges.count),
   .classes = static_cast<const explore::ExploreRenderClassDescriptor*>(descriptors_.storage_.buffers_.classes_device_.data()),
   .class_capacity = static_cast<std::uint32_t>(descriptors_.descriptor_layout_.classes.count),
   .tiles = static_cast<const explore::ExploreRenderTileDescriptor*>(descriptors_.storage_.buffers_.tiles_device_.data()),
@@ -1700,6 +1734,7 @@ explore::ExploreRenderSemanticView GalleryStream::Impl::Semantics(const ExploreO
   .class_count = State().store->header().num_classes,
   .show_boxes = static_cast<std::uint8_t>(semantic && overlay.show_boxes),
   .show_masks = static_cast<std::uint8_t>(semantic && overlay.show_masks),
+  .show_keypoints = static_cast<std::uint8_t>(semantic && overlay.show_keypoints),
  };
 }
 void GalleryStream::Impl::UploadPendingDescriptors(cudaStream_t stream, std::span<const explore::ExploreRenderClassDescriptor> classes) {

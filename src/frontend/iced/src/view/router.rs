@@ -256,7 +256,7 @@ impl Router {
                 Outcome::Predict(outcome)
             }
             Message::Live(message) => {
-                let Some(outcome) = self.live.update(settings.state_mut(), message)? else {
+                let Some(outcome) = self.live.update(settings.state_mut(), model.file_dialog.as_ref(), message)? else {
                     return Ok(None);
                 };
                 Outcome::Live(outcome)

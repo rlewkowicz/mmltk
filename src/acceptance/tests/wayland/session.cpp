@@ -472,7 +472,11 @@ PreparedWaylandInputs::PreparedWaylandInputs()
  compile_wayland_fixture(square_, 384U, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
  prepare_wayland_upscale_assets();
 }
-const mmltk::testsupport::WorkflowWaylandInputs& PreparedWaylandInputs::workflows() {
+const mmltk::testsupport::WorkflowWaylandInputs& PreparedWaylandInputs::workflows(bool keypoints) {
+ if (keypoints) {
+  if (!keypoints_) keypoints_ = std::make_unique<mmltk::testsupport::WorkflowWaylandInputs>(root_.path() / "keypoints", true);
+  return *keypoints_;
+ }
  if (!workflows_) workflows_ = std::make_unique<mmltk::testsupport::WorkflowWaylandInputs>(root_.path() / "workflows");
  return *workflows_;
 }
@@ -504,7 +508,7 @@ const std::filesystem::path& PreparedWaylandInputs::sparse() {
 WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile, const bool diagnostics_enabled, const bool dpi,
  const bool host_to_device, std::string fault, const bool pixels_enabled, const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture)
     : inputs_(std::move(inputs)),
-      ordinary_fixture_(ordinary_fixture ? *ordinary_fixture : inputs_->mixed()),
+      ordinary_fixture_(ordinary_fixture ? *ordinary_fixture : profile == "keypoints" ? inputs_->workflows(true).fixture() : inputs_->mixed()),
       termination(terminal),
       profile_(std::move(profile)),
       logging(diagnostics_enabled),
@@ -537,7 +541,8 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
  initial_settings.ui.ui_scale = 1.0F;
  initial_settings.workflows.explore.h2d_dataloader = h2d;
  initial_settings.workflows.train.request.h2d_dataloader = h2d;
- if (profile_ == "workflows" || profile_ == "workflows-oom") inputs_->workflows().Configure(initial_settings, working.path());
+ if (profile_ == "workflows" || profile_ == "workflows-oom" || profile_ == "keypoints") inputs_->workflows(profile_ == "keypoints").Configure(initial_settings, working.path());
+ if (profile_ == "keypoints") REQUIRE_FALSE(initial_settings.workflows.train.overwrite_compiled_dataset);
  std::filesystem::create_directories(working.path() / ".mmltk-data");
  std::ofstream settings_file{working.path() / ".mmltk-data" / "gui.json"};
  REQUIRE(settings_file);
@@ -601,6 +606,8 @@ int WaylandSession::PollEvents(std::array<pollfd, 4U>& events) const {
  return ready;
 }
 void WaylandSession::RunWorkflows() {
+ std::unique_ptr<mmltk::testsupport::WorkflowArtifactMutation> artifacts;
+ if (profile_ == "keypoints") artifacts = std::make_unique<mmltk::testsupport::WorkflowArtifactMutation>(working.path(), inputs_->workflows(true).alternate_model());
  auto& process = *process_;
  arm_timerfd(deadline.get(), kWaylandStartupDeadline, "workflow browser startup");
  std::size_t progress = 0U;
@@ -643,7 +650,23 @@ void WaylandSession::RunWorkflows() {
    REQUIRE(event->generation == scenario_sequence_);
    using Kind = mmltk::controller::contracts::IntegrationControlKind;
    const auto kind = static_cast<Kind>(event->slot);
-   if (kind == Kind::Settled) {
+   if (kind == Kind::ArtifactMutationRequested) {
+    REQUIRE(artifacts);
+    const auto index = static_cast<std::uint32_t>(event->compiled_index);
+    if (index == 0) REQUIRE(native.ArmLiveArtifactFailure(artifacts->artifact().string()));
+    if (index == 1) {
+     ConsumeRecords(); REQUIRE(native.expected_live_failures == 1); REQUIRE_FALSE(native.expected_live_artifact_failure);
+     // The refusal frame must be sampled while the fixture artifact is absent.
+     REQUIRE(browser.keypoint_pixels.contains("live-failure-retained"));
+     REQUIRE(browser.keypoint_pixels.contains("live-zero-detections"));
+     const auto& retained = browser.keypoint_pixels.at("live-failure-retained");
+     REQUIRE(retained.value("current_receipt", false)); REQUIRE(retained.value("matched", false));
+     REQUIRE(retained.at("a") == browser.keypoint_pixels.at("live-zero-detections").at("a"));
+     REQUIRE(retained.at("drawn_source") == retained.at("a")); REQUIRE(retained.at("drawn_presentation") == retained.at("b"));
+    }
+    artifacts->Apply(index);
+    REQUIRE(process.command_explore(static_cast<std::uint8_t>(Command::ArtifactMutationReady)));
+   } else if (kind == Kind::Settled) {
     REQUIRE_FALSE(frontend_settled_);
     frontend_settled_ = true;
    } else if (kind == Kind::Failed) {
@@ -666,6 +689,27 @@ void WaylandSession::RunWorkflows() {
   REQUIRE(canvas_allocation_failed_);
   REQUIRE(graphics_recovery_visible_);
   REQUIRE(workflow_steps_.contains("train-after-graphics-failure"));
+ } else if (profile_ == "keypoints") {
+  CHECK((workflow_steps_ == std::set<std::string>{"keypoint-compile", "keypoint-explore", "keypoint-explore-edit-save", "keypoint-train-oks", "keypoint-validate-oks", "keypoint-validate", "keypoint-export", "keypoint-predict", "keypoint-predict-upscale", "keypoint-predict-edit-save", "live-capture-only", "live-production-analysis", "keypoint-live-edit-save", "live-zero-detections", "live-provider-start-failed", "live-new-model-restart", "model-pe-selection", "model-keypoint-selection", "live-incompatible-refused", "live-failure-retained", "live-upscale", "live-import-clean", "keypoint-live-upscale-edit-save", "catalog-pe-predict", "catalog-pe-image", "catalog-keypoint-train-oks"}));
+  CHECK((workflow_pixels_ == std::set<std::string>{"keypoint-explore", "keypoint-validate", "keypoint-predict", "keypoint-predict-upscale", "live-capture-only", "live-production-analysis", "live-zero-detections", "live-new-model-restart", "live-failure-retained", "live-upscale", "live-import-clean", "catalog-pe-image"}));
+  REQUIRE(browser.keypoint_pixels_complete());
+  REQUIRE(browser.keypoint_catalog_complete());
+  REQUIRE(native.expected_live_failures == 1);
+  REQUIRE_FALSE(native.expected_live_artifact_failure);
+  REQUIRE(native.live_completed_frames >= 4);
+  REQUIRE(native.annotation_copied); REQUIRE(native.annotation_edited);
+  REQUIRE(std::filesystem::is_regular_file(working.path() / "export" / "model.onnx"));
+  REQUIRE(std::filesystem::is_directory(working.path() / "annotations"));
+  mmltk::controller::contracts::GuiSettingsState persisted;
+  REQUIRE(mmltk::controller::contracts::load_gui_settings_file((working.path() / ".mmltk-data" / "gui.json").string(), persisted));
+  REQUIRE(persisted.workflows.predict.live_analysis_enabled);
+  REQUIRE(persisted.workflows.predict.request.threshold == 0);
+  REQUIRE(persisted.workflows.train.overwrite_compiled_dataset);
+  const auto& artifact = browser.keypoint_training_artifact;
+  const auto& preset = persisted.workflows.train.request.preset_name;
+  REQUIRE(native.CatalogTrainingCompleted(scalar(artifact,"b"), preset, persisted.workflows.train.request.resolution));
+  REQUIRE_NOTHROW(inputs_->workflows(true).VerifyCatalogTraining(working.path(), persisted.workflows.train.output.directory,
+   artifact.value("control", ""), artifact.value("detail", ""), preset));
  } else {
   CHECK(
    (workflow_steps_ == std::set<std::string>{
@@ -737,7 +781,7 @@ void WaylandSession::RunWorkflows() {
  CHECK_FALSE(browser_failed_);
 }
 void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool last, const bool dark, const bool pending_reconstruction) {
- if (viewer_scenario == "workflows") {
+ if (viewer_scenario == "workflows" || viewer_scenario == "keypoints") {
   RunWorkflows();
   return;
  }

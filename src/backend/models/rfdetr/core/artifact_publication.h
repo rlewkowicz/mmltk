@@ -8,7 +8,7 @@
 #include "src/common/io/staging_directory.h"
 #include "src/common/io/file_memory.h"
 namespace mmltk::backend::models::rfdetr {
-class ArtifactPublicationCancelled final : public std::runtime_error {
+class ArtifactPublicationCancelled : public std::runtime_error {
 public:
  ArtifactPublicationCancelled() : std::runtime_error("RF-DETR artifact publication cancelled") {}
 };

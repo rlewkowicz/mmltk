@@ -37,6 +37,7 @@ public:
  // CLEANUP-IGNORE: Remaining declarations mirror the one sealed public facade at its private pimpl boundary.
  [[nodiscard]] std::shared_ptr<const LivePhysicalTerminal> admitted_run_terminal() const noexcept;
  [[nodiscard]] mmltk::backend::media::capture::Status first_failure() const;
+ [[nodiscard]] mmltk::backend::media::capture::Status no_custody_start_settlement() const;
  [[nodiscard]] std::optional<PhysicalFrameRevision> newest_revision() const noexcept;
  [[nodiscard]] bool try_acquire_output(PhysicalFrameRevision revision, LiveCompositeOutputLease* output);
  [[nodiscard]] bool request_raw_readback(LiveRawFrameReadback request);
@@ -112,6 +113,8 @@ private:
  LiveRevisionListener revision_listener_{};
  LiveAdmittedRunTerminalListener admitted_run_terminal_listener_{};
  mmltk::backend::media::capture::Status first_failure_{};
+ cudaError_t cleanup_cuda_failure_ = cudaSuccess;
+ bool worker_joined_ = false;
  PhysicalPhase phase_ = PhysicalPhase::Idle;
  bool startup_ready_ = false;
  bool wake_pending_ = false;

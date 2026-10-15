@@ -38,6 +38,7 @@ target_include_directories(mmltk_backend_imaging_raster PRIVATE
 )
 target_link_libraries(mmltk_backend_imaging_raster
     PUBLIC
+        mmltk::backend::data::catalog
         mmltk::frameworks::gpu
         CUDA::cudart
     PRIVATE
@@ -49,6 +50,7 @@ set_target_properties(mmltk_backend_imaging_raster PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
 )
 
+mmltk_register_public_headers(mmltk_backend_imaging_raster BASE_DIRS ${CMAKE_SOURCE_DIR} FILES skeleton_projection.h)
 mmltk_register_header_isolation(mmltk_backend_imaging_raster)
 
 function(mmltk_add_backend_imaging_raster_tests)

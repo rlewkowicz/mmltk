@@ -212,6 +212,7 @@ pub fn view<'a>(
             enabled,
             Message::OverwriteChanged,
         ))
+        .id("train.dataset.overwrite")
         .padding(iced::Padding::ZERO.top(crate::view::workflow::FIELD_SPACING)),
     ];
     let fields = column![

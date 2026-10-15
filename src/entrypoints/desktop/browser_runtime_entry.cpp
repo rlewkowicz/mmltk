@@ -2,6 +2,7 @@
 #include <Loop.h>
 #include <spdlog/spdlog.h>
 #include "src/entrypoints/desktop/browser_runtime_options.h"
+#include "src/backend/media/live/tests/support/live_capture_fixture.h"
 #include <vector>
 #include <pthread.h>
 #include <signal.h>
@@ -183,6 +184,12 @@ int main(int argc, char** argv) {
     return 1;
    }
    config.file_dialog_launch_directory = integration_file_dialog_root;
+   if (const char* scenario = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO"); scenario && std::string_view{scenario} == "keypoints") {
+    auto input = std::make_shared<mmltk::backend::media::live::test_support::LiveCaptureFixture>(std::filesystem::path{integration_file_dialog_root} / "live-capture.fifo");
+    config.live.capture_device = input->path();
+    config.live.capture_api = input->api();
+    config.live.capture_custody = std::move(input);
+   }
    const int explore_control = integration_control_fd();
    if (explore_control < 0) {
     mmltk::common::logging::report_fatal("Explore acceptance control descriptor", "rejected");

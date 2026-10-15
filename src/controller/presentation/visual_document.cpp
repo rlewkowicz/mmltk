@@ -7,11 +7,61 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <cerrno>
+#include <string>
+#include <system_error>
+#include <sys/random.h>
+#include <unistd.h>
 #include "src/controller/contracts/application_boundary.h"
 namespace mmltk::controller {
-void VisualDocument::AppendSourceObject(contracts::AnnotationObject object, std::array<float, 4> bounds) {
+void VisualDocument::BindResource(contracts::WorkspaceResource resource) {
+ // An immutable image document is a product identity, independent of editor
+ // revisions. OS entropy scopes the monotonic meaning identity across process
+ // restarts; pid additionally separates a fork inheriting the process state.
+ static const std::string incarnation = [] {
+  std::array<unsigned char, 16> bytes{};
+  std::size_t offset = 0;
+  while (offset < bytes.size()) {
+   const auto count = ::getrandom(bytes.data() + offset, bytes.size() - offset, 0);
+   if (count < 0 && errno == EINTR) continue;
+   if (count <= 0) throw std::system_error(count < 0 ? errno : EIO, std::generic_category(), "visual document incarnation");
+   offset += static_cast<std::size_t>(count);
+  }
+  constexpr std::string_view hex = "0123456789abcdef";
+  std::string result;
+  result.reserve(32);
+  for (const auto value : bytes) { result += hex[value >> 4]; result += hex[value & 15]; }
+  return result;
+ }();
+ if (!resource.valid()) throw contracts::InvalidIntentError("Visual source identity is invalid");
+ auto bound = contracts::WorkspaceResource::From(std::string(resource.view()) + "/snapshot-" + incarnation + "-" + std::to_string(::getpid()) + "-" + std::to_string(meaning_identity_) + "-" + std::to_string(resource.revision), resource.revision);
+ if (!bound.valid()) throw contracts::InvalidIntentError("Visual source identity exceeds document capacity");
+ scene.document = bound;
+}
+std::vector<mmltk::backend::data::catalog::KeypointAnnotation> VisualSkeleton::Annotations() const {
+ using Visibility = mmltk::backend::data::catalog::KeypointVisibility;
+ if (joints.size() != schema.names.size()) throw contracts::InvalidIntentError("Visual joints disagree with their schema");
+ std::vector<mmltk::backend::data::catalog::KeypointAnnotation> result;
+ result.reserve(joints.size());
+ for (const auto& joint : joints) result.push_back({joint.point.x, joint.point.y, joint.visibility.value_or(joint.confidence >= 0.5F ? Visibility::Visible : Visibility::Unannotated)});
+ return result;
+}
+void VisualDocument::SetCatalog(const mmltk::backend::data::catalog::ClassCatalog& catalog) {
+ auto record = catalog.record();
+ scene.categories = std::move(record.names);
+ scene.keypoint_schemas = record.keypoints ? std::move(*record.keypoints) : std::vector<mmltk::backend::data::catalog::ClassKeypointSchema>{};
+}
+void VisualDocument::AppendSourceObject(contracts::AnnotationObject object, std::array<float, 4> bounds, std::span<const mmltk::backend::data::catalog::KeypointAnnotation> joints) {
+ if (!joints.empty()) {
+  if (object.category >= scene.keypoint_schemas.size()) throw contracts::InvalidIntentError("Annotation joint schema is unavailable");
+  const auto& schema = scene.keypoint_schemas[object.category];
+  if (schema.names.size() != joints.size()) throw contracts::InvalidIntentError("Annotation joints disagree with their class schema");
+  object.shape = contracts::AnnotationShape::Skeleton;
+  for (std::size_t index = 0; index < joints.size(); ++index) object.skeleton_nodes.push_back({schema.names[index], {joints[index].x, joints[index].y}, joints[index].visibility});
+  for (const auto& edge : schema.skeleton) object.skeleton_edges.push_back({edge.first, edge.second});
+ }
  mask_bounds.push_back(bounds);
- object.shape = object.mask.present ? contracts::AnnotationShape::Mask : contracts::AnnotationShape::Box;
+ if (object.shape != contracts::AnnotationShape::Skeleton) object.shape = object.mask.present ? contracts::AnnotationShape::Mask : contracts::AnnotationShape::Box;
  scene.objects.push_back(std::move(object));
 }
 std::uint64_t VisualDocument::NextIdentity() {
@@ -84,7 +134,25 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
  scene.frame_width = static_cast<std::uint16_t>(target.width);
  scene.frame_height = static_cast<std::uint16_t>(target.height);
  scene.frame_ready = true;
+ if (scene.document.view().find("/snapshot-") != std::string_view::npos) {
+  // Two equal-sized crops of one retained source still refer to different
+  // pixels. Derived scaling keeps the source resource; this import binds its
+  // actual sampling geometry without changing the producer's source facts.
+  scene.document = contracts::WorkspaceResource::From(std::string(scene.document.view()) + "/crop-" + std::to_string(extent.width) + "-" + std::to_string(extent.height) + "-" + std::to_string(crop.x) + "-" + std::to_string(crop.y) + "-" + std::to_string(crop.width) + "-" + std::to_string(crop.height) + "-" + std::to_string(target.width) + "-" + std::to_string(target.height), scene.document.revision);
+  if (!scene.document.valid()) throw contracts::InvalidIntentError("Annotation source geometry identity exceeds document capacity");
+ }
  project_spatial_members(scene.objects, {.crop = crop, .target = target});
+ // A clipped joint has no annotation in this crop. Keep its stable slot/name;
+ // clamping its position alone must not invent a visible boundary joint.
+ for (std::size_t index = 0; index < scene.objects.size(); ++index) {
+  auto& object = scene.objects[index];
+  const auto& source = document.scene.objects[index];
+  for (std::size_t joint = 0; joint < object.skeleton_nodes.size(); ++joint) {
+   const auto point = source.skeleton_nodes[joint].point;
+   if (point.x < crop.x || point.y < crop.y || point.x > crop.x + crop.width || point.y > crop.y + crop.height)
+    object.skeleton_nodes[joint].visibility = mmltk::backend::data::catalog::KeypointVisibility::Unannotated;
+  }
+ }
  std::size_t total_runs = 0U;
  for (std::size_t index = 0U; index < scene.objects.size(); ++index) {
   auto& object = scene.objects[index];

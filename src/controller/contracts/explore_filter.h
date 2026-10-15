@@ -28,6 +28,7 @@ struct ExploreOverlay final {
  ExploreClassSelection class_selection{};
  bool show_boxes = true;
  bool show_masks = true;
+ bool show_keypoints = true;
  bool show_labels = true;
  bool operator==(const ExploreOverlay&) const = default;
 };

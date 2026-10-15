@@ -2195,3 +2195,79 @@ export function mmltkIntegrationStatusExercise(stage, measured, focused, callbac
   report({event:'integration.status.paint_wait',control:painted,stage,input:owner.statusInput});
   paintWait.drawn();
 }
+
+export function mmltkIntegrationKeypointPixels(receipt, source, presentation, patches, region, empty, stage, oks, completed) {
+  completed = integrationCompletion(completed);
+  const owner = integrationState;
+  patches = Array.from(patches); region = Array.from(region); oks = Array.from(oks);
+  integrationFrame(() => integrationFrame(() => {
+    if (!owner || !probeCurrent(receipt) || receipt.drawn.sourceRevision !== source || receipt.drawn.presentationRevision !== presentation) { completed('invalidated'); return; }
+    try {
+      const canvas = document.querySelector('canvas');
+      if (!canvas || region.length !== 4 || !region.every(Number.isFinite) || patches.length % 7 !== 0 || !patches.every(Number.isFinite)) throw new Error('invalid paired keypoint probe');
+      const snapshot = canvasSnapshot(canvas);
+      let matched = 0, sampled = 0, variation = 0;
+      const cleanImport = stage === 'live-import-clean', catalogImage = stage === 'catalog-pe-image';
+      if (cleanImport) {
+        if (empty || !patches.length) throw new Error('missing former Live overlay coordinates');
+        for (let i=0; i<patches.length; i+=7) {
+          const x = Math.floor(patches[i]), y = Math.floor(patches[i+1]);
+          if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) throw new Error('former Live overlay outside canvas');
+          const pixel = snapshot.getImageData(x,y,1,1).data;
+          ++sampled;
+          if (Math.abs(pixel[0]-16) <= 12 && Math.abs(pixel[1]-24) <= 12 && pixel[2] >= 36 && pixel[2] <= 108) ++matched;
+        }
+        if (matched !== sampled) throw new Error('removed Live object left burned analysis pixels');
+      } else if (catalogImage) {
+        if (empty || patches.length) throw new Error('catalog PE image has invalid probe inputs');
+        const [x,y,w,h] = region;
+        const left = Math.max(0, Math.ceil(x + w*.1)), top = Math.max(0, Math.ceil(y + h*.1));
+        const width = Math.min(canvas.width-left, Math.floor(w*.8)), height = Math.min(canvas.height-top, Math.floor(h*.8));
+        if (width < 1 || height < 1) throw new Error('catalog PE image is outside canvas');
+        const pixels = snapshot.getImageData(left,top,width,height).data;
+        for (let i=0; i<pixels.length; i+=4) {
+          ++sampled;
+          if (pixels[i+3] === 255) ++matched;
+          variation = Math.max(variation, Math.abs(pixels[i]-pixels[0]), Math.abs(pixels[i+1]-pixels[1]), Math.abs(pixels[i+2]-pixels[2]));
+        }
+        if (matched !== sampled || variation <= 12) throw new Error('catalog PE operation has no rendered source pixels');
+      } else if (empty) {
+        if (patches.length) throw new Error('empty analysis retained skeleton patches');
+        const [x,y,w,h] = region;
+        const left = Math.max(0, Math.ceil(x + w * .2)), top = Math.max(0, Math.ceil(y + h * .2));
+        const width = Math.min(canvas.width - left, Math.floor(w * .6)), height = Math.min(canvas.height - top, Math.floor(h * .6));
+        if (width <= 0 || height <= 0) throw new Error('capture image is outside canvas');
+        const pixels = snapshot.getImageData(left, top, width, height).data;
+        for (let i=0; i<pixels.length; i+=4) {
+          ++sampled;
+          if (Math.abs(pixels[i]-16) <= 12 && Math.abs(pixels[i+1]-24) <= 12 && pixels[i+2] >= 36 && pixels[i+2] <= 108) ++matched;
+        }
+        if (matched < sampled * .7) throw new Error('capture-only or zero-detection pixels lost original source');
+      } else {
+        if (!patches.length) throw new Error('missing native skeleton coordinates');
+        for (let i=0; i<patches.length; i+=7) {
+          const [x,y,r,g,b,tolerance,radius] = patches.slice(i,i+7);
+          const left = Math.max(0, Math.floor(x-radius)), top = Math.max(0, Math.floor(y-radius));
+          const width = Math.min(canvas.width-left, Math.ceil(radius*2+1)), height = Math.min(canvas.height-top, Math.ceil(radius*2+1));
+          if (width <= 0 || height <= 0) throw new Error('native joint outside canvas');
+          const pixels = snapshot.getImageData(left,top,width,height).data;
+          let found = false;
+          for (let j=0; j<pixels.length; j+=4) if (Math.abs(pixels[j]-r) <= tolerance && Math.abs(pixels[j+1]-g) <= tolerance && Math.abs(pixels[j+2]-b) <= tolerance) {found = true; break;}
+          ++sampled; if (found) ++matched;
+        }
+        if (matched !== sampled) throw new Error('completed skeleton pixels disagree with paired native coordinates/colors');
+      }
+      let oksPixels = 0;
+      if (stage === 'keypoint-validate') {
+        if (oks.length !== 4 || !oks.every(Number.isFinite)) throw new Error('missing rendered OKS result');
+        const [x,y,w,h] = oks.map(Math.floor);
+        if (x < 0 || y < 0 || w < 1 || h < 1 || x+w > canvas.width || y+h > canvas.height) throw new Error('OKS result is outside the canvas');
+        const pixels = snapshot.getImageData(x,y,w,h).data;
+        for (let i=4; i<pixels.length; i+=4) if (Math.max(Math.abs(pixels[i]-pixels[0]),Math.abs(pixels[i+1]-pixels[1]),Math.abs(pixels[i+2]-pixels[2])) > 24) ++oksPixels;
+        if (oksPixels < 12) throw new Error('OKS result has no rendered text');
+      }
+      report({event:'integration.workflow.pixels', control:receipt.control, detail:stage, a:String(source), b:String(presentation), c:String(sampled), d:String(matched), matched:true, native_joints:cleanImport ? 0 : patches.length/7, source_samples:cleanImport || catalogImage ? sampled : 0, clean_import:cleanImport, catalog_image:catalogImage, variation, analyzed_empty:empty, oks_pixels:oksPixels, current_receipt:probeCurrent(receipt), drawn_source:String(receipt.drawn.sourceRevision), drawn_presentation:String(receipt.drawn.presentationRevision)});
+      completed('observed', sampled, matched);
+    } catch (error) { report({event:'integration.keypoint.failed', detail:String(error), control:stage}); completed('failed'); }
+  }));
+}

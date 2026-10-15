@@ -32,7 +32,7 @@ MMLTK_REFLECT_ENUM(CompilationMode)
  return {};
 }
 struct NativeRfDetrConfig {
- std::string preset_name;
+ MMLTK_MAX_BYTES(65536U) std::string preset_name;
  int resolution = 0;
  ModelTask task = ModelTask::Detection;
  BackboneConfig backbone{};
@@ -81,6 +81,7 @@ struct NativeRfDetrConfig {
  TrainingSupervisionConfig training_supervision;
  [[nodiscard]] bool has_masks() const noexcept { return task == ModelTask::Segmentation; }
  [[nodiscard]] bool has_keypoints() const noexcept { return task == ModelTask::Keypoints; }
+ bool operator==(const NativeRfDetrConfig&) const = default;
 };
 MMLTK_REFLECT_FIELDS(NativeRfDetrConfig)
 [[nodiscard]] bool native_model_config_valid(const NativeRfDetrConfig& config) noexcept;

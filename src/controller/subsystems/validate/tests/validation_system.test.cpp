@@ -4,6 +4,8 @@
 #include "src/controller/subsystems/validate/detail/validation_samples.h"
 #include "src/controller/subsystems/validate/detail/validation_sample_output.h"
 #include "src/backend/imaging/raster/detail/checked_png.h"
+#include "src/backend/imaging/raster/caption_raster.h"
+#include "src/test_support/cuda_test_utils.hpp"
 #include <cstdio>
 #include <iterator>
 #include <stb_image.h>
@@ -1308,6 +1310,76 @@ TEST_CASE("validation rendered output applies captured layers masks boxes and in
  const bool pb = prediction && choice != 5U, gb = truth_visible && choice != 6U;
  CHECK(box[0] == (pb || gb ? (pb ? 255U : 0U) : 64U));
  CHECK(box[1] == (pb || gb ? (gb ? 255U : 0U) : 64U));
+}
+TEST_CASE("validation saved and interactive skeletons share independent layer joint and uncertainty policy", "[controller][validation][gpu][output][keypoints]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ namespace rfdetr = mmltk::backend::models::rfdetr;
+ namespace catalog = mmltk::backend::data::catalog;
+ const auto choice = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U);
+ CAPTURE(choice);
+ const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+ const mmltk::testsupport::ScopedTempDir directory("validation-skeleton-policy");
+ contracts::ValidationRunPreview options;
+ options.ground_truth_labels = options.prediction_labels = false;
+ options.display.confidence_threshold = choice == 6 ? .501F : .5F;
+ options.overlays.prediction_boxes = options.overlays.ground_truth_boxes = false;
+ options.overlays.prediction_masks = options.overlays.ground_truth_masks = false;
+ options.overlays.prediction_layer = choice != 1;
+ options.overlays.ground_truth_layer = choice != 2;
+ options.overlays.prediction_keypoints = choice != 3 && choice != 4 && choice != 8;
+ options.overlays.ground_truth_keypoints = choice != 3 && choice != 4 && choice != 7;
+ options.overlays.uncertainty = choice != 4 && choice != 5;
+ const auto admitted = options;
+ catalog::ClassKeypointSchema schema{.names = {"joint"}, .horizontal_flip = {0}, .oks_sigmas = {.1}};
+ const auto classes = std::make_shared<const catalog::ClassCatalog>(catalog::OrderedClassCatalog{{{"object"}}, std::vector{schema}});
+ rfdetr::Prediction detection{.class_reference = 0, .score = .5F, .bbox_xyxy = {0, 0, 64, 64}, .keypoints = {{16, 16, .9F, {.125F, 0, .125F}}}};
+ auto truth = detection;
+ truth.keypoints.front().x = 48;
+ truth.keypoint_visibility = {catalog::KeypointVisibility::Visible};
+ const std::array truths{truth};
+ auto source = PredictionSource::Device(execution, {64, 64}, std::vector<float>(64U * 64U * 3U, .25F), {detection}, classes);
+ rfdetr::PredictionRecord record{.dataset_index = 29, .detections = {detection}};
+ const auto sample = [&] { return rfdetr::ValidationSampleView{record, {.chw = source.pixels(), .width = 64, .height = 64, .device = 0, .custody = source.custody()}, source.annotations(), truths}; };
+ const std::array<std::uint32_t, 1> indices{29};
+ std::filesystem::path saved;
+ detail::ValidationSampleOutput output({execution}, {}, [&](const auto& path) { saved = path; });
+ output.Begin(directory.path(), options, indices);
+ options.overlays = {}; options.overlays.prediction_layer = options.overlays.ground_truth_layer = false;
+ REQUIRE(output.Capture(sample()));
+ output.Finish(true);
+ auto [width, height, png] = mmltk::testsupport::read_rgba_image(saved);
+ REQUIRE(width == 64); REQUIRE(height == 64);
+ std::mutex mutex;
+ std::condition_variable changed;
+ detail::ValidationSamples interactive({.device = 0, .maximum_width = 512, .maximum_height = 576}, [&] { std::scoped_lock lock(mutex); changed.notify_all(); });
+ interactive.SetOverlays(admitted.overlays);
+ interactive.SetDisplay(admitted.display);
+ interactive.Begin(1, indices);
+ interactive.Capture(1, sample());
+ interactive.Settle(1, true);
+ await_validation(mutex, changed, [&] { return interactive.snapshot().sample_available[0]; });
+ interactive.Select({1, 29});
+ await_validation(mutex, changed, [&] { const auto value = interactive.snapshot(); return value.detail && value.frame.extent == VisualExtent{64, 64}; });
+ auto image = interactive.BorrowFrame();
+ REQUIRE(image.valid()); REQUIRE(image.plane_count() == 2);
+ image.plane(0).context().Bind();
+ const auto clean = image.plane(0).plane(), semantic = image.plane(1).plane();
+ auto composed = mmltk::testsupport::allocate_cuda_test_object<std::array<std::uint8_t, 64U * 64U * 4U>>();
+ auto target = clean;
+ target.data = reinterpret_cast<std::uintptr_t>(composed.get());
+ target.descriptor.pitch_bytes = 64U * 4U;
+ REQUIRE(cudaMemcpy2D(reinterpret_cast<void*>(target.data), target.descriptor.pitch_bytes, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes, 64U * 4U, 64U, cudaMemcpyDeviceToDevice) == cudaSuccess);
+ mmltk::backend::imaging::raster::CaptionRaster::Composite(target, semantic, 0);
+ std::array<std::uint8_t, 64U * 64U * 4U> pixels;
+ REQUIRE(cudaMemcpy(pixels.data(), composed.get(), pixels.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
+ CHECK(std::equal(pixels.begin(), pixels.end(), png.get()));
+ const auto changed_pixel = [&](unsigned x, unsigned y) { const auto* pixel = png.get() + (y * 64U + x) * 4U; return pixel[0] != 64 || pixel[1] != 64 || pixel[2] != 64; };
+ const bool prediction = admitted.overlays.prediction_layer && choice != 6;
+ CHECK(changed_pixel(16, 16) == (prediction && admitted.overlays.prediction_keypoints));
+ CHECK(changed_pixel(48, 16) == (admitted.overlays.ground_truth_layer && admitted.overlays.ground_truth_keypoints));
+ CHECK(changed_pixel(24, 16) == (prediction && admitted.overlays.uncertainty));
+ CHECK(changed_pixel(56, 16) == (admitted.overlays.ground_truth_layer && admitted.overlays.uncertainty));
+ interactive.Shutdown();
 }
 TEST_CASE("validation PNG captions preserve names independent flags opaque order and native geometry", "[controller][validation][gpu][output]") {
  namespace gpu = mmltk::frameworks::gpu;

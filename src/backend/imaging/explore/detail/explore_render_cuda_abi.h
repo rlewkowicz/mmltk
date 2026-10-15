@@ -44,11 +44,15 @@ struct ExploreRenderAnnotationDescriptorAbi final {
  float inverse[6U]{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
  std::uint32_t rle_offset = 0U;
  std::uint32_t rle_count = 0U;
+ std::uint32_t joint_offset = 0U, joint_count = 0U;
  std::uint32_t card_index = 0U;
  std::uint16_t class_id = 0U;
  std::int32_t occluder_index = -1;
 };
+struct ExploreRenderJointAbi final { float x = 0, y = 0; std::uint8_t visibility = 0, reserved[3]{}; };
+struct ExploreRenderEdgeAbi final { std::uint16_t first = 0, second = 0; };
 struct ExploreRenderClassDescriptorAbi final {
+ std::uint32_t edge_offset = 0, edge_count = 0;
  std::uint8_t color[3U]{255U, 0U, 0U};
  char name[32U]{};
  std::uint8_t length = 0U;
@@ -109,6 +113,7 @@ struct ExploreRenderScratchCapacitiesAbi final {
  std::uint32_t cards = 0U;
  std::uint32_t annotations = 0U;
  std::uint32_t rle_pairs = 0U;
+ std::uint32_t joints = 0U, edges = 0U;
  std::uint32_t classes = 0U;
  std::uint32_t tiles = 0U;
 };
@@ -116,6 +121,8 @@ struct ExploreRenderScratchViewAbi final {
  const ExploreRenderCardDescriptorAbi* cards = nullptr;
  const ExploreRenderAnnotationDescriptorAbi* annotations = nullptr;
  const void* rle_pairs = nullptr;
+ const void* joints = nullptr;
+ const ExploreRenderEdgeAbi* edges = nullptr;
  const ExploreRenderClassDescriptorAbi* classes = nullptr;
  const ExploreRenderTileDescriptorAbi* tiles = nullptr;
  ExploreRenderScratchCapacitiesAbi capacities{};
@@ -134,7 +141,8 @@ struct ExploreRenderSemanticViewAbi final {
  std::uint32_t class_count = 0U;
  std::uint8_t show_boxes = 1U;
  std::uint8_t show_masks = 1U;
- std::uint8_t reserved[2U]{};
+ std::uint8_t show_keypoints = 1U;
+ std::uint8_t reserved[1U]{};
 };
 struct ExploreRenderAtlasViewAbi final {
  std::uint32_t card_extent = 0U;

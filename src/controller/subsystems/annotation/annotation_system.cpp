@@ -7,6 +7,7 @@
 #include "src/frameworks/gpu/runtime/system_image_worker.h"
 #include <algorithm>
 #include <functional>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -24,7 +25,7 @@ using Runtime = mmltk::frameworks::gpu::SystemImageRuntime;
 }  // namespace
 class AnnotationSystem::Impl final {
  friend class AnnotationSystem;
- using Command = std::variant<AnnotationOpen, AnnotationEditRequest, AnnotationSave>;
+ using Command = std::variant<AnnotationOpen, AnnotationEditRequest, AnnotationSave, AnnotationLoad>;
  struct PeerBoundary final {};
  using InputRecord = std::variant<WorkspaceMouse, Command, PeerBoundary>;
  using Completion = std::move_only_function<void()>;
@@ -56,6 +57,10 @@ public:
  [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest request) { return Admit(Command{std::move(request)}); }
  [[nodiscard]] AnnotationSnapshot Save(AnnotationSave request) {
   if (request.destination.empty()) throw contracts::InvalidIntentError("Annotation save destination is unavailable");
+  return Admit(Command{std::move(request)});
+ }
+ [[nodiscard]] AnnotationSnapshot Load(AnnotationLoad request) {
+  if (request.source.empty()) throw contracts::InvalidIntentError("Annotation document path is unavailable");
   return Admit(Command{std::move(request)});
  }
  void SetInputPeer(std::uint64_t epoch) {
@@ -288,6 +293,23 @@ private:
    using Request = decltype(request);
    if constexpr (std::same_as<Request, AnnotationOpen>)
     OpenSource(request);
+   else if constexpr (std::same_as<Request, AnnotationLoad>) {
+    try {
+     // Admission and file I/O run on the same ordered document worker as edits.
+     // A file supplies meaning only; the current receiver-owned pixels remain
+     // paired by resource identity and checked geometry before replacement.
+     { std::scoped_lock lock(mutex_); if (!state_.ready) throw contracts::InvalidIntentError("Annotation reload requires a ready paired image"); }
+     auto loaded = document::load_annotation_document(document_.ui().scene, request.source);
+     if (!loaded) throw contracts::InvalidIntentError("Annotation document is invalid or does not match the current source image and geometry");
+     if (CancelRequested()) { InstallUi(true); return; }
+     const auto result = document_.Open(std::move(loaded->scene));
+     if (result.outcome != document::DocumentOutcome::Applied) { Reject(result.detail, true); return; }
+     static_cast<void>(CancelGesture());
+     { std::scoped_lock lock(mutex_); state_.legacy_source_attached = loaded->legacy_source_attached; state_.input_document_epoch = mmltk::common::types::advance_monotonic_identity(state_.input_document_epoch); }
+     InstallUi(true);
+     QueueRender();
+    } catch (const std::exception& error) { Reject(error.what(), true); }
+   }
    else {
     bool ready;
     {
@@ -377,6 +399,7 @@ private:
       std::scoped_lock lock(mutex_);
       gpu_continuation_ = false;
       state_.ready = true;
+      state_.legacy_source_attached = false;
       state_.input_document_epoch = mmltk::common::types::advance_monotonic_identity(state_.input_document_epoch);
      }
      InstallUi(true);
@@ -637,6 +660,7 @@ void AnnotationSystem::Input(WorkspaceMouse mouse) { impl_->Input(std::move(mous
 void AnnotationSystem::SetInputPeer(std::uint64_t epoch) { impl_->SetInputPeer(epoch); }
 AnnotationSnapshot AnnotationSystem::Edit(AnnotationEditRequest request) { return impl_->Edit(std::move(request)); }
 AnnotationSnapshot AnnotationSystem::Save(AnnotationSave request) { return impl_->Save(std::move(request)); }
+AnnotationSnapshot AnnotationSystem::Load(AnnotationLoad request) { return impl_->Load(std::move(request)); }
 AnnotationSnapshot AnnotationSystem::Stop() noexcept { return impl_->Stop(); }
 void AnnotationSystem::PeerClosed() noexcept { impl_->PeerClosed(); }
 void AnnotationSystem::Shutdown() noexcept { impl_->Shutdown(); }

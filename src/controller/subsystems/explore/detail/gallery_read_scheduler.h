@@ -44,13 +44,13 @@ private:
   // A lane payload's card offset begins a storage layout distinct from its batch descriptor.
   std::size_t card = 0U;
   StorageSpan annotations{};
-  StorageSpan rle{};
+  StorageSpan rle{}, joints{};
   std::size_t tile = 0U;
   std::size_t donor_pixels = 0U;
   std::size_t donor_instance = 0U;
   // Donor payload offsets are lane-local storage facts, not assembled descriptor capacities.
   std::size_t donor_box = 0U;
-  StorageSpan donor_rle{};
+  StorageSpan donor_rle{}, donor_joints{};
   std::size_t donor_mask = 0U;
   std::size_t bytes = 0U;
   std::size_t pixel_bytes = 0U;
@@ -94,6 +94,7 @@ private:
   bool transfer_ready = false;
   bool read_valid = false;
   std::uint32_t donor_index = 0U;
+  std::size_t donor_ordinal = 0U;
   std::optional<mmltk::backend::data::PackedInstance> donor_instance;
   std::exception_ptr failure{};
   std::shared_ptr<const TileMeaning> pending_meaning;
@@ -107,7 +108,7 @@ private:
  void CompleteLane(const std::size_t lane_index, std::exception_ptr failure) noexcept;
  mmltk::backend::data::CompiledImageStream::CompletionObserver LaneCompletion() noexcept;
  void SubmitRead(Lane& lane, const bool observed);
- PayloadLayout LayoutFor(const GalleryProductState& product, const std::uint32_t compiled_index, const bool has_donor, const std::size_t donor_rle_count) const;
+ PayloadLayout LayoutFor(const GalleryProductState& product, const std::uint32_t compiled_index, const bool has_donor, const std::size_t donor_rle_count, const std::size_t donor_joint_count) const;
  void PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot, const std::uint64_t generation);
  void Prioritize(GalleryProductState& product);
  bool ReserveInput(const GalleryProductState& product, Lane& lane);

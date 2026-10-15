@@ -95,6 +95,13 @@ struct BrowserAudit final {
  bool workflow_gpu_invalid = false;
  void consume_native_gpu(const nlohmann::json& record);
  [[nodiscard]] bool workflow_gpus_complete() const;
+ std::map<std::string, nlohmann::json> keypoint_pixels;
+ bool keypoint_pixel_invalid = false;
+ std::map<std::pair<std::string, std::string>, nlohmann::json> keypoint_catalog;
+ nlohmann::json keypoint_training_artifact;
+ bool keypoint_catalog_invalid = false;
+ [[nodiscard]] bool keypoint_catalog_complete() const;
+ [[nodiscard]] bool keypoint_pixels_complete() const;
  bool validate_to_explore_pixels = false;
  std::vector<nlohmann::json> validation_saved_samples;
  std::vector<nlohmann::json> validation_progressive, validation_restored_tiles;

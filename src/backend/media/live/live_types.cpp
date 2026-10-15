@@ -13,6 +13,7 @@ LiveCompositeOutputLease::LiveCompositeOutputLease(
     : owner_(owner), complete_(complete), abandon_(abandon), view_(view), frame_revision_(frame_revision) {}
 LiveCompositeOutputLease LiveCompositeOutputLease::Create(
  void* owner, const CompleteCallback complete, const AbandonCallback abandon, LiveOutputFrame view, const PhysicalFrameRevision frame_revision) noexcept {
+ if (!view.valid() || !frame_revision.valid() || view.ready_event != frame_revision.ready_event) return {};
  if (view.analysis && (!view.analysis->ready() || view.analysis->frame() != frame_revision.frame)) return {};
  return LiveCompositeOutputLease{owner, complete, abandon, view, frame_revision};
 }

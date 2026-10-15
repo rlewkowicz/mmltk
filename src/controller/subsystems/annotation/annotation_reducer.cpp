@@ -207,9 +207,11 @@ struct ObjectAfterView final {
   const auto* object = objects.at(*facts.selected_object);
   if (!object || *facts.selected_skeleton_joint >= object->skeleton_nodes.size()) return false;
  }
+ domain::AnnotationDocumentBudget budget;
+ for (const auto& schema : scene.keypoint_schemas) if (!budget.AddSchema(schema)) return false;
  for (std::size_t index = 0U; index != objects.size(); ++index) {
   const auto* object = objects.at(index);
-  if (!object || !object_valid_for(*object, category_count, scene)) return false;
+  if (!object || !object_valid_for(*object, category_count, scene) || !budget.AddObject(*object, scene.keypoint_schemas)) return false;
  }
  return true;
 }
@@ -348,7 +350,7 @@ void mark_edited(DocumentState& state) {
 [[nodiscard]] domain::AnnotationObjectIdentity make_identity(DocumentState& state, const domain::AnnotationObject& object, const std::uint64_t created_identity = 0U) {
  domain::AnnotationObjectIdentity identity{.object = created_identity ? created_identity : allocate_identity(state)};
  const auto count = identity_element_count(object);
- if (count != 0U) identity.elements.reserve(domain::kAnnotationGeometryCapacity);
+ if (count != 0U) identity.elements.reserve(count);
  for (std::size_t index = 0; index < count; ++index) identity.elements.push_back(allocate_identity(state));
  return identity;
 }
@@ -364,6 +366,17 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
   auto& elements = object->after_identity.elements;
   if (object->before.shape != object->after.shape) elements.clear();
   const auto count = identity_element_count(object->after);
+  if (object->before.category != object->after.category && object->before.shape == domain::AnnotationShape::Skeleton && object->after.shape == domain::AnnotationShape::Skeleton &&
+      !std::ranges::equal(object->before.skeleton_nodes, object->after.skeleton_nodes, {}, &domain::AnnotationSkeletonNode::key, &domain::AnnotationSkeletonNode::key)) {
+   std::vector<std::uint64_t> mapped;
+   mapped.reserve(count);
+   for (const auto& node : object->after.skeleton_nodes) {
+    const auto previous = std::ranges::find(object->before.skeleton_nodes, node.key, &domain::AnnotationSkeletonNode::key);
+    mapped.push_back(previous == object->before.skeleton_nodes.end() ? allocate_identity(state) : object->before_identity.elements.at(static_cast<std::size_t>(previous - object->before.skeleton_nodes.begin())));
+   }
+   elements = std::move(mapped);
+   return;
+  }
   if (elements.size() > count) {
    // The sole element-removal operation removes the selected spline
    // knot. Keep the surviving knots' identities even at reused indices.
@@ -752,9 +765,23 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
      break;
     case AnnotationPointerAction::SkeletonJoint:
      if (object.shape != domain::AnnotationShape::Skeleton) return refuse_pointer();
-     if (object.skeleton_nodes.size() >= domain::kAnnotationGeometryCapacity) return capacity(state);
+     if (object.category < scene.keypoint_schemas.size()) {
+      const auto& schema = scene.keypoint_schemas[object.category];
+      if (schema.names.empty()) return refuse_pointer();
+      if (object.skeleton_nodes.empty()) {
+       for (const auto& name : schema.names) object.skeleton_nodes.push_back({.key = name, .visibility = mmltk::backend::data::catalog::KeypointVisibility::Unannotated});
+       for (const auto& edge : schema.skeleton) object.skeleton_edges.push_back({edge.first, edge.second});
+      }
+      const auto joint = after.selected_skeleton_joint.value_or(0U);
+      if (joint >= object.skeleton_nodes.size()) return refuse_pointer();
+      object.skeleton_nodes[joint].point = request.point;
+      object.skeleton_nodes[joint].visibility = mmltk::backend::data::catalog::KeypointVisibility::Visible;
+      after.selected_skeleton_joint = static_cast<std::uint16_t>((joint + 1U) % object.skeleton_nodes.size());
+      break;
+     }
+     if (object.skeleton_nodes.size() >= domain::kAnnotationJointCapacity) return capacity(state);
      if (!object.skeleton_nodes.empty()) object.skeleton_edges.push_back({static_cast<std::uint16_t>(object.skeleton_nodes.size() - 1), static_cast<std::uint16_t>(object.skeleton_nodes.size())});
-     object.skeleton_nodes.push_back({.key = domain::AnnotationText::From("joint"), .point = request.point});
+     object.skeleton_nodes.push_back({.key = "joint " + std::to_string(object.skeleton_nodes.size()), .point = request.point});
      after.selected_skeleton_joint = static_cast<std::uint16_t>(object.skeleton_nodes.size() - 1U);
      break;
     case AnnotationPointerAction::HandleDrag:
@@ -807,7 +834,20 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
 [[nodiscard]] DocumentOutcome reduce_object_facts(DocumentState& state, const std::uint16_t category, const bool enabled) {
  if (!current(state) || !state.ui.editor.selected_object || category >= state.ui.scene.categories.size()) return refused(state);
  const auto index = *state.ui.editor.selected_object;
- return change_object(state, index, state.ui.editor, state.ui.editor, [category, enabled](domain::AnnotationObject& object, AnnotationEditorFacts&) {
+ return change_object(state, index, state.ui.editor, state.ui.editor, [&state, category, enabled](domain::AnnotationObject& object, AnnotationEditorFacts& editor) {
+  if (object.category != category && object.shape == domain::AnnotationShape::Skeleton && category < state.ui.scene.keypoint_schemas.size()) {
+   const auto& schema = state.ui.scene.keypoint_schemas[category];
+   std::vector<domain::AnnotationSkeletonNode> nodes;
+   nodes.reserve(schema.names.size());
+   for (const auto& name : schema.names) {
+    const auto old = std::ranges::find(object.skeleton_nodes, name, &domain::AnnotationSkeletonNode::key);
+    nodes.push_back(old == object.skeleton_nodes.end() ? domain::AnnotationSkeletonNode{.key = name, .visibility = mmltk::backend::data::catalog::KeypointVisibility::Unannotated} : *old);
+   }
+   object.skeleton_nodes = std::move(nodes);
+   object.skeleton_edges.clear();
+   for (const auto& edge : schema.skeleton) object.skeleton_edges.push_back({edge.first, edge.second});
+   editor.selected_skeleton_joint.reset();
+  }
   object.category = category;
   object.enabled = enabled;  // CLEANUP-IGNORE: CPD crosses distinct object-facts and
                              // spline-selection reducer transitions.
@@ -958,15 +998,16 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
    return change_object(state, index, before, after, [&before](domain::AnnotationObject& changed, AnnotationEditorFacts&) {
     auto& joint = changed.skeleton_nodes[*before.selected_skeleton_joint];
     joint.point = {};
-    joint.visible = false;
+    joint.visibility = mmltk::backend::data::catalog::KeypointVisibility::Unannotated;
    });
   }
   case domain::AnnotationSidebarCommand::SkeletonHide:
-  case domain::AnnotationSidebarCommand::SkeletonShow: {
+  case domain::AnnotationSidebarCommand::SkeletonShow:
+  case domain::AnnotationSidebarCommand::SkeletonOccluded: {
    if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Skeleton) || !before.selected_skeleton_joint) return refused(state);
    const auto index = *before.selected_object;
    return change_object(state, index, before, after, [&before, command](domain::AnnotationObject& changed, AnnotationEditorFacts&) {
-    changed.skeleton_nodes[*before.selected_skeleton_joint].visible = command == domain::AnnotationSidebarCommand::SkeletonShow;
+    changed.skeleton_nodes[*before.selected_skeleton_joint].visibility = command == domain::AnnotationSidebarCommand::SkeletonShow ? mmltk::backend::data::catalog::KeypointVisibility::Visible : command == domain::AnnotationSidebarCommand::SkeletonOccluded ? mmltk::backend::data::catalog::KeypointVisibility::Occluded : mmltk::backend::data::catalog::KeypointVisibility::Unannotated;
    });
   }
   case domain::AnnotationSidebarCommand::Undo:
@@ -1061,6 +1102,21 @@ public:
     return reduce_handle(state_, value.handle, value.mode, value.point);
    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSkeletonEdit>)
     return reduce_skeleton(state_, value.joint);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSkeletonConnectionEdit>) {
+    const auto& before = state_.ui.editor;
+    const auto& scene = state_.ui.scene;
+    if (!current(state_) || !selected_shape(scene, before.selected_object, domain::AnnotationShape::Skeleton)) return refused(state_);
+    const auto& object = scene.objects[*before.selected_object];
+    if (value.first == value.second || value.first >= object.skeleton_nodes.size() || value.second >= object.skeleton_nodes.size()) return refused(state_);
+    const auto matches = [&](const domain::AnnotationEdge& edge) { return (edge.source == value.first && edge.target == value.second) || (edge.source == value.second && edge.target == value.first); };
+    const auto found = std::ranges::find_if(object.skeleton_edges, matches);
+    if ((found != object.skeleton_edges.end()) == value.connected) return DocumentOutcome::Applied;
+    if (value.connected && object.skeleton_edges.size() == domain::kAnnotationEdgeCapacity) return capacity(state_);
+    return change_object(state_, *before.selected_object, before, before, [&](domain::AnnotationObject& changed, AnnotationEditorFacts&) {
+     if (value.connected) changed.skeleton_edges.push_back({value.first, value.second});
+     else std::erase_if(changed.skeleton_edges, matches);
+    });
+   }
    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskCleanupEdit>)
     return reduce_mask_cleanup(state_, value.operation, value.radius);
    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskColorsEdit>)
@@ -1128,7 +1184,7 @@ public:
     if (knot.out.enabled && near(knot.out.point)) return handle(index, Role::SplineOutHandle);
    }
    for (std::size_t index = 0U; index != object.skeleton_nodes.size(); ++index)
-    if (object.skeleton_nodes[index].visible && near(object.skeleton_nodes[index].point)) return handle(index, Role::SkeletonNode);
+    if (object.skeleton_nodes[index].visible() && near(object.skeleton_nodes[index].point)) return handle(index, Role::SkeletonNode);
   }
   for (std::size_t index = scene.objects.size(); index-- != 0U;) {
    const auto& object = scene.objects[index];
@@ -1147,7 +1203,7 @@ public:
     }
     case Shape::Point: hit = near(object.point); break;
     case Shape::Spline: hit = std::ranges::any_of(object.spline_knots, [&](const auto& knot) { return near(knot.point); }); break;
-    case Shape::Skeleton: hit = std::ranges::any_of(object.skeleton_nodes, [&](const auto& node) { return node.visible && near(node.point); }); break;
+    case Shape::Skeleton: hit = std::ranges::any_of(object.skeleton_nodes, [&](const auto& node) { return node.visible() && near(node.point); }); break;
    }
    if (hit) {
     domain::AnnotationPointerTarget target{.object = static_cast<std::uint16_t>(index)};

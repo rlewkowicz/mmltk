@@ -5,6 +5,7 @@ struct ValidationOverlays final {
  bool prediction_boxes = true, prediction_masks = true;
  bool ground_truth_boxes = true, ground_truth_masks = true;
  bool prediction_layer = true, ground_truth_layer = true;
+ bool prediction_keypoints = true, ground_truth_keypoints = true, uncertainty = false;
  bool operator==(const ValidationOverlays&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ValidationOverlays)

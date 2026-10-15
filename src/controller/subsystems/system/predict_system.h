@@ -21,6 +21,7 @@
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_source_projection.h"
+#include "src/controller/presentation/visual_document.h"
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/system/compute_runtime.h"
@@ -32,14 +33,8 @@
 #include "src/frameworks/gpu/image/image_workspace.h"
 #include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller {
-struct PredictLabel final {
- contracts::AnnotationBox box{};
- int class_reference = 0;
- mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
- float confidence = 0.0F;
- contracts::AnnotationColor color{};
- MMLTK_MAX_BYTES(256U) std::string name;
-};
+// Preserve the complete application's existing 32 MiB bootstrap envelope.
+inline constexpr std::size_t kPredictSnapshotByteBudget = 3U * 1024U * 1024U;
 namespace detail {
 class PredictionPreviewFrame;
 }
@@ -89,8 +84,10 @@ struct PredictPauseIntent final {
 struct PredictImageMetadata final {
  std::uint64_t content_identity = 0U;
  VisualFrame frame{};
- MMLTK_MAX_ITEMS(contracts::kAnnotationObjectCapacity) std::vector<PredictLabel> labels {};
+ VisualDocumentFacts document{};
+ MMLTK_MAX_ITEMS(contracts::kAnnotationObjectCapacity) std::vector<VisualObjectLabel> labels {};
  std::int64_t image_id = 0;
+ contracts::PredictionRunPreview preview{};
 };
 struct PredictionSourceQuery final {
  MMLTK_MAX_PATH_BYTES std::string path;
@@ -113,8 +110,10 @@ struct PredictSnapshot final {
  bool paused = false;
  bool video = false;
  VisualFrame frame{};
- MMLTK_MAX_ITEMS(contracts::kAnnotationObjectCapacity) std::vector<PredictLabel> labels {};
+ VisualDocumentFacts document{};
+ MMLTK_MAX_ITEMS(contracts::kAnnotationObjectCapacity) std::vector<VisualObjectLabel> labels {};
  std::int64_t image_id = 0;
+ contracts::PredictionRunPreview preview{};
  // CLEANUP-IGNORE: PredictSnapshot is a distinct reflected boundary type.
 };
 // Scalar observation excludes immutable image labels and metadata.
@@ -155,12 +154,13 @@ public:
  // CLEANUP-IGNORE: Predict shutdown is ordinary facade forwarding for this sealed system.
  void Shutdown() noexcept;
  // CLEANUP-IGNORE: Predict owns its reflected snapshot and public read surface independently of Live and Annotation.
- [[= contracts::reflection::Snapshot{2U * 1024U * 1024U}]] [[nodiscard]] PredictSnapshot snapshot() const;
+ [[= contracts::reflection::Snapshot{kPredictSnapshotByteBudget}]] [[nodiscard]] PredictSnapshot snapshot() const;
  // CLEANUP-IGNORE: Predict exposes its sealed image and workspace API through the existing private shared runtime.
  [[nodiscard]] std::optional<PredictImageMetadata> ImageSnapshot(const VisualFrame&) const;
  [[nodiscard]] VisualSourceObservation ObserveSource() const;
  // CLEANUP-IGNORE: Predict retains a sealed raw/display read API backed by the shared private VisualRuntimeOwner.
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+ [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
  [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
  void RequestWorkspace(VisualWorkspaceRequest);
@@ -170,7 +170,6 @@ private:
  std::unique_ptr<Impl> impl_;
 };
 MMLTK_REFLECT_FIELDS(PredictPauseIntent)
-MMLTK_REFLECT_FIELDS(PredictLabel)
 MMLTK_REFLECT_FIELDS(PredictImageMetadata)
 MMLTK_REFLECT_FIELDS(PredictSnapshot)
 MMLTK_REFLECT_FIELDS(PredictProgressState)

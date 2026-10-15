@@ -190,21 +190,26 @@ void GalleryReadScheduler::AcceptanceDiagnostic(const VisualDiagnosticOperation 
  });
 }
 void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
- const auto labels = lane.store->image_labels(lane.compiled_index);
- std::size_t rle_cursor = 0U;
+ const auto source = lane.store->annotations(lane.compiled_index);
+ const auto labels = source.labels;
+ std::size_t rle_cursor = 0U, joint_cursor = 0U;
  for (std::size_t label_index = 0U; label_index != labels.size(); ++label_index) {
   const auto& label = labels[label_index];
-  const auto runs = lane.store->instance_rle(lane.compiled_index, label);
+  const auto runs = source.instance_rle(label);
+  const auto joints = source.instance_joints(label_index);
+  store_payload(lane.pinned.data(), lane.layout.joints.offset + joint_cursor * sizeof(data::PackedKeypoint), joints);
   store_payload(lane.pinned.data(), lane.layout.rle.offset + rle_cursor * sizeof(data::RLEPair), runs);
   const explore::ExploreRenderAnnotationDescriptor annotation{
    .mask_present = label.has_mask(),
    .rle_offset = static_cast<std::uint32_t>(rle_cursor),
    .rle_count = static_cast<std::uint32_t>(runs.size()),
+   .joint_offset = static_cast<std::uint32_t>(joint_cursor), .joint_count = static_cast<std::uint32_t>(joints.size()),
    .card_index = lane.destination_slot,
    .class_id = label.class_id,
   };
   store_payload(lane.pinned.data(), lane.layout.annotations.offset + label_index * sizeof(explore::ExploreRenderAnnotationDescriptor), annotation);
   rle_cursor += runs.size();
+  joint_cursor += joints.size();
  }
  const auto& entry = lane.store->image_entry(lane.compiled_index);
  const bool source_known = entry.original_width != 0U && entry.original_height != 0U;
@@ -238,6 +243,7 @@ void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
   store_payload(lane.pinned.data(), lane.layout.donor_box, std::span{donor_box});
   const auto donor_runs = lane.store->instance_rle(lane.donor_index, *lane.donor_instance);
   store_payload(lane.pinned.data(), lane.layout.donor_rle.offset, donor_runs);
+  store_payload(lane.pinned.data(), lane.layout.donor_joints.offset, lane.store->annotations(lane.donor_index).instance_joints(lane.donor_ordinal));
   auto* const donor_mask = reinterpret_cast<std::uint64_t*>(static_cast<std::byte*>(lane.pinned.data()) + lane.layout.donor_mask);
   pack_rle_mask(donor_runs, std::span{donor_mask, lane.layout.donor_mask_words}, static_cast<std::size_t>(lane.store->header().image_width) * lane.store->header().image_height);
  }
@@ -300,7 +306,7 @@ void GalleryReadScheduler::SubmitRead(Lane& lane, const bool observed) {
   {.context = this, .complete = [](void* context, std::size_t index, std::exception_ptr error) noexcept { static_cast<GalleryReadScheduler*>(context)->FinishTransfer(index, error); }});
 }
 GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(
- const GalleryProductState& product, const std::uint32_t compiled_index, const bool has_donor, const std::size_t donor_rle_count) const {
+ const GalleryProductState& product, const std::uint32_t compiled_index, const bool has_donor, const std::size_t donor_rle_count, const std::size_t donor_joint_count) const {
  const auto& header = product.store->header();
  PayloadLayout result;
  constexpr std::size_t channels_bytes = 3U * sizeof(float);
@@ -311,6 +317,8 @@ GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(
  result.pixel_bytes = pixels * channels_bytes;
  const auto labels = product.store->image_labels(compiled_index);
  result.annotations.count = labels.size();
+ result.joints.count = product.store->annotations(compiled_index).joints.size();
+ if (result.joints.count > explore::kExploreRenderJointCapacity || donor_joint_count > explore::kExploreRenderJointCapacity - result.joints.count) throw contracts::BusyError("Explore joints exceed renderer capacity");
  if (result.annotations.count > explore::kExploreRenderAnnotationCapacity) throw contracts::BusyError("Explore thumbnail annotations exceed renderer capacity");
  for (const auto& label : labels) {
   const auto run_count = product.store->instance_rle(compiled_index, label).size();
@@ -320,14 +328,16 @@ GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(
  result.card = 0U;
  result.annotations.offset = align_up(result.card + sizeof(explore::ExploreRenderCardDescriptor), alignof(explore::ExploreRenderAnnotationDescriptor));
  result.rle.offset = align_up(result.annotations.offset + result.annotations.count * sizeof(explore::ExploreRenderAnnotationDescriptor), alignof(data::RLEPair));
- result.tile = align_up(result.rle.offset + result.rle.count * sizeof(data::RLEPair), alignof(explore::ExploreRenderTileDescriptor));
+ result.joints.offset = align_up(result.rle.offset + result.rle.count * sizeof(data::RLEPair), alignof(data::PackedKeypoint));
+ result.tile = align_up(result.joints.offset + result.joints.count * sizeof(data::PackedKeypoint), alignof(explore::ExploreRenderTileDescriptor));
  result.donor_rle.count = donor_rle_count;
  result.donor_mask_words = has_donor ? (pixels + 63U) / 64U : 0U;
  result.donor_pixels = align_up(result.tile + sizeof(explore::ExploreRenderTileDescriptor), alignof(float));
  result.donor_instance = align_up(result.donor_pixels, alignof(data::PackedInstance));
  result.donor_box = align_up(result.donor_instance + (has_donor ? sizeof(data::PackedInstance) : 0U), alignof(float));
  result.donor_rle.offset = align_up(result.donor_box + (has_donor ? 4U * sizeof(float) : 0U), alignof(data::RLEPair));
- result.donor_mask = align_up(result.donor_rle.offset + donor_rle_count * sizeof(data::RLEPair), alignof(std::uint64_t));
+ result.donor_joints = {align_up(result.donor_rle.offset + donor_rle_count * sizeof(data::RLEPair), alignof(data::PackedKeypoint)), donor_joint_count};
+ result.donor_mask = align_up(result.donor_joints.offset + donor_joint_count * sizeof(data::PackedKeypoint), alignof(std::uint64_t));
  result.bytes = result.donor_mask + result.donor_mask_words * sizeof(std::uint64_t);
  return result;
 }
@@ -360,6 +370,7 @@ void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product
      if (instance.is_crowd()) continue;
      if (remaining == 0U) {
       lane.donor_instance = instance;
+      lane.donor_ordinal = static_cast<std::size_t>(&instance - donor_instances.data());
       break;
      }
      --remaining;
@@ -367,7 +378,8 @@ void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product
    }
   }
  }
- lane.layout = LayoutFor(product, compiled_index, lane.donor_instance.has_value(), lane.donor_instance ? lane.donor_instance->mask_rle_pairs : 0U);
+ lane.layout = LayoutFor(product, compiled_index, lane.donor_instance.has_value(), lane.donor_instance ? lane.donor_instance->mask_rle_pairs : 0U,
+  lane.donor_instance ? lane.store->annotations(lane.donor_index).instance_joints(lane.donor_ordinal).size() : 0U);
  image_stream_.prepare_metadata(lane.index, lane.layout.bytes);
  image_stream_.prepare_images(lane.index, 2U * lane.layout.pixel_bytes);
  image_stream_.prepare_reads(lane.index, 2U);

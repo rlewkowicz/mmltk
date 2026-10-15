@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/data/compiler/dataset_compile_phase.h"
@@ -805,6 +806,15 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     ++phase_progress_revision;
    }
   }
+ } else if (event == "integration.keypoint.catalog") {
+  const auto key = std::pair{record.value("control", ""), record.value("detail", "")};
+  if (keypoint_catalog.size() >= 4 || !keypoint_catalog.emplace(key, record).second) keypoint_catalog_invalid = true;
+ } else if (event == "integration.keypoint.training-artifact") {
+  if (!keypoint_training_artifact.is_null()) keypoint_catalog_invalid = true;
+  else keypoint_training_artifact = record;
+ } else if (event == "integration.workflow.pixels" && (record.contains("native_joints") || record.value("detail", "").starts_with("keypoint-"))) {
+  const auto stage = record.value("detail", "");
+  if (!keypoint_pixels.emplace(stage, record).second) keypoint_pixel_invalid = true;
  } else if (event == "integration.workflow.pixels" && record.value("detail", "") == "validate-to-explore") {
   const auto sampled = scalar(record, "c"), colored = scalar(record, "d");
   const auto width = scalar(record, "sample_width"), height = scalar(record, "sample_height");
@@ -2428,3 +2438,50 @@ bool BrowserAudit::validation_layout_complete() const {
  return true;
 }
 }  // namespace mmltk::acceptance::wayland
+
+namespace mmltk::acceptance::wayland {
+bool BrowserAudit::keypoint_pixels_complete() const {
+ if (keypoint_pixel_invalid || keypoint_pixels.size() != 12) return false;
+ for (const auto stage : {"keypoint-explore", "keypoint-validate", "keypoint-predict", "keypoint-predict-upscale", "live-capture-only", "live-production-analysis", "live-zero-detections", "live-new-model-restart", "live-failure-retained", "live-upscale", "live-import-clean", "catalog-pe-image"}) {
+  const auto found = keypoint_pixels.find(stage);
+  if (found == keypoint_pixels.end()) return false;
+  const auto& record = found->second;
+  const std::string_view name(stage);
+  const bool empty = name == "live-capture-only" || name == "live-zero-detections" || name == "live-failure-retained";
+  const bool clean = name == "live-import-clean", catalog = name == "catalog-pe-image";
+  const auto control = name == "keypoint-explore" ? "explore.detail.workspace" : name == "keypoint-validate" ? "validate.samples.atlas" : clean ? "annotation.workspace.surface" : "workflow.visual.workspace";
+  const auto sampled = scalar(record, "c"), matched = scalar(record, "d"), joints = scalar(record, "native_joints");
+  if (record.value("control", "") != control || scalar(record, "a") == 0 || scalar(record, "b") == 0 || !record.value("matched", false) || record.value("analyzed_empty", !empty) != empty || sampled == 0 || matched > sampled
+      || !record.value("current_receipt", false) || scalar(record, "drawn_source") != scalar(record, "a") || scalar(record, "drawn_presentation") != scalar(record, "b")) return false;
+  if (clean || catalog) {
+   if (joints != 0 || scalar(record, "source_samples") != sampled || matched != sampled || record.value("clean_import", false) != clean || record.value("catalog_image", false) != catalog || (catalog && scalar(record,"variation") <= 12)) return false;
+  } else if (empty ? joints != 0 || matched * 10 < sampled * 7 : joints == 0 || sampled != joints || matched != sampled) return false;
+  if (name == "keypoint-validate" && scalar(record, "oks_pixels") < 12) return false;
+ }
+ const auto& failed = keypoint_pixels.at("live-failure-retained");
+ const auto& retained = keypoint_pixels.at("live-zero-detections");
+ return scalar(failed,"a") == scalar(retained,"a");
+}
+bool BrowserAudit::keypoint_catalog_complete() const {
+ namespace rfdetr = mmltk::backend::models::rfdetr;
+ if (keypoint_catalog_invalid || keypoint_catalog.size() != 4 || keypoint_training_artifact.is_null()) return false;
+ std::uint64_t pe_model = 0, pose_model = 0, pose_operation = 0;
+ for (const auto& [key, record] : keypoint_catalog) {
+  const auto row = scalar(record,"d");
+  if (row >= rfdetr::kPresetCatalog.size()) return false;
+  const auto& preset = rfdetr::kPresetCatalog[row];
+  const bool pose = preset.task == rfdetr::ModelTask::Keypoints;
+  if (record.value("control", "") != key.first || record.value("detail", "") != key.second || (!pose && preset.backbone.kind != rfdetr::BackboneKind::PeCoreTiny) || key.first != preset.preset_name || scalar(record,"a") == 0 || scalar(record,"c") != preset.resolution) return false;
+  if (key.second == "prepared") { if (scalar(record,"b") != 0) return false; continue; }
+  if (key.second != "completed" || scalar(record,"b") == 0) return false;
+  const auto prepared = keypoint_catalog.find({key.first,"prepared"});
+  if (prepared == keypoint_catalog.end() || scalar(prepared->second,"a") != scalar(record,"a") || scalar(prepared->second,"d") != row) return false;
+  const auto executed = workflow_gpu_runs.find({pose ? "train" : "predict", scalar(record,"b")});
+  if (executed == workflow_gpu_runs.end() || executed->second.empty() || std::ranges::any_of(executed->second,[](auto device) { return device < 0; })) return false;
+  if (pose) { pose_model = scalar(record,"a"); pose_operation = scalar(record,"b"); }
+  else pe_model = scalar(record,"a");
+ }
+ return !workflow_gpu_invalid && pe_model != 0 && pose_model > pe_model && scalar(keypoint_training_artifact,"a") == pose_model && scalar(keypoint_training_artifact,"b") == pose_operation
+     && scalar(keypoint_training_artifact,"c") > 0 && !keypoint_training_artifact.value("control", "").empty() && !keypoint_training_artifact.value("detail", "").empty();
+}
+}

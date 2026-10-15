@@ -14,7 +14,7 @@ inline contracts::AnnotationObject make_annotation_wire_object(const contracts::
   .nosup = {.center = color, .minus = color, .plus = color},
   .mask_points = std::vector<AnnotationPoint>(kAnnotationGeometryCapacity, point),
   .spline_knots = std::vector<AnnotationSplineKnot>(kAnnotationGeometryCapacity, {.point = point, .in = {.point = point, .enabled = true}, .out = {.point = point, .enabled = true}}),
-  .skeleton_nodes = std::vector<AnnotationSkeletonNode>(kAnnotationGeometryCapacity, {.key = AnnotationText::From(std::string(kAnnotationNameCapacity, 'k')), .point = point}),
+  .skeleton_nodes = std::vector<AnnotationSkeletonNode>(kAnnotationGeometryCapacity, {.key = std::string(kAnnotationNameCapacity, 'k'), .point = point}),
   .skeleton_edges = std::vector<AnnotationEdge>(kAnnotationGeometryCapacity, {.source = 6U, .target = 7U}),
  };
 }

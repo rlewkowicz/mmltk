@@ -19,6 +19,7 @@ struct PredictionOutputSettings final {
 };
 struct PredictionRunPreview final {
  bool labels = true, boxes = true, masks = true;
+ bool keypoints = true, uncertainty = false;
  MMLTK_MINIMUM(float, 0.0F) MMLTK_MAXIMUM(float, 1.0F) MMLTK_FINITE float confidence_threshold = 0.25F;
  bool operator==(const PredictionRunPreview&) const = default;
 };

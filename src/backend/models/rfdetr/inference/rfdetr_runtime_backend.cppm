@@ -8,6 +8,7 @@ module;
 #include <optional>
 #include <span>
 #include <stop_token>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include "src/backend/ml/runtime/analysis_provider.h"
@@ -17,8 +18,15 @@ module;
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
+#include "src/backend/models/rfdetr/core/artifact_publication.h"
 export module mmltk.backend.models.rfdetr.inference.runtime_backend;
 export namespace mmltk::backend::models::rfdetr {
+// Artifact IO admission failed before a runtime lane or model GPU storage exists.
+class RfdetrArtifactAdmissionFailure final : public std::runtime_error {
+public:
+ using std::runtime_error::runtime_error;
+};
+class RfdetrArtifactAdmissionCancelled final : public ArtifactPublicationCancelled {};
 struct RfdetrRuntimeBackendOptions final {
  ModelArtifactRequest artifacts;
  std::string backend = "auto";
@@ -80,7 +88,7 @@ public:
  [[nodiscard]] const mmltk::backend::ml::runtime::RuntimeModelInfo& model_info() const noexcept;
  // Mask capacity does not imply demand; availability belongs to each produced result.
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeSubmission Run(const mmltk::backend::ml::runtime::RuntimeTensorBuffer& input,
-  std::span<mmltk::backend::ml::runtime::AnalysisAnnotationStorage> annotations, std::span<RfdetrOutputSelection> selections = {}, bool include_masks = false);
+  std::span<mmltk::backend::ml::runtime::AnalysisAnnotationStorage> annotations, std::span<RfdetrOutputSelection> selections = {}, bool include_masks = false, float confidence_threshold = 0.0F);
  void ReleaseAfterCompletion(mmltk::backend::ml::runtime::RuntimeSubmission&& submission);
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
  [[nodiscard]] std::span<const RfdetrNamedOutputRole> output_roles() const noexcept;

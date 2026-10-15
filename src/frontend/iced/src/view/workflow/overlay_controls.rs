@@ -5,14 +5,16 @@ pub enum Message {
     Labels(bool),
     Masks(bool),
     Boxes(bool),
+    Keypoints(bool),
 }
 pub fn view(
     labels: bool,
     masks: bool,
     boxes: bool,
+    keypoints: bool,
     labels_enabled: bool,
     native_enabled: bool,
-    ids: [&'static str; 3],
+    ids: [&'static str; 4],
 ) -> Element<'static, Message> {
     row![
         container(
@@ -33,6 +35,7 @@ pub fn view(
                 .on_toggle_maybe(native_enabled.then_some(Message::Boxes))
         )
         .id(ids[2]),
+        container(checkbox(keypoints).label("Skeletons").on_toggle_maybe(native_enabled.then_some(Message::Keypoints))).id(ids[3]),
     ]
     .spacing(7)
     .align_y(iced::Center)

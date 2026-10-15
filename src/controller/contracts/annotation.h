@@ -13,6 +13,8 @@
 #include <optional>
 #include <ranges>
 #include <string_view>
+#include <string>
+#include <span>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -26,6 +28,11 @@ inline constexpr std::size_t kAnnotationObjectCapacity = 4096U;
 inline constexpr std::size_t kAnnotationCategoryCapacity = mmltk::backend::data::catalog::kClassCatalogCapacity;
 inline constexpr std::size_t kAnnotationMaskRunCapacity = 32768U;
 inline constexpr std::size_t kAnnotationGeometryCapacity = 8U;
+inline constexpr std::size_t kAnnotationJointCapacity = mmltk::backend::data::catalog::kKeypointsPerClassCapacity;
+inline constexpr std::size_t kAnnotationEdgeCapacity = mmltk::backend::data::catalog::kSkeletonEdgeCapacity;
+inline constexpr std::size_t kAnnotationDocumentJointCapacity = 32768U;
+inline constexpr std::size_t kAnnotationDocumentEdgeCapacity = 32768U;
+inline constexpr std::size_t kAnnotationDocumentJointNameBytes = 4U * 1024U * 1024U;
 inline constexpr std::size_t kAnnotationUiStateByteBudget = 8U * 1024U * 1024U;
 inline constexpr mmltk::frameworks::reflection::FixedText kAnnotationTextPolicy{
  .capacity = kAnnotationNameCapacity,
@@ -52,6 +59,7 @@ enum class AnnotationSidebarCommand : std::uint8_t {
  SkeletonSkip,
  SkeletonHide,
  SkeletonShow,
+ SkeletonOccluded,
  SkeletonReseed
 };
 enum class AnnotationSetupAction : std::uint8_t { StartLive, StopLive, ReloadFrame, PreviousFrame, NextFrame };
@@ -124,10 +132,11 @@ struct AnnotationSplineKnot final {
  auto operator<=>(const AnnotationSplineKnot&) const = default;
 };
 struct AnnotationSkeletonNode final {
- AnnotationText key{};
+ MMLTK_MAX_BYTES(mmltk::backend::data::catalog::kKeypointNameCapacity) std::string key;
  AnnotationPoint point{};
- bool visible = true;
- [[nodiscard]] bool valid() const noexcept { return key.valid() && point.finite(); }
+ mmltk::backend::data::catalog::KeypointVisibility visibility = mmltk::backend::data::catalog::KeypointVisibility::Visible;
+ [[nodiscard]] bool visible() const noexcept { return visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; }
+ [[nodiscard]] bool valid() const noexcept { return !key.empty() && key.size() <= mmltk::backend::data::catalog::kKeypointNameCapacity && key.find('\0') == std::string::npos && point.finite() && mmltk::frameworks::reflection::enum_contains(visibility); }
  auto operator<=>(const AnnotationSkeletonNode&) const = default;
 };
 struct AnnotationEdge final {
@@ -163,14 +172,14 @@ struct AnnotationObject final {
  AnnotationColorRange nosup{};
  MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<AnnotationPoint> mask_points {};
  MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<AnnotationSplineKnot> spline_knots {};
- MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<AnnotationSkeletonNode> skeleton_nodes {};
- MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<AnnotationEdge> skeleton_edges {};
+ MMLTK_MAX_ITEMS(kAnnotationJointCapacity) std::vector<AnnotationSkeletonNode> skeleton_nodes {};
+ MMLTK_MAX_ITEMS(kAnnotationEdgeCapacity) std::vector<AnnotationEdge> skeleton_edges {};
  std::uint16_t category = 0U;
  bool spline_closed = false;
  bool enabled = true;
  [[nodiscard]] bool valid() const noexcept {
-  if (mask_points.size() > kAnnotationGeometryCapacity || spline_knots.size() > kAnnotationGeometryCapacity || skeleton_nodes.size() > kAnnotationGeometryCapacity ||
-      skeleton_edges.size() > kAnnotationGeometryCapacity)
+  if (mask_points.size() > kAnnotationGeometryCapacity || spline_knots.size() > kAnnotationGeometryCapacity || skeleton_nodes.size() > kAnnotationJointCapacity ||
+      skeleton_edges.size() > kAnnotationEdgeCapacity)
    return false;
   if (!name.valid() || !mmltk::frameworks::reflection::enum_contains(shape) || !point.finite() || !mask.valid() || !sup.valid() || !nosup.valid()) { return false; }
   if (shape == AnnotationShape::Box && !box.valid()) return false;
@@ -182,6 +191,45 @@ struct AnnotationObject final {
  }
  auto operator<=>(const AnnotationObject&) const = default;
 };
+// Aggregate admission is shared by complete scenes and prospective journal views.
+class AnnotationDocumentBudget final {
+public:
+ [[nodiscard]] bool AddSchema(const mmltk::backend::data::catalog::ClassKeypointSchema& schema) noexcept {
+  if (!Bytes(1, 128) || !Bytes(schema.names.size(), 32) || !Bytes(schema.skeleton.size(), 32)) return false;
+  for (const auto& name : schema.names) if (!Add(name.size(), names_, kAnnotationDocumentJointNameBytes) || !Bytes(name.size(), 1)) return false;
+  return true;
+ }
+ [[nodiscard]] bool AddObject(const AnnotationObject& object, std::span<const mmltk::backend::data::catalog::ClassKeypointSchema> schemas) noexcept {
+  if (!Add(object.mask.runs.size(), runs_, kAnnotationMaskRunCapacity) || !Add(object.skeleton_nodes.size(), joints_, kAnnotationDocumentJointCapacity) ||
+      !Add(object.skeleton_edges.size(), edges_, kAnnotationDocumentEdgeCapacity)) return false;
+  if (!Bytes(1, 1024) || !Bytes(object.mask.runs.size(), 32) || !Bytes(object.mask_points.size(), 32) || !Bytes(object.spline_knots.size(), 256) ||
+      !Bytes(object.skeleton_nodes.size(), 96) || !Bytes(object.skeleton_edges.size(), 32)) return false;
+  for (const auto& node : object.skeleton_nodes) if (!Add(node.key.size(), names_, kAnnotationDocumentJointNameBytes) || !Bytes(node.key.size(), 1)) return false;
+  if (object.shape == AnnotationShape::Skeleton && object.category < schemas.size()) {
+   const auto& schema = schemas[object.category];
+   if (schema.names.size() != object.skeleton_nodes.size()) return false;
+   for (std::size_t index = 0; index < schema.names.size(); ++index) if (schema.names[index] != object.skeleton_nodes[index].key) return false;
+  }
+  return true;
+ }
+private:
+ // Conservative CBOR envelope costs include field names, maximal scalar encodings,
+ // and fixed object content. Admission computes these without serializing or
+ // allocating a second scene during pointer edits. The reserve covers the
+ // category palette, resource identity, editor facts and publication wrapper.
+ bool Bytes(std::size_t count, std::size_t cost) noexcept {
+  if (count > (kAnnotationUiStateByteBudget - bytes_) / cost) return false;
+  bytes_ += count * cost;
+  return true;
+ }
+ std::size_t bytes_ = 512U * 1024U;
+ static bool Add(std::size_t count, std::size_t& used, std::size_t capacity) noexcept {
+  if (count > capacity - used) return false;
+  used += count;
+  return true;
+ }
+ std::size_t joints_ = 0, edges_ = 0, names_ = 0, runs_ = 0;
+};
 // Runtime custody facts are deliberately separate from persisted object content.
 struct AnnotationTargetIdentity final {
  std::uint64_t object = 0U;
@@ -190,7 +238,7 @@ struct AnnotationTargetIdentity final {
 };
 struct AnnotationObjectIdentity final {
  std::uint64_t object = 0U;
- MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<std::uint64_t> elements {};
+ MMLTK_MAX_ITEMS(kAnnotationJointCapacity) std::vector<std::uint64_t> elements {};
  auto operator<=>(const AnnotationObjectIdentity&) const = default;
 };
 struct AnnotationPointerTarget final {
@@ -222,6 +270,7 @@ struct AnnotationSceneContent final {
  MMLTK_MAX_ITEMS(kAnnotationCategoryCapacity) std::vector<mmltk::backend::data::catalog::ClassName> categories {};
  MMLTK_MAX_ITEMS(kAnnotationCategoryCapacity) std::vector<AnnotationColor> palette {};
  MMLTK_MAX_ITEMS(kAnnotationObjectCapacity) std::vector<AnnotationObject> objects {};
+ MMLTK_MAX_ITEMS(kAnnotationCategoryCapacity) std::vector<mmltk::backend::data::catalog::ClassKeypointSchema> keypoint_schemas {};
  std::uint16_t frame_width = 0U;
  std::uint16_t frame_height = 0U;
  std::uint32_t frame_index = 0U;
@@ -230,11 +279,15 @@ struct AnnotationSceneContent final {
   if (!document.valid() || categories.size() > kAnnotationCategoryCapacity || objects.size() > kAnnotationObjectCapacity || palette.size() > kAnnotationCategoryCapacity ||
       (!palette.empty() && palette.size() != categories.size()) || !std::ranges::all_of(palette, [](const auto& color) { return color.valid(); }))
    return false;
-  std::size_t mask_runs = 0U;
-  for (const auto& object : objects) {
-   if (object.mask.runs.size() > kAnnotationMaskRunCapacity - mask_runs) return false;
-   mask_runs += object.mask.runs.size();
-  }
+  AnnotationDocumentBudget budget;
+  if (keypoint_schemas.size() > categories.size()) return false;
+  try {
+   for (const auto& schema : keypoint_schemas) {
+    mmltk::backend::data::catalog::validate_keypoint_schema(schema);
+    if (!budget.AddSchema(schema)) return false;
+   }
+  } catch (...) { return false; }
+  for (const auto& object : objects) if (!budget.AddObject(object, keypoint_schemas)) return false;
   if (frame_ready && (frame_width == 0U || frame_height == 0U)) return false;
   const auto point_in_frame = [this](const AnnotationPoint point) { return !frame_ready || (point.x >= 0.0F && point.y >= 0.0F && point.x <= frame_width && point.y <= frame_height); };
   if (!std::ranges::all_of(categories, [](const auto& item) { return item.valid(); }) || !std::ranges::all_of(objects, [this, &point_in_frame](const auto& item) {
@@ -272,7 +325,7 @@ struct AnnotationUiState final {
  std::uint64_t saved_revision = 0U;
  std::uint64_t scene_revision = 0U;
  [[nodiscard]] bool empty() const noexcept {
-  return tool_capabilities.empty() && !can_undo && !can_redo && !source_navigation_available && !scene.document.valid() && scene.categories.empty() && scene.palette.empty() && scene.objects.empty() &&
+  return tool_capabilities.empty() && !can_undo && !can_redo && !source_navigation_available && !scene.document.valid() && scene.categories.empty() && scene.palette.empty() && scene.keypoint_schemas.empty() && scene.objects.empty() &&
          editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle && save_generation == 0U && interaction_revision == 0U && document_revision == 0U && saved_revision == 0U &&
          scene_revision == 0U;
  }
@@ -311,4 +364,5 @@ MMLTK_REFLECT_FIELDS(AnnotationUiState)
 // reflected specialization behind this ordinary function gives every caller
 // one schema authority and one template instantiation site.
 [[nodiscard]] bool encode_annotation_persistence(const AnnotationUiState& state, std::vector<std::byte>& destination) noexcept;
+[[nodiscard]] std::optional<AnnotationUiState> decode_annotation_persistence(std::span<const std::byte> bytes) noexcept;
 }  // namespace mmltk::controller::contracts

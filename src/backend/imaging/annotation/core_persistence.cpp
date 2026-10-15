@@ -22,12 +22,14 @@ module;
 #include <variant>
 #include <vector>
 #include "src/common/io/json_file.h"
+#include "src/frameworks/serialization/serialization.h"
 #include "src/backend/data/catalog/class_catalog.h"
 module mmltk.backend.imaging.annotation.core;
 import mmltk.backend.imaging.annotation.renderer;
 namespace mmltk::backend::imaging::annotation {
 namespace {
 using json = nlohmann::json;
+namespace catalog = mmltk::backend::data::catalog;
 constexpr std::string_view kAnnotationCategoriesSchemaVersion = "3.0";
 constexpr std::string_view kAnnotationImageFormat = "png";
 constexpr std::string_view kAnnotationBoxFormat = "xyxy_absolute_pixels";
@@ -142,16 +144,19 @@ json serialize_annotation_shape_payload(const AnnotationFrame& frame, const Anno
    for (const AnnotationSkeletonNode& node : shape.nodes) {
     nodes.push_back(json{
      {"key", node.key},
-     {"visible", node.visible},
+     {"visibility", static_cast<std::uint8_t>(node.visibility)},
      {"xy", point_to_json(annotation_capture_point_to_frame_unclipped(frame, node.point))},
     });
    }
    json edges = json::array();
    for (const AnnotationSkeletonEdge& edge : shape.edges) { edges.push_back({edge.source_index, edge.target_index}); }
-   return json{
-    {"nodes", std::move(nodes)},
-    {"edges", std::move(edges)},
-   };
+   json payload{{"nodes", std::move(nodes)}, {"edges", std::move(edges)}};
+   if (!shape.schema.names.empty()) {
+    catalog::validate_keypoint_schema(shape.schema);
+    std::vector<std::byte> scratch(128U * 1024U);
+    payload["schema"] = mmltk::frameworks::serialization::reflected_json(shape.schema, scratch, {.max_bytes = scratch.size(), .max_items = scratch.size()});
+   }
+   return payload;
   } else {
    return json::object();
   }
@@ -278,6 +283,11 @@ AnnotationObject annotation_object_from_scene_record(const json& record, Annotat
    const auto edges = shape_payload.find("edges");
    if (edges == shape_payload.end() || !edges->is_array()) { fail("skeleton record is missing array `shape.edges`"); }
    AnnotationSkeletonShape skeleton;
+   if (nodes->size() > catalog::kKeypointsPerClassCapacity || edges->size() > catalog::kSkeletonEdgeCapacity) fail("skeleton exceeds catalog capacity");
+   if (const auto schema = shape_payload.find("schema"); schema != shape_payload.end()) {
+    skeleton.schema = mmltk::frameworks::serialization::decode_reflected_json<catalog::ClassKeypointSchema>(schema->dump(), {.max_bytes = 128U * 1024U, .max_items = 128U * 1024U});
+    catalog::validate_keypoint_schema(skeleton.schema);
+   }
    skeleton.nodes.reserve(nodes->size());
    for (const auto& node_entry : *nodes) {
     if (!node_entry.is_object()) { fail("skeleton record contains a non-object node"); }
@@ -288,10 +298,13 @@ AnnotationObject annotation_object_from_scene_record(const json& record, Annotat
     const AnnotationPoint node_point_value = node_point.value_or(AnnotationPoint{});
     const auto key = node_entry.find("key");
     if (key == node_entry.end() || !key->is_string()) { fail("skeleton node is missing string `key`"); }
+    if (node_entry.contains("visibility") && node_entry.contains("visible")) fail("skeleton node mixes current and old visibility");
+    if (node_entry.contains("visibility") && (!node_entry["visibility"].is_number_unsigned() || node_entry["visibility"].get<std::uint64_t>() > std::numeric_limits<std::uint8_t>::max() ||
+        !mmltk::frameworks::reflection::enum_contains(static_cast<catalog::KeypointVisibility>(node_entry["visibility"].get<std::uint8_t>())))) fail("skeleton visibility is invalid");
     skeleton.nodes.push_back(AnnotationSkeletonNode{
      key->get<std::string>(),
      annotation_frame_point_to_capture_unclipped(node_point_value, view_x, view_y),
-     node_entry.value("visible", true),
+     node_entry.contains("visibility") ? static_cast<catalog::KeypointVisibility>(node_entry.at("visibility").get<std::uint8_t>()) : node_entry.value("visible", true) ? catalog::KeypointVisibility::Visible : catalog::KeypointVisibility::Unannotated,
     });
    }
    skeleton.edges.reserve(edges->size());
@@ -301,6 +314,10 @@ AnnotationObject annotation_object_from_scene_record(const json& record, Annotat
      edge_entry.at(0).get<std::size_t>(),
      edge_entry.at(1).get<std::size_t>(),
     });
+   }
+   if (!skeleton.schema.names.empty()) {
+    if (skeleton.schema.names.size() != skeleton.nodes.size()) fail("skeleton schema count disagrees");
+    for (std::size_t joint = 0; joint < skeleton.nodes.size(); ++joint) if (skeleton.nodes[joint].key != skeleton.schema.names[joint]) fail("skeleton schema joint identity disagrees");
    }
    object.shape = std::move(skeleton);
    if (categories != nullptr && object.category_index < categories->items.size()) {

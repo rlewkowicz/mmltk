@@ -11,11 +11,12 @@
 #include "src/controller/contracts/model_selection.h"
 #include "src/controller/contracts/model_selection_types.h"
 #include "src/backend/models/rfdetr/contract/class_layout.h"
+#include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/controller/contracts/terminal_presentation.h"
 #include "src/controller/contracts/workflows.h"
 #include "src/frameworks/serialization/serialization.h"
 namespace mmltk::controller::contracts {
-inline constexpr std::size_t kModelUiStateByteBudget = 16384U;
+inline constexpr std::size_t kModelUiStateByteBudget = 128U * 1024U;
 inline constexpr std::size_t kModelDetailCapacity = 4096U;
 [[nodiscard]] inline std::string bounded_model_detail(const std::string_view value) { return std::string{value.substr(0U, kModelDetailCapacity)}; }
 enum class ModelProgressStage : std::uint8_t {
@@ -42,7 +43,13 @@ struct ModelSelection final {
  std::optional<std::int32_t> inspection_device{};
  MMLTK_MAX_BYTES(kModelArtifactCapacity) std::string artifact;
  mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout{};
- [[nodiscard]] bool valid() const noexcept { return key.valid() && !artifact.empty() && artifact.size() <= kModelArtifactCapacity; }
+ mmltk::backend::models::rfdetr::ModelTask task = mmltk::backend::models::rfdetr::ModelTask::Detection;
+ std::optional<mmltk::backend::models::rfdetr::NativeRfDetrConfig> training_config;
+ mmltk::backend::models::rfdetr::PresetTrainingCapabilities training_capabilities{};
+ [[nodiscard]] bool valid() const noexcept {
+  return key.valid() && !artifact.empty() && artifact.size() <= kModelArtifactCapacity && mmltk::frameworks::reflection::enum_contains(task) &&
+         (!training_config || training_config->task == task);
+ }
  bool operator==(const ModelSelection&) const = default;
 };
 enum class ModelSelectionOutcome : std::uint8_t { Idle, Accepted, Rejected, Cancelled, CancellationRequested };

@@ -45,6 +45,9 @@ struct AnnotationOpen final {
 struct AnnotationSave final {
  MMLTK_MAX_BYTES(4096U) std::string destination;
 };
+struct AnnotationLoad final {
+ MMLTK_MAX_PATH_BYTES std::string source;
+};
 struct AnnotationToolEdit final {
  contracts::AnnotationTool tool = contracts::AnnotationTool::Select;
 };
@@ -78,6 +81,11 @@ struct AnnotationSplineHandleEdit final {
  contracts::AnnotationSplineHandleMode mode = contracts::AnnotationSplineHandleMode::Corner;
  contracts::AnnotationPoint point{};
 };
+struct AnnotationSkeletonConnectionEdit final {
+ std::uint16_t first = 0U;
+ std::uint16_t second = 0U;
+ bool connected = true;
+};
 struct AnnotationSkeletonEdit final {
  std::uint16_t joint = 0U;
 };
@@ -96,7 +104,7 @@ struct AnnotationRedoEdit final {};
 struct AnnotationEdit final {
  using variant_type =
   std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit, AnnotationCategoryEdit, AnnotationSelectedObjectEdit, AnnotationSplineEdit,
-   AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationMaskCleanupEdit, AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
+   AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationSkeletonConnectionEdit, AnnotationMaskCleanupEdit, AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
  variant_type value{};
 };
 struct AnnotationEditRequest final {
@@ -133,6 +141,7 @@ struct AnnotationSnapshot final {
  bool cancellation_requested = false;
  // CLEANUP-IGNORE: Annotation readiness begins a domain-specific reflected snapshot tail, not shared state.
  bool ready = false;
+ bool legacy_source_attached = false;
  contracts::AnnotationUiState ui{};
  VisualFrame frame{};
  // CLEANUP-IGNORE: The Annotation snapshot terminator precedes domain-specific transient and critical events.
@@ -173,6 +182,7 @@ public:
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest);
  // CLEANUP-IGNORE: Annotation persistence and lifecycle methods do not duplicate Explore navigation ownership.
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Save(AnnotationSave);
+ [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Load(AnnotationLoad);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Stop() noexcept;
  void PeerClosed() noexcept;
  void Shutdown() noexcept;
@@ -197,6 +207,7 @@ MMLTK_REFLECT_FIELDS(AnnotationPointer)
 // CLEANUP-IGNORE: Each canonical Annotation type requires its own registration; projection already shares reflected field machinery.
 MMLTK_REFLECT_FIELDS(AnnotationOpen)
 MMLTK_REFLECT_FIELDS(AnnotationSave)
+MMLTK_REFLECT_FIELDS(AnnotationLoad)
 MMLTK_REFLECT_FIELDS(AnnotationToolEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSetupEdit)
 MMLTK_REFLECT_FIELDS(AnnotationHoldEdit)
@@ -211,6 +222,7 @@ MMLTK_REFLECT_FIELDS(AnnotationSelectedObjectEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSplineEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSplineHandleEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSkeletonEdit)
+MMLTK_REFLECT_FIELDS(AnnotationSkeletonConnectionEdit)
 MMLTK_REFLECT_FIELDS(AnnotationMaskCleanupEdit)
 MMLTK_REFLECT_FIELDS(AnnotationMaskColorsEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSceneEdit)

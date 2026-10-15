@@ -307,7 +307,7 @@ __global__ void composite_rgba_over_rgba_pitched_kernel(const draw_launch::Compo
  if (!sample.visible) { return; }
  const auto& base_rgba = launch.base_rgba;
  const auto base_pixel = raster_math::load_rgba_pixel(base_rgba.pixels, base_rgba.pitch_bytes, sample.x, sample.y);
- raster_math::store_rgba_pixel(base_rgba.pixels, base_rgba.pitch_bytes, sample.x, sample.y, raster_math::composite_rgba_over_rgba(base_pixel, sample.overlay_pixel));
+ raster_math::store_rgba_pixel(base_rgba.pixels, base_rgba.pitch_bytes, sample.x, sample.y, raster_math::composite_rgba_over_rgba(base_pixel, sample.overlay_pixel, launch.preserve_alpha));
 }
 __device__ raster_math::RgbaPixelU8 surface_read_rgba(const cudaSurfaceObject_t surface, const int x, const int y) {
  uchar4 raw{};
@@ -322,7 +322,7 @@ __global__ void composite_rgba_kernel(const draw_launch::CompositeRgbaLaunchAbi 
  if (!sample.visible) { return; }
  const cudaSurfaceObject_t surface = launch.base_rgba.surface;
  const auto base_pixel = surface_read_rgba(surface, sample.x, sample.y);
- surface_write_rgba(surface, sample.x, sample.y, raster_math::composite_rgba_over_rgba(base_pixel, sample.overlay_pixel));
+ surface_write_rgba(surface, sample.x, sample.y, raster_math::composite_rgba_over_rgba(base_pixel, sample.overlay_pixel, launch.preserve_alpha));
 }
 // Loads the bounds-checked BGR source pixel for the copy kernels and converts it to clamped RGBA with the
 // requested alpha. Returns false (without writing) for threads outside the source image.
@@ -542,7 +542,7 @@ MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_composite_rgba, draw_launch::CompositeRgb
  if (!draw_launch::is_valid(launch.base_rgba) || !draw_launch::is_valid(launch.overlay_rgba)) { return cudaErrorInvalidValue; }
  if (launch.base_rgba.width != launch.overlay_rgba.width || launch.base_rgba.height != launch.overlay_rgba.height) { return cudaErrorInvalidValue; }
  if (launch.base_rgba.kind == draw_launch::RgbaTargetKindAbi::Pitched) {
-  return launch_composite_rgba_over_rgba_pitched(draw_launch::CompositeRgbaOverRgbaPitchedLaunch{launch.base_rgba.pitched, launch.overlay_rgba, launch.stream});
+  return launch_composite_rgba_over_rgba_pitched(draw_launch::CompositeRgbaOverRgbaPitchedLaunch{launch.base_rgba.pitched, launch.overlay_rgba, launch.stream, launch.preserve_alpha});
  }
  const dim3 block = draw_kernel_block();
  const dim3 grid = draw_kernel_grid(launch.base_rgba.width, launch.base_rgba.height);

@@ -84,7 +84,7 @@ struct VisibleSkeletonTopology {
  std::vector<std::optional<std::size_t>> node_remap(shape.nodes.size());
  topology.node_indices.reserve(shape.nodes.size());
  for (std::size_t index = 0; index < shape.nodes.size(); ++index) {
-  if (!shape.nodes[index].visible) continue;
+  if (!shape.nodes[index].visible()) continue;
   node_remap[index] = topology.node_indices.size();
   topology.node_indices.push_back(index);
  }
@@ -154,7 +154,7 @@ void project_selected_handles(const AnnotationFrame& frame, const AnnotationScen
    scene.editable_handles.reserve(shape.nodes.size());
    for (std::size_t index = 0; index < shape.nodes.size(); ++index) {
     const AnnotationSkeletonNode& node = shape.nodes[index];
-    if (!node.visible) continue;
+    if (!node.visible()) continue;
     push_handle(scene, selected_index, index, AnnotationHandleRole::SkeletonNode, object->category_index, node.point, annotation_capture_point_to_frame_unclipped(frame, node.point));
    }
   }

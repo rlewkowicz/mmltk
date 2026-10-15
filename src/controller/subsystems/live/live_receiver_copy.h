@@ -14,6 +14,6 @@ struct LiveReceiverCopyOperations final {
 };
 [[nodiscard]] LiveReceiverCopyOperations native_live_receiver_copy_operations() noexcept;
 [[nodiscard]] cudaError_t copy_live_receiver_frame(
- mmltk::frameworks::gpu::ImagePlaneView target, mmltk::backend::media::live::LiveCompositeOutputLease&,
+ mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, mmltk::backend::media::live::LiveCompositeOutputLease&,
  mmltk::backend::media::live::LiveAnalysisProduct&, std::uintptr_t stream, const LiveReceiverCopyOperations&) noexcept;
 }  // namespace mmltk::controller::detail

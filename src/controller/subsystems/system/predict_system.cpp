@@ -7,6 +7,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <meta>
 #include <stdexcept>
 #include <utility>
 #include "detail/cuda_runtime_resources.h"
@@ -28,6 +29,20 @@
 #include "src/frameworks/gpu/runtime/system_image_runtime.h"
 import mmltk.backend.models.rfdetr.inference.prediction;
 namespace mmltk::controller {
+namespace {
+// Reserve every non-label snapshot field at its reflected maximum, plus the
+// failure-event detail/envelope. Concurrent progress cannot overflow a retained
+// image admitted against this bound.
+constexpr std::size_t kPredictImageByteBudget = [] consteval {
+ std::size_t overhead = contracts::kArtifactErrorCapacity + 1024U;
+ mmltk::frameworks::reflection::visit_materialized_members<PredictSnapshot>([&]<class Field>(const auto&) {
+  if constexpr (std::meta::reflect_constant(Field::pointer) != std::meta::reflect_constant(&PredictSnapshot::labels))
+   overhead += mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<typename Field::member_type>();
+ });
+ if (overhead >= kPredictSnapshotByteBudget) throw "Predict scalar snapshot exceeds its metadata budget";
+ return kPredictSnapshotByteBudget - overhead;
+}();
+}
 class CudaPredictRuntime::Impl final : public detail::CudaSessionRuntimeState<mmltk::backend::models::rfdetr::PredictionSession> {
 public:
  explicit Impl(DirectComputeConfiguration configuration) : CudaSessionRuntimeState(configuration), config(std::move(configuration)) {}
@@ -80,7 +95,7 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
     {
      .stop = stop,
      .source_pixels = static_cast<bool>(products),
-     .encoded_masks = static_cast<bool>(json),
+     .encoded_masks = static_cast<bool>(json) || static_cast<bool>(products),
      .demand =
       [&](std::int64_t index) {
     const bool save = media.Wants(index);
@@ -226,6 +241,7 @@ public:
    state_.execution.operation_generation = *generation;
    state_.paused = false;
    preview_failure_.clear();
+   preview_options_ = intent.preview;
    state_.video = source.kind == contracts::SourceKind::VideoFile;
    playback_.Reset();
    try {
@@ -452,16 +468,18 @@ private:
    auto candidate = worker_.TryAcquireOutput(runtime, baseline);
    if (!candidate.valid()) return {};
    PendingProduct pending;
+   contracts::PredictionRunPreview preview;
    {
     std::scoped_lock lock(mutex_);
     pending = std::move(*pending_product_);
+    preview = preview_options_;
     pending_product_.reset();
    }
    if (!pending.product) throw std::runtime_error(pending.product.error());
    auto& product = *pending.product;
    if (!product.extent.valid() || !product.raw || product.extent.width > visual_.maximum_width || product.extent.height > visual_.maximum_height)
     throw std::runtime_error("Prediction preview exceeds the visual product limits");
-   std::vector<PredictLabel> labels;
+   std::vector<VisualObjectLabel> labels;
    if (preview_class_count_ != product.raw->class_count()) {
     preview_palette_ = mmltk::controller::annotation_class_palette(static_cast<std::size_t>(product.raw->class_count()));
     preview_class_count_ = product.raw->class_count();
@@ -475,22 +493,29 @@ private:
      {{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.class_domain, detection.score,
       category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
       detection.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category]
-                                                                                                                                                                        : std::string{}});
+                                                                                                                                                                        : std::string{}, product.raw->Skeleton(detection)});
     const auto& label = labels.back();
     if (!label.box.valid() || !label.color.valid() || !std::isfinite(label.confidence) || label.name.size() > mmltk::frameworks::reflection::kMaximumNameBytes)
      throw std::runtime_error("Prediction preview metadata exceeds the visual product limits");
    }
-   product.raw->Draw(runtime, candidate);
+   auto document = product.raw->Document(contracts::WorkspaceResource::From("predict://image", pending.content_identity), static_cast<std::uint32_t>(product.source_index));
    const auto frame = visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, candidate.revision());
-   detail::VisualRuntimeOwner::Notification notification = [this, frame, labels = std::move(labels), identity = product.image_id, content_identity = pending.content_identity]() mutable {
+   PredictImageMetadata metadata{pending.content_identity, frame, document->facts(), std::move(labels), product.image_id, preview};
+   if (!visual_metadata_admitted(metadata, kPredictImageByteBudget)) throw std::runtime_error("Prediction preview metadata exceeds the aggregate publication capacity");
+   const std::array regions{detail::PredictionPreviewComposition::Region{product.raw, {0U, 0U, product.extent.width, product.extent.height}}};
+   detail::PredictionPreviewComposition::Draw(runtime, candidate, product.extent, regions, detail::PredictionPreviewComposition::Options::Prediction(preview));
+   detail::VisualRuntimeOwner::Notification notification = [this, frame, labels = std::move(metadata.labels), identity = product.image_id, content_identity = pending.content_identity, preview, document = std::move(document)]() mutable {
     PredictSnapshot changed;
     {
      std::scoped_lock lock(mutex_);
      const auto revision = detail::PredictRevision::Frame(state_.revision, state_.operation.active, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
      if (!revision) return;
      state_.frame = frame;
+     document_ = std::move(document);
+     state_.document = document_->facts();
      state_.labels = std::move(labels);
      state_.image_id = identity;
+     state_.preview = preview;
      state_.content_identity = content_identity;
      state_.revision = *revision;
      changed = state_;
@@ -602,7 +627,9 @@ private:
  SystemEventSink<event_type> events_;
  mutable std::mutex mutex_;
  PredictSnapshot state_;
+ std::shared_ptr<const VisualDocument> document_;
  std::optional<PendingProduct> pending_product_;
+ contracts::PredictionRunPreview preview_options_;
  int preview_class_count_ = 0;
  std::vector<contracts::AnnotationColor> preview_palette_;
  std::string source_key_;
@@ -699,6 +726,21 @@ VisualSourceObservation PredictSystem::ObserveSource() const {
 }
 // CLEANUP-IGNORE: Predict forwards its sealed source API to its own owner and the existing shared renderer.
 std::optional<PredictImageMetadata> PredictSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
+VisualDocumentRead PredictSystem::BorrowDocument(const VisualFrame& frame) const {
+ std::shared_ptr<const VisualDocument> document;
+ std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> metadata;
+ {
+  std::scoped_lock lock(impl_->mutex_);
+  if (impl_->state_.frame != frame || !impl_->document_) return {};
+  document = impl_->document_;
+  auto value = mmltk::frameworks::serialization::reflected_transport_value(visual_source::ImageOf(impl_->state_));
+  if (!value) return {};
+  metadata = std::make_shared<const mmltk::frameworks::serialization::wire::Value>(std::move(*value));
+ }
+ auto pixels = borrow_matching_visual_product(frame, impl_->worker_);
+ if (!pixels.valid()) return {};
+ return {std::move(pixels), std::move(document), std::move(metadata)};
+}
 mmltk::frameworks::gpu::BorrowedImageProductReadView PredictSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace PredictSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 mmltk::frameworks::gpu::ImageWorkspaceObservation PredictSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }

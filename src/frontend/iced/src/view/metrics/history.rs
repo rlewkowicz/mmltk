@@ -283,18 +283,18 @@ impl History {
                     }
                     (progress.scalars.value(field), false)
                 }
-                Source::Evaluation { mask, field } => {
+                Source::Evaluation { kind, field } => {
                     if !evaluation {
                         continue;
                     }
                     let summary = progress
                         .val
                         .as_ref()
-                        .and_then(|v| if mask { v.mask.as_ref() } else { Some(&v.bbox) });
+                        .and_then(|v| match kind { crate::generated::EvaluationMetricKind::Box => Some(&v.bbox), crate::generated::EvaluationMetricKind::Mask => v.mask.as_ref(), crate::generated::EvaluationMetricKind::Keypoint => v.keypoint.as_ref() });
                     if let crate::generated::MetricSummaryField::AverageRecall(index) = field {
                         if let Some(cap) = summary.and_then(|s| s.detectionlimits.get(index)) {
                             curve.name =
-                                format!("{} AR@{}", if mask { "Mask" } else { "Box" }, cap);
+                                format!("{} AR@{}", match kind { crate::generated::EvaluationMetricKind::Box => "Box", crate::generated::EvaluationMetricKind::Mask => "Mask", crate::generated::EvaluationMetricKind::Keypoint => "OKS" }, cap);
                         }
                     }
                     (

@@ -6,6 +6,11 @@ use iced::widget::{button, column};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Product(crate::view::image_viewer::ProductAction),
+    Model(crate::view::workflow::model_card::Message),
+    AnalysisChanged(bool),
+    KeypointsChanged(bool),
+    UncertaintyChanged(bool),
     StartRequested,
     StopRequested,
     Workspace(crate::view::workspace::Message),
@@ -13,16 +18,23 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    Product(crate::view::image_viewer::ProductAction),
+    Model(crate::view::workflow::model_card::Outcome),
     StartRequested,
     StopRequested,
     SettingsEdited(crate::view::settings::EditSchedule),
 }
 
-#[derive(Default)]
 pub struct Component {
     pub(crate) input: crate::workspace_input::Binding,
+    model_card: crate::view::workflow::model_card::Component,
 }
 
+impl Default for Component {
+    fn default() -> Self {
+        Self { input: Default::default(), model_card: crate::view::workflow::model_card::Component::new(crate::generated::FeatureId::Predict) }
+    }
+}
 // CLEANUP-IGNORE: Live owns its direct page view and input binding; Export owns model-card state.
 impl Component {
     pub fn view<'a>(
@@ -32,7 +44,8 @@ impl Component {
         surface: Option<Surface>,
         width: f32,
     ) -> Element<'a, Message> {
-        let settings_edit_available = settings.draft.is_some() && model.settings_edit_available();
+        let settings_edit_available = settings.draft.is_some() && model.settings_edit_available() && !model.primary_action_active(crate::generated::FeatureId::Live);
+        let draft = settings.draft.as_ref().map(|draft| &draft.workflows.predict);
         let completed_frames: Element<'a, Message> = model.live_snapshot.as_ref().map_or_else(
             || column![].into(),
             |snapshot| {
@@ -60,18 +73,26 @@ impl Component {
                 "live.card.capture",
                 crate::view::shared::card(
                     "Live capture",
-                    "Start and Stop follow the typed Live snapshot.",
+                    "Capture runs without analysis by default. Analysis uses the shared Predict model and settings.",
                     column![
                         status_text(format!(
                             "Requested viewport · {} × {} · {} fps",
                             model.window_width, model.window_height, requested_fps
                         )),
+                        crate::view::shared::identified("live.analysis.enabled", crate::view::workflow::fields::toggle("Analyze captured frames", draft.is_some_and(|value| value.liveanalysisenabled), settings_edit_available, Message::AnalysisChanged)),
+                        status_text("Analysis requires a prepared ONNX or TensorRT model on the capture device."),
+                        crate::view::shared::identified("live.keypoints", crate::view::workflow::fields::toggle("Skeletons", draft.is_none_or(|value| value.showkeypoints), settings_edit_available, Message::KeypointsChanged)),
+                        crate::view::shared::identified("live.uncertainty", crate::view::workflow::fields::toggle("Joint uncertainty", draft.is_some_and(|value| value.showuncertainty), settings_edit_available, Message::UncertaintyChanged)),
                         status_text(state_label),
                         completed_frames,
                     ]
                     .spacing(8),
                 )
             ),
+            self.model_card.view(crate::view::workflow::model_card::State::from_settings(
+                crate::generated::FeatureId::Predict, settings.draft.as_ref(), model.model_snapshot.as_ref(), model.file_dialog.as_ref(), settings_edit_available,
+                !settings.has_local_edits() && settings.draft.as_ref().is_some_and(|draft| model.model_selection_available(draft, crate::generated::FeatureId::Predict)), model.model_stop_available()
+            )).map(Message::Model),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Live,
                 model.primary_action_active(crate::generated::FeatureId::Live),
@@ -84,9 +105,12 @@ impl Component {
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
         .into();
+        let paired = surface.and_then(crate::presentation_surface::drawable_prediction);
+        let surface = paired.as_ref().map(|(surface, _)| *surface).or(surface);
+        let labels = paired.map_or(crate::presentation_surface::labels::Source::Hidden, |(_, objects)| crate::presentation_surface::labels::Source::Prediction(objects));
         let workspace = crate::view::workflow::workspace(
             surface,
-            crate::presentation_surface::labels::Source::Hidden,
+            labels,
             settings,
             settings_edit_available,
             crate::generated::FeatureId::Live,
@@ -95,6 +119,7 @@ impl Component {
             self.input
                 .for_source(crate::generated::PresentationSourceKind::Live, 0, None),
         );
+        let workspace = column![workspace, crate::view::image_viewer::product_actions(crate::generated::FeatureId::Live, model).map(Message::Product)].spacing(8).into();
         let advanced = crate::view::shared::card(
             "Advanced",
             "Direct Live lifecycle controls.",
@@ -122,9 +147,18 @@ impl Component {
     pub fn update(
         &mut self,
         settings: &mut crate::view::settings::SettingsModel,
+        file_dialog: Option<&crate::generated::FileDialogSnapshot>,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
+            Message::Product(action) => Outcome::Product(action),
+            Message::Model(message) => {
+                let Some(outcome) = self.model_card.update(message, file_dialog, settings)? else { return Ok(None); };
+                Outcome::Model(outcome)
+            }
+            Message::AnalysisChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Immediate, |draft| crate::generated::edit_workflowspredictliveanalysisenabled(draft, value))?),
+            Message::KeypointsChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Immediate, |draft| crate::generated::edit_workflowspredictshowkeypoints(draft, value))?),
+            Message::UncertaintyChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Immediate, |draft| crate::generated::edit_workflowspredictshowuncertainty(draft, value))?),
             Message::StartRequested => Outcome::StartRequested,
             // CLEANUP-IGNORE: Live reduces its Stop lifecycle before its independent workspace child.
             Message::StopRequested => Outcome::StopRequested,
@@ -150,6 +184,7 @@ mod tests {
         assert!(matches!(
             Component::default().update(
                 &mut crate::view::settings::SettingsModel::default(),
+                None,
                 Message::StartRequested
             ),
             Ok(Some(Outcome::StartRequested))
@@ -157,6 +192,7 @@ mod tests {
         assert!(matches!(
             Component::default().update(
                 &mut crate::view::settings::SettingsModel::default(),
+                None,
                 Message::StopRequested
             ),
             Ok(Some(Outcome::StopRequested))

@@ -561,9 +561,9 @@ TEST_CASE("test_scene_round_trip_preserves_skeleton_topology", "[backend][imagin
  skeleton.category_index = category_index;
  skeleton.shape = AnnotationSkeletonShape{
   {
-   AnnotationSkeletonNode{"left", AnnotationPoint{3.0f, 4.0f}, true},
-   AnnotationSkeletonNode{"right", AnnotationPoint{8.0f, 6.0f}, true},
-   AnnotationSkeletonNode{"tail", AnnotationPoint{12.0f, 9.0f}, false},
+   AnnotationSkeletonNode{"left", AnnotationPoint{3.0f, 4.0f}, mmltk::backend::data::catalog::KeypointVisibility::Visible},
+   AnnotationSkeletonNode{"right", AnnotationPoint{8.0f, 6.0f}, mmltk::backend::data::catalog::KeypointVisibility::Occluded},
+   AnnotationSkeletonNode{"tail", AnnotationPoint{12.0f, 9.0f}, mmltk::backend::data::catalog::KeypointVisibility::Unannotated},
   },
   {
    AnnotationSkeletonEdge{0U, 1U},
@@ -576,9 +576,9 @@ TEST_CASE("test_scene_round_trip_preserves_skeleton_topology", "[backend][imagin
  REQUIRE(loaded_skeleton->nodes.size() == 3U);
  REQUIRE(loaded_skeleton->edges.size() == 2U);
  REQUIRE(loaded_skeleton->nodes[0].key == "left");
- REQUIRE(loaded_skeleton->nodes[0].visible);
+ REQUIRE(loaded_skeleton->nodes[0].visible());
  REQUIRE(loaded_skeleton->nodes[2].key == "tail");
- REQUIRE(!loaded_skeleton->nodes[2].visible);
+ REQUIRE(!loaded_skeleton->nodes[2].visible());
  REQUIRE(loaded_skeleton->edges[1].source_index == 1U);
  REQUIRE(loaded_skeleton->edges[1].target_index == 2U);
  REQUIRE(scene.categories.items.size() == 1U);

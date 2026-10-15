@@ -97,10 +97,18 @@ __device__ __forceinline__ RgbPixelFloat composite_rgba_over_bgr(const RgbPixelF
 __device__ __forceinline__ std::uint8_t lerp_u8(const std::uint8_t base, const std::uint8_t overlay, const float alpha) {
  return clamp_to_u8(static_cast<float>(base) * (1.0f - alpha) + static_cast<float>(overlay) * alpha);
 }
-__device__ __forceinline__ RgbaPixelU8 composite_rgba_over_rgba(const RgbaPixelU8& base, const RgbaPixelU8& overlay) {
+__device__ __forceinline__ RgbaPixelU8 composite_rgba_over_rgba(const RgbaPixelU8& base, const RgbaPixelU8& overlay, const bool preserve_alpha = false) {
  if (overlay.a == 0U) { return base; }
  if (overlay.a == 255U) { return RgbaPixelU8{overlay.r, overlay.g, overlay.b, 255U}; }
  const float alpha = static_cast<float>(overlay.a) / 255.0f;
+ if (preserve_alpha && base.a != 255U) {
+  if (base.a == 0U) return overlay;
+  const float retained = static_cast<float>(base.a) / 255.0f * (1.0f - alpha);
+  const float combined = alpha + retained;
+  return {clamp_to_u8((overlay.r * alpha + base.r * retained) / combined),
+   clamp_to_u8((overlay.g * alpha + base.g * retained) / combined),
+   clamp_to_u8((overlay.b * alpha + base.b * retained) / combined), clamp_to_u8(combined * 255.0f)};
+ }
  return RgbaPixelU8{
   lerp_u8(base.r, overlay.r, alpha),
   lerp_u8(base.g, overlay.g, alpha),

@@ -204,6 +204,7 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
     .height = info.height,
     .channels = info.channels,
     .max_instances_per_image = info.max_instances_per_image,
+    .has_keypoints = info.class_catalog->has_keypoints(),
     .class_names = {}
    });
    for (const std::string& name : info.class_names()) split.class_names.push_back({.value = name});

@@ -1,4 +1,5 @@
 //! Real model workflows driven through the packaged Iced interface.
+pub(super) mod keypoints;
 use super::annotation_checks::annotation_layout_scale;
 use crate::generated::FeatureId;
 use crate::generated::{ComputeOperationOutcome, SourceKind};
@@ -19,6 +20,7 @@ use iced::{Rectangle, Task};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Picture {
+    Keypoints,
     Progress,
     Sources,
     Train,
@@ -37,6 +39,7 @@ pub enum Picture {
 impl Picture {
     fn name(self) -> &'static str {
         match self {
+            Self::Keypoints => "keypoints",
             Self::Progress => "progress",
             Self::Sources => "training-sources",
             Self::Train => "train",
@@ -95,6 +98,7 @@ impl Retention {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Step {
+    Keypoints(keypoints::Stage),
     GpuSelect(FeatureId, i32),
     GpuReady(FeatureId),
     Train,
@@ -225,6 +229,7 @@ pub(super) enum Step {
 
 #[derive(Default)]
 pub(super) struct State {
+    keypoints: keypoints::State,
     source_fixture: Option<TrainingFixture>,
     gpu_completed: [bool; 4],
     gpu_admitted: [u64; 4],
@@ -2056,6 +2061,7 @@ impl State {
         index: u8,
         outcome: ProbeOutcome,
     ) {
+        if picture == Picture::Keypoints { self.keypoints.pixels(driver, outcome); return; }
         if driver.phase != Phase::Workflows(Step::AwaitPixels(picture, index)) {
             return;
         }
@@ -2106,6 +2112,7 @@ impl State {
                     ));
                 }
                 driver.phase = Phase::Workflows(match picture {
+                    Picture::Keypoints => unreachable!("keypoints owns its completion"),
                     Picture::Confidence if index < 8 => Step::ConfidenceEdit(index + 1),
                     Picture::Confidence => Step::ConfidenceLayer(true),
                     Picture::Progress => {
@@ -2165,6 +2172,7 @@ impl State {
         let Phase::Workflows(step) = driver.phase else {
             return;
         };
+        if let Step::Keypoints(stage) = step { self.keypoints.located(driver, stage, control, bounds); return; }
         if matches!(step, Step::Pixels(Picture::Progress, _)) && self.progress_epoch.is_none() {
             self.retry_progress_capture(driver);
             return;
@@ -2571,6 +2579,7 @@ impl State {
         surface: Option<crate::presentation_surface::Surface>,
         router: &crate::view::router::Router,
     ) -> Task<RootMessage> {
+        if let Step::Keypoints(stage) = step { return self.keypoints.advance(widgets, driver, stage, model, settings, active, surface); }
         let settled = !settings.has_local_edits();
         let entry = match step {
             Step::StartTrain => Some(FeatureId::Train),

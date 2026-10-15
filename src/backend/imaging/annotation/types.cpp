@@ -204,7 +204,7 @@ std::optional<AnnotationBox> annotation_object_bbox(const AnnotationObject& obje
    std::vector<AnnotationPoint> points;
    points.reserve(shape.nodes.size());
    for (const AnnotationSkeletonNode& node : shape.nodes) {
-    if (node.visible) { points.push_back(node.point); }
+    if (node.visible()) { points.push_back(node.point); }
    }
    return bbox_from_points(points);
   }

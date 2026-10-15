@@ -62,13 +62,17 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
     }
 }
 
-pub fn view(train: &crate::generated::TrainViewState, enabled: bool) -> Element<'_, Message> {
+pub fn view<'a>(train: &'a crate::generated::TrainViewState, enabled: bool, admitted: Option<&crate::generated::PresetTrainingCapabilities>) -> Element<'a, Message> {
     let supervision = &train.request.trainingsupervision;
+    let capabilities = crate::generated::RFDETR_PRESET_CATALOG.iter().find(|preset| preset.presetname.as_ref() == train.request.presetname).map(|preset| &preset.trainingcapabilities);
+    let capabilities = admitted.or_else(|| (train.modelsource == crate::generated::ModelSelectionSource::Canonical).then_some(capabilities).flatten());
+    let match_free_available = capabilities.is_some_and(|value| value.matchfree);
+    let denoising_available = capabilities.is_some_and(|value| value.denoising);
     let assignment_choices = crate::generated::TRAIN_ASSIGNMENT_KIND_VALUES
         .iter()
         .copied()
         .fold(row![].spacing(6), |choices, assignment| {
-            let available = enabled;
+            let available = enabled && (assignment == TrainAssignmentKind::Hungarian || match_free_available);
             let choice = button(assignment_label(assignment))
                 .on_press_maybe(available.then_some(Message::Assignment(assignment)))
                 .style(if supervision.assignment == assignment {
@@ -83,7 +87,7 @@ pub fn view(train: &crate::generated::TrainViewState, enabled: bool) -> Element<
             }
         });
     let denoising_toggle = checkbox(supervision.denoising.enabled).label("Denoising supervision");
-    let denoising_toggle: Element<'_, Message> = if enabled {
+    let denoising_toggle: Element<'_, Message> = if enabled && (denoising_available || supervision.denoising.enabled) {
         denoising_toggle.on_toggle(Message::DenoisingEnabled).into()
     } else {
         denoising_toggle.into()
@@ -102,7 +106,7 @@ pub fn view(train: &crate::generated::TrainViewState, enabled: bool) -> Element<
     ]
     .spacing(crate::view::workflow::FIELD_SPACING);
 
-    if match_free_controls_visible(supervision.assignment) {
+    if match_free_available && match_free_controls_visible(supervision.assignment) {
         controls = controls.push(
             fields::numeric_grid()
                 .push(fields::number_f32(
@@ -128,7 +132,7 @@ pub fn view(train: &crate::generated::TrainViewState, enabled: bool) -> Element<
                 )),
         );
     }
-    if supervision.denoising.enabled {
+    if denoising_available && supervision.denoising.enabled {
         controls = controls.push(
             fields::numeric_grid()
                 .push(fields::number_u64(
