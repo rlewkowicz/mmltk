@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -282,7 +283,28 @@ private:
  [[nodiscard]] std::expected<void, EncodeError> head(std::uint8_t major, std::uint64_t argument);
  [[nodiscard]] std::expected<void, EncodeError> put(std::byte value);
  [[nodiscard]] std::expected<void, EncodeError> append_raw_item(ByteSegments item, std::size_t depth);
+ [[nodiscard]] std::expected<void, EncodeError> write_text_head(std::string_view spelling, std::size_t size);
  [[nodiscard]] std::expected<void, EncodeError> write_text_body(std::string_view text);
+ [[nodiscard]] std::expected<void, EncodeError> begin_item(std::size_t depth);
+ [[nodiscard]] std::expected<void, EncodeError> write_array_body(std::size_t size);
+ [[nodiscard]] std::expected<void, EncodeError> write_object_body(std::size_t size, const Value::Object* fields = nullptr);
+ [[nodiscard]] std::expected<void, EncodeError> write_body(std::monostate);
+ [[nodiscard]] std::expected<void, EncodeError> write_body(bool value);
+ [[nodiscard]] std::expected<void, EncodeError> write_body(std::int64_t value);
+ [[nodiscard]] std::expected<void, EncodeError> write_body(std::uint64_t value);
+ [[nodiscard]] std::expected<void, EncodeError> write_body(double value);
+ [[nodiscard]] std::expected<void, EncodeError> write_body(std::string_view value);
+ [[nodiscard]] std::expected<void, EncodeError> write_body(ByteView value);
+ template <class T>
+ [[nodiscard]] std::expected<void, EncodeError> write_scalar(const T& value, std::size_t depth) {
+  auto begun = begin_item(depth);
+  return begun ? write_body(value) : begun;
+ }
+ // Only the counting owner calls these payload-free forms. Text spelling is
+ // validated before accounting for its normalized length (Linux paths).
+ [[nodiscard]] std::expected<void, EncodeError> count_payload(std::size_t size);
+ [[nodiscard]] std::expected<void, EncodeError> count_bytes(std::size_t size, std::size_t depth);
+ [[nodiscard]] std::expected<void, EncodeError> count_text(std::string_view spelling, std::size_t size, std::size_t depth);
  [[nodiscard]] std::expected<void, EncodeError> write_item(const Value& value, std::size_t depth);
  ByteBuffer* dynamic_destination_ = nullptr;
  std::span<std::byte> fixed_destination_{};
@@ -294,12 +316,26 @@ private:
 };
 class CountingEncoder {
 public:
- explicit CountingEncoder(Limits limits, RawArrayItems raw_array = {}) noexcept : limits_(limits), raw_array_(raw_array) {}
+ explicit CountingEncoder(Limits limits, RawArrayItems raw_array = {}) noexcept : writer_(limits, raw_array) {}
  [[nodiscard]] std::expected<std::size_t, EncodeError> measure(const Value& value);
+ // Typed projections append in wire order without an owned Value graph. A
+ // sticky wire error permits the projection to finish its own validation;
+ // that validation has precedence over every aggregate encoding failure.
+ template <class T>
+ void scalar(const T& value, std::size_t depth) {
+  if (!failure_) accept(writer_.write_scalar(value, depth));
+ }
+ void value(const Value& value, std::size_t depth);
+ void array(std::size_t size, std::size_t depth);
+ void object(std::size_t size, std::size_t depth);
+ void bytes(std::size_t size, std::size_t depth);
+ void text(std::string_view spelling, std::size_t size, std::size_t depth);
+ [[nodiscard]] std::expected<std::size_t, EncodeError> finish() const;
 
 private:
- Limits limits_{};
- RawArrayItems raw_array_{};
+ void accept(std::expected<void, EncodeError> result);
+ Writer writer_;
+ std::optional<EncodeError> failure_;
 };
 [[nodiscard]] std::expected<Value, DecodeError> decode(ByteSegments bytes, Limits limits);
 [[nodiscard]] std::expected<void, EncodeError> encode(const Value& value, ByteBuffer& destination, Limits limits);

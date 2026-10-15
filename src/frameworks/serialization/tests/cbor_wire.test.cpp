@@ -4,8 +4,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <concepts>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <filesystem>
+#include <inplace_vector>
 #include <limits>
 #include <memory>
 #include <sys/mman.h>
@@ -61,7 +65,7 @@ struct catalog_provider_relation<mmltk::frameworks::serialization::test::OpaqueF
        MemberRelationEntry<member_path<&mmltk::frameworks::serialization::test::OpaqueFixtureRow::value>, member_path<&mmltk::frameworks::serialization::test::OpaqueFixtureOwner::value>>> {
  using override_state_type = mmltk::frameworks::serialization::test::OpaqueFixture;
  inline static constexpr auto destination_override_state = member_path<&mmltk::frameworks::serialization::test::OpaqueFixtureOwner::overrides>;
- static constexpr void set(override_state_type& state) noexcept { state.mask = 1U; }
+ static constexpr void set(override_state_type& state, std::uint16_t value = 1U) noexcept { state.mask = value; }
 };
 }  // namespace mmltk::frameworks::reflection
 namespace {
@@ -80,6 +84,45 @@ template <class Result>
 void require_decode_error(const Result& result, const wire::ErrorCode code) {
  REQUIRE_FALSE(result.has_value());
  CHECK(result.error().code == code);
+}
+template <class T>
+std::expected<std::size_t, wire::EncodeError> check_measurement_against_encoder(const T& source, wire::Limits limits, bool transport) {
+ namespace cbor = mmltk::frameworks::serialization;
+ CAPTURE(transport, limits.max_bytes, limits.max_items, limits.max_depth);
+ const auto projected = transport ? cbor::reflected_transport_value(source) : cbor::reflected_value(source);
+ wire::ByteBuffer bytes;
+ const auto encoded = projected ? wire::encode(*projected, bytes, limits) : std::expected<void, wire::EncodeError>(std::unexpected(projected.error()));
+ const auto counted = transport ? cbor::measure_transport(source, limits) : cbor::measure(source, limits);
+ REQUIRE(counted.has_value() == encoded.has_value());
+ if (encoded) CHECK(*counted == bytes.size());
+ else {
+  CHECK(counted.error().code == encoded.error().code);
+  CHECK(counted.error().path == encoded.error().path);
+  CHECK(counted.error().offset == encoded.error().offset);
+ }
+ return counted;
+}
+template <class T>
+void check_measurement_boundaries(const T& source) {
+ namespace cbor = mmltk::frameworks::serialization;
+ for (const bool transport : {false, true}) {
+  const auto limits = test_limits(1024U * 1024U, 1024U * 1024U);
+  auto size = check_measurement_against_encoder(source, limits, transport);
+  REQUIRE(size);
+  REQUIRE(check_measurement_against_encoder(source, test_limits(*size, limits.max_items), transport));
+  REQUIRE_FALSE(check_measurement_against_encoder(source, test_limits(*size - 1U, limits.max_items), transport));
+  const auto projected = transport ? cbor::reflected_transport_value(source) : cbor::reflected_value(source);
+  REQUIRE(projected);
+  wire::ByteBuffer bytes;
+  REQUIRE(wire::encode(*projected, bytes, limits));
+  wire::Reader reader({bytes, {}}, limits);
+  REQUIRE(reader.read());
+  REQUIRE(check_measurement_against_encoder(source, test_limits(*size, reader.items_read()), transport));
+  REQUIRE_FALSE(check_measurement_against_encoder(source, test_limits(*size, reader.items_read() - 1U), transport));
+  REQUIRE_FALSE(check_measurement_against_encoder(source, test_limits(*size, 0U), transport));
+  for (const auto depth : {0U, 1U, 2U, 3U, 4U})
+   static_cast<void>(check_measurement_against_encoder(source, test_limits(*size, limits.max_items, depth), transport));
+ }
 }
 template <std::size_t N>
 void require_structural_error(const std::array<std::byte, N>& bytes, wire::ErrorCode code) {
@@ -156,9 +199,10 @@ static_assert(std::is_final_v<mmltk::frameworks::reflection::detail::OpaqueField
 static_assert(mmltk::frameworks::reflection::opaque_relation_storage_shape_is_valid<mmltk::frameworks::serialization::test::OpaqueFixture>(0x07ffU));
 static_assert(!mmltk::frameworks::reflection::opaque_relation_storage_shape_is_valid<mmltk::frameworks::serialization::test::OpaqueFixture>(0x0800U));
 using CborObjectLayout = mmltk::frameworks::serialization::implementation::detail::ObjectLayout;
-template <class Owner, CborObjectLayout Layout>
-concept PublicRawCborAppend = requires(const Owner& source, std::conditional_t<Layout == CborObjectLayout::Named, wire::Value::Object, wire::Value::Array>& object,
- std::optional<wire::EncodeError>& failure) { mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout>(source, object, failure); };
+template <class Owner, CborObjectLayout Layout, bool Materialize = true>
+concept PublicRawCborAppend = requires(const Owner& source,
+ std::conditional_t<Materialize, std::conditional_t<Layout == CborObjectLayout::Named, wire::Value::Object, wire::Value::Array>, std::monostate>& object,
+ std::optional<wire::EncodeError>& failure) { mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout, Materialize>(source, object, failure, nullptr, 0U); };
 template <class Owner>
 concept PublicRawCborValueDecode = requires(Owner& destination, std::span<const mmltk::frameworks::serialization::implementation::detail::NamedFieldMatch> matches, std::size_t& index,
  std::optional<wire::DecodeError>& failure) { mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, matches, index, failure); };
@@ -177,6 +221,10 @@ static_assert(PublicRawCborProjectedDecode<OpaqueFixtureOwner>);
 static_assert(PublicRawCborFixedEncode<OpaqueFixtureOwner>);
 static_assert(!PublicRawCborAppend<OpaqueFixture, CborObjectLayout::Named>);
 static_assert(!PublicRawCborAppend<OpaqueFixture, CborObjectLayout::Positional>);
+static_assert(PublicRawCborAppend<OpaqueFixtureOwner, CborObjectLayout::Named, false>);
+static_assert(PublicRawCborAppend<OpaqueFixtureOwner, CborObjectLayout::Positional, false>);
+static_assert(!PublicRawCborAppend<OpaqueFixture, CborObjectLayout::Named, false>);
+static_assert(!PublicRawCborAppend<OpaqueFixture, CborObjectLayout::Positional, false>);
 static_assert(!PublicRawCborValueDecode<OpaqueFixture>);
 static_assert(!PublicRawCborProjectedDecode<OpaqueFixture>);
 static_assert(!PublicRawCborFixedEncode<OpaqueFixture>);
@@ -619,6 +667,176 @@ TEST_CASE("schema agreed transport preserves reflected fields and named persiste
  const auto opaque = cbor::reflected_transport_value(OpaqueFixture{});
  REQUIRE(opaque);
  CHECK(*opaque == *cbor::reflected_value(OpaqueFixture{}));
+}
+TEST_CASE("direct reflected measurement matches emitted named and transport containers", "[frameworks][serialization][reflection][bounds]") {
+ namespace cbor = mmltk::frameworks::serialization;
+ using namespace cbor::test;
+ BoundLeaf leaf;
+ check_measurement_boundaries(leaf);
+ leaf.id = 65535U;
+ leaf.text.assign(24U, 'x');
+ leaf.bytes.fill(std::byte{0xff});
+ leaf.payload = wire::Value{};
+ check_measurement_boundaries(leaf);
+ leaf.payload = wire::Value(wire::Value::Array{wire::Value(std::uint64_t{24})});
+ check_measurement_boundaries(leaf);
+ const std::array<BoundLeaf, 2U> borrowed{leaf, {}};
+ BoundContainers containers;
+ check_measurement_boundaries(containers);
+ containers.rows = std::vector<BoundLeaf>{leaf, {}};
+ containers.fixed = {leaf, std::nullopt};
+ containers.local.push_back(leaf);
+ containers.borrowed = borrowed;
+ containers.values = {wire::Value(wire::Value::Object{{"dynamic", wire::Value(true)}}), wire::Value(wire::ByteBuffer(24U, std::byte{0xff}))};
+ check_measurement_boundaries(containers);
+ check_measurement_boundaries(BoundVariant{containers});
+ check_measurement_boundaries(BoundVariant{leaf});
+ using Relation = mmltk::frameworks::reflection::catalog_provider_relation<OpaqueFixtureProvider>;
+ OpaqueFixtureOwner opaque;
+ Relation::set(opaque.overrides);
+ check_measurement_boundaries(opaque);
+ const std::array<std::uint8_t, 3U> bytes{0U, 128U, 255U};
+ check_measurement_boundaries(bytes);
+ check_measurement_boundaries(std::span(bytes));
+ check_measurement_boundaries(std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
+ check_measurement_boundaries(std::inplace_vector<std::uint8_t, 3U>{0U, 128U, 255U});
+ check_measurement_boundaries(std::optional<std::string>{});
+ check_measurement_boundaries(std::optional<std::string>{"present"});
+ check_measurement_boundaries(MeasurementChoice::Second);
+ check_measurement_boundaries(MeasurementChoice::Alias);
+ const auto symbol = cbor::reflected_value(MeasurementChoice::Alias);
+ REQUIRE(symbol);
+ CHECK(std::get<std::string>(symbol->storage) == "First");
+ check_measurement_boundaries(std::monostate{});
+ check_measurement_boundaries(std::byte{0xff});
+ check_measurement_boundaries(BoundPaths{{"a//b", "////"}});
+ for (const std::string_view path : {"", "/", "///", "//root///leaf//", "a//./b/../", "relative", "a\\b", "utf8/é/日"}) {
+  CAPTURE(path);
+  check_measurement_boundaries(std::filesystem::path(path));
+ }
+ const auto flat_text = wire::FlatValue::text("text", 4U);
+ const auto flat_bytes = wire::FlatValue::bytes(std::as_bytes(std::span(bytes)), 4U);
+ REQUIRE(flat_text);
+ REQUIRE(flat_bytes);
+ const std::array flat_leaves{*flat_text, *flat_bytes, wire::FlatValue(-0.0), wire::FlatValue(std::uint64_t{65536}), wire::FlatValue{}, wire::FlatValue(false), wire::FlatValue(std::int64_t{-24})};
+ const auto flat = wire::FlatValue::array(flat_leaves, {.max_bytes = 4U, .max_items = flat_leaves.size(), .max_depth = 1U});
+ REQUIRE(flat);
+ check_measurement_boundaries(*flat);
+ check_measurement_boundaries(BoundFlat{*flat_text});
+}
+TEST_CASE("direct counts retain canonical integer heads float widths and negative zero", "[frameworks][serialization][reflection][bounds]") {
+ namespace cbor = mmltk::frameworks::serialization;
+ const std::array<std::uint64_t, 12U> integers{0U, 23U, 24U, 255U, 256U, 65535U, 65536U, 0xffffffffU, 0x100000000ULL,
+  std::uint64_t(std::numeric_limits<std::int64_t>::max()), std::uint64_t(std::numeric_limits<std::int64_t>::max()) + 1U, std::numeric_limits<std::uint64_t>::max()};
+ for (const auto value : integers) {
+  CAPTURE(value);
+  check_measurement_boundaries(value);
+  if (value <= std::uint64_t(std::numeric_limits<std::int64_t>::max())) {
+   check_measurement_boundaries(static_cast<std::int64_t>(value));
+   check_measurement_boundaries(-static_cast<std::int64_t>(value) - 1);
+  }
+ }
+ for (const auto [value, size] : std::array<std::pair<double, std::size_t>, 10U>{{
+       {0.0, 3U}, {-0.0, 3U}, {1.5, 3U}, {65504.0, 3U}, {65536.0, 5U}, {0x1p-24, 3U}, {0x1p-25, 5U},
+       {static_cast<double>(1.1F), 5U}, {1.1, 9U}, {std::numeric_limits<double>::max(), 9U}}}) {
+  CAPTURE(value, size);
+  check_measurement_boundaries(value);
+  const auto count = cbor::measure_transport(value, test_limits(size));
+  REQUIRE(count);
+  CHECK(*count == size);
+ }
+ const auto negative_zero = cbor::reflected_transport_value(-0.0);
+ REQUIRE(negative_zero);
+ wire::ByteBuffer encoded;
+ REQUIRE(wire::encode(*negative_zero, encoded, test_limits(3U)));
+ CHECK(encoded == wire::ByteBuffer{std::byte{0xf9}, std::byte{0x80}, std::byte{0x00}});
+ for (const auto length : {23U, 24U, 255U, 256U, 65535U, 65536U}) {
+  CAPTURE(length);
+  check_measurement_boundaries(std::string(length, 't'));
+  check_measurement_boundaries(wire::ByteBuffer(length, std::byte{0xff}));
+  check_measurement_boundaries(std::vector<bool>(length, true));
+ }
+}
+TEST_CASE("direct measurement preserves projection validation before aggregate wire errors", "[frameworks][serialization][reflection][bounds]") {
+ namespace cbor = mmltk::frameworks::serialization;
+ using namespace cbor::test;
+ const auto check_failure = [](const auto& source, wire::ErrorCode code, std::string_view path, wire::Limits limits = test_limits(4096U)) {
+  for (const bool transport : {false, true}) {
+   const auto result = check_measurement_against_encoder(source, limits, transport);
+   REQUIRE_FALSE(result);
+   CHECK(result.error().code == code);
+   CHECK(result.error().path == path);
+   CHECK(result.error().offset == 0U);
+  }
+ };
+ const std::string invalid_utf8("\xc0\x80", 2U);
+ check_failure(invalid_utf8, wire::ErrorCode::InvalidUtf8, "");
+ check_failure(std::filesystem::path(invalid_utf8), wire::ErrorCode::InvalidUtf8, "");
+ check_failure(BoundPaths{{"a///b"}}, wire::ErrorCode::LimitExceeded, "paths", test_limits(0U, 0U));
+ check_failure(std::numeric_limits<double>::infinity(), wire::ErrorCode::InvalidFloat, "", test_limits(0U, 0U, 0U));
+ check_failure(std::numeric_limits<double>::quiet_NaN(), wire::ErrorCode::InvalidFloat, "");
+ check_failure(static_cast<MeasurementChoice>(255U), wire::ErrorCode::Overflow, "", test_limits(0U, 0U, 0U));
+ const wire::Value duplicate(wire::Value::Object{{"same", wire::Value{}}, {"same", wire::Value{}}});
+ check_failure(duplicate, wire::ErrorCode::DuplicateKey, "", test_limits(0U, 1U));
+ // Root admission precedes duplicate-key validation; map-key items are real items.
+ check_failure(duplicate, wire::ErrorCode::LimitExceeded, "", test_limits(4096U, 0U));
+ check_failure(wire::Value(wire::Value::Object{{invalid_utf8, wire::Value{}}}), wire::ErrorCode::InvalidUtf8, "");
+ MeasurementFailures source;
+ source.dynamic = duplicate;
+ source.numbers = {std::numeric_limits<double>::infinity()};
+ check_failure(source, wire::ErrorCode::InvalidFloat, "numbers", test_limits(0U, 0U, 0U));
+ check_failure(source, wire::ErrorCode::InvalidFloat, "numbers");
+ source.numbers = {};
+ source.choice = static_cast<MeasurementChoice>(255U);
+ check_failure(source, wire::ErrorCode::LimitExceeded, "choice", test_limits(0U, 0U, 0U));
+ source.choice = MeasurementChoice::First;
+ source.leaf.text.assign(25U, 'x');
+ check_failure(source, wire::ErrorCode::LimitExceeded, "leaf.text", test_limits(0U, 0U, 0U));
+ check_failure(BoundVariant{source.leaf}, wire::ErrorCode::LimitExceeded, "payload.text", test_limits(0U, 0U, 0U));
+ source.leaf.text.clear();
+ source.dynamic = wire::Value(invalid_utf8);
+ check_failure(source, wire::ErrorCode::InvalidUtf8, "");
+ // Dynamic and flat floats fail at the wire stage, so aggregate limits can win.
+ source.dynamic = wire::Value(std::numeric_limits<double>::infinity());
+ check_failure(source, wire::ErrorCode::InvalidFloat, "");
+ check_failure(source, wire::ErrorCode::LimitExceeded, "", test_limits(0U, 0U, 0U));
+ check_failure(BoundFlat{wire::FlatValue(std::numeric_limits<double>::infinity())}, wire::ErrorCode::InvalidFloat, "");
+ BoundLeaf constrained;
+ constrained.payload = wire::Value(wire::Value::Array{wire::Value{}, wire::Value{}});
+ check_failure(constrained, wire::ErrorCode::LimitExceeded, "payload");
+ BoundContainers too_many;
+ too_many.rows.emplace(3U);
+ check_failure(too_many, wire::ErrorCode::LimitExceeded, "rows");
+ DeclarationBounds bounded;
+ bounded.fraction = std::numeric_limits<double>::infinity();
+ check_failure(bounded, wire::ErrorCode::LimitExceeded, "fraction", test_limits(0U, 0U));
+ OpaqueFixtureOwner opaque;
+ mmltk::frameworks::reflection::catalog_provider_relation<OpaqueFixtureProvider>::set(opaque.overrides, 0x0800U);
+ check_failure(opaque, wire::ErrorCode::LimitExceeded, "overrides.mask", test_limits(0U, 0U));
+ wire::Value nested;
+ for (std::size_t depth = 0U; depth <= wire::kMaximumNestingDepth; ++depth) {
+  for (const bool transport : {false, true}) {
+   REQUIRE(check_measurement_against_encoder(nested, test_limits(4096U, 256U, depth), transport));
+   if (depth != 0U) REQUIRE_FALSE(check_measurement_against_encoder(nested, test_limits(4096U, 256U, depth - 1U), transport));
+  }
+  nested = wire::Value(wire::Value::Array{std::move(nested)});
+ }
+ check_failure(nested, wire::ErrorCode::DepthExceeded, "");
+}
+TEST_CASE("borrowed counting rejects payload and map arithmetic beyond size capacity", "[frameworks][serialization][bounds]") {
+ constexpr auto maximum = std::numeric_limits<std::size_t>::max();
+ wire::CountingEncoder full(test_limits(maximum, maximum));
+ full.bytes(maximum - 9U, 0U);
+ REQUIRE(full.finish());
+ CHECK(*full.finish() == maximum);
+ full.scalar(true, 0U);
+ require_decode_error(full.finish(), wire::ErrorCode::LimitExceeded);
+ wire::CountingEncoder overflow(test_limits(maximum, maximum));
+ overflow.bytes(maximum, 0U);
+ require_decode_error(overflow.finish(), wire::ErrorCode::LimitExceeded);
+ wire::CountingEncoder map(test_limits(maximum, maximum));
+ map.object(maximum, 0U);
+ require_decode_error(map.finish(), wire::ErrorCode::LimitExceeded);
 }
 TEST_CASE("reflected aggregate budgets reject arithmetic overflow", "[frameworks][serialization][reflection][bounds]") {
  namespace cbor = mmltk::frameworks::serialization;

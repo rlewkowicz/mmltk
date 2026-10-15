@@ -19,8 +19,7 @@ inline constexpr std::size_t kVisualMetadataByteBudget = 8U * 1024U * 1024U;
 template <class Metadata>
 [[nodiscard]] bool visual_metadata_admitted(const Metadata& metadata, std::size_t budget = kVisualMetadataByteBudget) {
  namespace serial = mmltk::frameworks::serialization;
- const auto value = serial::reflected_transport_value(metadata);
- return value && serial::wire::CountingEncoder({.max_bytes = budget, .max_items = kVisualMetadataByteBudget}).measure(*value).has_value();
+ return serial::measure_transport(metadata, {.max_bytes = budget, .max_items = kVisualMetadataByteBudget}).has_value();
 }
 struct VisualKeypoint final {
  contracts::AnnotationPoint point{};

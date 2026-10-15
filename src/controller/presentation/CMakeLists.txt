@@ -19,7 +19,8 @@ target_link_libraries(mmltk_controller_visual_contract
         mmltk::controller::application_boundary
         mmltk::controller::contracts
         mmltk::frameworks::gpu
-        mmltk::frameworks::reflection)
+        mmltk::frameworks::reflection
+        mmltk::frameworks::serialization)
 target_link_libraries(mmltk_controller_visual_contract PRIVATE
     mmltk::backend::imaging::primitives)
 mmltk_register_header_isolation(mmltk_controller_visual_contract)

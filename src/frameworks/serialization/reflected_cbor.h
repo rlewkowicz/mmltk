@@ -31,6 +31,10 @@ template <class T>
  return implementation::measure(value, limits);
 }
 template <class T>
+[[nodiscard]] std::expected<std::size_t, wire::EncodeError> measure_transport(const T& value, const wire::Limits limits) {
+ return implementation::measure<implementation::detail::ObjectLayout::Positional>(value, limits);
+}
+template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode(const wire::ByteSegments bytes, const wire::Limits limits) {
  // CLEANUP-IGNORE: Public decode forwards once to the implementation that owns allocation policy and validation.
  return implementation::decode<T>(bytes, limits);

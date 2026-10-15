@@ -3,6 +3,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -401,6 +402,24 @@ template <class T>
  return std::string(static_variant_name<T>());
 }
 enum class ObjectLayout { Named, Positional };
+// Both admission and owning projection follow this one type/member traversal.
+// The nonmaterializing result carries only projection validation; wire failures
+// stay with the counter until the entire projection has been validated.
+template <bool Materialize>
+using ProjectedValue = std::conditional_t<Materialize, wire::Value, std::monostate>;
+template <ObjectLayout Layout, bool Materialize, class T>
+[[nodiscard]] std::expected<ProjectedValue<Materialize>, wire::EncodeError> project_value(const T& value, wire::CountingEncoder* counter, std::size_t depth);
+template <bool Materialize, class T>
+[[nodiscard]] ProjectedValue<Materialize> project_scalar(const T& value, wire::CountingEncoder* counter, std::size_t depth) {
+ if constexpr (Materialize) {
+  if constexpr (std::same_as<T, std::string_view>) return wire::Value(std::string(value));
+  else return wire::Value(value);
+ } else {
+  counter->scalar(value, depth);
+  return {};
+ }
+}
+void count_path(wire::CountingEncoder& counter, const std::filesystem::path& value, std::size_t depth);
 template <class T>
 [[nodiscard]] consteval std::size_t flattened_member_count();
 template <ObjectLayout Layout = ObjectLayout::Named, class T>
@@ -408,8 +427,8 @@ template <ObjectLayout Layout = ObjectLayout::Named, class T>
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> from_value(const wire::Value& value);
 struct OpaqueCborFacade final {
- template <class T>
- [[nodiscard]] static std::expected<wire::Value, wire::EncodeError> EncodeObject(const T& value);
+ template <bool Materialize, class T>
+ [[nodiscard]] static std::expected<ProjectedValue<Materialize>, wire::EncodeError> EncodeObject(const T& value, wire::CountingEncoder* counter, std::size_t depth);
  template <class T>
  [[nodiscard]] static std::expected<T, wire::DecodeError> DecodeObject(const wire::Value& value);
  template <class T>
@@ -551,11 +570,11 @@ template <class T>
  });
  return present_count;
 }
-template <ObjectLayout Layout, class T, class Fields>
+template <ObjectLayout Layout, bool Materialize, class T, class Fields>
  requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
-void append_reflected_object_fields(const T& value, Fields& object, std::optional<wire::EncodeError>& failure) {
+void append_reflected_object_fields(const T& value, Fields& object, std::optional<wire::EncodeError>& failure, wire::CountingEncoder* counter, const std::size_t depth) {
  visit_bases<T>([&]<class Base>() {
-  if (!failure) { append_reflected_object_fields<Layout>(static_cast<const Base&>(value), object, failure); }
+  if (!failure) append_reflected_object_fields<Layout, Materialize>(static_cast<const Base&>(value), object, failure, counter, depth);
  });
  visit_members<T>([&]<class Declaration>(const auto& fact) {
   if constexpr (requires { Declaration::pointer; }) {
@@ -563,21 +582,20 @@ void append_reflected_object_fields(const T& value, Fields& object, std::optiona
     constexpr auto member = Declaration::pointer;
     bool present = true;
     using MemberType = RemoveCvRef<decltype(value.*member)>;
-    if constexpr (Layout == ObjectLayout::Named && kIsOptional<MemberType>) { present = (value.*member).has_value(); }
+    if constexpr (Layout == ObjectLayout::Named && kIsOptional<MemberType>) present = (value.*member).has_value();
     if (present) {
      if (!member_constraints_accept<Declaration>(value.*member)) {
       failure = encode_error(wire::ErrorCode::LimitExceeded);
       prepend_path(*failure, fact.member_name);
      } else {
-      auto encoded = to_value<Layout>(value.*member);
+      if constexpr (!Materialize && Layout == ObjectLayout::Named) counter->scalar(fact.member_name, depth + 1U);
+      auto encoded = project_value<Layout, Materialize>(value.*member, counter, depth + 1U);
       if (!encoded) {
        failure = encoded.error();
        prepend_path(*failure, fact.member_name);
-      } else {
-       if constexpr (Layout == ObjectLayout::Named)
-        object.emplace_back(std::string(fact.member_name), std::move(*encoded));
-       else
-        object.push_back(std::move(*encoded));
+      } else if constexpr (Materialize) {
+       if constexpr (Layout == ObjectLayout::Named) object.emplace_back(std::string(fact.member_name), std::move(*encoded));
+       else object.push_back(std::move(*encoded));
       }
      }
     }
@@ -585,21 +603,22 @@ void append_reflected_object_fields(const T& value, Fields& object, std::optiona
   }
  });
 }
-template <ObjectLayout Layout, class T>
-[[nodiscard]] std::expected<wire::Value, wire::EncodeError> encode_object(const T& value) {
+template <ObjectLayout Layout, bool Materialize, class T>
+[[nodiscard]] std::expected<ProjectedValue<Materialize>, wire::EncodeError> encode_object(const T& value, wire::CountingEncoder* counter, const std::size_t depth) {
  audit_object<T>();
  if constexpr (mmltk::frameworks::reflection::kOpaqueRelationStorage<T>) {
-  return OpaqueCborFacade::EncodeObject(value);
+  return OpaqueCborFacade::EncodeObject<Materialize>(value, counter, depth);
  } else {
-  std::conditional_t<Layout == ObjectLayout::Named, wire::Value::Object, wire::Value::Array> object;
-  if constexpr (Layout == ObjectLayout::Named)
-   object.reserve(reflected_object_present_count(value));
-  else
-   object.reserve(flattened_member_count<T>());
+  using Fields = std::conditional_t<Layout == ObjectLayout::Named, wire::Value::Object, wire::Value::Array>;
+  std::conditional_t<Materialize, Fields, std::monostate> object;
+  const std::size_t count = Layout == ObjectLayout::Named ? reflected_object_present_count(value) : flattened_member_count<T>();
+  if constexpr (Materialize) object.reserve(count);
+  else if constexpr (Layout == ObjectLayout::Named) counter->object(count, depth);
+  else counter->array(count, depth);
   std::optional<wire::EncodeError> failure;
-  append_reflected_object_fields<Layout>(value, object, failure);
+  append_reflected_object_fields<Layout, Materialize>(value, object, failure, counter, depth);
   if (failure) return std::unexpected(std::move(*failure));
-  return wire::Value(std::move(object));
+  return ProjectedValue<Materialize>(std::move(object));
  }
 }
 struct NamedFieldMatch final {
@@ -713,30 +732,34 @@ template <class T>
   return result;
  }
 }
-template <class T>
-[[nodiscard]] std::expected<wire::Value, wire::EncodeError> OpaqueCborFacade::EncodeObject(const T& value) {
+template <bool Materialize, class T>
+[[nodiscard]] std::expected<ProjectedValue<Materialize>, wire::EncodeError> OpaqueCborFacade::EncodeObject(const T& value, wire::CountingEncoder* counter, const std::size_t depth) {
  static_assert(mmltk::frameworks::reflection::kOpaqueRelationStorage<T>);
- wire::Value::Object object;
- object.reserve(declarations<T>().size());
+ std::conditional_t<Materialize, wire::Value::Object, std::monostate> object;
+ if constexpr (Materialize) object.reserve(declarations<T>().size());
+ else counter->object(declarations<T>().size(), depth);
  std::optional<wire::EncodeError> failure;
  mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(value, [&]<std::meta::info Member>(const auto& member_value) {
   if (failure) return;
   constexpr auto policy = mmltk::frameworks::reflection::policy_of<Member>();
-  const auto name = std::define_static_string(std::meta::identifier_of(Member));
+  const std::string_view name = std::define_static_string(std::meta::identifier_of(Member));
   if (!mmltk::frameworks::reflection::field_value_satisfies(member_value, policy)) {
    failure = encode_error(wire::ErrorCode::LimitExceeded);
    prepend_path(*failure, name);
    return;
   }
-  auto encoded = to_value(member_value);
+  if constexpr (!Materialize) counter->scalar(name, depth + 1U);
+  // Opaque relation storage retains its named representation in both layouts.
+  auto encoded = project_value<ObjectLayout::Named, Materialize>(member_value, counter, depth + 1U);
   if (!encoded) {
    failure = encoded.error();
    prepend_path(*failure, name);
    return;
   }
-  object.emplace_back(std::string(name), std::move(*encoded));
+  if constexpr (Materialize) object.emplace_back(std::string(name), std::move(*encoded));
  });
- return failure ? std::unexpected(std::move(*failure)) : std::expected<wire::Value, wire::EncodeError>(wire::Value(std::move(object)));
+ if (failure) return std::unexpected(std::move(*failure));
+ return ProjectedValue<Materialize>(std::move(object));
 }
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> OpaqueCborFacade::DecodeObject(const wire::Value& value) {
@@ -771,24 +794,29 @@ template <class T>
  });
  return finish_decoded_object(std::move(result), *object, source_index, std::move(failure));
 }
-template <ObjectLayout Layout, class Variant>
-[[nodiscard]] std::expected<wire::Value, wire::EncodeError> encode_variant(const Variant& value) {
- wire::Value::Object object;
- object.reserve(VariantEnvelope::field_count);
- std::optional<wire::EncodeError> failure;
- std::visit([&object, &failure](const auto& alternative) {
+template <ObjectLayout Layout, bool Materialize, class Variant>
+[[nodiscard]] std::expected<ProjectedValue<Materialize>, wire::EncodeError> encode_variant(const Variant& value, wire::CountingEncoder* counter, const std::size_t depth) {
+ return std::visit([&](const auto& alternative) -> std::expected<ProjectedValue<Materialize>, wire::EncodeError> {
   using Alternative = RemoveCvRef<decltype(alternative)>;
-  auto encoded = to_value<Layout>(alternative);
-  if (!encoded) {
-   failure = encoded.error();
-   prepend_path(*failure, VariantEnvelope::payload_key);
-   return;
+  if constexpr (!Materialize) {
+   counter->object(VariantEnvelope::field_count, depth);
+   counter->scalar(VariantEnvelope::kind_key, depth + 1U);
+   counter->scalar(static_variant_name<Alternative>(), depth + 1U);
+   counter->scalar(VariantEnvelope::payload_key, depth + 1U);
   }
-  object.emplace_back(VariantEnvelope::kind_key, wire::Value(variant_name<Alternative>()));
-  object.emplace_back(VariantEnvelope::payload_key, std::move(*encoded));
+  auto encoded = project_value<Layout, Materialize>(alternative, counter, depth + 1U);
+  if (!encoded) {
+   prepend_path(encoded.error(), VariantEnvelope::payload_key);
+   return std::unexpected(std::move(encoded.error()));
+  }
+  if constexpr (Materialize) {
+   wire::Value::Object object;
+   object.reserve(VariantEnvelope::field_count);
+   object.emplace_back(VariantEnvelope::kind_key, wire::Value(variant_name<Alternative>()));
+   object.emplace_back(VariantEnvelope::payload_key, std::move(*encoded));
+   return wire::Value(std::move(object));
+  } else return std::monostate{};
  }, value);
- if (failure) { return std::unexpected(std::move(*failure)); }
- return wire::Value(std::move(object));
 }
 template <class Variant>
 [[nodiscard]] std::expected<Variant, wire::DecodeError> decode_variant(const wire::Value& value) {
@@ -830,74 +858,91 @@ template <class Variant>
  }
  return std::move(*decoded);
 }
-template <ObjectLayout Layout, class T>
-[[nodiscard]] std::expected<wire::Value, wire::EncodeError> to_value(const T& value) {
+template <ObjectLayout Layout, bool Materialize, class T>
+[[nodiscard]] std::expected<ProjectedValue<Materialize>, wire::EncodeError> project_value(const T& value, wire::CountingEncoder* counter, const std::size_t depth) {
  using U = RemoveCvRef<T>;
  static_assert(supported_type<U>(), "Attempted to encode an unsupported reflected CBOR type.");
  if constexpr (std::is_same_v<U, wire::Value>) {
-  return value;
+  if constexpr (Materialize) return value;
+  else {
+   counter->value(value, depth);
+   return std::monostate{};
+  }
  } else if constexpr (std::is_same_v<U, wire::FlatValue>) {
-  return value.visit([]<class FlatLeaf>(const FlatLeaf& leaf) -> wire::Value {
+  return value.visit([&]<class FlatLeaf>(const FlatLeaf& leaf) -> ProjectedValue<Materialize> {
    using Leaf = RemoveCvRef<FlatLeaf>;
    if constexpr (kFlatScalar<Leaf>) {
-    return wire::Value(leaf);
+    return project_scalar<Materialize>(leaf, counter, depth);
    } else {
-    wire::Value::Array encoded;
-    encoded.reserve(leaf.size());
+    std::conditional_t<Materialize, wire::Value::Array, std::monostate> encoded;
+    if constexpr (Materialize) encoded.reserve(leaf.size());
+    else counter->array(leaf.size(), depth);
     for (const auto& scalar : leaf) {
-     encoded.push_back(std::visit([](const auto& item) { return wire::Value(item); }, scalar));
+     auto item = std::visit([&](const auto& value) { return project_scalar<Materialize>(value, counter, depth + 1U); }, scalar);
+     if constexpr (Materialize) encoded.push_back(std::move(item));
     }
-    return wire::Value(std::move(encoded));
+    return ProjectedValue<Materialize>(std::move(encoded));
    }
   });
- } else if constexpr (std::is_same_v<U, std::monostate>) {
-  return wire::Value(std::monostate{});
- } else if constexpr (std::is_same_v<U, bool>) {
-  return wire::Value(value);
+ } else if constexpr (std::is_same_v<U, std::monostate> || std::is_same_v<U, bool>) {
+  return project_scalar<Materialize>(value, counter, depth);
  } else if constexpr (std::is_same_v<U, std::byte>) {
-  return wire::Value(static_cast<std::uint64_t>(std::to_integer<unsigned char>(value)));
+  return project_scalar<Materialize>(static_cast<std::uint64_t>(std::to_integer<unsigned char>(value)), counter, depth);
  } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U>) {
-  return wire::Value(static_cast<std::int64_t>(value));
+  return project_scalar<Materialize>(static_cast<std::int64_t>(value), counter, depth);
  } else if constexpr (std::is_integral_v<U>) {
-  return wire::Value(static_cast<std::uint64_t>(value));
+  return project_scalar<Materialize>(static_cast<std::uint64_t>(value), counter, depth);
  } else if constexpr (std::is_floating_point_v<U>) {
-  if (!std::isfinite(value)) { return std::unexpected(encode_error(wire::ErrorCode::InvalidFloat)); }
+  if (!std::isfinite(value)) return std::unexpected(encode_error(wire::ErrorCode::InvalidFloat));
   const double encoded = static_cast<double>(value);
-  if (static_cast<U>(encoded) != value) { return std::unexpected(encode_error(wire::ErrorCode::Overflow)); }
-  return wire::Value(encoded);
+  if (static_cast<U>(encoded) != value) return std::unexpected(encode_error(wire::ErrorCode::Overflow));
+  return project_scalar<Materialize>(encoded, counter, depth);
  } else if constexpr (std::is_same_v<U, std::string>) {
-  return wire::Value(value);
+  return project_scalar<Materialize>(value, counter, depth);
  } else if constexpr (std::is_same_v<U, std::filesystem::path>) {
-  return wire::Value(value.generic_string());
- } else if constexpr (std::is_enum_v<U> && !std::is_same_v<U, std::byte>) {
-  std::optional<std::string> name;
-  for (const auto& enumerator : enumerators<U>()) {
-   if (!name && value == enumerator.value) { name = std::string(enumerator.name); }
+  if constexpr (Materialize) return wire::Value(value.generic_string());
+  else {
+   count_path(*counter, value, depth);
+   return std::monostate{};
   }
-  if (!name) { return std::unexpected(encode_error(wire::ErrorCode::Overflow)); }
-  return wire::Value(std::move(*name));
+ } else if constexpr (std::is_enum_v<U>) {
+  for (const auto& enumerator : enumerators<U>()) {
+   if (value == enumerator.value) return project_scalar<Materialize>(enumerator.name, counter, depth);
+  }
+  return std::unexpected(encode_error(wire::ErrorCode::Overflow));
  } else if constexpr (kByteSequence<U>) {
-  wire::ByteBuffer bytes;
-  bytes.reserve(value.size());
-  std::transform(value.begin(), value.end(), std::back_inserter(bytes), [](const auto byte) { return to_wire_byte(byte); });
-  return wire::Value(std::move(bytes));
+  if constexpr (Materialize) {
+   wire::ByteBuffer bytes;
+   bytes.reserve(value.size());
+   std::transform(value.begin(), value.end(), std::back_inserter(bytes), [](const auto byte) { return to_wire_byte(byte); });
+   return wire::Value(std::move(bytes));
+  } else {
+   counter->bytes(value.size(), depth);
+   return std::monostate{};
+  }
  } else if constexpr (kIsOptional<U>) {
-  return value ? to_value<Layout>(*value) : std::expected<wire::Value, wire::EncodeError>(wire::Value());
+  if (value) return project_value<Layout, Materialize>(*value, counter, depth);
+  return project_scalar<Materialize>(std::monostate{}, counter, depth);
  } else if constexpr (kIsVariant<U>) {
   static_assert(kUniqueVariantAlternatives<U>, "Reflected CBOR variant alternatives require unique type identifiers.");
-  return encode_variant<Layout>(value);
- } else if constexpr (kIsArray<U> || kIsVector<U> || kIsSpan<U> || kIsInplaceVector<U>) {
-  wire::Value::Array array;
-  array.reserve(value.size());
+  return encode_variant<Layout, Materialize>(value, counter, depth);
+ } else if constexpr (kIsSequence<U>) {
+  std::conditional_t<Materialize, wire::Value::Array, std::monostate> array;
+  if constexpr (Materialize) array.reserve(value.size());
+  else counter->array(value.size(), depth);
   for (const auto& element : value) {
-   auto encoded = to_value<Layout>(element);
-   if (!encoded) { return std::unexpected(encoded.error()); }
-   array.push_back(std::move(*encoded));
+   auto encoded = project_value<Layout, Materialize>(element, counter, depth + 1U);
+   if (!encoded) return std::unexpected(encoded.error());
+   if constexpr (Materialize) array.push_back(std::move(*encoded));
   }
-  return wire::Value(std::move(array));
+  return ProjectedValue<Materialize>(std::move(array));
  } else {
-  return encode_object<Layout>(value);
+  return encode_object<Layout, Materialize>(value, counter, depth);
  }
+}
+template <ObjectLayout Layout, class T>
+[[nodiscard]] std::expected<wire::Value, wire::EncodeError> to_value(const T& value) {
+ return project_value<Layout, true>(value, nullptr, 0U);
 }
 // The fixed browser result and contract both need a conservative
 // encoded-byte bound, but neither may grow a second CBOR vocabulary.  Keep
@@ -1750,11 +1795,12 @@ template <class T>
  if (!encode_fixed(writer, value)) return std::unexpected(detail::encode_error(writer.error()));
  return writer.size();
 }
-template <class T>
+template <detail::ObjectLayout Layout = detail::ObjectLayout::Named, class T>
 [[nodiscard]] std::expected<std::size_t, wire::EncodeError> measure(const T& value, const wire::Limits limits) {
- auto encoded = detail::to_value(value);
- if (!encoded) { return std::unexpected(encoded.error()); }
- return wire::CountingEncoder(limits).measure(*encoded);
+ wire::CountingEncoder counter(limits);
+ auto projected = detail::project_value<Layout, false>(value, &counter, 0U);
+ if (!projected) return std::unexpected(std::move(projected.error()));
+ return counter.finish();
 }
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode(const wire::ByteSegments bytes, const wire::Limits limits) {

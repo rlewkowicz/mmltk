@@ -159,6 +159,15 @@ MMLTK_REFLECT_FIELDS(BoundFlat)
 MMLTK_REFLECT_FIELDS(BoundPaths)
 MMLTK_REFLECT_FIELDS(BoundTextContainers)
 using BoundVariant = std::variant<BoundLeaf, BoundContainers>;
+enum class MeasurementChoice : std::uint8_t { First, Second, Alias = First };
+MMLTK_REFLECT_ENUM(MeasurementChoice)
+struct MeasurementFailures final {
+ wire::Value dynamic;
+ MMLTK_MAX_ITEMS(4U) std::vector<double> numbers;
+ MeasurementChoice choice = MeasurementChoice::First;
+ BoundLeaf leaf;
+};
+MMLTK_REFLECT_FIELDS(MeasurementFailures)
 // Authoring syntax exercises the same canonical policies as the serializer's
 // existing nested-container fixtures, without defining an alternate schema.
 struct DeclarationBounds final {

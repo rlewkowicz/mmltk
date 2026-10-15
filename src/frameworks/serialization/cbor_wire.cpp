@@ -107,10 +107,9 @@ template <class Range, class Operation>
  }
  return {};
 }
-[[nodiscard]] std::expected<void, EncodeError> validate_object_encoding(const Value::Object& object, const std::size_t items, const Limits& limits) {
- if (duplicate_object_key(object)) { return std::unexpected(encode_error(ErrorCode::DuplicateKey)); }
+[[nodiscard]] std::expected<void, EncodeError> validate_object_encoding(const std::size_t size, const std::size_t items, const Limits& limits) {
  constexpr std::size_t kMapEntriesItemCount = 2U;
- if (items > limits.max_items || object.size() > (limits.max_items - items) / kMapEntriesItemCount) { return std::unexpected(encode_error(ErrorCode::LimitExceeded)); }
+ if (items > limits.max_items || size > (limits.max_items - items) / kMapEntriesItemCount) { return std::unexpected(encode_error(ErrorCode::LimitExceeded)); }
  return {};
 }
 [[nodiscard]] constexpr std::uint8_t additional_info_for_head_size(const std::size_t size) noexcept {
@@ -662,7 +661,7 @@ void Writer::truncate(const std::size_t size) noexcept {
 }
 std::expected<void, EncodeError> Writer::append(const ByteView bytes) {
  const std::size_t size = destination_size();
- if (size > limits_.max_bytes || bytes.size() > limits_.max_bytes - size) { return std::unexpected(encode_error()); }
+ if (!fits_remaining(bytes.size(), size, limits_.max_bytes)) { return std::unexpected(encode_error()); }
  if (count_only_) {
   fixed_size_ += bytes.size();
  } else if (dynamic_destination_ != nullptr) {
@@ -691,64 +690,85 @@ std::expected<void, EncodeError> Writer::head(const std::uint8_t major, const st
  }
  return {};
 }
+std::expected<void, EncodeError> Writer::write_text_head(const std::string_view spelling, const std::size_t size) {
+ if (!mmltk::common::types::valid_utf8(spelling)) return std::unexpected(encode_error(ErrorCode::InvalidUtf8));
+ return head(3U, size);
+}
 std::expected<void, EncodeError> Writer::write_text_body(const std::string_view text) {
- if (!mmltk::common::types::valid_utf8(text)) { return std::unexpected(encode_error(ErrorCode::InvalidUtf8)); }
- auto result = head(3U, text.size());
+ auto result = write_text_head(text, text.size());
  if (!result) { return result; }
  return append(std::as_bytes(std::span<const char>{text.data(), text.size()}));
 }
+std::expected<void, EncodeError> Writer::begin_item(const std::size_t depth) { return begin_encode_item(depth, items_, limits_); }
+std::expected<void, EncodeError> Writer::write_array_body(const std::size_t size) {
+ if (!fits_remaining(size, items_, limits_.max_items)) return std::unexpected(encode_error());
+ return head(4U, size);
+}
+std::expected<void, EncodeError> Writer::write_object_body(const std::size_t size, const Value::Object* fields) {
+ if (fields != nullptr && duplicate_object_key(*fields)) return std::unexpected(encode_error(ErrorCode::DuplicateKey));
+ auto valid = validate_object_encoding(size, items_, limits_);
+ return valid ? head(5U, size) : valid;
+}
+std::expected<void, EncodeError> Writer::write_body(std::monostate) { return put(std::byte{0xf6}); }
+std::expected<void, EncodeError> Writer::write_body(const bool value) { return put(value ? std::byte{0xf5} : std::byte{0xf4}); }
+std::expected<void, EncodeError> Writer::write_body(const std::int64_t value) {
+ return value >= 0 ? head(0U, static_cast<std::uint64_t>(value)) : head(1U, static_cast<std::uint64_t>(-(value + 1)));
+}
+std::expected<void, EncodeError> Writer::write_body(const std::uint64_t value) { return head(0U, value); }
+std::expected<void, EncodeError> Writer::write_body(const double value) {
+ const auto encoding = canonical_float_encoding(value);
+ if (!encoding) return std::unexpected(encode_error(encoding.error()));
+ const std::size_t width = static_cast<std::size_t>(encoding->width);
+ auto result = put(width == 2U ? std::byte{0xf9} : width == 4U ? std::byte{0xfa} : std::byte{0xfb});
+ if (!result) return result;
+ for (std::size_t index = width; index-- > 0U;) {
+  result = put(std::byte((encoding->bits >> (index * 8U)) & 0xffU));
+  if (!result) return result;
+ }
+ return {};
+}
+std::expected<void, EncodeError> Writer::write_body(const std::string_view value) { return write_text_body(value); }
+std::expected<void, EncodeError> Writer::write_body(const ByteView value) {
+ auto result = head(2U, value.size());
+ return result ? append(value) : result;
+}
+std::expected<void, EncodeError> Writer::count_payload(const std::size_t size) {
+ if (!fits_remaining(size, fixed_size_, limits_.max_bytes)) return std::unexpected(encode_error());
+ fixed_size_ += size;
+ return {};
+}
+std::expected<void, EncodeError> Writer::count_bytes(const std::size_t size, const std::size_t depth) {
+ auto result = begin_item(depth);
+ if (result) result = head(2U, size);
+ return result ? count_payload(size) : result;
+}
+std::expected<void, EncodeError> Writer::count_text(const std::string_view spelling, const std::size_t size, const std::size_t depth) {
+ auto result = begin_item(depth);
+ if (!result) return result;
+ result = write_text_head(spelling, size);
+ return result ? count_payload(size) : result;
+}
 std::expected<void, EncodeError> Writer::write_item(const Value& value, const std::size_t depth) {
- auto begun = begin_encode_item(depth, items_, limits_);
+ auto begun = begin_item(depth);
  if (!begun) return begun;
  return std::visit([this, depth](const auto& item) -> std::expected<void, EncodeError> {
   using T = std::decay_t<decltype(item)>;
-  if constexpr (std::is_same_v<T, std::monostate>) {
-   return put(std::byte{0xf6});
-  } else if constexpr (std::is_same_v<T, bool>) {
-   return put(item ? std::byte{0xf5} : std::byte{0xf4});
-  } else if constexpr (std::is_same_v<T, std::int64_t>) {
-   return item >= 0 ? head(0U, static_cast<std::uint64_t>(item)) : head(1U, static_cast<std::uint64_t>(-(item + 1)));
-  } else if constexpr (std::is_same_v<T, std::uint64_t>) {
-   return head(0U, item);
-  } else if constexpr (std::is_same_v<T, double>) {
-   const auto encoding = canonical_float_encoding(item);
-   if (!encoding) return std::unexpected(encode_error(encoding.error()));
-   const std::size_t width = static_cast<std::size_t>(encoding->width);
-   auto result = put(width == 2U ? std::byte{0xf9} : width == 4U ? std::byte{0xfa} : std::byte{0xfb});
-   if (!result) { return result; }
-   for (std::size_t index = width; index-- > 0U;) {
-    result = put(std::byte((encoding->bits >> (index * 8U)) & 0xffU));
-    if (!result) { return result; }
-   }
-   return {};
-  } else if constexpr (std::is_same_v<T, std::string>) {
-   return write_text_body(item);
-  } else if constexpr (std::is_same_v<T, ByteBuffer>) {
-   auto result = head(2U, item.size());
-   if (!result) { return result; }
-   return append(item);
-  } else if constexpr (std::is_same_v<T, Value::Array>) {
+  if constexpr (std::is_same_v<T, Value::Array>) {
    const bool substitute = raw_array_.target == &item;
    const std::size_t element_count = substitute ? raw_array_.items.size() : item.size();
-   if (!fits_remaining(element_count, items_, limits_.max_items)) { return std::unexpected(encode_error(ErrorCode::LimitExceeded)); }
-   auto result = head(4U, element_count);
-   if (!result) { return result; }
-   if (substitute) {
-    return encode_each(raw_array_.items, [this, depth](const ByteSegments encoded) { return append_raw_item(encoded, depth + 1U); });
-   }
+   auto result = write_array_body(element_count);
+   if (!result) return result;
+   if (substitute) return encode_each(raw_array_.items, [this, depth](const ByteSegments encoded) { return append_raw_item(encoded, depth + 1U); });
    return encode_each(item, [this, depth](const Value& element) { return write_item(element, depth + 1U); });
-  } else {
-   auto valid = validate_object_encoding(item, items_, limits_);
-   if (!valid) return valid;
-   auto result = head(5U, item.size());
-   if (!result) { return result; }
+  } else if constexpr (std::is_same_v<T, Value::Object>) {
+   auto result = write_object_body(item.size(), &item);
+   if (!result) return result;
    return encode_each(item, [this, depth](const auto& entry) {
-    auto encoded = begin_encode_item(depth + 1U, items_, limits_);
-    if (!encoded) return encoded;
-    encoded = write_text_body(entry.first);
-    if (!encoded) return encoded;
-    return write_item(entry.second, depth + 1U);
+    auto encoded = write_scalar(entry.first, depth + 1U);
+    return encoded ? write_item(entry.second, depth + 1U) : encoded;
    });
+  } else {
+   return write_body(item);
   }
  }, value.storage);
 }
@@ -783,8 +803,34 @@ std::expected<void, EncodeError> Writer::append_raw_item(const ByteSegments item
  items_ += reader.items_read();
  return {};
 }
+void CountingEncoder::accept(std::expected<void, EncodeError> result) {
+ if (!result) failure_ = std::move(result.error());
+}
+void CountingEncoder::value(const Value& value, const std::size_t depth) {
+ if (!failure_) accept(writer_.write_item(value, depth));
+}
+void CountingEncoder::array(const std::size_t size, const std::size_t depth) {
+ if (failure_) return;
+ auto begun = writer_.begin_item(depth);
+ accept(begun ? writer_.write_array_body(size) : begun);
+}
+void CountingEncoder::object(const std::size_t size, const std::size_t depth) {
+ if (failure_) return;
+ auto begun = writer_.begin_item(depth);
+ accept(begun ? writer_.write_object_body(size) : begun);
+}
+void CountingEncoder::bytes(const std::size_t size, const std::size_t depth) {
+ if (!failure_) accept(writer_.count_bytes(size, depth));
+}
+void CountingEncoder::text(const std::string_view spelling, const std::size_t size, const std::size_t depth) {
+ if (!failure_) accept(writer_.count_text(spelling, size, depth));
+}
+std::expected<std::size_t, EncodeError> CountingEncoder::finish() const {
+ return failure_ ? std::unexpected(*failure_) : std::expected<std::size_t, EncodeError>{writer_.bytes_written()};
+}
 std::expected<std::size_t, EncodeError> CountingEncoder::measure(const Value& value) {
- Writer writer{limits_, raw_array_};
+ // Whole-document measurements remain independent, including repeated calls.
+ Writer writer{writer_.limits_, writer_.raw_array_};
  auto result = writer.write(value);
  return result ? std::expected<std::size_t, EncodeError>{writer.bytes_written()} : std::unexpected(result.error());
 }

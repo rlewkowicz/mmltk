@@ -10,6 +10,12 @@
 #include "src/controller/browser/tests/annotation_wire_fixture.h"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <expected>
+#include <span>
+#include <string_view>
+#include <vector>
 #include <cctype>
 #include <concepts>
 #include <cstdint>
@@ -31,6 +37,10 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
+#include "src/controller/subsystems/system/predict_system.h"
+#include "src/controller/subsystems/validate/validation_types.h"
+#include "src/controller/subsystems/live/live_system.h"
+#include "src/controller/presentation/visual_document.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 #include "src/frameworks/serialization/reflected_json.h"
 namespace mmltk::controller::browser::relation_audit_test {
@@ -1513,6 +1523,159 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
  retain("upscale", upscale);
  REQUIRE(browser::encode_server_record(browser::ServerRecord{std::move(bootstrap)}, encoded));
  CHECK(encoded.size() < browser::kMaxRecordWireBytes);
+}
+TEST_CASE("native image and Annotation measurements agree with emitted complete joint metadata", "[browser][reflection][capacity][keypoints]") {
+ using namespace mmltk::controller;
+ namespace serial = mmltk::frameworks::serialization;
+ namespace catalog = mmltk::backend::data::catalog;
+ namespace c = contracts;
+ // One comparison exercises the actual owning projection and encoder for each
+ // native declaration, including exact and one-byte-short successful budgets.
+ const auto compare = [](const auto& source, bool transport, std::size_t budget = kVisualMetadataByteBudget) {
+  const auto projected = transport ? serial::reflected_transport_value(source) : serial::reflected_value(source);
+  const auto measure = [&](std::size_t ceiling) { return transport ? serial::measure_transport(source, {.max_bytes = ceiling, .max_items = kVisualMetadataByteBudget})
+                                                                : serial::measure(source, {.max_bytes = ceiling, .max_items = kVisualMetadataByteBudget}); };
+  const auto result = measure(budget);
+  std::array ceilings{budget, budget, budget};
+  for (std::size_t index = 0U; index < ceilings.size(); ++index) {
+   const auto ceiling = ceilings[index];
+   CAPTURE(transport, ceiling);
+   serial::wire::ByteBuffer bytes;
+   const auto emitted = projected ? serial::wire::encode(*projected, bytes, {.max_bytes = ceiling, .max_items = kVisualMetadataByteBudget})
+                                  : std::expected<void, serial::wire::EncodeError>(std::unexpected(projected.error()));
+   const auto counted = index == 0U ? result : measure(ceiling);
+   REQUIRE(counted.has_value() == emitted.has_value());
+   if (!emitted) {
+    CHECK(counted.error().code == emitted.error().code);
+    CHECK(counted.error().path == emitted.error().path);
+    CHECK(counted.error().offset == emitted.error().offset);
+    if (index == 0U) break;
+   } else {
+    CHECK(*counted == bytes.size());
+    if (index == 0U) {
+     ceilings[1] = bytes.size();
+     ceilings[2] = bytes.size() - 1U;
+    }
+   }
+  }
+  return result;
+ };
+ VisualSkeleton full;
+ for (std::size_t joint = 0U; joint < catalog::kKeypointsPerClassCapacity; ++joint) {
+  auto name = "joint-" + std::to_string(joint);
+  name.resize(catalog::kKeypointNameCapacity, 'j');
+  full.schema.names.push_back(std::move(name));
+  full.schema.horizontal_flip.push_back(static_cast<catalog::JointIndex>(joint));
+  full.schema.oks_sigmas.push_back(.125);
+  VisualKeypoint point{.point = {static_cast<float>(joint % 64U), static_cast<float>(joint / 64U)}, .confidence = .75F};
+  if (joint % 4U != 0U) point.visibility = static_cast<catalog::KeypointVisibility>(joint % 3U);
+  if (joint % 2U != 0U) point.covariance = std::array{1.25F, -.25F, 2.5F};
+  full.joints.push_back(point);
+ }
+ for (std::size_t distance = 1U; full.schema.skeleton.size() < catalog::kSkeletonEdgeCapacity; ++distance)
+  for (std::size_t joint = 0U; joint + distance < full.schema.names.size() && full.schema.skeleton.size() < catalog::kSkeletonEdgeCapacity; ++joint)
+   full.schema.skeleton.push_back({static_cast<catalog::JointIndex>(joint), static_cast<catalog::JointIndex>(joint + distance)});
+ REQUIRE_NOTHROW(catalog::validate_keypoint_schema(full.schema));
+ REQUIRE(full.schema.names.size() == 256U);
+ REQUIRE(full.schema.skeleton.size() == 512U);
+ const VisualObjectLabel label{.box = {{0, 0}, {64, 64}}, .confidence = .875F, .name = std::string(256U, 'c'), .skeleton = full};
+ const VisualSkeleton small{.schema = {{"left", "right"}, {{0U, 1U}}, {1U, 0U}, {.1, .1}},
+  .joints = {{{1, 2}, .5F, catalog::KeypointVisibility::Occluded, {}}, {{3, 4}, .75F, catalog::KeypointVisibility::Visible, std::array{1.0F, 0.0F, 1.0F}}}};
+ PredictImageMetadata prediction;
+ prediction.content_identity = 1U;
+ prediction.frame = visual_frame({PresentationSourceKind::Predict, 1U}, {64U, 64U}, 1U);
+ prediction.labels = {label, VisualObjectLabel{.skeleton = small}, VisualObjectLabel{}};
+ prediction.preview = {.labels = true, .boxes = true, .masks = false, .keypoints = true, .uncertainty = true, .confidence_threshold = .5F};
+ LiveImageMetadata live{.frame = visual_frame({PresentationSourceKind::Live, 1U}, {64U, 64U}, 2U), .analyzed = true, .labels = prediction.labels};
+ ValidationImageMetadata validation;
+ validation.frame = visual_frame({PresentationSourceKind::Validation, 1U}, {128U, 64U}, 3U);
+ validation.content_identity = 1U;
+ validation.samples.front().identity = {1U, 0U};
+ validation.samples.back().identity = {1U, 1U};
+ validation.samples.front().available = validation.samples.back().available = true;
+ validation.samples.front().labels = {{.name = label.name, .skeleton = full}, {.ground_truth = true, .skeleton = small}, {}};
+ validation.samples.back().labels = {{.ground_truth = true, .skeleton = full}, {}};
+ c::AnnotationUiState annotation;
+ annotation.document_revision = annotation.scene_revision = annotation.interaction_revision = 1U;
+ auto& scene = annotation.scene;
+ scene.document = c::WorkspaceResource::From("counting://document", 1U);
+ prediction.document = live.document = validation.document = {scene.document, 1U};
+ scene.frame_width = scene.frame_height = 64U;
+ scene.frame_ready = true;
+ scene.categories = {{"complete"}, {"small"}, {"empty"}};
+ scene.keypoint_schemas = {full.schema, small.schema, {}};
+ auto object = browser::test_support::make_annotation_wire_object({1, 2}, {});
+ object.shape = c::AnnotationShape::Skeleton;
+ object.skeleton_nodes.clear();
+ object.skeleton_edges.clear();
+ for (std::size_t joint = 0U; joint < full.joints.size(); ++joint)
+  object.skeleton_nodes.push_back({full.schema.names[joint], full.joints[joint].point, full.joints[joint].visibility.value_or(catalog::KeypointVisibility::Unannotated)});
+ for (const auto edge : full.schema.skeleton) object.skeleton_edges.push_back({edge.first, edge.second});
+ scene.objects = {object, c::AnnotationObject{.name = c::AnnotationText::From("empty"), .category = 2U}};
+ REQUIRE(annotation.valid());
+ for (const bool transport : {false, true}) {
+  REQUIRE(compare(prediction, transport));
+  REQUIRE(compare(live, transport));
+  REQUIRE(compare(validation, transport));
+  REQUIRE(compare(annotation, transport));
+ }
+ validation.detail = true;
+ validation.selected = validation.samples.front().identity;
+ REQUIRE(compare(validation, true));
+ REQUIRE(visual_metadata_admitted(prediction));
+ REQUIRE(visual_metadata_admitted(live));
+ REQUIRE(visual_metadata_admitted(validation));
+ prediction.labels.assign(32U, label);
+ REQUIRE(compare(prediction, true, kPredictSnapshotByteBudget));
+ prediction.labels.resize(64U, label);
+ REQUIRE_FALSE(compare(prediction, true, kPredictSnapshotByteBudget));
+ REQUIRE(compare(prediction, true));
+ REQUIRE(visual_metadata_admitted(prediction));
+ prediction.labels.resize(128U, label);
+ REQUIRE_FALSE(compare(prediction, true));
+ CHECK_FALSE(visual_metadata_admitted(prediction));
+ live.labels = prediction.labels;
+ REQUIRE_FALSE(compare(live, true));
+ CHECK_FALSE(visual_metadata_admitted(live));
+ validation.samples.front().labels.resize(128U, validation.samples.front().labels.front());
+ REQUIRE_FALSE(compare(validation, true));
+ CHECK_FALSE(visual_metadata_admitted(validation));
+ // Annotation intentionally admits through its conservative document policy.
+ // Exact serialization still accepts some forms that that policy refuses.
+ scene.objects.assign(64U, object);
+ CHECK_FALSE(annotation.valid());
+ REQUIRE(compare(annotation, false));
+ scene.objects.resize(128U, object);
+ REQUIRE_FALSE(compare(annotation, false));
+ // Native projection errors retain field context even under zero aggregate
+ // budget; malformed UTF-8 remains a wire error without a reflected path.
+ prediction.labels = {label};
+ prediction.labels.front().skeleton.joints.front().confidence = std::numeric_limits<float>::infinity();
+ const auto invalid_joint = compare(prediction, true, 0U);
+ REQUIRE_FALSE(invalid_joint);
+ CHECK(invalid_joint.error().code == serial::wire::ErrorCode::LimitExceeded);
+ CHECK(invalid_joint.error().path == "labels.skeleton.joints.confidence");
+ prediction.labels.front().skeleton.joints.front().confidence = .75F;
+ prediction.labels.front().skeleton.joints.front().covariance = std::array{1.0F, std::numeric_limits<float>::infinity(), 1.0F};
+ const auto invalid_covariance = compare(prediction, true, 0U);
+ REQUIRE_FALSE(invalid_covariance);
+ CHECK(invalid_covariance.error().code == serial::wire::ErrorCode::InvalidFloat);
+ CHECK(invalid_covariance.error().path == "labels.skeleton.joints.covariance");
+ live.labels = {label};
+ live.labels.front().skeleton.schema.names.front().push_back('x');
+ const auto invalid_name = compare(live, true, 0U);
+ REQUIRE_FALSE(invalid_name);
+ CHECK(invalid_name.error().path == "labels.skeleton.schema.names");
+ validation.samples.front().labels = {{.name = std::string("\xc0\x80", 2U)}};
+ const auto invalid_utf8 = compare(validation, true);
+ REQUIRE_FALSE(invalid_utf8);
+ CHECK(invalid_utf8.error().code == serial::wire::ErrorCode::InvalidUtf8);
+ CHECK(invalid_utf8.error().path.empty());
+ scene.objects = {object};
+ scene.objects.front().skeleton_nodes.front().visibility = static_cast<catalog::KeypointVisibility>(255U);
+ const auto invalid_annotation = compare(annotation, false, 0U);
+ REQUIRE_FALSE(invalid_annotation);
+ CHECK(invalid_annotation.error().path == "scene.objects.skeleton_nodes.visibility");
 }
 TEST_CASE("Predict scalar progress excludes full retained labels and keeps native observation", "[browser][predict][reflection]") {
  using namespace mmltk::controller;

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <ranges>
 #include <span>
@@ -12,6 +13,18 @@
 namespace mmltk::frameworks::serialization::implementation::detail {
 wire::EncodeError encode_error(const wire::ErrorCode code) { return {.code = code, .offset = 0U, .path = {}}; }
 wire::DecodeError decode_error(const wire::ErrorCode code) { return {.code = code, .offset = 0U, .path = {}}; }
+void count_path(wire::CountingEncoder& counter, const std::filesystem::path& value, const std::size_t depth) {
+ // Linux generic_string preserves components and trailing separators, reducing
+ // each slash run to one slash. Count that spelling without constructing it;
+ // removing ASCII slashes cannot change validity of the original UTF-8 bytes.
+ std::size_t size = 0U;
+ bool slash = false;
+ for (const char character : value.native()) {
+  if (character != '/' || !slash) ++size;
+  slash = character == '/';
+ }
+ counter.text(value.native(), size, depth);
+}
 void prepend_path(wire::Error& error, const std::string_view component) {
  if (error.path.empty()) {
   error.path = component;
