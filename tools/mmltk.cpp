@@ -2229,7 +2229,8 @@ class Wrapper {
  std::pair<std::string, std::string> ensure_oracle_image(const std::string& revision) {
   const auto input = fingerprint({revision, donor, trim(read_optional(repo + "/build/tools/.inputs.sha256"))},
               {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp", "tools/oracle/native_catalog.cpp", "tools/oracle/native_catalog.h", "tools/oracle/rfdetr_sources.json",
-               "src/backend/models/rfdetr/contract/preset_catalog.h", "src/backend/models/rfdetr/contract/class_layout.h", "src/backend/models/rfdetr/contract/output_roles.h",
+               "src/backend/models/rfdetr/contract/preset_catalog.h", "src/backend/models/rfdetr/contract/model_topology.h", "src/backend/models/rfdetr/contract/training_supervision.h", "src/backend/models/rfdetr/contract/weight_catalog.h",
+               "src/backend/models/rfdetr/contract/class_layout.h", "src/backend/models/rfdetr/contract/output_roles.h",
                "src/backend/data/catalog/class_catalog.h", "src/backend/data/catalog/keypoint_schema.h", "src/frameworks/reflection/include/mmltk/frameworks/reflection/materializer.h", "src/frameworks/reflection/reflection_metadata.h",
                "src/frameworks/reflection/reflected_field_policy.h", "src/frameworks/reflection/field_policy.h", "src/frameworks/reflection/declaration_annotations.h", "src/frameworks/reflection/reflected_declarations.h",
                "tools/support/cpp_support.cpp", "tools/support/cpp_text.cpp", "tools/support/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake",

@@ -35,6 +35,7 @@
 #include "detail/training_supervision.h"
 #include "src/backend/ml/layers/ms_deform_attn.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/common/math/checked_arithmetic.h"
 import mmltk.backend.ml.cuda.gpu_quiescence;
 import mmltk.common.logging.mmltk_logging;

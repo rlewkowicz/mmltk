@@ -2,6 +2,7 @@
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/backend/models/rfdetr/core/detail/modules_technical.h"
 #include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/test_support/error_expectation_test_utils.hpp"
 #include <ATen/CPUGeneratorImpl.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>

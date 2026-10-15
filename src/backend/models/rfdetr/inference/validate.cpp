@@ -1,4 +1,5 @@
 #include "src/backend/models/rfdetr/core/evaluator.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/common/io/file_digest.h"

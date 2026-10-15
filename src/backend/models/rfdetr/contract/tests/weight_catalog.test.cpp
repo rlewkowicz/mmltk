@@ -205,3 +205,16 @@ TEST_CASE("RF-DETR configuration admission validates backbone patch grids", "[ba
  atto.resolution = 381;
  CHECK_FALSE(native_model_config_valid(atto));
 }
+TEST_CASE("RF-DETR supervision capabilities do not admit malformed topology", "[backend][models][rfdetr][contract]") {
+ using namespace mmltk::backend::models::rfdetr;
+ auto config = native_config_from_preset(*find_preset_catalog_entry("rf-detr-nano"));
+ config.training_supervision.assignment = TrainAssignmentKind::MatchFree;
+ config.training_supervision.denoising.enabled = true;
+ SECTION("negative decoder depth") { config.dec_layers = -1; }
+ SECTION("unknown task") { config.task = static_cast<ModelTask>(std::numeric_limits<std::uint8_t>::max()); }
+ SECTION("zero backbone attention heads") { config.backbone.heads = 0U; }
+ SECTION("repeated backbone features") { config.backbone.features[1U] = config.backbone.features[0U]; }
+ SECTION("keypoint head for detection") { config.keypoint_head = KeypointHeadKind::GroupPose; }
+ CHECK(training_supervision_model_config_valid(config));
+ CHECK_FALSE(native_model_config_valid(config));
+}

@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -9,12 +10,13 @@
 #include <string_view>
 #include <type_traits>
 #include "mmltk/frameworks/reflection/materializer.h"
-#include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/backend/models/rfdetr/contract/model_topology.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include <vector>
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::models::rfdetr {
+struct PresetCatalogEntry;
 enum class CompilationMode : std::uint8_t {
  kNone,
  kSelective,
@@ -83,7 +85,7 @@ MMLTK_REFLECT_FIELDS(NativeRfDetrConfig)
 [[nodiscard]] bool native_model_config_valid(const NativeRfDetrConfig& config) noexcept;
 [[nodiscard]] inline bool training_supervision_model_config_valid(const NativeRfDetrConfig& config) noexcept {
  if (!training_supervision_config_valid(config.training_supervision)) return false;
- if (training_supervision_enabled(config.training_supervision) && (config.task == ModelTask::Keypoints || config.dec_layers == 0)) return false;
+ if (training_supervision_admission_error(config.task, config.dec_layers, config.training_supervision)) return false;
  if (training_supervision_enabled(config.training_supervision) &&
      (config.num_queries < 0 || config.group_detr <= 0 ||
       !training_supervision_query_layout_valid(config.training_supervision, static_cast<std::size_t>(config.num_queries), static_cast<std::size_t>(config.group_detr), 0U))) {

@@ -1,5 +1,6 @@
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/detail/selective_compilation.h"
 #include "src/backend/models/rfdetr/core/detail/decoder_attention.h"
 #include "src/backend/models/rfdetr/core/detail/modules_technical.h"

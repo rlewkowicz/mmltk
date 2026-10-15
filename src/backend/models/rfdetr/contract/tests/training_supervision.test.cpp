@@ -3,7 +3,9 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <string>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
@@ -165,16 +167,63 @@ TEST_CASE("test_request_and_model_boundaries_reject_unsupported_feature_combinat
  test_request_and_model_boundaries_reject_unsupported_feature_combinations();
 }
 TEST_CASE("test_query_layout_capacity_checks_each_product_and_sum", "[model][rfdetr][training_supervision]") { test_query_layout_capacity_checks_each_product_and_sum(); }
-TEST_CASE("Task admission retains stock keypoint and zero-decoder training", "[model][rfdetr][training_supervision]") {
+TEST_CASE("Catalog capabilities and model and request admission agree for every supervision mode", "[model][rfdetr][training_supervision]") {
  using namespace mmltk::backend::models::rfdetr;
- for (const auto name : {"rf-detr-keypoint-preview", "rf-detr-atto"}) {
-  auto request = valid_train_request();
-  request.preset_name = name;
-  CHECK_NOTHROW(validate_train_request(request));
-  request.training_supervision.assignment = TrainAssignmentKind::MatchFree;
-  CHECK_THROWS(validate_train_request(request));
-  request.training_supervision.assignment = TrainAssignmentKind::Hungarian;
-  request.training_supervision.denoising.enabled = true;
-  CHECK_THROWS(validate_train_request(request));
+ for (const auto& row : kPresetCatalog) {
+  INFO(row.preset_name);
+  const bool supports_experimental = row.preset_name != "rf-detr-keypoint-preview" && row.preset_name != "rf-detr-atto";
+  const auto capabilities = model_training_capabilities(row.task, row.decoder_layer_count);
+  CHECK(capabilities == row.training_capabilities);
+  CHECK(capabilities.match_free == supports_experimental);
+  CHECK(capabilities.denoising == supports_experimental);
+  for (const auto assignment : {TrainAssignmentKind::Hungarian, TrainAssignmentKind::MatchFree}) {
+   for (const bool denoising : {false, true}) {
+    auto request = valid_train_request();
+    request.preset_name = row.preset_name;
+    request.training_supervision.assignment = assignment;
+    request.training_supervision.denoising.enabled = denoising;
+    INFO(cli_enum_spelling(assignment));
+    INFO("denoising=" << denoising);
+    const bool experimental = assignment == TrainAssignmentKind::MatchFree || denoising;
+    const bool admitted = !experimental || supports_experimental;
+    const auto error = training_supervision_admission_error(row.task, row.decoder_layer_count, request.training_supervision);
+    CHECK(error.has_value() == !admitted);
+    if (!admitted) {
+     REQUIRE(error.has_value());
+     CHECK(*error == (row.task == ModelTask::Keypoints
+                      ? "Keypoint training requires stock Hungarian supervision; Match-Free and denoising are unsupported"
+                      : "Zero-decoder Atto training does not support Match-Free or denoising supervision"));
+    }
+    auto model = native_config_from_preset(row);
+    model.training_supervision = request.training_supervision;
+    CHECK(training_supervision_model_config_valid(model) == admitted);
+    CHECK(native_model_config_valid(model) == admitted);
+    for (const auto mode : {CompilationMode::kNone, CompilationMode::kSelective, CompilationMode::kFullTrace}) {
+     request.compilation_mode = mode;
+     INFO(cli_enum_spelling(mode));
+     if (experimental && mode == CompilationMode::kFullTrace) {
+      CHECK_THROWS_WITH(validate_train_request(request), "RF-DETR Match-Free and denoising supervision do not support full-trace compilation");
+     } else if (admitted) {
+      CHECK_NOTHROW(validate_train_request(request));
+     } else {
+      CHECK_THROWS_WITH(validate_train_request(request), std::string(*error));
+     }
+    }
+   }
+  }
  }
+}
+TEST_CASE("Model supervision admission follows actual decoder depth", "[model][rfdetr][training_supervision]") {
+ using namespace mmltk::backend::models::rfdetr;
+ auto model = native_config_from_preset(*find_preset_catalog_entry("rf-detr-atto"));
+ model.training_supervision.assignment = TrainAssignmentKind::MatchFree;
+ model.training_supervision.denoising.enabled = true;
+ CHECK_FALSE(training_supervision_model_config_valid(model));
+ model.dec_layers = 1;
+ CHECK(training_supervision_model_config_valid(model));
+ CHECK(native_model_config_valid(model));
+ model.dec_layers = 0;
+ model.training_supervision = {};
+ CHECK(training_supervision_model_config_valid(model));
+ CHECK(native_model_config_valid(model));
 }

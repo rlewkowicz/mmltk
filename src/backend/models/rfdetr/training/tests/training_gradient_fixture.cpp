@@ -1,4 +1,5 @@
 #include "src/test_support/cuda_test_gate.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "training_gradient_fixture.h"
 #include "training_continuation_fixture.h"

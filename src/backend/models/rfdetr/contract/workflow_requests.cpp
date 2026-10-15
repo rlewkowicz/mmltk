@@ -60,7 +60,7 @@ void validate_train_request(const TrainRequest& request) {
   throw std::runtime_error("RF-DETR Match-Free and denoising supervision do not support full-trace compilation");
  }
  if (const PresetCatalogEntry* preset = find_preset_catalog_entry(request.preset_name)) {
-  if (const auto error = training_supervision_admission_error(*preset, request.training_supervision)) throw std::runtime_error(std::string(*error));
+  if (const auto error = training_supervision_admission_error(preset->task, preset->decoder_layer_count, request.training_supervision)) throw std::runtime_error(std::string(*error));
   NativeRfDetrConfig model_config = native_config_from_preset(*preset);
   if (!native_model_config_valid(model_config)) throw std::runtime_error("RF-DETR preset has invalid task or head topology");
   model_config.training_supervision = request.training_supervision;

@@ -1,4 +1,5 @@
 #include "src/backend/models/rfdetr/core/tests/training_fixture.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/models/rfdetr/core/detail/training_supervision.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"

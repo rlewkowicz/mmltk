@@ -1,11 +1,13 @@
 #pragma once
 #include <optional>
 #include <cstdint>
-#include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <span>
 #include <string>
 #include <string_view>
 namespace mmltk::backend::models::rfdetr {
+enum class OfficialClassLayout : std::uint8_t { Unresolved, CocoSparse, PersonActiveFirst, PersonBackgroundFirst };
+MMLTK_REFLECT_ENUM(OfficialClassLayout)
 struct WeightAsset final {
  std::string_view filename;
  std::string_view download_url;

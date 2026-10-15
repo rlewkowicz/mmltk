@@ -12,6 +12,7 @@
 #include "detail/training_distributed.h"
 #include "detail/evaluation_runtime.h"
 #include "src/backend/models/rfdetr/contract/cli.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"

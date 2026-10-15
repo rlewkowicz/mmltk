@@ -32,6 +32,7 @@
 #include "src/common/system/numa_memory.h"
 #include "src/common/system/numa_topology.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include <torch/types.h>

@@ -5,6 +5,7 @@
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include <torch/utils.h>
 #include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 // RF-DETR Match-Free mathematical and topology coverage.
 #include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>

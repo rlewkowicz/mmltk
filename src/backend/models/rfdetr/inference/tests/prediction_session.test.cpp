@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/frameworks/gpu/tests/terminal_retirement_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/frameworks/gpu/tests/pinned_host_fault.h"

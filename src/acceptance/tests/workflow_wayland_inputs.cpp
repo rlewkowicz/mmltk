@@ -9,6 +9,7 @@
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/model_state.h"

@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "detail/training_snapshot.h"
 #include "detail/training_artifact.h"
 #include "detail/training_session_checkpoint.h"

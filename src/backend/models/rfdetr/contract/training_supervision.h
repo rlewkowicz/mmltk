@@ -1,6 +1,6 @@
 #pragma once
 #include "src/frameworks/reflection/reflected_declarations.h"
-#include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/backend/models/rfdetr/contract/model_topology.h"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +9,16 @@
 #include <string_view>
 #include "mmltk/frameworks/reflection/materializer.h"
 namespace mmltk::backend::models::rfdetr {
+struct PresetTrainingCapabilities final {
+ bool match_free = false;
+ bool denoising = false;
+ constexpr bool operator==(const PresetTrainingCapabilities&) const noexcept = default;
+};
+MMLTK_REFLECT_FIELDS(PresetTrainingCapabilities)
+[[nodiscard]] constexpr PresetTrainingCapabilities model_training_capabilities(const ModelTask task, const std::int64_t decoder_layers) noexcept {
+ const bool decoder_supervision = task != ModelTask::Keypoints && decoder_layers != 0;
+ return {.match_free = decoder_supervision, .denoising = decoder_supervision};
+}
 enum class TrainAssignmentKind : std::uint8_t {
  Hungarian,
  MatchFree,
@@ -59,10 +69,12 @@ static_assert(mmltk::frameworks::reflection::ingress_policies_are_valid<Training
  return !mmltk::frameworks::reflection::validate_reflected_fields(config).has_value() && mmltk::frameworks::reflection::enum_contains(config.assignment) && selected_objective;
 }
 [[nodiscard]] constexpr bool training_supervision_enabled(const TrainingSupervisionConfig& config) noexcept { return config.assignment == TrainAssignmentKind::MatchFree || config.denoising.enabled; }
-[[nodiscard]] constexpr std::optional<std::string_view> training_supervision_admission_error(const PresetCatalogEntry& preset, const TrainingSupervisionConfig& config) noexcept {
+[[nodiscard]] constexpr std::optional<std::string_view> training_supervision_admission_error(
+ const ModelTask task, const std::int64_t decoder_layers, const TrainingSupervisionConfig& config) noexcept {
+ const auto capabilities = model_training_capabilities(task, decoder_layers);
  if (!training_supervision_enabled(config) ||
-     ((config.assignment != TrainAssignmentKind::MatchFree || preset.training_capabilities.match_free) && (!config.denoising.enabled || preset.training_capabilities.denoising))) return std::nullopt;
- if (preset.task == ModelTask::Keypoints) return "Keypoint training requires stock Hungarian supervision; Match-Free and denoising are unsupported";
+     ((config.assignment != TrainAssignmentKind::MatchFree || capabilities.match_free) && (!config.denoising.enabled || capabilities.denoising))) return std::nullopt;
+ if (task == ModelTask::Keypoints) return "Keypoint training requires stock Hungarian supervision; Match-Free and denoising are unsupported";
  return "Zero-decoder Atto training does not support Match-Free or denoising supervision";
 }
 [[nodiscard]] constexpr bool training_supervision_query_layout_valid(
