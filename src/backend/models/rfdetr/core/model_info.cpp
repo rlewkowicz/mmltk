@@ -1,5 +1,6 @@
 #include "model_info.h"
 #include "keypoint_layout.h"
+#include <algorithm>
 namespace mmltk::backend::models::rfdetr {
 void validate_rfdetr_output_contract(const RfdetrOutputContract& contract, const ResolvedClassLayout* layout) {
  if (contract.version != 1U || !model_task_name(contract.task)) throw std::invalid_argument("invalid RF-DETR output contract version/task");
@@ -13,42 +14,53 @@ void validate_rfdetr_output_contract(const RfdetrOutputContract& contract, const
  } else if (!contract.keypoints_per_class.empty()) throw std::invalid_argument("non-keypoint artifact declares joint slots");
 }
 RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo& info) {
- std::optional<std::size_t> logits, boxes, masks, keypoints;
+ RfdetrOutputRoles roles;
  for (std::size_t index = 0; index < info.outputs.size(); ++index) {
   auto& output = info.outputs[index];
   auto role = output.role;
-  const auto canonical = output.name == "pred_logits"   ? RfdetrOutputRole::Logits
-                         : output.name == "pred_boxes"  ? RfdetrOutputRole::Boxes
-                          : output.name == "pred_masks" ? RfdetrOutputRole::Masks
-                          : output.name == "pred_keypoints" ? RfdetrOutputRole::Keypoints
-                                                        : RfdetrOutputRole::Unspecified;
+  const auto canonical = RfdetrOutputSchema::canonical_role(output.name);
   if (role == RfdetrOutputRole::Unspecified)
    role = canonical;
   else if (canonical != RfdetrOutputRole::Unspecified && canonical != role)
    throw std::invalid_argument("RF-DETR output role contradicts canonical tensor name");
-  auto* selected = role == RfdetrOutputRole::Logits ? &logits : role == RfdetrOutputRole::Boxes ? &boxes : role == RfdetrOutputRole::Masks ? &masks : role == RfdetrOutputRole::Keypoints ? &keypoints : nullptr;
-  if (!selected || *selected) throw std::invalid_argument("ambiguous RF-DETR output roles");
-  *selected = index;
+  std::size_t rank = 0;
+  RfdetrOutputSchema::visit([&]<RfdetrOutputRole Role>(RfdetrOutputPolicy facts) {
+   if (role == Role) {
+    if (roles.index<Role>()) throw std::invalid_argument("ambiguous RF-DETR output roles");
+    roles.resolve<Role>(index);
+    rank = facts.rank;
+   }
+  });
+  if (rank == 0) throw std::invalid_argument("ambiguous RF-DETR output roles");
   output.role = role;
-  const auto rank = (role == RfdetrOutputRole::Masks || role == RfdetrOutputRole::Keypoints) ? 4U : 3U;
   if (output.shape.size() != rank || output.shape[0] == 0 || output.shape[0] < -1 || output.shape[1] <= 0 || output.shape[2] <= 0 || (role == RfdetrOutputRole::Boxes && output.shape[2] != 4) ||
-      ((role == RfdetrOutputRole::Masks || role == RfdetrOutputRole::Keypoints) && output.shape[3] <= 0))
+      std::any_of(output.shape.begin() + 3, output.shape.end(), [](auto extent) { return extent <= 0; }))
    throw std::invalid_argument("invalid RF-DETR output shape");
  }
- if (!logits || !boxes || info.outputs.size() != 2U + masks.has_value() + keypoints.has_value()) throw std::invalid_argument("RF-DETR requires declared logits and boxes outputs");
+ RfdetrOutputSchema::visit([&]<RfdetrOutputRole Role>(RfdetrOutputPolicy facts) {
+  if (!facts.task && !roles.index<Role>()) throw std::invalid_argument("RF-DETR requires declared logits and boxes outputs");
+ });
+ const auto logits = roles.index<RfdetrOutputRole::Logits>();
+ const auto keypoints = roles.index<RfdetrOutputRole::Keypoints>();
  const auto& shape = info.outputs[*logits].shape;
  for (const auto& output : info.outputs)
   if (output.shape[1] != shape[1] || (output.shape[0] > 0 && shape[0] > 0 && output.shape[0] != shape[0])) throw std::invalid_argument("RF-DETR output batch/query axes disagree");
- if (masks && keypoints) throw std::invalid_argument("RF-DETR masks and keypoints are mutually exclusive");
+ std::optional<ModelTask> inferred_task;
+ RfdetrOutputSchema::visit([&]<RfdetrOutputRole Role>(RfdetrOutputPolicy facts) {
+  if (facts.task && roles.index<Role>()) {
+   if (inferred_task && inferred_task != facts.task) throw std::invalid_argument("RF-DETR masks and keypoints are mutually exclusive");
+   inferred_task = facts.task;
+  }
+ });
  if (!info.output_contract) {
   if (keypoints) throw std::invalid_argument("keypoint artifacts require explicit task and joint schema metadata");
-  info.output_contract = RfdetrOutputContract{1U, masks ? ModelTask::Segmentation : ModelTask::Detection, {}};
+  info.output_contract = RfdetrOutputContract{1U, inferred_task.value_or(ModelTask::Detection), {}};
  }
  const auto& contract = *info.output_contract;
  validate_rfdetr_output_contract(contract);
- if (contract.version != 1U || !model_task_name(contract.task) ||
-     (contract.task == ModelTask::Segmentation) != masks.has_value() || (contract.task == ModelTask::Keypoints) != keypoints.has_value())
-  throw std::invalid_argument("RF-DETR output roles disagree with task metadata");
+ RfdetrOutputSchema::visit([&]<RfdetrOutputRole Role>(RfdetrOutputPolicy facts) {
+  if (facts.supports(contract.task) != roles.index<Role>().has_value()) throw std::invalid_argument("RF-DETR output roles disagree with task metadata");
+ });
  if (keypoints) {
   const KeypointTensorLayout joints(contract.keypoints_per_class);
   const auto& joint_shape = info.outputs[*keypoints].shape;
@@ -64,7 +76,7 @@ RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo& info) {
    throw std::invalid_argument("RF-DETR output dtypes disagree or are not floating point");
  info.num_queries = shape[1];
  info.num_classes = shape[2];
- info.has_masks = masks.has_value();
- return {*logits, *boxes, masks, keypoints};
+ info.has_masks = roles.index<RfdetrOutputRole::Masks>().has_value();
+ return roles;
 }
 }

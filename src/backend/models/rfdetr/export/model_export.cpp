@@ -7,10 +7,12 @@ module;
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/backend/models/rfdetr/contract/output_roles.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/backend/models/rfdetr/core/detail/traced_graph.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
 #define ONNX_NAMESPACE onnx_torch
 #include <cuda_runtime_api.h>
 #include <torch/csrc/jit/frontend/tracer.h>
@@ -28,6 +30,7 @@ module;
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include "src/backend/models/rfdetr/core/model.h"
 module mmltk.backend.models.rfdetr.model_export;
@@ -46,12 +49,13 @@ void erase_unused_module_self_input(const std::shared_ptr<torch::jit::Graph>& gr
  if (!graph->inputs().empty() && graph->inputs().front()->type()->kind() == c10::TypeKind::ClassType) { graph->eraseInput(0); }
 }
 void assign_onnx_tensor_names(const std::shared_ptr<torch::jit::Graph>& graph, const ModelTask task) {
- const std::size_t expected_outputs = task == ModelTask::Detection ? 2U : 3U;
+ const std::size_t expected_outputs = RfdetrOutputSchema::count(task);
  if (graph->inputs().size() != 1U || graph->outputs().size() != expected_outputs) throw std::runtime_error("RF-DETR ONNX graph does not expose the task prediction tensors");
  graph->inputs().front()->setDebugName("pixel_values");
- graph->outputs()[0]->setDebugName("pred_logits");
- graph->outputs()[1]->setDebugName("pred_boxes");
- if (task != ModelTask::Detection) graph->outputs()[2]->setDebugName(task == ModelTask::Segmentation ? "pred_masks" : "pred_keypoints");
+ std::size_t index = 0;
+ RfdetrOutputSchema::visit([&]<RfdetrOutputRole>(RfdetrOutputPolicy facts) {
+  if (facts.supports(task)) graph->outputs()[index++]->setDebugName(std::string(facts.name));
+ });
 }
 }  // namespace
 void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& output_path, const int opset_version, const int batch_size, const bool simplify,
@@ -88,12 +92,19 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
   const auto task = model.config().task;
   auto traced = torch::jit::tracer::trace({dummy_pixels}, [&technical_model, dummy_mask, task](torch::jit::Stack args) {
    const auto outputs = technical_model.forward(NestedTensor{args[0].toTensor(), dummy_mask}, true);
-   if (task == ModelTask::Keypoints) {
-    if (!outputs.main.pred_keypoints) throw std::runtime_error("keypoint export omitted its task output");
-    return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_keypoints};
-   }
-   if (task == ModelTask::Segmentation && outputs.main.pred_masks) { return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks}; }
-   return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes};
+   torch::jit::Stack stack;
+   stack.reserve(RfdetrOutputSchema::count(task));
+   RfdetrOutputProjection::visit(outputs.main, [&]<RfdetrOutputRole Role>(RfdetrOutputPolicy facts, const auto& tensor) {
+    if (!facts.supports(task)) return;
+    if constexpr (std::is_same_v<std::remove_cvref_t<decltype(tensor)>, torch::Tensor>) {
+     stack.emplace_back(tensor);
+    } else if (tensor) {
+     stack.emplace_back(*tensor);
+    } else if constexpr (Role == RfdetrOutputRole::Keypoints) {
+     throw std::runtime_error("keypoint export omitted its task output");
+    }
+   });
+   return stack;
   }, [](const torch::autograd::Variable&) { return ""; }, false, false, &export_module);
   detail::install_recorded_forward(export_module, *compilation_unit, traced.first->graph);
   std::unordered_map<std::string, at::Tensor> lowering_initializers;

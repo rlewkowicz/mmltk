@@ -1,12 +1,15 @@
 #pragma once
 #include <cstddef>
+#include <array>
 #include <algorithm>
 #include <span>
 #include <cstdint>
+#include <limits>
 #include <sstream>
 #include <optional>
 #include <stdexcept>
 #include "src/backend/models/rfdetr/contract/class_layout.h"
+#include "src/backend/models/rfdetr/contract/output_roles.h"
 #include <string>
 #include <vector>
 namespace mmltk::backend::models::rfdetr {
@@ -53,9 +56,23 @@ inline void apply_rfdetr_output_roles(ModelInfo& info, std::span<const RfdetrNam
  stream << "]";
  return stream.str();
 }
-struct RfdetrOutputRoles final {
- std::size_t logits{}, boxes{};
- std::optional<std::size_t> masks, keypoints;
+class RfdetrOutputRoles final {
+public:
+ template <RfdetrOutputRole Role>
+ [[nodiscard]] std::optional<std::size_t> index() const noexcept {
+  const auto value = indices_[RfdetrOutputSchema::index<Role>()];
+  return value == kAbsent ? std::nullopt : std::optional{value};
+ }
+private:
+ friend RfdetrOutputRoles validate_rfdetr_output_layout(ModelInfo&);
+ template <RfdetrOutputRole Role>
+ void resolve(std::size_t index) noexcept { indices_[RfdetrOutputSchema::index<Role>()] = index; }
+ inline static constexpr auto kAbsent = std::numeric_limits<std::size_t>::max();
+ std::array<std::size_t, kRfdetrExecutableOutputCount> indices_ = [] {
+  std::array<std::size_t, kRfdetrExecutableOutputCount> result;
+  result.fill(kAbsent);
+  return result;
+ }();
 };
 class ResolvedClassLayout;
 void validate_rfdetr_output_contract(const RfdetrOutputContract&, const ResolvedClassLayout* layout = nullptr);

@@ -2,6 +2,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/types.h>
 #include <c10/cuda/CUDAStream.h>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -15,6 +16,7 @@
 #include <vector>
 #include <memory>
 #include "src/backend/data/catalog/class_catalog.h"
+#include "src/backend/models/rfdetr/contract/output_roles.h"
 #include "reflected_tensor_packet.h"
 #include "criterion_terms.h"
 namespace mmltk::backend::models::rfdetr {
@@ -194,6 +196,41 @@ struct OutputTensors {
  std::optional<torch::Tensor> pred_masks{};
  std::optional<torch::Tensor> pred_keypoints{};
  std::span<const std::uint16_t> keypoints_per_class{};
+};
+namespace detail {
+template <class Owner>
+consteval auto output_role_members() {
+ std::array<std::meta::info, kRfdetrExecutableOutputCount> result{};
+ RfdetrOutputSchema::visit([&]<RfdetrOutputRole Role>(RfdetrOutputPolicy facts) {
+  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Owner, std::meta::access_context::current()))) {
+   if (std::meta::identifier_of(member) == facts.name) {
+    using Tensor = typename[:std::meta::type_of(member):];
+    if (facts.task ? !std::is_same_v<Tensor, std::optional<torch::Tensor>> : !std::is_same_v<Tensor, torch::Tensor>)
+     throw "RF-DETR output role has the wrong required/optional tensor type";
+    result[RfdetrOutputSchema::index<Role>()] = member;
+    return;
+   }
+  }
+  throw "RF-DETR output role has no matching tensor member";
+ });
+ return result;
+}
+// Materialize both structural boundaries here; consumers do not reflect their
+// own tensor inventories. Tensor handles and their storage stay with the caller.
+inline constexpr auto kOutputLayerRoleMembers = output_role_members<OutputLayer>();
+inline constexpr auto kOutputTensorRoleMembers = output_role_members<OutputTensors>();
+}  // namespace detail
+struct RfdetrOutputProjection final {
+ template <class Self, class Visitor>
+ static void visit(Self&& output, Visitor&& visitor) {
+  using Owner = std::remove_cvref_t<Self>;
+  static_assert(std::is_same_v<Owner, OutputLayer> || std::is_same_v<Owner, OutputTensors>);
+  RfdetrOutputSchema::visit([&]<RfdetrOutputRole Role>(RfdetrOutputPolicy facts) {
+   constexpr auto index = RfdetrOutputSchema::index<Role>();
+   constexpr auto member = std::is_same_v<Owner, OutputLayer> ? detail::kOutputLayerRoleMembers[index] : detail::kOutputTensorRoleMembers[index];
+   visitor.template operator()<Role>(facts, output.[:member:]);
+  });
+ }
 };
 void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, at::ScalarType expected_dtype, const char* context);
 struct DetectionConfig {

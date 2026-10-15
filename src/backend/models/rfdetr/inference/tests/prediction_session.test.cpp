@@ -373,6 +373,21 @@ TEST_CASE("cancelled prediction does not bind an artifact or deliver records", "
  CHECK_FALSE(delivered);
 }
 namespace {
+void rename_and_reverse_prediction_outputs(mmltk_onnx::ModelProto& model) {
+ auto* graph = model.mutable_graph();
+ for (auto& output : *graph->mutable_output()) {
+  const auto previous = output.name();
+  const auto renamed = "producer_" + previous;
+  output.set_name(renamed);
+  for (auto& node : *graph->mutable_node()) {
+   for (auto& input : *node.mutable_input()) if (input == previous) input = renamed;
+   for (auto& result : *node.mutable_output()) if (result == previous) result = renamed;
+  }
+  for (auto& value : *graph->mutable_value_info()) if (value.name() == previous) value.set_name(renamed);
+ }
+ auto* outputs = graph->mutable_output();
+ for (int index = 0; index < outputs->size() / 2; ++index) outputs->SwapElements(index, outputs->size() - index - 1);
+}
 class PredictionStream final {
 public:
  explicit PredictionStream(bool nonblocking) : selected_(nonblocking ? c10::cuda::getStreamFromExternal(owned_.get(), 0) : c10::cuda::getDefaultCUDAStream(0)), guard_(selected_) {
@@ -1289,39 +1304,36 @@ TEST_CASE("ONNX output roles accept explicit producer names without shape guessi
  namespace onnx = mmltk_onnx;
  const mmltk::testsupport::ScopedTempDir root("rfdetr-named-output-roles");
  const auto path = root.path() / "custom.onnx";
- write_prediction_model(path, 2, false);
+ const bool masks = GENERATE(false, true);
+ write_prediction_model(path, 2, masks);
  onnx::ModelProto model;
  {
   std::ifstream input(path, std::ios::binary);
   REQUIRE(model.ParseFromIstream(&input));
  }
- const std::array<std::pair<std::string, std::string>, 2> names{{{"pred_logits", "scores_from_producer"}, {"pred_boxes", "locations_from_producer"}}};
- for (const auto& [from, to] : names) {
-  for (auto& output : *model.mutable_graph()->mutable_output())
-   if (output.name() == from) output.set_name(to);
-  for (auto& node : *model.mutable_graph()->mutable_node())
-   for (auto& output : *node.mutable_output())
-    if (output == from) output = to;
- }
+ rename_and_reverse_prediction_outputs(model);
  {
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   REQUIRE(model.SerializeToOstream(&output));
  }
  CHECK_THROWS(rfdetr::load_onnx_model_info(path));
- const std::array roles{
-  rfdetr::RfdetrNamedOutputRole{"scores_from_producer", rfdetr::RfdetrOutputRole::Logits}, rfdetr::RfdetrNamedOutputRole{"locations_from_producer", rfdetr::RfdetrOutputRole::Boxes}
- };
+ std::vector<rfdetr::RfdetrNamedOutputRole> roles;
+ if (masks) roles.push_back({"producer_pred_masks", rfdetr::RfdetrOutputRole::Masks});
+ roles.push_back({"producer_pred_boxes", rfdetr::RfdetrOutputRole::Boxes});
+ roles.push_back({"producer_pred_logits", rfdetr::RfdetrOutputRole::Logits});
  const auto admitted = rfdetr::load_onnx_model_info(path, roles);
  CHECK(admitted.num_classes == 2);
  CHECK(admitted.num_queries == 2);
- CHECK_FALSE(admitted.has_masks);
+ CHECK(admitted.has_masks == masks);
+ REQUIRE(admitted.output_contract);
+ CHECK(admitted.output_contract->task == (masks ? rfdetr::ModelTask::Segmentation : rfdetr::ModelTask::Detection));
  CHECK_FALSE(admitted.class_layout);
  // CLEANUP-IGNORE: Two foreground slots are explicit inputs to distinct output-role mapping and retained descriptor identity cases.
  auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}));
  layout.slots.pop_back();
  const auto companion = std::filesystem::path(path.string() + ".classes.json");
  namespace io = mmltk::common::io;
- rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout, std::vector<rfdetr::RfdetrNamedOutputRole>(roles.begin(), roles.end())});
+ rfdetr::test_support::write_class_descriptor_fixture(companion, {1, io::sha256_hex(io::sha256_file(path)), layout, roles});
  rfdetr::simplify_onnx_model_file(path);
  const auto descriptor = rfdetr::test_support::checked_class_descriptor_fixture(path, companion, layout);
  CHECK((rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path, descriptor.output_roles)) == descriptor.output_roles));
@@ -2279,6 +2291,7 @@ TEST_CASE("Model-taking export isolates eager selective and full source executio
 }
 
 TEST_CASE("Native keypoint validation maps classes and named joints in both metric and sample directions", "[model][rfdetr][validation][keypoints][gpu]") {
+ const bool renamed_outputs = GENERATE(false, true);
  namespace data = mmltk::backend::data;
  namespace catalog = data::catalog;
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
@@ -2354,6 +2367,29 @@ TEST_CASE("Native keypoint validation maps classes and named joints in both metr
  CHECK(inspected.output_contract->task == rfdetr::ModelTask::Keypoints);
  CHECK(inspected.output_contract->keypoints_per_class == config.keypoints_per_class);
  CHECK(inspected.class_layout == layout);
+ REQUIRE(inspected.outputs.size() == 3);
+ CHECK(inspected.outputs[0].name == "pred_logits");
+ CHECK(inspected.outputs[1].name == "pred_boxes");
+ CHECK(inspected.outputs[2].name == "pred_keypoints");
+ if (renamed_outputs) {
+  // Exercise embedded roles through the real ONNX and engine repeated-lane
+  // comparisons below, alongside the original canonical-name case.
+  mmltk_onnx::ModelProto renamed_model;
+  {
+   std::ifstream input(exported.output_path, std::ios::binary);
+   REQUIRE(renamed_model.ParseFromIstream(&input));
+  }
+  rename_and_reverse_prediction_outputs(renamed_model);
+  {
+   std::ofstream output(exported.output_path, std::ios::binary | std::ios::trunc);
+   REQUIRE(renamed_model.SerializeToOstream(&output));
+  }
+  const auto renamed_info = rfdetr::load_onnx_model_info(exported.output_path);
+  CHECK(renamed_info.output_contract == inspected.output_contract);
+  CHECK(renamed_info.class_layout == inspected.class_layout);
+  CHECK(renamed_info.outputs.front().name == "producer_pred_keypoints");
+  CHECK(renamed_info.outputs.front().role == rfdetr::RfdetrOutputRole::Keypoints);
+ }
  rfdetr::BuildEngineRequest engine;
  engine.onnx_path = exported.output_path;
  engine.output_path = root.path() / "named-joints.engine";

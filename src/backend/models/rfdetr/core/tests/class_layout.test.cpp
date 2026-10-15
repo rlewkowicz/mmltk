@@ -10,8 +10,23 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
+#include <catch2/generators/catch_generators.hpp>
 namespace r = mmltk::backend::models::rfdetr;
 namespace catalog = mmltk::backend::data::catalog;
+namespace {
+r::ModelInfo task_output_info(r::ModelTask task) {
+ using Role = r::RfdetrOutputRole;
+ r::ModelInfo info;
+ info.outputs = {{"pred_logits", {2, 4, 3}, "float32", Role::Logits}, {"pred_boxes", {2, 4, 4}, "float32", Role::Boxes}};
+ info.output_contract = r::RfdetrOutputContract{1U, task, {}};
+ if (task == r::ModelTask::Segmentation) info.outputs.push_back({"pred_masks", {2, 4, 12, 16}, "float32", Role::Masks});
+ if (task == r::ModelTask::Keypoints) {
+  info.outputs.push_back({"pred_keypoints", {2, 4, 2, 8}, "float32", Role::Keypoints});
+  info.output_contract->keypoints_per_class = {2};
+ }
+ return info;
+}
+}  // namespace
 TEST_CASE("Native sigmoid layout preserves foreground zero and reserved output", "[rfdetr][layout]") {
  const r::ResolvedClassLayout layout(r::native_training_class_layout(catalog::ClassCatalog({"background", "person", "car"})));
  CHECK(layout.semantic());
@@ -87,8 +102,8 @@ TEST_CASE("Output names distinguish four-wide logits from boxes", "[rfdetr][layo
  r::ModelInfo info;
  info.outputs = {{"pred_boxes", {1, 300, 4}, "float32"}, {"pred_logits", {1, 300, 4}, "float32"}};
  const auto roles = r::validate_rfdetr_output_layout(info);
- CHECK(roles.logits == 1);
- CHECK(roles.boxes == 0);
+ CHECK(roles.index<r::RfdetrOutputRole::Logits>() == 1);
+ CHECK(roles.index<r::RfdetrOutputRole::Boxes>() == 0);
  CHECK(info.num_classes == 4);
  info.outputs[0].name = "some_box_tensor";
  for (auto& output : info.outputs) output.role = r::RfdetrOutputRole::Unspecified;
@@ -118,6 +133,76 @@ TEST_CASE("Class descriptors admit every canonical named output role", "[model][
  CHECK(r::decode_class_descriptor(r::encode_class_descriptor(descriptor)).output_roles == descriptor.output_roles);
  descriptor.output_roles.back().role = descriptor.output_roles.front().role;
  CHECK_THROWS(r::encode_class_descriptor(descriptor));
+}
+TEST_CASE("Artifact output roles preserve persisted identity and all task orderings", "[model][rfdetr][layout]") {
+ using Role = r::RfdetrOutputRole;
+ constexpr std::array spellings{"Unspecified", "Logits", "Boxes", "Masks", "Keypoints", "KeypointScores", "KeypointPrecision"};
+ for (std::size_t index = 0; index < spellings.size(); ++index)
+  CHECK(mmltk::frameworks::reflection::enum_name(static_cast<Role>(index)) == spellings[index]);
+ const auto task = GENERATE(r::ModelTask::Detection, r::ModelTask::Segmentation, r::ModelTask::Keypoints);
+ const bool renamed = GENERATE(false, true);
+ const auto dtype = GENERATE("float32", "float16", "bfloat16", "float64");
+ auto original = task_output_info(task);
+ for (auto& output : original.outputs) output.dtype = dtype;
+ original.outputs[0].shape[0] = -1;
+ std::array<std::size_t, 3> order{0, 1, 2};
+ do {
+  auto info = original;
+  for (std::size_t index = 0; index < info.outputs.size(); ++index) {
+   info.outputs[index] = original.outputs[order[index]];
+   if (renamed) info.outputs[index].name = "producer_" + info.outputs[index].name;
+   else info.outputs[index].role = Role::Unspecified;
+  }
+  const auto roles = r::validate_rfdetr_output_layout(info);
+  CHECK(roles.index<Role::Logits>() == static_cast<std::size_t>(std::ranges::find(order, 0) - order.begin()));
+  CHECK(roles.index<Role::Boxes>() == static_cast<std::size_t>(std::ranges::find(order, 1) - order.begin()));
+  const auto task_index = static_cast<std::size_t>(std::ranges::find(order, 2) - order.begin());
+  CHECK(roles.index<Role::Masks>() == (task == r::ModelTask::Segmentation ? std::optional{task_index} : std::nullopt));
+  CHECK(roles.index<Role::Keypoints>() == (task == r::ModelTask::Keypoints ? std::optional{task_index} : std::nullopt));
+  CHECK(info.num_queries == 4);
+  CHECK(info.num_classes == 3);
+  CHECK(info.has_masks == (task == r::ModelTask::Segmentation));
+  CHECK(info.output_contract == original.output_contract);
+  if (task != r::ModelTask::Keypoints) {
+   info.output_contract.reset();
+   CHECK_NOTHROW(r::validate_rfdetr_output_layout(info));
+   CHECK(info.output_contract == original.output_contract);
+  }
+ } while (std::next_permutation(order.begin(), order.begin() + original.outputs.size()));
+}
+TEST_CASE("Artifact task roles reject contradictory incomplete and unsupported outputs", "[model][rfdetr][layout]") {
+ using Role = r::RfdetrOutputRole;
+ const auto task = GENERATE(r::ModelTask::Detection, r::ModelTask::Segmentation, r::ModelTask::Keypoints);
+ auto info = task_output_info(task);
+ REQUIRE_NOTHROW(r::validate_rfdetr_output_layout(info));
+ SECTION("missing logits") { info.outputs.erase(info.outputs.begin()); }
+ SECTION("missing boxes") { info.outputs.erase(info.outputs.begin() + 1); }
+ SECTION("missing task output or unexpected task") {
+  if (task == r::ModelTask::Detection) info.output_contract->task = r::ModelTask::Segmentation;
+  else info.outputs.pop_back();
+ }
+ SECTION("extra task tensor") {
+  if (task == r::ModelTask::Segmentation) info.outputs.push_back({"pred_keypoints", {2, 4, 2, 8}, "float32"});
+  else info.outputs.push_back({"pred_masks", {2, 4, 12, 16}, "float32"});
+ }
+ SECTION("canonical name conflicts with explicit role") { info.outputs[0].role = Role::Boxes; }
+ SECTION("renamed duplicate role") { info.outputs.push_back({"producer_scores", {2, 4, 3}, "float32", Role::Logits}); }
+ SECTION("unsupported descriptor role") {
+  info.outputs.push_back({"producer_optional", {2, 4, 2}, "float32", GENERATE(Role::KeypointScores, Role::KeypointPrecision, static_cast<Role>(255))});
+ }
+ SECTION("unresolved producer name") { info.outputs[0].name = "producer_scores"; info.outputs[0].role = Role::Unspecified; }
+ SECTION("rank") { info.outputs[0].shape.push_back(1); }
+ SECTION("zero batch") { info.outputs[0].shape[0] = 0; }
+ SECTION("invalid dynamic batch") { info.outputs[0].shape[0] = -2; }
+ SECTION("batch disagreement") { info.outputs[1].shape[0] = 3; }
+ SECTION("query disagreement") { info.outputs[1].shape[1] = 3; }
+ SECTION("empty query axis") { info.outputs[0].shape[1] = 0; }
+ SECTION("empty class axis") { info.outputs[0].shape[2] = 0; }
+ SECTION("empty terminal extent") { info.outputs.back().shape.back() = 0; }
+ SECTION("box width") { info.outputs[1].shape[2] = 5; }
+ SECTION("dtype disagreement") { info.outputs[1].dtype = "float16"; }
+ SECTION("nonfloating outputs") { for (auto& output : info.outputs) output.dtype = "int32"; }
+ CHECK_THROWS_AS(r::validate_rfdetr_output_layout(info), std::invalid_argument);
 }
 
 TEST_CASE("Model schema admission bounds escaped JSON and validates optional raw evidence", "[rfdetr][layout][keypoints]") {
@@ -240,9 +325,9 @@ TEST_CASE("Keypoint artifact admission requires a typed task and exact physical 
  // Omitted trailing classifier slots have zero joint contribution.
  info.output_contract = r::RfdetrOutputContract{1U, r::ModelTask::Keypoints, {2}};
  const auto roles = r::validate_rfdetr_output_layout(info);
- CHECK(roles.keypoints == 0U);
- CHECK(roles.logits == 2U);
- CHECK_FALSE(roles.masks);
+ CHECK(roles.index<r::RfdetrOutputRole::Keypoints>() == 0U);
+ CHECK(roles.index<r::RfdetrOutputRole::Logits>() == 2U);
+ CHECK_FALSE(roles.index<r::RfdetrOutputRole::Masks>());
  CHECK(r::decode_output_contract(r::encode_output_contract(*info.output_contract)) == info.output_contract);
  const auto admitted = info;
  SECTION("wrong task") { info.output_contract->task = r::ModelTask::Detection; }

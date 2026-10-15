@@ -13,6 +13,8 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"
+#include <algorithm>
+#include <catch2/generators/catch_generators.hpp>
 namespace r = mmltk::backend::models::rfdetr;
 namespace c = mmltk::backend::data::catalog;
 namespace io = mmltk::common::io;
@@ -359,11 +361,17 @@ TEST_CASE("Engine companions bind joint task schema and reject competing contrac
  descriptor.artifact_sha256 = io::sha256_hex(io::sha256_file(artifact));
  descriptor.layout = r::native_training_class_layout(c::ClassCatalog(names));
  descriptor.output_roles = {{"pred_logits",r::RfdetrOutputRole::Logits},{"pred_boxes",r::RfdetrOutputRole::Boxes},{"pred_keypoints",r::RfdetrOutputRole::Keypoints}};
+ if (GENERATE(false, true)) {
+  for (auto& output : descriptor.output_roles) output.name = "producer_" + output.name;
+  std::ranges::reverse(descriptor.output_roles);
+ }
  descriptor.output_contract = r::RfdetrOutputContract{1U,r::ModelTask::Keypoints,{2}};
+ CHECK(r::decode_class_descriptor(r::encode_class_descriptor(descriptor)) == descriptor);
  const auto write = [&](const std::filesystem::path& destination) { std::ofstream output(destination); output << r::encode_class_descriptor(descriptor); };
  write(artifact.string() + ".classes.json");
  const r::ClassArtifactAdmission admitted(artifact);
  CHECK(admitted.output_contract() == descriptor.output_contract);
+ CHECK(admitted.output_roles() == descriptor.output_roles);
  CHECK(admitted.Resolve(2,{}) == descriptor.layout);
  const auto selected = root.path() / "selected.classes.json";
  descriptor.output_contract->keypoints_per_class.push_back(0);

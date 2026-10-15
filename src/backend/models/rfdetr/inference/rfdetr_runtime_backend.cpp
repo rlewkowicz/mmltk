@@ -1,5 +1,6 @@
 module;
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/backend/models/rfdetr/contract/output_roles.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "prediction_capacity.h"
@@ -16,7 +17,6 @@ module;
 #include <fstream>
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/common/io/file_digest.h"
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -245,9 +245,7 @@ struct RfdetrRuntimeBackend::State final {
  std::string artifact_sha256;
  std::shared_ptr<const ClassArtifactAdmission> admission;
  std::unique_ptr<PostprocessLane> postprocess;
- std::optional<std::size_t> masks, keypoints;
- std::size_t logits = std::numeric_limits<std::size_t>::max();
- std::size_t boxes = std::numeric_limits<std::size_t>::max();
+ RfdetrOutputRoles resolved_roles;
  std::shared_ptr<OutputStorage> outputs;
  std::vector<std::shared_ptr<PostprocessedSelection>> selections;
 };
@@ -279,20 +277,16 @@ RfdetrRuntimeBackend::RfdetrRuntimeBackend(std::shared_ptr<runtime::RuntimeBacke
  projected.output_contract = state_->output_contract;
  projected.class_layout = state_->layout->record();
  apply_rfdetr_output_roles(projected, state_->output_roles);
- const auto roles = validate_rfdetr_output_layout(projected);
- state_->logits = roles.logits;
- state_->boxes = roles.boxes;
- state_->masks = roles.masks;
- state_->keypoints = roles.keypoints;
- const auto& logits = model.outputs[state_->logits];
- const auto& boxes = model.outputs[state_->boxes];
+ state_->resolved_roles = validate_rfdetr_output_layout(projected);
+ const auto& logits = model.outputs[*state_->resolved_roles.index<RfdetrOutputRole::Logits>()];
+ const auto& boxes = model.outputs[*state_->resolved_roles.index<RfdetrOutputRole::Boxes>()];
  if ((logits.element_type != runtime::RuntimeElementType::Float16 && logits.element_type != runtime::RuntimeElementType::Float32) || boxes.element_type != logits.element_type ||
      logits.shape.extents[1] <= 0 || boxes.shape.extents[1] != logits.shape.extents[1] ||
      (boxes.shape.extents[0] > 0 && logits.shape.extents[0] > 0 && boxes.shape.extents[0] != logits.shape.extents[0])) {
   throw std::invalid_argument("RF-DETR logits and boxes have incompatible shapes or types");
  }
- if (state_->masks) {
-  const auto& masks = model.outputs[*state_->masks];
+ if (const auto index = state_->resolved_roles.index<RfdetrOutputRole::Masks>()) {
+  const auto& masks = model.outputs[*index];
   if (masks.element_type != logits.element_type || masks.shape.extents[1] != logits.shape.extents[1] || masks.shape.extents[2] <= 0 || masks.shape.extents[3] <= 0 ||
       (masks.shape.extents[0] > 0 && logits.shape.extents[0] > 0 && masks.shape.extents[0] != logits.shape.extents[0]))
    throw std::invalid_argument("RF-DETR masks have incompatible shape or type");
@@ -306,8 +300,8 @@ RfdetrRuntimeBackend::RfdetrRuntimeBackend(RfdetrRuntimeBackend&&) noexcept = de
 RfdetrRuntimeBackend& RfdetrRuntimeBackend::operator=(RfdetrRuntimeBackend&&) noexcept = default;
 const std::string& RfdetrRuntimeBackend::backend_name() const noexcept { return backend_name_; }
 const RfdetrOutputContract& RfdetrRuntimeBackend::output_contract() const noexcept { return state_->output_contract; }
-bool RfdetrRuntimeBackend::has_masks() const noexcept { return state_->masks.has_value(); }
-const runtime::RuntimeShape& RfdetrRuntimeBackend::logits_shape() const noexcept { return model_info().outputs[state_->logits].shape; }
+bool RfdetrRuntimeBackend::has_masks() const noexcept { return state_->resolved_roles.index<RfdetrOutputRole::Masks>().has_value(); }
+const runtime::RuntimeShape& RfdetrRuntimeBackend::logits_shape() const noexcept { return model_info().outputs[*state_->resolved_roles.index<RfdetrOutputRole::Logits>()].shape; }
 std::uint32_t RfdetrRuntimeBackend::static_resolution() const noexcept { return static_resolution_; }
 const std::shared_ptr<const ClassArtifactAdmission>& RfdetrRuntimeBackend::class_artifact() const noexcept { return state_->admission; }
 const std::string& RfdetrRuntimeBackend::artifact_sha256() const noexcept { return state_->artifact_sha256; }
@@ -327,7 +321,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
  if (!selections.empty()) state_->selections.resize(selections.size());
  if (state_->closed || !state_->retirement->admission_open()) throw std::runtime_error("RF-DETR runtime storage is retired");
  for (auto& annotation : annotations) {
-  const auto& logits = lane_->model_info().outputs[state_->logits];
+  const auto& logits = lane_->model_info().outputs[*state_->resolved_roles.index<RfdetrOutputRole::Logits>()];
   const auto capacity = PredictionCapacity::Resolve(std::min(maximum_detections_, annotation.value_capacity), static_cast<std::size_t>(batch), logits.shape.extents[1], logits.shape.extents[2],
    annotation.source_region.width, annotation.source_region.height, annotation.masks.address != 0U, state_->layout->eligible_count())
                          .candidates;
@@ -392,8 +386,8 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
    const auto bound_device = bound_owner.lane_->device();
    const auto bound_stream = bound_owner.lane_->command_stream().native_handle;
    PredictionCountStorage::Prepare(bound_call.outputs->counts, bound_call.annotations.size(), bound_device, bound_owner.state_->retirement, bound_owner.state_->operations);
-   auto logits = bound_call.outputs->tensors[bound_owner.state_->logits];
-   auto all_boxes = bound_call.outputs->tensors[bound_owner.state_->boxes];
+   const auto& roles = bound_owner.state_->resolved_roles;
+   const auto& logits = bound_call.outputs->tensors[*roles.index<RfdetrOutputRole::Logits>()];
    for (std::size_t index = 0U; index < bound_call.annotations.size(); ++index) {
     auto& annotation = bound_call.annotations[index];
     const auto limit = std::min({bound_owner.maximum_detections_, annotation.value_capacity, static_cast<std::size_t>(logits.size(1) * logits.size(2))});
@@ -402,15 +396,13 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
      continue;
     }
     const auto& region = annotation.source_region;
-    auto selected = select_output_batch_fixed_size(
-     OutputTensors{
-      .pred_logits = logits.narrow(0, static_cast<std::int64_t>(index), 1),
-      .pred_boxes = all_boxes.narrow(0, static_cast<std::int64_t>(index), 1),
-      .pred_masks =
-       bound_call.include_masks && bound_owner.state_->masks ? std::optional{bound_call.outputs->tensors[*bound_owner.state_->masks].narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
-      .pred_keypoints = bound_owner.state_->keypoints ? std::optional{bound_call.outputs->tensors[*bound_owner.state_->keypoints].narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
-      .keypoints_per_class = bound_owner.state_->output_contract.keypoints_per_class,
-     },
+    OutputTensors tensors;
+    RfdetrOutputProjection::visit(tensors, [&]<RfdetrOutputRole Role>(RfdetrOutputPolicy, auto& tensor) {
+     if constexpr (Role == RfdetrOutputRole::Masks) { if (!bound_call.include_masks) return; }
+     if (const auto resolved = roles.index<Role>()) tensor = bound_call.outputs->tensors[*resolved].narrow(0, static_cast<std::int64_t>(index), 1);
+    });
+    tensors.keypoints_per_class = bound_owner.state_->output_contract.keypoints_per_class;
+    auto selected = select_output_batch_fixed_size(tensors,
      region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->postprocess.get());
     bound_call.outputs->counts->Publish(index, selected.counts, annotation);
     write_analysis_keypoints(selected, annotation);
@@ -439,7 +431,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
        .shape = {.rank = 2U, .extents = {1, joints.size(1)}}, .element_type = runtime::RuntimeElementType::Int32};
      }
      if (selected.mask_logits) {
-      auto mask_buffer = bound_call.outputs->buffers[*bound_owner.state_->masks];
+      auto mask_buffer = bound_call.outputs->buffers[*roles.index<RfdetrOutputRole::Masks>()];
       mask_buffer.device_data = selected.mask_logits->data_ptr();
       mask_buffer.shape.extents[0] = 1;
       mask_buffer.capacity_bytes = selected.mask_logits->numel() * selected.mask_logits->element_size();
