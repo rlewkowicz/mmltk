@@ -47,6 +47,8 @@ mmltk_register_public_headers(
         detection_types.h
         detection_statistics.h
         reflected_tensor_packet.h
+        keypoint_prediction.h
+        keypoint_layout.h
         detection_ops.h
         sample_output.h
         execution_precision.h
@@ -82,6 +84,7 @@ mmltk_register_ordinary_sources(
     dino_backbone.cpp
     pe_core_backbone.cpp
     keypoint_head.cpp
+    keypoint_layout.cpp
     decoder_attention.cpp
     segmentation_depthwise.cpp
     gpu_batch_preprocessor.cpp

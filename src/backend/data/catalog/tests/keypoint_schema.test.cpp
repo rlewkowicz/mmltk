@@ -5,6 +5,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <utility>
 #include <vector>
 namespace catalog = mmltk::backend::data::catalog;
 TEST_CASE("Keypoint schema preserves named joint meaning across permutations", "[catalog][keypoint]") {
@@ -73,6 +74,51 @@ TEST_CASE("Keypoint schema admission rejects malformed identity and geometry met
  CHECK_THROWS(catalog::checked_keypoint_payload_count(1U, catalog::kKeypointsPerClassCapacity + 1U));
  CHECK(catalog::checked_foreground_index(255U) == 255U);
  CHECK_THROWS(catalog::checked_foreground_index(256U));
+}
+TEST_CASE("Named joint correspondence admits shared meaning independently of complete joint sets", "[catalog][keypoint]") {
+ using Pairs = std::vector<std::pair<catalog::JointIndex, catalog::JointIndex>>;
+ const catalog::ClassKeypointSchema source{{"left", "right", "nose", "old"}, {{0, 2}, {1, 2}, {2, 3}}, {1, 0, 2, 3}, {.05, .05, .07, .08}};
+ const catalog::ClassKeypointSchema destination{{"nose", "right", "new", "left"}, {{0, 1}, {3, 0}, {0, 2}}, {0, 3, 2, 1}, {.07, .05, .09, .05}};
+ // Edges touching removed/new joints do not change the shared skeleton.
+ CHECK(catalog::shared_keypoint_correspondence(source, destination) == Pairs{{2, 0}, {1, 1}, {0, 3}});
+ CHECK(catalog::shared_keypoint_correspondence(destination, source) == Pairs{{3, 0}, {1, 1}, {0, 2}});
+ CHECK_THROWS(catalog::keypoint_permutation(source, destination));
+ const catalog::ClassKeypointSchema disjoint{{"other"}, {}, {0}, {.2}};
+ CHECK(catalog::shared_keypoint_correspondence(source, disjoint).empty());
+ CHECK(catalog::shared_keypoint_correspondence(source, {}).empty());
+ CHECK(catalog::shared_keypoint_correspondence({}, destination).empty());
+ CHECK(catalog::keypoint_permutation({}, {}).empty());
+ CHECK_THROWS(catalog::keypoint_permutation(source, disjoint));
+ CHECK_THROWS(catalog::keypoint_permutation(source, {}));
+ auto conflict = destination;
+ conflict.oks_sigmas[0] = .2;
+ CHECK_THROWS(catalog::shared_keypoint_correspondence(source, conflict));
+ conflict = destination;
+ conflict.horizontal_flip = {0, 1, 2, 3};
+ CHECK_THROWS(catalog::shared_keypoint_correspondence(source, conflict));
+ conflict = destination;
+ conflict.skeleton.erase(conflict.skeleton.begin());
+ CHECK_THROWS(catalog::shared_keypoint_correspondence(source, conflict));
+ // A shared joint's named flip partner must agree even if the other joint
+ // was removed: restricting the comparison to shared endpoints is invalid.
+ const catalog::ClassKeypointSchema paired{{"anchor", "removed"}, {}, {1, 0}, {.1, .1}};
+ const catalog::ClassKeypointSchema replacement{{"anchor", "new"}, {}, {1, 0}, {.1, .1}};
+ const catalog::ClassKeypointSchema singleton{{"anchor"}, {}, {0}, {.1}};
+ CHECK_THROWS(catalog::shared_keypoint_correspondence(paired, replacement));
+ CHECK_THROWS(catalog::shared_keypoint_correspondence(paired, singleton));
+ // Exact and partial matching use the same checks for a complete named set.
+ const std::vector<catalog::JointIndex> permutation{3, 2, 1, 0};
+ auto complete = catalog::permute_keypoint_schema(source, permutation);
+ CHECK(catalog::keypoint_permutation(source, complete) == permutation);
+ CHECK(catalog::shared_keypoint_correspondence(source, complete) == Pairs{{3, 0}, {2, 1}, {1, 2}, {0, 3}});
+ for (unsigned kind = 0; kind < 3; ++kind) {
+  complete = catalog::permute_keypoint_schema(source, permutation);
+  if (kind == 0) complete.oks_sigmas[0] = .2;
+  if (kind == 1) complete.horizontal_flip = {0, 1, 2, 3};
+  if (kind == 2) complete.skeleton.pop_back();
+  CHECK_THROWS(catalog::keypoint_permutation(source, complete));
+  CHECK_THROWS(catalog::shared_keypoint_correspondence(source, complete));
+ }
 }
 TEST_CASE("Keypoint annotation keeps visible occluded and unannotated labels distinct", "[catalog][keypoint]") {
  CHECK(static_cast<std::uint8_t>(catalog::KeypointVisibility::Unannotated) == 0U);

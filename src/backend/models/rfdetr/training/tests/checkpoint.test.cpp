@@ -23,6 +23,7 @@
 #include "detail/checkpoint_private.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "model_state_fixture.h"
 #include "parity_fixture_support.h"
@@ -632,7 +633,14 @@ TEST_CASE("Native format four admits bounded historical topology and normalizes 
 TEST_CASE("Joint Transfer uses named schema entries and exact loading rejects semantic changes atomically", "[rfdetr][checkpoint][keypoints]") {
  namespace r = mmltk::backend::models::rfdetr;
  namespace c = mmltk::backend::data::catalog;
- const c::ClassKeypointSchema source_schema{{"left", "right", "nose"}, {{0, 2}, {1, 2}}, {1, 0, 2}, {.05, .05, .05}};
+ c::ClassKeypointSchema source_schema{{"left", "right", "nose"}, {{0, 2}, {1, 2}}, {1, 0, 2}, {.05, .05, .05}};
+ SECTION("Source joint set is retained") {}
+ SECTION("Source-only joint and its skeleton edge are removed") {
+  source_schema.names.push_back("removed");
+  source_schema.skeleton.push_back({2, 3});
+  source_schema.horizontal_flip.push_back(3);
+  source_schema.oks_sigmas.push_back(.1);
+ }
  const c::ClassKeypointSchema destination_schema{{"nose", "left", "new", "right"}, {{0, 1}, {0, 3}}, {0, 3, 2, 1}, {.05, .05, .1, .05}};
  const auto layout = [](const auto& schema) {
   c::OrderedClassCatalog record;
@@ -646,7 +654,7 @@ TEST_CASE("Joint Transfer uses named schema entries and exact loading rejects se
  config.num_queries = config.num_select = 3;
  config.group_detr = 1;
  config.num_classes = 3;
- config.keypoints_per_class = {3, 0};
+ config.keypoints_per_class = {static_cast<std::uint16_t>(source_schema.names.size()), 0};
  r::NativeRfDetrModel source(config, source_layout.record());
  auto entries = r::testsupport::clone_normalized_model_state(source);
  const std::array axes{"transformer.decoder.keypoint_pos_embed", "transformer.keypoint_query_initializer.queries", "transformer.keypoint_query_initializer_enc.queries"};
@@ -679,6 +687,12 @@ TEST_CASE("Joint Transfer uses named schema entries and exact loading rejects se
  auto missing = entries;
  std::erase_if(missing, [](const auto& entry) { return entry.name == "transformer.decoder.keypoint_class_mask"; });
  CHECK_THROWS(destination.stage_normalized_state(missing, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
+ const auto partial = destination.stage_normalized_state(missing, r::detail::NormalizedModelStateAdmission::PartialFreshTransfer, &source_layout);
+ CHECK(partial.summary.missing_names == std::vector<std::string>{"transformer.decoder.keypoint_class_mask"});
+ CHECK_THROWS(destination.stage_normalized_state(malformed, r::detail::NormalizedModelStateAdmission::PartialFreshTransfer, &source_layout));
+ auto no_active_mask = entries;
+ std::erase_if(no_active_mask, [](const auto& entry) { return entry.name == "_kp_active_mask"; });
+ CHECK_THROWS(destination.stage_normalized_state(no_active_mask, r::detail::NormalizedModelStateAdmission::PartialFreshTransfer, &source_layout));
  auto duplicated = entries;
  duplicated.push_back(entries.front());
  CHECK_THROWS(destination.stage_normalized_state(duplicated, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
@@ -690,10 +704,18 @@ TEST_CASE("Joint Transfer uses named schema entries and exact loading rejects se
  std::swap(reordered.foreground.keypoints->front().names[0], reordered.foreground.keypoints->front().names[2]);
  CHECK_THROWS(destination.load_normalized_state(installed, true, &reordered));
  const auto installed_parameters = destination.named_parameters();
+ const auto installed_buffers = destination.named_buffers();
  for (const auto& entry : installed) {
-  const auto current = installed_parameters.find(entry.name);
-  if (current) CHECK(torch::equal(*current, entry.tensor));
+  const auto* current = installed_parameters.find(entry.name);
+  if (!current) current = installed_buffers.find(entry.name);
+  REQUIRE(current != nullptr);
+  CHECK(torch::equal(*current, entry.tensor));
  }
+ const r::KeypointTensorLayout destination_joints(config.keypoints_per_class);
+ CHECK(torch::equal(installed_buffers["_kp_active_mask"], destination_joints.active_mask()));
+ CHECK(torch::equal(installed_buffers["transformer.decoder.keypoint_class_mask"], destination_joints.class_mask()));
+ CHECK(destination_joints.slot_count() == 2);
+ CHECK(destination_joints.padded_count() == 8);  // Third classifier slot stays omitted.
  mmltk::testsupport::ScopedTempDir directory("rfdetr-joint-native");
  r::DecodedNativeModelState checkpoint;
  checkpoint.metadata = r::testsupport::model_checkpoint_metadata(destination, "native", "joint fixture");
@@ -704,6 +726,10 @@ TEST_CASE("Joint Transfer uses named schema entries and exact loading rejects se
  CHECK(restored.artifacts.config.keypoints_per_class == config.keypoints_per_class);
  CHECK(restored.artifacts.class_layout == destination.class_layout()->record());
  CHECK(destination.load_normalized_state(restored.model_state.entries(), true).loaded_names.size() == restored.model_state.tensor_count());
+ auto partial_exact = r::testsupport::clone_normalized_model_state(destination);
+ std::erase_if(partial_exact, [](const auto& entry) { return entry.name == "transformer.decoder.keypoint_class_mask"; });
+ CHECK_NOTHROW(destination.stage_normalized_state(partial_exact, r::detail::NormalizedModelStateAdmission::PartialExact));
+ CHECK_THROWS(destination.stage_normalized_state(partial_exact, r::detail::NormalizedModelStateAdmission::Exact));
  auto conflicting_topology = config;
  conflicting_topology.num_windows = 1;
  r::NativeRfDetrModel wrong_windows(conflicting_topology, destination.class_layout()->record());

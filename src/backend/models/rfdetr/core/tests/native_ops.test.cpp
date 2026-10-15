@@ -11,6 +11,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -27,6 +28,7 @@
 #include <unistd.h>
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/detail/keypoint_head.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "detail/lsap_scratch.h"
@@ -1145,18 +1147,75 @@ TEST_CASE("CUDA matcher keeps exact grouped assignments for repeated and reorder
  REQUIRE(workspace.statistics().cost_submissions == before.cost_submissions);
 }
 
+TEST_CASE("GroupPose packet selects the fixed upstream channels by native field identity", "[rfdetr][keypoints]") {
+ namespace kp = mmltk::backend::models::rfdetr;
+ using Packet = kp::KeypointPredictionPacket;
+ STATIC_REQUIRE(Packet::size == 8);
+ STATIC_REQUIRE(sizeof(kp::KeypointPrediction) / sizeof(float) == Packet::size);
+ STATIC_REQUIRE(offsetof(kp::KeypointPrediction, x) / sizeof(float) == Packet::index<^^kp::KeypointPrediction::x>());
+ STATIC_REQUIRE(offsetof(kp::KeypointPrediction, findable_logit) / sizeof(float) == Packet::index<^^kp::KeypointPrediction::findable_logit>());
+ STATIC_REQUIRE(offsetof(kp::KeypointPrediction, class_logit) / sizeof(float) == Packet::index<^^kp::KeypointPrediction::class_logit>());
+ const auto tensor = torch::arange(8, torch::kFloat32).reshape({1, 1, 1, 8});
+ CHECK(Packet::select<^^kp::KeypointPrediction::x>(tensor, -1).item<float>() == 0.F);
+ CHECK(Packet::select<^^kp::KeypointPrediction::y>(tensor, -1).item<float>() == 1.F);
+ CHECK(Packet::select<^^kp::KeypointPrediction::findable_logit>(tensor, -1).item<float>() == 2.F);
+ CHECK(Packet::select<^^kp::KeypointPrediction::visible_logit>(tensor, -1).item<float>() == 3.F);
+ CHECK(Packet::select<^^kp::KeypointPrediction::log_l11>(tensor, -1).item<float>() == 4.F);
+ CHECK(Packet::select<^^kp::KeypointPrediction::l21>(tensor, -1).item<float>() == 5.F);
+ CHECK(Packet::select<^^kp::KeypointPrediction::log_l22>(tensor, -1).item<float>() == 6.F);
+ CHECK(Packet::select<^^kp::KeypointPrediction::class_logit>(tensor, -1).item<float>() == 7.F);
+}
+
+TEST_CASE("GroupPose tensor layouts retain empty slots and reject malformed extents", "[rfdetr][keypoints]") {
+ namespace kp = mmltk::backend::models::rfdetr;
+ const kp::KeypointTensorLayout empty;
+ CHECK(empty.compact_count() == 0);
+ CHECK(empty.padded_count() == 0);
+ CHECK(empty.active_mask().sizes() == c10::IntArrayRef({0, 0}));
+ CHECK_FALSE(empty.class_mask()[0][0].item<bool>());
+ CHECK(kp::KeypointTensorLayout::from_active_mask(empty.active_mask()).counts().empty());
+ CHECK_THROWS(empty.pad(torch::zeros({1, 1, 0, 8})));
+ const kp::KeypointTensorLayout inactive(std::array<std::uint16_t, 2>{0, 0});
+ CHECK(inactive.active_mask().sizes() == c10::IntArrayRef({2, 0}));
+ CHECK(kp::KeypointTensorLayout::from_active_mask(inactive.active_mask()).slot_count() == 2);
+ const auto zero = inactive.pad(torch::zeros({1, 1, 0, 8}));
+ CHECK(zero.sizes() == c10::IntArrayRef({1, 1, 0, 8}));
+ CHECK(torch::equal(inactive.class_logits(zero, inactive.active_mask(), 3), torch::zeros({1, 1, 3})));
+ const kp::KeypointTensorLayout mixed(std::array<std::uint16_t, 3>{2, 0, 1});
+ CHECK(mixed.compact_count() == 3);
+ CHECK(mixed.maximum_joints() == 2);
+ CHECK(mixed.padded_count() == 6);
+ CHECK(mixed.compact_offset(1) == 2);
+ CHECK(mixed.compact_offset(2) == 2);
+ CHECK(mixed.compact_offset(3) == 3);
+ CHECK(mixed.padded_offset(2) == 4);
+ CHECK(mixed.padded_offset(3) == 6);
+ CHECK_THROWS(mixed.compact_offset(4));
+ CHECK_THROWS(mixed.padded_offset(4));
+ CHECK_THROWS(mixed.pad(torch::zeros({1, 1, 2, 8})));
+ CHECK_THROWS(mixed.pad(torch::zeros({1, 1, 3, 7})));
+ CHECK_THROWS(mixed.pad(torch::zeros({1, 3, 8})));
+ const auto padded = mixed.pad(torch::zeros({1, 1, 3, 8}));
+ CHECK_THROWS(mixed.class_logits(padded, mixed.active_mask(), 2));
+ CHECK_THROWS(mixed.class_logits(padded, inactive.active_mask(), 3));
+ CHECK_THROWS(mixed.class_logits(torch::zeros({1, 1, 5, 8}), mixed.active_mask(), 3));
+ for (const auto& mask : {torch::Tensor{}, torch::zeros({2, 2}), torch::zeros({1, 2, 2}, torch::kBool), torch::tensor({{false, true}}, torch::kBool), torch::zeros({2, 3}, torch::kBool), torch::zeros({0, 1}, torch::kBool), torch::zeros({4097, 0}, torch::kBool), torch::ones({1, 257}, torch::kBool), torch::ones({257, 1}, torch::kBool)})
+  CHECK_THROWS(kp::KeypointTensorLayout::from_active_mask(mask));
+}
+
 TEST_CASE("GroupPose compact joints preserve precision, visibility, class masks and finite gradients", "[rfdetr][keypoints]") {
- namespace kp = mmltk::backend::models::rfdetr::detail;
+ namespace kp = mmltk::backend::models::rfdetr;
  const std::array<std::uint16_t, 3> counts{2, 0, 1};
- const auto active = kp::keypoint_active_mask(counts), mask = kp::keypoint_class_mask(counts);
- CHECK(kp::keypoint_counts_from_mask(active) == std::vector<std::uint16_t>{2, 0, 1});
+ const kp::KeypointTensorLayout layout(counts);
+ const auto active = layout.active_mask(), mask = layout.class_mask();
+ CHECK(std::ranges::equal(kp::KeypointTensorLayout::from_active_mask(active).counts(), counts));
  REQUIRE(mask.sizes() == c10::IntArrayRef({4, 4}));
  CHECK_FALSE(mask[0].any().item<bool>());
  CHECK_FALSE(mask.select(1, 0).any().item<bool>());
  CHECK_FALSE(mask[1][2].item<bool>());
  CHECK(mask[1][3].item<bool>());
- CHECK_THROWS(kp::keypoint_counts_from_mask(torch::tensor({{false, true}}, torch::kBool)));
- CHECK_THROWS(kp::keypoint_counts_from_mask(torch::zeros({2, 3}, torch::kBool)));
+ CHECK_THROWS(kp::KeypointTensorLayout::from_active_mask(torch::tensor({{false, true}}, torch::kBool)));
+ CHECK_THROWS(kp::KeypointTensorLayout::from_active_mask(torch::zeros({2, 3}, torch::kBool)));
  for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
   CAPTURE(dtype);
   const auto options = torch::TensorOptions().dtype(dtype);
@@ -1166,7 +1225,7 @@ TEST_CASE("GroupPose compact joints preserve precision, visibility, class masks 
   delta.set_requires_grad(true);
   auto boxes = torch::tensor({{{.5F, .25F, .2F, .4F}, {.5F, .25F, .2F, .4F}}}, options).set_requires_grad(true);
   const auto compact = kp::refine_keypoints(delta, boxes);
-  const auto padded = kp::padded_keypoints(compact, counts);
+  const auto padded = layout.pad(compact);
   REQUIRE(padded.sizes() == c10::IntArrayRef({1, 2, 6, 8}));
   CHECK(torch::isfinite(padded).all().item<bool>());
   CHECK(padded[0][0][0][0].item<float>() == .5F);
@@ -1175,7 +1234,7 @@ TEST_CASE("GroupPose compact joints preserve precision, visibility, class masks 
   CHECK(torch::equal(padded.narrow(2, 5, 1), torch::zeros_like(padded.narrow(2, 5, 1))));
   // Channels 2/3 are logits and 4/5/6 raw Cholesky entries, never squashed.
   CHECK(padded[0][1][4][6].item<float>() == 1.F);
-  const auto logits = kp::keypoint_class_logits(padded, active, 4);
+  const auto logits = layout.class_logits(padded, active, 4);
   CHECK(torch::equal(logits, torch::tensor({{{2.F, 0.F, 1.F, 0.F}, {2.F, 0.F, 1.F, 0.F}}}, options)));
   (padded.to(torch::kFloat32).sum() + logits.to(torch::kFloat32).sum()).backward();
   CHECK(torch::isfinite(boxes.grad()).all().item<bool>());

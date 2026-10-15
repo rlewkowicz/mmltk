@@ -14,6 +14,44 @@ SkeletonEdge ordered_edge(SkeletonEdge edge) noexcept {
  if (edge.second < edge.first) std::swap(edge.first, edge.second);
  return edge;
 }
+using JointLookup = std::unordered_map<std::string_view, JointIndex>;
+JointLookup joint_lookup(const ClassKeypointSchema& schema) {
+ JointLookup lookup;
+ lookup.reserve(schema.names.size());
+ for (std::size_t index = 0; index < schema.names.size(); ++index) lookup.emplace(schema.names[index], checked_joint_index(index, schema.names.size()));
+ return lookup;
+}
+std::set<std::pair<std::string_view, std::string_view>> shared_edges(const ClassKeypointSchema& schema, const JointLookup& other) {
+ std::set<std::pair<std::string_view, std::string_view>> edges;
+ for (const auto edge : schema.skeleton) {
+  std::string_view first = schema.names[edge.first], second = schema.names[edge.second];
+  if (!other.contains(first) || !other.contains(second)) continue;
+  if (second < first) std::swap(first, second);
+  edges.emplace(first, second);
+ }
+ return edges;
+}
+std::vector<std::pair<JointIndex, JointIndex>> joint_correspondence(const ClassKeypointSchema& source, const ClassKeypointSchema& destination, bool exact) {
+ validate_keypoint_schema(source);
+ validate_keypoint_schema(destination);
+ if (exact && source.names.size() != destination.names.size()) throw std::invalid_argument("keypoint schemas have different joint sets");
+ const auto source_lookup = joint_lookup(source), destination_lookup = joint_lookup(destination);
+ std::vector<std::pair<JointIndex, JointIndex>> result;
+ result.reserve(std::min(source.names.size(), destination.names.size()));
+ for (std::size_t target = 0; target < destination.names.size(); ++target) {
+  const auto found = source_lookup.find(destination.names[target]);
+  if (found == source_lookup.end()) {
+   if (exact) throw std::invalid_argument("keypoint schemas have different joint sets");
+   continue;
+  }
+  const auto from = found->second;
+  if (source.oks_sigmas[from] != destination.oks_sigmas[target] || source.names[source.horizontal_flip[from]] != destination.names[destination.horizontal_flip[target]])
+   throw std::invalid_argument("keypoint schemas disagree on joint meaning: " + destination.names[target]);
+  result.emplace_back(from, checked_joint_index(target, destination.names.size()));
+ }
+ if (shared_edges(source, destination_lookup) != shared_edges(destination, source_lookup)) throw std::invalid_argument("keypoint schemas disagree on skeleton meaning for shared joints");
+ return result;
+}
 }
 JointIndex checked_joint_index(const std::size_t index, const std::size_t count) {
  if (count > kKeypointsPerClassCapacity || index >= count) throw std::invalid_argument("keypoint index exceeds admitted joint count");
@@ -76,25 +114,13 @@ ClassKeypointSchema permute_keypoint_schema(const ClassKeypointSchema& source, c
  return result;
 }
 std::vector<JointIndex> keypoint_permutation(const ClassKeypointSchema& source, const ClassKeypointSchema& destination) {
- validate_keypoint_schema(source);
- validate_keypoint_schema(destination);
- if (source.names.size() != destination.names.size()) throw std::invalid_argument("keypoint schemas have different joint sets");
- std::unordered_map<std::string_view, JointIndex> lookup;
- for (std::size_t index = 0; index < destination.names.size(); ++index) lookup.emplace(destination.names[index], checked_joint_index(index, destination.names.size()));
- std::vector<JointIndex> permutation;
- permutation.reserve(source.names.size());
- for (const auto& name : source.names) {
-  const auto found = lookup.find(name);
-  if (found == lookup.end()) throw std::invalid_argument("keypoint schemas have different joint sets");
-  permutation.push_back(found->second);
- }
- const auto mapped = permute_keypoint_schema(source, permutation);
- auto edges = destination.skeleton;
- for (auto& edge : edges) edge = ordered_edge(edge);
- std::ranges::sort(edges);
- if (mapped.horizontal_flip != destination.horizontal_flip || mapped.oks_sigmas != destination.oks_sigmas || mapped.skeleton != edges)
-  throw std::invalid_argument("keypoint schemas disagree on joint meaning");
+ const auto pairs = joint_correspondence(source, destination, true);
+ std::vector<JointIndex> permutation(source.names.size());
+ for (const auto [from, to] : pairs) permutation[from] = to;
  return permutation;
+}
+std::vector<std::pair<JointIndex, JointIndex>> shared_keypoint_correspondence(const ClassKeypointSchema& source, const ClassKeypointSchema& destination) {
+ return joint_correspondence(source, destination, false);
 }
 ClassKeypointSchema coco_person_keypoint_schema() {
  // COCO person category order; edges use zero-based canonical joint references.

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 #include "src/backend/data/catalog/keypoint_visibility.h"
 #include "src/frameworks/reflection/reflected_declarations.h"
@@ -40,6 +41,9 @@ void validate_keypoint_annotations(std::span<const KeypointAnnotation> joints, s
 [[nodiscard]] std::uint32_t checked_keypoint_payload_count(std::size_t instances, std::size_t joints_per_instance);
 // Source index -> destination index; verifies sigma, flip and skeleton meaning.
 [[nodiscard]] std::vector<JointIndex> keypoint_permutation(const ClassKeypointSchema& source, const ClassKeypointSchema& destination);
+// Source/destination pairs in destination order. Shared exact names retain
+// sigma and named flip partners; edges are compared only between shared joints.
+[[nodiscard]] std::vector<std::pair<JointIndex, JointIndex>> shared_keypoint_correspondence(const ClassKeypointSchema& source, const ClassKeypointSchema& destination);
 [[nodiscard]] ClassKeypointSchema permute_keypoint_schema(const ClassKeypointSchema& source, std::span<const JointIndex> source_to_destination);
 [[nodiscard]] ClassKeypointSchema coco_person_keypoint_schema();
 }  // namespace mmltk::backend::data::catalog

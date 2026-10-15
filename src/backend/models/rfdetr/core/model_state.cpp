@@ -10,7 +10,7 @@
 #include <charconv>
 #include "src/backend/ml/torch/archive.h"
 #include "detail/class_tensor_axes.h"
-#include "detail/keypoint_head.h"
+#include "keypoint_layout.h"
 #include "src/frameworks/serialization/json_wire.h"
 #include "src/frameworks/serialization/serialization.h"
 #include "src/backend/models/rfdetr/contract/artifacts.h"
@@ -236,6 +236,8 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
   throw std::invalid_argument("checkpoint output width disagrees with its class layout");
  std::optional<NativeRfDetrConfig> config;
  if (!state.metadata.native_configuration.empty() || !state.metadata.preset_name.empty()) config = checkpoint_configuration(state.metadata);
+ std::optional<KeypointTensorLayout> keypoints;
+ if (config) keypoints.emplace(config->keypoints_per_class);
  std::unordered_set<std::string_view> names;
  names.reserve(state.tensor_count());
  for (const auto& entry : state.entries()) {
@@ -244,11 +246,11 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
   if (config) {
    const auto& value = *config;
    if (entry.name == "_kp_active_mask") {
-    const auto counts = detail::keypoint_counts_from_mask(entry.tensor);
-    if (counts != value.keypoints_per_class) throw std::invalid_argument("checkpoint active mask conflicts with model configuration");
-    detail::validate_keypoint_layout(layout, counts);
+    const auto supplied = KeypointTensorLayout::from_active_mask(entry.tensor);
+    if (!std::ranges::equal(supplied.counts(), keypoints->counts())) throw std::invalid_argument("checkpoint active mask conflicts with model configuration");
+    supplied.require_class_layout(layout);
    }
-   if (entry.name == "transformer.decoder.keypoint_class_mask" && (!value.has_keypoints() || entry.tensor.scalar_type() != torch::kBool || !torch::equal(entry.tensor.to(torch::kCPU), detail::keypoint_class_mask(value.keypoints_per_class)))) throw std::invalid_argument("checkpoint keypoint attention mask disagrees with schema");
+   if (entry.name == "transformer.decoder.keypoint_class_mask" && (!value.has_keypoints() || entry.tensor.scalar_type() != torch::kBool || !torch::equal(entry.tensor.to(torch::kCPU), keypoints->class_mask()))) throw std::invalid_argument("checkpoint keypoint attention mask disagrees with schema");
    const bool dino_patch = entry.name == "backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight";
    const bool pe_patch = entry.name == "backbone.0.encoder.model.patch_embed.proj.weight";
    if (dino_patch || pe_patch) {
@@ -260,7 +262,7 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
   if (!axis) continue;
   if (!entry.tensor.defined() || entry.tensor.dim() != axis->rank || entry.tensor.size(axis->dimension) <= 0) throw std::invalid_argument("invalid class-dependent checkpoint tensor: " + entry.name);
   if (axis->coordinates == detail::ClassTensorCoordinates::NamedJoints) {
-   if (!config || !config->has_keypoints() || entry.tensor.size(axis->dimension) != detail::compact_keypoint_count(config->keypoints_per_class)) throw std::invalid_argument("joint-dependent checkpoint tensor disagrees with admitted schema: " + entry.name);
+   if (!config || !config->has_keypoints() || entry.tensor.size(axis->dimension) != keypoints->compact_count()) throw std::invalid_argument("joint-dependent checkpoint tensor disagrees with admitted schema: " + entry.name);
    continue;
   }
   const bool classifier = axis->coordinates == detail::ClassTensorCoordinates::OutputSlots;
@@ -274,7 +276,7 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
  }
  if (config && config->has_keypoints()) {
   if (!names.contains("_kp_active_mask") || !names.contains("transformer.decoder.keypoint_class_mask")) throw std::invalid_argument("keypoint checkpoint is missing its schema masks");
-  detail::validate_keypoint_layout(layout, config->keypoints_per_class);
+  keypoints->require_class_layout(layout);
  }
 }
 
@@ -370,8 +372,9 @@ void normalize_legacy_keypoint_projection(DecodedNativeModelState& state, const 
  if (std::ranges::none_of(state.entries(), [&](const auto& entry) { return entry.name.starts_with(prefix); })) return;
  // The pinned Preview checkpoint retains this unused pre-GroupPose head
  // (upstream models/weights.py). Admit its complete verified inventory only.
+ const KeypointTensorLayout keypoints(config.keypoints_per_class);
  if (!config.has_keypoints() || config.hidden_dim != 256 || config.num_classes != 2 || config.keypoints_per_class.size() != 2 ||
-     detail::compact_keypoint_count(config.keypoints_per_class) != 17 || *std::ranges::max_element(config.keypoints_per_class) != 17)
+     keypoints.compact_count() != 17 || keypoints.maximum_joints() != 17)
   throw std::invalid_argument("legacy GroupPose projection disagrees with admitted topology");
  constexpr std::array<int64_t, 2> hidden_weight{256, 256}, projection_weight{238, 256};
  constexpr std::array<int64_t, 1> hidden_bias{256}, projection_bias{238};
@@ -489,17 +492,18 @@ DecodedNativeModelState decode_model_state(
   auto config = checkpoint_configuration(result.metadata);
   const auto active = std::ranges::find(result.entries(), "_kp_active_mask", &NormalizedModelStateEntry::name);
   if (active != result.entries().end()) {
-   const auto counts = detail::keypoint_counts_from_mask(active->tensor);
+   const auto keypoints = KeypointTensorLayout::from_active_mask(active->tensor);
+   const auto counts = keypoints.counts();
    if (!config.has_keypoints() && !counts.empty()) throw std::invalid_argument("active joint mask on a non-keypoint model");
-   if (!result.metadata.native_configuration.empty() && counts != config.keypoints_per_class) throw std::invalid_argument("native configuration conflicts with active joint mask");
-   config.keypoints_per_class = counts;
+   if (!result.metadata.native_configuration.empty() && !std::ranges::equal(counts, config.keypoints_per_class)) throw std::invalid_argument("native configuration conflicts with active joint mask");
+   config.keypoints_per_class.assign(counts.begin(), counts.end());
    if (counts.empty()) {
     auto entries = result.consume_entries();
     std::erase_if(entries, [](const auto& entry) { return entry.name == "_kp_active_mask"; });
     result.replace_entries(std::move(entries));
    }
   }
-  detail::validate_keypoint_layout(ResolvedClassLayout(result.metadata.class_layout), config.keypoints_per_class);
+  KeypointTensorLayout(config.keypoints_per_class).require_class_layout(ResolvedClassLayout(result.metadata.class_layout));
   normalize_legacy_keypoint_projection(result, config);
   result.metadata.native_configuration = encode_checkpoint_configuration(config);
   // External keypoint counts may be stale after upstream head resizing. The

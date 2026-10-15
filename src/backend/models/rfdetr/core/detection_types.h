@@ -132,7 +132,8 @@ struct OutputLayer {
  std::optional<torch::Tensor> query_features;
  std::optional<SupervisedQueryLayout> query_layout;
  std::optional<torch::Tensor> pred_masks;
- // [batch, queries, classes * max_joints, 8]: x/y, findable/visible, precision-Cholesky, class contribution.
+ // [batch, queries, KeypointTensorLayout::padded_count(), KeypointPredictionPacket::size].
+ // keypoint_layout.h owns physical schema slots; keypoint_prediction.h owns channels.
  std::optional<torch::Tensor> pred_keypoints;
  std::optional<SparsePredMasks> sparse_pred_masks;
  template <class Self, class Visitor>

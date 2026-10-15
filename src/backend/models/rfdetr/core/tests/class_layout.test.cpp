@@ -1,8 +1,13 @@
 #include <array>
+#include <algorithm>
+#include <cstdint>
+#include <utility>
+#include <vector>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
 namespace r = mmltk::backend::models::rfdetr;
 namespace catalog = mmltk::backend::data::catalog;
@@ -158,6 +163,67 @@ TEST_CASE("Joint configurations preserve independent foreground and physical slo
  config.keypoints_per_class.assign(r::kMaximumClassOutputSlots, 0);
  config.keypoints_per_class.back() = 17;
  CHECK(r::native_model_config_valid(config));
+ const r::KeypointTensorLayout sparse(config.keypoints_per_class);
+ CHECK(sparse.slot_count() == 4096);
+ CHECK(sparse.compact_count() == 17);
+ CHECK(sparse.maximum_joints() == 17);
+ CHECK(sparse.compact_offset(4095) == 0);
+ CHECK(sparse.padded_count() == 4096 * 17);
+ CHECK(std::ranges::equal(r::KeypointTensorLayout::from_active_mask(sparse.active_mask()).counts(), config.keypoints_per_class));
  for (std::size_t index = 0; index < catalog::kClassCatalogCapacity; ++index) config.keypoints_per_class[index] = 1;
  CHECK_FALSE(r::native_model_config_valid(config));
+ CHECK_THROWS(r::KeypointTensorLayout(config.keypoints_per_class));
+ CHECK_THROWS(r::KeypointTensorLayout(std::vector<std::uint16_t>(r::kMaximumClassOutputSlots + 1, 0)));
+ CHECK_THROWS(r::KeypointTensorLayout(std::array<std::uint16_t, 1>{257}));
+ const r::KeypointTensorLayout full_joints(std::array<std::uint16_t, 1>{256});
+ CHECK(full_joints.compact_count() == 256);
+ CHECK(full_joints.maximum_joints() == 256);
+}
+
+TEST_CASE("Joint Transfer projects catalog correspondence through physical slots in destination order", "[rfdetr][layout][keypoints]") {
+ const catalog::ClassKeypointSchema pair{{"left", "right"}, {{0, 1}}, {1, 0}, {.1, .1}};
+ const catalog::ClassKeypointSchema pin{{"tip"}, {}, {0}, {.2}};
+ catalog::OrderedClassCatalog source_record;
+ source_record.names = {{"paired"}, {"pin"}, {"empty"}};
+ source_record.keypoints = std::vector{pair, pin, catalog::ClassKeypointSchema{}};
+ const r::ResolvedClassLayout active_first(r::native_training_class_layout(catalog::ClassCatalog(source_record)));
+ // The reserved fourth classifier slot is omitted from the joint schema.
+ const r::KeypointTensorLayout source_joints(std::array<std::uint16_t, 3>{2, 1, 0});
+ CHECK_NOTHROW(source_joints.require_class_layout(active_first));
+ CHECK(source_joints.padded_count() == 6);
+ auto destination_record = source_record;
+ destination_record.names = {{"pin"}, {"empty"}, {"paired"}};
+ destination_record.keypoints = std::vector{pin, catalog::ClassKeypointSchema{}, catalog::permute_keypoint_schema(pair, std::array<catalog::JointIndex, 2>{1, 0})};
+ auto background_record = r::native_training_class_layout(catalog::ClassCatalog(destination_record));
+ background_record.no_object = r::NoObjectEncoding::ExplicitBackground;
+ background_record.slots = {{r::ClassSlotRole::Background, std::nullopt}, {r::ClassSlotRole::Foreground, 0}, {r::ClassSlotRole::Foreground, 1}, {r::ClassSlotRole::Foreground, 2}};
+ const r::ResolvedClassLayout background_first(background_record);
+ const r::KeypointTensorLayout destination_joints(std::array<std::uint16_t, 4>{0, 1, 0, 2});
+ CHECK_NOTHROW(destination_joints.require_class_layout(background_first));
+ using Rows = std::vector<std::pair<std::int64_t, std::int64_t>>;
+ CHECK(r::keypoint_transfer_rows(active_first, source_joints, background_first, destination_joints) == Rows{{2, 0}, {1, 1}, {0, 2}});
+ CHECK(r::keypoint_transfer_rows(background_first, destination_joints, active_first, source_joints) == Rows{{2, 0}, {1, 1}, {0, 2}});
+ CHECK_THROWS(source_joints.require_class_layout(background_first));
+ CHECK_THROWS(destination_joints.require_class_layout(active_first));
+ CHECK_THROWS(r::KeypointTensorLayout(std::array<std::uint16_t, 2>{0, 1}).require_class_layout(background_first));
+ auto sparse_record = background_record;
+ sparse_record.slots.assign(r::kMaximumClassOutputSlots, {r::ClassSlotRole::Unused, std::nullopt});
+ sparse_record.slots[0] = {r::ClassSlotRole::Background, std::nullopt};
+ sparse_record.slots[7] = {r::ClassSlotRole::Foreground, 0};
+ sparse_record.slots[2048] = {r::ClassSlotRole::Foreground, 1};
+ sparse_record.slots.back() = {r::ClassSlotRole::Foreground, 2};
+ const r::ResolvedClassLayout sparse(sparse_record);
+ std::vector<std::uint16_t> sparse_counts(r::kMaximumClassOutputSlots, 0);
+ sparse_counts[7] = 1;
+ sparse_counts.back() = 2;
+ const r::KeypointTensorLayout sparse_joints(sparse_counts);
+ CHECK_NOTHROW(sparse_joints.require_class_layout(sparse));
+ CHECK(sparse_joints.compact_offset(4095) == 1);
+ CHECK(sparse_joints.padded_offset(4095) == 8190);
+ CHECK(r::keypoint_transfer_rows(active_first, source_joints, sparse, sparse_joints) == Rows{{2, 0}, {1, 1}, {0, 2}});
+ CHECK_THROWS(r::keypoint_transfer_rows(r::ResolvedClassLayout(r::unresolved_class_layout(4)), source_joints, sparse, sparse_joints));
+ auto disjoint_record = source_record;
+ disjoint_record.keypoints = std::vector{catalog::ClassKeypointSchema{{"new_left", "new_right"}, {{0, 1}}, {1, 0}, {.1, .1}}, catalog::ClassKeypointSchema{{"new_tip"}, {}, {0}, {.2}}, catalog::ClassKeypointSchema{}};
+ const r::ResolvedClassLayout disjoint(r::native_training_class_layout(catalog::ClassCatalog(disjoint_record)));
+ CHECK(r::keypoint_transfer_rows(active_first, source_joints, disjoint, source_joints).empty());
 }
