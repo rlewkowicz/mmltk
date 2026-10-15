@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include "src/backend/data/catalog/keypoint_visibility.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/data/compiled/compiled_format_limits.h"
 namespace mmltk::backend::data {
@@ -79,14 +81,17 @@ struct PackedJointSpan {
 };
 struct PackedKeypoint {
  float x = 0, y = 0;
- std::uint8_t visibility = 0;
+ catalog::KeypointVisibility visibility = catalog::KeypointVisibility::Unannotated;
  std::array<std::uint8_t, 3> reserved{};
 };
+static_assert(std::is_standard_layout_v<PackedKeypoint> && std::is_trivially_copyable_v<PackedKeypoint>);
+static_assert(sizeof(PackedKeypoint) == 12 && alignof(PackedKeypoint) == alignof(float));
+static_assert(offsetof(PackedKeypoint, x) == 0 && offsetof(PackedKeypoint, y) == 4 && offsetof(PackedKeypoint, visibility) == 8 && offsetof(PackedKeypoint, reserved) == 9);
 struct PackedJointHeader {
  std::uint32_t version = 1;
  std::uint32_t count = 0;
 };
-static_assert(sizeof(PackedJointSpan) == 8 && sizeof(PackedKeypoint) == 12 && sizeof(PackedJointHeader) == 8);
+static_assert(sizeof(PackedJointSpan) == 8 && sizeof(PackedJointHeader) == 8);
 enum class ImageStatus : std::uint8_t { Inactive = 0, Eligible = 1 };
 struct __attribute__((packed)) ImageEntry {
  uint16_t num_instances = 0;

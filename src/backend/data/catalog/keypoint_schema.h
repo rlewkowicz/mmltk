@@ -5,14 +5,13 @@
 #include <span>
 #include <string>
 #include <vector>
+#include "src/backend/data/catalog/keypoint_visibility.h"
 #include "src/frameworks/reflection/reflected_declarations.h"
 namespace mmltk::backend::data::catalog {
 using JointIndex = std::uint16_t;
 inline constexpr std::size_t kKeypointsPerClassCapacity = 256U;
 inline constexpr std::size_t kSkeletonEdgeCapacity = 512U;
 inline constexpr std::size_t kKeypointNameCapacity = mmltk::frameworks::reflection::kMaximumNameBytes;
-enum class KeypointVisibility : std::uint8_t { Unannotated = 0U, Occluded = 1U, Visible = 2U };
-MMLTK_REFLECT_ENUM(KeypointVisibility)
 struct SkeletonEdge final {
  JointIndex first = 0U;
  JointIndex second = 0U;

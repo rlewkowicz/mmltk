@@ -1,10 +1,12 @@
 #include "annotation_support.h"
 #include "spatial_erasure.h"
 #include "src/backend/imaging/sampling.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cmath>
 #include <stdexcept>
 #include <limits>
 namespace mmltk::backend::models::rfdetr {
+using mmltk::backend::data::catalog::KeypointVisibility;
 namespace {
 namespace sampling = mmltk::backend::imaging::sampling;
 constexpr std::array<float, 6> identity{1, 0, 0, 0, 1, 0};
@@ -44,10 +46,10 @@ void map_augmentation_keypoints(std::span<const mmltk::backend::data::PackedKeyp
  for (std::size_t index = 0; index < source.size(); ++index) {
   const auto& point = source[index];
   const auto target = flip ? schema.horizontal_flip[index] : index;
-  if (target >= destination.size() || !std::isfinite(point.x) || !std::isfinite(point.y) || point.visibility > 2) throw std::invalid_argument("invalid keypoint augmentation input");
+  if (target >= destination.size() || !std::isfinite(point.x) || !std::isfinite(point.y) || !mmltk::frameworks::reflection::enum_contains(point.visibility)) throw std::invalid_argument("invalid keypoint augmentation input");
   auto& out = destination[target];
   out = {};
-  if (!point.visibility) continue;
+  if (point.visibility == KeypointVisibility::Unannotated) continue;
   const float source_x = point.x / width, source_y = point.y / height;
   if (donor && !plan->paste_masked && (source_x < plan->paste_source_box[0] || source_x > plan->paste_source_box[2] || source_y < plan->paste_source_box[1] || source_y > plan->paste_source_box[3])) continue;
   const auto [x, y] = sampling::affine_point(forward.data(), source_x, source_y);
@@ -56,7 +58,7 @@ void map_augmentation_keypoints(std::span<const mmltk::backend::data::PackedKeyp
   if (plan) {
    const bool pasted_over = !donor && plan->paste_donor_slot >= 0 && (!plan->paste_masked || plan->paste_support_count) &&
     contains(plan->paste_source_box, plan->paste_masked ? std::span{plan->paste_support, plan->paste_support_count} : std::span<const mmltk::backend::data::RLEPair>{}, plan->paste_inverse, x, y, width, height);
-   if (pasted_over || augment_math::erases_sample(plan->erasure, x, y, width, height)) out.visibility = 1;
+   if (pasted_over || augment_math::erases_sample(plan->erasure, x, y, width, height)) out.visibility = KeypointVisibility::Occluded;
   }
  }
 }

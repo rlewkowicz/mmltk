@@ -6,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 #include "src/frameworks/serialization/serialization.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data {
 using namespace mmltk::common::math;
@@ -39,7 +40,9 @@ void ImageAnnotations::validate_joints(const catalog::ClassCatalog* schema) cons
  }
  if (consumed != joints.size()) throw std::runtime_error("unreferenced compiled joints");
  for (const auto& joint : joints)
-  if (!std::isfinite(joint.x) || !std::isfinite(joint.y) || joint.visibility > 2 || (!joint.visibility && (joint.x != 0 || joint.y != 0)) || !std::ranges::all_of(joint.reserved, [](auto value) { return value == 0; })) throw std::runtime_error("invalid compiled keypoint");
+  if (!std::isfinite(joint.x) || !std::isfinite(joint.y) || !mmltk::frameworks::reflection::enum_contains(joint.visibility) ||
+      (joint.visibility == catalog::KeypointVisibility::Unannotated && (joint.x != 0 || joint.y != 0)) || !std::ranges::all_of(joint.reserved, [](auto value) { return value == 0; }))
+   throw std::runtime_error("invalid compiled keypoint");
 }
 std::span<const PackedKeypoint> ImageAnnotations::instance_joints(std::size_t instance) const {
  if (instance >= labels.size()) throw std::out_of_range("compiled joint instance");

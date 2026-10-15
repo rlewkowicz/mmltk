@@ -663,7 +663,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   for (std::size_t joint = 0; joint < source.size(); ++joint) {
    output[joint * 3] = transformed[joint].x / image_width;
    output[joint * 3 + 1] = transformed[joint].y / image_height;
-   output[joint * 3 + 2] = transformed[joint].visibility;
+   output[joint * 3 + 2] = static_cast<float>(std::to_underlying(transformed[joint].visibility));
   }
  };
  auto boxes = staging.boxes.accessor<float, 2>();

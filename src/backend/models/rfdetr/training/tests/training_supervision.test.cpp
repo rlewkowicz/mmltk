@@ -2899,8 +2899,8 @@ TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusab
   PackedInstance{.class_id = 2, .bbox_x2 = 8, .bbox_y2 = 8},
  };
  std::array<PackedKeypoint, 19> joints{};
- joints[17] = {2, 4, 2};
- joints[18] = {6, 5, 1};
+ joints[17] = {2, 4, catalog::KeypointVisibility::Visible};
+ joints[18] = {6, 5, catalog::KeypointVisibility::Occluded};
  const std::array spans{PackedJointSpan{0, 17}, PackedJointSpan{17, 2}, PackedJointSpan{19, 0}};
  const std::array annotations{ImageAnnotations{labels, {}, spans, joints}};
  const std::array<std::uint32_t, 1> identities{0};
@@ -2948,7 +2948,7 @@ TEST_CASE("prepared keypoints preserve mixed counts filtered identity and reusab
  lease.retire();
  // Masked donors retain joint support outside their independent detection box.
  const std::array donor_mask{RLEPair{0, 1}};
- const std::array donor_joints{PackedKeypoint{.5F, .5F, 2}, PackedKeypoint{.25F, .25F, 1}};
+ const std::array donor_joints{PackedKeypoint{.5F, .5F, catalog::KeypointVisibility::Visible}, PackedKeypoint{.25F, .25F, catalog::KeypointVisibility::Occluded}};
  plan.copy_paste_enabled = true;
  auto& image = plan.images[0];
  image = {};

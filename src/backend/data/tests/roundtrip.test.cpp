@@ -1872,13 +1872,18 @@ TEST_CASE("compiled keypoint catalogs and contiguous payloads survive resize and
  REQUIRE(person.size() == 17);
  CHECK(person[0].x == 2.F);
  CHECK(person[0].y == 7.F);
- CHECK(person[0].visibility == 2);
+ CHECK(person[0].visibility == catalog::KeypointVisibility::Visible);
  CHECK(person[1].x == 2.5F);
  CHECK(person[1].y == 7.5F);
- CHECK(person[1].visibility == 1);
+ CHECK(person[1].visibility == catalog::KeypointVisibility::Occluded);
  CHECK(person[2].x == 0);
  CHECK(person[2].y == 0);
- CHECK(person[2].visibility == 0);
+ CHECK(person[2].visibility == catalog::KeypointVisibility::Unannotated);
+ const auto joint_bytes = std::as_bytes(person);
+ CHECK(joint_bytes[8] == std::byte{2});
+ CHECK(joint_bytes[20] == std::byte{1});
+ CHECK(joint_bytes[32] == std::byte{0});
+ for (const auto& joint : annotations.joints) CHECK(joint.reserved == std::array<std::uint8_t, 3>{});
  CHECK(person[16].x == 10.F);
  CHECK(annotations.labels[0].annotation_id == 20);
  CHECK(annotations.labels[0].source_category_id == 1);
@@ -1891,7 +1896,7 @@ TEST_CASE("compiled keypoint catalogs and contiguous payloads survive resize and
  const auto entry = source.image_entry(1);
  CHECK_THROWS(annotation_view(entry, std::span{payload}.first(payload.size() - 1)));
  const auto layout = annotation_layout(entry.num_instances, entry.num_runs, COMPILED_LABEL_LIMIT, annotations.joints.size());
- const auto corrupt = GENERATE(0, 1, 2, 3);
+ const auto corrupt = GENERATE(0, 1, 2, 3, 4, 5, 6, 7);
  if (corrupt == 0) {
   PackedJointHeader header{1, UINT32_MAX};
   std::memcpy(payload.data() + layout.joint_span_offset - sizeof(header), &header, sizeof(header));
@@ -1900,9 +1905,13 @@ TEST_CASE("compiled keypoint catalogs and contiguous payloads survive resize and
   std::memcpy(payload.data() + layout.joint_span_offset, &span, sizeof(span));
  } else if (corrupt == 2) {
   payload[layout.joint_offset + offsetof(PackedKeypoint, visibility)] = std::byte{3};
- } else {
+ } else if (corrupt == 3) {
   PackedJointSpan span{0, 18, 0};
   std::memcpy(payload.data() + layout.joint_span_offset, &span, sizeof(span));
+ } else if (corrupt == 4) {
+  payload[layout.joint_offset + offsetof(PackedKeypoint, visibility)] = std::byte{255};
+ } else {
+  payload[layout.joint_offset + offsetof(PackedKeypoint, reserved) + corrupt - 5] = std::byte{1};
  }
  CHECK_THROWS(annotation_view(entry, payload, source.class_catalog().get()));
 }
@@ -1964,20 +1973,22 @@ TEST_CASE("Directory keypoint admission rejects malformed late triples without r
  create_keypoint_dataset(fixture);
  compile_existing_fixture(fixture);
  const auto original = read_compiled_header(compiled_bin_path(fixture));
+ const auto original_bytes = mmltk::testsupport::read_binary_file(compiled_bin_path(fixture));
  const auto path = fs::path(dataset_dir(fixture)) / fixture.split / "000002.jsonl";
  std::ifstream input(path);
  std::string line;
  REQUIRE(static_cast<bool>(std::getline(input, line)));
  auto record = nlohmann::json::parse(line);
  input.close();
- const auto invalid = GENERATE(0, 1, 2, 3);
- if (invalid == 0) record["keypoints"].erase(record["keypoints"].end() - 1);
- if (invalid == 1) record["keypoints"][50] = 3;
- if (invalid == 2) record["keypoints"][49] = "not a coordinate";
- if (invalid == 3) record["keypoints"][50] = 1.5;
+ const std::string_view invalid = GENERATE("length", "coordinate", "3", "255", "256", "257", "258", "18446744073709551615", "-1", "1.5", "2.0", "true");
+ CAPTURE(invalid);
+ if (invalid == "length") record["keypoints"].erase(record["keypoints"].end() - 1);
+ else if (invalid == "coordinate") record["keypoints"][49] = "not a coordinate";
+ else record["keypoints"][50] = nlohmann::json::parse(invalid.begin(), invalid.end());
  std::ofstream(path) << record.dump() << '\n';
  CHECK_THROWS(compile_existing_fixture(fixture));
  const auto retained = read_compiled_header(compiled_bin_path(fixture));
  CHECK(std::memcmp(&original, &retained, sizeof(original)) == 0);
+ CHECK(mmltk::testsupport::read_binary_file(compiled_bin_path(fixture)) == original_bytes);
  CHECK(CompiledDataset::open(compiled_bin_path(fixture)).annotations(1).joints.size() == 19);
 }

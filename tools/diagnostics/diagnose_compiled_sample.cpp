@@ -38,7 +38,7 @@ export int mmltk_tool_diagnose_compiled_sample(int argc, char** argv) try {
  std::size_t ordinal = 0;
  for (const auto& label : annotations.labels) {
   auto joints = nlohmann::json::array();
-  for (const auto& joint : annotations.instance_joints(ordinal++)) joints.push_back({joint.x, joint.y, joint.visibility});
+  for (const auto& joint : annotations.instance_joints(ordinal++)) joints.push_back({joint.x, joint.y, std::to_underlying(joint.visibility)});
   labels.push_back(
    {{"class_id", +label.class_id}, {"class_name", catalog.names()[label.class_id]}, {"flags", +label.flags}, {"bbox", {+label.bbox_x1, +label.bbox_y1, +label.bbox_x2, +label.bbox_y2}},
     {"mask_pairs", +label.mask_rle_pairs}, {"annotation_id", +label.annotation_id}, {"source_category_id", +label.source_category_id}, {"original_area", +label.original_area},

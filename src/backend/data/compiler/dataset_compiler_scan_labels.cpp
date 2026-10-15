@@ -2,6 +2,7 @@
 #include "src/backend/data/compiler/detail/dataset_annotation_json.h"
 #include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/common/math/checked_arithmetic.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -16,6 +17,7 @@
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
@@ -408,11 +410,12 @@ struct DirectoryLabels::Impl {
   for (std::size_t joint = 0; joint < joint_count; ++joint) {
    const auto& values = record.keypoints->sequence;
    const double x = numeric(values[joint * 3], "keypoint x must be numeric"), y = numeric(values[joint * 3 + 1], "keypoint y must be numeric");
-   const auto visibility = identity(values[joint * 3 + 2], "keypoint visibility must be an integer 0, 1 or 2");
-   if (!std::isfinite(x) || !std::isfinite(y) || visibility > 2) throw std::runtime_error("invalid keypoint coordinates or visibility");
+   const auto raw_visibility = identity(values[joint * 3 + 2], "keypoint visibility must be an integer 0, 1 or 2");
+   const auto visibility = static_cast<catalog::KeypointVisibility>(checked_cast<std::underlying_type_t<catalog::KeypointVisibility>>(raw_visibility, "keypoint visibility exceeds byte range"));
+   if (!std::isfinite(x) || !std::isfinite(y) || !mmltk::frameworks::reflection::enum_contains(visibility)) throw std::runtime_error("invalid keypoint coordinates or visibility");
    PackedKeypoint point;
-   point.visibility = static_cast<std::uint8_t>(visibility);
-   if (visibility) {
+   point.visibility = visibility;
+   if (visibility != catalog::KeypointVisibility::Unannotated) {
     const double px = x * geometry.resized_width / dimensions.width + geometry.offset_x;
     const double py = y * geometry.resized_height / dimensions.height + geometry.offset_y;
     if (!std::isfinite(px) || !std::isfinite(py) || std::abs(px) > std::numeric_limits<float>::max() || std::abs(py) > std::numeric_limits<float>::max()) throw std::runtime_error("transformed keypoint overflow");
