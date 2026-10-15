@@ -19,6 +19,7 @@
 #include <exception>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <nlohmann/json.hpp>
 namespace mmltk::backend::models::rfdetr::testsupport {
 namespace {
@@ -156,12 +157,13 @@ at::ScalarType OracleCase::dtype() const {
  if (precision == "bf16") return torch::kBFloat16;
  invalid("unsupported precision " + precision);
 }
-OracleArchive::OracleArchive(const std::filesystem::path& directory,const Json& reference):OracleArchive(archive_record(directory,reference)) {}
-OracleArchive::OracleArchive(OracleArchiveRecord record):record_(std::move(record)) {
+OracleArchive::OracleArchive(const std::filesystem::path& directory,const Json& reference, std::function<void(std::size_t)> physical_load)
+ :OracleArchive(archive_record(directory,reference), std::move(physical_load)) {}
+OracleArchive::OracleArchive(OracleArchiveRecord record, std::function<void(std::size_t)> physical_load)
+ :record_(std::move(record)), physical_load_(std::move(physical_load)) {
  for (std::size_t index=0;index<record_.shards.size();++index) {
   for (const auto& [name,spec]:record_.shards[index].tensors) {
    if (!locations_.emplace(name,index).second) invalid("duplicate logical tensor");
-   if (!spec.defined) undefined_.insert(name);
   }
   // Validate every physical shard before exposing the logical view, retaining
   // only one bounded shard. Later reads reuse that shard or replace its cache.
@@ -233,15 +235,49 @@ void OracleArchive::load_shard(std::size_t index,bool remember_order) const {
  }
  if (!expected.empty()) invalid("missing archive entries");
  loaded_=index;
+ if (physical_load_) physical_load_(index);
+}
+TensorMap OracleArchive::read_tensors(std::span<const std::string> names, const torch::Device device) const {
+ TensorMap result;
+ std::map<std::size_t, std::vector<TensorMap::iterator>> requests;
+ std::uint64_t selected_bytes = 0;
+ // Resolve the entire set and its owning-storage budget before physical reads.
+ // Repeated names select one result, and undefined entries need no shard load.
+ for (const auto& name : names) {
+  const auto location = locations_.find(name);
+  if (location == locations_.end()) invalid("required tensor missing: " + name);
+  const auto [selected, inserted] = result.try_emplace(name);
+  if (!inserted) continue;
+  const auto& spec = record_.shards[location->second].tensors.at(name);
+  if (!spec.defined) continue;
+  const auto bytes = static_cast<std::uint64_t>(spec.elements) * c10::elementSize(spec.dtype);
+  if (bytes > kStepStorageLimit - selected_bytes) invalid("unbounded selected tensor storage");
+  selected_bytes += bytes;
+  requests[location->second].push_back(selected);
+ }
+ const auto gather = [&](const auto& request) {
+  if (loaded_ != request.first) load_shard(request.first);
+  for (const auto selected : request.second) {
+   const auto found = tensors_.find(selected->first);
+   if (found == tensors_.end()) invalid("required tensor missing: " + selected->first);
+   // A contiguous serialized view can still share a larger storage. Force an
+   // owning copy so a selected value never pins unrelated shard storage.
+   selected->second = found->second.to(device, found->second.scalar_type(), false, true);
+  }
+ };
+ // Consume the current working shard before replacing it, when requested.
+ if (loaded_) {
+  const auto cached = requests.find(*loaded_);
+  if (cached != requests.end()) {
+   gather(*cached);
+   requests.erase(cached);
+  }
+ }
+ for (const auto& request : requests) gather(request);
+ return result;
 }
 torch::Tensor OracleArchive::tensor(const std::string& name, const torch::Device device) const {
- if (undefined_.contains(name)) return {};
- const auto location=locations_.find(name);
- if (location==locations_.end()) invalid("required tensor missing: "+name);
- if (loaded_!=location->second) load_shard(location->second);
- const auto found = tensors_.find(name);
- if (found == tensors_.end()) invalid("required tensor missing: " + name);
- return found->second.to(device);
+ return read_tensors(std::span<const std::string>(&name, 1), device).at(name);
 }
 bool OracleArchive::contains(const std::string& name) const { return locations_.contains(name); }
 std::vector<std::string> OracleArchive::ordered_defined_names(const std::string_view prefix) const {
@@ -684,9 +720,16 @@ PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& e
 std::vector<LayerMaskSamples> oracle_samples(const OracleArchive& archive, std::size_t layers, torch::Device device, const std::string& prefix) {
  std::vector<LayerMaskSamples> samples(layers);
  if (!archive.contains(prefix + "samples/0/matcher")) return samples;
+ std::vector<std::string> read_names;
  for (std::size_t i = 0; i < layers; ++i) {
   const auto key = prefix + "samples/" + std::to_string(i) + "/";
-  samples[i] = {archive.tensor(key + "matcher", device), archive.tensor(key + "candidates", device), archive.tensor(key + "remainder", device)};
+  for (const auto* field : {"matcher", "candidates", "remainder"}) read_names.push_back(key + field);
+ }
+ // All sampled inputs already live together in the returned layer vector.
+ const auto expected = archive.read_tensors(read_names, device);
+ for (std::size_t i = 0; i < layers; ++i) {
+  const auto key = prefix + "samples/" + std::to_string(i) + "/";
+  samples[i] = {expected.at(key + "matcher"), expected.at(key + "candidates"), expected.at(key + "remainder")};
  }
  return samples;
 }
@@ -703,14 +746,18 @@ void compare_oracle_outputs(OracleComparison& comparison, const OracleArchive& a
  std::set<std::string> indices;
  for (std::size_t group = 0; group < encoder_indices.size(); ++group) indices.insert(std::to_string(group));
  if (observed_encoder) comparison.inventory(prefix + "encoder identity inventory", indices, archive.names(prefix + "encoder/"));
+ std::vector<std::string> read_names;
+ for (std::size_t group = 0; group < encoder_indices.size(); ++group) read_names.push_back(prefix + "encoder/" + std::to_string(group));
+ for (const auto& [name, value] : tensors) read_names.push_back(prefix + "output/" + name);
+ const auto expected = archive.read_tensors(read_names);
  for (std::size_t group = 0; group < encoder_indices.size(); ++group) {
   const auto name = prefix + "encoder/" + std::to_string(group);
-  comparison.compare(name, encoder_indices[group], archive.tensor(name), OracleComparisonPolicy::Exact);
+  comparison.compare(name, encoder_indices[group], expected.at(name), OracleComparisonPolicy::Exact);
  }
  std::exception_ptr first_difference;
  for (const auto& [name, value] : tensors) {
   try {
-   comparison.compare(prefix + "output/" + name, value, archive.tensor(prefix + "output/" + name), OracleComparisonPolicy::Value);
+   comparison.compare(prefix + "output/" + name, value, expected.at(prefix + "output/" + name), OracleComparisonPolicy::Value);
   } catch (const std::runtime_error&) {
    if (!first_difference) first_difference = std::current_exception();
   }
@@ -725,10 +772,15 @@ void compare_oracle_vjp(OracleComparison& comparison, const OracleArchive& archi
  // dictionary. Lexical map order changes low-precision backward accumulation.
  const auto cotangents = archive.ordered_defined_names("cotangent/");
  comparison.inventory("defined cotangent inventory", {cotangents.begin(), cotangents.end()}, keys(tensors));
- for (const auto& name : cotangents) {
-  const auto& value = tensors.at(name);
-  auto term = (value * archive.tensor("cotangent/" + name, value.device())).sum();
-  scalar = scalar.defined() ? scalar + term : term;
+ {
+  std::vector<std::string> read_names;
+  for (const auto& name : cotangents) read_names.push_back("cotangent/" + name);
+  const auto expected = archive.read_tensors(read_names);
+  for (const auto& name : cotangents) {
+   const auto& value = tensors.at(name);
+   auto term = (value * expected.at("cotangent/" + name).to(value.device())).sum();
+   scalar = scalar.defined() ? scalar + term : term;
+  }
  }
  std::vector<torch::Tensor> operands{input};
  std::vector<std::string> names{"input"};
@@ -739,10 +791,13 @@ void compare_oracle_vjp(OracleComparison& comparison, const OracleArchive& archi
   }
  comparison.inventory("VJP inventory", {names.begin(), names.end()}, archive.names("vjp/"));
  const auto gradients = torch::autograd::grad({scalar}, operands, {}, retain_graph, false, true);
+ std::vector<std::string> read_names;
+ for (const auto& name : names) read_names.push_back("vjp/" + name);
+ const auto references = archive.read_tensors(read_names);
  TensorMap actual, expected;
  for (std::size_t i = 0; i < names.size(); ++i) {
   actual.emplace(names[i], gradients[i]);
-  expected.emplace(names[i], archive.tensor("vjp/" + names[i]));
+  expected.emplace(names[i], references.at("vjp/" + names[i]));
  }
  comparison.derivatives("vjp/", actual, expected);
 }

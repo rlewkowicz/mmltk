@@ -15,6 +15,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -61,21 +62,24 @@ struct OracleCase final {
 };
 class OracleArchive final {
 public:
- explicit OracleArchive(OracleArchiveRecord record);
- OracleArchive(const std::filesystem::path& directory,const nlohmann::json& reference);
+ // The optional observation belongs to fixture evidence and never controls reads.
+ OracleArchive(const std::filesystem::path& directory,const nlohmann::json& reference, std::function<void(std::size_t)> physical_load = {});
+ // Own only the requested tensor storage, independently of the working shard.
+ [[nodiscard]] TensorMap read_tensors(std::span<const std::string> names, torch::Device device = torch::kCPU) const;
  [[nodiscard]] torch::Tensor tensor(const std::string& name, torch::Device device = torch::kCPU) const;
  [[nodiscard]] std::set<std::string> names(std::string_view prefix) const;
  [[nodiscard]] std::vector<std::string> ordered_defined_names(std::string_view prefix) const;
  [[nodiscard]] bool contains(const std::string& name) const;
 
 private:
+ explicit OracleArchive(OracleArchiveRecord record, std::function<void(std::size_t)> physical_load);
  void load_shard(std::size_t index, bool remember_order = false) const;
  OracleArchiveRecord record_;
  std::map<std::string,std::size_t> locations_;
  mutable TensorMap tensors_;
  mutable std::optional<std::size_t> loaded_;
- std::set<std::string> undefined_;
  mutable std::vector<std::string> serialized_order_;
+ std::function<void(std::size_t)> physical_load_;
 };
 class UpstreamOracle final {
 public:

@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 #include <torch/serialize.h>
 #include <algorithm>
+#include <array>
 #include <numeric>
 #include <set>
 #include <span>
@@ -33,6 +34,22 @@ std::vector<const rf::OutputLayer*> layers(const rf::ModelOutputs& outputs) {
 void compare_assignments(support::OracleComparison& comparison, const support::OracleArchive& archive, const rf::ModelOutputs& outputs, const rf::PreparedTargets& targets,
  const rf::DetectionConfig& config, bool training, std::span<const rf::LayerMaskSamples> samples, const std::string& prefix) {
  const auto output_layers = layers(outputs);
+ std::vector<std::string> read_names;
+ for (std::size_t index = 0; index < output_layers.size(); ++index) {
+  for (std::size_t image = 0; image < targets.counts.size(); ++image) {
+   const auto key = prefix + "assignment/" + std::to_string(index) + "/" + std::to_string(image) + "/";
+   for (const auto* suffix : {"query", "target"}) {
+    read_names.push_back(key + suffix);
+    if (prefix.empty()) read_names.push_back("stock/" + key + suffix);
+   }
+  }
+  if (config.include_masks) {
+   const auto key = prefix + "direct/" + std::to_string(index) + "/";
+   for (const auto* suffix : {"point_coords", "point_logits", "point_labels"}) read_names.push_back(key + suffix);
+   if (prefix.empty()) read_names.push_back("stock/" + key + "point_coords");
+  }
+ }
+ const auto expected = archive.read_tensors(read_names);
  for (std::size_t index = 0; index < output_layers.size(); ++index) {
   rf::ModelOutputs layer;
   layer.main = *output_layers[index];
@@ -40,8 +57,8 @@ void compare_assignments(support::OracleComparison& comparison, const support::O
   for (std::size_t image = 0; image < matches.size(); ++image) {
    const auto key = prefix + "assignment/" + std::to_string(index) + "/" + std::to_string(image) + "/";
    for (const auto& [suffix, actual] : {std::pair{"query", matches[image].first}, std::pair{"target", matches[image].second}}) {
-    comparison.compare(key + suffix, actual, archive.tensor(key + suffix), ComparisonPolicy::Exact);
-    if (prefix.empty()) comparison.compare("stock-policy/" + key + suffix, actual, archive.tensor("stock/" + key + suffix), ComparisonPolicy::Exact, true);
+    comparison.compare(key + suffix, actual, expected.at(key + suffix), ComparisonPolicy::Exact);
+    if (prefix.empty()) comparison.compare("stock-policy/" + key + suffix, actual, expected.at("stock/" + key + suffix), ComparisonPolicy::Exact, true);
    }
   }
   if (!config.include_masks) continue;
@@ -59,10 +76,10 @@ void compare_assignments(support::OracleComparison& comparison, const support::O
   const auto key = prefix + "direct/" + std::to_string(index) + "/";
   // Exact coordinates expose uncertainty top-k selection, including ties;
   // equal-looking interpolated logits cannot conceal different selected points.
-  comparison.compare(key + "point_coords", sampled.coordinates, archive.tensor(key + "point_coords"), ComparisonPolicy::Exact);
-  if (prefix.empty()) comparison.compare("stock-policy/" + key + "point_coords", sampled.coordinates, archive.tensor("stock/" + key + "point_coords"), ComparisonPolicy::Exact, true);
-  comparison.compare(key + "point_logits", sampled.logits, archive.tensor(key + "point_logits"), ComparisonPolicy::Value);
-  comparison.compare(key + "point_labels", sampled.targets, archive.tensor(key + "point_labels"), ComparisonPolicy::Value);
+  comparison.compare(key + "point_coords", sampled.coordinates, expected.at(key + "point_coords"), ComparisonPolicy::Exact);
+  if (prefix.empty()) comparison.compare("stock-policy/" + key + "point_coords", sampled.coordinates, expected.at("stock/" + key + "point_coords"), ComparisonPolicy::Exact, true);
+  comparison.compare(key + "point_logits", sampled.logits, expected.at(key + "point_logits"), ComparisonPolicy::Value);
+  comparison.compare(key + "point_labels", sampled.targets, expected.at(key + "point_labels"), ComparisonPolicy::Value);
  }
 }
 torch::Tensor compare_loss(support::OracleComparison& comparison, const support::OracleArchive& archive, const rf::ModelOutputs& outputs, const rf::PreparedTargets& targets,
@@ -80,25 +97,42 @@ torch::Tensor compare_loss(support::OracleComparison& comparison, const support:
  expected_losses.erase("total");
  comparison.inventory(prefix + "loss inventory", actual_losses, expected_losses);
  comparison.inventory(prefix + "statistic inventory", actual_statistics, archive.names(prefix + "statistic/"));
+ std::vector<std::string> read_names;
  for (const auto& [key, value] : external_losses) {
   const auto name = prefix + (key.starts_with("loss_") ? "loss/" : "statistic/") + key;
-  comparison.compare(name, value, archive.tensor(name), ComparisonPolicy::Value);
-  if (prefix.empty()) comparison.compare("stock-policy/" + name, value, archive.tensor("stock/" + name), ComparisonPolicy::Value, true);
+  read_names.push_back(name);
+  if (prefix.empty()) read_names.push_back("stock/" + name);
+ }
+ read_names.push_back(prefix + "loss/total");
+ if (prefix.empty()) read_names.push_back("stock/loss/total");
+ const auto expected = archive.read_tensors(read_names);
+ for (const auto& [key, value] : external_losses) {
+  const auto name = prefix + (key.starts_with("loss_") ? "loss/" : "statistic/") + key;
+  comparison.compare(name, value, expected.at(name), ComparisonPolicy::Value);
+  if (prefix.empty()) comparison.compare("stock-policy/" + name, value, expected.at("stock/" + name), ComparisonPolicy::Value, true);
  }
  auto total = rf::weighted_detection_loss(losses, config, outputs.main.pred_logits.device());
- comparison.compare(prefix + "loss/total", total, archive.tensor(prefix + "loss/total"), ComparisonPolicy::Value);
- if (prefix.empty()) comparison.compare("stock-policy/loss/total", total, archive.tensor("stock/loss/total"), ComparisonPolicy::Value, true);
+ comparison.compare(prefix + "loss/total", total, expected.at(prefix + "loss/total"), ComparisonPolicy::Value);
+ if (prefix.empty()) comparison.compare("stock-policy/loss/total", total, expected.at("stock/loss/total"), ComparisonPolicy::Value, true);
  return total;
 }
 void compare_gradients(support::OracleComparison& comparison, const support::OracleArchive& archive, const rf::NativeRfDetrModel& model, const std::string& prefix, bool stock) {
  std::set<std::string> names;
  rf::TensorMap actual, expected;
- for (const auto& parameter : model.named_parameters(true)) {
+ const auto parameters = model.named_parameters(true);
+ std::vector<std::string> read_names;
+ for (const auto& parameter : parameters) {
+  if (!parameter.value().requires_grad()) continue;
+  read_names.push_back(prefix + parameter.key());
+  if (stock) read_names.push_back("stock/" + prefix + parameter.key());
+ }
+ const auto references = archive.read_tensors(read_names);
+ for (const auto& parameter : parameters) {
   if (!parameter.value().requires_grad()) continue;
   names.insert(parameter.key());
   actual.emplace(parameter.key(), parameter.value().grad());
-  expected.emplace(parameter.key(), archive.tensor(prefix + parameter.key()));
-  if (stock) comparison.compare("stock-policy/" + prefix + parameter.key(), parameter.value().grad(), archive.tensor("stock/" + prefix + parameter.key()), ComparisonPolicy::Derivative, true);
+  expected.emplace(parameter.key(), references.at(prefix + parameter.key()));
+  if (stock) comparison.compare("stock-policy/" + prefix + parameter.key(), parameter.value().grad(), references.at("stock/" + prefix + parameter.key()), ComparisonPolicy::Derivative, true);
  }
  comparison.inventory(prefix + "inventory", names, archive.names(prefix));
  comparison.derivatives(prefix, actual, expected);
@@ -111,18 +145,32 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
  REQUIRE(serialization::require_double(archive, "beta2") == .999);
  REQUIRE(serialization::require_double(archive, "eps") == 1e-8);
  const auto parameters = serialization::require_int(archive, "param_count");
+ constexpr std::array state_fields{std::pair{"step", ComparisonPolicy::Exact}, std::pair{"exp_avg", ComparisonPolicy::Derivative}, std::pair{"exp_avg_sq", ComparisonPolicy::SecondMoment}};
  std::vector<std::string> names;
+ std::vector<torch::serialize::InputArchive> parameter_archives;
+ std::vector<std::string> read_names;
  for (int64_t index = 0; index < parameters; ++index) {
-  torch::serialize::InputArchive parameter;
+  auto& parameter = parameter_archives.emplace_back();
   archive.read(serialization::archive_entry_name("param", static_cast<std::size_t>(index)), parameter);
   const auto name = serialization::require_string(parameter, "name");
   names.push_back(name);
   if (!state || !std::ranges::contains(entry.trainable, name)) continue;
-  for (const auto& [field, policy] : {std::pair{"step", ComparisonPolicy::Exact}, std::pair{"exp_avg", ComparisonPolicy::Derivative}, std::pair{"exp_avg_sq", ComparisonPolicy::SecondMoment}}) {
+  for (const auto& [field, policy] : state_fields) {
+   const auto key = "optimizer/" + name + "/" + field;
+   read_names.push_back(key);
+   if (entry.dtype() != torch::kFloat32 && reference.contains("stock/" + key)) read_names.push_back("stock/" + key);
+  }
+ }
+ const auto references = reference.read_tensors(read_names);
+ for (std::size_t index = 0; index < names.size(); ++index) {
+  const auto& name = names[index];
+  auto& parameter = parameter_archives[index];
+  if (!state || !std::ranges::contains(entry.trainable, name)) continue;
+  for (const auto& [field, policy] : state_fields) {
    torch::Tensor value;
    (void)parameter.try_read(field, value);
    const auto key = "optimizer/" + name + "/" + field;
-   const auto expected = reference.tensor(key);
+   const auto& expected = references.at(key);
    // Native eagerly owns zero moments/age for unused eligible parameters;
    // PyTorch lazily omits that state. Verify the zero state explicitly.
    // This branch retains the oracle's value tolerance for floating zeros.
@@ -132,7 +180,7 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
    } else {
     comparison.compare(key, value, expected, policy);
    }
-   if (entry.dtype() != torch::kFloat32 && reference.contains("stock/" + key)) comparison.compare("stock-policy/" + key, value, reference.tensor("stock/" + key), policy, true);
+   if (entry.dtype() != torch::kFloat32 && reference.contains("stock/" + key)) comparison.compare("stock-policy/" + key, value, references.at("stock/" + key), policy, true);
   }
  }
  const auto group_count = serialization::require_int(archive, "group_count");
@@ -236,8 +284,13 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
       std::vector<torch::Tensor> norms;
       for (const auto& parameter : built.optimizer.parameters())
        if (parameter.grad().defined()) norms.push_back(parameter.grad().norm());
-      comparison.compare("clip_norm", torch::stack(norms).norm(), archive.tensor("clip_norm"), ComparisonPolicy::Value);
-      if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/clip_norm", torch::stack(norms).norm(), archive.tensor("stock/clip_norm"), ComparisonPolicy::Value, true);
+      {
+       std::vector<std::string> read_names{"clip_norm"};
+       if (entry.dtype() != torch::kFloat32) read_names.push_back("stock/clip_norm");
+       const auto expected = archive.read_tensors(read_names);
+       comparison.compare("clip_norm", torch::stack(norms).norm(), expected.at("clip_norm"), ComparisonPolicy::Value);
+       if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/clip_norm", torch::stack(norms).norm(), expected.at("stock/clip_norm"), ComparisonPolicy::Value, true);
+      }
       built.optimizer.clip_grad_norm_(entry.clip_max_norm);
       compare_gradients(comparison, archive, model, "clipped/", entry.dtype() != torch::kFloat32);
       rf::TensorMap actual_before;
@@ -246,20 +299,36 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
       if (matched_state) {
        // Isolate AdamW from floating backward noise. The production optimizer
        // still owns every update, age and moment over the complete sequence.
-       for (const auto& parameter : model.named_parameters(true)) {
+       const auto parameters = model.named_parameters(true);
+       std::vector<std::string> read_names;
+       for (const auto& parameter : parameters)
+        if (parameter.value().requires_grad()) read_names.push_back("clipped/" + parameter.key());
+       const auto clipped = archive.read_tensors(read_names);
+       for (const auto& parameter : parameters) {
         if (!parameter.value().requires_grad()) continue;
-        parameter.value().mutable_grad() = archive.tensor("clipped/" + parameter.key(), parameter.value().device());
+        const auto& expected = clipped.at("clipped/" + parameter.key());
+        parameter.value().mutable_grad() = expected.defined() ? expected.to(parameter.value().device()) : torch::Tensor{};
        }
       }
       built.optimizer.step();
-      for (const auto& parameter : model.named_parameters(true))
-       if (parameter.value().requires_grad()) {
-        const auto key = "updated/" + parameter.key();
-        comparison.compare(key, parameter.value(), archive.tensor(key), ComparisonPolicy::Value);
-        comparison.parameter_update("update/" + parameter.key(), actual_before.at(parameter.key()), parameter.value(), expected_before.at(parameter.key()), archive.tensor(key));
-        expected_before[parameter.key()] = archive.tensor(key);
-        if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/" + key, parameter.value(), archive.tensor("stock/" + key), ComparisonPolicy::Value, true);
+      {
+       const auto parameters = model.named_parameters(true);
+       std::vector<std::string> read_names;
+       for (const auto& parameter : parameters) {
+        if (!parameter.value().requires_grad()) continue;
+        read_names.push_back("updated/" + parameter.key());
+        if (entry.dtype() != torch::kFloat32) read_names.push_back("stock/updated/" + parameter.key());
        }
+       const auto expected = archive.read_tensors(read_names);
+       for (const auto& parameter : parameters)
+        if (parameter.value().requires_grad()) {
+         const auto key = "updated/" + parameter.key();
+         comparison.compare(key, parameter.value(), expected.at(key), ComparisonPolicy::Value);
+         comparison.parameter_update("update/" + parameter.key(), actual_before.at(parameter.key()), parameter.value(), expected_before.at(parameter.key()), expected.at(key));
+         expected_before[parameter.key()] = expected.at(key);
+         if (entry.dtype() != torch::kFloat32) comparison.compare("stock-policy/" + key, parameter.value(), expected.at("stock/" + key), ComparisonPolicy::Value, true);
+        }
+      }
       compare_optimizer(comparison, archive, built.optimizer, entry, true);
       if (matched_state) {
        torch::NoGradGuard no_grad;

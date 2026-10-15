@@ -6,6 +6,7 @@
 #include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
+#include "src/backend/ml/torch/scalar_type.h"
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -20,13 +21,16 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 namespace rf = mmltk::backend::models::rfdetr;
@@ -79,8 +83,12 @@ public:
   active_ = nullptr;
  }
  void report(rf::testsupport::OracleComparison& comparison, const rf::testsupport::OracleArchive& archive) const {
+  std::vector<std::string> read_names;
   for (const auto& [name, value] : outputs_)
-   if (archive.contains(name)) comparison.compare(name, value, archive.tensor(name), ComparisonPolicy::Value, true);
+   if (archive.contains(name)) read_names.push_back(name);
+  const auto expected = archive.read_tensors(read_names);
+  for (const auto& [name, value] : outputs_)
+   if (archive.contains(name)) comparison.compare(name, value, expected.at(name), ComparisonPolicy::Value, true);
  }
 };
 std::vector<Json> oracle_comparison_records(const std::filesystem::path& root, const std::string& name) {
@@ -284,6 +292,8 @@ TEST_CASE("Oracle comparison collection retains numerical failures and immediate
 TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or altered publication", "[rfdetr][parity][oracle_archive]") {
  namespace support=rf::testsupport;
  namespace io=mmltk::common::io;
+ static_assert(!std::is_constructible_v<support::OracleArchive, support::OracleArchiveRecord>);
+ static_assert(!std::is_constructible_v<support::OracleArchive, support::OracleArchiveRecord, std::function<void(std::size_t)>>);
  const mmltk::testsupport::ScopedTempDir root("oracle-shards");
  const auto reference=[&](const std::string& name) {
   const auto path=root.path()/name;
@@ -293,36 +303,186 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
   std::ofstream file(root.path()/name); file<<value.dump(); file.close();
   return reference(name);
  };
- std::vector<Json> shards;
- for (int index=0;index<2;++index) {
-  const auto name="loss/"+std::string(index==0?"z":"a");
-  c10::Dict<std::string,torch::Tensor> values;
-  values.insert(name,torch::tensor({float(index+1)}));
-  values.insert("finite/"+name,torch::ones({1},torch::kBool));
-  const auto bytes=torch::pickle_save(c10::IValue(values));
+ constexpr std::array families{"gradient/", "stock/gradient/", "updated/"};
+ constexpr std::array loss_names{"z", "a", "m"};
+ std::array<c10::Dict<std::string,torch::Tensor>, 3> values;
+ std::array<Json, 3> shards;
+ const auto write_shard = [&](std::size_t index) {
+  const auto bytes=torch::pickle_save(c10::IValue(values[index]));
   const auto filename=std::to_string(index)+".pt";
   std::ofstream data(root.path()/filename,std::ios::binary); data.write(bytes.data(),bytes.size()); data.close();
-  auto shard=reference(filename);
-  shard["tensors"]={{name,{{"defined",true},{"shape",{1}},{"stride",{1}},{"dtype","torch.float32"},{"device","cuda:0"},{"finite_count",1},{"elements",1}}}};
-  if (index==0) shard["tensors"]["optional"]={{"defined",false}};
-  shards.push_back(shard);
+  const auto physical = reference(filename);
+  for (const auto& [name, value] : physical.items()) shards[index][name] = value;
+ };
+ for (std::size_t index=0;index<shards.size();++index) {
+  const auto add = [&](const std::string& name, const torch::Tensor& tensor) {
+   values[index].insert(name, tensor);
+   const auto finite = torch::isfinite(tensor);
+   if (tensor.is_floating_point()) values[index].insert("finite/" + name, finite);
+   shards[index]["tensors"][name] = {{"defined",true},{"shape",tensor.sizes().vec()},{"stride",tensor.strides().vec()},
+    {"dtype","torch." + mmltk::backend::ml::serialization::scalar_type_name(tensor.scalar_type())},
+    {"device","cuda:0"},{"finite_count",finite.sum().item<int64_t>()},{"elements",tensor.numel()}};
+  };
+  add("loss/" + std::string(loss_names[index]), torch::tensor({float(index+1)}));
+  const auto backing = torch::arange(4096, torch::kFloat32) + static_cast<float>(5000 * index);
+  const std::string family(families[index]);
+  add(family + "unused", backing);
+  add(family + "z", backing.narrow(0, 3, 4).reshape({2, 2}));
+  add(family + "a", backing.narrow(0, 12, 4));
+  if (index == 0) {
+   shards[index]["tensors"]["optional"]={{"defined",false}};
+   add("typed/int64", torch::tensor({int64_t{1} << 54, (int64_t{1} << 54) + 1}, torch::kInt64));
+  } else if (index == 1) {
+   add("typed/bool", torch::tensor({true, false}, torch::kBool));
+  } else {
+   add("typed/empty", torch::empty({0, 2}, torch::kFloat64));
+   add("typed/scalar", torch::tensor(1.25, torch::kFloat64));
+  }
+  write_shard(index);
  }
  const auto publish=[&] {
-  Json refs=Json::array(); std::uint64_t bytes=0;
+  Json refs=Json::array(); std::uint64_t bytes=0; std::size_t tensors=0;
   for (std::size_t index=0;index<shards.size();++index) {
    refs.push_back(write(std::to_string(index)+".json",shards[index])); bytes+=shards[index].at("bytes").get<std::uint64_t>();
+   tensors += shards[index].at("tensors").size();
   }
-  return write("step.json",{{"format","mmltk.rfdetr.step.v2"},{"shards",refs},{"bytes",bytes},{"tensor_count",3}});
+  return write("step.json",{{"format","mmltk.rfdetr.step.v2"},{"shards",refs},{"bytes",bytes},{"tensor_count",tensors}});
  };
  auto committed=publish();
  SECTION("complete multi-shard view retains order and borrowed values") {
   const support::OracleArchive archive(root.path(),committed);
-  CHECK((archive.ordered_defined_names("loss/")==std::vector<std::string>{"z","a"}));
+  CHECK((archive.ordered_defined_names("loss/")==std::vector<std::string>{"z","a","m"}));
   const auto first=archive.tensor("loss/z");
   CHECK(archive.tensor("loss/a").item<float>()==2.F);
   CHECK(first.item<float>()==1.F);
   CHECK_FALSE(archive.tensor("optional").defined());
-  CHECK((archive.names("loss/")==std::set<std::string>{"a","z"}));
+  CHECK((archive.names("loss/")==std::set<std::string>{"a","m","z"}));
+ }
+ SECTION("grouped alternating families decode each required shard at most once") {
+  std::array<std::size_t, 3> loads{};
+  const support::OracleArchive archive(root.path(), committed, [&](std::size_t index) { ++loads.at(index); });
+  CHECK((loads == std::array<std::size_t, 3>{1, 1, 1}));
+  loads.fill(0);
+  CHECK(archive.read_tensors(std::array<std::string, 3>{"gradient/z", "stock/gradient/z", "updated/z"}).size() == 3);
+  CHECK(std::ranges::all_of(loads, [](std::size_t count) { return count <= 1; }));
+  CHECK(std::accumulate(loads.begin(), loads.end(), std::size_t{0}) == 2);
+  const std::vector<std::string> requested{"gradient/z", "stock/gradient/z", "updated/z", "gradient/a", "stock/gradient/a", "updated/a", "gradient/z", "optional"};
+  for (int pass = 0; pass < 2; ++pass) {
+   CAPTURE(pass);
+   loads.fill(0);
+   const auto selected = archive.read_tensors(requested);
+   CHECK(selected.size() == 7);
+   CHECK_FALSE(selected.at("optional").defined());
+   CHECK(std::ranges::all_of(loads, [](std::size_t count) { return count <= 1; }));
+   CHECK(std::accumulate(loads.begin(), loads.end(), std::size_t{0}) == 2);
+   std::size_t selected_bytes = 0;
+   for (std::size_t index = 0; index < families.size(); ++index) {
+    for (const auto* suffix : {"z", "a"}) {
+     const auto name = std::string(families[index]) + suffix;
+     const auto& tensor = selected.at(name);
+     const auto source = values[index].at(name);
+     CHECK(torch::equal(tensor, source));
+     CHECK(tensor.scalar_type() == source.scalar_type());
+     CHECK(tensor.sizes() == source.sizes());
+     CHECK(tensor.is_cpu());
+     CHECK(tensor.storage_offset() == 0);
+     CHECK(tensor.storage().nbytes() == tensor.nbytes());
+     CHECK(tensor.storage().nbytes() < source.storage().nbytes());
+     selected_bytes += tensor.storage().nbytes();
+    }
+   }
+   CHECK(selected_bytes == 6 * 4 * sizeof(float));
+  }
+  // More logical lookups, including duplicate names, leave physical work fixed.
+  std::vector<std::string> repeated;
+  for (int count = 0; count < 32; ++count) repeated.insert(repeated.end(), requested.begin(), requested.end());
+  loads.fill(0);
+  CHECK(archive.read_tensors(repeated).size() == 7);
+  CHECK(std::ranges::all_of(loads, [](std::size_t count) { return count <= 1; }));
+  CHECK(std::accumulate(loads.begin(), loads.end(), std::size_t{0}) == 2);
+  CHECK((archive.ordered_defined_names("loss/") == std::vector<std::string>{"z", "a", "m"}));
+  CHECK((archive.ordered_defined_names("gradient/") == std::vector<std::string>{"unused", "z", "a"}));
+ }
+ SECTION("empty undefined and missing read sets do not decode shards") {
+  std::array<std::size_t, 3> loads{};
+  const support::OracleArchive archive(root.path(), committed, [&](std::size_t index) { ++loads.at(index); });
+  loads.fill(0);
+  CHECK(archive.read_tensors({}).empty());
+  const auto undefined = archive.read_tensors(std::array<std::string, 2>{"optional", "optional"});
+  REQUIRE(undefined.size() == 1);
+  CHECK_FALSE(undefined.at("optional").defined());
+  CHECK_THROWS_AS(archive.read_tensors(std::array<std::string, 3>{"gradient/z", "missing", "updated/z"}), std::runtime_error);
+  CHECK_THROWS_AS(archive.tensor("missing"), std::runtime_error);
+  CHECK((loads == std::array<std::size_t, 3>{0, 0, 0}));
+  const auto selected = archive.read_tensors(std::array<std::string, 2>{"gradient/a", "optional"});
+  CHECK(selected.size() == 2);
+  CHECK((loads == std::array<std::size_t, 3>{1, 0, 0}));
+ }
+ SECTION("selected values retain exact dtype shape and independent storage through owner destruction") {
+  rf::TensorMap selected;
+  torch::Tensor isolated;
+  {
+   const support::OracleArchive archive(root.path(), committed);
+   selected = archive.read_tensors(std::array<std::string, 6>{"gradient/z", "typed/int64", "typed/bool", "typed/empty", "typed/scalar", "optional"});
+   isolated = archive.tensor("stock/gradient/a");
+   auto modified = archive.read_tensors(std::array<std::string, 1>{"gradient/z"});
+   modified.at("gradient/z").fill_(-1);
+   CHECK(torch::equal(archive.tensor("gradient/z"), values[0].at("gradient/z")));
+   CHECK(archive.tensor("loss/m").item<float>() == 3.F);
+  }
+  REQUIRE(selected.size() == 6);
+  CHECK_FALSE(selected.at("optional").defined());
+  for (std::size_t index = 0; index < values.size(); ++index) {
+   for (const auto& [name, tensor] : selected) {
+    if (!tensor.defined() || !values[index].contains(name)) continue;
+    const auto source = values[index].at(name);
+    CHECK(torch::equal(tensor, source));
+    CHECK(tensor.scalar_type() == source.scalar_type());
+    CHECK(tensor.sizes() == source.sizes());
+    CHECK(tensor.storage().nbytes() == tensor.nbytes());
+   }
+  }
+  CHECK(torch::equal(isolated, values[1].at("stock/gradient/a")));
+  CHECK(isolated.storage().nbytes() == isolated.nbytes());
+ }
+ SECTION("a later physical read reauthenticates unchanged-size shard bytes") {
+  const support::OracleArchive archive(root.path(), committed);
+  const auto retained = archive.read_tensors(std::array<std::string, 1>{"gradient/z"});
+  (void)archive.tensor("loss/m");
+  const auto path = root.path()/"0.pt";
+  const auto original_bytes = std::filesystem::file_size(path);
+  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+  char byte = 0;
+  file.read(&byte, 1);
+  byte ^= 1;
+  file.seekp(0);
+  file.write(&byte, 1);
+  file.close();
+  REQUIRE(std::filesystem::file_size(path) == original_bytes);
+  CHECK_THROWS_AS(archive.read_tensors(std::array<std::string, 2>{"updated/z", "gradient/z"}), std::runtime_error);
+  CHECK_THROWS_AS(archive.tensor("gradient/z"), std::runtime_error);
+  CHECK(torch::equal(retained.at("gradient/z"), values[0].at("gradient/z")));
+ }
+ SECTION("corruption in an unrequested shard fails complete admission") {
+  values[2].at("finite/updated/unused").fill_(false);
+  write_shard(2);
+  committed = publish();
+  CHECK_THROWS_AS(([&] {
+   const support::OracleArchive archive(root.path(), committed);
+   return archive.read_tensors(std::array<std::string, 1>{"gradient/z"});
+  }()), std::runtime_error);
+ }
+ SECTION("unrequested noncontiguous serialized values fail admission") {
+  values[2].insert_or_assign("updated/z", values[2].at("updated/z").transpose(0, 1));
+  write_shard(2);
+  committed = publish();
+  CHECK_THROWS_AS(support::OracleArchive(root.path(), committed), std::runtime_error);
+ }
+ SECTION("unrequested unexpected dictionary values fail admission") {
+  values[2].insert("unexpected", torch::zeros({1}));
+  write_shard(2);
+  committed = publish();
+  CHECK_THROWS_AS(support::OracleArchive(root.path(), committed), std::runtime_error);
  }
  SECTION("unpublished leaves do not replace authenticated completion") {
   write("step.json.partial",{{"incomplete",true}});
@@ -373,7 +533,8 @@ TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[r
       torch::NoGradGuard no_grad;
       for (const auto& parameter : initializer.named_parameters()) parameter.value().copy_(model.named_parameters()[family.prefix() + parameter.key()]);
       mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
-      comparison.compare(prefix + "output", initializer.forward(archive.tensor(prefix + "input",torch::kCUDA)), archive.tensor(prefix + "output"), ComparisonPolicy::Value);
+      const auto expected = archive.read_tensors(std::array<std::string, 2>{prefix + "input", prefix + "output"});
+      comparison.compare(prefix + "output", initializer.forward(expected.at(prefix + "input").to(torch::kCUDA)), expected.at(prefix + "output"), ComparisonPolicy::Value);
      }
     }
     rf::detail::NativeBackboneImpl backbone(model.config());
@@ -387,8 +548,11 @@ TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[r
      mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
      const auto features = backbone.forward_features(input);
      REQUIRE(features.size() == archive.names("backbone/").size());
+     std::vector<std::string> read_names;
+     for (std::size_t index = 0; index < features.size(); ++index) read_names.push_back("backbone/" + std::to_string(index));
+     const auto expected = archive.read_tensors(read_names);
      for (std::size_t index = 0; index < features.size(); ++index)
-      comparison.compare("backbone/" + std::to_string(index), features[index], archive.tensor("backbone/" + std::to_string(index)), ComparisonPolicy::Value);
+      comparison.compare(read_names[index], features[index], expected.at(read_names[index]), ComparisonPolicy::Value);
     }
    }
    std::vector<torch::Tensor> indices;
@@ -431,10 +595,10 @@ TEST_CASE("Independent upstream repetitions measure the numerical noise floor", 
            std::pair{"held/assignment/", ComparisonPolicy::Exact}, std::pair{"held/output/", ComparisonPolicy::Value}, std::pair{"held/loss/", ComparisonPolicy::Value}
           }) {
       comparison.inventory(std::string(prefix) + "inventory", actual.names(prefix), expected.names(prefix));
-      for (const auto& name : expected.names(prefix)) {
-       const auto key = std::string(prefix) + name;
-       comparison.compare(key, actual.tensor(key), expected.tensor(key), policy);
-      }
+      std::vector<std::string> read_names;
+      for (const auto& name : expected.names(prefix)) read_names.push_back(std::string(prefix) + name);
+      const auto actual_values = actual.read_tensors(read_names), expected_values = expected.read_tensors(read_names);
+      for (const auto& key : read_names) comparison.compare(key, actual_values.at(key), expected_values.at(key), policy);
      }
     }
    });
