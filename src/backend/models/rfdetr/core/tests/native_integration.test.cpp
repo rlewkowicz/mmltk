@@ -16,6 +16,7 @@
 #include "asset_cache_support.h"
 #include "checkpoint_fixture_support.h"
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/common/io/file_digest.h"
 #include "parity_fixture_support.h"
 import mmltk.backend.models.rfdetr.model_export;
 namespace mmltk::backend::models::rfdetr::testsupport {
@@ -170,4 +171,82 @@ TEST_CASE("Python artifacts preserve explicit layouts and keep ambiguous names r
  CHECK(native.metadata.class_layout.foreground == binding.foreground);
  CHECK(native.metadata.class_layout.class_name_evidence == source.metadata.class_layout.class_name_evidence);
  CHECK(native.tensor_count() == raw.tensor_count());
+}
+
+TEST_CASE("All official asset digests admit their exact native topology independently of filename", "[model][rfdetr][checkpoint][official][integration]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ namespace fixture = r::testsupport;
+ mmltk::testsupport::ScopedTempDir directory("rfdetr-official-admission");
+ for (const auto& preset : r::kPresetCatalog) {
+  CAPTURE(preset.preset_name);
+  const auto& asset = fixture::require_weight_asset(preset.canonical_weight_filename);
+  const auto original = fixture::cached_model_assets_root() / std::string(preset.preset_name) / std::string(asset.filename);
+  fixture::ensure_downloaded_weight(original, asset);
+  const auto renamed = directory.path() / "opaque.pth";
+  fixture::remove_if_exists(renamed);
+  fs::create_symlink(fs::absolute(original), renamed);
+  const auto admitted = r::resolve_model_state(renamed, {}, 0);
+  CHECK(admitted.artifacts.config.preset_name == preset.preset_name);
+  CHECK(admitted.artifacts.config.num_classes == asset.classifier_width);
+  REQUIRE(r::ResolvedClassLayout(admitted.artifacts.class_layout).semantic());
+  r::NativeRfDetrModel model(admitted.artifacts.config, admitted.artifacts.class_layout);
+  auto candidate = model.stage_normalized_state(admitted.model_state.entries(), r::detail::NormalizedModelStateAdmission::RequiredCore);
+  REQUIRE(candidate.summary.missing_names.empty());
+  REQUIRE(candidate.summary.unexpected_names.empty());
+  REQUIRE(candidate.summary.incompatible_names.empty());
+  model.commit_normalized_state(std::move(candidate));
+  if (preset.task == r::ModelTask::Keypoints) {
+   CHECK(admitted.artifacts.config.keypoints_per_class == std::vector<std::uint16_t>{0, 17});
+   CHECK(model.class_layout()->physical_references()[0] == -1);
+   CHECK(model.class_layout()->physical_references()[1] == 0);
+   constexpr std::string_view legacy_prefix = "keypoint_head.keypoint_proj.";
+   CHECK(std::ranges::none_of(admitted.model_state.entries(), [&](const auto& entry) { return entry.name.starts_with(legacy_prefix); }));
+   const auto normalized = directory.path() / "keypoint-native.pt";
+   run_subprocess({mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", renamed.string(), "--output", normalized.string()});
+   const auto restored = r::decode_model_state(normalized);
+   CHECK(restored.tensor_count() == admitted.model_state.tensor_count());
+   CHECK(model.load_normalized_state(restored.entries(), true, &restored.metadata.class_layout).unexpected_names.empty());
+   const auto healthy_digest = mmltk::common::io::sha256_file(normalized);
+   for (int malformed = 0; malformed < 4; ++malformed) {
+    CAPTURE(malformed);
+    auto entries = admitted.model_state.entries();
+    const auto start = entries.size();
+    entries.push_back({"keypoint_head.keypoint_proj.0.weight", torch::zeros({256, 256}, torch::kFloat32)});
+    entries.push_back({"keypoint_head.keypoint_proj.0.bias", torch::zeros({256}, torch::kFloat32)});
+    entries.push_back({"keypoint_head.keypoint_proj.2.weight", torch::zeros({238, 256}, torch::kFloat32)});
+    entries.push_back({"keypoint_head.keypoint_proj.2.bias", torch::zeros({238}, torch::kFloat32)});
+    if (malformed == 0) entries.pop_back();
+    if (malformed == 1) entries.back().tensor = torch::zeros({237}, torch::kFloat32);
+    if (malformed == 2) entries[start].tensor = entries[start].tensor.to(torch::kFloat64);
+    if (malformed == 3) entries.push_back({"keypoint_head.keypoint_proj.1.bias", torch::zeros({256}, torch::kFloat32)});
+    r::DecodedNativeModelState legacy(std::move(entries));
+    legacy.metadata = admitted.model_state.metadata;
+    legacy.metadata.class_layout.provenance = {r::ClassLayoutOrigin::Embedded, "legacy-keypoint-projection", {}};
+    const auto external = directory.path() / "malformed-keypoint.pth";
+    r::write_upstream_model_state(external, legacy);
+    const auto rejected = mmltk::testsupport::run_subprocess_capture_output(
+     {mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", external.string(), "--output", normalized.string()});
+    CHECK(rejected.exit_code != 0);
+    CHECK(rejected.output_text.find("legacy GroupPose projection") != std::string::npos);
+    CHECK(mmltk::common::io::sha256_file(normalized) == healthy_digest);
+   }
+  }
+  if (!preset.decoder_layer_count) {
+   auto malformed = admitted.model_state.entries();
+   const auto before = model.named_parameters()["class_embed.weight"].clone();
+   auto dormant = std::ranges::find(malformed, "class_embed.weight", &r::NormalizedModelStateEntry::name);
+   REQUIRE(dormant != malformed.end());
+   dormant->tensor = dormant->tensor.to(torch::kInt64);
+   CHECK_THROWS(model.stage_normalized_state(malformed, r::detail::NormalizedModelStateAdmission::RequiredCore));
+   CHECK(torch::equal(model.named_parameters()["class_embed.weight"], before));
+   const auto normalized = directory.path() / "atto-native.pt";
+   run_subprocess({mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", renamed.string(), "--output", normalized.string()});
+   const auto restored = r::decode_model_state(normalized);
+   REQUIRE(restored.tensor_count() == admitted.model_state.tensor_count());
+   for (std::size_t index = 0; index < restored.tensor_count(); ++index) {
+    CHECK(restored.entries()[index].name == admitted.model_state.entries()[index].name);
+    CHECK(torch::equal(restored.entries()[index].tensor, admitted.model_state.entries()[index].tensor));
+   }
+  }
+ }
 }

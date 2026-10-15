@@ -175,3 +175,13 @@ is the entire agreement concerning the Software's licensing. You may not assign 
 license except as permitted under the Platform Agreement. If any provision is
 unenforceable, it will be modified to the minimum extent necessary to make it enforceable.
 All rights not expressly granted are reserved. No implied licenses are granted.
+
+PyTorch Image Models (timm) PE-Core-T
+-------------------------------------
+
+The native PE-Core-T trunk projects the EVA/AttentionRope implementation in
+timm 1.0.27. Copyright Ross Wightman and contributors, Apache License 2.0.
+EVA and EVA02 model contributions retain Copyright (c) 2022 and 2023
+BAAI-Vision; the timm modifications retain Copyright 2023 Ross Wightman.
+Source: https://github.com/huggingface/pytorch-image-models/tree/v1.0.27
+The packaged Apache-2.0 license is retained in LICENSE.

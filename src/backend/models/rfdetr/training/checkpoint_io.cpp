@@ -65,6 +65,7 @@ void write_native_checkpoint_metadata(torch::serialize::OutputArchive& archive, 
  const ResolvedClassLayout layout(metadata.class_layout);
  if (layout.output_width() != static_cast<std::size_t>(metadata.num_classes)) throw std::runtime_error("native checkpoint class layout disagrees with tensor output width");
  mmltk::backend::ml::serialization::write_string(archive, "class_layout", encode_class_layout(metadata.class_layout));
+ mmltk::backend::ml::serialization::write_string(archive, "native_configuration", encode_checkpoint_configuration(checkpoint_configuration(metadata)));
  mmltk::backend::ml::serialization::write_string(archive, "format", kNativeCheckpointFormat);
  mmltk::backend::ml::serialization::write_int(archive, "format_version", kNativeCheckpointFormatVersion);
  mmltk::backend::ml::serialization::write_string(archive, "preset_name", metadata.preset_name);

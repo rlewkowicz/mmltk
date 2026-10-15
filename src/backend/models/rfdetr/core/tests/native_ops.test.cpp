@@ -26,6 +26,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <unistd.h>
 #include "src/backend/models/rfdetr/core/detection_ops.h"
+#include "src/backend/models/rfdetr/core/detail/keypoint_head.h"
+#include "src/backend/ml/cuda/torch_autocast_scope.h"
+#include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "detail/lsap_scratch.h"
 #include "detail/matcher_workspace.h"
 #include "src/common/system/execution_policy.h"
@@ -1140,4 +1143,108 @@ TEST_CASE("CUDA matcher keeps exact grouped assignments for repeated and reorder
  const auto before = workspace.statistics();
  REQUIRE(r::matcher_indices(empty, targets, config, true).empty());
  REQUIRE(workspace.statistics().cost_submissions == before.cost_submissions);
+}
+
+TEST_CASE("GroupPose compact joints preserve precision, visibility, class masks and finite gradients", "[rfdetr][keypoints]") {
+ namespace kp = mmltk::backend::models::rfdetr::detail;
+ const std::array<std::uint16_t, 3> counts{2, 0, 1};
+ const auto active = kp::keypoint_active_mask(counts), mask = kp::keypoint_class_mask(counts);
+ CHECK(kp::keypoint_counts_from_mask(active) == std::vector<std::uint16_t>{2, 0, 1});
+ REQUIRE(mask.sizes() == c10::IntArrayRef({4, 4}));
+ CHECK_FALSE(mask[0].any().item<bool>());
+ CHECK_FALSE(mask.select(1, 0).any().item<bool>());
+ CHECK_FALSE(mask[1][2].item<bool>());
+ CHECK(mask[1][3].item<bool>());
+ CHECK_THROWS(kp::keypoint_counts_from_mask(torch::tensor({{false, true}}, torch::kBool)));
+ CHECK_THROWS(kp::keypoint_counts_from_mask(torch::zeros({2, 3}, torch::kBool)));
+ for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+  CAPTURE(dtype);
+  const auto options = torch::TensorOptions().dtype(dtype);
+  auto delta = torch::ones({1, 2, 3, 8}, options);
+  delta[0][0][0][0] = std::numeric_limits<float>::infinity();
+  delta[0][0][1][4] = std::numeric_limits<float>::quiet_NaN();
+  delta.set_requires_grad(true);
+  auto boxes = torch::tensor({{{.5F, .25F, .2F, .4F}, {.5F, .25F, .2F, .4F}}}, options).set_requires_grad(true);
+  const auto compact = kp::refine_keypoints(delta, boxes);
+  const auto padded = kp::padded_keypoints(compact, counts);
+  REQUIRE(padded.sizes() == c10::IntArrayRef({1, 2, 6, 8}));
+  CHECK(torch::isfinite(padded).all().item<bool>());
+  CHECK(padded[0][0][0][0].item<float>() == .5F);
+  CHECK(padded[0][0][1][4].item<float>() == 0.F);
+  CHECK(torch::equal(padded.narrow(2, 2, 2), torch::zeros_like(padded.narrow(2, 2, 2))));
+  CHECK(torch::equal(padded.narrow(2, 5, 1), torch::zeros_like(padded.narrow(2, 5, 1))));
+  // Channels 2/3 are logits and 4/5/6 raw Cholesky entries, never squashed.
+  CHECK(padded[0][1][4][6].item<float>() == 1.F);
+  const auto logits = kp::keypoint_class_logits(padded, active, 4);
+  CHECK(torch::equal(logits, torch::tensor({{{2.F, 0.F, 1.F, 0.F}, {2.F, 0.F, 1.F, 0.F}}}, options)));
+  (padded.to(torch::kFloat32).sum() + logits.to(torch::kFloat32).sum()).backward();
+  CHECK(torch::isfinite(boxes.grad()).all().item<bool>());
+  CHECK(torch::isfinite(delta.grad()).all().item<bool>());
+  CHECK(delta.grad()[0][0][0][0].item<float>() == 0.F);
+ }
+}
+
+TEST_CASE("Conditional joint queries match linear primitive outputs and VJPs across precisions", "[rfdetr][keypoints][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; conditional query AMP coverage remains unverified");
+ c10::cuda::CUDAGuard device_guard(0);
+ mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
+ const auto options = torch::TensorOptions().device(torch::kCUDA, 0).dtype(torch::kFloat32);
+ for (const auto& [device, dtype] : mmltk::backend::ml::testsupport::available_amp_precisions()) {
+  if (!device.is_cuda()) continue;
+  CAPTURE(dtype);
+  mmltk::backend::models::rfdetr::detail::ConditionalQueryInitializer initializer(16, 4, 8);
+  initializer.to(device);
+  {
+   torch::NoGradGuard guard;
+   for (const auto& parameter : initializer.named_parameters())
+    parameter.value().copy_(torch::linspace(-.3, .4, parameter.value().numel(), options).reshape_as(parameter.value()));
+  }
+  auto reference = mmltk::backend::ml::testsupport::independent_parameters(initializer);
+  auto condition = torch::linspace(-.8, .9, 2 * 3 * 16, options).reshape({2, 3, 16}).set_requires_grad(true);
+  auto reference_condition = mmltk::backend::ml::testsupport::independent_leaf(condition);
+  torch::Tensor actual, expected;
+  {
+   mmltk::backend::ml::cuda::TorchAutocastScope autocast(dtype != torch::kFloat32, dtype);
+   actual = initializer.forward(condition);
+   // The pinned Python initializer uses aten::linear at every rank-four
+   // boundary; independent leaves retain its fused bias and AMP VJPs.
+   const auto hidden = at::gelu(at::linear(reference_condition.unsqueeze(-2), reference.at("adaLN_modulation.0.weight"), reference.at("adaLN_modulation.0.bias")));
+   const auto modulation = at::linear(hidden, reference.at("adaLN_modulation.2.weight"), reference.at("adaLN_modulation.2.bias")).chunk(3, -1);
+   const auto queries = at::layer_norm(reference.at("queries"), {8}, {}, {}, 1e-5);
+   expected = at::linear((modulation[0] + 1.0) * queries + modulation[1], reference.at("out_proj.weight"), reference.at("out_proj.bias")) * modulation[2] + reference.at("queries");
+  }
+  CHECK(torch::equal(actual, expected));
+  const auto cotangent = torch::linspace(-.4, .6, actual.numel(), options).reshape_as(actual);
+  (actual * cotangent).sum().backward();
+  (expected * cotangent).sum().backward();
+  CHECK(torch::equal(condition.grad(), reference_condition.grad()));
+  for (const auto& parameter : initializer.named_parameters()) {
+   CAPTURE(parameter.key());
+   REQUIRE(parameter.value().grad().defined());
+   CHECK(torch::isfinite(parameter.value().grad()).all().item<bool>());
+   CHECK(torch::equal(parameter.value().grad(), reference.at(parameter.key()).grad()));
+  }
+ }
+}
+TEST_CASE("PE-Core positions and RoPE admit dynamic geometry without learned-state mutation", "[rfdetr][backbone][pe_core]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ for (const auto filename : {"rf-detr-atto.pth", "rf-detr-femto.pth", "rf-detr-pico.pth"}) {
+  auto config = r::native_config_from_preset(*r::find_model_preset_by_weight_filename(filename));
+  config.group_detr = 1;
+  config.num_queries = config.num_select = 3;
+  r::NativeRfDetrModel model(config);
+  model.eval();
+  const auto parameters = model.named_parameters();
+  const auto position = parameters["backbone.0.encoder.model.pos_embed"].clone();
+  const auto buffers_before = model.named_buffers().size();
+  torch::NoGradGuard guard;
+  for (const auto extent : {2, 3, 2}) {
+   const auto side = config.patch_size * config.num_windows * extent;
+   const auto output = model.forward({torch::rand({1, 3, side, side}), {}}, false);
+   CHECK(output.main.pred_logits.sizes() == c10::IntArrayRef({1, 3, config.num_classes}));
+   CHECK(torch::isfinite(output.main.pred_boxes).all().item<bool>());
+   CHECK(torch::equal(parameters["backbone.0.encoder.model.pos_embed"], position));
+   CHECK(model.named_buffers().size() == buffers_before);
+  }
+ }
 }

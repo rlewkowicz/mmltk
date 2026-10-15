@@ -25,6 +25,19 @@ torch::Tensor model_scaled_dot_product_attention(
  }
  return at::scaled_dot_product_attention(query, key, value, admitted_mask.defined() ? std::optional<torch::Tensor>(admitted_mask) : std::nullopt, 0.0, false, scale);
 }
+torch::Tensor keypoint_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& position, const torch::Tensor& excluded, bool force_math) {
+ const int64_t batch = target.size(0), count = target.size(1), width = target.size(2), heads = attention->options.num_heads();
+ const auto positioned = (target + position).transpose(0, 1);
+ const auto values = target.transpose(0, 1);
+ const auto project = [&](const torch::Tensor& input, int64_t part) {
+  return torch::linear(input, attention->in_proj_weight.narrow(0, part * width, width), attention->in_proj_bias.narrow(0, part * width, width))
+   .reshape({count, batch, heads, width / heads}).permute({1, 2, 0, 3});
+ };
+ const auto mask = excluded.defined() ? torch::zeros_like(excluded, target.options()).masked_fill(excluded, -std::numeric_limits<double>::infinity()) : torch::Tensor{};
+ auto result = model_scaled_dot_product_attention(project(positioned, 0), project(positioned, 1), project(values, 2), mask, std::nullopt, force_math);
+ result = detail::linear_forward(*attention->out_proj, result.permute({2, 0, 1, 3}).reshape({count * batch, width}));
+ return result.reshape({count, batch, width}).transpose(0, 1);
+}
 namespace {
 torch::Tensor grouped_attention(
  const torch::Tensor& query, const torch::Tensor& key, const torch::Tensor& value, int64_t heads, int64_t groups, bool force_math, const torch::Tensor& excluded_keys = {}) {

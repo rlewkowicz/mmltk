@@ -88,6 +88,7 @@ TEST_CASE("admitted native state resolves complete metadata without reopening it
   const auto projected = rfdetr::make_native_checkpoint_metadata(resolved, 2);
   auto expected = source.metadata;
   expected.preset_name = resolved.config.preset_name;
+  expected.native_configuration = rfdetr::encode_checkpoint_configuration(resolved.config);
   CHECK(rfdetr::same_native_model_semantics(projected, expected));
  }
  const auto descriptor = temp.path() / "classes.json";

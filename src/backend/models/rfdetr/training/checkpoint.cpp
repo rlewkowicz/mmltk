@@ -24,6 +24,7 @@ ModelStateLoadSummary load_model_weights(NativeRfDetrModel& model, const std::fi
  return apply_checkpoint_to_module(model, checkpoint, strict);
 }
 ModelStateLoadSummary apply_checkpoint_to_module(NativeRfDetrModel& module, const DecodedNativeModelState& checkpoint, const bool strict) {
+ if (strict) require_checkpoint_model_topology(module.config(), checkpoint.metadata);
  return module.load_normalized_state(checkpoint.entries(), strict, &checkpoint.metadata.class_layout);
 }
 ModelStateLoadSummary apply_checkpoint_to_module(NativeRfDetrModel& module, const std::filesystem::path& checkpoint_path, bool strict) {

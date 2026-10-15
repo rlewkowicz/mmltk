@@ -31,12 +31,15 @@ void visit_matching_members(Left& left, const Right& right, Visitor&& visit) {
 }  // namespace mmltk::backend::models::rfdetr::model_state_detail
 namespace mmltk::backend::models::rfdetr {
 inline constexpr const char* kNativeCheckpointFormat = "mmltk.rfdetr.native_checkpoint";
-inline constexpr int64_t kNativeCheckpointFormatVersion = 4;
+inline constexpr int64_t kNativeCheckpointFormatVersion = 5;
 struct NativeCheckpointMetadata {
  ModelClassLayout class_layout;
  std::string preset_name;
  std::string source_kind;
  std::string source_path;
+ // Complete canonical configuration for format 5; external args are evidence only.
+ std::string native_configuration;
+ std::string external_topology;
  int64_t num_classes = 0;
  int64_t num_queries = 0;
  int64_t num_select = 0;
@@ -60,6 +63,10 @@ struct NativeCheckpointMetadata {
  std::optional<double> giou_loss_coef;
  std::optional<double> mask_ce_loss_coef;
  std::optional<double> mask_dice_loss_coef;
+ std::optional<double> keypoint_l1_loss_coef;
+ std::optional<double> keypoint_findable_loss_coef;
+ std::optional<double> keypoint_visible_loss_coef;
+ std::optional<double> keypoint_nll_loss_coef;
  std::optional<double> set_cost_class;
  std::optional<double> set_cost_bbox;
  std::optional<double> set_cost_giou;
@@ -111,7 +118,11 @@ struct ResolvedModelState {
  ResolvedModelArtifacts artifacts;
  DecodedNativeModelState model_state;
 };
+[[nodiscard]] std::string encode_checkpoint_configuration(const NativeRfDetrConfig&);
+[[nodiscard]] NativeRfDetrConfig decode_checkpoint_configuration(std::string_view);
+[[nodiscard]] NativeRfDetrConfig checkpoint_configuration(const NativeCheckpointMetadata&);
 void validate_decoded_model_state(const DecodedNativeModelState& state);
+void require_checkpoint_model_topology(const NativeRfDetrConfig&, const NativeCheckpointMetadata&);
 [[nodiscard]] bool same_native_model_semantics(const NativeCheckpointMetadata&, const NativeCheckpointMetadata&);
 enum class ModelStateContainer { Unknown, Python, Native };
 [[nodiscard]] ModelStateContainer identify_model_state_container(const std::filesystem::path&);

@@ -88,11 +88,6 @@ def _load_checkpoint_root(checkpoint_path: Path):
         normalized[name] = tensor
     if not normalized:
         raise RuntimeError(f"RF-DETR checkpoint has no model tensors: {checkpoint_path}")
-    inactive_keypoints = normalized.get("_kp_active_mask")
-    if inactive_keypoints is not None:
-        if inactive_keypoints.dtype != torch.bool or tuple(inactive_keypoints.shape) != (0, 0):
-            raise RuntimeError("RF-DETR checkpoint has unsupported active keypoint state")
-        del normalized["_kp_active_mask"]
     checkpoint["model"] = normalized
     return checkpoint
 
@@ -135,63 +130,37 @@ def _coerce_float(value):
 
 def _extract_checkpoint_metadata(checkpoint) -> dict:
     args_obj = checkpoint.get("args")
-    # These options select behavior that the native catalog does not implement.
-    # Shape-compatible alternatives must fail before tensor publication, not
-    # quietly inherit a preset's different forward computation.
-    fixed_topology = {
-        "encoder": "dinov2_windowed_small",
-        "out_feature_indexes": [3, 6, 9, 12],
-        "projector_scale": ["P4"],
-        "vit_encoder_num_layers": 12,
-        "position_embedding": "sine",
-        "decoder_norm": "LN",
-        "decoder_norm_type": "LN",
-        "layer_norm": True,
-        "rms_norm": False,
-        "two_stage": True,
-        "encoder_only": False,
-        "backbone_only": False,
-        "num_channels": 3,
-        "num_feature_levels": 1,
-        "dropout": 0.0,
-        "drop_path": 0.0,
-        "drop_path_rate": 0.0,
-        "use_grouppose_keypoints": False,
-        "num_keypoints_per_class": [],
-        "num_decoder_registers": 0,
-        "num_registers": 0,
-        "num_register_tokens": 0,
-        "dual_projector": False,
-        "mask_downsample_ratio": 4,
-    }
-    for name, supported in fixed_topology.items():
+    # Retain the external envelope; native admission owns supported topology.
+    # Tensor-derived facts are independently cross-checked there.
+    metadata = {}
+    topology_fields = (
+        "encoder", "out_feature_indexes", "projector_scale", "vit_encoder_num_layers",
+        "position_embedding", "decoder_norm", "decoder_norm_type", "layer_norm", "rms_norm",
+        "two_stage", "encoder_only", "backbone_only", "num_channels", "num_feature_levels",
+        "dropout", "drop_path", "drop_path_rate", "use_grouppose_keypoints", "num_keypoints_per_class",
+        "num_decoder_registers", "num_registers", "num_register_tokens", "dual_projector",
+        "dual_projector_kp_only", "mask_downsample_ratio", "window_block_indexes",
+        "num_windows", "sa_nheads", "ca_nheads", "bbox_reparam", "lite_refpoint_refine",
+        "grouppose_keypoint_dim_downscale", "keypoint_cross_attn", "inter_instance_kp_attn",
+        "dec_layers", "hidden_dim", "patch_size", "positional_encoding_size", "group_detr",
+        "dim_feedforward", "dec_n_points",
+    )
+    topology = _checkpoint_arg_value(args_obj, "external_topology") or {}
+    if not isinstance(topology, dict):
+        raise RuntimeError("invalid retained RF-DETR topology evidence")
+    topology = dict(topology)
+    for name in topology_fields:
         value = _checkpoint_arg_value(args_obj, name)
         if isinstance(value, tuple):
             value = list(value)
-        if value is not None and value != supported:
-            raise RuntimeError(f"unsupported RF-DETR checkpoint topology {name}={value!r}")
-    window_blocks = _checkpoint_arg_value(args_obj, "window_block_indexes")
-    if window_blocks is not None and list(window_blocks) != [0, 1, 2, 4, 5, 7, 8, 10, 11]:
-        raise RuntimeError("unsupported RF-DETR checkpoint window attention schedule")
-    metadata = {}
-    for name, coercer in {
-        "num_windows": _coerce_int,
-        "sa_nheads": _coerce_int,
-        "ca_nheads": _coerce_int,
-        "bbox_reparam": _coerce_bool,
-        "lite_refpoint_refine": _coerce_bool,
-    }.items():
-        evidence_name = f"topology_{name}"
-        raw = _checkpoint_arg_value(args_obj, name)
-        retained = _checkpoint_arg_value(args_obj, evidence_name)
-        if raw is not None and retained is not None and raw != retained:
-            raise RuntimeError(f"conflicting RF-DETR checkpoint topology evidence: {name}")
-        raw = raw if raw is not None else retained
-        if raw is not None:
-            value = coercer(raw)
-            if value is None or (coercer is _coerce_int and value <= 0):
-                raise RuntimeError(f"invalid RF-DETR checkpoint topology: {name}")
-            metadata[evidence_name] = value
+        if isinstance(value, (np.bool_, np.integer, np.floating)):
+            value = value.item()
+        if value is not None:
+            topology[name] = value
+    retained = checkpoint.get("native_configuration", _checkpoint_arg_value(args_obj, "native_configuration"))
+    if retained is not None:
+        metadata["native_configuration"] = retained
+    metadata["external_topology"] = topology
     layout = checkpoint.get("class_layout")
     if layout is not None:
         if not isinstance(layout, dict):
@@ -204,6 +173,16 @@ def _extract_checkpoint_metadata(checkpoint) -> dict:
         ):
             raise RuntimeError("RF-DETR class-name evidence exceeds its supported schema")
         metadata["class_name_evidence"] = list(class_names)
+    # Retain the old five optional fields in round trips of historical native
+    # envelopes. They are checked against the same canonical configuration.
+    for name, coercer in (("num_windows", _coerce_int), ("sa_nheads", _coerce_int), ("ca_nheads", _coerce_int), ("bbox_reparam", _coerce_bool), ("lite_refpoint_refine", _coerce_bool)):
+        key = "topology_" + name
+        raw = _checkpoint_arg_value(args_obj, key)
+        if raw is not None:
+            value = coercer(raw)
+            if value is None:
+                raise RuntimeError(f"invalid retained RF-DETR topology evidence: {key}")
+            metadata[key] = value
     field_specs = {
         "num_queries": _coerce_int,
         "num_select": _coerce_int,
@@ -219,6 +198,10 @@ def _extract_checkpoint_metadata(checkpoint) -> dict:
         "giou_loss_coef": _coerce_float,
         "mask_ce_loss_coef": _coerce_float,
         "mask_dice_loss_coef": _coerce_float,
+        "keypoint_l1_loss_coef": _coerce_float,
+        "keypoint_findable_loss_coef": _coerce_float,
+        "keypoint_visible_loss_coef": _coerce_float,
+        "keypoint_nll_loss_coef": _coerce_float,
         "set_cost_class": _coerce_float,
         "set_cost_bbox": _coerce_float,
         "set_cost_giou": _coerce_float,

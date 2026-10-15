@@ -6,6 +6,18 @@
 #include "src/frameworks/serialization/serialization.h"
 namespace mmltk::backend::models::rfdetr {
 namespace catalog = mmltk::backend::data::catalog;
+namespace {
+template <class Record>
+std::string encode_record(const Record& record) {
+ std::vector<std::byte> bytes;
+ if (!mmltk::frameworks::serialization::encode(record, bytes, {.max_bytes = kClassLayoutByteBudget, .max_items = kClassLayoutByteBudget}))
+  throw std::invalid_argument("cannot encode RF-DETR class record");
+ auto text = mmltk::frameworks::serialization::json_from_cbor({bytes, {}}, {.max_bytes = kClassLayoutByteBudget, .max_items = kClassLayoutByteBudget}).dump();
+ if (text.size() > kClassLayoutByteBudget) throw std::invalid_argument("RF-DETR class record escaped JSON exceeds 1 MiB artifact budget");
+ return text;
+}
+}
+
 ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std::move(record)) {
  if (record_.version != kClassLayoutVersion || record_.slots.size() > kMaximumClassOutputSlots) throw std::invalid_argument("unsupported or oversized RF-DETR class layout");
  if (record_.provenance.producer.find('\0') != std::string::npos || record_.provenance.producer.size() > 1024 || record_.provenance.artifact_sha256.size() > 64)
@@ -17,6 +29,11 @@ ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std:
  if (record_.class_name_evidence.names.size() > catalog::kClassCatalogCapacity) throw std::invalid_argument("oversized class-name evidence");
  for (const auto& name : record_.class_name_evidence.names)
   if (name.value.size() > catalog::kClassNameCapacity || name.value.find('\0') != std::string::npos) throw std::invalid_argument("invalid class-name evidence");
+ if (record_.class_name_evidence.keypoints) {
+  if (record_.class_name_evidence.keypoints->size() != record_.class_name_evidence.names.size()) throw std::invalid_argument("class-name joint evidence has the wrong class count");
+  for (const auto& schema : *record_.class_name_evidence.keypoints) catalog::validate_keypoint_schema(schema);
+ }
+ static_cast<void>(encode_record(record_));
  catalog_ = std::make_shared<const catalog::ClassCatalog>(record_.foreground);
  std::array<bool, catalog::kClassCatalogCapacity> seen{};
  std::size_t background_count = 0;
@@ -114,13 +131,6 @@ ModelClassLayout coco_class_layout(ClassLayoutProvenance provenance) {
  return result;
 }
 namespace {
-template <class Record>
-std::string encode_record(const Record& record) {
- std::vector<std::byte> bytes;
- if (!mmltk::frameworks::serialization::encode(record, bytes, {.max_bytes = kClassLayoutByteBudget, .max_items = kClassLayoutByteBudget}))
-  throw std::invalid_argument("cannot encode RF-DETR class record");
- return mmltk::frameworks::serialization::json_from_cbor({bytes, {}}, {.max_bytes = kClassLayoutByteBudget, .max_items = kClassLayoutByteBudget}).dump();
-}
 template <class Record>
 Record decode_record(std::string_view text) {
  if (text.size() > kClassLayoutByteBudget) throw std::invalid_argument("RF-DETR class record exceeds byte budget");

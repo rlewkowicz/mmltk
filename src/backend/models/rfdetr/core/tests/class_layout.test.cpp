@@ -113,3 +113,51 @@ TEST_CASE("Class descriptors admit every canonical named output role", "[model][
  descriptor.output_roles.back().role = descriptor.output_roles.front().role;
  CHECK_THROWS(r::encode_class_descriptor(descriptor));
 }
+
+TEST_CASE("Model schema admission bounds escaped JSON and validates optional raw evidence", "[rfdetr][layout][keypoints]") {
+ catalog::ClassKeypointSchema joints;
+ for (unsigned index = 0; index < 128; ++index) {
+  joints.names.push_back(std::to_string(index) + std::string(190, '\x01'));
+  joints.horizontal_flip.push_back(index);
+  joints.oks_sigmas.push_back(.05);
+ }
+ catalog::OrderedClassCatalog catalog_record;
+ for (unsigned index = 0; index < 6; ++index) catalog_record.names.push_back({"class-" + std::to_string(index)});
+ catalog_record.keypoints.emplace(catalog_record.names.size(), joints);
+ auto record = r::native_training_class_layout(catalog::ClassCatalog(catalog_record));
+ const auto encoded = r::encode_class_layout(record);
+ REQUIRE(encoded.size() < r::kClassLayoutByteBudget);
+ CHECK(r::decode_class_layout(encoded) == record);
+ r::ModelClassDescriptor descriptor;
+ descriptor.artifact_sha256 = std::string(64, 'a');
+ descriptor.layout = record;
+ CHECK(r::decode_class_descriptor(r::encode_class_descriptor(descriptor)).layout == record);
+ for (unsigned index = 6; index < 8; ++index) {
+  catalog_record.names.push_back({"class-" + std::to_string(index)});
+  catalog_record.keypoints->push_back(joints);
+ }
+ // Independent data catalogs admit this schema; model publication has a lower
+ // byte budget, including JSON escaping of the joint-name control characters.
+ const catalog::ClassCatalog large(catalog_record);
+ CHECK_THROWS(r::ResolvedClassLayout(r::native_training_class_layout(large)));
+ auto raw = r::unresolved_class_layout(2);
+ raw.class_name_evidence.names = {{""}, {""}};
+ raw.class_name_evidence.keypoints = std::vector{catalog::coco_person_keypoint_schema(), catalog::coco_person_keypoint_schema()};
+ CHECK_FALSE(r::ResolvedClassLayout(raw).semantic());
+ CHECK(r::decode_class_layout(r::encode_class_layout(raw)) == raw);
+ raw.class_name_evidence.keypoints->pop_back();
+ CHECK_THROWS(r::ResolvedClassLayout(raw));
+ raw.class_name_evidence.keypoints->push_back(catalog::coco_person_keypoint_schema());
+ raw.class_name_evidence.keypoints->front().horizontal_flip[0] = 255;
+ CHECK_THROWS(r::encode_class_layout(raw));
+}
+
+TEST_CASE("Joint configurations preserve independent foreground and physical slot capacities", "[rfdetr][layout][keypoints]") {
+ auto config = r::native_config_from_preset(*r::find_preset_catalog_entry("rf-detr-keypoint-preview"));
+ config.num_classes = r::kMaximumClassOutputSlots;
+ config.keypoints_per_class.assign(r::kMaximumClassOutputSlots, 0);
+ config.keypoints_per_class.back() = 17;
+ CHECK(r::native_model_config_valid(config));
+ for (std::size_t index = 0; index < catalog::kClassCatalogCapacity; ++index) config.keypoints_per_class[index] = 1;
+ CHECK_FALSE(r::native_model_config_valid(config));
+}

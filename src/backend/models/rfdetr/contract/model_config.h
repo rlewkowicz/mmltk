@@ -11,7 +11,7 @@
 #include <type_traits>
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/backend/models/rfdetr/contract/model_topology.h"
-#include "src/backend/data/catalog/class_catalog.h"
+#include "src/backend/models/rfdetr/contract/class_layout.h"
 #include <vector>
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -41,7 +41,8 @@ struct NativeRfDetrConfig {
  int keypoint_dimension_downscale = 1;
  bool keypoint_cross_attention = true;
  bool inter_instance_keypoint_attention = false;
- MMLTK_MAX_ITEMS(mmltk::backend::data::catalog::kClassCatalogCapacity) std::vector<std::uint16_t> keypoints_per_class;
+ // Counts index physical classifier slots; at most 256 slots own foreground schemas.
+ MMLTK_MAX_ITEMS(kMaximumClassOutputSlots) std::vector<std::uint16_t> keypoints_per_class;
  int num_classes = 0;
  int num_queries = 0;
  int num_select = 0;

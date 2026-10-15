@@ -49,6 +49,7 @@ std::vector<torch::Tensor> prediction_tensors(const rf::ModelOutputs& outputs) {
   result.push_back(layer.pred_logits);
   result.push_back(layer.pred_boxes);
   if (layer.pred_masks) result.push_back(*layer.pred_masks);
+  if (layer.pred_keypoints) result.push_back(*layer.pred_keypoints);
   if (layer.sparse_pred_masks) {
    result.push_back(layer.sparse_pred_masks->spatial_features);
    result.push_back(layer.sparse_pred_masks->query_features);
@@ -261,3 +262,66 @@ TEST_CASE("Lazy FullTrace rejects target-dependent supervision before recording"
  }
 }
 }  // namespace
+
+TEST_CASE("New backbone and joint families execute every compilation mode with real derivatives", "[rfdetr][compilation][gpu]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; native family compilation remains unverified");
+ const fixture::FullMatrixPrecision precision;
+ const torch::Device device(torch::kCUDA, 0);
+ for (const auto preset : {"rf-detr-xlarge", "rf-detr-atto", "rf-detr-femto", "rf-detr-keypoint-preview"}) {
+  auto config = rf::native_config_from_preset(*rf::find_preset_catalog_entry(preset));
+  config.resolution = config.patch_size * config.num_windows * 2;
+  config.num_queries = config.num_select = 3;
+  config.group_detr = 2;
+  if (config.has_keypoints()) { config.num_classes = 4; config.keypoints_per_class = {2, 0, 1}; }
+  for (const auto mode : {rf::CompilationMode::kNone, rf::CompilationMode::kSelective, rf::CompilationMode::kFullTrace}) {
+   CAPTURE(preset, mode);
+   torch::manual_seed(918);
+   rf::NativeRfDetrModel eager(config);
+   torch::manual_seed(918);
+   rf::NativeRfDetrModel compiled(config);
+   if (config.has_keypoints()) {
+    torch::NoGradGuard guard;
+    const auto weight = eager.named_parameters()["keypoint_embed.layers.2.weight"];
+    const auto values = torch::sin(torch::arange(weight.numel(), weight.options())).reshape(weight.sizes()) * .02;
+    weight.copy_(values);
+    compiled.named_parameters()["keypoint_embed.layers.2.weight"].copy_(values);
+   }
+   eager.to(device);
+   compiled.to(device);
+   eager.train();
+   compiled.optimize_for_inference(1, true, mode);
+   for (int invocation = 0; invocation < 3; ++invocation) {
+    auto image = torch::rand({1, 3, config.resolution, config.resolution}, torch::TensorOptions().device(device)).set_requires_grad(true);
+    auto observed_image = independent_leaf(image);
+    auto expected = eager.forward({image, {}}, false);
+    auto actual = compiled.forward({observed_image, {}}, false);
+    REQUIRE(actual.main.pred_logits.defined());
+    REQUIRE(actual.main.pred_keypoints.has_value() == config.has_keypoints());
+    REQUIRE(actual.enc_outputs.has_value() == (config.dec_layers > 0));
+    if (config.dec_layers == 0) REQUIRE(actual.aux_outputs.empty());
+    prediction_vjp(actual, expected, torch::kFloat32, false).backward();
+    prediction_vjp(actual, expected, torch::kFloat32, true).backward();
+    compare_tensor(observed_image.grad(), image.grad(), torch::kFloat32);
+    const auto actual_parameters = compiled.named_parameters();
+    for (const auto& parameter : eager.named_parameters()) {
+     CAPTURE(parameter.key());
+     const auto& observed = actual_parameters[parameter.key()];
+     REQUIRE(observed.grad().defined() == parameter.value().grad().defined());
+     if (observed.grad().defined()) compare_tensor(observed.grad(), parameter.value().grad(), torch::kFloat32);
+    }
+    for (auto parameter : eager.parameters()) parameter.mutable_grad() = torch::Tensor{};
+    for (auto parameter : compiled.parameters()) parameter.mutable_grad() = torch::Tensor{};
+   }
+   if (mode == rf::CompilationMode::kFullTrace) REQUIRE(Access::graph(compiled, true));
+   if (mode == rf::CompilationMode::kSelective) REQUIRE(Access::backbone_identity(compiled, true));
+   eager.eval();
+   compiled.optimize_for_inference(1, false, mode);
+   torch::NoGradGuard guard;
+   const auto image = torch::rand({1, 3, config.resolution, config.resolution}, torch::TensorOptions().device(device));
+   for (int invocation = 0; invocation < 2; ++invocation) {
+    const auto expected = eager.forward({image, {}}, false), actual = compiled.forward({image, {}}, false);
+    static_cast<void>(prediction_vjp(actual, expected, torch::kFloat32, true));
+   }
+  }
+ }
+}

@@ -6,6 +6,7 @@
 namespace mmltk::backend::models::rfdetr {
 [[nodiscard]] torch::Tensor isolated_group_self_attention(
  torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout, bool force_math = false);
+[[nodiscard]] torch::Tensor keypoint_self_attention(torch::nn::MultiheadAttention&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor& excluded = {}, bool force_math = false);
 // Local backend selection shared by backbone and decoder attention.
 [[nodiscard]] torch::Tensor model_scaled_dot_product_attention(
  const torch::Tensor& query, const torch::Tensor& key, const torch::Tensor& value, const torch::Tensor& admitted_mask = {}, std::optional<double> scale = std::nullopt, bool force_math = false);

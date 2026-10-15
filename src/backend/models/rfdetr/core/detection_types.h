@@ -132,6 +132,8 @@ struct OutputLayer {
  std::optional<torch::Tensor> query_features;
  std::optional<SupervisedQueryLayout> query_layout;
  std::optional<torch::Tensor> pred_masks;
+ // [batch, queries, classes * max_joints, 8]: x/y, findable/visible, precision-Cholesky, class contribution.
+ std::optional<torch::Tensor> pred_keypoints;
  std::optional<SparsePredMasks> sparse_pred_masks;
  template <class Self, class Visitor>
  void for_each_required_tensor(this Self&& self, Visitor&& visit) {

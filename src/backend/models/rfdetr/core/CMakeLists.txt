@@ -79,6 +79,9 @@ mmltk_register_retained_module_importers(
     training_supervision.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
+    dino_backbone.cpp
+    pe_core_backbone.cpp
+    keypoint_head.cpp
     decoder_attention.cpp
     segmentation_depthwise.cpp
     gpu_batch_preprocessor.cpp
@@ -93,6 +96,8 @@ mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_core
     detail/selective_compilation.h
     detail/tensor_trace.h
+    detail/backbone.h
+    detail/keypoint_head.h
     detail/decoder_attention.h
     detail/lsap_scratch.h
     detail/matcher_workspace.h

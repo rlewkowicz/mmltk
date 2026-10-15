@@ -681,3 +681,60 @@ TEST_CASE("Optimizer Resume seals group policy while restoring held schedule and
  }
 }
 }  // namespace
+
+TEST_CASE("Atto trains encoder predictions while retaining cold dormant state without moments", "[rfdetr][training][atto]") {
+ auto config = rf::native_config_from_preset(*rf::find_model_preset_by_weight_filename("rf-detr-atto.pth"));
+ config.resolution = 80;
+ config.num_queries = config.num_select = 3;
+ config.group_detr = 2;
+ rf::NativeRfDetrModel model(config);
+ model.train();
+ auto built = rf::build_optimizer(model.named_parameters(), optimizer_test_request(rf::TrainOptimizerKind::AdamW));
+ const auto dormant = [](std::string_view name) {
+  return name.starts_with("class_embed.") || name.starts_with("bbox_embed.") || name == "query_feat.weight" || name == "refpoint_embed.weight" || name.starts_with("transformer.decoder.");
+ };
+ std::vector<std::pair<std::string, torch::Tensor>> retained;
+ for (const auto& parameter : model.named_parameters()) {
+  REQUIRE_FALSE(parameter.key().starts_with("transformer.decoder.layers."));
+  if (dormant(parameter.key())) {
+   CHECK_FALSE(parameter.value().requires_grad());
+   retained.emplace_back(parameter.key(), parameter.value().detach().clone());
+  }
+ }
+ REQUIRE_FALSE(retained.empty());
+ for (const auto& name : built.optimizer.parameter_names()) CHECK_FALSE(dormant(name));
+ const auto input = torch::rand({1, 3, config.resolution, config.resolution});
+ for (int step = 0; step < 2; ++step) {
+  auto outputs = model.forward({input, {}}, false);
+  REQUIRE(outputs.main.pred_logits.size(1) == config.num_queries * config.group_detr);
+  REQUIRE(outputs.aux_outputs.empty());
+  REQUIRE_FALSE(outputs.enc_outputs);
+  (outputs.main.pred_logits.square().mean() + outputs.main.pred_boxes.square().mean()).backward();
+  built.optimizer.step();
+  built.optimizer.zero_grad(true);
+ }
+ const auto parameters = model.named_parameters();
+ for (const auto& [name, expected] : retained) {
+  CHECK_FALSE(parameters[name].grad().defined());
+  CHECK(torch::equal(parameters[name], expected));
+ }
+ auto archived = optimizer_checkpoint(built.optimizer);
+ for (std::size_t index = 0; index < built.optimizer.eligible_parameter_names().size(); ++index) {
+  const auto& name = built.optimizer.eligible_parameter_names()[index];
+  if (!dormant(name)) continue;
+  torch::serialize::InputArchive parameter;
+  archived.read(mmltk::backend::ml::serialization::archive_entry_name("param", index), parameter);
+  CHECK(mmltk::backend::ml::serialization::require_int(parameter, "initialized") == 0);
+  torch::Tensor tensor;
+  CHECK_FALSE(parameter.try_read("exp_avg", tensor));
+  CHECK_FALSE(parameter.try_read("exp_avg_sq", tensor));
+ }
+ auto detection = rf::testsupport::detection_fixture_base(config);
+ rf::populate_default_detection_weight_dict(detection);
+ for (const auto& [name, weight] : detection.weight_dict) CHECK_FALSE(name.ends_with("_enc"));
+ model.eval();
+ torch::NoGradGuard guard;
+ const auto output = model.forward({input, {}}, false);
+ CHECK(output.main.pred_logits.size(1) == config.num_queries);
+ CHECK_FALSE(output.enc_outputs);
+}

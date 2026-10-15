@@ -25,6 +25,8 @@
 #include <vector>
 #include "model.h"
 #include "detail/class_tensor_axes.h"
+#include "detail/backbone.h"
+#include "detail/keypoint_head.h"
 #include "detail/decoder_attention.h"
 #include "detail/selective_compilation.h"
 #include "detail/tensor_trace.h"
@@ -97,6 +99,8 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  torch::nn::Embedding refpoint_embed{nullptr};
  torch::nn::Embedding query_feat{nullptr};
  std::shared_ptr<torch::nn::Module> segmentation_head_;
+ std::shared_ptr<RfDetrMlpImpl> keypoint_embed_;
+ torch::Tensor keypoint_active_mask_;
  std::shared_ptr<TrainingSupervisionImpl> training_supervision_;
  detail::TensorTrace full_trace_{"full_model"};
  std::array<ModelOutputs, 2> full_output_layout_;
@@ -105,11 +109,6 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
 };
 namespace {
 using namespace torch::indexing;
-constexpr int64_t kDinoHiddenSize = 384;
-constexpr int64_t kDinoNumLayers = 12;
-constexpr int64_t kDinoNumHeads = 6;
-constexpr int64_t kProjectorBlocks = 3;
-constexpr std::array<int64_t, 4> kOutFeatureStages = {3, 6, 9, 12};
 constexpr std::string_view kQueryFeatureWeight = "query_feat.weight", kReferencePointWeight = "refpoint_embed.weight";
 // Backbone features come out at their own spatial resolution, so the padding mask has to be rebound
 // to each feature map. Every backbone path does it the same way, so the resize lives here once.
@@ -126,16 +125,13 @@ torch::Tensor reparam_box_refine(const torch::Tensor& base, const torch::Tensor&
  auto wh = delta.index({Ellipsis, Slice(2, None)}).exp() * base.index({Ellipsis, Slice(2, None)});
  return torch::cat({cxcy, wh}, -1);
 }
-// Copies source into destination when the optional metadata field carries a value.
-template <typename Source, typename Destination>
-void apply_if_set(const std::optional<Source>& source, Destination& destination) {
- if (source.has_value()) { destination = *source; }
-}
 struct NativeTransformerOutput {
  torch::Tensor hidden_states;
  torch::Tensor refs_unsigmoid;
  torch::Tensor enc_memory;
  torch::Tensor enc_boxes;
+ torch::Tensor keypoint_hidden_states;
+ torch::Tensor enc_keypoints;
 };
 torch::Tensor gen_sineembed_for_position(const torch::Tensor& pos_tensor, int64_t dim) {
  const double scale = 2.0 * M_PI;
@@ -163,378 +159,6 @@ torch::Tensor gen_sineembed_for_position(const torch::Tensor& pos_tensor, int64_
  }
  return torch::cat(encoded, -1);
 }
-bool is_out_feature_stage(int64_t stage) { return std::ranges::find(kOutFeatureStages, stage) != kOutFeatureStages.end(); }
-class LayerNorm2dImpl : public torch::nn::Module {
-public:
- explicit LayerNorm2dImpl(int64_t normalized_shape, double eps = 1.0e-6)
-     : weight(register_parameter("weight", torch::ones({normalized_shape}, torch::kFloat32))), bias(register_parameter("bias", torch::zeros({normalized_shape}, torch::kFloat32))), eps_(eps) {}
- torch::Tensor forward(const torch::Tensor& x) {
-  auto y = x.permute({0, 2, 3, 1});
-  y = F::layer_norm(y, F::LayerNormFuncOptions({y.size(3)}).weight(weight).bias(bias).eps(eps_));
-  return y.permute({0, 3, 1, 2});
- }
- torch::Tensor weight;
- torch::Tensor bias;
-
-private:
- double eps_ = 1.0e-6;
-};
-TORCH_MODULE(LayerNorm2d);
-class ConvXImpl : public torch::nn::Module {
-public:
- ConvXImpl(int64_t in_planes, int64_t out_planes, int64_t kernel = 3, int64_t stride = 1, int64_t groups = 1, bool layer_norm = false)
-     : conv(register_module("conv", torch::nn::Conv2d(torch::nn::Conv2dOptions(in_planes, out_planes, kernel).stride(stride).padding(kernel / 2).groups(groups).bias(false)))),
-       use_layer_norm_(layer_norm) {
-  if (use_layer_norm_) {
-   ln = register_module("bn", LayerNorm2d(out_planes));
-  } else {
-   bn = register_module("bn", torch::nn::BatchNorm2d(out_planes));
-  }
- }
- torch::Tensor forward(const torch::Tensor& x) {
-  auto out = conv->forward(x.contiguous());
-  out = use_layer_norm_ ? ln->forward(out) : bn->forward(out);
-  return torch::silu(out);
- }
- torch::nn::Conv2d conv{nullptr};
-
-private:
- bool use_layer_norm_ = false;
- LayerNorm2d ln{nullptr};
- torch::nn::BatchNorm2d bn{nullptr};
-};
-TORCH_MODULE(ConvX);
-class BottleneckImpl : public torch::nn::Module {
-public:
- BottleneckImpl(int64_t c1, int64_t c2, bool shortcut = true, int64_t groups = 1, bool layer_norm = false)
-     : cv1(register_module("cv1", ConvX(c1, c2, 3, 1, groups, layer_norm))), cv2(register_module("cv2", ConvX(c2, c2, 3, 1, groups, layer_norm))), add_(shortcut && c1 == c2) {}
- torch::Tensor forward(const torch::Tensor& x) {
-  auto out = cv2->forward(cv1->forward(x));
-  return add_ ? x + out : out;
- }
-
-private:
- ConvX cv1{nullptr};
- ConvX cv2{nullptr};
- bool add_ = false;
-};
-TORCH_MODULE(Bottleneck);
-class C2fImpl : public torch::nn::Module {
-public:
- C2fImpl(int64_t c1, int64_t c2, int64_t num_blocks, bool layer_norm = false)
-     : c_(c2 / 2),
-       cv1(register_module("cv1", ConvX(c1, 2 * c_, 1, 1, 1, layer_norm))),
-       cv2(register_module("cv2", ConvX((2 + num_blocks) * c_, c2, 1, 1, 1, layer_norm))),
-       m(register_module("m", torch::nn::ModuleList())) {
-  for (int64_t index = 0; index < num_blocks; ++index) { m->push_back(Bottleneck(c_, c_, false, 1, layer_norm)); }
- }
- torch::Tensor forward(const torch::Tensor& x) {
-  auto stem = cv1->forward(x);
-  std::vector<torch::Tensor> parts;
-  parts.reserve(static_cast<size_t>(2 + m->size()));
-  parts.push_back(stem.narrow(1, 0, c_));
-  parts.push_back(stem.narrow(1, c_, c_));
-  for (size_t index = 0; index < m->size(); ++index) { parts.push_back(m[index]->as<Bottleneck>()->forward(parts.back())); }
-  return cv2->forward(torch::cat(parts, 1));
- }
-
-private:
- int64_t c_ = 0;
- ConvX cv1{nullptr};
- ConvX cv2{nullptr};
- torch::nn::ModuleList m{nullptr};
-};
-TORCH_MODULE(C2f);
-class Dinov2PatchEmbeddingsImpl : public torch::nn::Module {
-public:
- explicit Dinov2PatchEmbeddingsImpl(int64_t patch_size)
-     : projection(register_module("projection", torch::nn::Conv2d(torch::nn::Conv2dOptions(3, kDinoHiddenSize, patch_size).stride(patch_size).bias(true)))), patch_size_(patch_size) {}
- torch::Tensor forward(const torch::Tensor& pixel_values) { return projection->forward(pixel_values).flatten(2).transpose(1, 2); }
- torch::nn::Conv2d projection{nullptr};
-
-private:
- int64_t patch_size_ = 0;
-};
-TORCH_MODULE(Dinov2PatchEmbeddings);
-class WindowedDinov2EmbeddingsImpl : public torch::nn::Module {
-public:
- explicit WindowedDinov2EmbeddingsImpl(const NativeRfDetrConfig& config)
-     : cls_token(register_parameter("cls_token", torch::empty({1, 1, kDinoHiddenSize}, torch::kFloat32))),
-       mask_token(register_parameter("mask_token", torch::zeros({1, kDinoHiddenSize}, torch::kFloat32))),
-       position_embeddings(register_parameter("position_embeddings", torch::empty({1, config.positional_encoding_size * config.positional_encoding_size + 1, kDinoHiddenSize}, torch::kFloat32))),
-       patch_embeddings(register_module("patch_embeddings", Dinov2PatchEmbeddings(config.patch_size))),
-       patch_size_(config.patch_size),
-       num_windows_(std::max<int64_t>(1, config.num_windows)) {}
- torch::Tensor interpolate_pos_encoding(const torch::Tensor& embeddings, int64_t height, int64_t width) const {
-  const int64_t num_patches = embeddings.size(1) - 1;
-  const int64_t num_positions = position_embeddings.size(1) - 1;
-  if (num_patches == num_positions && height == width) { return position_embeddings; }
-  auto class_pos_embed = position_embeddings.index({Slice(), 0});
-  auto patch_pos_embed = position_embeddings.index({Slice(), Slice(1, None)});
-  const int64_t dim = embeddings.size(-1);
-  const int64_t patch_height = height / patch_size_;
-  const int64_t patch_width = width / patch_size_;
-  const auto sqrt_num_positions = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(num_positions))));
-  patch_pos_embed = patch_pos_embed.view({1, sqrt_num_positions, sqrt_num_positions, dim}).permute({0, 3, 1, 2});
-  patch_pos_embed =
-   F::interpolate(patch_pos_embed.to(torch::kFloat32), F::InterpolateFuncOptions().size(std::vector<int64_t>{patch_height, patch_width}).mode(torch::kBicubic).align_corners(false).antialias(true))
-    .to(position_embeddings.dtype());
-  patch_pos_embed = patch_pos_embed.permute({0, 2, 3, 1}).reshape({1, -1, dim});
-  return torch::cat({class_pos_embed.unsqueeze(0), patch_pos_embed}, 1);
- }
- torch::Tensor forward(const torch::Tensor& pixel_values) {
-  const int64_t batch_size = pixel_values.size(0);
-  const int64_t height = pixel_values.size(2);
-  const int64_t width = pixel_values.size(3);
-  auto embeddings = patch_embeddings->forward(pixel_values.to(patch_embeddings->projection->weight.dtype()));
-  auto cls_tokens = cls_token.expand({batch_size, 1, kDinoHiddenSize});
-  embeddings = torch::cat({cls_tokens, embeddings}, 1);
-  embeddings = embeddings + interpolate_pos_encoding(embeddings, height, width);
-  if (num_windows_ > 1) {
-   const int64_t num_h_patches = height / patch_size_;
-   const int64_t num_w_patches = width / patch_size_;
-   const int64_t num_h_patches_per_window = num_h_patches / num_windows_;
-   const int64_t num_w_patches_per_window = num_w_patches / num_windows_;
-   auto cls_token_with_pos_embed = embeddings.narrow(1, 0, 1);
-   auto pixel_tokens_with_pos_embed = embeddings.narrow(1, 1, embeddings.size(1) - 1);
-   pixel_tokens_with_pos_embed = pixel_tokens_with_pos_embed.view({batch_size, num_h_patches, num_w_patches, kDinoHiddenSize});
-   auto windowed_pixel_tokens = pixel_tokens_with_pos_embed.reshape({batch_size * num_windows_, num_h_patches_per_window, num_windows_, num_w_patches_per_window, kDinoHiddenSize})
-                                 .permute({0, 2, 1, 3, 4})
-                                 .reshape({batch_size * num_windows_ * num_windows_, num_h_patches_per_window * num_w_patches_per_window, kDinoHiddenSize});
-   auto windowed_cls_token_with_pos_embed = cls_token_with_pos_embed.repeat({num_windows_ * num_windows_, 1, 1});
-   embeddings = torch::cat({windowed_cls_token_with_pos_embed, windowed_pixel_tokens}, 1);
-  }
-  return embeddings;
- }
- torch::Tensor cls_token;
- torch::Tensor mask_token;
- torch::Tensor position_embeddings;
- Dinov2PatchEmbeddings patch_embeddings{nullptr};
-
-private:
- int64_t patch_size_ = 0;
- int64_t num_windows_ = 1;
-};
-TORCH_MODULE(WindowedDinov2Embeddings);
-class Dinov2SelfAttentionImpl : public torch::nn::Module {
-public:
- bool force_math_attention_ = false;
- Dinov2SelfAttentionImpl()
-     : query(register_module("query", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))),
-       key(register_module("key", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))),
-       value(register_module("value", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))) {}
- torch::Tensor forward(const torch::Tensor& hidden_states) {
-  const int64_t batch = hidden_states.size(0);
-  const int64_t seq_len = hidden_states.size(1);
-  const int64_t head_dim = kDinoHiddenSize / kDinoNumHeads;
-  auto reshape = [&](const torch::Tensor& tensor) { return tensor.view({batch, seq_len, kDinoNumHeads, head_dim}).permute({0, 2, 1, 3}); };
-  auto query_layer = reshape(detail::linear_forward(*query, hidden_states));
-  auto key_layer = reshape(detail::linear_forward(*key, hidden_states));
-  auto value_layer = reshape(detail::linear_forward(*value, hidden_states));
-  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
-  auto context = model_scaled_dot_product_attention(query_layer, key_layer, value_layer, {}, scale, force_math_attention_);
-  return context.permute({0, 2, 1, 3}).contiguous().view({batch, seq_len, kDinoHiddenSize});
- }
-
-private:
- torch::nn::Linear query{nullptr};
- torch::nn::Linear key{nullptr};
- torch::nn::Linear value{nullptr};
-};
-TORCH_MODULE(Dinov2SelfAttention);
-class Dinov2SelfOutputImpl : public torch::nn::Module {
-public:
- Dinov2SelfOutputImpl() : dense(register_module("dense", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))) {}
- torch::Tensor forward(const torch::Tensor& hidden_states) { return detail::linear_forward(*dense, hidden_states); }
- torch::nn::Linear dense{nullptr};
-};
-TORCH_MODULE(Dinov2SelfOutput);
-class Dinov2AttentionImpl : public torch::nn::Module {
-public:
- Dinov2AttentionImpl() : attention(register_module("attention", Dinov2SelfAttention())), output(register_module("output", Dinov2SelfOutput())) {}
- torch::Tensor forward(const torch::Tensor& hidden_states) { return output->forward(attention->forward(hidden_states)); }
-
-private:
- Dinov2SelfAttention attention{nullptr};
- Dinov2SelfOutput output{nullptr};
-};
-TORCH_MODULE(Dinov2Attention);
-class Dinov2LayerScaleImpl : public torch::nn::Module {
-public:
- Dinov2LayerScaleImpl() : lambda1(register_parameter("lambda1", torch::ones({kDinoHiddenSize}, torch::kFloat32))) {}
- torch::Tensor forward(const torch::Tensor& hidden_state) const { return hidden_state * lambda1; }
- torch::Tensor lambda1;
-};
-TORCH_MODULE(Dinov2LayerScale);
-class Dinov2MlpImpl : public torch::nn::Module {
-public:
- Dinov2MlpImpl() : fc1(register_module("fc1", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize * 4))), fc2(register_module("fc2", torch::nn::Linear(kDinoHiddenSize * 4, kDinoHiddenSize))) {}
- torch::Tensor forward(const torch::Tensor& hidden_state) { return detail::linear_forward(*fc2, torch::gelu(detail::linear_forward(*fc1, hidden_state))); }
-
-private:
- torch::nn::Linear fc1{nullptr};
- torch::nn::Linear fc2{nullptr};
-};
-TORCH_MODULE(Dinov2Mlp);
-class WindowedDinov2LayerImpl : public torch::nn::Module {
-public:
- explicit WindowedDinov2LayerImpl(int64_t num_windows)
-     : num_windows_(std::max<int64_t>(1, num_windows)),
-       norm1(register_module("norm1", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kDinoHiddenSize}).eps(1.0e-6)))),
-       attention(register_module("attention", Dinov2Attention())),
-       layer_scale1(register_module("layer_scale1", Dinov2LayerScale())),
-       norm2(register_module("norm2", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kDinoHiddenSize}).eps(1.0e-6)))),
-       mlp(register_module("mlp", Dinov2Mlp())),
-       layer_scale2(register_module("layer_scale2", Dinov2LayerScale())) {}
- torch::Tensor forward(const torch::Tensor& input, bool run_full_attention) {
-  auto hidden_states = input;
-  const auto shortcut = hidden_states;
-  const int64_t original_batch = hidden_states.size(0);
-  const int64_t original_hw = hidden_states.size(1);
-  if (run_full_attention && num_windows_ > 1) {
-   const int64_t num_windows_squared = num_windows_ * num_windows_;
-   hidden_states = hidden_states.view({original_batch / num_windows_squared, num_windows_squared * original_hw, kDinoHiddenSize});
-  }
-  auto attention_output = attention->forward(norm1->forward(hidden_states));
-  if (run_full_attention && num_windows_ > 1) { attention_output = attention_output.view({original_batch, original_hw, kDinoHiddenSize}); }
-  hidden_states = shortcut + layer_scale1->forward(attention_output);
-  auto layer_output = layer_scale2->forward(mlp->forward(norm2->forward(hidden_states)));
-  return hidden_states + layer_output;
- }
-
-private:
- int64_t num_windows_ = 1;
- torch::nn::LayerNorm norm1{nullptr};
- Dinov2Attention attention{nullptr};
- Dinov2LayerScale layer_scale1{nullptr};
- torch::nn::LayerNorm norm2{nullptr};
- Dinov2Mlp mlp{nullptr};
- Dinov2LayerScale layer_scale2{nullptr};
-};
-TORCH_MODULE(WindowedDinov2Layer);
-class WindowedDinov2EncoderImpl : public torch::nn::Module {
-public:
- explicit WindowedDinov2EncoderImpl(int64_t num_windows) : layer(register_module("layer", torch::nn::ModuleList())) {
-  for (int64_t index = 0; index < kDinoNumLayers; ++index) { layer->push_back(WindowedDinov2Layer(num_windows)); }
- }
- std::vector<torch::Tensor> forward(const torch::Tensor& hidden_states_in) {
-  auto hidden_states = hidden_states_in;
-  std::vector<torch::Tensor> all_hidden_states;
-  all_hidden_states.reserve(static_cast<size_t>(kDinoNumLayers + 1));
-  for (int64_t index = 0; index < kDinoNumLayers; ++index) {
-   all_hidden_states.push_back(hidden_states);
-   hidden_states = layer[index]->as<WindowedDinov2Layer>()->forward(hidden_states, is_out_feature_stage(index));
-  }
-  all_hidden_states.push_back(hidden_states);
-  return all_hidden_states;
- }
-
-private:
- torch::nn::ModuleList layer{nullptr};
-};
-TORCH_MODULE(WindowedDinov2Encoder);
-void initialize_dino_weight(torch::Tensor tensor) {
- // Pinned DINO uses trunc_normal_(std=.02, a=-2, b=2). These are absolute
- // bounds, not two standard deviations. Its normal CDF endpoints round to
- // zero and one at this scale; retain the upstream inverse-CDF construction.
- tensor.uniform_(-1.0, 1.0).erfinv_().mul_(0.02 * std::sqrt(2.0)).clamp_(-2.0, 2.0);
-}
-class WindowedDinov2BackboneImpl : public torch::nn::Module {
-public:
- explicit WindowedDinov2BackboneImpl(const NativeRfDetrConfig& config)
-     : patch_size_(config.patch_size),
-       num_windows_(std::max<int64_t>(1, config.num_windows)),
-       embeddings(register_module("embeddings", WindowedDinov2Embeddings(config))),
-       encoder(register_module("encoder", WindowedDinov2Encoder(config.num_windows))),
-       layernorm(register_module("layernorm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kDinoHiddenSize}).eps(1.0e-6)))) {
-  torch::NoGradGuard no_grad;
-  for (const auto& module : modules(false)) {
-   if (auto* linear = dynamic_cast<torch::nn::LinearImpl*>(module.get())) {
-    initialize_dino_weight(linear->weight);
-    if (linear->bias.defined()) linear->bias.zero_();
-   } else if (auto* convolution = dynamic_cast<torch::nn::Conv2dImpl*>(module.get())) {
-    initialize_dino_weight(convolution->weight);
-    if (convolution->bias.defined()) convolution->bias.zero_();
-   } else if (auto* norm = dynamic_cast<torch::nn::LayerNormImpl*>(module.get())) {
-    norm->weight.fill_(1.0);
-    norm->bias.zero_();
-   }
-  }
-  initialize_dino_weight(embeddings->position_embeddings);
-  initialize_dino_weight(embeddings->cls_token);
- }
- std::vector<torch::Tensor> forward(const torch::Tensor& pixel_values) {
-  auto hidden_states = encoder->forward(embeddings->forward(pixel_values));
-  const int64_t batch_size = pixel_values.size(0);
-  const int64_t num_h_patches = pixel_values.size(2) / patch_size_;
-  const int64_t num_w_patches = pixel_values.size(3) / patch_size_;
-  const int64_t num_windows_squared = num_windows_ * num_windows_;
-  const int64_t num_h_patches_per_window = num_h_patches / num_windows_;
-  const int64_t num_w_patches_per_window = num_w_patches / num_windows_;
-  std::vector<torch::Tensor> feature_maps;
-  feature_maps.reserve(kOutFeatureStages.size());
-  for (const auto stage : kOutFeatureStages) {
-   auto hidden_state = layernorm->forward(hidden_states[static_cast<size_t>(stage)]);
-   hidden_state = hidden_state.slice(1, 1, c10::nullopt);
-   if (num_windows_ > 1) {
-    hidden_state = hidden_state.reshape({batch_size, num_windows_squared, hidden_state.size(1), kDinoHiddenSize});
-    hidden_state = hidden_state.reshape({batch_size * num_windows_, num_windows_, num_h_patches_per_window, num_w_patches_per_window, kDinoHiddenSize});
-    hidden_state = hidden_state.permute({0, 2, 1, 3, 4});
-   }
-   hidden_state = hidden_state.reshape({batch_size, num_h_patches, num_w_patches, kDinoHiddenSize});
-   feature_maps.push_back(hidden_state.permute({0, 3, 1, 2}).contiguous());
-  }
-  return feature_maps;
- }
-
-private:
- int64_t patch_size_ = 0;
- int64_t num_windows_ = 1;
- WindowedDinov2Embeddings embeddings{nullptr};
- WindowedDinov2Encoder encoder{nullptr};
- torch::nn::LayerNorm layernorm{nullptr};
-};
-TORCH_MODULE(WindowedDinov2Backbone);
-class DinoV2WrapperImpl : public torch::nn::Module {
-public:
- explicit DinoV2WrapperImpl(const NativeRfDetrConfig& config) : encoder(register_module("encoder", WindowedDinov2Backbone(config))) {}
- std::vector<torch::Tensor> forward(const torch::Tensor& tensors) { return encoder->forward(tensors); }
-
-private:
- WindowedDinov2Backbone encoder{nullptr};
-};
-TORCH_MODULE(DinoV2Wrapper);
-class NativeBackboneProjectorImpl : public torch::nn::Module {
-public:
- explicit NativeBackboneProjectorImpl(int64_t hidden_dim) : stages(register_module("stages", torch::nn::ModuleList())) {
-  auto stage = torch::nn::Sequential();
-  stage->push_back(C2f(kDinoHiddenSize * static_cast<int64_t>(kOutFeatureStages.size()), hidden_dim, kProjectorBlocks, true));
-  stage->push_back(LayerNorm2d(hidden_dim));
-  stages->push_back(stage);
- }
- std::vector<torch::Tensor> forward(const std::vector<torch::Tensor>& inputs) {
-  if (inputs.empty()) { throw std::runtime_error("RF-DETR projector requires at least one input"); }
-  return {stages[0]->as<torch::nn::Sequential>()->forward(torch::cat(inputs, 1))};
- }
-
-private:
- torch::nn::ModuleList stages{nullptr};
-};
-TORCH_MODULE(NativeBackboneProjector);
-class NativeBackboneImpl : public torch::nn::Module {
-public:
- explicit NativeBackboneImpl(const NativeRfDetrConfig& config)
-     : encoder(register_module("encoder", DinoV2Wrapper(config))), projector(register_module("projector", NativeBackboneProjector(config.hidden_dim))) {}
- torch::Tensor forward_features(const torch::Tensor& pixel_values) {
-  mmltk::common::logging::ScopedProfile profile_rfdetr_model_backbone{"rfdetr.model.backbone"};
-  auto projected = projector->forward(encoder->forward(pixel_values));
-  return projected[0];
- }
-
-private:
- DinoV2Wrapper encoder{nullptr};
- NativeBackboneProjector projector{nullptr};
-};
 }  // namespace
 namespace {
 class FeatureLayout {
@@ -545,9 +169,10 @@ public:
   level_start_index_ = torch::cat({spatial_shapes_.new_zeros({1}), spatial_shapes_.prod(1).cumsum(0).slice(0, 0, -1)}).contiguous();
   offset_normalizer_ = torch::stack({spatial_shapes_.select(1, 1), spatial_shapes_.select(1, 0)}, -1).to(device_, scalar_type_, false, true).contiguous();
  }
+ bool compatible(const std::vector<int64_t>& shape_values, const torch::Device& device, const c10::ScalarType scalar_type) const { return shape_values_ == shape_values && device_ == device && scalar_type_ == scalar_type; }
  void require_compatible(const std::vector<int64_t>& shape_values, const torch::Device& device, const c10::ScalarType scalar_type) const {
-  if (shape_values_ != shape_values) { throw std::invalid_argument("RF-DETR feature layout changed after static construction"); }
-  if (device_ != device || scalar_type_ != scalar_type) { throw std::invalid_argument("RF-DETR feature layout has one fixed device projection"); }
+  if (shape_values_ != shape_values) throw std::invalid_argument("RF-DETR feature layout changed after static construction");
+  if (device_ != device || scalar_type_ != scalar_type) throw std::invalid_argument("RF-DETR feature layout has one fixed device projection");
  }
  [[nodiscard]] const torch::Tensor& spatial_shapes() const noexcept { return spatial_shapes_; }
  [[nodiscard]] const torch::Tensor& level_start_index() const noexcept { return level_start_index_; }
@@ -637,20 +262,71 @@ TORCH_MODULE(MSDeformAttn);
 class NativeDecoderLayerImpl : public torch::nn::Module {
 public:
  bool force_math_attention_ = false;
- NativeDecoderLayerImpl(int64_t d_model, int64_t sa_nhead, int64_t ca_nhead, int64_t dim_feedforward, int64_t num_feature_levels, int64_t dec_n_points)
+ NativeDecoderLayerImpl(int64_t d_model, int64_t sa_nhead, int64_t ca_nhead, int64_t dim_feedforward, int64_t num_feature_levels, int64_t dec_n_points, const NativeRfDetrConfig* keypoint_config = nullptr)
      : self_attn(register_module("self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(d_model, sa_nhead).dropout(0.0)))),
        norm1(register_module("norm1", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))),
        cross_attn(register_module("cross_attn", MSDeformAttn(d_model, num_feature_levels, ca_nhead, dec_n_points))),
        linear1(register_module("linear1", torch::nn::Linear(d_model, dim_feedforward))),
        linear2(register_module("linear2", torch::nn::Linear(dim_feedforward, d_model))),
        norm2(register_module("norm2", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))),
-       norm3(register_module("norm3", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))) {}
+       norm3(register_module("norm3", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))) {
+  if (keypoint_config && keypoint_config->has_keypoints()) {
+   const auto& config = *keypoint_config;
+   const int64_t width = d_model / config.keypoint_dimension_downscale;
+   if (config.keypoint_dimension_downscale > 1) {
+    inst_in_proj = register_module("inst_in_proj", torch::nn::Linear(d_model, width));
+    inst_pos_in_proj = register_module("inst_pos_in_proj", torch::nn::Linear(d_model, width));
+    inst_out_proj = register_module("inst_out_proj", torch::nn::Linear(width, d_model));
+    memory_in_proj = register_module("memory_in_proj", torch::nn::Linear(d_model, width));
+   }
+   kp_inst_self_attn = register_module("kp_inst_self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(width, std::max<int64_t>(1, sa_nhead / config.keypoint_dimension_downscale)).dropout(0.0)));
+   kp_inst_norm = register_module("kp_inst_norm", torch::nn::LayerNorm(std::vector<int64_t>{d_model}));
+   kp_norm = register_module("kp_norm", torch::nn::LayerNorm(std::vector<int64_t>{width}));
+   if (config.inter_instance_keypoint_attention) {
+    inter_inst_kp_attn = register_module("inter_inst_kp_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(width, std::max<int64_t>(1, ca_nhead / config.keypoint_dimension_downscale)).dropout(0.0)));
+    inter_inst_kp_norm = register_module("inter_inst_kp_norm", torch::nn::LayerNorm(std::vector<int64_t>{width}));
+   }
+   if (config.keypoint_cross_attention) {
+    kp_cross_attn = register_module("kp_cross_attn", MSDeformAttn(width, num_feature_levels, std::max<int64_t>(1, ca_nhead / config.keypoint_dimension_downscale), dec_n_points));
+    kp_cross_attn_norm = register_module("kp_cross_attn_norm", torch::nn::LayerNorm(std::vector<int64_t>{width}));
+   }
+   kp_linear1 = register_module("kp_linear1", torch::nn::Linear(width, width * 4));
+   kp_linear3 = register_module("kp_linear3", torch::nn::Linear(width * 4, width));
+   kp_norm5 = register_module("kp_norm5", torch::nn::LayerNorm(std::vector<int64_t>{width}));
+   instance_kp_layer_scale = register_parameter("instance_kp_layer_scale", torch::ones({1}) * 1.e-6);
+  }
+ }
  torch::Tensor forward(const torch::Tensor& tgt, const torch::Tensor& memory, const torch::Tensor& memory_key_padding_mask, const torch::Tensor& query_pos, const torch::Tensor& reference_points,
-  const FeatureLayout& feature_layout, const DecoderQueryLayout& query_layout) {
+  const FeatureLayout& feature_layout, const DecoderQueryLayout& query_layout, torch::Tensor* keypoints = nullptr, const torch::Tensor& keypoint_position = {}, const torch::Tensor& keypoint_mask = {}, const torch::Tensor& keypoint_memory = {}) {
   const auto attended = isolated_group_self_attention(self_attn, tgt, query_pos, query_layout, force_math_attention_);
   auto output = norm1->forward(tgt + attended);
   auto cross = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
-  return post_cross_attention(output, cross);
+  output = post_cross_attention(output, cross);
+  if (keypoints) {
+   auto& joints = *keypoints;
+   const auto batch = joints.size(0), queries = joints.size(1), count = joints.size(2), width = joints.size(3);
+   const auto project = [](const torch::nn::Linear& projection, const torch::Tensor& input) { return projection ? detail::linear_forward(*projection, input) : input; };
+   const auto instance = project(inst_in_proj, output), position = project(inst_pos_in_proj, query_pos);
+   auto combined = torch::cat({instance.unsqueeze(2), joints}, 2).reshape({batch * queries, count + 1, width});
+   auto positions = torch::cat({torch::zeros_like(instance).unsqueeze(2), keypoint_position}, 2).reshape({batch * queries, count + 1, width});
+   auto attended = keypoint_self_attention(kp_inst_self_attn, combined, positions, keypoint_mask, force_math_attention_).reshape({batch, queries, count + 1, width});
+   output = kp_inst_norm->forward(output + project(inst_out_proj, attended.select(2, 0)) * instance_kp_layer_scale);
+   joints = kp_norm->forward(joints + attended.narrow(2, 1, count));
+   if (inter_inst_kp_attn) {
+    auto swapped = joints.transpose(1, 2).reshape({batch * count, queries, width});
+    auto swapped_position = position.unsqueeze(1).expand({batch, count, queries, width}).reshape({batch * count, queries, width});
+    auto cross_instance = keypoint_self_attention(inter_inst_kp_attn, swapped, swapped_position, {}, force_math_attention_).reshape({batch, count, queries, width}).transpose(1, 2);
+    joints = inter_inst_kp_norm->forward(joints + cross_instance);
+   }
+   if (kp_cross_attn) {
+    auto query = (joints + position.unsqueeze(2)).reshape({batch, queries * count, width});
+    auto references = reference_points.unsqueeze(2).expand({batch, queries, count, reference_points.size(2), reference_points.size(3)}).reshape({batch, queries * count, reference_points.size(2), reference_points.size(3)});
+    auto attended_joints = kp_cross_attn->forward(query, references, project(memory_in_proj, keypoint_memory.defined() ? keypoint_memory : memory), feature_layout, memory_key_padding_mask);
+    joints = kp_cross_attn_norm->forward(joints + attended_joints.reshape({batch, queries, count, width}));
+   }
+   joints = kp_norm5->forward(joints + detail::linear_forward(*kp_linear3, torch::relu(detail::linear_forward(*kp_linear1, joints))));
+  }
+  return output;
  }
  void prepare_selective(bool training, bool enabled, std::int64_t batch_size) { tail_region_.prepare(training, enabled, batch_size); }
  void invalidate_selective() { tail_region_.invalidate(); }
@@ -670,6 +346,11 @@ private:
   auto feed_forward = detail::linear_forward(*linear2, torch::relu(detail::linear_forward(*linear1, output)));
   return norm3->forward(output + feed_forward);
  }
+ torch::nn::Linear inst_in_proj{nullptr}, inst_pos_in_proj{nullptr}, inst_out_proj{nullptr}, memory_in_proj{nullptr}, kp_linear1{nullptr}, kp_linear3{nullptr};
+ torch::nn::MultiheadAttention kp_inst_self_attn{nullptr}, inter_inst_kp_attn{nullptr};
+ torch::nn::LayerNorm kp_inst_norm{nullptr}, kp_norm{nullptr}, inter_inst_kp_norm{nullptr}, kp_cross_attn_norm{nullptr}, kp_norm5{nullptr};
+ MSDeformAttn kp_cross_attn{nullptr};
+ torch::Tensor instance_kp_layer_scale;
  detail::SelectiveTensorRegion tail_region_{"decoder_tail", true};
  torch::nn::MultiheadAttention self_attn{nullptr};
  torch::nn::LayerNorm norm1{nullptr};
@@ -683,7 +364,7 @@ TORCH_MODULE(NativeDecoderLayer);
 class NativeDecoderImpl : public torch::nn::Module {
 public:
  explicit NativeDecoderImpl(const NativeRfDetrConfig& config)
-     : num_layers_(std::max<int64_t>(1, config.dec_layers)),
+     : num_layers_(config.dec_layers),
        d_model_(config.hidden_dim),
        lite_refpoint_refine_(config.lite_refpoint_refine),
        bbox_reparam_(config.bbox_reparam),
@@ -691,21 +372,27 @@ public:
        norm(register_module("norm", torch::nn::LayerNorm(std::vector<int64_t>{config.hidden_dim}))),
        ref_point_head(register_module("ref_point_head", std::make_shared<RfDetrMlpImpl>(2 * config.hidden_dim, config.hidden_dim, config.hidden_dim, 2))) {
   for (int64_t index = 0; index < num_layers_; ++index) {
-   layers->push_back(NativeDecoderLayer(config.hidden_dim, config.sa_nheads, config.ca_nheads, config.dim_feedforward, 1, config.dec_n_points));
+   layers->push_back(NativeDecoderLayer(config.hidden_dim, config.sa_nheads, config.ca_nheads, config.dim_feedforward, 1, config.dec_n_points, &config));
   }
   // Upstream clones one decoder layer before the transformer Xavier sweep.
   // Rank-two weights will be independently reset; its untouched biases and
   // normalization vectors retain the prototype's values across layers.
   torch::NoGradGuard no_grad;
-  const auto prototype = layers[0]->named_parameters();
+  if (config.has_keypoints()) {
+   keypoint_pos_embed = register_parameter("keypoint_pos_embed", torch::randn({detail::compact_keypoint_count(config.keypoints_per_class), config.hidden_dim / config.keypoint_dimension_downscale}));
+   keypoint_class_mask = register_buffer("keypoint_class_mask", detail::keypoint_class_mask(config.keypoints_per_class));
+  }
+  const auto prototype = num_layers_ > 0 ? layers[0]->named_parameters() : torch::OrderedDict<std::string, torch::Tensor>{};
   for (int64_t index = 1; index < num_layers_; ++index)
    for (auto& parameter : layers[index]->named_parameters())
     if (parameter.value().dim() <= 1) parameter.value().copy_(prototype[parameter.key()]);
  }
  void set_bbox_embed(const std::shared_ptr<RfDetrMlpImpl>& bbox_embed) { bbox_embed_ = bbox_embed; }
  std::pair<torch::Tensor, torch::Tensor> forward(const torch::Tensor& tgt, const torch::Tensor& memory, const torch::Tensor& memory_key_padding_mask, const torch::Tensor& pos,
-  const torch::Tensor& refpoints_unsigmoid, const FeatureLayout& feature_layout, const torch::Tensor& valid_ratios, const DecoderQueryLayout& query_layout) {
+  const torch::Tensor& refpoints_unsigmoid, const FeatureLayout& feature_layout, const torch::Tensor& valid_ratios, const DecoderQueryLayout& query_layout, torch::Tensor keypoints, torch::Tensor& keypoint_states, const torch::Tensor& keypoint_memory) {
   auto output = tgt;
+  std::vector<torch::Tensor> intermediate_keypoints;
+  const auto positions = keypoints.defined() ? keypoint_pos_embed.unsqueeze(0).unsqueeze(0).expand_as(keypoints) : torch::Tensor{};
   auto refpoints = refpoints_unsigmoid;
   std::vector<torch::Tensor> intermediate;
   intermediate.reserve(static_cast<size_t>(num_layers_));
@@ -727,7 +414,8 @@ public:
   if (lite_refpoint_refine_) { std::tie(refpoints_input, query_pos) = get_reference(bbox_reparam_ ? refpoints : refpoints.sigmoid()); }
   for (int64_t layer_id = 0; layer_id < num_layers_; ++layer_id) {
    if (!lite_refpoint_refine_) { std::tie(refpoints_input, query_pos) = get_reference(bbox_reparam_ ? refpoints : refpoints.sigmoid()); }
-   output = layers[layer_id]->as<NativeDecoderLayer>()->forward(output, memory, memory_key_padding_mask, query_pos, refpoints_input, feature_layout, query_layout);
+   output = layers[layer_id]->as<NativeDecoderLayer>()->forward(output, memory, memory_key_padding_mask, query_pos, refpoints_input, feature_layout, query_layout, keypoints.defined() ? &keypoints : nullptr, positions, keypoint_class_mask, keypoint_memory);
+   if (keypoints.defined()) intermediate_keypoints.push_back(keypoints);
    if (!lite_refpoint_refine_ && bbox_embed_) {
     auto new_refpoints = refine(refpoints, bbox_embed_->forward(output));
     if (layer_id != num_layers_ - 1) { hs_refpoints_unsigmoid.push_back(new_refpoints); }
@@ -736,11 +424,13 @@ public:
    intermediate.push_back(norm->forward(output));
    (void)pos;
   }
+  if (!intermediate_keypoints.empty()) keypoint_states = torch::stack(intermediate_keypoints);
   if (bbox_embed_) { return {torch::stack(intermediate), torch::stack(hs_refpoints_unsigmoid)}; }
   return {torch::stack(intermediate), refpoints.unsqueeze(0)};
  }
 
 private:
+ torch::Tensor keypoint_pos_embed, keypoint_class_mask;
  int64_t num_layers_ = 0;
  int64_t d_model_ = 0;
  bool lite_refpoint_refine_ = true;
@@ -811,6 +501,12 @@ public:
    enc_output->push_back(torch::nn::Linear(config.hidden_dim, config.hidden_dim));
    enc_output_norm->push_back(torch::nn::LayerNorm(std::vector<int64_t>{config.hidden_dim}));
   }
+  if (config.has_keypoints()) {
+   const auto total = detail::compact_keypoint_count(config.keypoints_per_class);
+   keypoint_initializer = register_module(std::string(detail::kKeypointQueryAxis.module_name()), std::make_shared<detail::ConditionalQueryInitializer>(config.hidden_dim, total, config.hidden_dim / config.keypoint_dimension_downscale));
+   keypoint_initializer_enc = register_module(std::string(detail::kEncoderKeypointQueryAxis.module_name()), std::make_shared<detail::ConditionalQueryInitializer>(config.hidden_dim, total, config.hidden_dim / config.keypoint_dimension_downscale));
+   enc_out_keypoint_embed = register_module("enc_out_keypoint_embed", torch::nn::ModuleList());
+  }
   torch::NoGradGuard no_grad;
   // Upstream resets the transformer before the detector installs its group
   // heads. Deformable offsets and uniform attention override the Xavier sweep.
@@ -836,6 +532,16 @@ public:
    enc_out_bbox_embed->push_back(std::move(box_head));
   }
  }
+ void initialize_keypoint_heads(const RfDetrMlpImpl& prototype) {
+  torch::NoGradGuard guard;
+  const auto source = prototype.named_parameters();
+  for (int64_t index = 0; index < config_.group_detr; ++index) {
+   const auto width = config_.hidden_dim / config_.keypoint_dimension_downscale;
+   auto head = std::make_shared<RfDetrMlpImpl>(width, width, detail::kKeypointPredictionDimension, 3);
+   for (auto& parameter : head->named_parameters()) parameter.value().copy_(source[parameter.key()]);
+   enc_out_keypoint_embed->push_back(head);
+  }
+ }
  void set_decoder_bbox_embed(const std::shared_ptr<RfDetrMlpImpl>& bbox_embed) { decoder->set_bbox_embed(bbox_embed); }
  void append_class_axes(std::vector<detail::ClassTensorAxis>& axes) const { detail::kEncoderClassAxis.AppendParameters(axes, *enc_out_class_embed); }
  torch::Tensor encoder_class_logits(const torch::Tensor& hs_enc, bool training_mode) {
@@ -850,7 +556,7 @@ public:
   return torch::cat(logits, 1);
  }
  NativeTransformerOutput forward(const std::vector<torch::Tensor>& srcs, const std::vector<torch::Tensor>& masks, const std::vector<torch::Tensor>& pos_embeds, const torch::Tensor& refpoint_embed,
-  const torch::Tensor& query_feat, bool training_mode, const DenoisingQueryBatch* denoising, TrainingSupervisionImpl* supervision, std::vector<torch::Tensor>* encoder_indices = nullptr) {
+  const torch::Tensor& query_feat, bool training_mode, const DenoisingQueryBatch* denoising, TrainingSupervisionImpl* supervision, const torch::Tensor& keypoint_features, std::vector<torch::Tensor>* encoder_indices = nullptr) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_transformer{"rfdetr.model.transformer"};
   if (srcs.empty()) { throw std::runtime_error("RF-DETR transformer requires at least one source feature"); }
   const int64_t batch = srcs.front().size(0);
@@ -889,12 +595,15 @@ public:
    mask_flatten_tensor = torch::cat(mask_flatten, 1);
    valid_ratios_tensor = torch::stack(valid_ratios, 1);
   }
-  const auto& layout = feature_layout(spatial_shape_values, memory.device(), memory.scalar_type());
+  const auto layout_owner = feature_layout(spatial_shape_values, memory.device(), memory.scalar_type());
+  const auto& layout = *layout_owner;
   torch::Tensor hidden_states;
   torch::Tensor refs_unsigmoid;
   torch::Tensor enc_memory;
   torch::Tensor enc_boxes;
   torch::Tensor decoder_refpoints;
+  torch::Tensor keypoint_hidden_states, enc_keypoints;
+  const auto keypoint_memory = keypoint_features.defined() ? keypoint_features.flatten(2).transpose(1, 2) : torch::Tensor{};
   if (config_.two_stage) {
    mmltk::common::logging::ScopedProfile profile_rfdetr_model_transformer_two_stage{"rfdetr.model.transformer.two_stage"};
    auto [output_memory, output_proposals] = gen_encoder_output_proposals(memory, mask_flatten_tensor, layout.spatial_shapes(), !config_.bbox_reparam);
@@ -939,6 +648,14 @@ public:
   } else if (config_.dec_layers > 0) {
    decoder_refpoints = refpoint_embed.unsqueeze(0).repeat({batch, 1, 1});
   }
+  if (keypoint_initializer_enc) {
+   const auto queries = keypoint_initializer_enc->forward(enc_memory);
+   const int64_t groups = training_mode ? config_.group_detr : 1;
+   const auto query_groups = queries.chunk(groups, 1), box_groups = enc_boxes.chunk(groups, 1);
+   std::vector<torch::Tensor> predictions;
+   for (int64_t group = 0; group < groups; ++group) predictions.push_back(detail::refine_keypoints(enc_out_keypoint_embed->at<RfDetrMlpImpl>(group).forward(query_groups[group]), box_groups[group]));
+   enc_keypoints = torch::cat(predictions, 1);
+  }
   if (config_.dec_layers > 0) {
    mmltk::common::logging::ScopedProfile profile_rfdetr_model_transformer_decoder{"rfdetr.model.transformer.decoder"};
    auto tgt = query_feat.unsqueeze(0).repeat({batch, 1, 1});
@@ -957,7 +674,7 @@ public:
    if (denoising != nullptr) { supervision->begin_denoising_decoder_timing(); }
    try {
     std::tie(hidden_states, refs_unsigmoid) =
-     decoder->forward(tgt, memory, mask_flatten_tensor, lvl_pos_embed_flatten, decoder_refpoints, layout, valid_ratios_tensor.to(memory.dtype()), query_layout);
+     decoder->forward(tgt, memory, mask_flatten_tensor, lvl_pos_embed_flatten, decoder_refpoints, layout, valid_ratios_tensor.to(memory.dtype()), query_layout, keypoint_initializer ? keypoint_initializer->forward(tgt) : torch::Tensor{}, keypoint_hidden_states, keypoint_memory);
    } catch (...) {
     if (denoising != nullptr) { supervision->end_denoising_decoder_timing(); }
     throw;
@@ -969,27 +686,28 @@ public:
    std::move(refs_unsigmoid),
    std::move(enc_memory),
    std::move(enc_boxes),
+   std::move(keypoint_hidden_states),
+   std::move(enc_keypoints),
   };
  }
 
 private:
- [[nodiscard]] const FeatureLayout& feature_layout(const std::vector<int64_t>& spatial_shape_values, const torch::Device& device, const c10::ScalarType scalar_type) {
+ [[nodiscard]] std::shared_ptr<const FeatureLayout> feature_layout(const std::vector<int64_t>& spatial_shape_values, const torch::Device& device, const c10::ScalarType scalar_type) {
   std::lock_guard lock(feature_layout_mutex_);
-  if (!feature_layout_) {
-   feature_layout_ = std::make_unique<FeatureLayout>(spatial_shape_values, device, scalar_type);
-  } else {
-   feature_layout_->require_compatible(spatial_shape_values, device, scalar_type);
-  }
-  return *feature_layout_;
+  if (!feature_layout_ || (config_.backbone.kind == BackboneKind::PeCoreTiny && !feature_layout_->compatible(spatial_shape_values, device, scalar_type))) feature_layout_ = std::make_shared<const FeatureLayout>(spatial_shape_values, device, scalar_type);
+  else feature_layout_->require_compatible(spatial_shape_values, device, scalar_type);
+  return feature_layout_;
  }
  std::shared_ptr<NativeDecoderImpl> decoder;
  torch::nn::ModuleList enc_output{nullptr};
  torch::nn::ModuleList enc_output_norm{nullptr};
  torch::nn::ModuleList enc_out_class_embed{nullptr};
  torch::nn::ModuleList enc_out_bbox_embed{nullptr};
+ torch::nn::ModuleList enc_out_keypoint_embed{nullptr};
+ std::shared_ptr<detail::ConditionalQueryInitializer> keypoint_initializer, keypoint_initializer_enc;
  NativeRfDetrConfig config_;
  std::mutex feature_layout_mutex_;
- std::unique_ptr<FeatureLayout> feature_layout_;
+ std::shared_ptr<const FeatureLayout> feature_layout_;
 };
 }  // namespace
 NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout layout)
@@ -1004,13 +722,22 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
  layout_ = std::make_shared<const ResolvedClassLayout>(std::move(layout));
  if (layout_->output_width() != static_cast<std::size_t>(config_.num_classes)) throw std::invalid_argument("model class layout disagrees with configured output width");
  if (training_supervision_enabled(config_.training_supervision)) layout_->require_execution(true);
- backbone_->push_back(std::make_shared<NativeBackboneImpl>(config_));
+ if (config_.has_keypoints()) detail::validate_keypoint_layout(*layout_, config_.keypoints_per_class);
+ backbone_->push_back(std::make_shared<detail::NativeBackboneImpl>(config_));
  backbone_->push_back(PositionEmbeddingSine(config_.hidden_dim / 2, 10000.0, true, 2.0 * M_PI));
  transformer_ = register_module(std::string(detail::kTransformerModule), std::make_shared<NativeTransformerImpl>(config_));
  bbox_embed_ = register_module("bbox_embed", std::make_shared<RfDetrMlpImpl>(config_.hidden_dim, config_.hidden_dim, 4, 3));
  if (config_.has_masks()) { segmentation_head_ = register_module("segmentation_head", std::make_shared<SegmentationHeadImpl>(config_.hidden_dim, std::max<int64_t>(1, config_.dec_layers))); }
  if (auto transformer = std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)) {
   if (!config_.lite_refpoint_refine) { transformer->set_decoder_bbox_embed(std::dynamic_pointer_cast<RfDetrMlpImpl>(bbox_embed_)); }
+ }
+ if (config_.has_keypoints()) {
+  const auto width = config_.hidden_dim / config_.keypoint_dimension_downscale;
+  keypoint_embed_ = register_module("keypoint_embed", std::make_shared<RfDetrMlpImpl>(width, width, detail::kKeypointPredictionDimension, 3));
+  keypoint_active_mask_ = register_buffer("_kp_active_mask", detail::keypoint_active_mask(config_.keypoints_per_class));
+  torch::NoGradGuard guard;
+  for (auto& parameter : keypoint_embed_->named_parameters()) if (parameter.key().starts_with("layers.2.")) parameter.value().zero_();
+  std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->initialize_keypoint_heads(*keypoint_embed_);
  }
  torch::NoGradGuard no_grad;
  refpoint_embed->weight.zero_();
@@ -1022,6 +749,14 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
   if (auto* weight = params.find("layers.2.weight")) { weight->zero_(); }
   if (auto* bias = params.find("layers.2.bias")) { bias->zero_(); }
   std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->initialize_detector_heads(class_embed, *bbox);
+ }
+ if (config_.dec_layers == 0) {
+  // These official Atto tensors are state, but never participate in its graph.
+  // Excluding them from the active optimizer inventory also avoids invented moments.
+  for (auto& parameter : named_parameters()) {
+   const auto& name = parameter.key();
+   if (name.starts_with("class_embed.") || name.starts_with("bbox_embed.") || name == kQueryFeatureWeight || name == kReferencePointWeight || name.starts_with("transformer.decoder.")) parameter.value().set_requires_grad(false);
+  }
  }
  if (training_supervision_enabled(config_.training_supervision)) {
   auto generator = at::detail::getDefaultCPUGenerator();
@@ -1040,11 +775,10 @@ std::vector<detail::ClassTensorAxis> NativeRfDetrModel::Impl::class_axes() const
  detail::kDecoderClassAxis.AppendParameters(axes, *class_embed);
  std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->append_class_axes(axes);
  if (training_supervision_) training_supervision_->append_class_axes(axes);
+ for (const auto& parameter : named_parameters()) if (const auto shape = detail::class_tensor_shape(parameter.key()); shape && shape->coordinates == detail::ClassTensorCoordinates::NamedJoints) axes.push_back({parameter.key(), shape->dimension, shape->coordinates});
  return axes;
 }
 std::shared_ptr<torch::nn::Module> test_support::DecoderTailTestAccess::make(int64_t width, int64_t feedforward) { return std::make_shared<NativeDecoderLayerImpl>(width, 2, 2, feedforward, 1, 2); }
-std::shared_ptr<torch::nn::Module> test_support::ProjectorConvTestAccess::make(int64_t channels) { return std::make_shared<ConvXImpl>(channels, channels, 1, 1, 1, true); }
-torch::Tensor test_support::ProjectorConvTestAccess::invoke(torch::nn::Module& module, const torch::Tensor& input) { return dynamic_cast<ConvXImpl&>(module).forward(input); }
 torch::Tensor test_support::DecoderTailTestAccess::invoke(torch::nn::Module& module, const torch::Tensor& residual, const torch::Tensor& cross, bool selective) {
  auto& layer = dynamic_cast<NativeDecoderLayerImpl&>(module);
  layer.prepare_selective(layer.is_training(), selective, residual.size(0));
@@ -1178,11 +912,13 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
   samples.mask = torch::zeros({samples.tensors.size(0), samples.tensors.size(2), samples.tensors.size(3)}, torch::TensorOptions().dtype(torch::kBool).device(samples.tensors.device()));
  }
  std::vector<NestedTensor> features;
+ torch::Tensor keypoint_features;
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_backbone{"rfdetr.model.forward.backbone"};
-  auto& backbone = backbone_->at<NativeBackboneImpl>(0);
-  auto feature =
-   backbone_region_.invoke(is_train, {samples.tensors}, {&backbone}, [&](const auto& inputs) { return detail::SelectiveTensorRegion::Tensors{backbone.forward_features(inputs[0])}; }).front();
+  auto& backbone = backbone_->at<detail::NativeBackboneImpl>(0);
+  auto projected = backbone_region_.invoke(is_train, {samples.tensors}, {&backbone}, [&](const auto& inputs) { return backbone.forward_features(inputs[0]); });
+  const auto& feature = projected.front();
+  if (projected.size() == 2) keypoint_features = projected[1];
   features.push_back(NestedTensor{feature, resize_mask_to_feature(samples.mask, feature)});
  }
  std::vector<torch::Tensor> srcs;
@@ -1196,7 +932,8 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
   for (const auto& feature : features) {
    srcs.push_back(feature.tensors);
    feature_masks.push_back(feature.mask);
-   poss.push_back(backbone_->at<PositionEmbeddingSineImpl>(1).forward_full_valid(feature.tensors.size(0), feature.tensors.size(2), feature.tensors.size(3), feature.tensors.device()));
+   auto& positions = backbone_->at<PositionEmbeddingSineImpl>(1);
+   poss.push_back(config_.backbone.kind == BackboneKind::PeCoreTiny ? positions.forward_mask(feature.mask) : positions.forward_full_valid(feature.tensors.size(0), feature.tensors.size(2), feature.tensors.size(3), feature.tensors.device()));
   }
  }
  const int64_t active_query_count = is_training() ? config_.num_queries * std::max(1, config_.group_detr) : config_.num_queries;
@@ -1208,7 +945,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
  NativeTransformerOutput transformed;
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_transformer{"rfdetr.model.forward.transformer"};
-  transformed = transformer->forward(srcs, feature_masks, poss, ref_weights, query_weights, is_training(), denoising, training_supervision_.get(), encoder_indices);
+  transformed = transformer->forward(srcs, feature_masks, poss, ref_weights, query_weights, is_training(), denoising, training_supervision_.get(), keypoint_features, encoder_indices);
  }
  std::vector<torch::Tensor> combined_query_features;
  std::vector<torch::Tensor> decoder_query_features;
@@ -1248,7 +985,12 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
   // Separate calls round shared AMP parameter gradients before summing them.
   const auto deltas = bbox->forward(transformed.hidden_states);
   const auto boxes = config_.bbox_reparam ? reparam_box_refine(transformed.refs_unsigmoid, deltas) : (deltas + transformed.refs_unsigmoid).sigmoid();
-  const auto logits = detail::linear_forward(*class_embed, transformed.hidden_states);
+  auto logits = detail::linear_forward(*class_embed, transformed.hidden_states);
+  torch::Tensor joints;
+  if (keypoint_embed_) {
+   joints = detail::padded_keypoints(detail::refine_keypoints(keypoint_embed_->forward(transformed.keypoint_hidden_states), transformed.refs_unsigmoid), config_.keypoints_per_class);
+   logits = logits + detail::keypoint_class_logits(joints, keypoint_active_mask_, config_.num_classes);
+  }
   for (size_t index = 0; index < decoder_query_features.size(); ++index) {
    const auto& hs = decoder_query_features[index];
    const auto all_boxes = boxes.index({static_cast<int64_t>(index)});
@@ -1256,6 +998,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
    OutputLayer layer;
    layer.pred_logits = all_logits.narrow(1, 0, active_query_count);
    layer.pred_boxes = all_boxes.narrow(1, 0, active_query_count);
+   if (joints.defined()) layer.pred_keypoints = joints[static_cast<int64_t>(index)];
    const bool final_decoder_layer = index + 1 == decoder_query_features.size();
    if (capture_match_free_features && (final_decoder_layer || config_.aux_loss)) {
     const int64_t groups = is_training() ? std::max<int64_t>(1, config_.group_detr) : 1;
@@ -1300,6 +1043,10 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
   OutputLayer enc_output;
   enc_output.pred_logits = transformer->encoder_class_logits(transformed.enc_memory, is_training());
   enc_output.pred_boxes = transformed.enc_boxes;
+  if (keypoint_embed_) {
+   enc_output.pred_keypoints = detail::padded_keypoints(transformed.enc_keypoints, config_.keypoints_per_class);
+   enc_output.pred_logits = enc_output.pred_logits + detail::keypoint_class_logits(*enc_output.pred_keypoints, keypoint_active_mask_, config_.num_classes);
+  }
   if (capture_match_free_features && config_.aux_loss) {
    const int64_t groups = is_training() ? std::max<int64_t>(1, config_.group_detr) : 1;
    const int64_t queries_per_group = transformed.enc_memory.size(1) / groups;
@@ -1314,7 +1061,8 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
     enc_output.pred_masks = segmentation_head->forward(features.front().tensors, {transformed.enc_memory}, {samples.tensors.size(2), samples.tensors.size(3)}, true)[0];
    }
   }
-  outputs.enc_outputs = std::move(enc_output);
+  if (config_.dec_layers == 0) outputs.main = std::move(enc_output);
+  else outputs.enc_outputs = std::move(enc_output);
  }
  return outputs;
 }
@@ -1322,6 +1070,10 @@ ModelStateLoadSummary NativeRfDetrModel::Impl::load_normalized_state(const std::
  auto next_layout = admitted_layout ? std::make_shared<const ResolvedClassLayout>(*admitted_layout) : layout_;
  if (next_layout->output_width() != static_cast<std::size_t>(config_.num_classes)) throw std::invalid_argument("checkpoint layout disagrees with model output width");
  if (training_supervision_ && next_layout->record() != layout_->record()) throw std::invalid_argument("active supervision checkpoint requires the exact admitted layout");
+ if (config_.has_keypoints()) {
+  detail::validate_keypoint_layout(*next_layout, config_.keypoints_per_class);
+  if (layout_->semantic() && (next_layout->record().foreground != layout_->record().foreground || next_layout->record().slots != layout_->record().slots || next_layout->record().scores != layout_->record().scores || next_layout->record().no_object != layout_->record().no_object)) throw std::invalid_argument("exact keypoint loading requires the admitted class and joint schema");
+ }
  auto candidate = stage_normalized_state(state, strict ? detail::NormalizedModelStateAdmission::Exact : detail::NormalizedModelStateAdmission::PartialExact);
  auto summary = candidate.summary;
  commit_normalized_state(std::move(candidate));
@@ -1365,7 +1117,15 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
  const auto axes = class_axes();
  std::unordered_map<std::string_view, const detail::ClassTensorAxis*> axis_by_name;
  for (const auto& axis : axes) axis_by_name.emplace(axis.name, &axis);
- std::vector<std::pair<std::int64_t, std::int64_t>> foreground_matches, output_matches;
+ std::vector<std::pair<std::int64_t, std::int64_t>> foreground_matches, output_matches, joint_matches;
+ std::vector<std::uint16_t> source_joint_counts;
+ if (config_.has_keypoints()) {
+  const auto mask = std::ranges::find(state, "_kp_active_mask", &NormalizedModelStateEntry::name);
+  if (mask == state.end()) throw std::invalid_argument("keypoint state is missing its active mask");
+  source_joint_counts = detail::keypoint_counts_from_mask(mask->tensor);
+  if (transfer) joint_matches = detail::keypoint_transfer_rows(*source_layout, source_joint_counts, *layout_, config_.keypoints_per_class);
+  else if (source_joint_counts != config_.keypoints_per_class) throw std::invalid_argument("exact keypoint state requires the admitted joint counts");
+ }
  if (transfer && source_layout->semantic()) {
   std::vector<std::int64_t> source_slots(source_layout->catalog()->size());
   for (std::size_t slot = 0; slot < source_layout->record().slots.size(); ++slot) {
@@ -1393,8 +1153,8 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
   if (destination == nullptr) { destination = buffers.find(entry.name); }
   if (destination == nullptr) {
    // Upstream registers this inactive detector buffer even without keypoints.
-   // Accept only its exact empty form; active keypoint state stays unexpected.
-   if (admission != detail::NormalizedModelStateAdmission::Exact && entry.name == "_kp_active_mask" && entry.tensor.defined() && entry.tensor.scalar_type() == torch::kBool &&
+   // Accept only its exact empty form on models without a keypoint owner.
+   if (entry.name == "_kp_active_mask" && entry.tensor.defined() && entry.tensor.scalar_type() == torch::kBool &&
        entry.tensor.dim() == 2 && entry.tensor.size(0) == 0 && entry.tensor.size(1) == 0)
     continue;
    if ((admission == detail::NormalizedModelStateAdmission::RequiredCore || (admission == detail::NormalizedModelStateAdmission::FreshTransfer && !training_supervision_)) &&
@@ -1408,16 +1168,23 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
    continue;
   }
   torch::Tensor source = entry.tensor;
+  if (entry.name == "_kp_active_mask" || entry.name == "transformer.decoder.keypoint_class_mask") {
+   const auto expected = entry.name == "_kp_active_mask" ? detail::keypoint_active_mask(source_joint_counts) : detail::keypoint_class_mask(source_joint_counts);
+   if (!source.defined() || source.scalar_type() != torch::kBool || !torch::equal(source.to(torch::kCPU), expected)) throw std::invalid_argument("keypoint state mask disagrees with its admitted schema: " + entry.name);
+   if (transfer) source = destination->detach().clone();
+  }
+  if (source.defined() && (source.is_floating_point() != destination->is_floating_point() || (!source.is_floating_point() && source.scalar_type() != destination->scalar_type()))) throw std::invalid_argument("checkpoint tensor dtype disagrees with its role: " + entry.name);
   if (transfer) {
    if (const auto found = axis_by_name.find(entry.name); found != axis_by_name.end()) {
     const auto& axis = *found->second;
+    const bool joints = axis.coordinates == detail::ClassTensorCoordinates::NamedJoints;
     const bool classifier = axis.coordinates == detail::ClassTensorCoordinates::OutputSlots;
     const bool boxes = axis.coordinates == detail::ClassTensorCoordinates::ForegroundWithBoxes;
-    const bool known_axis = classifier || source_layout->record().supervision_in_foreground_order;
+    const bool known_axis = joints || classifier || source_layout->record().supervision_in_foreground_order;
     bool compatible = source.defined() && source.dim() == destination->dim();
     for (std::int64_t dimension = 0; compatible && dimension < source.dim(); ++dimension)
      if (dimension != axis.dimension && source.size(dimension) != destination->size(dimension)) compatible = false;
-    const auto source_classes = classifier ? source_layout->output_width() : source_layout->catalog()->size();
+    const auto source_classes = joints ? static_cast<size_t>(detail::compact_keypoint_count(source_joint_counts)) : classifier ? source_layout->output_width() : source_layout->catalog()->size();
     if (compatible && known_axis && source.size(axis.dimension) != static_cast<std::int64_t>(source_classes + (boxes ? 4 : 0))) {
      if (partial) throw std::invalid_argument("class-dependent tensor disagrees with admitted layout: " + entry.name);
      candidate.summary.incompatible_names.push_back(entry.name);
@@ -1427,7 +1194,7 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
      auto adapted = destination->detach().clone();
      if (known_axis && source_layout->semantic()) {
       const auto converted = source.to(destination->device(), destination->scalar_type());
-      for (const auto& [from, to] : classifier ? output_matches : foreground_matches) adapted.select(axis.dimension, to).copy_(converted.select(axis.dimension, from));
+      for (const auto& [from, to] : joints ? joint_matches : classifier ? output_matches : foreground_matches) adapted.select(axis.dimension, to).copy_(converted.select(axis.dimension, from));
       if (boxes) adapted.narrow(axis.dimension, layout_->catalog()->size(), 4).copy_(converted.narrow(axis.dimension, source_layout->catalog()->size(), 4));
      }
      source = std::move(adapted);
@@ -1655,7 +1422,7 @@ void NativeRfDetrModel::set_force_math_attention(bool value) {
  invalidate_compilation();
  impl_->force_math_attention_ = value;
  for (const auto& module : impl_->modules(false)) {
-  if (auto* attention = dynamic_cast<Dinov2SelfAttentionImpl*>(module.get())) attention->force_math_attention_ = value;
+  if (auto* backbone = dynamic_cast<detail::NativeBackboneImpl*>(module.get())) backbone->set_force_math_attention(value);
   if (auto* decoder = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) decoder->force_math_attention_ = value;
  }
 }

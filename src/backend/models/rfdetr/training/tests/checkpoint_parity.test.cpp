@@ -59,6 +59,8 @@ void assert_clean_summary(const ModelStateLoadSummary& summary, const std::strin
 void write_module_upstream_checkpoint(const fs::path& path, const NativeRfDetrModel& module) {
  mmltk::backend::models::rfdetr::DecodedNativeModelState state;
  state.metadata.class_layout = module.class_layout()->record();
+ state.metadata.num_classes = module.config().num_classes;
+ state.metadata.native_configuration = mmltk::backend::models::rfdetr::encode_checkpoint_configuration(module.config());
  state.metadata.num_queries = module.config().num_queries;
  state.metadata.num_select = module.config().num_select;
  state.metadata.cls_loss_coef = 7.3;
@@ -158,14 +160,9 @@ void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, 
   rf::testsupport::write_checkpoint_envelope(upstream_path, malformed, CheckpointEnvelope::Lightning, metadata);
   REQUIRE_THROWS(rf::decode_model_state(malformed));
  }
- // Same-shaped semantic topology survives both bridge and native archives.
+ // Same-shaped conflicting topology is rejected at external admission.
  rf::testsupport::write_checkpoint_envelope(upstream_path, malformed, CheckpointEnvelope::CompiledLightning, R"({"num_windows":7})");
- auto wrong_topology = rf::decode_model_state(malformed);
- REQUIRE(wrong_topology.metadata.topology_num_windows == 7);
- REQUIRE_THROWS(rf::resolve_admitted_model_artifacts(wrong_topology, malformed, fixture.preset_name, 0));
- const auto retained = temp_dir.path() / "wrong-topology.native.pt";
- rf::save_native_checkpoint(retained, wrong_topology);
- REQUIRE_THROWS(rf::resolve_model_state(retained, fixture.preset_name, 0));
+ REQUIRE_THROWS(rf::decode_model_state(malformed));
 }
 }  // namespace
 void test_checkpoint_parity_matches_for_all_registered_fixtures() {

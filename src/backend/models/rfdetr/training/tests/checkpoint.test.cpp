@@ -47,7 +47,7 @@ void populate_detection_metadata(mmltk::backend::models::rfdetr::NativeCheckpoin
    field = 0.25;
   ++index;
  });
- REQUIRE(index == 15);
+ REQUIRE(index == 19);
 }
 template <class Metadata>
 void require_detection_metadata_equal(const Metadata& expected, const Metadata& actual) {
@@ -80,6 +80,11 @@ void write_legacy_native_checkpoint(const fs::path& output_path, int version = 1
  write_archive_string(archive, "source_kind", "legacy-native-test");
  write_archive_string(archive, "source_path", output_path.string());
  write_archive_int(archive, "num_classes", 7);
+ if (version >= 4) {
+  write_archive_int(archive, "num_queries", 200);
+  write_archive_int(archive, "num_select", 200);
+  write_archive_string(archive, "class_layout", mmltk::backend::models::rfdetr::encode_class_layout(mmltk::backend::models::rfdetr::unresolved_class_layout(7)));
+ }
  torch::serialize::OutputArchive state_archive;
  write_archive_int(state_archive, "entry_count", 1);
  torch::serialize::OutputArchive entry_archive;
@@ -181,6 +186,9 @@ void test_native_checkpoint_tensor_preparation() {
  checkpoint.metadata.num_queries = 1;
  checkpoint.metadata.num_select = 1;
  populate_detection_metadata(checkpoint.metadata);
+ auto configuration = mmltk::backend::models::rfdetr::native_config_from_preset(mmltk::backend::models::rfdetr::model_presets().front());
+ configuration.num_classes = configuration.num_queries = configuration.num_select = 1;
+ checkpoint.metadata.native_configuration = mmltk::backend::models::rfdetr::encode_checkpoint_configuration(configuration);
  const auto cpu_contiguous = torch::arange(12, torch::TensorOptions().dtype(torch::kFloat32)).view({3, 4}).clone();
  const auto cpu_non_contiguous = cpu_contiguous.transpose(0, 1);
  std::vector<mmltk::backend::models::rfdetr::NormalizedModelStateEntry> synthetic_entries;
@@ -600,4 +608,104 @@ TEST_CASE("Direct ONNX export replaces an old automatic companion with embedded 
  CHECK(info.class_layout == source.metadata.class_layout);
  CHECK(r::ClassArtifactAdmission(output).Resolve(info.num_classes, info.class_layout) == source.metadata.class_layout);
  CHECK(r::rfdetr_output_roles(info).size() == info.outputs.size());
+}
+
+TEST_CASE("Native format four admits bounded historical topology and normalizes to format five", "[rfdetr][checkpoint]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ mmltk::testsupport::ScopedTempDir directory("rfdetr-format-four");
+ const auto legacy = directory.path() / "legacy.pt", current = directory.path() / "current.pt";
+ write_legacy_native_checkpoint(legacy, 4, r::kNativeCheckpointFormat);
+ auto admitted = r::decode_model_state(legacy);
+ REQUIRE_FALSE(admitted.metadata.native_configuration.empty());
+ const auto config = r::checkpoint_configuration(admitted.metadata);
+ CHECK(config.backbone.kind == r::BackboneKind::DinoV2Small);
+ CHECK(config.num_classes == 7);
+ CHECK(config.has_masks());
+ r::save_native_checkpoint(current, admitted);
+ const auto normalized = r::decode_model_state(current);
+ CHECK(normalized.metadata.native_configuration == admitted.metadata.native_configuration);
+ CHECK(normalized.metadata.class_layout == admitted.metadata.class_layout);
+ CHECK(torch::equal(normalized.entries().front().tensor, admitted.entries().front().tensor));
+ write_legacy_native_checkpoint(legacy, 5, r::kNativeCheckpointFormat);
+ CHECK_THROWS(r::decode_model_state(legacy));  // New archives require complete configuration.
+}
+TEST_CASE("Joint Transfer uses named schema entries and exact loading rejects semantic changes atomically", "[rfdetr][checkpoint][keypoints]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ namespace c = mmltk::backend::data::catalog;
+ const c::ClassKeypointSchema source_schema{{"left", "right", "nose"}, {{0, 2}, {1, 2}}, {1, 0, 2}, {.05, .05, .05}};
+ const c::ClassKeypointSchema destination_schema{{"nose", "left", "new", "right"}, {{0, 1}, {0, 3}}, {0, 3, 2, 1}, {.05, .05, .1, .05}};
+ const auto layout = [](const auto& schema) {
+  c::OrderedClassCatalog record;
+  record.names = {{"person"}, {"empty"}};
+  record.keypoints = std::vector{schema, c::ClassKeypointSchema{}};
+  return r::native_training_class_layout(c::ClassCatalog(record));
+ };
+ const r::ResolvedClassLayout source_layout(layout(source_schema));
+ auto config = r::native_config_from_preset(*r::find_preset_catalog_entry("rf-detr-keypoint-preview"));
+ config.resolution = 48;
+ config.num_queries = config.num_select = 3;
+ config.group_detr = 1;
+ config.num_classes = 3;
+ config.keypoints_per_class = {3, 0};
+ r::NativeRfDetrModel source(config, source_layout.record());
+ auto entries = r::testsupport::clone_normalized_model_state(source);
+ const std::array axes{"transformer.decoder.keypoint_pos_embed", "transformer.keypoint_query_initializer.queries", "transformer.keypoint_query_initializer_enc.queries"};
+ for (const auto* name : axes) {
+  auto entry = std::ranges::find(entries, name, &r::NormalizedModelStateEntry::name);
+  REQUIRE(entry != entries.end());
+  for (int64_t row = 0; row < entry->tensor.size(0); ++row) entry->tensor[row].fill_(100.0 + row);
+ }
+ config.keypoints_per_class = {4, 0};
+ r::NativeRfDetrModel destination(config, layout(destination_schema));
+ const auto before = r::testsupport::clone_normalized_model_state(destination);
+ auto candidate = destination.stage_normalized_state(entries, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
+ REQUIRE(candidate.summary.missing_names.empty());
+ destination.commit_normalized_state(std::move(candidate));
+ const auto parameters = destination.named_parameters();
+ for (const auto* name : axes) {
+  const auto seed = std::ranges::find(before, name, &r::NormalizedModelStateEntry::name);
+  REQUIRE(seed != before.end());
+  CHECK(torch::equal(parameters[name][0], torch::full_like(parameters[name][0], 102.0)));
+  CHECK(torch::equal(parameters[name][1], torch::full_like(parameters[name][1], 100.0)));
+  CHECK(torch::equal(parameters[name][2], seed->tensor[2]));
+  CHECK(torch::equal(parameters[name][3], torch::full_like(parameters[name][3], 101.0)));
+ }
+ auto malformed = entries;
+ auto mask = std::ranges::find(malformed, "_kp_active_mask", &r::NormalizedModelStateEntry::name);
+ mask->tensor = mask->tensor.clone();
+ mask->tensor[0][0] = false;
+ const auto installed = r::testsupport::clone_normalized_model_state(destination);
+ CHECK_THROWS(destination.stage_normalized_state(malformed, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
+ auto missing = entries;
+ std::erase_if(missing, [](const auto& entry) { return entry.name == "transformer.decoder.keypoint_class_mask"; });
+ CHECK_THROWS(destination.stage_normalized_state(missing, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
+ auto duplicated = entries;
+ duplicated.push_back(entries.front());
+ CHECK_THROWS(destination.stage_normalized_state(duplicated, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
+ auto conflict = source_layout.record();
+ conflict.foreground.keypoints->front().oks_sigmas[0] = .2;
+ const r::ResolvedClassLayout conflicting(conflict);
+ CHECK_THROWS(destination.stage_normalized_state(entries, r::detail::NormalizedModelStateAdmission::FreshTransfer, &conflicting));
+ auto reordered = destination.class_layout()->record();
+ std::swap(reordered.foreground.keypoints->front().names[0], reordered.foreground.keypoints->front().names[2]);
+ CHECK_THROWS(destination.load_normalized_state(installed, true, &reordered));
+ const auto installed_parameters = destination.named_parameters();
+ for (const auto& entry : installed) {
+  const auto current = installed_parameters.find(entry.name);
+  if (current) CHECK(torch::equal(*current, entry.tensor));
+ }
+ mmltk::testsupport::ScopedTempDir directory("rfdetr-joint-native");
+ r::DecodedNativeModelState checkpoint;
+ checkpoint.metadata = r::testsupport::model_checkpoint_metadata(destination, "native", "joint fixture");
+ r::testsupport::set_synthetic_model_state(checkpoint, r::testsupport::clone_normalized_model_state(destination));
+ const auto path = directory.path() / "renamed.pt";
+ r::save_native_checkpoint(path, checkpoint);
+ const auto restored = r::resolve_model_state(path, {}, 0);
+ CHECK(restored.artifacts.config.keypoints_per_class == config.keypoints_per_class);
+ CHECK(restored.artifacts.class_layout == destination.class_layout()->record());
+ CHECK(destination.load_normalized_state(restored.model_state.entries(), true).loaded_names.size() == restored.model_state.tensor_count());
+ auto conflicting_topology = config;
+ conflicting_topology.num_windows = 1;
+ r::NativeRfDetrModel wrong_windows(conflicting_topology, destination.class_layout()->record());
+ CHECK_THROWS(r::apply_checkpoint_to_module(wrong_windows, restored.model_state, true));
 }

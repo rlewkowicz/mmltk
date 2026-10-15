@@ -1975,7 +1975,7 @@ class Wrapper {
              name = container_name + "-gpu-environment";
   Args args{
    "run", "--rm", "--init", "--pull", "never", "--name", name, "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--network", "none", "--gpus", "all", "--user", user(),
-   "--env", "NVIDIA_DRIVER_CAPABILITIES=all", "--env", "MMLTK_DIAGNOSTIC_IMAGE=" + image, "--env", "MMLTK_DIAGNOSTIC_IMAGE_ID=" + id, "--entrypoint", "/opt/mmltk-tools/mmltk"
+   "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=32m", "--env", "NVIDIA_DRIVER_CAPABILITIES=all", "--env", "MMLTK_DIAGNOSTIC_IMAGE=" + image, "--env", "MMLTK_DIAGNOSTIC_IMAGE_ID=" + id, "--entrypoint", "/opt/mmltk-tools/mmltk"
   };
   common_groups();
   labels(args, "diagnose-gpu-environment");

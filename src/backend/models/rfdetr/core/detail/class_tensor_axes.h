@@ -10,7 +10,7 @@ namespace torch::nn {
 class Module;
 }
 namespace mmltk::backend::models::rfdetr::detail {
-enum class ClassTensorCoordinates { OutputSlots, Foreground, ForegroundWithBoxes };
+enum class ClassTensorCoordinates { OutputSlots, Foreground, ForegroundWithBoxes, NamedJoints };
 struct ClassTensorAxis final {
  std::string name;
  std::int64_t dimension;
@@ -65,8 +65,11 @@ inline constexpr ClassTensorFamily kDenoisingClassAxis{kTrainingSupervisionModul
 inline constexpr std::string_view kProbeInputWeight = "linear1.weight";
 inline constexpr std::string_view kProbeInputLayer = kProbeInputWeight.substr(0, kProbeInputWeight.find('.'));
 inline constexpr ClassTensorFamily kMatchFreeClassAxis{kTrainingSupervisionModule, "ground_truth_mlp", kProbeInputWeight, false, 1, ClassTensorCoordinates::ForegroundWithBoxes};
+inline constexpr ClassTensorFamily kKeypointPositionAxis{"transformer", "decoder", "keypoint_pos_embed", false, 0, ClassTensorCoordinates::NamedJoints};
+inline constexpr ClassTensorFamily kKeypointQueryAxis{kTransformerModule, "keypoint_query_initializer", "queries", false, 0, ClassTensorCoordinates::NamedJoints};
+inline constexpr ClassTensorFamily kEncoderKeypointQueryAxis{kTransformerModule, "keypoint_query_initializer_enc", "queries", false, 0, ClassTensorCoordinates::NamedJoints};
 [[nodiscard]] constexpr std::optional<ClassTensorShape> class_tensor_shape(std::string_view name) noexcept {
- for (const auto* family : std::array{&kDecoderClassAxis, &kEncoderClassAxis, &kDenoisingClassAxis, &kMatchFreeClassAxis})
+ for (const auto* family : std::array{&kDecoderClassAxis, &kEncoderClassAxis, &kDenoisingClassAxis, &kMatchFreeClassAxis, &kKeypointPositionAxis, &kKeypointQueryAxis, &kEncoderKeypointQueryAxis})
   if (const auto axis = family->Match(name)) return axis;
  return std::nullopt;
 }

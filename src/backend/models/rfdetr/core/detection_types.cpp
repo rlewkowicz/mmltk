@@ -22,7 +22,7 @@ void populate_default_detection_weight_dict(DetectionConfig& config) {
  for (std::int64_t layer_index = 0; layer_index < config.dec_layers - 1; ++layer_index) {
   for (const auto& item : base_weights) { config.weight_dict.emplace_back(item.first + "_" + std::to_string(layer_index), item.second); }
  }
- if (config.two_stage) {
+ if (config.two_stage && config.dec_layers > 0) {
   for (const auto& item : base_weights) { config.weight_dict.emplace_back(item.first + "_enc", item.second); }
  }
 }

@@ -118,7 +118,7 @@ NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset) {
   .keypoint_dimension_downscale = preset.keypoint_dimension_downscale,
   .keypoint_cross_attention = preset.keypoint_cross_attention,
   .inter_instance_keypoint_attention = preset.inter_instance_keypoint_attention,
-  .keypoints_per_class = preset.default_person_keypoints == 0U ? std::vector<std::uint16_t>{} : std::vector<std::uint16_t>{preset.default_person_keypoints},
+  .keypoints_per_class = preset.default_person_keypoints == 0U ? std::vector<std::uint16_t>{} : (preset.official_class_layout == OfficialClassLayout::PersonBackgroundFirst ? std::vector<std::uint16_t>{0U, preset.default_person_keypoints} : std::vector<std::uint16_t>{preset.default_person_keypoints}),
   .num_classes = preset.class_count,
   .num_queries = preset.query_count,
   .num_select = preset.selected_query_count,
@@ -159,15 +159,17 @@ bool native_model_config_valid(const NativeRfDetrConfig& config) noexcept {
      !backbone_config_valid(config.backbone) || !training_supervision_model_config_valid(config)) return false;
  if (config.has_keypoints()) {
   if (config.keypoint_head != KeypointHeadKind::GroupPose || config.projector != ProjectorKind::DualKeypointOnly || config.keypoint_dimension_downscale <= 0 ||
-      config.hidden_dim % config.keypoint_dimension_downscale != 0 || (config.hidden_dim / config.keypoint_dimension_downscale) % config.sa_nheads != 0 ||
+      config.hidden_dim % config.keypoint_dimension_downscale != 0 || !config.lite_refpoint_refine ||
+      (config.hidden_dim / config.keypoint_dimension_downscale) % std::max(1, config.sa_nheads / config.keypoint_dimension_downscale) != 0 ||
+      (config.hidden_dim / config.keypoint_dimension_downscale) % std::max(1, config.ca_nheads / config.keypoint_dimension_downscale) != 0 ||
       config.keypoints_per_class.empty() || config.keypoints_per_class.size() > static_cast<std::size_t>(config.num_classes) ||
-      config.keypoints_per_class.size() > mmltk::backend::data::catalog::kClassCatalogCapacity) return false;
-  bool any = false;
+      config.keypoints_per_class.size() > kMaximumClassOutputSlots) return false;
+  std::size_t active_classes = 0;
   for (const auto count : config.keypoints_per_class) {
    if (count > mmltk::backend::data::catalog::kKeypointsPerClassCapacity) return false;
-   any = any || count != 0U;
+   active_classes += count != 0U;
   }
-  if (!any) return false;
+  if (active_classes == 0 || active_classes > mmltk::backend::data::catalog::kClassCatalogCapacity) return false;
  } else if (config.keypoint_head != KeypointHeadKind::None || config.projector != ProjectorKind::Single || !config.keypoints_per_class.empty()) return false;
  for (const auto coefficient : {config.cls_loss_coef, config.bbox_loss_coef, config.giou_loss_coef, config.mask_ce_loss_coef, config.mask_dice_loss_coef,
                                config.set_cost_class, config.set_cost_bbox, config.set_cost_giou, config.keypoint_l1_loss_coef, config.keypoint_findable_loss_coef,

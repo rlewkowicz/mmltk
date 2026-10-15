@@ -12,6 +12,7 @@ namespace mmltk::backend::models::rfdetr::testsupport {
   if constexpr (!model_state_detail::is_optional<std::remove_cvref_t<Target>>) target = source;
  });
  metadata.class_layout = model.class_layout()->record();
+ metadata.native_configuration = encode_checkpoint_configuration(model.config());
  metadata.source_kind = std::move(source_kind);
  metadata.source_path = std::move(source_path);
  return metadata;
