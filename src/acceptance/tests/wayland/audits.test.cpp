@@ -2976,16 +2976,18 @@ TEST_CASE("Catalog workflow evidence joins canonical prepared models to actual n
  namespace rfdetr = mmltk::backend::models::rfdetr;
  BrowserAudit audit;
  std::string pe, pose;
+ std::uint64_t pose_model = 0;
  for (std::size_t row=0; row<rfdetr::kPresetCatalog.size(); ++row) {
   const auto& preset = rfdetr::kPresetCatalog[row];
   const bool keypoints = preset.task == rfdetr::ModelTask::Keypoints;
-  if (!keypoints && (preset.backbone.kind != rfdetr::BackboneKind::PeCoreTiny || !pe.empty())) continue;
-  (keypoints ? pose : pe) = preset.preset_name;
-  const auto model = keypoints ? 12U : 11U, generation = keypoints ? 2U : 3U;
+  if (keypoints) pose = preset.preset_name;
+  else if (preset.backbone.kind == rfdetr::BackboneKind::PeCoreTiny && pe.empty()) pe = preset.preset_name;
+  const auto model = row + 11U, generation = keypoints ? 2U : row + 3U;
+  if (keypoints) pose_model = model;
   for (const auto stage : {"prepared", "completed"}) audit.consume({{"event","integration.keypoint.catalog"},{"control",preset.preset_name},{"detail",stage},{"a",model},{"b",std::string_view(stage)=="prepared"?0U:generation},{"c",preset.resolution},{"d",row}});
   audit.consume_native_gpu({{"event","workflow.gpu_execution"},{"owner",keypoints?"training":"prediction"},{"participant",keypoints?"train":"predict"},{"sequence",generation},{"value",0U},{"detail",1U},{"device",0}});
  }
- audit.consume({{"event","integration.keypoint.training-artifact"},{"control","/session/training/catalog-keypoint/model.pt"},{"detail","actual-run"},{"a",12U},{"b",2U},{"c",4U},{"d",.5}});
+ audit.consume({{"event","integration.keypoint.training-artifact"},{"control","/session/training/catalog-keypoint/model.pt"},{"detail","actual-run"},{"a",pose_model},{"b",2U},{"c",4U},{"d",.5}});
  REQUIRE(audit.keypoint_catalog_complete());
  SECTION("selection only") { audit.keypoint_catalog.erase({pe,"completed"}); }
  SECTION("custom compact model") { audit.keypoint_catalog.at({pose,"prepared"})["control"] = "rf-detr-nano"; }

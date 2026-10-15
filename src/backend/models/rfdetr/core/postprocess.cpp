@@ -106,13 +106,17 @@ std::optional<torch::Tensor> postprocess_keypoints(const OutputTensors& outputs,
  const auto active = lane ? lane->KeypointMask(layout, raw.device()) : layout.active_mask().to(raw.device());
  const auto mask = active.index_select(0, slots.flatten()).view({batch, core.scores.size(1), k}) & core.physical_labels.lt(layout.slot_count()).unsqueeze(-1);
  core.keypoint_counts = mask.sum(-1).to(torch::kInt32);
- const auto a = Packet::select<^^KeypointPrediction::log_l11>(selected, -1), b = Packet::select<^^KeypointPrediction::l21>(selected, -1), c = Packet::select<^^KeypointPrediction::log_l22>(selected, -1);
- const auto weight = Packet::select<^^KeypointPrediction::findable_logit>(selected, -1).sigmoid().clamp_min(1e-12).log().masked_fill(~mask, -std::numeric_limits<float>::infinity());
- const auto trace = torch::logsumexp(torch::stack({-2 * a, -2 * c, 2 * b.abs().clamp_min(1e-12).log() - 2 * a - 2 * c}, -1), -1);
- const auto mean_trace = torch::where(mask.any(-1), torch::logsumexp(trace + weight, -1) - torch::logsumexp(weight, -1), torch::zeros_like(core.scores));
- auto fused = (core.scores.log() - 0.2 * mean_trace).sigmoid();
- fused = torch::minimum(fused, torch::nextafter(torch::ones_like(fused), torch::zeros_like(fused)));
- core.scores = torch::where(core.physical_labels.lt(layout.slot_count()), fused, core.scores);
+ // The upstream postprocessor skips uncertainty fusion for an entirely
+ // zero-width physical schema. Mixed schemas still fuse every admitted slot.
+ if (k > 0) {
+  const auto a = Packet::select<^^KeypointPrediction::log_l11>(selected, -1), b = Packet::select<^^KeypointPrediction::l21>(selected, -1), c = Packet::select<^^KeypointPrediction::log_l22>(selected, -1);
+  const auto weight = Packet::select<^^KeypointPrediction::findable_logit>(selected, -1).sigmoid().clamp_min(1e-12).log().masked_fill(~mask, -std::numeric_limits<float>::infinity());
+  const auto trace = torch::logsumexp(torch::stack({-2 * a, -2 * c, 2 * b.abs().clamp_min(1e-12).log() - 2 * a - 2 * c}, -1), -1);
+  const auto mean_trace = torch::where(mask.any(-1), torch::logsumexp(trace + weight, -1) - torch::logsumexp(weight, -1), torch::zeros_like(core.scores));
+  auto fused = (core.scores.log() - 0.2 * mean_trace).sigmoid();
+  fused = torch::minimum(fused, torch::nextafter(torch::ones_like(fused), torch::zeros_like(fused)));
+  core.scores = torch::where(core.physical_labels.lt(layout.slot_count()), fused, core.scores);
+ }
  selected = selected.masked_fill(~mask.unsqueeze(-1), 0);
  map_prediction_keypoints_(selected, width, height);
  selected.narrow(-1, Packet::index<^^KeypointPrediction::log_l11>(), 3).masked_fill_(~mask.unsqueeze(-1), std::numeric_limits<float>::quiet_NaN());

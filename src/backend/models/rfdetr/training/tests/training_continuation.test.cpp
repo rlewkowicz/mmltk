@@ -631,6 +631,7 @@ TEST_CASE("Original application sessions resume with immutable format ten identi
  const auto evidence=nlohmann::json::parse(evidence_file);
  REQUIRE(evidence.at("format_version")==1);
  REQUIRE(evidence.at("application_revision")=="1c13fec8b04036661a4028b8807d0e1cff42407d");
+ REQUIRE(evidence.at("source_tree")=="ab06f768a4ad225f0d3fdd0985ea414b726402df");
  REQUIRE(evidence.at("source_tree_clean")==true);
  REQUIRE(evidence.at("build_sha256").get<std::string>().size()==64);
  REQUIRE_FALSE(evidence.at("inputs").empty());
@@ -665,6 +666,8 @@ TEST_CASE("Original application sessions resume with immutable format ten identi
  REQUIRE(hashes.at(binary)==evidence.at("build_sha256").get<std::string>());
  require_evidence(evidence.at("build_transcript").get<std::string>());
  require_evidence(evidence.at("producer_transcript").get<std::string>());
+ for (const auto* role:{"source","include","identity_declarations","link_options"}) require_evidence(evidence.at("harness").at(role).get<std::string>());
+ REQUIRE(evidence.at("harness").size()==4);
  for (const auto& input:evidence.at("inputs")) {
   const auto path=require_evidence(input.at("path").get<std::string>());
   CHECK(hashes.at(path)==input.at("sha256").get<std::string>());
@@ -674,6 +677,8 @@ TEST_CASE("Original application sessions resume with immutable format ten identi
  std::ifstream manifest_file(original);
  const auto original_manifest=nlohmann::json::parse(manifest_file);
  REQUIRE_FALSE(original_manifest.contains("identity_schema"));
+ std::ifstream continued_file(continued);
+ REQUIRE_FALSE(nlohmann::json::parse(continued_file).contains("identity_schema"));
  r::TrainingSessionAdmission saved(original), expected(continued);
  REQUIRE(saved.manifest().identity_schema==1);
  REQUIRE(expected.manifest().identity_schema==1);

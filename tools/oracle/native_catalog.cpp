@@ -1,7 +1,9 @@
 #include "native_catalog.h"
 #include <nlohmann/json.hpp>
 #include <type_traits>
+#include <stdexcept>
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/class_layout.h"
 #include "src/backend/data/catalog/class_catalog.h"
 namespace {
@@ -28,4 +30,15 @@ std::string rfdetr_native_catalog_json() {
  result["foreground_capacity"] = mmltk::backend::data::catalog::kClassCatalogCapacity;
  result["output_slot_capacity"] = kMaximumClassOutputSlots;
  return result.dump();
+}
+std::string rfdetr_native_configuration_json(const std::string_view preset, const int groups) {
+ using namespace mmltk::backend::models::rfdetr;
+ const auto* row = find_preset_catalog_entry(preset);
+ if (!row) throw std::invalid_argument("unknown RF-DETR oracle preset: " + std::string(preset));
+ auto config = native_config_from_preset(*row);
+ config.group_detr = groups;
+ if (!native_model_config_valid(config)) throw std::invalid_argument("invalid RF-DETR oracle configuration: " + std::string(preset));
+ const auto result = project(config).dump();
+ if (result.size() > 65536U) throw std::invalid_argument("RF-DETR oracle configuration exceeds checkpoint byte bound");
+ return result;
 }

@@ -1,6 +1,7 @@
 #pragma once
 #include "src/backend/models/rfdetr/core/criterion_terms.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/class_layout.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
@@ -26,10 +27,18 @@ struct OracleTensor final {
  std::string device;
  int64_t finite_count = 0, elements = 0;
 };
-struct OracleArchiveRecord final {
+struct OracleShardRecord final {
  std::string file, sha256;
  std::uint64_t bytes = 0;
  std::map<std::string, OracleTensor> tensors;
+};
+struct OracleArchiveRecord final {
+ std::filesystem::path directory;
+ std::vector<OracleShardRecord> shards;
+};
+struct OracleArchiveReference final {
+ std::filesystem::path directory;
+ nlohmann::json index;
 };
 struct OracleParameterGroup final {
  std::vector<std::string> names;
@@ -37,49 +46,61 @@ struct OracleParameterGroup final {
  bool amsgrad = false;
 };
 struct OracleCase final {
- std::string id, preset, precision;
+ std::string id, preset, precision, protocol;
  bool training = false;
  bool math_sdpa = false;
- int batch = 0, resolution = 0, groups = 0, classes = 0;
+ int batch = 0, resolution = 0, groups = 0, classes = 0, queries = 0;
+ std::vector<std::uint16_t> keypoints_per_class;
  std::vector<std::string> trainable;
  std::vector<OracleParameterGroup> parameter_groups;
  TrainRecipeValues recipe;
  double clip_max_norm = .1;
  std::map<std::string, double> loss_weights;
- std::vector<OracleArchiveRecord> steps;
+ std::vector<OracleArchiveReference> steps;
  [[nodiscard]] at::ScalarType dtype() const;
 };
 class OracleArchive final {
 public:
- OracleArchive(const std::filesystem::path& directory, const OracleArchiveRecord& record);
+ explicit OracleArchive(OracleArchiveRecord record);
+ OracleArchive(const std::filesystem::path& directory,const nlohmann::json& reference);
  [[nodiscard]] torch::Tensor tensor(const std::string& name, torch::Device device = torch::kCPU) const;
  [[nodiscard]] std::set<std::string> names(std::string_view prefix) const;
  [[nodiscard]] std::vector<std::string> ordered_defined_names(std::string_view prefix) const;
  [[nodiscard]] bool contains(const std::string& name) const;
 
 private:
- TensorMap tensors_;
+ void load_shard(std::size_t index, bool remember_order = false) const;
+ OracleArchiveRecord record_;
+ std::map<std::string,std::size_t> locations_;
+ mutable TensorMap tensors_;
+ mutable std::optional<std::size_t> loaded_;
  std::set<std::string> undefined_;
- std::vector<std::string> serialized_order_;
+ mutable std::vector<std::string> serialized_order_;
 };
 class UpstreamOracle final {
 public:
- // Absence alone is an optional skip. Empty, missing or malformed requested
- // paths throw, including provenance/inventory/hash mismatches.
+ // Required ordinary-suite evidence. Missing preparation fails acceptance.
  [[nodiscard]] static std::optional<std::filesystem::path> requested();
  explicit UpstreamOracle(const std::filesystem::path& root);
  [[nodiscard]] const std::vector<OracleCase>& cases() const noexcept { return cases_; }
  [[nodiscard]] const std::filesystem::path& directory() const noexcept { return directory_; }
  [[nodiscard]] std::filesystem::path checkpoint(std::string_view preset) const;
+ [[nodiscard]] std::filesystem::path official_checkpoint(std::string_view preset) const;
  [[nodiscard]] NativeRfDetrModel model(const OracleCase& entry) const;
  [[nodiscard]] OracleArchive archive(const OracleCase& entry, std::size_t step) const;
  [[nodiscard]] OracleArchive resize_archive() const;
+ [[nodiscard]] OracleArchive keypoint_archive() const;
+ [[nodiscard]] const nlohmann::json& keypoint_cases() const noexcept { return keypoint_cases_; }
 
 private:
  std::filesystem::path directory_;
  std::map<std::string, std::filesystem::path> checkpoints_;
+ std::map<std::string, std::filesystem::path> originals_;
+ mutable std::map<std::string, ModelClassLayout> official_layouts_;
  std::vector<OracleCase> cases_;
- OracleArchiveRecord resize_;
+ OracleArchiveReference resize_;
+ OracleArchiveReference keypoints_;
+ nlohmann::json keypoint_cases_;
 };
 // Numerical acceptance is independent of diagnostic paths and artifact keys.
 enum class OracleComparisonPolicy : std::uint8_t { Value, Exact, Derivative, SecondMoment, Hyperparameter };
@@ -126,6 +147,7 @@ private:
 [[nodiscard]] PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& entry, torch::Device device);
 [[nodiscard]] std::vector<LayerMaskSamples> oracle_samples(const OracleArchive&, std::size_t layers, torch::Device, const std::string& prefix = "");
 [[nodiscard]] DetectionConfig oracle_detection(const NativeRfDetrConfig& config);
-void compare_oracle_outputs(OracleComparison&, const OracleArchive&, const ModelOutputs&, const std::vector<torch::Tensor>& encoder_indices, const std::string& prefix = "");
+[[nodiscard]] std::vector<CompilationMode> oracle_execution_modes(const OracleCase&);
+void compare_oracle_outputs(OracleComparison&, const OracleArchive&, const ModelOutputs&, const std::vector<torch::Tensor>& encoder_indices, const std::string& prefix = "", bool observed_encoder = true);
 void compare_oracle_vjp(OracleComparison&, const OracleArchive&, NativeRfDetrModel&, const ModelOutputs&, const torch::Tensor& input, bool retain_graph);
 }  // namespace mmltk::backend::models::rfdetr::testsupport

@@ -1,6 +1,7 @@
 #include "checkpoint_fixture_support/upstream_oracle_fixture.h"
 #include "src/backend/ml/torch/scalar_type.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/tests/training_fixture.h"
 #include "src/common/io/file_digest.h"
 #include <caffe2/serialize/inline_container.h>
@@ -9,6 +10,7 @@
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/version.h>
 #include <ATen/Context.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/autocast_mode.h>
 #include <algorithm>
 #include <cmath>
@@ -22,10 +24,12 @@ namespace mmltk::backend::models::rfdetr::testsupport {
 namespace {
 constexpr std::uint64_t kManifestLimit = 32U * 1024U * 1024U;
 constexpr std::uint64_t kArchiveLimit = 4ULL * 1024U * 1024U * 1024U;
+constexpr std::uint64_t kStepStorageLimit = 64ULL * 1024U * 1024U * 1024U;
+constexpr std::size_t kShardLimit = 256, kTensorLimit = 20000;
 using Json = nlohmann::json;
 [[noreturn]] void invalid(const std::string& message) { throw std::runtime_error("RF-DETR upstream oracle: " + message); }
 std::filesystem::path child(const std::filesystem::path& parent, const std::string& name) {
- if (name.empty() || name.size() > 256 || std::filesystem::path(name).filename() != name || name == "." || name == "..") invalid("invalid artifact filename");
+ if (std::filesystem::is_symlink(parent) || name.empty() || name.size() > 256 || std::filesystem::path(name).filename() != name || name == "." || name == "..") invalid("invalid artifact filename");
  const auto value = parent / name;
  if (std::filesystem::is_symlink(value)) invalid("artifact symlink is not admitted: " + name);
  return value;
@@ -33,8 +37,19 @@ std::filesystem::path child(const std::filesystem::path& parent, const std::stri
 void verify_hash(const std::filesystem::path& file, const std::string& hash) {
  if (hash.size() != 64 || mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(file)) != hash) invalid("SHA256 mismatch: " + file.string());
 }
+Json read_index(const std::filesystem::path& path) {
+ if (!std::filesystem::is_regular_file(path) || std::filesystem::is_symlink(path) || std::filesystem::file_size(path)>kManifestLimit) invalid("invalid evidence JSON");
+ std::ifstream input(path);
+ std::vector<std::set<std::string>> keys;
+ return Json::parse(input,[&](int,Json::parse_event_t event,Json& value) {
+  if (event==Json::parse_event_t::object_start) keys.emplace_back();
+  else if (event==Json::parse_event_t::key && !keys.back().insert(value.get<std::string>()).second) invalid("duplicate evidence JSON key");
+  else if (event==Json::parse_event_t::object_end) keys.pop_back();
+  return true;
+ });
+}
 at::ScalarType oracle_dtype(at::ScalarType dtype) {
- // The v1 oracle admits a strict subset of the shared scalar vocabulary.
+ // The oracle admits a strict subset of the shared scalar vocabulary.
  switch (dtype) {
   case at::kFloat:
   case at::kHalf:
@@ -72,15 +87,15 @@ std::uint64_t tensor_bytes(const OracleTensor& tensor) {
  if (product > kArchiveLimit / width) invalid("unbounded tensor storage");
  return product * width;
 }
-OracleArchiveRecord archive_record(const Json& value) {
- OracleArchiveRecord result;
+OracleShardRecord shard_record(const Json& value) {
+ OracleShardRecord result;
  result.file = value.at("file").get<std::string>();
  result.sha256 = value.at("sha256").get<std::string>();
  result.bytes = value.at("bytes").get<std::uint64_t>();
  if (!result.bytes || result.bytes > kArchiveLimit || value.at("tensors").size() > 20000) invalid("unbounded tensor archive");
  std::uint64_t bytes = 0;
  for (const auto& [name, item] : value.at("tensors").items()) {
-  if (name.empty() || name.size() > 512) invalid("invalid tensor name");
+  if (name.empty() || name.size() > 512 || name.starts_with("finite/")) invalid("invalid tensor name");
   OracleTensor tensor;
   tensor.defined = item.at("defined").get<bool>();
   if (tensor.defined) {
@@ -101,6 +116,34 @@ OracleArchiveRecord archive_record(const Json& value) {
  }
  return result;
 }
+Json authenticated_index(const std::filesystem::path& directory,const Json& reference) {
+ const auto path=child(directory,reference.at("file").get<std::string>());
+ const auto bytes=reference.at("bytes").get<std::uint64_t>();
+ if (!bytes || bytes>kManifestLimit || std::filesystem::file_size(path)!=bytes) invalid("index size mismatch");
+ verify_hash(path,reference.at("sha256").get<std::string>());
+ return read_index(path);
+}
+OracleArchiveRecord archive_record(const std::filesystem::path& directory,const Json& reference) {
+ const auto index=authenticated_index(directory,reference);
+ if (index.at("format")!="mmltk.rfdetr.step.v2" || index.at("shards").empty() || index.at("shards").size()>kShardLimit) invalid("unbounded step shard inventory");
+ OracleArchiveRecord result{directory,{}};
+ std::set<std::string> files,names;
+ std::uint64_t bytes=0,metadata=0;
+ for (const auto& ref:index.at("shards")) {
+  if (!files.insert(ref.at("file").get<std::string>()).second) invalid("duplicate shard index");
+  const auto index_bytes=ref.at("bytes").get<std::uint64_t>();
+  if (index_bytes>kManifestLimit-metadata) invalid("unbounded step metadata");
+  metadata+=index_bytes;
+  auto shard=shard_record(authenticated_index(directory,ref));
+  if (!files.insert(shard.file).second || shard.bytes>kStepStorageLimit-bytes) invalid("duplicate or unbounded physical storage");
+  bytes+=shard.bytes;
+  for (const auto& [name,spec]:shard.tensors)
+   if (!names.insert(name).second || names.size()>kTensorLimit) invalid("duplicate or unbounded logical tensor inventory");
+  result.shards.push_back(std::move(shard));
+ }
+ if (bytes!=index.at("bytes") || names.size()!=index.at("tensor_count")) invalid("step accounting mismatch");
+ return result;
+}
 std::set<std::string> keys(const TensorMap& values) {
  std::set<std::string> result;
  for (const auto& [name, value] : values) result.insert(name);
@@ -113,7 +156,22 @@ at::ScalarType OracleCase::dtype() const {
  if (precision == "bf16") return torch::kBFloat16;
  invalid("unsupported precision " + precision);
 }
-OracleArchive::OracleArchive(const std::filesystem::path& directory, const OracleArchiveRecord& record) {
+OracleArchive::OracleArchive(const std::filesystem::path& directory,const Json& reference):OracleArchive(archive_record(directory,reference)) {}
+OracleArchive::OracleArchive(OracleArchiveRecord record):record_(std::move(record)) {
+ for (std::size_t index=0;index<record_.shards.size();++index) {
+  for (const auto& [name,spec]:record_.shards[index].tensors) {
+   if (!locations_.emplace(name,index).second) invalid("duplicate logical tensor");
+   if (!spec.defined) undefined_.insert(name);
+  }
+  // Validate every physical shard before exposing the logical view, retaining
+  // only one bounded shard. Later reads reuse that shard or replace its cache.
+  load_shard(index,true);
+ }
+}
+void OracleArchive::load_shard(std::size_t index,bool remember_order) const {
+ tensors_.clear(); loaded_.reset();
+ const auto& record=record_.shards.at(index);
+ const auto& directory=record_.directory;
  const auto file = child(directory, record.file);
  if (std::filesystem::file_size(file) != record.bytes) invalid("archive size mismatch");
  verify_hash(file, record.sha256);
@@ -153,7 +211,6 @@ OracleArchive::OracleArchive(const std::filesystem::path& directory, const Oracl
  std::set<std::string> expected;
  for (const auto& [name, spec] : record.tensors) {
   if (!spec.defined) {
-   undefined_.insert(name);
    continue;
   }
   expected.insert(name);
@@ -172,17 +229,21 @@ OracleArchive::OracleArchive(const std::filesystem::path& directory, const Oracl
  }
  for (const auto& item : dictionary) {
   if (!item.key().isString() || !expected.erase(item.key().toStringRef())) invalid("unexpected archive entry");
-  if (tensors_.contains(item.key().toStringRef())) serialized_order_.push_back(item.key().toStringRef());
+  if (remember_order && tensors_.contains(item.key().toStringRef())) serialized_order_.push_back(item.key().toStringRef());
  }
  if (!expected.empty()) invalid("missing archive entries");
+ loaded_=index;
 }
 torch::Tensor OracleArchive::tensor(const std::string& name, const torch::Device device) const {
  if (undefined_.contains(name)) return {};
+ const auto location=locations_.find(name);
+ if (location==locations_.end()) invalid("required tensor missing: "+name);
+ if (loaded_!=location->second) load_shard(location->second);
  const auto found = tensors_.find(name);
  if (found == tensors_.end()) invalid("required tensor missing: " + name);
  return found->second.to(device);
 }
-bool OracleArchive::contains(const std::string& name) const { return tensors_.contains(name) || undefined_.contains(name); }
+bool OracleArchive::contains(const std::string& name) const { return locations_.contains(name); }
 std::vector<std::string> OracleArchive::ordered_defined_names(const std::string_view prefix) const {
  std::vector<std::string> result;
  for (const auto& name : serialized_order_)
@@ -191,24 +252,27 @@ std::vector<std::string> OracleArchive::ordered_defined_names(const std::string_
 }
 std::set<std::string> OracleArchive::names(const std::string_view prefix) const {
  std::set<std::string> result;
- for (const auto& [name, value] : tensors_)
-  if (name.starts_with(prefix)) result.insert(name.substr(prefix.size()));
- for (const auto& name : undefined_)
+ for (const auto& [name, value] : locations_)
   if (name.starts_with(prefix)) result.insert(name.substr(prefix.size()));
  return result;
 }
 std::optional<std::filesystem::path> UpstreamOracle::requested() {
  const auto* value = std::getenv("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR");
- if (!value) return std::nullopt;
+ if (!value) invalid("required reference preparation is absent; run the owning rfdetr suite through ./mmltk");
  if (!*value) invalid("explicitly requested evidence path is empty");
  return std::filesystem::path(value);
 }
 UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
  const auto path = child(root, "manifest.json");
  if (!std::filesystem::is_regular_file(path) || std::filesystem::file_size(path) > kManifestLimit) invalid("requested manifest missing or oversized");
- std::ifstream stream(path);
- const auto manifest = Json::parse(stream);
- if (manifest.at("format") != "mmltk.rfdetr.upstream-oracle.v1" || manifest.at("revision") != "e9a138f70cc14e3fddca029a0683055e34ab8f35" ||
+ const auto manifest = read_index(path);
+ const auto* repository = std::getenv("MMLTK_REPO_ROOT");
+ if (!repository) invalid("wrapper repository provenance missing");
+ const auto pins_path = std::filesystem::path(repository) / "tools/oracle/rfdetr_sources.json";
+ std::ifstream pins_input(pins_path);
+ const auto pins = Json::parse(pins_input);
+ if (manifest.at("sources") != pins || manifest.at("revision") != pins.at("core").at("revision")) invalid("source pins differ");
+ if (manifest.at("format") != "mmltk.rfdetr.upstream-oracle.v2" ||
      manifest.at("status") != "references_complete_native_comparison_pending")
   invalid("incompatible oracle format/revision/status");
  if (manifest.at("policy").at("matmul_tf32").get<bool>() || manifest.at("policy").at("cudnn_tf32").get<bool>() || manifest.at("policy").at("gradient_scale") != 1 ||
@@ -221,11 +285,14 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   invalid("math SDPA policy disagrees with producer backends");
  for (const auto* key : {"producer_sha256", "dependency_sha256", "payload_sha256", "fingerprint"})
   if (manifest.at(key).get<std::string>().size() != 64) invalid("missing provenance identity");
- if (manifest.at("source_hashes").empty() || manifest.at("source_hashes").size() > 5000) invalid("missing source provenance");
+ for (const auto* key : {"source_hashes", "plus_source_hashes"})
+  if (manifest.at(key).empty() || manifest.at(key).size() > 5000) invalid("missing source provenance");
+ verify_hash(child(child(root,"inventory"),"manifest.json"), manifest.at("inventory_sha256").get<std::string>());
  if (!manifest.at("environment").at("torch").get<std::string>().starts_with(TORCH_VERSION) || manifest.at("torch_build_config").get<std::string>().empty())
   invalid("incompatible Torch payload provenance");
  directory_ = child(root, manifest.at("directory").get<std::string>());
- if (manifest.at("presets").size() != 2) invalid("missing required preset");
+ if (manifest.at("presets").size() != kPresetCatalog.size()) invalid("missing required preset");
+ std::map<std::string,std::pair<std::string,std::string>> checkpoint_hashes;
  for (const auto& preset : manifest.at("presets")) {
   const auto name = preset.at("name").get<std::string>();
   const auto checkpoint = child(directory_, preset.at("checkpoint").get<std::string>());
@@ -234,13 +301,29 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   for (const auto& [kind, facts] : preset.at("constructor").items())
    for (const auto& [member, passed] : facts.items())
     if (!passed.get<bool>()) invalid("upstream constructor invariant failed: " + member);
+  const auto* row = find_preset_catalog_entry(name);
+  if (!row) invalid("unknown catalog preset");
+  const auto& asset = preset.at("verified_asset");
+  if (asset.at("preset") != name || asset.at("filename") != row->canonical_weight_filename ||
+      asset.at("md5") != row->canonical_weight_md5 || asset.at("url") != row->canonical_weight_url ||
+      asset.at("classifier_width") != row->class_count || asset.at("sha256") != preset.at("original_sha256")) invalid("official asset binding differs");
+  checkpoint_hashes.emplace(name,std::pair{preset.at("sha256").get<std::string>(),preset.at("original_sha256").get<std::string>()});
+  originals_.emplace(name, child(directory_, preset.at("original").get<std::string>()));
   if (!checkpoints_.emplace(name, checkpoint).second) invalid("duplicate preset");
  }
- if (manifest.at("cases").size() < 16 || manifest.at("cases").size() > 24) invalid("incomplete or unbounded model matrix");
+ if (manifest.at("cases").size() < kPresetCatalog.size() * 9 || manifest.at("cases").size() > kPresetCatalog.size() * 13) invalid("incomplete or unbounded model matrix");
  std::set<std::string> identities;
- for (const auto& item : manifest.at("cases")) {
+ std::set<std::string> case_directories;
+ for (const auto& reference : manifest.at("cases")) {
+  const auto case_name=reference.at("directory").get<std::string>();
+  if (!case_directories.insert(case_name).second) invalid("duplicate case directory");
+  const auto case_directory=child(directory_,case_name);
+  const auto item=authenticated_index(case_directory,reference);
   OracleCase entry;
   entry.id = item.at("id").get<std::string>();
+  entry.protocol=item.at("protocol").get<std::string>();
+  const bool stock=entry.protocol=="stock";
+  if ((!stock && entry.protocol!="controlled-group2") || entry.id!=case_name) invalid("case protocol identity differs");
   entry.preset = item.at("preset").get<std::string>();
   entry.precision = item.at("precision").get<std::string>();
   entry.training = item.at("training").get<bool>();
@@ -249,6 +332,8 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   entry.resolution = item.at("resolution").get<int>();
   entry.groups = item.at("groups").get<int>();
   entry.classes = item.at("classes").get<int>();
+  entry.queries = item.at("queries").get<int>();
+  entry.keypoints_per_class = item.at("keypoints_per_class").get<std::vector<std::uint16_t>>();
   entry.trainable = item.at("trainable").get<std::vector<std::string>>();
   entry.loss_weights = item.at("loss_weights").get<std::map<std::string, double>>();
   entry.clip_max_norm = item.at("clip_max_norm").get<double>();
@@ -258,9 +343,15 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   entry.recipe.lr_component_decay = recipe.at("lr_component_decay");
   entry.recipe.encoder_layer_decay = recipe.at("lr_vit_layer_decay");
   entry.recipe.weight_decay = recipe.at("weight_decay");
-  if (entry.id.size() > 128 || !identities.insert(entry.id).second || !checkpoints_.contains(entry.preset) || (entry.batch != 1 && entry.batch != 2) || entry.groups != 2 || entry.classes != 91 ||
-      entry.resolution != (entry.preset == "rf-detr-nano" ? 384 : 312) || entry.trainable.empty() || entry.trainable.size() > 2000)
+  const auto* row = find_preset_catalog_entry(entry.preset);
+  if (!row) invalid("unknown case preset");
+  if (entry.id.size() > 128 || !identities.insert(entry.id).second || !checkpoints_.contains(entry.preset) || (entry.batch != 1 && entry.batch != 2) || entry.groups != (stock?row->group_count:2) || entry.classes != row->class_count || entry.queries != row->query_count ||
+      entry.resolution != row->resolution || entry.trainable.empty() || entry.trainable.size() > 2000)
    invalid("invalid case configuration");
+  if (stock && (entry.precision!="fp32" || !entry.training || entry.batch!=1)) invalid("invalid stock case");
+  const auto& hashes=checkpoint_hashes.at(entry.preset);
+  if (item.at("checkpoint_sha256")!=(stock?hashes.second:hashes.first)) invalid("case checkpoint identity differs");
+  if (item.at("producer_sha256")!=manifest.at("producer_sha256") || item.at("fingerprint")!=manifest.at("fingerprint")) invalid("case producer binding differs");
   (void)entry.dtype();
   if (item.at("comparison_policy") != (entry.dtype() == torch::kFloat32 || !entry.training ? "untouched_stock" : "upstream_with_fp32_matcher_boundary") ||
       item.at("execution_policy").at("autocast_enabled").get<bool>() != (entry.dtype() != torch::kFloat32) ||
@@ -277,32 +368,64 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
    value.amsgrad = group.at("amsgrad");
    entry.parameter_groups.push_back(std::move(value));
   }
-  const std::size_t expected_steps = entry.training && entry.batch == 2 && entry.preset == "rf-detr-nano" && entry.precision == "fp32" ? 8 : 1;
+  const std::size_t expected_steps = !stock && entry.training && entry.batch == 2 ? 8 : 1;
   if (item.at("steps").size() != expected_steps) invalid("trajectory length mismatch");
+  std::set<std::string> step_files;
   for (const auto& step : item.at("steps")) {
    if (step.at("step").get<std::size_t>() != entry.steps.size()) invalid("trajectory step sequence mismatch");
-   entry.steps.push_back(archive_record(step));
+   if (!step_files.insert(step.at("file").get<std::string>()).second) invalid("duplicate step index");
+   const auto admitted=archive_record(case_directory,step);
+   for (const auto& shard:admitted.shards)
+    if (!step_files.insert(shard.file).second) invalid("physical shard reused across trajectory steps");
+   entry.steps.push_back({case_directory,step});
   }
   cases_.push_back(std::move(entry));
  }
- const bool bf16 = std::ranges::any_of(cases_, [](const auto& value) { return value.precision == "bf16"; });
+ if (at::cuda::getNumGPUs()==0) invalid("required CUDA device unavailable");
+ const bool bf16=at::cuda::getDeviceProperties(0)->major>=8;
+ const auto& capability=manifest.at("precision_capability");
+ if (capability.at("fp32")!=true || capability.at("fp16")!=true || capability.at("bf16")!=bf16) invalid("current supported precision coverage differs");
  if (bf16 ? !manifest.at("unsupported").empty() : manifest.at("unsupported") != Json::array({"bf16: CUDA device does not support BF16"})) invalid("precision support inventory differs");
- for (const auto& preset : {"rf-detr-nano", "rf-detr-seg-nano"})
+ for (const auto& row : kPresetCatalog)
   for (const auto& precision : {"fp32", "fp16", "bf16"})
    for (const auto batch : {1, 2})
     for (const bool training : {false, true})
-     if (std::ranges::count_if(cases_, [&](const auto& value) { return value.preset == preset && value.precision == precision && value.batch == batch && value.training == training; }) !=
+     if (std::ranges::count_if(cases_, [&](const auto& value) { return value.protocol=="controlled-group2" && value.preset == row.preset_name && value.precision == precision && value.batch == batch && value.training == training; }) !=
          (std::string_view(precision) == "bf16" && !bf16 ? 0 : 1))
       invalid("missing required model case");
- resize_ = archive_record(manifest.at("resize").at("archive"));
+ for (const auto& row:kPresetCatalog)
+  if (std::ranges::count_if(cases_,[&](const auto& value){return value.protocol=="stock" && value.preset==row.preset_name;})!=1) invalid("missing full stock training case");
+ for (const auto* family:{"resize","keypoints"})
+  if (!case_directories.insert(manifest.at(family).at("directory").get<std::string>()).second) invalid("duplicate supplemental evidence directory");
+ const auto resize_directory=child(directory_,manifest.at("resize").at("directory").get<std::string>());
+ const auto keypoint_directory=child(directory_,manifest.at("keypoints").at("directory").get<std::string>());
+ const auto resize=authenticated_index(resize_directory,manifest.at("resize"));
+ const auto keypoints=authenticated_index(keypoint_directory,manifest.at("keypoints"));
+ (void)archive_record(resize_directory,resize.at("archive"));
+ (void)archive_record(keypoint_directory,keypoints.at("archive"));
+ resize_={resize_directory,resize.at("archive")};
+ keypoints_={keypoint_directory,keypoints.at("archive")};
+ keypoint_cases_=keypoints.at("cases");
+ if (keypoint_cases_.size() != 5) invalid("incomplete keypoint boundary cases");
 }
 std::filesystem::path UpstreamOracle::checkpoint(const std::string_view preset) const { return checkpoints_.at(std::string(preset)); }
+std::filesystem::path UpstreamOracle::official_checkpoint(const std::string_view preset) const { return originals_.at(std::string(preset)); }
 NativeRfDetrModel UpstreamOracle::model(const OracleCase& entry) const {
- auto admitted = resolve_model_state(checkpoint(entry.preset), entry.preset, entry.resolution);
+ auto admitted = resolve_model_state(entry.protocol=="stock"?official_checkpoint(entry.preset):checkpoint(entry.preset), entry.preset, entry.resolution);
  auto config = admitted.artifacts.config;
- config.group_detr = entry.groups;
- if (config.num_classes != entry.classes) invalid("checkpoint class inventory differs");
- NativeRfDetrModel model(config, admitted.artifacts.class_layout);
+ if (entry.protocol=="stock") apply_stock_training_coefficients(config);
+ if (config.group_detr!=entry.groups) invalid("checkpoint group topology differs");
+ if (config.num_classes != entry.classes || config.num_queries != entry.queries || config.keypoints_per_class != entry.keypoints_per_class) invalid("checkpoint class/query/joint inventory differs");
+ auto layout = official_layouts_.find(entry.preset);
+ if (layout == official_layouts_.end()) {
+  // Reduced-group numerical checkpoints are derived upstream state, so their
+  // new bytes cannot inherit a verified official digest. Admit class meaning
+  // independently from the retained original asset through production APIs.
+  auto official = resolve_model_artifacts(official_checkpoint(entry.preset), entry.preset, entry.resolution);
+  if (official.config.num_classes != config.num_classes || official.config.keypoints_per_class != config.keypoints_per_class) invalid("official and derived class schema differs");
+  layout = official_layouts_.emplace(entry.preset,std::move(official.class_layout)).first;
+ }
+ NativeRfDetrModel model(config, layout->second);
  auto candidate = model.stage_normalized_state(admitted.model_state.entries(), detail::NormalizedModelStateAdmission::RequiredCore);
  if (!candidate.summary.missing_names.empty() || !candidate.summary.incompatible_names.empty() || !candidate.summary.unexpected_names.empty())
   invalid("upstream checkpoint admission inventory differs");
@@ -317,11 +440,25 @@ NativeRfDetrModel UpstreamOracle::model(const OracleCase& entry) const {
  if (trainable != std::set<std::string>(entry.trainable.begin(), entry.trainable.end())) invalid("trainable parameter inventory differs");
  return model;
 }
-OracleArchive UpstreamOracle::archive(const OracleCase& entry, std::size_t step) const { return {directory_, entry.steps.at(step)}; }
-OracleArchive UpstreamOracle::resize_archive() const { return {directory_, resize_}; }
+OracleArchive UpstreamOracle::archive(const OracleCase& entry, std::size_t step) const { const auto& reference=entry.steps.at(step); return OracleArchive(reference.directory,reference.index); }
+OracleArchive UpstreamOracle::keypoint_archive() const { return OracleArchive(keypoints_.directory,keypoints_.index); }
+std::vector<CompilationMode> oracle_execution_modes(const OracleCase& entry) {
+ const auto* preset = find_preset_catalog_entry(entry.preset);
+ if (!preset) invalid("unknown execution preset");
+ if (entry.protocol=="controlled-group2" && entry.batch == 1 && (preset->backbone.kind != BackboneKind::DinoV2Small || preset->task == ModelTask::Keypoints))
+  return {CompilationMode::kNone, CompilationMode::kSelective, CompilationMode::kFullTrace};
+ return {CompilationMode::kNone};
+}
+OracleArchive UpstreamOracle::resize_archive() const { return OracleArchive(resize_.directory,resize_.index); }
 OracleComparison::OracleComparison(const std::filesystem::path& root, std::string name, at::ScalarType precision, std::string objective)
     : precision_(precision), run_unix_ns_(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()) {
- const auto reports = root / "comparisons";
+ auto reports = root / "comparisons";
+ const auto* attempt=std::getenv("MMLTK_RFDETR_ORACLE_ATTEMPT");
+ const auto* evidence=std::getenv("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR");
+ if (attempt && evidence && std::filesystem::equivalent(root,evidence)) {
+  reports=child(reports,attempt);
+  if (!std::filesystem::is_directory(reports)) invalid("comparison attempt was not admitted by the wrapper");
+ }
  std::filesystem::create_directories(reports);
  report_.open(child(reports, name + ".jsonl"), std::ios::app);
  if (!report_) invalid("cannot write comparison evidence");
@@ -484,6 +621,7 @@ TensorMap oracle_output_tensors(const ModelOutputs& outputs) {
   result.emplace(prefix + "/pred_logits", value.pred_logits);
   result.emplace(prefix + "/pred_boxes", value.pred_boxes);
   if (value.pred_masks) result.emplace(prefix + "/pred_masks", *value.pred_masks);
+  if (value.pred_keypoints) result.emplace(prefix + "/pred_keypoints", *value.pred_keypoints);
   if (value.sparse_pred_masks) {
    result.emplace(prefix + "/pred_masks/spatial_features", value.sparse_pred_masks->spatial_features);
    result.emplace(prefix + "/pred_masks/query_features", value.sparse_pred_masks->query_features);
@@ -498,7 +636,7 @@ TensorMap oracle_output_tensors(const ModelOutputs& outputs) {
 }
 PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& entry, torch::Device device) {
  PreparedTargets result;
- std::vector<torch::Tensor> boxes, labels, masks;
+ std::vector<torch::Tensor> boxes, labels, masks, joints, counts;
  int64_t offset = 0;
  for (int image = 0; image < entry.batch; ++image) {
   const auto prefix = "target/" + std::to_string(image) + "/";
@@ -512,6 +650,12 @@ PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& e
   boxes.push_back(b);
   labels.push_back(l);
   if (archive.contains(prefix + "masks")) masks.push_back(archive.tensor(prefix + "masks"));
+  if (archive.contains(prefix + "keypoints")) {
+   target.keypoints = archive.tensor(prefix + "keypoints", device);
+   target.keypoint_counts = torch::tensor(std::vector<int64_t>(entry.keypoints_per_class.begin(), entry.keypoints_per_class.end()), torch::TensorOptions().dtype(torch::kInt64).device(device)).index_select(0, l);
+   joints.push_back(target.keypoints);
+   counts.push_back(target.keypoint_counts);
+  }
  }
  result.all_boxes = torch::cat(boxes);
  result.all_labels = torch::cat(labels);
@@ -519,7 +663,11 @@ PreparedTargets oracle_targets(const OracleArchive& archive, const OracleCase& e
  result.target_counts = torch::tensor(result.counts, integers);
  result.target_offsets = torch::tensor(result.offsets, integers);
  result.target_indices = torch::arange(offset, integers);
- result.resolved_query_count = entry.preset == "rf-detr-nano" ? 300 : 100;
+ result.resolved_query_count = entry.queries;
+ if (!joints.empty()) {
+  result.all_keypoints = torch::cat(joints);
+  result.all_keypoint_counts = torch::cat(counts);
+ }
  if (!masks.empty()) {
   const auto dense = torch::cat(masks).to(torch::kBool).contiguous();
   const auto pixels = dense.size(1) * dense.size(2), words = (pixels + 63) / 64;
@@ -549,12 +697,12 @@ DetectionConfig oracle_detection(const NativeRfDetrConfig& config) {
  populate_default_detection_weights(result);
  return result;
 }
-void compare_oracle_outputs(OracleComparison& comparison, const OracleArchive& archive, const ModelOutputs& outputs, const std::vector<torch::Tensor>& encoder_indices, const std::string& prefix) {
+void compare_oracle_outputs(OracleComparison& comparison, const OracleArchive& archive, const ModelOutputs& outputs, const std::vector<torch::Tensor>& encoder_indices, const std::string& prefix, bool observed_encoder) {
  const auto tensors = oracle_output_tensors(outputs);
  comparison.inventory(prefix + "output inventory", keys(tensors), archive.names(prefix + "output/"));
  std::set<std::string> indices;
  for (std::size_t group = 0; group < encoder_indices.size(); ++group) indices.insert(std::to_string(group));
- comparison.inventory(prefix + "encoder identity inventory", indices, archive.names(prefix + "encoder/"));
+ if (observed_encoder) comparison.inventory(prefix + "encoder identity inventory", indices, archive.names(prefix + "encoder/"));
  for (std::size_t group = 0; group < encoder_indices.size(); ++group) {
   const auto name = prefix + "encoder/" + std::to_string(group);
   comparison.compare(name, encoder_indices[group], archive.tensor(name), OracleComparisonPolicy::Exact);

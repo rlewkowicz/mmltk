@@ -808,7 +808,7 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   }
  } else if (event == "integration.keypoint.catalog") {
   const auto key = std::pair{record.value("control", ""), record.value("detail", "")};
-  if (keypoint_catalog.size() >= 4 || !keypoint_catalog.emplace(key, record).second) keypoint_catalog_invalid = true;
+  if (keypoint_catalog.size() >= 2 * mmltk::backend::models::rfdetr::kPresetCatalog.size() || !keypoint_catalog.emplace(key, record).second) keypoint_catalog_invalid = true;
  } else if (event == "integration.keypoint.training-artifact") {
   if (!keypoint_training_artifact.is_null()) keypoint_catalog_invalid = true;
   else keypoint_training_artifact = record;
@@ -2464,24 +2464,29 @@ bool BrowserAudit::keypoint_pixels_complete() const {
 }
 bool BrowserAudit::keypoint_catalog_complete() const {
  namespace rfdetr = mmltk::backend::models::rfdetr;
- if (keypoint_catalog_invalid || keypoint_catalog.size() != 4 || keypoint_training_artifact.is_null()) return false;
- std::uint64_t pe_model = 0, pose_model = 0, pose_operation = 0;
+ if (keypoint_catalog_invalid || keypoint_catalog.size() != 2 * rfdetr::kPresetCatalog.size() || keypoint_training_artifact.is_null()) return false;
+ std::uint64_t prediction_model = 0, pose_model = 0, pose_operation = 0;
+ std::set<std::uint64_t> models, predictions;
  for (const auto& [key, record] : keypoint_catalog) {
   const auto row = scalar(record,"d");
   if (row >= rfdetr::kPresetCatalog.size()) return false;
   const auto& preset = rfdetr::kPresetCatalog[row];
   const bool pose = preset.task == rfdetr::ModelTask::Keypoints;
-  if (record.value("control", "") != key.first || record.value("detail", "") != key.second || (!pose && preset.backbone.kind != rfdetr::BackboneKind::PeCoreTiny) || key.first != preset.preset_name || scalar(record,"a") == 0 || scalar(record,"c") != preset.resolution) return false;
+  if (record.value("control", "") != key.first || record.value("detail", "") != key.second || key.first != preset.preset_name || scalar(record,"a") == 0 || scalar(record,"c") != preset.resolution) return false;
   if (key.second == "prepared") { if (scalar(record,"b") != 0) return false; continue; }
   if (key.second != "completed" || scalar(record,"b") == 0) return false;
   const auto prepared = keypoint_catalog.find({key.first,"prepared"});
   if (prepared == keypoint_catalog.end() || scalar(prepared->second,"a") != scalar(record,"a") || scalar(prepared->second,"d") != row) return false;
   const auto executed = workflow_gpu_runs.find({pose ? "train" : "predict", scalar(record,"b")});
   if (executed == workflow_gpu_runs.end() || executed->second.empty() || std::ranges::any_of(executed->second,[](auto device) { return device < 0; })) return false;
+  if (!models.insert(scalar(record,"a")).second) return false;
   if (pose) { pose_model = scalar(record,"a"); pose_operation = scalar(record,"b"); }
-  else pe_model = scalar(record,"a");
+  else {
+   if (!predictions.insert(scalar(record,"b")).second) return false;
+   prediction_model = std::max(prediction_model, scalar(record,"a"));
+  }
  }
- return !workflow_gpu_invalid && pe_model != 0 && pose_model > pe_model && scalar(keypoint_training_artifact,"a") == pose_model && scalar(keypoint_training_artifact,"b") == pose_operation
+ return !workflow_gpu_invalid && models.size() == rfdetr::kPresetCatalog.size() && prediction_model != 0 && pose_model > prediction_model && scalar(keypoint_training_artifact,"a") == pose_model && scalar(keypoint_training_artifact,"b") == pose_operation
      && scalar(keypoint_training_artifact,"c") > 0 && !keypoint_training_artifact.value("control", "").empty() && !keypoint_training_artifact.value("detail", "").empty();
 }
 }

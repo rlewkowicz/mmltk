@@ -169,7 +169,7 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
 }  // namespace
 TEST_CASE("Actual upstream matched-state criterion AdamW and measured independent trajectory", "[rfdetr][parity][upstream_oracle][cuda]") {
  const auto requested = support::UpstreamOracle::requested();
- if (!requested) SKIP("optional independent upstream artifacts absent; default skip is not parity evidence");
+ REQUIRE(requested);
  const support::UpstreamOracle oracle(*requested);
  // CLEANUP-IGNORE: CUDA availability, device scope, and precision scope are separate prerequisites; model, training, and optimizer oracles retain independent setup.
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
@@ -179,17 +179,20 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
  rf::ScopedRuntimeContext runtime(nullptr, 0, &matcher.workspace);
  for (const auto& entry : oracle.cases()) {
   if (!entry.training) continue;
+  for (const auto mode : support::oracle_execution_modes(entry)) {
   for (const bool matched_state : {true, false}) {
-   DYNAMIC_SECTION(entry.id << (matched_state ? " matched state" : " independent trajectory")) {
+   if (!matched_state && mode != rf::CompilationMode::kNone) continue;
+   DYNAMIC_SECTION(entry.id << " mode=" << static_cast<int>(mode) << (matched_state ? " matched state" : " independent trajectory")) {
     CAPTURE(entry.id);
     auto model = oracle.model(entry);
+    if (mode != rf::CompilationMode::kNone) model.optimize_for_inference(entry.batch, true, mode);
     const auto config = support::oracle_detection(model.config());
     rf::TrainRequest request;
     static_cast<rf::TrainRecipeValues&>(request.recipe) = entry.recipe;
     request.fused_optimizer = false;
-    auto built = rf::build_optimizer(model.named_parameters(true), request);
+    auto built = rf::build_optimizer(model.named_parameters(true), request, model.config().backbone);
     const rf::TrainingStep step(1, 1., entry.dtype() != torch::kFloat32, entry.dtype());
-    support::OracleComparison comparison(*requested, (matched_state ? "training-" : "trajectory-") + entry.id, entry.dtype());
+    support::OracleComparison comparison(*requested, (matched_state ? "training-" : "trajectory-") + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype());
     comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
     std::set<std::string> actual_weights, expected_weights;
     for (const auto& [name, weight] : entry.loss_weights) expected_weights.insert(name);
@@ -202,7 +205,7 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
     rf::TensorMap expected_before;
     for (const auto& parameter : model.named_parameters(true))
      if (parameter.value().requires_grad()) expected_before.emplace(parameter.key(), parameter.value().detach().cpu().clone());
-    comparison.fact("trajectory", {{"updates", entry.steps.size()}, {"optimizer_backend", built.optimizer.backend_name()}, {"matched_state", matched_state},
+    comparison.fact("trajectory", {{"protocol",entry.protocol},{"groups",entry.groups},{"updates", entry.steps.size()}, {"optimizer_backend", built.optimizer.backend_name()}, {"matched_state", matched_state},
                                    {"interpretation", matched_state ? "model/criterion at upstream weights; optimizer consumes identical upstream clipped gradients"
                                                                     : "independent updates; measured differences, no trajectory-equality or dataset AP claim"}});
     const auto run_updates = [&] {
@@ -224,8 +227,8 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
       torch::Tensor total;
       step.forward([&] {
        comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
-       outputs = model.forward_observed({input, mask}, model.config().has_masks(), encoder);
-       support::compare_oracle_outputs(comparison, archive, outputs, encoder);
+       outputs = mode == rf::CompilationMode::kNone ? model.forward_observed({input, mask}, model.config().has_masks(), encoder) : model.forward({input, mask}, model.config().has_masks());
+       support::compare_oracle_outputs(comparison, archive, outputs, encoder, "", mode == rf::CompilationMode::kNone);
        total = compare_loss(comparison, archive, outputs, targets, config, true, "");
       });
       step.backward(total);
@@ -264,15 +267,17 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
         if (parameter.value().requires_grad()) parameter.value().copy_(expected_before.at(parameter.key()));
       }
       model.eval();
+      if (mode != rf::CompilationMode::kNone) model.optimize_for_inference(entry.batch, false, mode);
       {
        torch::NoGradGuard no_grad;
        step.forward([&] {
-        auto held = model.forward_observed({archive.tensor("held/input", torch::kCUDA), mask}, model.config().has_masks(), encoder);
-        support::compare_oracle_outputs(comparison, archive, held, encoder, "held/");
+        auto held = mode == rf::CompilationMode::kNone ? model.forward_observed({archive.tensor("held/input", torch::kCUDA), mask}, model.config().has_masks(), encoder) : model.forward({archive.tensor("held/input", torch::kCUDA), mask}, model.config().has_masks());
+        support::compare_oracle_outputs(comparison, archive, held, encoder, "held/", mode == rf::CompilationMode::kNone);
         (void)compare_loss(comparison, archive, held, targets, config, false, "held/");
        });
       }
       model.train();
+      if (mode != rf::CompilationMode::kNone) model.optimize_for_inference(entry.batch, true, mode);
      }
     };
     if (matched_state)
@@ -281,5 +286,6 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
      comparison.observe_values(run_updates);
    }
   }
+ }
  }
 }

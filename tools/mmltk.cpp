@@ -2231,6 +2231,8 @@ class Wrapper {
               {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp", "tools/oracle/native_catalog.cpp", "tools/oracle/native_catalog.h", "tools/oracle/rfdetr_sources.json",
                "src/backend/models/rfdetr/contract/preset_catalog.h", "src/backend/models/rfdetr/contract/model_topology.h", "src/backend/models/rfdetr/contract/training_supervision.h", "src/backend/models/rfdetr/contract/weight_catalog.h",
                "src/backend/models/rfdetr/contract/class_layout.h", "src/backend/models/rfdetr/contract/output_roles.h",
+               "src/backend/models/rfdetr/contract/model_config.cpp", "src/backend/models/rfdetr/contract/model_config.h", "src/backend/models/rfdetr/contract/weight_catalog.cpp", "src/backend/models/rfdetr/contract/contract.h",
+               "src/backend/models/contract/capabilities.h", "src/common/types/string_utils.h", "src/backend/data/catalog/keypoint_visibility.h",
                "src/backend/data/catalog/class_catalog.h", "src/backend/data/catalog/keypoint_schema.h", "src/frameworks/reflection/include/mmltk/frameworks/reflection/materializer.h", "src/frameworks/reflection/reflection_metadata.h",
                "src/frameworks/reflection/reflected_field_policy.h", "src/frameworks/reflection/field_policy.h", "src/frameworks/reflection/declaration_annotations.h", "src/frameworks/reflection/reflected_declarations.h",
                "tools/support/cpp_support.cpp", "tools/support/cpp_text.cpp", "tools/support/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake",
@@ -2245,7 +2247,47 @@ class Wrapper {
   if (const int image_status = wait_one_task(); image_status) throw Exit{image_status};
   return {input, image};
  }
- int oracle(Args arguments) {
+ static constexpr std::array oracle_targets{"mmltk_backend_models_rfdetr_core_tests","mmltk_backend_models_rfdetr_training_tests","mmltk_backend_models_rfdetr_export_tests","mmltk_backend_models_rfdetr_inference_tests"};
+ void oracle_record(const std::string& path,const support::json& record) {
+  write_text(path+".partial",record.dump(2)+"\n");
+  fs::rename(path+".partial",path);
+ }
+ std::string begin_oracle_attempt(const std::string& root) {
+  const auto attempt=std::to_string(wrapper_pid)+"-"+std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  const auto directory=root+"/comparisons/"+attempt;
+  owned_dirs({root+"/comparisons"});
+  require(fs::create_directory(directory),"oracle attempt identity already exists");
+  // Older records are retained distinctly, including pre-attempt verdicts.
+  if (present(root+"/verdict.json")) fs::copy_file(root+"/verdict.json",directory+"/previous-verdict.json");
+  const support::json record{{"status","incomplete"},{"attempt",attempt},{"native_build","pending"},
+   {"manifest_sha256",get({"sha256sum",root+"/manifest.json"}).substr(0,64)}};
+  oracle_record(directory+"/verdict.json",record);
+  oracle_record(root+"/verdict.json",record);
+  return attempt;
+ }
+ void finish_oracle_attempt(const std::string& root,const std::string& attempt) {
+  const auto directory=root+"/comparisons/"+attempt;
+  auto verdict=support::json::parse(read_text(directory+"/verdict.json"));
+  bool complete=true;
+  verdict["native_build"]=support::json::object();
+  for (const auto* target:oracle_targets) {
+   const auto path=directory+"/"+target+".json";
+   if (!present(path)) { complete=false; continue; }
+   const auto record=support::json::parse(read_text(path));
+   if (record.at("attempt")!=attempt || record.at("manifest_sha256")!=verdict.at("manifest_sha256") || record.at("status")!="passed" || record.at("required_cases")!=true) complete=false;
+   verdict["native_build"][target]=record;
+  }
+  verdict["status"]=complete?"passed_required_checks":"incomplete";
+  const auto manifest=support::json::parse(read_text(root+"/manifest.json"));
+  require(get({"sha256sum",root+"/manifest.json"}).substr(0,64)==verdict.at("manifest_sha256"),"oracle reference changed during comparison attempt");
+  verdict["sources"]=manifest.at("sources"); verdict["assets"]=manifest.at("presets");
+  verdict["measurements"]="unchanged per-family/precision gates; controlled and stock topology; autonomous trajectories and stock AMP differentials remain measurements";
+  oracle_record(directory+"/verdict.json",verdict);
+  // A superseded invocation may retain its own result but cannot overwrite a
+  // newer attempt's current status, including that attempt's cancellation.
+  if (support::json::parse(read_text(root+"/verdict.json")).at("attempt")==attempt) oracle_record(root+"/verdict.json",verdict);
+ }
+ int oracle(Args arguments, bool prepare_only = false) {
   if (first(arguments) == "--help" || first(arguments) == "-h") {
    std::cout << commands::oracle_help;
    return 0;
@@ -2278,10 +2320,23 @@ class Wrapper {
    } else
     die("unknown RF-DETR oracle option '" + option + "'");
   }
-  require(!upstream.empty() && !plus_upstream.empty() && !output.empty(), "RF-DETR oracle requires --upstream, --plus-upstream and --output");
+  // Both ordinary suites and the standalone diagnostic enter this owner.
+  // Managed source clones are admitted by the same revision/tree/clean checks
+  // as explicitly supplied checkouts.
+  acquire_mutation();
+  for (auto [kind, destination] : std::array{std::pair{"core", &upstream}, std::pair{"plus", &plus_upstream}}) {
+   if (!destination->empty()) continue;
+   const auto& pin = sources.at(kind);
+   *destination = cache + "/tests/rfdetr/sources/" + pin.at("revision").get<std::string>();
+   if (!fs::exists(*destination)) {
+    owned_dirs({parent(*destination)});
+    must({"git", "clone", "--no-checkout", pin.at("repository").get<std::string>(), *destination});
+    must({"git", "-C", *destination, "checkout", "--detach", pin.at("revision").get<std::string>()});
+   }
+  }
   upstream = existing(upstream);
   plus_upstream = existing(plus_upstream);
-  output = normalized(output);
+  if (!output.empty()) output = normalized(output);
   require(upstream.find(':') == std::string::npos && plus_upstream.find(':') == std::string::npos && output.find(':') == std::string::npos, "oracle mount paths cannot contain colons");
   Args source_mounts;
   std::string source_trees;
@@ -2302,72 +2357,214 @@ class Wrapper {
    const auto tree = source_git({"rev-parse", "HEAD^{tree}"});
    require(tree == pin.at("tree").get<std::string>(), "oracle source tree disagrees with manifest: " + kind);
    require(git_dir.find(':') == std::string::npos && common_dir.find(':') == std::string::npos, "oracle Git mount paths cannot contain colons");
-   require(!within(output, source), "oracle output must be outside read-only source checkouts");
+   require(output.empty() || !within(output, source), "oracle output must be outside read-only source checkouts");
    const auto mount = kind == "core" ? "/upstream" : "/plus-upstream";
    append(source_mounts, {"--volume", source + ":" + mount + ":ro", "--volume", git_dir + ":" + mount + "-git:ro", "--volume", common_dir + ":" + mount + "-common:ro"});
    source_trees += tree + "\n";
   }
-  require(!present(output + "/manifest.json") && !present(output + "/verdict.json") && !present(output + "/references"), "oracle output already contains evidence; choose a fresh directory");
   const auto weights = repository_cache + "/mmltk/weights";
-  if (!inventory_only) require(fs::is_regular_file(weights + "/rf-detr-nano.pth") && fs::is_regular_file(weights + "/rf-detr-seg-nano.pt"), "numerical oracle requires cached official Nano weights");
   owned_dirs({weights});
-  owned_dirs({output});
-  prepare_logging(output + "/wrapper.log");
-  acquire_mutation();
+  if (!prepare_only && !output.empty()) prepare_logging(output + "/wrapper.log");
   ensure_docker();
   cache_layout();
   nvidia_inputs();
   const auto [image_input, image] = ensure_oracle_image(revision);
-  const auto input = sha(image_input + "\n" + source_trees + "\n" + sdpa), name = container_name + "-upstream";
+  const auto name=container_name+"-upstream";
+  support::json capability;
+  if (!inventory_only) {
+   Args probe{"run","--rm","--init","--name",name+"-capability","--gpus","all","--network","none","--read-only","--user",user(),
+    "--tmpfs","/tmp:rw,exec,nosuid,nodev,size=256m","--env","HOME=/tmp","--env","NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+    "--entrypoint","/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle"};
+   labels(probe,mode); append(probe,{image,"--capabilities"});
+   const auto observed=owned_docker(name+"-capability",probe,{.capture=true});
+   require(!observed.status,"required oracle CUDA precision inspection failed");
+   capability=support::json::parse(observed.out);
+   require(capability.at("fp32")==true && capability.at("fp16")==true && capability.at("bf16").is_boolean(),"required oracle precision capability unavailable");
+  }
+  const auto input=sha(image_input+"\n"+source_trees+"\n"+sdpa+"\n"+capability.dump());
+  if (output.empty()) {
+   output = cache + "/tests/rfdetr/upstream/" + input + (inventory_only ? "-inventory" : "");
+   if (!prepare_only) prepare_logging(output + "/wrapper.log");
+  }
+  require(!within(output, upstream) && !within(output, plus_upstream), "oracle output must be outside read-only source checkouts");
+  owned_dirs({output});
   Args args{
-   "run", "--rm", "--init", "--name", name, "--gpus", "all", "--ipc", "host", "--network", inventory_only ? "bridge" : "none", "--read-only", "--user", user(), "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+   "run", "--rm", "--init", "--name", name, "--gpus", "all", "--ipc", "host", "--network", "bridge", "--read-only", "--user", user(), "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
    "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=4g", "--env", "HOME=/tmp", "--env", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
    "--env", "GIT_OPTIONAL_LOCKS=0", "--env", "HF_HOME=/tmp/huggingface", "--env", "TRITON_CACHE_DIR=/tmp/triton", "--volume",
-   weights + (inventory_only ? ":/weights:rw" : ":/weights:ro"), "--volume", output + ":/evidence:rw",
+   weights + ":/weights:rw", "--volume", output + ":/evidence:rw",
    "--workdir", "/tmp", "--entrypoint", "/usr/bin/timeout"
   };
   append(args, source_mounts);
   execution_policy(args);
   labels(args, mode);
   diagnostic_tools(args);
-  append(args, {image, "--signal=TERM", "--kill-after=15s", "7200s", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "--upstream", "/upstream", "--plus-upstream", "/plus-upstream", "--output", "/evidence", "--weights", "/weights",
+  append(args, {image, "--signal=TERM", "--kill-after=15s", "172800s", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "--upstream", "/upstream", "--plus-upstream", "/plus-upstream", "--output", "/evidence", "--weights", "/weights",
                 "--fingerprint", input, "--sdpa", sdpa});
   if (inventory_only) args.emplace_back("--inventory-only");
-  const int status = owned_docker(name, args).status;
-  release_mutation();
+  int status = 0;
+  if (present(output + "/manifest.json")) {
+   const auto retained = support::json::parse(read_text(output + "/manifest.json"));
+   require(retained.at("fingerprint") == input && retained.at("sources") == sources, "cached upstream evidence provenance changed");
+   require(retained.at("status") == (inventory_only ? "verified_inventory_complete" : "references_complete_native_comparison_pending"), "cached upstream evidence is incomplete");
+   if (!inventory_only) require(retained.at("format")=="mmltk.rfdetr.upstream-oracle.v2" && retained.at("precision_capability")==capability,"cached reference precision capability differs from current hardware");
+  } else status = owned_docker(name, args).status;
   if (status) {
+   release_mutation();
    log("upstream reference production failed (exit " + std::to_string(status) + "); evidence retained in " + output);
    return status;
   }
+  for (const auto& entry : fs::recursive_directory_iterator(output)) {
+   const auto relative = entry.path().lexically_relative(output).generic_string();
+   if (entry.is_regular_file() && (relative == "manifest.json" || relative.starts_with("references/") || relative.starts_with("inventory/") || (inventory_only && relative.starts_with("assets/"))))
+    fs::permissions(entry.path(), fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write, fs::perm_options::remove);
+  }
+  release_mutation();
   if (inventory_only) {
    log("hash-bound RF-DETR catalog inventory complete: " + output + "/manifest.json");
    return 0;
   }
-  int failure = 0;
-  for (const auto* target : {"mmltk_backend_models_rfdetr_core_tests", "mmltk_backend_models_rfdetr_training_tests"}) {
-   // Re-enter this native wrapper, with fresh ownership and transcript state.
-   const Args invocation{self, "--test", "rfdetr", "--executable", target, "--env", "MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=" + host_path(output), "--", "[upstream_oracle]", "--warn", "UnmatchedTestSpec"};
-   task([&, invocation, target] {
-    support::RunOptions options;
-    options.env["MMLTK_TEST_LOG_FILE"] = output + "/" + target + ".log";
-    support::exec(invocation, options);
-   });
-   const int comparison_status = wait_one_task();
-   if (!failure) failure = comparison_status;
+  if (prepare_only) {
+   test_environment.push_back("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=" + host_path(output));
+   return 0;
   }
+  acquire_mutation();
+  const auto attempt=begin_oracle_attempt(output);
+  release_mutation();
+  int failure=0;
+  for (const auto* target:oracle_targets) {
+   const Args invocation{self,"--test","rfdetr","--executable",target,"--env","MMLTK_RFDETR_UPSTREAM_ORACLE_DIR="+host_path(output),
+    "--env","MMLTK_RFDETR_ORACLE_ATTEMPT="+attempt,"--","[upstream_oracle]","--warn","UnmatchedTestSpec"};
+   task([&,invocation,target] {
+    support::RunOptions options;
+    options.env["MMLTK_TEST_LOG_FILE"]=output+"/comparisons/"+attempt+"/"+target+".log";
+    support::exec(invocation,options);
+   });
+   const int status=wait_one_task();
+   acquire_mutation();
+   const auto receipt_path=output+"/comparisons/"+attempt+"/"+target+".json";
+   if (present(receipt_path)) {
+    auto receipt=support::json::parse(read_text(receipt_path));
+    receipt["wrapper_exit_status"]=status;
+    if (status) receipt["status"]="failed";
+    oracle_record(receipt_path,receipt);
+   }
+   release_mutation();
+   if (!failure) failure=status;
+  }
+  acquire_mutation();
+  finish_oracle_attempt(output,attempt);
+  release_mutation();
   if (failure) {
-   log("native oracle comparison failed (exit " + std::to_string(failure) + "); reference artifacts and comparisons retained in " + output);
+   log("native oracle comparison failed (exit "+std::to_string(failure)+"); incomplete attempt retained: "+attempt);
    return failure;
   }
-  support::json verdict{
-   {"status", "passed_required_checks"}, {"evidence", "actual upstream matched-state forward/objectives and complete derivative vectors; identical-gradient AdamW; native Match-Free compilation"},
-   {"measurements", "per-tensor bounds, autonomous trajectories and stock AMP matcher differences retained; no accuracy or trajectory-equality claim"}, {"fingerprint", input},
-   {"manifest_sha256", get({"sha256sum", output + "/manifest.json"}).substr(0, 64)}
-  };
-  write_text(output + "/.verdict.partial", verdict.dump() + "\n");
-  fs::rename(output + "/.verdict.partial", output + "/verdict.json");
-  log("upstream production and required matched-state comparisons passed; trajectory differences remain measurements; " + output + "/verdict.json");
+  require(support::json::parse(read_text(output+"/comparisons/"+attempt+"/verdict.json")).at("status")=="passed_required_checks","oracle comparison attempt is incomplete");
+  log("required oracle comparisons passed for actual native executable set; attempt "+attempt);
   return 0;
+ }
+ void prepare_baseline_session() {
+  const auto pin = support::json::parse(read_text(repo + "/tools/oracle/rfdetr_sources.json")).at("baseline_application");
+  const auto revision = pin.at("revision").get<std::string>(), tree = pin.at("tree").get<std::string>();
+  acquire_mutation();
+  ensure_docker();
+  cache_layout();
+  ensure_build_image();
+  const auto identity = fingerprint({std::string(revision), std::string(tree), image_id(build_image)},
+    {"tools/oracle/rfdetr_baseline_session.cpp", "tools/oracle/rfdetr_baseline_session.cmake"});
+  const auto base = cache + "/tests/rfdetr/baseline/" + identity;
+  const auto source = base + "/source", evidence = base + "/evidence";
+  const auto container_base = "/workspace" + base.substr(repo.size());
+  const auto container_source = container_base + "/source", container_evidence = container_base + "/evidence";
+  const auto file_hash = [&](const std::string& path) { return get({"sha256sum", path}).substr(0, 64); };
+  const auto verify = [&](const support::json& record) {
+   require(record.at("format_version") == 1 && record.at("application_revision") == revision && record.at("source_tree") == tree &&
+           record.at("source_tree_clean") == true && record.at("preparation_identity") == identity, "historical fixture provenance differs");
+   require(!record.at("files").empty() && !record.at("inputs").empty(), "historical fixture evidence is incomplete");
+   std::set<std::string> paths;
+   for (const auto& file : record.at("files")) {
+    const auto path = fs::canonical(evidence + "/" + file.at("path").get<std::string>()).string();
+    require(within(path, evidence, false) && paths.insert(path).second && fs::is_regular_file(path), "historical evidence escapes retained cache or repeats a file");
+    require(fs::file_size(path) == file.at("bytes").get<std::uint64_t>() && file_hash(path) == file.at("sha256"), "historical evidence changed: " + path);
+   }
+  };
+  if (!present(evidence + "/baseline.json")) {
+   // Unpublished products have no admitted identity. Retry their production
+   // in the same isolated source/build cache without altering a published run.
+   fs::remove_all(evidence);
+   owned_dirs({base, evidence});
+   if (!present(source)) must({"git", "-C", repo, "worktree", "add", "--detach", source, std::string(revision)});
+   const auto source_git = [&](Args args) {
+    Args command{"git", "--no-optional-locks", "-c", "safe.directory=" + source, "-C", source};
+    append(command, args);
+    return get(command);
+   };
+   require(trim(source_git({"rev-parse", "HEAD"})) == revision && trim(source_git({"rev-parse", "HEAD^{tree}"})) == tree &&
+           trim(source_git({"status", "--porcelain", "--untracked-files=all"})).empty(), "historical source must be the clean pinned application");
+   // Preserve the external harness itself beside the historical executable.
+   for (const auto* name : {"rfdetr_baseline_session.cpp", "rfdetr_baseline_session.cmake"})
+    fs::copy_file(repo + "/tools/oracle/" + name, evidence + "/" + name, fs::copy_options::overwrite_existing);
+   const auto build = container_base + "/build";
+   const auto tools_build = container_base + "/tools-build";
+   const auto old_tools = container_base + "/tools";
+   const auto quoted_source = shell_quote(container_source);
+   const std::string build_command = "set -euo pipefail\nexport CCACHE_DIR=" + shell_quote(container_base + "/ccache") +
+    "\nexport CCACHE_TEMPDIR=" + shell_quote(container_base + "/ccache/tmp") +
+    "\nexport MMLTK_CONTAINER_CACHE_ROOT=" + shell_quote(container_base + "/build-cache") +
+    "\nmkdir -p \"$CCACHE_TEMPDIR\"\n{\ncmake -S " + quoted_source + "/tools -B " + shell_quote(tools_build) +
+    " -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=" + shell_quote(old_tools) +
+    "\ncmake --build " + shell_quote(tools_build) + " --parallel " + std::to_string(jobs) + " --target mmltk mmltk_tool_tests\ncmake --install " + shell_quote(tools_build) +
+    " --component Runtime\ncd " + quoted_source + "\ncmake --preset release -B " + shell_quote(build) +
+    " -DBUILD_MMLTK_BROWSER_APP=OFF -DBUILD_MMLTK_BROWSER_HOST=OFF -DBUILD_MMLTK_FIREFOX_RUNTIME=OFF -DMMLTK_NATIVE_TOOLS_EXECUTABLE=" + shell_quote(old_tools + "/mmltk") +
+    " -DMMLTK_FIREFOX_CACHE_ROOT=" + shell_quote(container_base + "/firefox") +
+    " -DCMAKE_PROJECT_INCLUDE=" + shell_quote(container_evidence + "/rfdetr_baseline_session.cmake") +
+    "\ncmake --build " + shell_quote(build) + " --parallel " + std::to_string(jobs) + " --target mmltk_rfdetr_baseline_session\n} 2>&1 | tee " + shell_quote(container_evidence + "/build.log") +
+    "\ncp " + shell_quote(build + "/mmltk_rfdetr_baseline_session") + " " + shell_quote(container_evidence + "/producer") +
+    "\ncp " + shell_quote(build + "/historical_identity_wrap.h") + " " + shell_quote(build + "/historical_identity_wrap.rsp") + " " + shell_quote(container_evidence);
+   must_toolchain(test_build_container + "-historical", build_command);
+   const std::string produce = "set -euo pipefail\nMMLTK_RFDETR_BASELINE_OUTPUT=" + shell_quote(container_evidence) + " " +
+    shell_quote(container_evidence + "/producer") + " '[historical_producer]' 2>&1 | tee " + shell_quote(container_evidence + "/producer.log");
+   must_toolchain(test_run_container + "-historical", produce, "compute,utility");
+   require(trim(source_git({"status", "--porcelain", "--untracked-files=all"})).empty(), "historical application source changed during production");
+   auto record = support::json::parse(read_text(evidence + "/historical.json"));
+   record["format_version"] = 1;
+   record["application_revision"] = revision;
+   record["source_tree"] = tree;
+   record["source_tree_clean"] = true;
+   record["preparation_identity"] = identity;
+   record["build_image"] = image_id(build_image);
+   record["build_path"] = "producer";
+   record["build_sha256"] = file_hash(evidence + "/producer");
+   record["build_transcript"] = "build.log";
+   record["producer_transcript"] = "producer.log";
+   record["harness"] = {{"source", "rfdetr_baseline_session.cpp"}, {"include", "rfdetr_baseline_session.cmake"},
+                         {"identity_declarations", "historical_identity_wrap.h"}, {"link_options", "historical_identity_wrap.rsp"}};
+   record["files"] = support::json::array();
+   record["inputs"] = support::json::array();
+   for (const auto& entry : fs::recursive_directory_iterator(evidence)) {
+    if (!entry.is_regular_file()) continue;
+    const auto relative = entry.path().lexically_relative(evidence).generic_string();
+    const auto hash = file_hash(entry.path().string());
+    record["files"].push_back({{"path", relative}, {"sha256", hash}, {"bytes", entry.file_size()}});
+    if (relative.starts_with("inputs/")) record["inputs"].push_back({{"path", relative}, {"sha256", hash}});
+   }
+   verify(record);
+   write_text(evidence + "/.baseline.partial", record.dump(2) + "\n");
+   fs::rename(evidence + "/.baseline.partial", evidence + "/baseline.json");
+  }
+  verify(support::json::parse(read_text(evidence + "/baseline.json")));
+  // No renaming of original products: session paths and dataset mtimes are
+  // identity-bearing evidence. Current continuation writes to its own root.
+  // Reapply custody after interrupted publication as well as fresh production.
+  for (const auto& entry : fs::recursive_directory_iterator(evidence)) {
+   const auto filename = entry.path().filename().string();
+   // Original session custody uses O_RDWR flock files; their empty contents
+   // remain hash-bound while current readers acquire/release ordinary leases.
+   const bool lease = filename == ".lease" || filename.starts_with(".session.");
+   if (entry.is_regular_file() && !lease) fs::permissions(entry.path(), fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write, fs::perm_options::remove);
+  }
+  test_environment.push_back("MMLTK_RFDETR_BASELINE_SESSION=" + container_evidence);
+  release_mutation();
  }
  void ensure_validation_image() {
   const auto runtime_result = docker({"image", "inspect", image_name, "--format", "{{.Id}}"}, {.capture = true});
@@ -2708,7 +2905,36 @@ cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" --parallel "${MMLTK_JOBS
   }
   require(!debugger || executables.size() == 1, "--gdb requires a suite with one executable or an explicit --executable");
   begin_test(selected);
+  if (selected == "rfdetr" || selected == "all") {
+   const auto supplied = [&](std::string_view name) { return std::ranges::any_of(test_environment, [&](const auto& value) { return value.starts_with(std::string(name) + "="); }); };
+   if (!supplied("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR")) {
+    const auto preparation = oracle({}, true);
+    if (preparation) return preparation;
+   }
+   if (!supplied("MMLTK_RFDETR_BASELINE_SESSION")) prepare_baseline_session();
+  }
   acquire_mutation();
+  std::string oracle_root,oracle_attempt;
+  bool owns_oracle_attempt=false;
+  if (selected=="rfdetr" || selected=="all") {
+   const auto value=[&](std::string_view key) {
+    for (const auto& item:test_environment) if (item.starts_with(std::string(key)+"=")) return item.substr(key.size()+1);
+    return std::string();
+   };
+   oracle_root=value("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR");
+   if (oracle_root.starts_with("/host/")) oracle_root.erase(0,5);
+   else if (oracle_root.starts_with("/workspace/")) oracle_root=repo+oracle_root.substr(10);
+   oracle_root=existing(oracle_root);
+   oracle_attempt=value("MMLTK_RFDETR_ORACLE_ATTEMPT");
+   owns_oracle_attempt=oracle_attempt.empty();
+   if (owns_oracle_attempt) {
+    oracle_attempt=begin_oracle_attempt(oracle_root);
+    test_environment.push_back("MMLTK_RFDETR_ORACLE_ATTEMPT="+oracle_attempt);
+   }
+   require(matches(oracle_attempt,"[0-9]+-[0-9]+") && present(oracle_root+"/comparisons/"+oracle_attempt+"/verdict.json"),"unadmitted oracle comparison attempt");
+   const auto attempt_record=support::json::parse(read_text(oracle_root+"/comparisons/"+oracle_attempt+"/verdict.json"));
+   require(attempt_record.at("status")=="incomplete" && attempt_record.at("manifest_sha256")==get({"sha256sum",oracle_root+"/manifest.json"}).substr(0,64),"oracle attempt was completed or its reference changed");
+  }
   ensure_docker();
   cache_layout();
   ensure_build_image();
@@ -2756,14 +2982,35 @@ cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" --parallel "${MMLTK_JOBS
   int first_failure = 0;
   for (const auto& executable_name : executables) {
    quiet_log("running " + executable_name);
+   const bool oracle_target=!oracle_attempt.empty() && std::ranges::contains(oracle_targets,executable_name);
+   support::json receipt;
+   std::string receipt_path,executable_hash;
+   const auto executable_path=cmake+"/"+test_config+"/"+executable_name;
+   if (oracle_target) {
+    require(read_text(cmake+"/"+test_config+"/CMakeCache.txt").find("BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER:BOOL=ON")!=std::string::npos,"required upstream comparison cases are disabled in the native build");
+    executable_hash=get({"sha256sum",executable_path}).substr(0,64);
+    receipt_path=oracle_root+"/comparisons/"+oracle_attempt+"/"+executable_name+".json";
+    receipt={{"attempt",oracle_attempt},{"status","incomplete"},{"manifest_sha256",get({"sha256sum",oracle_root+"/manifest.json"}).substr(0,64)},
+     {"required_cases",arguments.empty() || arguments==Args{"[upstream_oracle]","--warn","UnmatchedTestSpec"}},
+     {"arguments",arguments},{"executable",executable_name},{"sha256",executable_hash},{"build_image",image_id(build_image)},
+     {"configuration",test_config},{"cmake_cache_sha256",get({"sha256sum",cmake+"/"+test_config+"/CMakeCache.txt"}).substr(0,64)},{"compile_commands_sha256",get({"sha256sum",cmake+"/"+test_config+"/compile_commands.json"}).substr(0,64)}};
+    oracle_record(receipt_path,receipt);
+   }
    const int status = test_program(container_cache + "/cmake/" + test_config + "/" + executable_name, arguments);
+   if (oracle_target) {
+    require(get({"sha256sum",executable_path}).substr(0,64)==executable_hash,"native comparison executable changed while running");
+    receipt["status"]=status?"failed":"passed"; receipt["exit_status"]=status;
+    oracle_record(receipt_path,receipt);
+   }
    if (!status) continue;
    if (!first_failure) first_failure = status;
    if (selected != "all") {
+    if (owns_oracle_attempt) finish_oracle_attempt(oracle_root,oracle_attempt);
     release_mutation();
     return status;
    }
   }
+  if (owns_oracle_attempt) finish_oracle_attempt(oracle_root,oracle_attempt);
   release_mutation();
   if (selected == "all" && test_executable.empty() && arguments.empty()) {
    const auto browser_status = browser_tests({});

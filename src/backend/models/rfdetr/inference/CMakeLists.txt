@@ -99,6 +99,12 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         nlohmann_json)
     mmltk_target_cuda_architectures(
         mmltk_backend_models_rfdetr_inference_tests)
+    if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
+        target_link_libraries(mmltk_backend_models_rfdetr_inference_tests PRIVATE
+            mmltk_backend_models_rfdetr_checkpoint_test_support)
+    endif()
+    target_compile_definitions(mmltk_backend_models_rfdetr_inference_tests PRIVATE
+        MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER=$<IF:$<BOOL:${BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER}>,1,0>)
     mmltk_enable_native_runtime_rpath(
         mmltk_backend_models_rfdetr_inference_tests)
     catch_discover_tests(mmltk_backend_models_rfdetr_inference_tests

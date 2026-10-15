@@ -1,11 +1,17 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "checkpoint_fixture_support/upstream_oracle_fixture.h"
+#include "src/backend/models/rfdetr/core/detail/backbone.h"
+#include "src/backend/models/rfdetr/core/detail/keypoint_head.h"
+#include "src/backend/models/rfdetr/core/detail/class_tensor_axes.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/serialize.h>
+#include "src/common/io/file_digest.h"
 #include <ATen/record_function.h>
 #include <algorithm>
 #include <array>
@@ -275,39 +281,132 @@ TEST_CASE("Oracle comparison collection retains numerical failures and immediate
  REQUIRE_NOTHROW(comparison.parameter_update("rounded-update", one, next, one, one));
  REQUIRE_THROWS_AS(comparison.parameter_update("incorrect-update", one, one + 1e-4, one, one), std::runtime_error);
 }
-TEST_CASE("Actual pinned upstream Nano and SegNano forward and fixed cotangent VJPs", "[rfdetr][parity][upstream_oracle][cuda]") {
+TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or altered publication", "[rfdetr][parity][oracle_archive]") {
+ namespace support=rf::testsupport;
+ namespace io=mmltk::common::io;
+ const mmltk::testsupport::ScopedTempDir root("oracle-shards");
+ const auto reference=[&](const std::string& name) {
+  const auto path=root.path()/name;
+  return Json{{"file",name},{"sha256",io::sha256_hex(io::sha256_file(path))},{"bytes",std::filesystem::file_size(path)}};
+ };
+ const auto write=[&](const std::string& name,const Json& value) {
+  std::ofstream file(root.path()/name); file<<value.dump(); file.close();
+  return reference(name);
+ };
+ std::vector<Json> shards;
+ for (int index=0;index<2;++index) {
+  const auto name="loss/"+std::string(index==0?"z":"a");
+  c10::Dict<std::string,torch::Tensor> values;
+  values.insert(name,torch::tensor({float(index+1)}));
+  values.insert("finite/"+name,torch::ones({1},torch::kBool));
+  const auto bytes=torch::pickle_save(c10::IValue(values));
+  const auto filename=std::to_string(index)+".pt";
+  std::ofstream data(root.path()/filename,std::ios::binary); data.write(bytes.data(),bytes.size()); data.close();
+  auto shard=reference(filename);
+  shard["tensors"]={{name,{{"defined",true},{"shape",{1}},{"stride",{1}},{"dtype","torch.float32"},{"device","cuda:0"},{"finite_count",1},{"elements",1}}}};
+  if (index==0) shard["tensors"]["optional"]={{"defined",false}};
+  shards.push_back(shard);
+ }
+ const auto publish=[&] {
+  Json refs=Json::array(); std::uint64_t bytes=0;
+  for (std::size_t index=0;index<shards.size();++index) {
+   refs.push_back(write(std::to_string(index)+".json",shards[index])); bytes+=shards[index].at("bytes").get<std::uint64_t>();
+  }
+  return write("step.json",{{"format","mmltk.rfdetr.step.v2"},{"shards",refs},{"bytes",bytes},{"tensor_count",3}});
+ };
+ auto committed=publish();
+ SECTION("complete multi-shard view retains order and borrowed values") {
+  const support::OracleArchive archive(root.path(),committed);
+  CHECK((archive.ordered_defined_names("loss/")==std::vector<std::string>{"z","a"}));
+  const auto first=archive.tensor("loss/z");
+  CHECK(archive.tensor("loss/a").item<float>()==2.F);
+  CHECK(first.item<float>()==1.F);
+  CHECK_FALSE(archive.tensor("optional").defined());
+  CHECK((archive.names("loss/")==std::set<std::string>{"a","z"}));
+ }
+ SECTION("unpublished leaves do not replace authenticated completion") {
+  write("step.json.partial",{{"incomplete",true}});
+  CHECK_NOTHROW(support::OracleArchive(root.path(),committed));
+ }
+ SECTION("missing shard") { std::filesystem::remove(root.path()/"1.pt"); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("changed completed shard") { std::ofstream file(root.path()/"1.pt",std::ios::app); file<<"changed"; file.close(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("changed index") { write("0.json",{{"changed",true}}); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("escaping index") { committed["file"]="../step.json"; CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("symlinked index") { std::filesystem::create_symlink(root.path()/"step.json",root.path()/"linked.json"); committed["file"]="linked.json"; CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("duplicate JSON members") {
+  std::ofstream file(root.path()/"step.json"); file<<"{\"format\":\"mmltk.rfdetr.step.v2\",\"format\":\"mmltk.rfdetr.step.v2\"}"; file.close();
+  committed=reference("step.json"); CHECK_THROWS(support::OracleArchive(root.path(),committed));
+ }
+ SECTION("oversized index") { committed["bytes"]=32ULL*1024*1024+1; CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("duplicate tensor across shards") { shards[1]["tensors"]=shards[0]["tensors"]; committed=publish(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("false finite inventory") { shards[0]["tensors"]["loss/z"]["finite_count"]=0; committed=publish(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("invalid source stride") { shards[0]["tensors"]["loss/z"]["stride"]={-1}; committed=publish(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+ SECTION("unbounded storage") { shards[0]["bytes"]=4ULL*1024*1024*1024+1; committed=publish(); CHECK_THROWS(support::OracleArchive(root.path(),committed)); }
+}
+TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[rfdetr][parity][upstream_oracle][cuda]") {
  const auto requested = rf::testsupport::UpstreamOracle::requested();
- if (!requested) SKIP("optional upstream evidence not requested; generate with --diagnose-rfdetr-upstream for independent acceptance");
+ REQUIRE(requested);
  const rf::testsupport::UpstreamOracle oracle(*requested);
  // CLEANUP-IGNORE: CUDA availability, device scope, and precision scope are separate prerequisites; model, training, and optimizer oracles retain independent setup.
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  c10::cuda::CUDAGuard guard(0);
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  for (const auto& entry : oracle.cases()) {
-  DYNAMIC_SECTION(entry.id) {
+  for (const auto mode : rf::testsupport::oracle_execution_modes(entry)) {
+  DYNAMIC_SECTION(entry.id << " mode=" << static_cast<int>(mode)) {
    CAPTURE(entry.id);
    if (entry.dtype() == torch::kBFloat16) REQUIRE(at::cuda::getCurrentDeviceProperties()->major >= 8);
    auto model = oracle.model(entry);
+   if (mode != rf::CompilationMode::kNone) model.optimize_for_inference(entry.batch, entry.training, mode);
    const auto archive = oracle.archive(entry, 0);
-   rf::testsupport::OracleComparison comparison(*requested, "core-" + entry.id, entry.dtype(), "actual upstream forward and fixed cotangent VJP; eager native production CUDA");
+   rf::testsupport::OracleComparison comparison(*requested, "core-" + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype(), "actual upstream forward and fixed cotangent VJP; eager native production CUDA");
    comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
+   comparison.fact("case topology",{{"protocol",entry.protocol},{"groups",entry.groups}});
    auto input = archive.tensor("input", torch::kCUDA).clone().set_requires_grad(true);
    const auto mask = archive.tensor("input_mask", torch::kCUDA);
+   if (mode == rf::CompilationMode::kNone) {
+    if (model.config().task == rf::ModelTask::Keypoints) {
+     for (const auto& family : {rf::detail::kKeypointQueryAxis, rf::detail::kEncoderKeypointQueryAxis}) {
+      const auto prefix = "grouppose/" + std::string(family.module_name()) + "/";
+      rf::detail::ConditionalQueryInitializer initializer(model.config().hidden_dim, rf::KeypointTensorLayout(model.config().keypoints_per_class).compact_count(), model.config().hidden_dim / model.config().keypoint_dimension_downscale);
+      initializer.to(torch::kCUDA);
+      torch::NoGradGuard no_grad;
+      for (const auto& parameter : initializer.named_parameters()) parameter.value().copy_(model.named_parameters()[family.prefix() + parameter.key()]);
+      mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
+      comparison.compare(prefix + "output", initializer.forward(archive.tensor(prefix + "input",torch::kCUDA)), archive.tensor(prefix + "output"), ComparisonPolicy::Value);
+     }
+    }
+    rf::detail::NativeBackboneImpl backbone(model.config());
+    backbone.to(torch::kCUDA);
+    backbone.train(entry.training);
+    backbone.set_force_math_attention(entry.math_sdpa);
+    {
+     torch::NoGradGuard no_grad;
+     for (const auto& parameter : backbone.named_parameters()) parameter.value().copy_(model.named_parameters()["backbone.0." + parameter.key()]);
+     for (const auto& buffer : backbone.named_buffers()) buffer.value().copy_(model.named_buffers()["backbone.0." + buffer.key()]);
+     mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
+     const auto features = backbone.forward_features(input);
+     REQUIRE(features.size() == archive.names("backbone/").size());
+     for (std::size_t index = 0; index < features.size(); ++index)
+      comparison.compare("backbone/" + std::to_string(index), features[index], archive.tensor("backbone/" + std::to_string(index)), ComparisonPolicy::Value);
+    }
+   }
    std::vector<torch::Tensor> indices;
    rf::ModelOutputs outputs;
    {
-    ForwardOperatorObservation operators(archive.contains("forward-operator/linear/0"));
+    ForwardOperatorObservation operators(mode == rf::CompilationMode::kNone && archive.contains("forward-operator/linear/0"));
     mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
     comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
-    outputs = model.forward_observed({input, mask}, model.config().has_masks(), indices);
-    operators.report(comparison, archive);
+    outputs = mode == rf::CompilationMode::kNone ? model.forward_observed({input, mask}, model.config().has_masks(), indices) : model.forward({input, mask}, model.config().has_masks());
+    if (mode == rf::CompilationMode::kNone) operators.report(comparison, archive);
    }
-   comparison.fact("execution", {{"mode", "eager"}, {"input", "identical admitted normalized tensor"}, {"training", entry.training}});
+   comparison.fact("execution", {{"mode", static_cast<int>(mode)}, {"input", "identical admitted normalized tensor"}, {"training", entry.training}});
    comparison.compare_all([&] {
-    rf::testsupport::compare_oracle_outputs(comparison, archive, outputs, indices);
+    rf::testsupport::compare_oracle_outputs(comparison, archive, outputs, indices, "", mode == rf::CompilationMode::kNone);
     rf::testsupport::compare_oracle_vjp(comparison, archive, model, outputs, input, false);
    });
   }
+ }
  }
 }
 TEST_CASE("Independent upstream repetitions measure the numerical noise floor", "[rfdetr][parity][upstream_repeat]") {
@@ -345,7 +444,7 @@ TEST_CASE("Independent upstream repetitions measure the numerical noise floor", 
 TEST_CASE("Explicit RGB resampling matches actual upstream tensor resize and records PIL differences", "[rfdetr][parity][upstream_oracle][torch_resize]") {
  namespace resize = mmltk::backend::imaging::resample;
  const auto requested = rf::testsupport::UpstreamOracle::requested();
- if (!requested) SKIP("optional upstream evidence not requested; generate with --diagnose-rfdetr-upstream for independent resize acceptance");
+ REQUIRE(requested);
  const rf::testsupport::UpstreamOracle oracle(*requested);
  const auto archive = oracle.resize_archive();
  rf::testsupport::OracleComparison comparison(*requested, "rgb-resampling", torch::kFloat32, "actual torchvision float RGB bilinear align_corners=false; PIL RGB8 dataset path recorded separately");

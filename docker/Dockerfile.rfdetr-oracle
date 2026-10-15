@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ninja-build mol
 COPY tools /tmp/native-tools/tools
 COPY src/frameworks/reflection /tmp/native-tools/src/frameworks/reflection
 COPY src/backend/models/rfdetr/contract /tmp/native-tools/src/backend/models/rfdetr/contract
+COPY src/backend/models/contract/capabilities.h /tmp/native-tools/src/backend/models/contract/capabilities.h
+COPY src/common/types/string_utils.h /tmp/native-tools/src/common/types/string_utils.h
 COPY src/backend/data/catalog /tmp/native-tools/src/backend/data/catalog
 COPY third_party/json/include /tmp/native-tools/third_party/json/include
 RUN cmake -S /tmp/native-tools/tools -B /tmp/oracle-build -G Ninja \

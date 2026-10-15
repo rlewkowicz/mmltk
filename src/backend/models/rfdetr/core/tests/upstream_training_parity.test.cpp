@@ -1,5 +1,7 @@
 #include "src/backend/models/rfdetr/core/tests/training_fixture.h"
+#if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/upstream_oracle_fixture.h"
+#endif
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/models/rfdetr/core/detail/training_supervision.h"
@@ -22,6 +24,9 @@
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
 #include "src/backend/models/rfdetr/core/detail/detr_matcher_cuda.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
+#include "src/backend/models/rfdetr/core/detail/keypoint_ops.h"
+#include "src/backend/models/rfdetr/core/detail/keypoint_head.h"
+#include "src/backend/models/rfdetr/core/evaluation.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/numa_topology.h"
 #include <limits>
@@ -1464,3 +1469,76 @@ TEST_CASE("DN masks use stock direct equations for fixed samples gradients and u
     }
  }
 }
+
+#if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
+TEST_CASE("Pinned upstream GroupPose schema losses initializer and OKS boundaries", "[rfdetr][keypoints][upstream_oracle]") {
+ namespace support = rf::testsupport;
+ using Policy = support::OracleComparisonPolicy;
+ const auto requested = support::UpstreamOracle::requested();
+ REQUIRE(requested);
+ const support::UpstreamOracle oracle(*requested);
+ const auto archive = oracle.keypoint_archive();
+ support::OracleComparison comparison(*requested, "keypoint-boundaries", torch::kFloat32, "actual pinned GroupPose and COCO evaluator boundaries");
+ for (const auto& item : oracle.keypoint_cases()) {
+  const auto id = item.at("id").get<std::string>();
+  const auto counts = item.at("counts").get<std::vector<std::uint16_t>>();
+  const rf::KeypointTensorLayout layout(counts);
+  comparison.compare(id + "/active", layout.active_mask(), archive.tensor(id + "/active"), Policy::Exact);
+  comparison.compare(id + "/class_mask", layout.class_mask(), archive.tensor(id + "/class_mask"), Policy::Exact);
+  const auto padded = layout.pad(archive.tensor(id + "/compact"));
+  comparison.compare(id + "/padded", padded, archive.tensor(id + "/padded"), Policy::Exact);
+  comparison.compare(id + "/class_logits", layout.class_logits(padded, layout.active_mask(), counts.size()), archive.tensor(id + "/class_logits"), Policy::Value);
+  for (const int n : {0, 2}) {
+   const auto prefix = id + "/targets-" + std::to_string(n) + "/";
+   auto predictions = archive.tensor(prefix + "predictions").clone().set_requires_grad(true);
+   const auto targets = archive.tensor(prefix + "targets"), labels = archive.tensor(prefix + "labels"), areas = archive.tensor(prefix + "areas");
+   const auto losses = rf::keypoint_losses(predictions, targets, labels, areas, layout);
+   const auto costs = rf::keypoint_matching_cost(predictions.unsqueeze(0), targets, labels, areas, layout);
+   auto total = predictions.sum() * 0;
+   std::size_t index = 0;
+   template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^rf::KeypointLossTerms, std::meta::access_context::current()))) {
+    const auto suffix = std::to_string(index++);
+    comparison.compare(prefix + "loss/" + suffix, losses.[:member:], archive.tensor(prefix + "loss/" + suffix), Policy::Value);
+    comparison.compare(prefix + "cost/" + suffix, costs.[:member:], archive.tensor(prefix + "cost/" + suffix), Policy::Value);
+    total = total + losses.[:member:].sum();
+   }
+   total.backward();
+   comparison.compare(prefix + "gradient", predictions.grad(), archive.tensor(prefix + "gradient"), Policy::Derivative);
+  }
+ }
+ rf::detail::ConditionalQueryInitializer initializer(16,5,8);
+ {
+  torch::NoGradGuard guard;
+  for (const auto& parameter : initializer.named_parameters()) parameter.value().copy_(archive.tensor("initializer/parameter/" + parameter.key()));
+ }
+ auto input = archive.tensor("initializer/input").clone().set_requires_grad(true);
+ const auto output = initializer.forward(input);
+ comparison.compare("initializer/output", output, archive.tensor("initializer/output"), Policy::Value);
+ output.square().sum().backward();
+ comparison.compare("initializer/input_gradient", input.grad(), archive.tensor("initializer/input_gradient"), Policy::Derivative);
+ rf::TensorMap actual, expected;
+ for (const auto& parameter : initializer.named_parameters()) {
+  actual.emplace(parameter.key(), parameter.value().grad());
+  expected.emplace(parameter.key(), archive.tensor("initializer/gradient/" + parameter.key()));
+ }
+ comparison.derivatives("initializer/gradient/", actual, expected);
+ namespace data = mmltk::backend::data;
+ for (const auto visibility : {data::catalog::KeypointVisibility::Unannotated, data::catalog::KeypointVisibility::Occluded, data::catalog::KeypointVisibility::Visible}) {
+  std::array<data::PackedKeypoint,3> targets{};
+  std::array<rf::KeypointPrediction,3> predictions{};
+  for (std::size_t joint=0; joint<3; ++joint) {
+   targets[joint].x=20+3*joint; targets[joint].y=30+joint; targets[joint].visibility=visibility;
+   predictions[joint].x=21+3*joint; predictions[joint].y=32+joint;
+  }
+  const rf::KeypointPredictionView view{reinterpret_cast<const float*>(predictions.data()), 3 * static_cast<std::ptrdiff_t>(rf::KeypointPredictionPacket::size), 3};
+  const auto oks = rf::keypoint_oks(view,0,targets,std::array<double,3>{.05,.08,.1},{10,10,60,70},3000,{1,1});
+  comparison.compare("oks/" + std::to_string(static_cast<int>(visibility)), torch::tensor({{oks}},torch::kFloat64), archive.tensor("oks/" + std::to_string(static_cast<int>(visibility))), Policy::Value);
+ }
+ const auto precision=archive.tensor("covariance/input").reshape({3});
+ rf::PredictedKeypoint point;
+ std::copy_n(precision.data_ptr<float>(),3,point.precision_cholesky.begin());
+ const auto covariance=rf::keypoint_covariance(rf::map_prediction_keypoint(point,400,200));
+ comparison.compare("covariance/pixels",torch::tensor({covariance[0],covariance[1],covariance[1],covariance[2]}).reshape({1,1,2,2}),archive.tensor("covariance/output"),Policy::Value);
+}
+
+#endif

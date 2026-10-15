@@ -14,5 +14,9 @@
     "package": "rfdetr_plus",
     "license": "PML-1.0"
   },
+  "baseline_application": {
+    "revision": "1c13fec8b04036661a4028b8807d0e1cff42407d",
+    "tree": "ab06f768a4ad225f0d3fdd0985ea414b726402df"
+  },
   "timm": "1.0.27"
 }

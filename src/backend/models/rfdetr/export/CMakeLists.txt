@@ -152,6 +152,14 @@ function(mmltk_add_backend_models_rfdetr_export_tests)
         mmltk::backend::models::rfdetr::export
         mmltk::vendor::onnxruntime
         mmltk::backend::ml::torch_dependencies)
+    if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
+        target_link_libraries(mmltk_backend_models_rfdetr_export_tests PRIVATE
+            mmltk_backend_models_rfdetr_checkpoint_test_support
+            mmltk_backend_models_rfdetr_training_fixture
+            mmltk::backend::models::rfdetr::training)
+    endif()
+    target_compile_definitions(mmltk_backend_models_rfdetr_export_tests PRIVATE
+        MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER=$<IF:$<BOOL:${BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER}>,1,0>)
     mmltk_prefer_system_protobuf_headers(
         mmltk_backend_models_rfdetr_export_tests PRIVATE)
     mmltk_enable_native_runtime_rpath(

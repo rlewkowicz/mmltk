@@ -22,7 +22,7 @@ pub(crate) enum Stage {
     LivePage(u8), StartLive(u8), LiveFrame(u8), StopLive(u8), StoppedLive(u8), EnableAnalysis, AnalysisEnabled,
     ThresholdPage(bool), ThresholdEdit(bool), ThresholdReady(bool),
     Mutate(u32), AwaitMutation(u32), MutationReady(u32), FailedStart, Failed,
-    ModelPage, SelectPe, PeSelected, PeSource, PeSourceReady, PreparePe, PePrepared, StartPe, PeRunning, PePixels,
+    ModelPage, SelectPe, PeSelected, PeSource, PeSourceReady, PreparePe, PePrepared, StartPe, PeRunning, PePixels, NextCatalog,
     PosePage, SelectPose, PoseSelected, CompilePose, PoseCompiled, PreparePose, PosePrepared, PoseEpochs, PoseEpochsReady, PoseOutput, PoseOutputReady, StartPose, PoseTraining,
     LiveDerivedPage, UpscaleLive, UpscaledLive, ClearImported, ClearedImported, RestoreImported, RestoredImported,
     IncompatiblePage, SelectIncompatible, IncompatibleSelected, RefuseStart, Refused,
@@ -46,6 +46,7 @@ pub(super) struct State {
     oks_bounds: Option<Rectangle>,
     live_revision: u64,
     model_row: usize,
+    catalog_prediction_index: usize,
     gallery_tile: Option<Rectangle>,
     analyzed_joint: Option<(f32, f32)>,
     catalog_selection: Option<ModelSelection>,
@@ -73,6 +74,12 @@ fn same_scene(left: &AnnotationSceneContent, right: &AnnotationSceneContent) -> 
 fn schema_scene(scene: &AnnotationSceneContent) -> bool {
     scene.keypointschemas.iter().any(|schema| schema.names.len() == 17)
         && scene.objects.iter().any(|object| object.skeletonnodes.len() == 17 && object.skeletonedges.len() > 8)
+}
+fn catalog_prediction_rows() -> impl Iterator<Item = usize> {
+    // Preserve the existing zero-decoder PE pixel case first, then exercise
+    // every other detector/segmenter. The keypoint row owns real training below.
+    let first = RFDETR_PRESET_CATALOG.iter().position(|row| row.backbone.kind == BackboneKind::PeCoreTiny && row.decoderlayercount == 0).unwrap();
+    std::iter::once(first).chain(RFDETR_PRESET_CATALOG.iter().enumerate().filter_map(move |(index, row)| (index != first && row.task != ModelTask::Keypoints).then_some(index)))
 }
 impl State {
     pub(super) fn advance(&mut self, widgets: &mut widget_ops::RevealState, driver: &mut Driver, stage: Stage, model: &ApplicationModel, settings: &SettingsModel, active: FeatureId, requested: Option<Surface>) -> Task<RootMessage> {
@@ -271,14 +278,14 @@ impl State {
             Stage::PosePage => control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Train)),
             Stage::SelectPe | Stage::SelectPose if active == if stage == Stage::SelectPe { FeatureId::Predict } else { FeatureId::Train } => {
                 if RFDETR_PRESET_CATALOG.len() != 16 { driver.fail("Model selector omitted a canonical model"); return Task::none(); }
-                self.model_row = RFDETR_PRESET_CATALOG.iter().position(|preset| if stage == Stage::SelectPe {preset.backbone.kind == BackboneKind::PeCoreTiny} else {preset.task == ModelTask::Keypoints}).unwrap();
+                self.model_row = if stage == Stage::SelectPe { catalog_prediction_rows().nth(self.catalog_prediction_index).unwrap() } else { RFDETR_PRESET_CATALOG.iter().position(|preset| preset.task == ModelTask::Keypoints).unwrap() };
                 control(widgets, driver, if stage == Stage::SelectPe { "predict.model.presets" } else { "train.model.presets" })
             }
             Stage::PeSelected | Stage::PoseSelected if settled && settings.draft.as_ref().is_some_and(|value| {
                 let (name, source) = if stage == Stage::PeSelected { (&value.workflows.predict.request.presetname, value.workflows.predict.modelsource) } else { (&value.workflows.train.request.presetname, value.workflows.train.modelsource) };
                 name == RFDETR_PRESET_CATALOG[self.model_row].presetname.as_ref() && source == ModelSelectionSource::Canonical
             }) => {
-                completed(if stage == Stage::PeSelected {"model-pe-selection"} else {"model-keypoint-selection"}, [self.model_row as f64, RFDETR_PRESET_CATALOG.len() as f64, 0.0, 0.0]);
+                completed(if stage != Stage::PeSelected {"model-keypoint-selection"} else if self.catalog_prediction_index == 0 {"model-pe-selection"} else {"model-catalog-selection"}, [self.model_row as f64, RFDETR_PRESET_CATALOG.len() as f64, 0.0, 0.0]);
                 phase(driver, if stage == Stage::PeSelected {Stage::PeSource} else {Stage::CompilePose})
             }
             Stage::PeSource => control(widgets, driver, "predict.source.image"),
@@ -297,17 +304,24 @@ impl State {
                 let value = model.predict_snapshot.as_ref().unwrap();
                 if !self.catalog_selection_current(model) || value.execution.operationgeneration != value.operation.generationfrontier || value.execution.admittedcapacity == 0
                     || self.catalog_frame.as_ref() == Some(&value.frame) || value.frame.extent.width == 0 {
-                    driver.fail("PE completion is not the prepared catalog operation and new native product"); return Task::none();
+                    driver.fail("Catalog completion is not the prepared operation and new native product"); return Task::none();
                 }
-                self.report_catalog("completed", value.operation.generationfrontier);
-                completed("catalog-pe-predict", [self.model_generation as f64, value.operation.generationfrontier as f64, value.execution.admittedcapacity as f64, self.model_row as f64]);
                 phase(driver, Stage::PePixels)
             }
             Stage::PePixels => {
                 let Some((display, content)) = requested.and_then(surface::drawable_prediction) else { return Task::none(); };
                 if model.predict_snapshot.as_ref().is_none_or(|value| value.frame != *content.frame()) { return Task::none(); }
+                if probe::current_receipt("workflow.visual.workspace").is_none_or(|value| value.surface.frame != display.frame) { return Task::none(); }
+                let value = model.predict_snapshot.as_ref().unwrap();
+                self.report_catalog("completed", value.operation.generationfrontier);
+                completed(if self.catalog_prediction_index == 0 {"catalog-pe-predict"} else {"catalog-predict"}, [self.model_generation as f64, value.operation.generationfrontier as f64, value.execution.admittedcapacity as f64, self.model_row as f64]);
+                if self.catalog_prediction_index != 0 { return phase(driver, Stage::NextCatalog); }
                 self.patches.clear();
-                self.begin_pixels(driver, display, "workflow.visual.workspace", "catalog-pe-image", false, Stage::PosePage)
+                self.begin_pixels(driver, display, "workflow.visual.workspace", "catalog-pe-image", false, Stage::NextCatalog)
+            }
+            Stage::NextCatalog => {
+                self.catalog_prediction_index += 1;
+                phase(driver, if catalog_prediction_rows().nth(self.catalog_prediction_index).is_some() { Stage::SelectPe } else { Stage::PosePage })
             }
             Stage::PreparePose => control(widgets, driver, "train.model.action"),
             Stage::PosePrepared if prepared(FeatureId::Train) => {
@@ -538,6 +552,42 @@ impl State {
             }
             ProbeOutcome::Invalidated if attempt < 8 => driver.phase = Phase::Workflows(Step::Keypoints(Stage::Pixels(attempt + 1))),
             _ => driver.fail("Completed Keypoint canvas did not contain its native joint pixels"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod catalog_cases {
+    use super::*;
+
+    #[test]
+    fn ordinary_workflow_exercises_each_generated_catalog_row_once() {
+        let rows: Vec<_> = catalog_prediction_rows().collect();
+        let first = &RFDETR_PRESET_CATALOG[rows[0]];
+        assert_eq!(first.backbone.kind, BackboneKind::PeCoreTiny);
+        assert_eq!(first.decoderlayercount, 0);
+        let mut executions = rows;
+        executions.extend(RFDETR_PRESET_CATALOG.iter().enumerate().filter_map(|(index, row)| (row.task == ModelTask::Keypoints).then_some(index)));
+        executions.sort_unstable();
+        assert_eq!(executions, (0..RFDETR_PRESET_CATALOG.len()).collect::<Vec<_>>());
+        assert_eq!(executions.len(), 16);
+    }
+
+    #[test]
+    fn each_catalog_model_uses_the_ordinary_selector_on_every_model_workflow() {
+        use crate::view::workflow::model_card;
+        for workflow in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
+            let mut component = model_card::Component::new(workflow);
+            let mut settings = crate::view::settings::installed_settings_model();
+            for (index, row) in RFDETR_PRESET_CATALOG.iter().enumerate() {
+                assert!(matches!(component.update(model_card::Message::PresetSelected(index), None, &mut settings).unwrap(), Some(model_card::Outcome::SettingsEdited(_))));
+                let selected = crate::view_model::model_settings_projection(settings.draft.as_ref().unwrap(), workflow).unwrap();
+                assert_eq!(selected.selection.key.preset, row.presetname.as_ref());
+                assert_eq!(selected.selection.key.resolution, row.resolution);
+                assert_eq!(selected.selection.key.source, ModelSelectionSource::Canonical);
+                assert_eq!(selected.selection.key.input, ModelArtifactInputKind::Weights);
+                assert!(selected.selection.key.classlayoutpath.is_empty());
+            }
         }
     }
 }
