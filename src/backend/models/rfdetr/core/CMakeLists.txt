@@ -165,6 +165,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_core
         mmltk::common::io
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::backend::ml::torch_archive_cbor
         mmltk::backend::imaging::primitives
         mmltk::backend::imaging::raster
         mmltk::backend::models::rfdetr::augmentation

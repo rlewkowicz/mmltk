@@ -108,6 +108,21 @@ target_link_libraries(mmltk_backend_ml_torch
         mmltk::backend::ml::torch_dependencies
 )
 
+add_library(mmltk_backend_ml_torch_archive_cbor STATIC)
+add_library(mmltk::backend::ml::torch_archive_cbor
+    ALIAS mmltk_backend_ml_torch_archive_cbor)
+mmltk_configure_component(
+    mmltk_backend_ml_torch_archive_cbor PUBLIC_DECLARATIONS)
+mmltk_register_public_headers(mmltk_backend_ml_torch_archive_cbor
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES archive_cbor.h)
+mmltk_register_ordinary_sources(mmltk_backend_ml_torch_archive_cbor
+    archive_cbor.cpp)
+target_link_libraries(mmltk_backend_ml_torch_archive_cbor PUBLIC
+    mmltk::backend::ml::torch_dependencies
+    mmltk::frameworks::serialization)
+mmltk_register_header_isolation(mmltk_backend_ml_torch_archive_cbor)
+
 function(mmltk_enable_torch target visibility)
     target_link_libraries("${target}" "${visibility}"
         mmltk::backend::ml::torch)

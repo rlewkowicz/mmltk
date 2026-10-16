@@ -17,6 +17,9 @@
 #include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/frameworks/serialization/reflected_cbor.h"
+#include <catch2/matchers/catch_matchers.hpp>
+#include <limits>
 namespace rfdetr = mmltk::backend::models::rfdetr;
 TEST_CASE("external pretrained import retains filename and path preset resolution", "[model][rfdetr][checkpoint_resolution]") {
  const auto* upstream = rfdetr::infer_model_preset_from_path("/tmp/rf-detr-nano.pth");
@@ -161,21 +164,56 @@ TEST_CASE("native encoder lineage survives archive normalization and ordinary ar
  CHECK_FALSE(inspected.resumable);
  const auto normalized = r::normalize_checkpoint_to_native(source, root.path() / "normalized.pt", {});
  CHECK(normalized.metadata.encoder_pretraining == state.metadata.encoder_pretraining);
+ constexpr auto capacity = mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<r::EncoderPretrainingProvenance>();
+ {
+  torch::Tensor original;
+  decoded.admitted_archive()->read("encoder_pretraining_cbor", original);
+  auto strided = r::testsupport::strided_checkpoint_bytes(original);
+  REQUIRE_FALSE(strided.is_contiguous());
+  torch::serialize::OutputArchive output;
+  r::testsupport::copy_checkpoint_archive(*decoded.admitted_archive(), output, "encoder_pretraining_cbor");
+  output.write("encoder_pretraining_cbor", strided);
+  const auto path = root.path() / "strided.pt";
+  output.save_to(path.string());
+  const auto restored = r::decode_native_model_state(path);
+  restored.admitted_archive()->read("encoder_pretraining_cbor", original);
+  REQUIRE_FALSE(original.is_contiguous());
+  CHECK(restored.metadata.encoder_pretraining == state.metadata.encoder_pretraining);
+ }
+ {
+  auto maximum = state.metadata.encoder_pretraining;
+  maximum->asset_id.assign(mmltk::frameworks::reflection::kMaximumNameBytes, 'a');
+  maximum->adaptation_revision = std::numeric_limits<std::uint32_t>::max();
+  const auto original = state.metadata.encoder_pretraining;
+  state.metadata.encoder_pretraining = maximum;
+  const auto path = root.path() / "maximum.pt";
+  r::save_native_checkpoint(path, state);
+  const auto restored = r::decode_native_model_state(path);
+  torch::Tensor tensor;
+  restored.admitted_archive()->read("encoder_pretraining_cbor", tensor);
+  CHECK(static_cast<std::size_t>(tensor.numel()) == capacity);
+  CHECK(restored.metadata.encoder_pretraining == maximum);
+  state.metadata.encoder_pretraining = original;
+ }
  auto invalid = state.metadata.encoder_pretraining;
  invalid->sha256 = std::string(64, 'Z');
  state.metadata.encoder_pretraining = invalid;
  REQUIRE_THROWS(r::save_native_checkpoint(root.path() / "invalid.pt", state));
  // Present malformed data cannot become a missing optional record.
- for (int kind = 0; kind < 4; ++kind) {
+ for (int kind = 0; kind < 6; ++kind) {
+  CAPTURE(kind);
   torch::serialize::OutputArchive output;
   r::testsupport::copy_checkpoint_archive(*decoded.admitted_archive(), output, "encoder_pretraining_cbor");
   if (kind == 0) output.write("encoder_pretraining_cbor", c10::IValue("bad"));
   if (kind == 1) output.write("encoder_pretraining_cbor", torch::zeros({2, 2}, torch::kUInt8));
-  if (kind == 2) output.write("encoder_pretraining_cbor", torch::zeros({65536}, torch::kUInt8));
-  if (kind == 3) output.write("encoder_pretraining_cbor", torch::zeros({4}, torch::kUInt8));
+  if (kind == 2) output.write("encoder_pretraining_cbor", torch::zeros({static_cast<int64_t>(capacity + 1)}, torch::kUInt8));
+  if (kind == 3) output.write("encoder_pretraining_cbor", torch::zeros({static_cast<int64_t>(capacity)}, torch::kUInt8));
+  if (kind == 4) output.write("encoder_pretraining_cbor", torch::empty({0}, torch::kUInt8));
+  if (kind == 5) output.write("encoder_pretraining_cbor", torch::zeros({1}, torch::kInt64));
   const auto path = root.path() / ("malformed-" + std::to_string(kind) + ".pt");
   output.save_to(path.string());
-  REQUIRE_THROWS(r::decode_native_model_state(path));
+  REQUIRE_THROWS_WITH(r::decode_native_model_state(path),
+   kind == 0 ? "invalid encoder pretraining CBOR metadata" : kind == 3 ? "invalid encoder pretraining provenance" : "invalid encoder pretraining CBOR extent");
  }
  state.metadata.encoder_pretraining.reset();
  r::save_native_checkpoint(root.path() / "legacy.pt", state);

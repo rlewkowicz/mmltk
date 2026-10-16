@@ -9,6 +9,7 @@
 #include <caffe2/serialize/inline_container.h>
 #include <charconv>
 #include "src/backend/ml/torch/archive.h"
+#include "src/backend/ml/torch/archive_cbor.h"
 #include "detail/class_tensor_axes.h"
 #include "keypoint_layout.h"
 #include "src/frameworks/serialization/json_wire.h"
@@ -353,16 +354,10 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  c10::IValue provenance;
  if (archive.try_read("encoder_pretraining_cbor", provenance)) {
   if (!provenance.isTensor()) throw std::runtime_error("invalid encoder pretraining CBOR metadata");
-  auto tensor = provenance.toTensor();
-  namespace serial = mmltk::frameworks::serialization;
-  constexpr auto capacity = serial::reflected_maximum_cbor_bytes<EncoderPretrainingProvenance>();
-  if (!tensor.defined() || !tensor.is_cpu() || tensor.scalar_type() != torch::kUInt8 || tensor.dim() != 1 || tensor.numel() <= 0 || static_cast<std::uint64_t>(tensor.numel()) > capacity)
-   throw std::runtime_error("invalid encoder pretraining CBOR extent");
-  tensor = tensor.contiguous();
-  const auto bytes = std::span(reinterpret_cast<const std::byte*>(tensor.const_data_ptr()), static_cast<std::size_t>(tensor.numel()));
-  auto decoded = serial::decode<EncoderPretrainingProvenance>({bytes, {}}, {.max_bytes = capacity, .max_items = 32, .max_depth = 4});
-  if (!decoded || !encoder_pretraining_provenance_valid(*decoded)) throw std::runtime_error("invalid encoder pretraining provenance");
-  metadata.encoder_pretraining = std::move(*decoded);
+  auto decoded = mmltk::backend::ml::serialization::read_cbor_record<EncoderPretrainingProvenance>(
+   provenance.toTensor(), {.max_items = 32, .max_depth = 4}, "invalid encoder pretraining CBOR extent", "invalid encoder pretraining provenance");
+  if (!encoder_pretraining_provenance_valid(decoded)) throw std::runtime_error("invalid encoder pretraining provenance");
+  metadata.encoder_pretraining = std::move(decoded);
  }
  metadata.num_classes = mmltk::backend::ml::serialization::read_optional_value<int64_t>(archive, "num_classes").value_or(0);
  metadata.num_queries = mmltk::backend::ml::serialization::require_int(archive, "num_queries");

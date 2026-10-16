@@ -23,6 +23,7 @@
 #include <vector>
 #include <utility>
 #include "src/backend/ml/torch/archive.h"
+#include "src/backend/ml/torch/archive_cbor.h"
 #include "detail/checkpoint_private.h"
 #include "detail/model_ema.h"
 #include "detail/training_continuation.h"
@@ -218,6 +219,89 @@ void test_ordered_cpu_ema_admission() {
 TEST_CASE("test_current_continuation_required_fields", "[model][rfdetr][training][continuation]") { test_current_continuation_required_fields(); }
 TEST_CASE("test_current_continuation_scalar_boundaries", "[model][rfdetr][training][continuation]") { test_current_continuation_scalar_boundaries(); }
 TEST_CASE("test_ordered_cpu_ema_admission", "[model][rfdetr][training][continuation][ema]") { test_ordered_cpu_ema_admission(); }
+TEST_CASE("continuation CBOR adapter enforces exact byte item and depth budgets", "[model][rfdetr][training][continuation]") {
+ namespace archive = mmltk::backend::ml::serialization;
+ using Record = r::TrainingEpochPolicyState;
+ const Record value{true, false};
+ // One map, two keys and two bool values; both fields have fixed byte size.
+ constexpr archive::CborArchiveBudget budget{.max_items = 5, .max_depth = 1};
+ torch::serialize::OutputArchive output;
+ archive::write_cbor_record(output, "epoch_policy", value, budget, "encode");
+ auto input = r::testsupport::checkpoint_input(output);
+ auto tensor = archive::require_tensor(input, "epoch_policy");
+ constexpr auto capacity = mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<Record>();
+ REQUIRE(static_cast<std::size_t>(tensor.numel()) == capacity);
+ CHECK(archive::read_cbor_record<Record>(tensor, budget, "extent", "decode") == value);
+ for (const auto limit : {archive::CborArchiveBudget{4, 1}, archive::CborArchiveBudget{5, 0}}) {
+  torch::serialize::OutputArchive rejected;
+  REQUIRE_THROWS_WITH(archive::write_cbor_record(rejected, "epoch_policy", value, limit, "encode"), "encode");
+  REQUIRE_THROWS_WITH(archive::read_cbor_record<Record>(tensor, limit, "extent", "decode"), "decode");
+ }
+ for (const auto& invalid : {torch::Tensor{}, tensor.to(torch::kInt32), tensor.unsqueeze(0), torch::empty({0}, torch::kUInt8), torch::zeros({}, torch::kUInt8),
+       torch::zeros({static_cast<int64_t>(capacity + 1)}, torch::kUInt8)}) {
+  REQUIRE_THROWS_WITH(archive::read_cbor_record<Record>(invalid, budget, "extent", "decode"), "extent");
+ }
+ REQUIRE_THROWS_WITH(archive::read_cbor_record<Record>(torch::zeros_like(tensor), budget, "extent", "decode"), "decode");
+ // The admitted tensor retains the normalized allocation after the
+ // noncontiguous backing leaves scope.
+ auto retained = [&] {
+  auto strided = r::testsupport::strided_checkpoint_bytes(tensor);
+  REQUIRE_FALSE(strided.is_contiguous());
+  REQUIRE_THROWS_WITH(archive::read_cbor_record<Record>(strided, budget, "extent", "decode", {.require_contiguous = true}), "extent");
+  return archive::admit_cbor_tensor<Record>(strided, "extent");
+ }();
+ CHECK(retained.is_contiguous());
+ CHECK(archive::read_cbor_record<Record>(retained, budget, "extent", "decode") == value);
+}
+TEST_CASE("saved requests normalize strided bytes while nested continuation records require contiguous storage", "[model][rfdetr][training][continuation]") {
+ auto request = saved_request();
+ request.train_compiled_path = "training//fixture.bin";
+ auto source = continuation_fixture(request);
+ const auto expected = r::detail::read_training_continuation(source);
+ REQUIRE(expected);
+ CHECK(expected->configuration.train_compiled_path.native() == "training/fixture.bin");
+ for (const auto* key : {"training_configuration_cbor", "schedule", "epoch_policy", "data", "epoch_metrics", "execution"}) {
+  INFO(key);
+  const auto original = mmltk::backend::ml::serialization::require_tensor(source, key);
+  auto strided = r::testsupport::strided_checkpoint_bytes(original);
+  auto input = corrupted_continuation(key, strided);
+  REQUIRE_FALSE(mmltk::backend::ml::serialization::require_tensor(input, key).is_contiguous());
+  if (std::string_view(key) == "training_configuration_cbor") {
+   const auto restored = r::detail::read_training_continuation(input);
+   REQUIRE(restored);
+   CHECK(restored->configuration == expected->configuration);
+  } else {
+   REQUIRE_THROWS_WITH(r::detail::read_training_continuation(input), "invalid continuation structure");
+   auto empty = corrupted_continuation(key, torch::empty({0}, torch::kUInt8));
+   REQUIRE_THROWS_WITH(r::detail::read_training_continuation(empty), "invalid continuation values");
+  }
+ }
+ constexpr auto capacity = mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<r::TrainRequest>();
+ for (const auto& invalid : {torch::empty({0}, torch::kUInt8), torch::zeros({1, 1}, torch::kUInt8), torch::zeros({1}, torch::kFloat32),
+       torch::zeros({static_cast<int64_t>(capacity + 1)}, torch::kUInt8)}) {
+  auto input = corrupted_continuation("training_configuration_cbor", invalid);
+  REQUIRE_THROWS_WITH(r::detail::read_training_configuration(input), "invalid checkpoint training configuration");
+ }
+ auto malformed = corrupted_continuation("training_configuration_cbor", torch::full({1}, 255, torch::kUInt8));
+ REQUIRE_THROWS(r::detail::read_training_configuration(malformed));
+}
+TEST_CASE("checkpoint CBOR readers reject device tensors before decoding", "[model][rfdetr][training][continuation][gpu]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; checkpoint device admission unexecuted");
+ auto request = saved_request();
+ request.training_supervision.denoising.enabled = true;
+ auto source = continuation_fixture(request);
+ for (const auto* key : {"training_configuration_cbor", "epoch_policy", "training_supervision_config_cbor"}) {
+  INFO(key);
+  torch::serialize::OutputArchive output;
+  r::testsupport::copy_checkpoint_archive(source, output, key);
+  output.write(key, mmltk::backend::ml::serialization::require_tensor(source, key).to(torch::kCUDA));
+  auto input = r::testsupport::checkpoint_input(output, std::nullopt);
+  REQUIRE(mmltk::backend::ml::serialization::require_tensor(input, key).is_cuda());
+  const auto* error = std::string_view(key) == "training_configuration_cbor" ? "invalid checkpoint training configuration" :
+   std::string_view(key) == "epoch_policy" ? "invalid continuation structure" : "invalid RF-DETR training supervision CBOR blob";
+  REQUIRE_THROWS_WITH(r::detail::read_training_continuation(input), error);
+ }
+}
 TEST_CASE("Continuation preserves held SGD values logical offsets donor identities and applied epoch latches", "[model][rfdetr][training][continuation]") {
  auto request = saved_request();
  request.recipe.optimizer = r::TrainOptimizerKind::SGD;
@@ -886,8 +970,13 @@ TEST_CASE("legacy checkpoint requests migrate only absent encoder launch fields"
  };
  CHECK(read(legacy) == request);
  for (const auto* name : {"from_scratch", "encoder_weights_path"}) {
+  auto partially_current = nlohmann::json::parse(r::encode_train_request_json(request));
+  partially_current.erase(name);
+  CHECK(read(partially_current) == request);
   auto invalid = legacy;
   invalid[name] = nullptr;
+  REQUIRE_THROWS(read(invalid));
+  invalid[name] = 1;
   REQUIRE_THROWS(read(invalid));
  }
  auto invalid = legacy;

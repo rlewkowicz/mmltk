@@ -3,6 +3,7 @@
 #include "src/frameworks/serialization/reflected_json.h"
 #include "src/pch_std.h"
 #include "src/backend/ml/torch/archive.h"
+#include "src/backend/ml/torch/archive_cbor.h"
 #include "detail/checkpoint_private.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 namespace mmltk::backend::models::rfdetr {
@@ -18,12 +19,10 @@ void validate_resume_continuation_manifest(const ResumeContinuationManifest& man
 }
 namespace detail {
 namespace serialization = mmltk::frameworks::serialization;
+namespace archive_serialization = mmltk::backend::ml::serialization;
 namespace {
-void write_bytes(torch::serialize::OutputArchive& archive, const char* key, const serialization::wire::ByteBuffer& bytes) {
- auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
- std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
- archive.write(key, tensor);
-}
+constexpr archive_serialization::CborArchiveBudget kContinuationCborBudget{.max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32};
+constexpr archive_serialization::CborArchiveBudget kTrainingConfigurationCborBudget{.max_items = 4096, .max_depth = 32};
 template <class Values, class Visitor>
 void visit_continuation_values(Values& values, Visitor&& visitor) {
  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^TrainingContinuationValues, std::meta::access_context::current()))) {
@@ -45,11 +44,7 @@ void write_scalar(torch::serialize::OutputArchive& archive, const char* key, con
  else if constexpr (std::is_floating_point_v<T>)
   mmltk::backend::ml::serialization::write_double(archive, key, static_cast<double>(value));
  else {
-  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<T>();
-  serialization::wire::ByteBuffer bytes;
-  if (!serialization::encode(value, bytes, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32}))
-   throw std::runtime_error("invalid continuation structure");
-  write_bytes(archive, key, bytes);
+  archive_serialization::write_cbor_record(archive, key, value, kContinuationCborBudget, "invalid continuation structure");
  }
 }
 template <class T>
@@ -60,14 +55,8 @@ auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
   if (!value) throw std::runtime_error(std::string("full training checkpoint is missing ") + key);
   return *value;
  } else {
-  const auto tensor = mmltk::backend::ml::serialization::require_tensor(archive, key);
-  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<T>();
-  if (!tensor.is_cpu() || tensor.scalar_type() != torch::kUInt8 || tensor.dim() != 1 || !tensor.is_contiguous() || static_cast<std::uint64_t>(tensor.numel()) > capacity)
-   throw std::runtime_error("invalid continuation structure");
-  auto value = serialization::decode<T>({std::span(reinterpret_cast<const std::byte*>(tensor.const_data_ptr()), static_cast<std::size_t>(tensor.numel())), {}},
-   {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
-  if (!value) throw std::runtime_error("invalid continuation values");
-  return std::move(*value);
+  return archive_serialization::read_cbor_record<T>(archive_serialization::require_tensor(archive, key), kContinuationCborBudget,
+   "invalid continuation structure", "invalid continuation values", {.require_contiguous = true, .allow_empty = true});
  }
 }
 void validate_values(const TrainingContinuationValues& values, const TrainRequest& request, bool present_ema) {
@@ -116,25 +105,21 @@ bool has_continuation_fields(torch::serialize::InputArchive& archive) {
 }
 }  // namespace
 void write_training_configuration(torch::serialize::OutputArchive& archive, const TrainRequest& request) {
- constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
- serialization::wire::ByteBuffer bytes;
- const auto encoded = serialization::encode(reusable_train_request(request), bytes, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
- if (!encoded) throw std::runtime_error("training configuration violates its checkpoint schema");
- write_bytes(archive, "training_configuration_cbor", bytes);
+ archive_serialization::write_cbor_record(
+  archive, "training_configuration_cbor", reusable_train_request(request), kTrainingConfigurationCborBudget, "training configuration violates its checkpoint schema");
 }
 TrainRequest read_training_configuration(torch::serialize::InputArchive& archive) {
  torch::Tensor configuration;
  if (!archive.try_read("training_configuration_cbor", configuration)) throw std::runtime_error("full checkpoint is missing current saved training configuration");
- constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
- if (!configuration.defined() || !configuration.is_cpu() || configuration.scalar_type() != torch::kUInt8 || configuration.dim() != 1 || configuration.numel() <= 0 ||
-     static_cast<std::size_t>(configuration.numel()) > capacity)
-  throw std::runtime_error("invalid checkpoint training configuration");
- configuration = configuration.contiguous();
+ constexpr auto limits = archive_serialization::cbor_archive_limits<TrainRequest>(kTrainingConfigurationCborBudget);
+ configuration = archive_serialization::admit_cbor_tensor<TrainRequest>(std::move(configuration), "invalid checkpoint training configuration");
  auto document = serialization::json_from_cbor(
-  {std::span(reinterpret_cast<const std::byte*>(configuration.const_data_ptr()), static_cast<std::size_t>(configuration.numel())), {}}, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
+  {std::span(reinterpret_cast<const std::byte*>(configuration.const_data_ptr()), static_cast<std::size_t>(configuration.numel())), {}}, limits);
  migrate_train_request_record(document);
- const auto bytes = serialization::json_to_cbor(document.dump(), {.max_bytes = 6U * capacity, .max_items = 4096, .max_depth = 32});
- auto request = serialization::decode<TrainRequest>({bytes, {}}, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
+ auto migration_limits = limits;
+ migration_limits.max_bytes *= 6U;
+ const auto bytes = serialization::json_to_cbor(document.dump(), migration_limits);
+ auto request = serialization::decode<TrainRequest>({bytes, {}}, limits);
  if (!request) throw std::runtime_error("invalid checkpoint training configuration values");
  validate_train_request(*request);
  return *request;

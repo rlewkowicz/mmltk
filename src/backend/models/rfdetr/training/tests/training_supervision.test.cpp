@@ -13,6 +13,7 @@
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/frameworks/serialization/reflected_json.h"
+#include "src/frameworks/serialization/reflected_cbor.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -261,6 +262,8 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
  rfdetr::detail::write_training_supervision_config(legacy_output, {});
  rfdetr::detail::write_state_archive(legacy_output, "state", {}, readback, 0);
  auto legacy_input = mmltk::backend::models::rfdetr::testsupport::reload_archive(legacy_output, path);
+ c10::IValue omitted;
+ REQUIRE_FALSE(legacy_input.try_read("training_supervision_config_cbor", omitted));
  REQUIRE((rfdetr::detail::read_training_supervision_config(legacy_input) == rfdetr::TrainingSupervisionConfig{}));
  rfdetr::TrainingSupervisionConfig inactive_nondefault;
  inactive_nondefault.match_free.rho = 0.75F;
@@ -269,6 +272,30 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
  // CLEANUP-IGNORE: The archive reload helper is shared; active and inactive configurations retain independent round-trip equality assertions.
  auto inactive_input = mmltk::backend::models::rfdetr::testsupport::reload_archive(inactive_output, path);
  REQUIRE((rfdetr::detail::read_training_supervision_config(inactive_input) == inactive_nondefault));
+ const auto original = mmltk::backend::ml::serialization::require_tensor(input, "training_supervision_config_cbor");
+ auto strided = rfdetr::testsupport::strided_checkpoint_bytes(original);
+ torch::serialize::OutputArchive strided_output;
+ strided_output.write("training_supervision_config_cbor", strided);
+ auto strided_input = rfdetr::testsupport::checkpoint_input(strided_output);
+ REQUIRE_FALSE(mmltk::backend::ml::serialization::require_tensor(strided_input, "training_supervision_config_cbor").is_contiguous());
+ CHECK(rfdetr::detail::read_training_supervision_config(strided_input) == config);
+ constexpr auto capacity = mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<rfdetr::TrainingSupervisionConfig>();
+ for (const auto& invalid : {original.to(torch::kInt64), original.unsqueeze(0), torch::empty({0}, torch::kUInt8), torch::zeros({static_cast<int64_t>(capacity + 1)}, torch::kUInt8)}) {
+  torch::serialize::OutputArchive malformed;
+  malformed.write("training_supervision_config_cbor", invalid);
+  auto malformed_input = rfdetr::testsupport::checkpoint_input(malformed);
+  REQUIRE_THROWS_WITH(rfdetr::detail::read_training_supervision_config(malformed_input), "invalid RF-DETR training supervision CBOR blob");
+ }
+ torch::serialize::OutputArchive malformed_cbor;
+ malformed_cbor.write("training_supervision_config_cbor", torch::zeros({static_cast<int64_t>(capacity)}, torch::kUInt8));
+ auto malformed_input = rfdetr::testsupport::checkpoint_input(malformed_cbor);
+ REQUIRE_THROWS_WITH(rfdetr::detail::read_training_supervision_config(malformed_input), "invalid RF-DETR training supervision CBOR configuration");
+ auto invalid_config = config;
+ invalid_config.match_free.correspondence_weight = invalid_config.match_free.query_weight = 0.0F;
+ torch::serialize::OutputArchive invalid_output;
+ rfdetr::detail::write_training_supervision_config(invalid_output, invalid_config);
+ auto invalid_input = rfdetr::testsupport::checkpoint_input(invalid_output);
+ REQUIRE_THROWS_WITH(rfdetr::detail::read_training_supervision_config(invalid_input), "invalid RF-DETR training supervision CBOR configuration");
  std::error_code ignored;
  std::filesystem::remove(path, ignored);
 }

@@ -46,6 +46,13 @@ inline torch::serialize::InputArchive checkpoint_input(torch::serialize::OutputA
  input.load_from(bytes, device);
  return input;
 }
+// Poison interleaved storage so readers must respect the byte tensor's stride.
+[[nodiscard]] inline torch::Tensor strided_checkpoint_bytes(const torch::Tensor& bytes) {
+ auto storage = torch::full({bytes.numel(), 2}, 255, bytes.options());
+ auto view = storage.select(1, 0);
+ view.copy_(bytes);
+ return view;
+}
 // The archive borrows staged CPU tensors. Consume it while readback still owns
 // their storage; only serialized bytes or a freshly loaded archive may escape.
 template <class Optimizer, class Consumer>

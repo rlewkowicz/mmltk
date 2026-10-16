@@ -93,6 +93,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_training
         mmltk::backend::models::rfdetr::contract
         mmltk::backend::models::rfdetr::core
     PRIVATE
+        mmltk::backend::ml::torch_archive_cbor
         mmltk::backend::models::rfdetr::augmentation
         mmltk::backend::ml::cuda
         mmltk::backend::ml::layers
@@ -164,6 +165,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk_backend_models_rfdetr_training_fixture
         mmltk::backend::models::rfdetr::export
         mmltk_backend_ml_torch_test_support
+        mmltk::backend::ml::torch_archive_cbor
         mmltk::backend::models::rfdetr::augmentation
         mmltk::backend::models::rfdetr::contract
         mmltk::backend::models::rfdetr::training

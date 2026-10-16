@@ -1,16 +1,14 @@
 
 #include "src/backend/models/rfdetr/core/class_layout.h"
-#include <array>
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
-#include <cstring>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
 #include "src/backend/ml/torch/archive.h"
+#include "src/backend/ml/torch/archive_cbor.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
-#include "src/frameworks/serialization/reflected_cbor.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/checkpoint_private.h"
@@ -27,13 +25,11 @@ void publish_native_checkpoint_archive(torch::serialize::OutputArchive& archive,
  archive.save_to(publication.staged_artifact().string());
  publication.Publish();
 }
-namespace serialization = mmltk::frameworks::serialization;
+namespace archive_serialization = mmltk::backend::ml::serialization;
 namespace {
 constexpr char kTrainingSupervisionKey[] = "training_supervision_config_cbor";
 constexpr std::string_view kTrainingSupervisionPrefix = "training_supervision.";
-constexpr std::size_t kTrainingSupervisionCborCapacity = serialization::reflected_maximum_cbor_bytes<TrainingSupervisionConfig>();
-constexpr serialization::wire::Limits kTrainingSupervisionCborLimits{
- .max_bytes = kTrainingSupervisionCborCapacity,
+constexpr archive_serialization::CborArchiveBudget kTrainingSupervisionCborBudget{
  .max_items = 64U,
  .max_depth = 8U,
 };
@@ -76,12 +72,8 @@ void write_native_checkpoint_metadata(torch::serialize::OutputArchive& archive, 
  mmltk::backend::ml::serialization::write_int(archive, "num_select", metadata.num_select);
  if (metadata.encoder_pretraining) {
   if (!encoder_pretraining_provenance_valid(*metadata.encoder_pretraining)) throw std::invalid_argument("invalid encoder pretraining provenance");
-  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<EncoderPretrainingProvenance>();
-  serialization::wire::ByteBuffer bytes;
-  if (!serialization::encode(*metadata.encoder_pretraining, bytes, {.max_bytes = capacity, .max_items = 32, .max_depth = 4})) throw std::runtime_error("cannot encode encoder pretraining provenance");
-  auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
-  std::memcpy(tensor.data_ptr<std::uint8_t>(), bytes.data(), bytes.size());
-  archive.write("encoder_pretraining_cbor", tensor);
+  archive_serialization::write_cbor_record(
+   archive, "encoder_pretraining_cbor", *metadata.encoder_pretraining, {.max_items = 32, .max_depth = 4}, "cannot encode encoder pretraining provenance");
  }
  metadata.for_each_optional_field([&]<class Optional>(const char* key, const Optional& value) {
   if constexpr (std::is_same_v<typename Optional::value_type, bool>)
@@ -108,12 +100,7 @@ void write_resume_state_archive(
 }
 void write_training_supervision_config(torch::serialize::OutputArchive& archive, const TrainingSupervisionConfig& config) {
  if (config == TrainingSupervisionConfig{}) { return; }
- std::array<std::byte, kTrainingSupervisionCborCapacity> bytes{};
- const auto encoded = serialization::encode(config, std::span<std::byte>(bytes), kTrainingSupervisionCborLimits);
- if (!encoded.has_value()) { throw std::runtime_error("failed to encode bounded RF-DETR training supervision configuration"); }
- auto tensor = torch::empty({static_cast<int64_t>(*encoded)}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
- std::memcpy(tensor.data_ptr<std::uint8_t>(), bytes.data(), *encoded);
- archive.write(kTrainingSupervisionKey, tensor);
+ archive_serialization::write_cbor_record(archive, kTrainingSupervisionKey, config, kTrainingSupervisionCborBudget, "failed to encode bounded RF-DETR training supervision configuration");
 }
 TrainingSupervisionConfig read_training_supervision_config(torch::serialize::InputArchive& archive) {
  torch::Tensor tensor;
@@ -122,15 +109,10 @@ TrainingSupervisionConfig read_training_supervision_config(torch::serialize::Inp
   if (archive.try_read(kTrainingSupervisionKey, value)) throw std::runtime_error("invalid RF-DETR training supervision CBOR blob");
   return {};
  }
- if (!tensor.defined() || !tensor.device().is_cpu() || tensor.scalar_type() != torch::kUInt8 || tensor.dim() != 1 || tensor.numel() <= 0 ||
-     static_cast<std::uint64_t>(tensor.numel()) > kTrainingSupervisionCborCapacity) {
-  throw std::runtime_error("invalid RF-DETR training supervision CBOR blob");
- }
- tensor = tensor.contiguous();
- const auto bytes = std::span(reinterpret_cast<const std::byte*>(tensor.data_ptr<std::uint8_t>()), static_cast<std::size_t>(tensor.numel()));
- const auto decoded = serialization::decode<TrainingSupervisionConfig>({bytes, {}}, kTrainingSupervisionCborLimits);
- if (!decoded.has_value() || !training_supervision_config_valid(*decoded)) { throw std::runtime_error("invalid RF-DETR training supervision CBOR configuration"); }
- return *decoded;
+ auto decoded = archive_serialization::read_cbor_record<TrainingSupervisionConfig>(
+  std::move(tensor), kTrainingSupervisionCborBudget, "invalid RF-DETR training supervision CBOR blob", "invalid RF-DETR training supervision CBOR configuration");
+ if (!training_supervision_config_valid(decoded)) { throw std::runtime_error("invalid RF-DETR training supervision CBOR configuration"); }
+ return decoded;
 }
 void require_resume_training_supervision_config(torch::serialize::InputArchive& archive, const TrainingSupervisionConfig& expected) {
  if (read_training_supervision_config(archive) != expected) { throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match"); }
