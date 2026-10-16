@@ -122,7 +122,8 @@ TEST_CASE("benchmark image diagnostic reads eligible physical slots and canonica
    {"source", 4}, {"image_id", 2212}, {"label_bytes", +fixture.entry.label_bytes}, {"max_label_bytes", +fixture.header.max_label_bytes},
    {"instances",
     Json::array(
-     {{{"class_id", 0}, {"class_name", "sample"}, {"flags", +fixture.label.flags}, {"bbox", {0, 0, 2, 1}}, {"mask_pairs", 1}, {"annotation_id", 8123}, {"source_category_id", 1}, {"original_area", 2.0}, {"source_ordinal", 9}}})}
+     {{{"class_id", 0}, {"class_name", "sample"}, {"flags", +fixture.label.flags}, {"bbox", {0, 0, 2, 1}}, {"mask_pairs", 1}, {"annotation_id", 8123}, {"source_category_id", 1}, {"original_area", 2.0}, {"source_ordinal", 9},
+       {"keypoint_names", Json::array()}, {"keypoints", Json::array()}}})}
   });
  const auto background = successful_record(fixture.inspect("0"));
  CHECK(background.at("image_id").is_null());

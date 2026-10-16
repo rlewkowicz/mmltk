@@ -185,6 +185,13 @@ TEST_CASE("All official and controlled assets retain strict topology and checkpo
  namespace rf = mmltk::backend::models::rfdetr;
  const auto requested = rf::testsupport::UpstreamOracle::requested();
  const rf::testsupport::UpstreamOracle oracle(requested);
+ const auto require_query_rows = [](const auto& entries, const auto& config) {
+  for (const auto name : {rf::detail::kQueryFeatureWeight, rf::detail::kReferencePointWeight}) {
+   const auto query = std::ranges::find(entries, name, &rf::NormalizedModelStateEntry::name);
+   REQUIRE(query != entries.end());
+   REQUIRE(query->tensor.size(0) == config.num_queries * config.group_detr);
+  }
+ };
  for (const auto& row : rf::kPresetCatalog) {
   DYNAMIC_SECTION(row.preset_name) {
    const auto original = oracle.official_checkpoint(row.preset_name);
@@ -201,6 +208,7 @@ TEST_CASE("All official and controlled assets retain strict topology and checkpo
    REQUIRE(layout.semantic());
    REQUIRE_FALSE(layout.catalog()->empty());
    const auto& entries = admitted.model_state.entries();
+   require_query_rows(entries, config);
    const auto classifier = std::ranges::find(entries, std::string("class_embed.weight"), &rf::NormalizedModelStateEntry::name);
    REQUIRE(classifier != entries.end());
    REQUIRE(classifier->tensor.size(0) == row.class_count);
@@ -261,11 +269,7 @@ TEST_CASE("All official and controlled assets retain strict topology and checkpo
    const auto external = nlohmann::json::parse(metadata.external_topology);
    REQUIRE(external.at("group_detr") == 2);
    const auto& controlled_entries = controlled.model_state.entries();
-   for (const auto* name : {"query_feat.weight", "refpoint_embed.weight"}) {
-    const auto query = std::ranges::find(controlled_entries, std::string(name), &rf::NormalizedModelStateEntry::name);
-    REQUIRE(query != controlled_entries.end());
-    REQUIRE(query->tensor.size(0) == controlled_config.num_queries * controlled_config.group_detr);
-   }
+   require_query_rows(controlled_entries, controlled_config);
    if (row.task == rf::ModelTask::Keypoints) {
     const auto mask = std::ranges::find(controlled_entries, std::string("_kp_active_mask"), &rf::NormalizedModelStateEntry::name);
     REQUIRE(mask != controlled_entries.end());

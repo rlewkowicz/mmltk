@@ -1202,7 +1202,8 @@ TEST_CASE("Schema reclassification maps joint identity by full name and reverses
  scene.categories.push_back({.value = "other"});
  scene.keypoint_schemas = {{{"shared", "old"}, {{0, 1}}, {0, 1}, {.1, .1}}, {{"new", "shared"}, {{0, 1}}, {0, 1}, {.2, .3}}};
  scene.objects.push_back(
-  {.shape = contracts::AnnotationShape::Skeleton,
+  {.name = contracts::AnnotationText::From("pose"),
+   .shape = contracts::AnnotationShape::Skeleton,
    .skeleton_nodes = {{"shared", {8, 9}, catalog::KeypointVisibility::Occluded}, {"old", {12, 13}, catalog::KeypointVisibility::Visible}},
    .skeleton_edges = {{0, 1}}});
  document::AnnotationDocument editor;
@@ -1236,13 +1237,15 @@ TEST_CASE("Explicit empty class schemas reject placement and retain reversible r
  scene.categories.push_back({"empty"});
  scene.keypoint_schemas = {catalog::ClassKeypointSchema{{"a", "b"}, {{0, 1}}, {0, 1}, {.1, .1}}, {}};
  scene.objects.push_back(
-  {.shape = contracts::AnnotationShape::Skeleton,
+  {.name = contracts::AnnotationText::From("pose"),
+   .shape = contracts::AnnotationShape::Skeleton,
    .skeleton_nodes = {{"a", {8, 9}, catalog::KeypointVisibility::Occluded}, {"b", {10, 11}, catalog::KeypointVisibility::Visible}},
    .skeleton_edges = {{0, 1}}});
  document::AnnotationDocument editor;
  const auto apply = [&](auto edit) { REQUIRE(editor.Edit({std::move(edit)}).outcome == document::DocumentOutcome::Applied); };
  auto geometric = scene;
- geometric.objects = {{.shape = contracts::AnnotationShape::Box, .box = {{1, 1}, {4, 4}}, .category = 1}, {.shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {4, 4}}, .category = 1}};
+ geometric.objects = {{.name = contracts::AnnotationText::From("box"), .shape = contracts::AnnotationShape::Box, .box = {{1, 1}, {4, 4}}, .category = 1},
+  {.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {4, 4}}, .category = 1}};
  REQUIRE(editor.Open(geometric).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
  apply(AnnotationObjectEdit{0});
@@ -1342,7 +1345,7 @@ TEST_CASE("Aggregate skeleton bounds publish within the wire envelope and reject
  namespace document = subsystems::annotation;
  auto scene = test_scene("direct://aggregate-skeletons");
  catalog::ClassKeypointSchema schema;
- contracts::AnnotationObject object{.shape = contracts::AnnotationShape::Skeleton};
+ contracts::AnnotationObject object{.name = contracts::AnnotationText::From("pose"), .shape = contracts::AnnotationShape::Skeleton};
  for (std::size_t index = 0; index < catalog::kKeypointsPerClassCapacity; ++index) {
   const auto name = "joint-" + std::to_string(index);
   schema.names.push_back(name);

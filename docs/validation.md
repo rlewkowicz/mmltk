@@ -14,7 +14,16 @@ after the required final full build, both gate commands must pass in this order:
 ```
 
 Unfiltered `all` runs native, browser JavaScript/Rust, cleanup/declaration,
-log-query, and compositor fixtures. Resume failed tests and tidy checks with
+log-query, and compositor fixtures. External RF-DETR upstream comparisons and
+historical-session acceptance are opt-in: ordinary `all` and `rfdetr` runs do
+not prepare their data and report those cases as skipped when no explicit
+evidence is supplied. `--with-upstream` explicitly enables preparation;
+`--env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=PATH` and
+`--env MMLTK_RFDETR_BASELINE_SESSION=PATH` reuse existing evidence without
+generating either missing fixture. Full upstream references can exceed 1 TiB;
+they are tensor snapshots, separate from diagnostic logs. New-model numerical
+acceptance still requires the explicitly selected comparisons to pass.
+Resume failed tests and tidy checks with
 the focused selections below; retain successful results and finish checks left
 unexecuted by an interruption. Rebuild changed product code through `./mmltk --build`
 before testing. During action-plan execution, once focused retries pass, run the
@@ -24,50 +33,40 @@ required full completion pass. Retries do not restart or reorder validation stag
 
 ```bash
 ./mmltk --tidy
-```
-
-The full configured suite first runs the [standalone tools stage](#native-tool-analysis),
-then formats tracked first-party C/C++/CUDA files and runs containerized
-`cargo fmt` for the first-party `mmltk-browser-app` package.
-The product stage refreshes `.cache/cmake/analysis`, runs clang-tidy where
-supported, and validates reflection translation units through their exact GCC
-compiler objects. Native `--file` selections skip the package-wide Rust
-formatting; `--start-at` retains it. This Rust step is formatting, not a Rust
-static-analysis suite. The [build reference](build.md#target-declarations-and-precompiled-headers)
-owns PCH and header-isolation handling in the analysis graph.
-`./mmltk --tidy --rust-only` formats just that Rust package through the same
-containerized owner, without configuring or analyzing native code. It cannot
-be combined with native file, start-at, or third-party selections.
-[.clang-format](../.clang-format) keeps the Google base, a 200-column limit,
-one-column indentation and continuation, and no tabs. Its Clang 22 braced-list
-settings use one-column indentation with opening/closing breaks for long lists;
-`LambdaBodyIndentation: OuterScope` keeps callbacks near their enclosing scope.
-An ordinary local aggregate can give a callback table a short anchor, as the
-`WebSocketBehavior` value in
-[browser_server.cpp](../src/frameworks/transport/browser_server.cpp) does.
-Layout changes do not count as structural code reduction.
-The repository's `modernize-use-auto.MinTypeNameLength` is `5` in
-[.clang-tidy](../.clang-tidy); it is a type-spelling threshold, not a permission
-to hide meaningful ownership or introduce indirection.
-CUDA clang-tidy covers host/device code at `sm_86`. Cppcheck is currently
-disabled because its parser does not support the repository's reflection
-syntax; `--cppcheck-only` is unavailable.
-
-For follow-up work, select one or several tracked sources with one `--file`,
-or resume at a translation unit with `--start-at`:
-
-```bash
+./mmltk --tidy --rust-only
 ./mmltk --tidy --file src/common/system/cpu_affinity.cpp src/common/system/execution_policy.cpp
 ./mmltk --tidy --file src/backend/imaging/explore/explore_render_core.cu
 ./mmltk --tidy --start-at src/common/system/cpu_affinity.cpp
 ```
 
-`--file` and `--start-at` cannot be combined. Focused runs do not replace the
-full passes required during action-plan execution. Tidy retains a
-[wrapper transcript](logging.md#wrapper-build-test-and-tidy-transcripts), with
-`MMLTK_TIDY_LOG_FILE` selecting its destination. The implementation and
-available analysis overrides are in
-[run_static_analysis.cpp](../tools/toolchain/run_static_analysis.cpp).
+Full tidy runs [tools analysis](#native-tool-analysis), formats tracked
+first-party C/C++/CUDA and the `mmltk-browser-app` Rust package, refreshes
+`.cache/cmake/analysis`, then runs supported clang-tidy checks and exact GCC
+objects for reflection units. CUDA clang-tidy covers host/device at `sm_86`.
+[PCH/header isolation](build.md#target-declarations-and-precompiled-headers)
+remain enabled. Cppcheck and `--cppcheck-only` are disabled because reflection
+syntax is unsupported.
+
+| Selection | Scope |
+| --- | --- |
+| `--file PATH...` | One/grouped tracked sources; skips package-wide Rust formatting |
+| `--start-at PATH` | Resume native units; retains Rust formatting |
+| `--rust-only` | Containerized Rust formatting only; no native configuration/analysis |
+
+File/resume selections are mutually exclusive. Rust-only rejects native
+selection and third-party options. Focused retries do not replace action-plan
+full passes. Rust formatting is not a Rust static-analysis suite.
+
+[.clang-format](../.clang-format): Google base, 200 columns, one-column indent
+and continuation, no tabs, Clang 22 long braced-list opening/closing breaks,
+`LambdaBodyIndentation: OuterScope`. Local aggregates can anchor callback tables;
+formatting alone is not structural reduction. [.clang-tidy](../.clang-tidy)
+sets `modernize-use-auto.MinTypeNameLength=5`, a spelling threshold that does
+not replace ownership clarity.
+
+[run_static_analysis.cpp](../tools/toolchain/run_static_analysis.cpp) owns
+analysis overrides. [Transcripts](logging.md#wrapper-build-test-and-tidy-transcripts)
+use `MMLTK_TIDY_LOG_FILE` for an explicit destination.
 
 ### Native tool analysis
 
@@ -77,22 +76,19 @@ available analysis overrides are in
 ./mmltk --tidy-tools --start-at tools/logging/log_query.cpp
 ```
 
-This operation formats and validates only translation units registered in
-[the standalone tools graph](build.md#standalone-tools-module-graph),
-using `.cache/cmake/tools` and the tools image. Its C++26/module units are
-validated by building their GCC objects and dependencies; clang-tidy does not
-consume GCC BMIs. Grouped `--file` and `--start-at` use the same selection rules
-as full tidy. The tools resume point uses the ordered registered-unit list.
-Focused selections need the tools compilation database from `--build-tools`.
+Tools tidy uses `.cache/cmake/tools`, the tools image, and registered units
+only. C++26/modules are checked by building exact GCC objects/dependencies;
+clang-tidy cannot consume GCC BMIs. Grouped file/resume rules match full tidy;
+resume uses registration order. Focused selections require the database from
+`--build-tools`.
 
-`--tidy` routes a mixed `--file` selection to the tools and product graphs.
-Product-dependent diagnostic modules belong to product analysis. The full
-formatting pass also formats the isolated oracle and Weston sources, whose
-compilation belongs to their respective images; oracle build/check preparation
-is `--diagnose-rfdetr-upstream --build-only`. `--tidy-tools` rejects those
-foreign-graph selections, Rust, and third-party selections. It shares the
-normal tidy transcript and does not publish a new executable; use
-`--build-tools` before exercising changed tool behavior.
+Full `--tidy` routes mixed file selections to their tools/product graphs.
+Product-dependent diagnostics belong to product analysis. Full formatting also
+covers isolated oracle/Weston sources, whose compilation stays in their own
+images; oracle preparation is `--diagnose-rfdetr-upstream --build-only`.
+Tools tidy rejects foreign-graph, Rust, and third-party selections. It retains
+the tidy transcript without publishing tools; rebuild them before exercising
+changed behavior.
 
 ## PCH include audit
 
@@ -102,40 +98,31 @@ normal tidy transcript and does not publish a new executable; use
 ./mmltk --audit-includes fix
 ```
 
-[audit_includes.cpp](../tools/cleanup/audit_includes.cpp) is a lexical inventory and
-conservative replacement tool for the checked-in PCH groups. It is not semantic
-include-what-you-use analysis. `report` (the default) and `preview` write reports
-without changing sources; `fix` applies admitted replacements. The tool reads
-the existing release graph by default. Leading `--refresh` first reconfigures
-that release graph with browser-host and Firefox runtime enabled.
-`--build-dir PATH` selects the graph to inspect and `--output PREFIX` selects
-report paths. Use the wrapper for all three modes;
-the [build reference](build.md#target-declarations-and-precompiled-headers)
-owns PCH registration and generated policy paths.
+[audit_includes.cpp](../tools/cleanup/audit_includes.cpp) lexically inventories
+checked-in PCH groups and conservatively replaces includes; it is not semantic
+include-what-you-use. Default `report` and `preview` leave source unchanged;
+`fix` applies admitted edits. The existing Release graph is default;
+`--refresh` first reconfigures it with browser-host/Firefox enabled.
+`--build-dir PATH` selects a graph; `--output PREFIX` replaces default
+`output/include-audit.{json,md}`. Use the wrapper for every mode.
 
-Default reports are `output/include-audit.json` and `.md`. They contain folder
-and large-file inventories, standard/Linux include frequencies, repeated local
-include bundles, per-source compiler contexts, proposed replacements, PCH
-issues, and retained includes with concrete reasons. Counts include lexical
-inactive branches and are inspection aids, not proof of redundant dependencies.
+Reports retain folder/large-file inventories, standard/Linux frequencies,
+repeated local bundles, every source compiler context, proposals, PCH issues,
+and concrete retention reasons. Inactive branches count lexically; frequency
+alone proves no redundancy.
 
-Every compilation-database entry is retained. Eligibility requires each
-context's owner, generated policy and exact target-local forced PCH to agree;
-replacement uses the groups common to all eligible contexts. Conflicting
-use/skip registration, missing groups, wrong-target forced includes, mismatched
-output ownership, and hidden response-file evidence prevent rewriting.
-Declaration headers remain self-contained. CUDA, retained modules and their
-importers, standalone/no-PCH sources, excluded source contexts, and headers
-outside consumed groups retain direct includes. A retained include is not an
-unresolved cleanup finding merely because another target uses that header in a PCH.
+Rewriting requires every context's owner, generated policy, output, and exact
+target-local forced PCH to agree; only common eligible groups apply. Conflicting
+use/skip, missing groups, wrong forced includes, mismatched owners, or hidden
+response-file evidence block edits. Declaration headers remain self-contained.
+CUDA, modules/importers, no-PCH/standalone/excluded contexts, and unconsumed groups
+retain direct includes; that retention is not a cleanup failure.
 
-Before editing, `fix` runs
-[check_toolchain_invariants.cpp](../tools/toolchain/check_toolchain_invariants.cpp) through
-the wrapper, including creation/use compiler-environment equality and exclusion
-checks. It preserves conditional branches and comments, verifies that each
-source still matches its inspected snapshot, and atomically replaces admitted
-files with their modes retained. Neither audit output nor successful rewriting
-establishes build/test success or a measured PCH speedup.
+`fix` first runs [toolchain invariants](../tools/toolchain/check_toolchain_invariants.cpp),
+including creation/use environment equality and exclusions. It preserves
+comments/branches, checks original snapshots, and atomically replaces files
+with modes retained. [Build policy](build.md#target-declarations-and-precompiled-headers)
+owns registration/generated paths. Audit success proves neither tests nor speedup.
 
 ## Deduplication reports
 
@@ -146,74 +133,53 @@ establishes build/test success or a measured PCH speedup.
 ./mmltk --cleanup-report all
 ```
 
-These select the C++, frontend, and native-tools reports under `cleanup/`;
-`all` runs all three profiles. `cpp-code-deduplication.json`,
-`frontend-code-deduplication.json`, and `tools-code-deduplication.json` contain
-textual `hits` and structural `structural_hits`, ordered with cross-file
-findings before within-file findings. Use the applicable full profiles and
-resolution rules in `AGENTS.md`; reports do not themselves change product code.
-The target files contain only match sizes, source paths/ranges, and applicable
-consolidation patterns. Detector configuration, inventory, rejected candidates,
-producer identity, and inline-suppression details live separately in
-`cleanup/rejected.json`, under the selected profile. Running one profile
-preserves the others' rejection records. Its `duplo.raw_hits` retains the
-detector's original hits before source filtering. Each output is replaced atomically.
+[generate_cleanup_json.cpp](../tools/cleanup/generate_cleanup_json.cpp) writes
+`cleanup/{cpp,frontend,tools}-code-deduplication.json`; `all` runs all profiles.
+`hits`/`structural_hits` contain match sizes, paths/ranges, consolidation patterns,
+with cross-file hits first. Reports change no source. [AGENTS rules](../AGENTS.md#code-deduplication)
+own applicable profiles and resolution.
 
-The standalone `tools` profile covers native modules, sources, and headers
-recursively under `tools/`, including the driver and fixtures and untracked,
-unignored files. Build, generated, vendor, and deleted files stay outside that
-inventory. It uses the C++ detector settings. Producer metadata records the
-native module/source identity, executing ELF path and SHA-256, and the tools
-input fingerprint when present beside the executable. Raw CPD reports retain
-that same `producer` object directly.
+`cleanup/rejected.json` separately retains profile configuration, inventory,
+producer, rejected candidates, suppressions, and Duplo `raw_hits`. Updating one
+profile preserves others. Every output is replaced atomically. Producer records
+native module/source, executing ELF path/SHA-256, and adjacent tools input hash;
+raw reports use the same identity.
 
-C++ Duplo uses a six-line minimum; CPD uses a 39-token minimum with identifiers
-anonymized and literal sequences ignored. Frontend minima are nine lines and
-75 tokens. The C++ source-context pass applies at every CPD token size and to
-Duplo's code-bearing textual candidates. It compares complete statements,
-restoring operation names, types, member
-identities, constants, assertion facts, and local-variable relationships.
-Independent dimension/storage reads retain their local role names. This removes
-matches that hide a different callee or argument outside CPD's fragment,
-declaration/signature boilerplate, aliases, adjacent getters, isolated calls,
-lock-and-forward bodies, and loop headers without a repeated body.
-Shared arithmetic can use a local value or a member receiver through the same
-method API; receiver overlays preserve repeated-input relationships.
-Multiplication-only arithmetic, useful CUDA setup, and repeated scalar/admission
-operations remain candidates. There is no blanket CUDA, role-name, or
-admission-name exclusion. A partial match must be assessed against its complete
-containing operations, regardless of match size.
+| Profile | Inventory / minimum |
+| --- | --- |
+| C++ | First-party native; Duplo 6 lines, CPD 39 tokens, identifiers anonymized/literal sequences ignored |
+| Frontend | Duplo 9 lines, CPD 75 tokens |
+| Tools | Recursive authored `tools/` modules/sources/headers, driver/fixtures, untracked-unignored files; excludes build/generated/vendor/deleted paths; C++ settings |
 
-The pass retains repeated executable sequences, complete identical records in
-distinct declarations, and overloads sharing a name, complete first parameter,
-and meaningful opening setup statement. A common guard or local alias alone
-does not establish an overload algorithm. Repeated fragments of one containing
-statement or declaration are not independent occurrences. Equal operation
-patterns are consolidated across CPD matches while preserving distinct targets.
-Unbalanced syntax stays visible for manual review. The lexical index supplies
-candidate triage; extraction still requires ownership, resource-lifetime, and
-existing-API review. Match sizes do not estimate removable lines.
+C++ context filtering applies at every CPD size and code-bearing Duplo hit. It
+compares complete statements with operation/type/member/constants/assertions
+and local-variable relationships restored; independent dimension/storage reads
+retain role names. It rejects fragments hiding different callees/arguments,
+signature boilerplate, aliases, adjacent getters, isolated calls, lock-forward
+bodies, and bodyless loop headers. Receiver/local-value forms can match through
+one method API while repeated-input relationships remain distinct. Arithmetic,
+CUDA setup, and scalar/admission work have no blanket exclusion.
 
-Default argument initializers do not interrupt function indexing. When a match
-crosses functions or includes different neighboring statements, the filter also
-compares balanced complete statement spans within each function. Compound return
-expressions remain candidates, with their constants intact. Duplo retains
-multiline literal content, including embedded scripts, for manual review;
-rejected non-code ranges and reasons are recorded with the other rejections.
+Candidates include repeated executable sequences, identical complete records in
+distinct declarations, and same-name overloads sharing complete first parameter
+and meaningful opening setup; a guard/alias alone is insufficient. Repeated
+parts of one statement/declaration are not independent occurrences. Cross-function
+fragments are compared as balanced complete statements; default arguments do
+not interrupt indexing, compound returns keep constants, and unbalanced syntax
+stays visible. Equivalent CPD patterns consolidate without dropping targets.
+Duplo preserves multiline literals/embedded scripts for manual inspection;
+non-code rejections retain reasons.
 
-Each affected file is indexed once, with one file's token index resident at a
-time. Statement boundaries and scope ownership are cached; reported spans and
-pattern identities are grouped without all-pairs function comparisons. No
-filename exclusions or suppression registry are added.
+The lexical index loads/indexes one affected file at a time, caches boundaries/
+owners, and groups spans without all-pairs function comparison. No filename
+exclusions or suppression registry apply. Review containing operations, existing
+APIs, ownership, and lifetime before extraction; sizes/covered lines are not
+removable-line estimates.
 
-[Inline suppression policy](../AGENTS.md#deduplication-rules) applies only to
-ordinary reports; raw declaration evidence below is separate.
-The [detector-integrity checks below](#raw-cpd-and-declaration-formatting) also
-apply to ordinary reports. Inspected false positives use one narrow
-`CLEANUP-IGNORE` or bounded `CLEANUP-OFF`/`CLEANUP-ON` span. The rejection report
-retains the rejected coordinates/reasons and suppressed occurrence counts.
-A clean ordinary report is not evidence of zero raw repetition or a complete
-human review of every file.
+Only inspected false positives permit narrow `CLEANUP-IGNORE` or bounded
+`CLEANUP-OFF`/`CLEANUP-ON`; rejected coordinates/reasons/counts remain in output.
+[Detector integrity](#raw-cpd-and-declaration-formatting) applies throughout.
+Clean ordinary reports prove neither zero raw repetition nor complete human review.
 
 ## Raw CPD and declaration formatting
 
@@ -444,28 +410,6 @@ the cold-bootstrap ownership/handoff fixture as container root with the
 required UID/GID and ownership capabilities. Ordinary fixture discovery and
 `all` omit that case and retain restricted container permissions.
 
-### Standalone tools acceptance record
-
-The 2026-10-08–09 validation completed against code commit `571afbd8`.
-The local [gate ledger](../build/validation/tools-dag/final-validation.json)
-records both complete tidy passes, the initial and final builds, cleanup,
-focused retries, oracle image preparation, and final test gates. These ignored
-`build/` artifacts belong to that run and are not shipped with a clean checkout.
-
-| Evidence | Recorded result |
-| --- | --- |
-| [Configured module and target graphs](../build/validation/tools-dag/standalone-graph.json) | 49 authored standalone units, 46 unique named providers, 220 scanner requirement edges; both graphs acyclic. All 53 authored tools C++ units, including the four separately deployed helpers, import `std`. Generated standard-library providers are separate. |
-| [Published production ELF](../build/validation/tools-dag/executable-final.json) | Stripped, 2,654,064 bytes; 0.433% above the 2,642,632-byte baseline. No fixture entry symbols and no direct GPU, Python, or Weston runtime dependency. |
-| [Final cleanup reports](../build/validation/tools-dag/cleanup-final.json) | C++ 1,122 files, frontend 124, tools 54; zero textual or structural hits in all three profiles. The [tools rejection review](../build/validation/tools-dag/rejected-review.json) inspected 214 CPD and 4 Duplo rejections without filter changes. |
-| [Final build](../build/logs/mmltk-build-20261008-232450-850863.log) | `./mmltk --build`, exit 0. |
-| [Final complete suites](../build/logs/mmltk-test-20261008-233138-865826.log) | `./mmltk --test all`, exit 0: 2,045 native passes and 14 skips; 173 JavaScript and 803 Rust passes, one ignored Rust case; cleanup/declaration groups 40/21/15/14, log-query 198, compositor fixtures 21. |
-| [Subsequent packaged Wayland acceptance](../build/logs/mmltk-test-20261009-000456-928834.log) | `./mmltk --test workspace-wayland --headless-compositor`, exit 0: 88 passes, one unavailable GDR case, 144,211 assertions. |
-
-The separate [tools ownership run](../build/logs/mmltk-test-20261008-230601-818065.log)
-also passed. Graph and binary inspection establish build/packaging ownership;
-the fixture and packaged acceptance runs establish the exercised behavior.
-Skipped hardware remains outside the passing coverage.
-
 ### Data compilation and resampling profiles
 
 `./mmltk --test data-profile -- --help` prepares the selected profile target and
@@ -660,6 +604,7 @@ exposes both under `--errors`.
 | `--executable TARGET` | Select one target owned by the suite |
 | `--config release` or `--config dev` | Select the supported native graph |
 | `--env NAME` or `--env NAME=VALUE` | Forward a native-test environment variable; repeatable |
+| `--with-upstream` | With `all` or `rfdetr`, explicitly prepare upstream references and the historical session; full references can exceed 1 TiB |
 | `--gdb` | Run one selected native executable in containerized GDB |
 | `--gdb-command COMMAND` | Add an ordered debugger command; also enables GDB |
 | `--headless-compositor` | Use private NVIDIA Weston with `workspace-wayland` |
@@ -833,286 +778,130 @@ replacement for the retained interop and application suites.
   --env WGPU_VALIDATION=1 --env WGPU_DEBUG=1 --env RUST_LOG=wgpu_hal=warn
 ```
 
-Visible and private-compositor runs use the packaged runtime and native
-acceptance executable. The visible path mounts the active host Wayland session.
-The private path adds a
-GPU-rendered Weston output and retains the same product assertions.
-Build the package first with `./mmltk --build`.
+Build the package with `./mmltk --build`. Visible runs mount host Wayland;
+headless runs add private NVIDIA Weston with identical assertions. The wrapper
+verifies all seven [registered hardware entrypoints](../src/acceptance/tests/wayland/scenarios.cpp)
+before the selected comma-separated Catch union. Standalone evidence-audit cases
+also live in this executable.
 
-The wrapper enumerates and verifies the seven hardware entrypoints registered
-in [wayland/scenarios.cpp](../src/acceptance/tests/wayland/scenarios.cpp)
-before executing the requested selection. Use one comma-separated Catch2
-filter to select alternatives, as above. The executable also contains
-standalone evidence-audit cases.
-
-| Hardware entrypoint | Process lifetimes and required behavior |
+| Entrypoint | Browser lifetimes / required behavior |
 | --- | --- |
-| `workspace_wayland_retained` | One H2D browser: Dataset presentation/disclosure/input and real cancel/restart, square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
-| `workspace_wayland_workflows` | Two H2D browsers: GPU selection and execution for Train/Validate/Predict/Export, actual Train start, resize during training, live progress pixels and hidden-tab progress, retained chart interaction, validation metrics and progressive sample/detail returns, confidence editing/filtering and responsive groups, direct Validate-to-Explore pixels, compiled/image/video prediction, Pause/Resume/EOF/Stop, export/cancellation, light/dark and minimum-width pixels; a second lifetime injects a resized canvas allocation failure and requires visible manual recovery plus completed native training; both end with SIGINT |
-| `workspace_wayland_dpi` | One H2D browser at DPI 1.5: Dataset presentation fixtures, light/dark copy, and rapid changes |
-| `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
-| `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
-| `workspace_wayland_quiet` | Two H2D browsers: blocked reads and a completed gesture with diagnostics/reporting/probes inactive |
-| `workspace_wayland_gdr` | One optional GDR browser; unavailable hardware remains an explicit skip |
+| `workspace_wayland_retained` | One H2D: Dataset disclosures/input, real Cancel/restart, capacity growth, integer typing/paste, cached/held-miss gallery/detail returns, Detail-open resize both orientations, augmentation retention, fractional/wrapped/partial rows, wide/tall layouts, native labels/semantics, light/dark copy, Annotate layout/long lists, FPS, rapid changes, SIGINT |
+| `workspace_wayland_workflows` | Two H2D: Train/Validate/Predict/Export GPU execution, real Train start/resize/live+hidden progress, retained charts, progressive Validation/detail/confidence/layout, direct Explore return, compiled/image/video Predict and Pause/Resume/EOF/Stop, export/cancellation, theme/minimum width. Second lifetime injects resized-canvas allocation failure and requires manual recovery plus completed training; both SIGINT |
+| `workspace_wayland_dpi` | One H2D, scale 1.5: Dataset fixtures, theme/copy, rapid changes |
+| `workspace_wayland_terminal` | Two H2D: real window close and abrupt peer loss after Annotation edit, completed draw, independent redraw |
+| `workspace_wayland_probe_recovery` | Four H2D: startup-latched allocation/reset/begin/end probe failures, exact-content recovery, final pixels/semantics |
+| `workspace_wayland_quiet` | Two H2D: blocked reads and completed gesture with diagnostics/reporting/probes inactive |
+| `workspace_wayland_gdr` | One optional GDR lifetime; absent hardware explicitly skips |
 
-This is twelve required H2D lifetimes and one independently optional GDR lifetime.
-Compatible scenarios reuse a browser; startup-latched DPI, transport, and
-fault settings and destructive exits retain separate lifetimes. Window-close
-coverage enables lifecycle diagnostics with pixel probes off. Quiet coverage
-keeps real typed control, input pressure, and settlement while leaving
-diagnostic owners inactive.
+Twelve H2D lifetimes are required; GDR is independent. Compatible scenarios
+reuse browsers; startup-latched settings/destructive exits require isolation.
+Window-close uses lifecycle diagnostics without probes. Quiet scenarios retain
+real input pressure, typed control, settlement, and drawn readiness.
 
-[WaylandSession](../src/acceptance/tests/wayland/session.h) owns the process,
-fixtures, artifact cursors, deadlines, and
-lifetime-wide physical-custody evidence. Advance requires both typed frontend
-settlement and the complete independent native/browser evidence. Scenario
-entry closes a surviving detail overlay, restores scenario-specific settings
-through normal UI messages, and waits for those operations before reopening.
-It resets scenario-local expectations while retaining physical allocations,
-claims, and release history. The primary compile workflow owns a private
-output directory; other lifetimes reuse prepared source and compiled assets.
-The padding-sensitive retained fixture explicitly chooses Letterbox through
-the Dataset radio and checks the stored compile mode. The model-workflow
-fixture uses the ordinary Stretch default. Padding observations therefore
-remain evidence for the selected geometry rather than assumptions about every
-compiled dataset.
+[WaylandSession](../src/acceptance/tests/wayland/session.h) owns process/fixtures,
+artifact cursors, deadlines, and lifetime custody. Advancement requires typed
+frontend settlement **and** independent native/browser evidence. Scenario entry
+closes overlays, restores settings through ordinary messages, and settles before
+reopening; physical allocation/claim/release history survives scenario-local resets.
+Primary compilation owns a private destination; other lifetimes reuse fixtures.
+Padding-sensitive retention selects Letterbox in the real Dataset radio;
+workflow models keep default Stretch. Geometry evidence is specific to that choice.
 
-The initial [Dataset scenario](#dataset-presentation-and-lifecycle) combines
-real control input, bounded presentation fixtures, and native Directory
-compilation. Benchmark release acquisition remains owned by the independent
-[native fixture cases](#benchmark-compilation-evidence).
-
-The native harness is split by evidence responsibility under
-[tests/wayland](../src/acceptance/tests/wayland):
-
-| Owner | Responsibility |
+| Harness owner | Responsibility |
 | --- | --- |
-| [session.cpp](../src/acceptance/tests/wayland/session.cpp) | Process/fixture lifetime, scenario advancement, deadlines, and final drain |
-| [artifact_cursor.h](../src/acceptance/tests/wayland/artifact_cursor.h) | Bounded incremental JSONL reads and retained incomplete records |
-| [native_audit.cpp](../src/acceptance/tests/wayland/native_audit.cpp) | Native command, operation, input, and product evidence |
-| [browser_audit.cpp](../src/acceptance/tests/wayland/browser_audit.cpp) | Browser interaction, displayed geometry, and rendered UI evidence |
-| [surface_audit.cpp](../src/acceptance/tests/wayland/surface_audit.cpp) | Physical allocation, acquisition, draw, and settlement ledger |
-| [pixel_audit.cpp](../src/acceptance/tests/wayland/pixel_audit.cpp) | Independent native/browser pixel-boundary joins |
+| [session.cpp](../src/acceptance/tests/wayland/session.cpp) | Process/fixtures, advancement, deadlines, final drain |
+| [artifact_cursor.h](../src/acceptance/tests/wayland/artifact_cursor.h) | Incremental extent reads, 16 KiB chunks, ≤64 KiB retained line; appends wait for notification |
+| [native_audit.cpp](../src/acceptance/tests/wayland/native_audit.cpp) | Command/operation/input/product facts |
+| [browser_audit.cpp](../src/acceptance/tests/wayland/browser_audit.cpp) | Interaction, displayed geometry, rendered UI |
+| [surface_audit.cpp](../src/acceptance/tests/wayland/surface_audit.cpp) | Allocation/acquisition/draw/settlement ledger |
+| [pixel_audit.cpp](../src/acceptance/tests/wayland/pixel_audit.cpp) | Independent native/browser pixel joins |
 
-[audits.test.cpp](../src/acceptance/tests/wayland/audits.test.cpp) and
-[artifact_cursor.test.cpp](../src/acceptance/tests/wayland/artifact_cursor.test.cpp)
-exercise those evidence owners in the same executable. The Rust
-[integration driver](../src/frontend/iced/src/integration_control.rs) retains
-separate `lifecycle`, `retained`, `annotation_product`, and `workflows`
-scenario modules. `dataset_presentation` observes Dataset drawing and owns
-bounded presentation fixtures alongside the shared widget, pixel, and probe
-helpers. Its private reporting owner remains effect-only.
+[audit](../src/acceptance/tests/wayland/audits.test.cpp) and [cursor](../src/acceptance/tests/wayland/artifact_cursor.test.cpp)
+cases exercise these owners. Malformed native JSON, overflow, truncation, or
+incomplete final records fail. Probe reconciliation uses ordered generation/frame
+ranges and matching slot identity before geometry scan; evidence ordinals,
+predecessor/suffix rules, independent drains, and late conflicts remain binding.
 
-The JSONL cursor reads one captured file extent in 16 KiB chunks, appending
-newline-delimited segments into a retained buffer capped at 64 KiB per line.
-Later appends wait for the next notification. Malformed native JSON, overflow,
-truncation, and an incomplete final native record remain failures. Native
-probe reconciliation searches the selected generation's ordered frame range;
-when a source revision is fixed, browser checks establish matching slot identity
-before one geometry scan. Evidence ordinals, predecessor/suffix rules,
-independent stream drains, and late-conflict rejection still govern those joins.
+The [Rust driver](../src/frontend/iced/src/integration_control.rs) separates
+lifecycle, retained, annotation_product, workflows, and Dataset presentation;
+reporting is effect-only. It uses [native model/video inputs](../src/acceptance/tests/workflow_wayland_inputs.cpp),
+ordinary actions/viewers, sibling CLI, and product systems:
 
-The [workflow driver](../src/frontend/iced/src/integration_control/workflows.rs)
-uses [native model/video fixtures](../src/acceptance/tests/workflow_wayland_inputs.cpp),
-normal primary actions/viewers, and the packaged sibling CLI and native systems.
-Typed terminals and canvas pixels are independently required for Train curves,
-progress, all six Validation thumbnails/detail, each prediction source, retained
-Stop output, and theme/narrow layouts. Bar capture pairs native image counts
-during Train; hidden-tab checks require later metric sequences. Validation opens
-detail during capture, settles successfully with detail retained, then closes it and requires all
-six same-generation samples without reevaluation. Canvas checks wait for sample
-rendering, which can lag native metric completion.
+| Behavior | Required independent observations |
+| --- | --- |
+| Train / GPU cards | Typed terminals plus curve/progress/theme/narrow pixels; bar capture paired to native image count, hidden-tab later metric sequences; [admitted generation ↔ actual device/rank](logging.md#workflow-gpu-evidence), including pre-progress cancellation and four Output/GPU light layouts plus dark/narrow Train |
+| Validation | Detail opens during capture and survives successful settlement; closing returns six same-generation samples without reevaluation; canvas may lag metrics. All saved PNGs verified |
+| Confidence / captions | Exact `0.437`, invalid/blank retention, inert arrows/wheel, settled `0→1→0`; [pixel oracle](logging.md#rendered-ui-acceptance-evidence) retains raw detections/clean identity/evaluation generation. Groundtruth/Detections below preview, 20 px spacing, narrow wrap, Advanced text. Seven atlas/detail caption cases cycle GT/Det; actual glyphs and Det-over-GT pixels required |
+| Workflow fixture | Real six-query detector calibrated against selected proposals to overlap captions; Validation FP32 matches calibration, Train still updates actual model. Native completion/caption cache alone proves no drawing |
+| Predict / outputs | Saving-control state, compiled/image samples, completed video, playable cancelled partial; disabled media/report leaves only empty `.mmltk-run-claim` with unchanged processing. [Failure records](logging.md#prediction-media-acceptance) distinguish invalid from missing evidence; native media tests own timestamps/audio/write faults/shortfall/crash-prefix recovery |
+| Explore return / layout | Direct Validate→Explore without extra Open, requiring paired ready-tile pixels; all Output cards atop right columns, left cards before actions, Predict saving controls retained |
+| Charts | Browser pan/legend settles through expansion/grid/hide/reveal/navigation; wheel over plot/axes/legend with modifiers leaves camera unchanged. Train aspect selector present, Train native workspace/Validate aspect selector absent; sparse gaps stay gaps, axes/legend cannot replace curve pixels |
+| Gallery | Measured N/N+1/N rows, forward/reverse demand, exact cached cells, held visible miss, known pending selection/hover, drawn compiled identity before/after release. Native controlled fixtures separately establish disk/GPU priority |
+| Detail resize | Repeated layout changes each orientation while retaining gallery measurements; ordinary close requires reconciled viewport, paired atlas draw, ready/new lower rows. Temporary inline canvas sizes invoke normal observer and are restored |
+| Retained semantics | Exact original/derived detail draws and overlay labels; holds initial automatic Basic during original stages, then releases and uses ordinary derived actions. Square/wide/tall retain automatic Basic |
+| Integers | Five Explore controls: min/max instances, seed, first/last compiled index. Spinner edges, wheel suppression, invalid unsigned text, native persistence/restoration; seed typing/paste uses exact value above `2^53`. Digits advance across render frames; rapid resize does not repeat audit |
+| Annotate | Wide/narrow shared layout, Timeline in Advanced, page/horizontal scroll reachability, 32 objects/classes and wrapped final entries. Remeasure after scroll with whole-pixel tolerance; gestures retain full-image/visible-region geometry |
+| Status | Real overlay, bounded fixture notices: add/update/dismiss/overflow, long wrapping/selection/exact Copy, hover/Escape/reentry, keyboard/touch, themes/narrow/modal, shortcut isolation, pulse/reduced motion, hidden quietness. [Records](logging.md#rendered-ui-acceptance-evidence) join identity; fixtures are not native failures. Rust covers reconnect/dedup/ack/stale delivery/clipboard |
 
-Each workflow selects a native inventory device through the GPU card and settles
-settings. [GPU evidence](logging.md#workflow-gpu-evidence) requires bidirectional
-admitted-generation/execution joins, device/rank facts, cancellation before
-progress, and Output/GPU layout in all four light cards plus dark/narrow Train.
-Selection labels alone do not pass.
+The [physical ledger](logging.md#physical-presentation-evidence) requires inventories,
+exact transfers/acquisitions, mode-specific settlement, encoded/submitted draws,
+final release, and pixels; exact draw IDs permit out-of-order callbacks. Capacity
+retry delivers arena availability before a held completion receipt. A typed
+undersized-candidate hold proves completed fallback before candidate release.
+Empty notice consumption waits for paired zero-match atlas draw; submission and
+settlement remain separately required. FPS combines real submissions and async
+canvas read, not numerical performance claims.
 
-The [Status driver](../src/frontend/iced/src/integration_control/status.rs)
-exercises the real overlay using bounded in-memory notices: add/update/dismiss,
-overflow, wrapping/selection of long text, exact Copy, hover/Escape/reentry,
-keyboard/touch, wide/narrow/theme/modal layouts, annotation shortcut isolation,
-pulse/reduced motion, and
-hidden quietness. JavaScript input/canvas and independent audits join
-[rendered records](logging.md#rendered-ui-acceptance-evidence) to notice identity;
-fixtures are not native failures. Rust tests cover bootstrap/reconnect,
-deduplication/acknowledgment, stale delivery, and clipboard custody under the
-[Status contract](gui-interaction.md#session-status).
-
-The workflow scenario also verifies the individual saved Validation PNGs,
-Predict saving-control state, compiled/image samples, completed video, and
-playable cancelled partial video. Media-disabled fixtures independently disable
-the image/compiled report and require only the empty `.mmltk-run-claim`
-reservation marker in the directory, with unchanged processing coverage.
-Native media cases separately exercise timestamps/audio, write failures,
-shortfall and crash-prefix recovery. The retained scenario measures all four
-Output cards at the top of the right column and checks the left-column cards
-preceding each primary action; Predict keeps its saving controls. Exact
-[failure records](logging.md#prediction-media-acceptance) distinguish invalid
-observations from missing terminal evidence.
-
-The same browser opens Explore, runs Validate, and returns directly with no
-intermediate page or extra Open. It requires [paired ready-tile pixels](logging.md#rendered-ui-acceptance-evidence),
-independently of dataset readiness.
-
-Confidence checks cover the default, exact `0.437`, blank/out-of-range retention,
-inert arrow/wheel input, and settled `0 → 1 → 0` edits. The independent
-[confidence pixel oracle](logging.md#rendered-ui-acceptance-evidence) verifies
-filtering with unchanged metrics/evaluation generation, raw detections, and
-clean identity. Layout checks require Groundtruth/Detections beneath the preview,
-20-pixel spacing, narrow wrapping, and Advanced confidence text.
-
-The workflow fixture keeps a real six-query native detector. It calibrates its
-checkpoint against the model's actual selected proposals so detection captions
-overlap the synthetic ground-truth boxes; its Validation request uses FP32 to
-match that calibration. Training still updates the real model. The independent
-[caption canvas oracle](logging.md#rendered-ui-acceptance-evidence) cycles GT/Det
-visibility across atlas and detail, requires visible glyph evidence, and checks
-that Det captions cover GT captions. Native completion or caption-cache contents
-cannot substitute for those pixels.
-
-The same case pans the chart and changes its legend through browser input,
-then requires settled camera/legend retention through expansion, return to the
-grid, hide/reveal, and navigation. Wheel checks cover plot, axes, and legend
-with ordinary and modified input while preserving the camera. It exercises
-Train's aspect selector and checks the absence of Train's native image workspace
-and Validate's aspect selector. Sparse chart markers preserve missing intervals;
-axes and legends alone cannot satisfy the curve-pixel assertion. These
-functional checks do not establish numerical overhead or throughput.
-
-Explore acceptance follows actual measured N/N+1/N visible-row changes,
-forward/reverse demand, exact cached cells, and an independently held visible
-miss. It checks displayed compiled-image identity and readiness before and
-after the typed release, including selection/hover on known pending cells.
-Native controlled fixtures separately establish disk/GPU admission priority;
-completion order alone cannot establish that priority.
-
-The Detail-open resize sequence makes repeated canvas layout changes in each
-orientation, observes retained gallery measurements while Detail is still
-open, and closes Detail through the ordinary component action. Acceptance
-requires the reconciled viewport, paired completed atlas draw, visible ready
-cells, and coverage of newly visible lower rows. The driver changes only
-temporary inline canvas dimensions so the normal resize observer runs; it
-restores the original dimensions before subsequent scenarios.
-
-The retained semantics scenario joins labels and overlays to the exact
-original and derived detail draws. Its integration fixture holds the initial
-automatic Basic upscale during the original-detail/overlay stages, then
-releases that hold and exercises derived methods through normal UI actions.
-Square, wide, and tall scenarios retain automatic Basic coverage.
-
-The initial general UI scenario audits Explore's five dataset integer inputs:
-minimum/maximum instances, shuffle seed, and first/last compiled index. It
-checks both former spinner edges, wheel suppression, invalid unsigned text,
-typed updates, native settings persistence, and restoration. Shuffle seed
-typing and clipboard paste use a distinct exact value above `2^53`. Numeric
-key input advances across browser render frames so controlled input values
-can update between digits; later rapid-resize coverage does not repeat this
-numeric audit.
-
-Annotate acceptance checks the [shared page composition](gui-interaction.md#workflow-layout-and-navigation)
-at wide and narrow logical widths, the Timeline's Advanced placement, and
-fully visible controls after page and horizontal scrolling. It adds 32 objects
-and 32 classes through settled native edits, then checks the last entries and
-wrapped labels within the right column. Reveal operations remeasure bounds
-after scrolling and allow for whole-pixel scroll translation; canvas gestures
-continue to use the full image geometry and visible source region.
-
-The [physical ledger](logging.md#physical-presentation-evidence) independently
-checks allocation inventories, exact acquisitions/transfers, mode-specific
-settlement, encoded/submitted draws, final release, and rendered pixels, admitting
-out-of-order callbacks by draw identity. The capacity fixture delivers arena
-availability before a held native completion receipt, then checks the exact retry.
-
-The pending-supersession fixture uses a typed acceptance-only hold for a
-synthetic undersized candidate; it verifies the retained completed fallback
-before releasing that candidate. Empty-gallery acceptance consumes its notice
-only after the zero-match atlas and its paired metadata reach an encoded draw.
-The physical ledger separately requires submission and settlement.
-FPS acceptance combines actual submission observations with an
-asynchronous canvas read of the displayed counter.
-
-[Mode-specific physical evidence](logging.md#physical-presentation-evidence)
-distinguishes direct read settlement, copy completion, and unacquired offers.
-Independent per-card/full-frame probes, clipped atlas patches, and Annotation
-geometry/background checks follow the [rendered evidence rules](logging.md#rendered-ui-acceptance-evidence).
-[Vulkan queries](logging.md#vulkan-diagnostics-and-descriptor-provenance) inspect
-validation-layer output. Controlled window close and intentional process loss
-have distinct terminals; exit alone proves neither balanced userspace destruction
-nor native GPU completion.
-
-See [headless details](headless-wayland.md) for compositor readiness,
-shutdown, and virtual-output limits. The [logging guide](logging.md#delivery-and-acceptance-ownership)
-owns diagnostic delivery and artifact-family layout. Query one captured run
-at a time.
+Independent card/frame probes, clipped atlas patches, Annotation geometry/background,
+and [Vulkan output](logging.md#vulkan-diagnostics-and-descriptor-provenance) complement
+custody. Window-close and intentional loss have distinct terminals; exit alone
+proves neither balanced destruction nor GPU completion. [Headless operation](headless-wayland.md)
+owns compositor limits; [logging](logging.md#delivery-and-acceptance-ownership)
+owns delivery/artifact families. Query one captured lifetime at a time.
 
 ### Dataset presentation and lifecycle
 
-The [lifecycle driver](../src/frontend/iced/src/integration_control/lifecycle.rs)
-clicks both benchmark recipes and all three Coconut validation choices through
-ordinary browser input. It requires native settings settlement, expected
-current-tree visibility, an inert disabled source Browse control, and restoration.
-Actual draws additionally establish Coconut indentation, aligned descriptions,
-small recovery typography, the revealed
-clip, and label pixels at ordinary and narrow widths. The narrow input case
-uses a 480-pixel canvas with the normal horizontal page scroll.
+[lifecycle.rs](../src/frontend/iced/src/integration_control/lifecycle.rs) clicks
+both recipes/all three Coconut validation choices with native settlement,
+visibility, disabled Browse behavior, and restoration. Actual ordinary/narrow
+draws verify indentation, aligned descriptions, small recovery type, clip, and
+label pixels; narrow uses 480 px canvas with normal horizontal page scroll.
 
-The same driver checks opening, closing, and interrupted reversal of nested
-choices, plus the manual split paths and Compile size disclosures. Diagnostics
-expansion supplies a non-Dataset consumer of the
-[shared transition](gui-interaction.md#shared-form-expansion-and-dividers).
-It observes stable absolute viewport/scroll geometry across disclosure changes,
-rejects clicks into outgoing controls, edits a split path through drag selection
-under simultaneous vertical/horizontal offsets, and releases a held checkbox
-after scrolling it offscreen without changing its native value. Baseline
-settings and the actual restored canvas layout must settle before navigation.
+Nested-choice opening/closing/reversal, manual split/Compile-size disclosures,
+and non-Dataset Diagnostics exercise [shared transitions](gui-interaction.md#shared-form-expansion-and-dividers):
+absolute viewport/scroll stability, outgoing-input rejection, drag-selected split
+editing under both offsets, and held-checkbox offscreen release without mutation.
+Settings and restored canvas must settle before navigation.
 
 [dataset_presentation.rs](../src/frontend/iced/src/integration_control/dataset_presentation.rs)
-renders the production progress component in 36 bounded cases: nine successive
-states at widths 224 and 360 in both themes. They cover unknown totals, grouped
-work counts, cached/resumed sources, shorter updates during reserved active
-height, completed tracks during Syncing/Publishing, cancellation requested,
-Cancelled, Failed, Completed, and late progress after settlement. These local
-values never enter the application model or count as native compile work.
-Canvas observations check the progress area and both shared dividers. Fixture
-completion must join a settled draw containing the complete expected captions;
-intermediate clipped frames establish reflow without replacing that proof.
-The DPI scenario repeats these presentation fixtures at scale 1.5.
+renders production progress in 36 local cases: nine states × widths 224/360 ×
+themes, repeated at DPI 1.5. Cases include unknown/grouped totals, cached/resumed
+sources, shorter active updates, completed tracks while Syncing/Publishing,
+cancellation request/Cancelled/Failed/Completed, and late post-settlement progress.
+They never enter native model/work counts. Progress/divider pixels and complete
+expected caption draws are required; clipped intermediate frames establish
+reflow only.
 
-The retained scenario separately starts the real local Directory compilation,
-observes its active work and all three tracks, and clicks Cancel. It waits until
-native compilation is inactive and reports Cancelled, with a settled result
-without live rows, then starts a new generation and requires success. The
-independent browser audit reconstructs exact work and track captions from each
-generation's native facts. Both the cancelled generation and the successful
-restart must supply fully exposed
-matching captions. A fast successful compile cannot substitute for cancellation
-or active-progress evidence. Directory's acquisition caption follows the
-[progress formatting policy](benchmark-datasets.md#reading-compilation-progress).
+Retained acceptance starts real Directory compilation, observes active work/all
+three tracks, clicks Cancel, requires inactive Cancelled state without live rows,
+then starts a fresh successful generation. Independent audits reconstruct exact
+captions for **both** generations; fast completion cannot substitute. [Caption
+policy](benchmark-datasets.md#reading-compilation-progress) owns Directory acquisition.
 
-Before cancelling and again before the successful generation settles, the
-retained scenario requires four active resize steps: 480×900, 960×720,
-fullscreen, and restored window. Each joins the current native revision with a
-new Dataset root draw after the resize request, the actual Iced root covering
-the canvas, matching CSS/backing and configured/presented extents, and zero
-recorded pointer, wheel, or keydown events between the resize request and
-completion. Native progress may remain
-unchanged while the new root is drawn and presented, including during Syncing;
-the evidence requires current native facts and fresh draw/presentation sequences.
-Fullscreen entry/exit must change the real viewport through Firefox's native
-window path. DOM fullscreen state or a redraw request alone is insufficient.
-The [resize observations](logging.md#dataset-presentation-evidence) distinguish
-unmet layout, progress, configuration, and presentation predicates.
+Both active generations require 480×900, 960×720, real fullscreen, and restored
+window steps. Each joins current native revision, fresh Dataset root draw,
+CSS/backing/configured/presented extents, full-root coverage, and zero pointer/
+wheel/keydown events during resize. Native progress may stay unchanged during
+Syncing; draw/presentation must advance. DOM fullscreen/request alone is
+insufficient. [Resize records](logging.md#dataset-presentation-evidence) identify
+unmet predicates without extending deadlines.
 
-The opt-in asynchronous canvas probe also exercises reuse of borrowed inputs,
-superseding a request with the same fixture key, changing/restoring canvas
-geometry, and reporting owner replacement. Retired callbacks must leave the
-replacement owner's canvas scratch and evidence unchanged. The
-[record reference](logging.md#dataset-presentation-evidence)
-defines the separate draw, caption, pixel, and probe-custody observations.
-These packaged cases acquire no live benchmark release and make no production
-download-throughput or full-release-capacity claim.
+The asynchronous canvas probe exercises borrowed-input reuse, same-key supersession,
+geometry restoration, owner replacement, and retired-callback drain; replacement
+scratch/evidence must remain untouched. [Record definitions](logging.md#dataset-presentation-evidence)
+separate draw/caption/pixel/custody. These cases acquire no benchmark release and
+claim no production download throughput or full-release capacity.
 
 ### Synthetic clipboard input
 
@@ -1221,9 +1010,8 @@ Annotation, Explore, and Upscale executables require `all` or explicit
 ## Training mathematics and compilation evidence
 
 The [training reference](rfdetr-training.md) owns the pinned equations and
-native adaptations. The [review index](reviews/rfdetr-math/README.md) preserves
-the four baseline reviews, while the [current results](reviews/rfdetr-math/current-results.md)
-record the completed bounded acceptance and its limits. Coverage is colocated
+native adaptations. Numerical gates and measurement limits are defined below.
+Coverage is colocated
 with these existing suites, selected
 by `all` and the standalone `rfdetr` route. This inventory describes source
 coverage, not a record that the current checkout passed these cases:
@@ -1288,17 +1076,10 @@ exact next-batch/Resume trajectory fixture enables deterministic cuDNN and
 disables cuDNN benchmarking for its comparison, then restores both settings.
 That fixture policy does not change ordinary training defaults.
 
-A retained compilation capture from the validated NGC payload contained
-1,163 executor-reuse records: 26 evaluation-backbone records each contained 33 TensorExpr groups;
-the other 1,137 records, including reported training-region graphs, had no
-counted fusion group. The bounded extracted evidence is
-`build/validation/compilation-execution-evidence-attempt7.jsonl`, retaining
-original log provenance. This historical observation establishes graph fusion in
-that evaluation backbone only; it is not a fresh acceptance run of the current
-implementation. Graph capture, executor reuse, available fuser flags
-and fused ATen operations do not establish training graph fusion or throughput.
-The [diagnostic fields](logging.md#native-selective-compilation) distinguish
-those facts.
+Graph capture, executor reuse, fuser availability, fused ATen operators, graph
+fusion, and throughput are separate claims. Inspect the actual optimized graph
+with [compilation diagnostics](logging.md#native-selective-compilation); functional
+compilation tests alone establish no training fusion or speedup.
 
 These are controlled functional, numerical, update and lifetime checks. The
 independent producer below executes actual upstream model/criterion/optimizer
@@ -1318,50 +1099,75 @@ A host lacking both cannot prove GDRCopy mapping even when CUDA/Wayland pass.
   --output build/validation/rfdetr-math/upstream
 ./mmltk --diagnose-rfdetr-upstream --upstream ../rf-upstream \
   --output build/validation/rfdetr-math/upstream-math --sdpa math
+./mmltk --diagnose-rfdetr-upstream --case CASE_ID --output FRESH_PATH
 ```
 
-Choose a fresh output directory for each production run. Admission requires a
-clean upstream checkout, including untracked files, at
-`e9a138f70cc14e3fddca029a0683055e34ab8f35`, plus the cached official
-`rf-detr-nano.pth` and `rf-detr-seg-nano.pt` under the repository cache's
-`mmltk/weights`. Source-specific command-local Git trust and read-only Git
-metadata mounts support linked worktrees and differently owned clean checkouts
-without changing global Git configuration. The source and weights remain
-read-only; the producer runs offline with a two-hour deadline. The
-[validation-only image](build.md#upstream-reference-image) retains the pinned
-donor Torch/CUDA environment.
+This diagnostic explicitly generates references and compares native code.
+Ordinary `all`/`rfdetr` never prepare them. Test `--with-upstream` opts into shared
+references and historical-session preparation; explicit `--env` evidence paths
+reuse only supplied data. Missing optional evidence skips; supplied invalid
+evidence fails admission.
 
-[The native producer](../tools/oracle/generate_rfdetr_upstream_oracle.cpp) embeds the
-donor's CPython runtime and imports the actual upstream model, matcher,
-criterion, and PyTorch optimizer. It records original
-official weight identities, normalized state, constructor facts, inputs/masks,
-outputs, operator boundaries, fixed cotangents/VJPs, stochastic samples,
-criterion terms, optimizer groups/moments/ages, and held-input outputs.
-`manifest.json` uses `mmltk.rfdetr.upstream-oracle.v1`, with source/payload/
-dependency/producer hashes, effective model and execution policy, and a checked
-tensor inventory for every archive. Unsupported precisions are explicit.
-`producer_sha256` identifies the running native producer executable.
+| Mode | Result |
+| --- | --- |
+| Full numerical (default) | All catalog references, then core/training/inference/export `[upstream_oracle]` cases |
+| `--case ID` | Exactly one named matrix case; same source/checkpoint/precision/archive checks, no native comparisons, manifest `selected_reference_native_comparison_pending`; cannot certify full matrix |
+| `--case ID --backward-operators` | Bounded intermediate gradient diagnostics; disabled by default |
+| `--case ID --export-reference` | Prepared CPU/CUDA controls and an actual pinned upstream ONNX artifact for one controlled FP32 batch-one case; disabled by default |
+| `--inventory-only` | Verify/download official assets; topology/class/joint/tensor metadata, no product build/forward/training/comparisons |
+| `--build-only` | Prepare isolated image/environment only, no weights/source checkout/numerical execution |
 
-The bounded stock matrix uses Nano 384 and SegNano 312, two Group-DETR groups,
-FP32/FP16/BF16 where available, batches one/two, and train/eval. Nano FP32 batch
-two training retains eight updates; the other cases retain one. The native
-comparison uses production custom CUDA attention. Default SDPA retains backend
-selection; `--sdpa math` explicitly selects upstream math SDPA and the native
-model-local math route. Both sides disable matmul/cuDNN TF32 for this controlled
-comparison; the manifest records float32 matmul precision `highest`.
-AMP main references use original upstream matcher functions with FP32 operands;
-the untouched upstream AMP matcher is also executed and saved under `stock/`.
-Its differences remain explicit policy observations.
+Admission requires clean core/Plus sources (including untracked files) at
+[`rfdetr_sources.json`](../tools/oracle/rfdetr_sources.json) revisions/trees.
+Omitted paths use managed pins; omitted output uses capability-addressed cache.
+Inventory verifies all sixteen official assets in cache `mmltk/weights`.
+Command-local Git trust/read-only metadata supports linked/differently owned
+checkouts without global changes. Numerical work binds source/weight identities,
+uses the [pinned donor image](build.md#upstream-reference-image), and has a
+48-hour deadline with bounded cancellation.
 
-After production, the wrapper runs `[upstream_oracle]` in both existing core
-and training executables. Only both successful stages publish
-`verdict.json` with `status=passed_required_checks`. The manifest's
-`references_complete_native_comparison_pending` status describes completed
-reference production and is not rewritten into a native-pass claim.
-References, appended `comparisons/*.jsonl`, `wrapper.log`, and executable logs
-survive comparison failure; cancellation settles the producer or child test
-owner without cancelling unrelated operations. Retry comparisons against
-retained artifacts without regenerating them:
+[Native producer](../tools/oracle/generate_rfdetr_upstream_oracle.cpp) embeds donor
+CPython and executes actual upstream model/matcher/criterion/PyTorch optimizer.
+`manifest.json` format `mmltk.rfdetr.upstream-oracle.v2` binds source/payload/
+dependency/producer hashes, model/execution policy, and checked tensor inventories.
+`producer_sha256` identifies the executable; unsupported precision is explicit.
+Archives retain official/normalized weights, constructors, inputs/masks/outputs,
+operator boundaries, cotangents/VJPs, stochastic samples, criterion terms,
+optimizer groups/moments/ages, and held-input results.
+
+Controlled FP32 batch-one cases also retain `export-math/`: the pinned source's
+prepared CUDA export graph with math SDPA, matching native export execution.
+Training cases capture this copy after their ordinary-policy update on the held
+input. Export comparisons use these outputs with the same value bounds and row
+order; native forward, gradient and optimizer comparisons retain the ordinary
+case policy. The manifest records the separate export policy. The optional
+`--export-reference` adds CPU and ordinary-policy CUDA controls plus a hash-bound
+artifact from the pinned upstream `OnnxExporter`. The export test's opt-in
+`MMLTK_RFDETR_EXPORT_SOURCE_RUNTIME=1` measures that independent artifact through
+the same runtime with matching precision options. These extra measurements do
+not replace required comparisons. `MMLTK_RFDETR_EXPORT_BACKEND=onnx|tensorrt`
+scopes a focused retry to the failed backend; default acceptance retains both.
+
+The sixteen-preset stock-resolution matrix includes full-stock FP32 training
+and controlled two-group train/eval, batches 1/2, FP32/FP16/supported BF16.
+Controlled batch-two training keeps eight updates/precision, others one:
+with BF16, **208 cases / 544 step archives**. Full tensor/gradient/update/moment
+payloads can exceed **1 TiB**; JSONL logs are separate and small.
+
+The native comparison uses production custom CUDA attention. Default SDPA keeps
+backend selection; `--sdpa math` explicitly selects both upstream math and native
+model-local math. Both disable matmul/cuDNN TF32; manifest precision is `highest`.
+Main AMP matcher references use original functions with FP32 operands; untouched
+upstream AMP matcher also runs under `stock/`, with explicit policy differences.
+
+Only all four successful native stages publish `verdict.json`,
+`status=passed_required_checks`. Full production status
+`references_complete_native_comparison_pending` is never rewritten as native
+success. Selected references never publish a full verdict. Per-attempt receipts,
+appended comparison JSONL, wrapper/executable logs, and references survive failure;
+cancellation retires only owned producer/test processes.
+
+Retry against explicit retained evidence without regeneration:
 
 ```bash
 ./mmltk --test rfdetr --executable mmltk_backend_models_rfdetr_core_tests \
@@ -1372,12 +1178,20 @@ retained artifacts without regenerating them:
   -- '[upstream_oracle]'
 ```
 
-Absent optional artifacts produce a skip, not independent parity evidence.
-Supplied invalid artifacts fail admission. The optional
-`MMLTK_RFDETR_UPSTREAM_REPEAT_DIR` supplies a second independently
-generated reference for upstream-versus-upstream comparisons. It is not needed
-by the ordinary public diagnostic. [Logging](logging.md#upstream-numerical-comparisons)
-explains record fields, retries, and bounded queries.
+Prepare unfinished cases individually, consume, then retire their payloads after
+**every required consumer** passes. Keep training inputs through optimizer and
+trained-export checks; preserve authenticated indexes, manifests, and reports.
+Omitted combinations stay unrun; deleting inputs does not change required scope.
+Official export reads explicitly selected inputs/task outputs, authenticating the
+full index and every selected physical shard; complete archive admission requires
+all payloads. Partially retained generations cannot serve fresh full checks and
+never regenerate implicitly. Preparation rejects `retention.json`-marked
+directories; use a fresh destination for missing cases.
+
+`MMLTK_RFDETR_UPSTREAM_REPEAT_DIR` optionally supplies a second independent
+reference for upstream-to-upstream observation; normal diagnostics do not need
+it. [Comparison logging](logging.md#upstream-numerical-comparisons) owns fields,
+retries, and queries.
 
 ### Numerical gates and trajectory observations
 
@@ -1417,67 +1231,11 @@ derivative gates compare against native eager execution, not stock upstream
 objective parity. Representative coverage uses official pretrained Nano 384,
 a frozen encoder, 13 groups, FP16/BF16, production `TrainingStep`, and fused AdamW.
 
-Independent upstream reruns themselves exceed original strict per-tensor and
-trajectory bounds. That measured fact motivated the separation above; it does
-not identify every native discrepancy as upstream noise. PyTorch distinguishes
+Independent upstream reruns can differ under finite precision; that does not
+classify a native discrepancy as upstream noise. PyTorch distinguishes
 [finite-precision operation order](https://docs.pytorch.org/docs/2.14/notes/numerical_accuracy.html)
 from [seeded randomness and deterministic algorithms](https://docs.pytorch.org/docs/2.14/notes/randomness.html).
-The [current results](reviews/rfdetr-math/current-results.md#measured-trajectories)
-retain the material remaining trajectory differences and the unmeasured AP limit.
-
-### Training startup and monitoring validation record
-
-The 2026-10-04 GUI capture for `output/train/run-0021` spent 63.066 seconds
-in dataset preparation. The selected `compiled/train.bin` contains 587,017
-eligible images, 5,069,379 labels, and 546,101,044 mask runs. Full admission
-walked those payloads before sampling or training. GPU monitoring starts with
-live training records, after this preparation stage.
-
-The read-only diagnostic in
-`build/validation/training-startup-measurement.log` measured the trusted
-header/index open at **15.289 ms** and full payload validation at **115.258 s**.
-Both ran serially in one invocation without requested cache eviction, while a
-user training run was active. An earlier full validation of recently accessed
-data took **1.109 s** (`training-startup-serial.jsonl` in the same directory).
-These measurements show cache/load sensitivity and the work removed from
-training admission; they do not measure complete training startup or establish
-a controlled end-to-end speedup. Sampling still needs class membership.
-
-Focused checks after `./mmltk --build` passed:
-
-| Coverage | Result | Local artifact under `build/validation/` |
-| --- | --- | --- |
-| Compiled admission, trusted/full and serial/parallel | 3 cases, 266 assertions | `training-startup-data-tests.log` |
-| Training telemetry and deterministic sampling plans | 20 cases, 2,599 assertions | `training-startup-training-tests.log` |
-| Preparation status and fatal-cause publication | 2 cases, 48 assertions | `training-startup-process-tests.log` |
-| Compiled diagnostic boundaries | 5 cases, 139 assertions | `training-startup-diagnostic-tests.log` |
-| Rust chart projection, retention, gaps, and selection | 33 cases | `training-charts-browser-tests.log` |
-| Browser pixel evidence, including flat chart boundaries | 9 cases across focused runs | `training-charts-pixel-proof-tests.log`, `training-charts-pixel-proof-tests-retry.log` |
-| Physical GPU monitor and CUDA-context preservation | 2 cases, 22 assertions, no skips | `training-charts-gpu-tests.log` |
-| Log queries, including bounded JSON documents | 183 cases | `training-json-log-tests.log` |
-
-After the pixel-probe correction, `./mmltk --build` passed again
-(`training-charts-pixel-proof-build.log`). The focused rendered gate
-`./mmltk --test workspace-wayland --headless-compositor -- 'workspace_wayland_workflows'`
-then passed, including normal training/chart interaction and the second
-browser's injected graphics-failure recovery. Its transcript is
-`training-charts-wayland-resumed.log`; `training-charts-rendered-evidence.jsonl`
-retains all four performance-chart pixel observations. The probe includes the
-full chart height so nearly flat used/total memory lines at opposite plot edges
-remain observable. Earlier resource-limited attempts ran while the user's
-training occupied the display GPU; the successful run followed its release.
-Existing successful checks were retained through focused retries. No full
-`all` suite, production dataset compilation, or Firefox-owned tests were run
-for this change.
-
-The earlier CLI/GUI throughput captures are not matched: CLI
-`checkpoints/nano-match-free2` froze the encoder and disabled denoising; GUI
-`output/train/run-0018` trained the encoder with denoising enabled. Their reader
-and prefetch settings also differed. The comparison is retained in
-`build/validation/training-gui-cli-comparison.jsonl`; its throughput values
-cannot establish GUI overhead. GUI progress reads in the later capture averaged
-about 0.3 ms across 239 observations (`training-gui-progress-read-cost.log`).
-All these artifacts are ignored local evidence, absent from a fresh checkout.
+Trajectory measurements do not establish AP, convergence or throughput equivalence.
 
 ## Benchmark compilation evidence
 
@@ -1608,323 +1366,19 @@ failure, Unicode scalars, and malformed wire-text rejection.
 
 ### Compiled Explore opening measurements
 
-The measurements below describe the former payload-verifying open. Current
-[compiled loading](datasets.md#loading-a-compiled-file) trusts published
-metadata for every reader and does not perform that scan. Use
-`--diagnose-benchmark-image --profile-compiled WORKERS` to measure current
-index loading; historical annotation-admission times measure different work.
-
-The 2026-10-04 capture delayed `shutdown.explore_join` by 72.29 seconds while
-the initial discrete Explore operation was active. An isolated read-only scan
-of the selected `compiled/train.bin` reproduced the costly cold annotation
-admission. The file contains 587,017 eligible images across 621,608 slots,
-5,069,379 objects and 546,101,044 RLE pairs. Its validated maximum complete
-label payload is 121,824 bytes; the maximum object count is 688 per image.
-The current `compiled/val.bin` header reports 5,000 images, at most 63 objects
-and a maximum payload of 40,624 bytes. The compiler default therefore covers
-both existing outputs; it is not a bound inferred for other resolutions or
-future datasets.
-
-| Annotation admission | Observed wall time |
-| --- | ---: |
-| Existing serial open, cached file | 0.962 s |
-| Existing serial open, file-local cache eviction requested | 124.528 s |
-| Parallel open, same eviction request, eight persistent workers | 16.798 s |
-
-The parallel workers used CPUs 0, 2, 4, 6, 8, 10, 12 and 14, NUMA node 0,
-and nice −10. The original serial captures did not record placement, so these
-are observed end-to-end opening times, not an isolated CPU-kernel comparison.
-Both cold scans admitted identical object/run totals and exact maximum bytes.
-No images were downloaded or compiled. Local records are
-`build/validation/explore-open-baseline.jsonl`,
-`explore-open-baseline-cold.jsonl` and `explore-open-parallel-cold.jsonl` in
-that directory; the [diagnostic command](commands.md#wrapper-operations)
-records placement in subsequent captures.
-
-The focused validation built the complete product and checked changed native
-units with tidy. Dataset admission, cancellation, pool reuse, compilation and
-storage checks passed across the data suite and its focused retry: the initial
-run had 566 passes, one fixture failure and one unavailable GDR branch; the
-fixture then passed 75 assertions after explicitly selecting the persisted
-format ceiling for its deliberately wide annotation. The new diagnostic cases
-passed 137 assertions in five cases. Native Explore acceptance passed 157,085
-assertions across eight cases; four cases were marked skipped after their
-available paths completed because GDR was unavailable. Captures are
-`explore-build-final.log`, `explore-data-tests.log`, `explore-data-retry.log`,
-`explore-diagnostic-tests.log` and `explore-native-acceptance.log` under
-`build/validation/`. Packaged acceptance through
-`./mmltk --test workspace-wayland --headless-compositor` also exited zero:
-88 cases passed, one GDR-capability case was skipped, and all 155,094 assertions
-passed (`build/validation/explore-wayland-acceptance.log`). No full `all` suite
-or production dataset compilation was part of this focused follow-up.
-
-After removing reader verification, the same existing training bin opened in
-8,115,359 ns (about 8.1 ms) with eight workers and file-local cache eviction
-requested. Recorded index totals remained 5,069,379 labels and 546,101,044 runs
-across 621,608 physical slots. This measures the trusted shared open, excluding
-Explore's subsequent label-summary pass and rendering. Worker placement matched
-the earlier eight-worker capture. The read-only command was:
+Measure the current trusted index open through the read-only diagnostic:
 
 ```bash
 ./mmltk --diagnose-benchmark-image --compiled compiled/train.bin --sample 0 \
   --profile-compiled 8 --cold-compiled
 ```
 
-The capture is
-[explore-open-trusted-cold.jsonl](../build/validation/explore-open-trusted-cold.jsonl).
-The product build and targeted tidy passed. Focused data checks passed 28,084
-assertions across 34 cases (33 passed, one marked skipped after H2D coverage
-because GDR was unavailable); diagnostic checks passed 137 assertions in five
-cases; native Explore acceptance passed all 157,083 assertions across eight
-cases (four passed, four marked skipped at their unavailable GDR branches).
-The respective test transcripts are
-[data](../build/logs/mmltk-test-20261004-171952-3066505.log),
-[diagnostics](../build/logs/mmltk-test-20261004-172153-3072276.log), and
-[Explore](../build/logs/mmltk-test-20261004-172213-3076038.log).
-
-### Compiler throughput validation record
-
-The aggregate-throughput implementation and validation finished at `cecde5c5`,
-using production baseline `333032e7` preserved at documentation commit
-`21bdcadc`. The [validation ledger](../build/validation/benchmark-throughput-validation.json)
-records both clean full tidy stages, fresh cleanup passes, initial/final product
-builds, focused remediation, retained successful checks, and bounded acceptance.
-The checkpoints are `de7d0d5f` (`pre cleanup`) and `6942a35e` (`post cleanup`).
-
-| Final gate | Result |
-| --- | --- |
-| [`./mmltk --test all`](../build/validation/benchmark-throughput-test-all-final.log) | Exit 0; the data executable passed 566 cases and 426,740 assertions, with one hardware-dependent skip |
-| [`./mmltk --test workspace-wayland --headless-compositor`](../build/validation/benchmark-throughput-wayland-final.log) | Exit 0; 88 passed cases and 148,146 assertions, with one unavailable GDR-capability skip |
-
-[Final gate results](../build/validation/benchmark-throughput-final-gates.json)
-retain exact command lines, transcripts, statuses, and times. The current suite
-pair followed the successful final build and focused fixes. Firefox coverage was first-party
-packaged acceptance; no Firefox-owned suite or new complete Coconut run ran.
-
-The [performance report](benchmark-performance.md#implemented-changes-and-bounded-measurements)
-owns the matched matrix, core-controlled repeats, operation-count evidence,
-output hashes, earlier small-image regression, and measured limits. Pipeline
-and compaction compare output/live-payload hashes; Pixels/Resample retain
-independent numerical coverage rather than claiming a profile hash check.
-All referenced `build/validation` artifacts are ignored local evidence.
-
-### Earlier compiler throughput validation record
-
-The throughput and storage implementation spans `0d4e0f7a..333032e7`.
-The local [performance ledger](../build/validation/benchmark-perceptual-performance.json)
-retains the initial cancelled GUI capture, phase evidence, commands, profile
-inputs, and validation scope. Cleanup checkpoints were `78ace8a2`
-(`pre cleanup`) and `e43b17ec` (`post cleanup`); both configured tidy stages
-and both cleanup profiles completed cleanly. Final follow-up validation used
-the explicit benchmark-only scope, retaining earlier successful checks.
-
-| Evidence | Result |
-| --- | --- |
-| [Final product build](../build/validation/benchmark-settlement-lifetime-build.log) | Exit 0; runtime `sha256:ba4609f2ffb21c5172ea5794c1b5e8e9123df3dbaca444b63518000e1539f98d` |
-| [Batch settlement and Coconut cases](../build/validation/benchmark-settlement-batch-tests.log) | Exit 0; 170 cases, 68,164 assertions, before final batch-lifetime hardening |
-| [Final affected cases](../build/validation/benchmark-final-targeted.log) | Exit 0; 3 cases, 11,217 assertions for batch settlement, dynamic slots, and fairness fixture synchronization |
-| Earlier [complete ordinary suite](../build/logs/mmltk-test-20261003-021103-3285703.log) and subsequent [Wayland acceptance](../build/logs/mmltk-test-20261003-023536-3345034.log) | Both exit 0 before later compiler follow-ups; Wayland had 88 passes, one GDR skip, and 147,989 assertions |
-| Later [broad suite](../build/validation/benchmark-final-all.log) | Stopped at user request, exit 143; resampling passed 47 cases/376,015 assertions, data reached 529 passes/one fairness-fixture failure/one skip. The fixture then passed in the final focused run above. This is not a passing full-suite result. |
-
-Those follow-ups ended without a new passing full `all`/Wayland pair at
-`333032e7`; the later completed pair is recorded above. The explicitly requested
-complete Coconut observations and earlier `42c97d14` bounded comparisons are
-retained in the [performance report's baseline evidence](benchmark-performance.md#baseline-measurement-boundary),
-with their cache, mixed-core, and trace-cost limitations. These ignored local
-artifacts are absent from a fresh checkout.
-
-### Benchmark ownership and recovery validation record
-
-This compilation ownership, recovery, and publication work completed at
-`9da36b78`. The local
-[validation ledger](../build/validation/benchmark-ownership.json) retains
-phase/audit commits, controlled before/after evidence, focused remediation,
-and the full validation stage history. Cleanup checkpoints are `14e261f8`
-(`pre cleanup`) and `f8404cad` (`post cleanup`). Both full tidy stages ended
-clean; the fresh C++ and frontend cleanup profiles reported zero textual and
-structural hits. The final runtime image is
-`sha256:55e52edfd4da54686f751e5332da9760e1e6c4e6613bb5244a46d05378b0148a`.
-
-| Final required operation | Transcript and result |
-| --- | --- |
-| `./mmltk --build`, after remediation | [mmltk-build-20261002-142718-2352585.log](../build/logs/mmltk-build-20261002-142718-2352585.log), exit 0 |
-| `./mmltk --test all` | [mmltk-test-20261002-143151-2373087.log](../build/logs/mmltk-test-20261002-143151-2373087.log), exit 0; 489 dataset cases passed, one GDR skip, 400,790 assertions; nine GDR-dependent native skips across the complete run, one existing ignored Rust doctest, and 177 log-query fixtures passed |
-| Subsequent `./mmltk --test workspace-wayland --headless-compositor` | [mmltk-test-20261002-150148-2441664.log](../build/logs/mmltk-test-20261002-150148-2441664.log), exit 0; 88 cases passed, one GDR skip, 147,757 assertions |
-
-These local ignored artifacts are absent from a fresh checkout. Compiler
-coverage includes Coconut with Stock validation, dropped-mask recovery enabled,
-Stretch, and perceptual downscaling. Directory and benchmark retain distinct
-source front ends and codec policies while sharing the
-[execution, storage, and publication owners](compile-execution.md).
-
-Controlled NUMA evidence reproduced the reported residency error by discarding
-an unlocked prefaulted page before verification. After locking moved before
-verification, the discard was refused and the ownership case passed. The
-original workload was unlogged: its actual per-page kernel status, including
-whether a page was missing or on another node, remains unknown.
-
-The 96-row Parquet fixture previously observed 540 metadata readiness visits
-in each pressure variant. The final case bounds those visits to the row count
-and requires two projection openings, zero replayed rows, retained payloads,
-and settled storage with and without unrelated scratch contention. Late
-physical/original repair cases cover cold and retained components, independent
-unrelated sources, converged identities, and released publication leases.
-
-Final Validation also reproduced recovery returning to a pending-original wait
-after shared execution had already failed. The correction propagates the
-existing interruption cause through recovery settlement. The final suites cover
-both fatal label conversion and independent compiler failure while originals
-and JPEG geometry remain held. Retry coverage creates and inspects a real
-compiled artifact through fresh staging after the preceding failure leaves
-the final destination absent. The historical Compile-again error
-`open failed: compiled/train.bin: No such file or directory` has not been
-reproduced through the current direct Compile path; successful retry and
-operation-stage diagnostics do not establish its historical root cause.
-
-The recipe became 17 lines smaller and the duplicated publication bodies
-shrank from 58 to 39 lines; production changes from `5b0e775a` through
-`9da36b78` totaled 234 additions and 174 deletions, a net increase of 60 lines.
-Fixture counts establish removed scans and reused workers, not a production
-speedup percentage.
-That validation measured no production-sized throughput or peak-memory
-benchmark. GDR skips
-remain unverified hardware coverage. Firefox coverage used only first-party
-suites and packaged application acceptance; no Firefox-owned tests were added
-or run.
-
-### Firefox and benchmark pipeline validation record
-
-The preceding Firefox and benchmark pipeline validation is recorded at `87a0d2b1`.
-The local [validation ledger](../build/validation/firefox-benchmark-validation.json)
-retains both full tidy stages, fresh C++/frontend cleanup results, builds,
-focused remediation, and final suite results. The cleanup checkpoints are
-`464b4b6c` (`pre cleanup`) and `10f3cdd4` (`post cleanup`). The final runtime image
-is `sha256:63660f31e205ff07335861d7922b3fb9fffe12d0b9b9d4c1b661b9e17c710308`.
-
-| Final required operation | Transcript and result |
-| --- | --- |
-| `./mmltk --build`, after remediation | [mmltk-build-20261001-161418-1078382.log](../build/logs/mmltk-build-20261001-161418-1078382.log), exit 0 |
-| `./mmltk --test all` | [mmltk-test-20261001-162542-1107674.log](../build/logs/mmltk-test-20261001-162542-1107674.log), exit 0; 480 dataset cases passed with 399,183 assertions, nine GDR-dependent native skips across the suites, and one existing ignored Rust case |
-| Subsequent `./mmltk --test workspace-wayland --headless-compositor` | [mmltk-test-20261001-165121-1164919.log](../build/logs/mmltk-test-20261001-165121-1164919.log), exit 0; 88 cases passed, one GDR-dependent skip, 148,715 assertions |
-
-These are local ignored artifacts, absent from a fresh checkout. The
-[log query](logging.md#wrapper-build-test-and-tidy-transcripts) exposes terminal
-and suite summaries without rerunning validation.
-
-The reported production configuration was COCONut, Stock validation, mask
-recovery enabled, Stretch, and perceptual downscaling. Its observation of
-Labels/masks `241596/241605` and Pixels `16177/unknown` ended with
-`dataset compiler returned invalid progress in its current state`. Source and
-controlled cases established mixed row/component accounting and premature
-known-total aggregation; the compiler now reports canonical units and exact row
-ledgers while retaining strict progress rejection. Separate controlled source
-custody evidence established cache preparation waiting on a still-live lease
-held by its own controller/sibling; the correction reuses that exact lease.
-The fixture with the same configuration also proves ready physical-archive
-pixels can complete while a peer download remains held. No supplied production
-trace establishes sustained throughput, a measured speedup, or every cause of
-the production wait.
-
-Firefox coverage remains in the existing first-party suites and packaged
-application acceptance. The complete Wayland pass covers direct/copy workspace
-integration, retained content, resizing, recovery, quiet execution, and shutdown.
-It does not individually exercise every actor collision or binding ordering,
-descriptor/capability rejection, Vulkan fatal branch, or idle semaphore-retirement
-branch. GDR-dependent skips remain unverified hardware coverage. No Firefox-owned
-test suite or dedicated Firefox harness was run for this validation.
-
-### Adaptive compilation validation record
-
-The earlier execution/progress cutover finished at implementation commit
-`7f2c12b9`. Its local
-[validation ledger](../build/validation/adaptive-execution-state.txt) records
-the complete stage history: first full tidy and initial build, `pre cleanup`
-at `dde77d44`, both fresh cleanup profiles and the second full tidy, and
-`post cleanup` at `b1e98a1d`, followed by the required final build, tests, and
-focused remediation. These are local ignored artifacts, absent from a fresh
-checkout.
-
-| Run | Transcript and result |
-| --- | --- |
-| Full `all` | [mmltk-test-20261001-054834-223635.log](../build/logs/mmltk-test-20261001-054834-223635.log), exit 42; exactly one failing Open Images progress-observation fixture, with all other native/browser/tool groups completed |
-| Open Images focused retry | [mmltk-test-20261001-061354-308088.log](../build/logs/mmltk-test-20261001-061354-308088.log), exit 0; 22 assertions, one case, after checking throttle decisions through their existing trace and valid delivered snapshots |
-| Full headless Wayland | [mmltk-test-20261001-061608-314991.log](../build/logs/mmltk-test-20261001-061608-314991.log), exit 42; 87 passed cases, one retained-state failure, one unavailable GDR case skipped |
-| Product rebuild after fullscreen correction | [mmltk-build-20261001-063454-357066.log](../build/logs/mmltk-build-20261001-063454-357066.log), exit 0 |
-| Focused browser-driver checks | [mmltk-test-20261001-064204-380016.log](../build/logs/mmltk-test-20261001-064204-380016.log), exit 0 |
-| `workspace_wayland_retained` | [mmltk-test-20261001-064214-383849.log](../build/logs/mmltk-test-20261001-064214-383849.log), exit 0; 8,932 assertions, one case |
-| Directly affected `workspace_wayland_dpi` | [mmltk-test-20261001-064613-397292.log](../build/logs/mmltk-test-20261001-064613-397292.log), exit 0; 7,239 assertions, one case |
-
-The retained-state failure came from integration-only Firefox shortcuts that
-changed document fullscreen without resizing the native Wayland widget.
-Removing those shortcuts restored parent/widget fullscreen entry and exit.
-The successful [retained Firefox capture](../build/validation/latest-wayland-test-firefox.log.history/69-863342452984565.log)
-recorded a 1920×1080 fullscreen viewport and
-1500×1100 restoration, all four steps in both native compile generations,
-advancing progress without recorded pointer, wheel, or keydown events,
-cancellation/restart, and artifact publication.
-
-This run retained successful results under an explicit focused-continuation
-instruction. Neither a later clean full `all` rerun nor a later clean full
-Wayland rerun was performed. The passed retries resolve the recorded failures
-within that scope; GDR hardware skips remain unverified coverage. They make no
-full-release COCONut throughput, sustained CPU utilization, or peak-RSS claim.
-
-### Fixed-storage measurements
-
-The earlier format-10 validation of implementation commit `23974612` retained these
-2026-09-29 wrapper transcripts:
-
-| Operation | Transcript and observed result |
-| --- | --- |
-| `./mmltk --build` | [mmltk-build-20260929-224513-2452962.log](../build/logs/mmltk-build-20260929-224513-2452962.log), exit 0 |
-| `./mmltk --test all` | [mmltk-test-20260929-232113-2554469.log](../build/logs/mmltk-test-20260929-232113-2554469.log), exit 0; nine native GDR-related cases skipped |
-| `./mmltk --test workspace-wayland --headless-compositor` | [mmltk-test-20260929-234032-2601309.log](../build/logs/mmltk-test-20260929-234032-2601309.log), exit 0; 89,357 assertions, 87 passed cases, one unavailable GDR scenario skipped |
-
-The data round-trip case completed its H2D checks before reporting its GDR
-skip. These results establish the executed H2D/CUDA/Wayland paths, not GDR
-mapping support on this host. The transcripts are local ignored build evidence,
-not files shipped by a fresh checkout. Use the
-[log-query examples](logging.md#benchmark-compilation-traces) to inspect complete
-measurement records and terminal status.
-
-The all-suite transcript contains bounded fixture observations:
-
-| Record | Observed value and scope |
-| --- | --- |
-| `benchmark_label_fixture` | First projection 1,161 ns; 256 active label bytes; 1,000,012 retained workspace bytes; zero steady output-vector growths. The growth observer covers two output vectors and excludes mapped backing. |
-| `benchmark_pipeline_fixture` | First label slot 81,691 ns; first pixel slot 1,026,153 ns; labels ready before JPEG arrival. Timings span ready publication to slot completion with fixture-owned normalized input. |
-| `compiled_stream_fixture` (H2D) | First host pixels/labels 53,668 ns; 6,720 logical label bytes and 8,192 retained label bytes; zero steady growths. Observation covers owned buffers/read containers, not every allocation. |
-| `native_png_fixture` | Exact independent scalar-ID/run equivalence across 18,456 pixels and 797 runs; combined PNG decode/support time 115,942 ns. This does not isolate SIMD performance. |
-
-The used-byte copy fixture compares format 10 with an independent reproduction
-of the packed algorithm at `3b1373b9`. Each reports sixteen repetitions totaling
-16,224,000 pixel bytes and 35,840 label bytes:
-
-| Warm order | Fixed format 10, bytes/s | Prior packed algorithm, bytes/s |
-| --- | ---: | ---: |
-| Sequential | 27,911,061,369 | 29,822,530,355 |
-| Shuffled, seed 1729 | 27,716,707,236 | 27,211,891,680 |
-
-The sequential fixed layout required 320 pixel copy calls versus 16 for packed
-storage; both shuffled paths required 320. Page padding prevents coalescing in
-that fixed fixture. These are warm in-memory used-byte copies, not cold storage
-or GPU end-to-end throughput. The comparison does not establish either layout
-as universally faster.
-
-Compaction started with a 1,310,724,192-byte apparent staged file:
-
-| Eligible maximum label bytes | Final apparent bytes |
-| ---: | ---: |
-| 0 | 1,210,060,896 |
-| 72 | 1,216,352,352 |
-| 466,944 | 1,304,432,736 |
-| 500,000 | 1,310,724,192 |
-
-The fixture verified unchanged inode identity and the 4 MiB scratch ceiling.
-Apparent lengths include sparse holes and padding; they do not measure allocated
-disk blocks or process RSS. None of these bounded observations is a production
-baseline for COCONut B's 241,602 images, a cold-cache benchmark, a full-release
-memory measurement, or an isolated SIMD speedup.
+Retain recorded counts, worker affinity/NUMA/nice, input identity, and cache
+condition. `--cold-compiled` requests eviction only for that file. The timed
+open copies/aggregates published metadata; it excludes payload verification,
+Explore's later label-summary pass, and rendering. [Compiled loading](datasets.md#loading-a-compiled-file)
+defines that boundary. Compare equivalent work and placement; file-local eviction
+does not establish cold host/device state.
 
 ## Shared fixtures and evidence
 
@@ -1976,5 +1430,5 @@ not establish that the full Upscale raster-oracle executable ran; those cases
 also require independent oracle files. Likewise, CPU assertions in a
 masked-device run do not verify GPU behavior. Asset-cache metadata validation
 must explicitly request ONNX diagnostics and distinguish reuse from export.
-Build, test, architecture-review, and documentation-review results remain
-separate evidence.
+Keep command results and reviews separate. Review reports belong only under
+ignored `build/validation/`; never add or commit them as documentation.

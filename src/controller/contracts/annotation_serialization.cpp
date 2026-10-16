@@ -4,15 +4,35 @@
 #include "src/controller/contracts/annotation.h"
 #include "src/frameworks/serialization/serialization.h"
 namespace mmltk::controller::contracts {
+namespace {
+constexpr mmltk::frameworks::serialization::wire::Limits kAnnotationLimits{.max_bytes = kAnnotationUiStateByteBudget, .max_items = kAnnotationUiStateByteBudget};
+}
+bool AnnotationDocumentBudget::AddSchema(const mmltk::backend::data::catalog::ClassKeypointSchema& schema) noexcept {
+ for (const auto& name : schema.names)
+  if (!Add(name.size(), names_, kAnnotationDocumentJointNameBytes)) return false;
+ try {
+  const auto bytes = mmltk::frameworks::serialization::measure_transport(schema, kAnnotationLimits);
+  return bytes && Bytes(*bytes);
+ } catch (...) { return false; }
+}
+bool AnnotationDocumentBudget::AddObject(const AnnotationObject& object) noexcept {
+ if (!Add(object.mask.runs.size(), runs_, kAnnotationMaskRunCapacity) || !Add(object.skeleton_nodes.size(), joints_, kAnnotationDocumentJointCapacity) ||
+     !Add(object.skeleton_edges.size(), edges_, kAnnotationDocumentEdgeCapacity)) return false;
+ for (const auto& node : object.skeleton_nodes)
+  if (!Add(node.key.size(), names_, kAnnotationDocumentJointNameBytes)) return false;
+ try {
+  const auto bytes = mmltk::frameworks::serialization::measure_transport(object, kAnnotationLimits);
+  return bytes && Bytes(*bytes);
+ } catch (...) { return false; }
+}
 bool encode_annotation_persistence(const AnnotationUiState& state, std::vector<std::byte>& destination) noexcept {
- constexpr mmltk::frameworks::serialization::wire::Limits limits{.max_bytes = kAnnotationUiStateByteBudget, .max_items = kAnnotationUiStateByteBudget};
- return mmltk::frameworks::serialization::encode(state, destination, limits).has_value();
+ return mmltk::frameworks::serialization::encode(state, destination, kAnnotationLimits).has_value();
 }
 std::optional<AnnotationUiState> decode_annotation_persistence(std::span<const std::byte> bytes) noexcept {
  namespace serial = mmltk::frameworks::serialization;
  namespace wire = serial::wire;
  try {
-  auto value = wire::decode({.first = bytes}, {.max_bytes = kAnnotationUiStateByteBudget, .max_items = kAnnotationUiStateByteBudget});
+  auto value = wire::decode({.first = bytes}, kAnnotationLimits);
   if (!value) return {};
   const auto member = [](wire::Value& object, std::string_view key) -> wire::Value* {
    auto* fields = std::get_if<wire::Value::Object>(&object.storage);

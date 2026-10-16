@@ -230,24 +230,36 @@ TEST_CASE("Live provider admission failure requires joined clean media resources
  StartupOwner owner;
  struct Provider {
   mmltk::testsupport::TestGate construction{"Live provider admission"};
-  bool invalidate_stream = false;
+  bool fail_cleanup = false;
   bool cancelled = false;
-  cudaError_t invalidation = cudaSuccess;
+  std::atomic_bool fail_restore{false};
+  std::atomic<unsigned> restore_failures{0};
  } provider;
- provider.invalidate_stream = fail_cleanup;
+ provider.fail_cleanup = fail_cleanup;
  provider.cancelled = cancelled;
- LiveMediaDataPlane plane(owner.Configuration());
+ auto config = owner.Configuration();
+ config.device_api = {
+  &provider,
+  [](void*, int* device) noexcept { return cudaGetDevice(device); },
+  [](void* context, int device) noexcept {
+   auto& state = *static_cast<Provider*>(context);
+   if (state.fail_restore.exchange(false)) {
+    ++state.restore_failures;
+    return cudaErrorInvalidValue;
+   }
+   return cudaSetDevice(device);
+  }
+ };
+ LiveMediaDataPlane plane(config);
  CHECK_FALSE(plane.no_custody_start_settlement().ok());
  auto startup = std::async(std::launch::async, [&] {
   return plane.start({&provider, [](const void* context, mmltk::backend::ml::runtime::BorrowedCommandStream stream) -> std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider> {
    auto& state = *static_cast<Provider*>(const_cast<void*>(context));
    if (!stream.valid) throw std::runtime_error("provider stream unavailable");
    state.construction.receipt().ArriveAndWait();
-   // PhysicalResources creates this stream immediately before this factory.
-   // No provider exists and no analyzer/capture worker has started, so there
-   // are no submitted stream consumers or callbacks. Deliberately retire the
-   // otherwise unused stream to exercise the owner's real cleanup error path.
-   if (state.invalidate_stream) state.invalidation = cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream.native_handle));
+   // Fail one cleanup scope's device restoration through the existing device
+   // API boundary. The owner retains and releases every real CUDA handle.
+   state.fail_restore = state.fail_cleanup;
    throw std::runtime_error(state.cancelled ? "provider admission cancelled before capture" : "provider artifact IO admission refused before capture");
   }});
  });
@@ -256,7 +268,7 @@ TEST_CASE("Live provider admission failure requires joined clean media resources
  CHECK_FALSE(plane.no_custody_start_settlement().ok());
  provider.construction.Release();
  const auto start = mmltk::testsupport::await_test_future(startup, "Live provider startup", std::chrono::seconds{20});
- REQUIRE(provider.invalidation == cudaSuccess);
+ REQUIRE(provider.restore_failures.load() == (fail_cleanup ? 1U : 0U));
  REQUIRE(start.valid());
  CHECK_FALSE(start.has_custody());
  CHECK(start.status.message == (cancelled ? "provider admission cancelled before capture" : "provider artifact IO admission refused before capture"));
@@ -268,7 +280,7 @@ TEST_CASE("Live provider admission failure requires joined clean media resources
  if (fail_cleanup) CHECK(settled.code == mmltk::backend::media::capture::StatusCode::kCudaError);
  CHECK_FALSE(owner.failed.load());
  CHECK(plane.first_failure().message == start.status.message);
- // The invalid-handle cleanup failure is ordinary: it must not poison the
+ // The device-restoration failure is ordinary: it must not poison the
  // CUDA context or prevent subsequent owner allocations and release.
  void* allocation = nullptr;
  REQUIRE(cudaMalloc(&allocation, 32) == cudaSuccess);
@@ -401,8 +413,10 @@ TEST_CASE("Live media leases keep capture clean beside masks boxes and manual al
  CHECK(semantic[center] == (mode == 2 ? 78 : 0));
  CHECK(semantic[center + 1] == (mode == 2 ? 69 : 100));
  if (mode == 2) {
-  CHECK(semantic[(4 * 32 + 4) * 4] == 255);
-  CHECK(semantic[(4 * 32 + 4) * 4 + 3] == 255);
+  // Box strokes extend outside the bounds; the inside corner remains mask.
+  CHECK(semantic[(4 * 32 + 3) * 4] == 255);
+  CHECK(semantic[(4 * 32 + 3) * 4 + 3] == 255);
+  CHECK(semantic[(4 * 32 + 4) * 4 + 3] == 115);
  }
  namespace raster = mmltk::backend::imaging::raster;
  mmltk::testsupport::ScopedTestStream composite_stream;
@@ -560,13 +574,17 @@ TEST_CASE("moving over an active Live output lease abandons only the displaced s
  LeaseProbe first;
  LeaseProbe second;
  auto displaced = LiveCompositeOutputLease::Create(&first, &LeaseProbe::Complete, &LeaseProbe::Abandon, kView, kRevision);
- auto replacement = LiveCompositeOutputLease::Create(&second, &LeaseProbe::Complete, &LeaseProbe::Abandon, kView,
+ auto replacement_view = kView;
+ replacement_view.ready_event = 8U;
+ auto replacement = LiveCompositeOutputLease::Create(&second, &LeaseProbe::Complete, &LeaseProbe::Abandon, replacement_view,
   PhysicalFrameRevision{
    .revision = 4U,
    .frame = {.session = 4U, .sequence = 6U},
    .slot = 2U,
    .ready_event = 8U,
   });
+ REQUIRE(displaced);
+ REQUIRE(replacement);
  displaced = std::move(replacement);
  std::move(displaced).Complete();
  CHECK(first.abandonments == 1U);

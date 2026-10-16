@@ -29,6 +29,7 @@ struct Signature {
  size_t count = 0;
  bool grad = torch::GradMode::is_enabled();
  bool amp = false;
+ bool amp_cache = false;
  c10::ScalarType amp_dtype = c10::ScalarType::Undefined;
  std::uint64_t specialization = 0;
  std::array<bool, 10> attention_policy{};
@@ -57,17 +58,20 @@ Signature signature_of(std::span<const torch::Tensor> inputs, bool dynamic, std:
  }
  const auto device_type = inputs.front().device().type();
  result.amp = at::autocast::is_autocast_enabled(device_type);
+ result.amp_cache = result.amp && at::autocast::is_autocast_cache_enabled();
  if (result.amp) result.amp_dtype = at::autocast::get_autocast_dtype(device_type);
  return result;
 }
-class RecordingAutocastCache final {
-public:
- RecordingAutocastCache() : previous_(at::autocast::is_autocast_cache_enabled()) { at::autocast::set_autocast_cache_enabled(false); }
- ~RecordingAutocastCache() { at::autocast::set_autocast_cache_enabled(previous_); }
-
-private:
- bool previous_;
-};
+void trace_cached_cast(const torch::Tensor& tensor, c10::DeviceType device, at::ScalarType dtype) {
+ if (tensor.device().type() != device || tensor.scalar_type() != torch::kFloat32 || !tensor.requires_grad() || !tensor.is_leaf()) return;
+ const auto converted = at::autocast::cached_cast(dtype, tensor, device);
+ if (torch::jit::tracer::getTracingState()->hasValue(converted)) return;
+ // A cast cached by the enclosing AMP scope predates this graph. Give its
+ // alias a recorded conversion while retaining the ordinary shared autograd
+ // tensor. Disabling the cache instead changes low-precision accumulation.
+ const auto recorded = tensor.to(dtype, false, true);
+ torch::jit::tracer::setValueTrace(converted, torch::jit::tracer::getValueTrace(recorded));
+}
 TensorSignature state_signature(const torch::Tensor& tensor) {
  TORCH_CHECK(tensor.dim() <= 4, "traced owner tensor rank exceeds four");
  TensorSignature result{tensor.device(), tensor.scalar_type(), {}, tensor.dim(), tensor.requires_grad()};
@@ -176,9 +180,9 @@ TensorTrace::Result TensorTrace::invoke(bool training, std::span<const torch::Te
     count(count, graph->block());
    }
    logger.debug(
-    "rfdetr compilation region={} owner={} reason={} training={} signature={} grad={} amp={} amp_dtype={} torch={} executor_optimize={} fuse_cpu={} fuse_gpu={} tf32_matmul={} tf32_cudnn={} "
+    "rfdetr compilation region={} owner={} reason={} training={} signature={} grad={} amp={} amp_cache={} amp_dtype={} torch={} executor_optimize={} fuse_cpu={} fuse_gpu={} tf32_matmul={} tf32_cudnn={} "
     "graph_available={} operators={} fusion_groups={} tensor_expr_groups={}",
-    name_, static_cast<const void*>(this), reason, training, metadata.str(), signature.grad, signature.amp, static_cast<int>(signature.amp_dtype), TORCH_VERSION,
+    name_, static_cast<const void*>(this), reason, training, metadata.str(), signature.grad, signature.amp, signature.amp_cache, static_cast<int>(signature.amp_dtype), TORCH_VERSION,
     torch::jit::getGraphExecutorOptimize(), torch::jit::canFuseOnCPU(), torch::jit::canFuseOnGPU(), at::globalContext().allowTF32CuBLAS(), at::globalContext().allowTF32CuDNN(),
     static_cast<bool>(graph), operators, fusion_groups, tensor_expr_groups);
   });
@@ -231,8 +235,12 @@ TensorTrace::Result TensorTrace::invoke(bool training, std::span<const torch::Te
   torch::jit::Stack arguments;
   for (const auto& input : inputs) arguments.emplace_back(input);
   const auto recording = [&] {
-   RecordingAutocastCache cache;
    return torch::jit::tracer::trace(std::move(arguments), [&](torch::jit::Stack values) {
+    if (signature.amp_cache) {
+     const auto device = inputs.front().device().type();
+     for (const auto& input : inputs) trace_cached_cast(input, device, signature.amp_dtype);
+     for (const auto& owned : candidate->members) trace_cached_cast(owned.tensor, device, signature.amp_dtype);
+    }
     std::array<torch::Tensor, 2> tensors;
     for (std::size_t index = 0; index < values.size(); ++index) tensors[index] = values[index].toTensor();
     auto output = ordinary(std::span(tensors.data(), values.size()));

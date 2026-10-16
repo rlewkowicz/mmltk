@@ -695,7 +695,8 @@ TEST_CASE("Atto trains encoder predictions while retaining cold dormant state wi
  rf::NativeRfDetrModel model(config);
  model.train();
  const auto kind = GENERATE(rf::TrainOptimizerKind::AdamW, rf::TrainOptimizerKind::Muon, rf::TrainOptimizerKind::SGD);
- auto built = rf::build_optimizer(model.named_parameters(), optimizer_test_request(kind), config.backbone);
+ const auto optimizer_parameters = model.named_optimizer_parameters();
+ auto built = rf::build_optimizer(optimizer_parameters, optimizer_test_request(kind), config.backbone);
  const auto dormant = [](std::string_view name) {
   return name.starts_with("class_embed.") || name.starts_with("bbox_embed.") || name == "query_feat.weight" || name == "refpoint_embed.weight" || name.starts_with("transformer.decoder.");
  };
@@ -703,31 +704,39 @@ TEST_CASE("Atto trains encoder predictions while retaining cold dormant state wi
  for (const auto& parameter : model.named_parameters()) {
   REQUIRE_FALSE(parameter.key().starts_with("transformer.decoder.layers."));
   if (dormant(parameter.key())) {
-   CHECK_FALSE(parameter.value().requires_grad());
+   CHECK(parameter.value().requires_grad());
+   CHECK_FALSE(optimizer_parameters[parameter.key()].requires_grad());
+   CHECK(optimizer_parameters[parameter.key()].data_ptr() == parameter.value().data_ptr());
    retained.emplace_back(parameter.key(), parameter.value().detach().clone());
   }
  }
  REQUIRE_FALSE(retained.empty());
- for (const auto& name : built.optimizer.parameter_names()) CHECK_FALSE(dormant(name));
+ for (const auto& [name, value] : retained) {
+  CHECK_FALSE(std::ranges::contains(built.optimizer.parameter_names(), name));
+  CHECK(std::ranges::contains(built.optimizer.eligible_parameter_names(), name));
+ }
  const auto input = torch::rand({1, 3, config.resolution, config.resolution});
+ const auto parameters = model.named_parameters();
  for (int step = 0; step < 2; ++step) {
   auto outputs = model.forward({input, {}}, false);
   REQUIRE(outputs.main.pred_logits.size(1) == config.num_queries * config.group_detr);
   REQUIRE(outputs.aux_outputs.empty());
   REQUIRE_FALSE(outputs.enc_outputs);
   (outputs.main.pred_logits.square().mean() + outputs.main.pred_boxes.square().mean()).backward();
+  for (const auto& [name, value] : retained) CHECK_FALSE(parameters[name].grad().defined());
   built.optimizer.step();
   built.optimizer.zero_grad(true);
  }
- const auto parameters = model.named_parameters();
  for (const auto& [name, expected] : retained) {
   CHECK_FALSE(parameters[name].grad().defined());
   CHECK(torch::equal(parameters[name], expected));
  }
  auto archived = optimizer_checkpoint(built.optimizer);
+ std::size_t dormant_states = 0;
  for (std::size_t index = 0; index < built.optimizer.eligible_parameter_names().size(); ++index) {
   const auto& name = built.optimizer.eligible_parameter_names()[index];
   if (!dormant(name)) continue;
+  ++dormant_states;
   torch::serialize::InputArchive parameter;
   archived.read(mmltk::backend::ml::serialization::archive_entry_name("param", index), parameter);
   CHECK(mmltk::backend::ml::serialization::require_int(parameter, kind == rf::TrainOptimizerKind::SGD ? "step" : "initialized") == 0);
@@ -736,6 +745,7 @@ TEST_CASE("Atto trains encoder predictions while retaining cold dormant state wi
   CHECK_FALSE(parameter.try_read("exp_avg_sq", tensor));
   CHECK_FALSE(parameter.try_read("momentum_buffer", tensor));
  }
+ CHECK(dormant_states == retained.size());
  auto detection = rf::testsupport::detection_fixture_base(config);
  rf::populate_default_detection_weights(detection);
  for (const auto& weight : detection.weights) CHECK(weight.key.layer.kind() == CriterionLayer::Kind::Main);
@@ -775,6 +785,8 @@ TEST_CASE("PE optimizer groups use actual depth token and decay policy for every
 TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", "[rfdetr][training][stock-suite][gpu]") {
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  const tensor_fixture::FullMatrixPrecision precision;
+ rf::testsupport::MatcherExecutionFixture matcher;
+ rf::ScopedRuntimeContext runtime(nullptr, 0, &matcher.workspace);
  const torch::Device device(torch::kCUDA, 0);
  for (const auto& preset : rf::model_presets()) {
   CAPTURE(preset.preset_name);
@@ -784,7 +796,7 @@ TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", 
   model.to(device);
   model.train();
   auto request = optimizer_test_request(rf::TrainOptimizerKind::AdamW);
-  auto built = rf::build_optimizer(model.named_parameters(), request, config.backbone);
+  auto built = rf::build_optimizer(model.named_optimizer_parameters(), request, config.backbone);
   auto criterion = rf::testsupport::detection_fixture_base(config);
   criterion.include_masks = config.has_masks();
   criterion.mask_point_sample_ratio = config.mask_point_sample_ratio;
@@ -829,6 +841,8 @@ TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", 
 TEST_CASE("Stock joint losses train through compilation AMP accumulation and every optimizer", "[rfdetr][training][keypoints][compilation][amp][gpu]") {
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  const tensor_fixture::FullMatrixPrecision precision;
+ rf::testsupport::MatcherExecutionFixture matcher;
+ rf::ScopedRuntimeContext runtime(nullptr, 0, &matcher.workspace);
  const torch::Device device(torch::kCUDA, 0);
  for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16})
   for (const auto mode : {rf::CompilationMode::kNone, rf::CompilationMode::kSelective, rf::CompilationMode::kFullTrace}) {
@@ -844,7 +858,7 @@ TEST_CASE("Stock joint losses train through compilation AMP accumulation and eve
    model.to(device);
    model.optimize_for_inference(1, true, mode);
    const auto kind = mode == rf::CompilationMode::kNone ? rf::TrainOptimizerKind::AdamW : mode == rf::CompilationMode::kSelective ? rf::TrainOptimizerKind::Muon : rf::TrainOptimizerKind::SGD;
-   auto optimizer = rf::build_optimizer(model.named_parameters(), optimizer_test_request(kind), config.backbone);
+   auto optimizer = rf::build_optimizer(model.named_optimizer_parameters(), optimizer_test_request(kind), config.backbone);
    auto criterion = rf::testsupport::detection_fixture_base(config);
    // CLEANUP-IGNORE: Each numerical case owns a fresh random input after its distinct model, optimizer and criterion setup.
    rf::populate_default_detection_weights(criterion);
@@ -862,6 +876,7 @@ TEST_CASE("Stock joint losses train through compilation AMP accumulation and eve
      step.forward([&] {
       auto output = model.forward({input, {}}, false);
       REQUIRE(output.main.pred_keypoints);
+      REQUIRE_NOTHROW(rf::assert_inference_output_dtype(output.main, dtype, "GroupPose training"));
       const auto values = rf::detection_loss_terms(output, targets, criterion, true, false);
       for (const auto term : {CriterionTerm::keypoint_l1, CriterionTerm::keypoint_findable, CriterionTerm::keypoint_visible, CriterionTerm::keypoint_nll}) {
        REQUIRE(values.contains({term}));

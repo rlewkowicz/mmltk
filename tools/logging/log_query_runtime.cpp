@@ -328,7 +328,7 @@ Expression QueryParser::primary(std::size_t d) {
   take();
   require("(");
   auto t = take();
-  if (t.quoted || !full(FIELD_NAME, t.text)) throw QueryError("mmltk::tools::includes() requires a field name");
+  if (t.quoted || !full(FIELD_NAME, t.text)) throw QueryError("has() requires a field name");
   require(")");
   return {"has", Json::array({t.text}), {}};
  }

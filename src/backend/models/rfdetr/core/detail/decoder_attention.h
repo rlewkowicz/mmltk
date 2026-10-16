@@ -4,6 +4,7 @@
 #include <optional>
 #include "src/backend/models/rfdetr/core/detection_types.h"
 namespace mmltk::backend::models::rfdetr {
+[[nodiscard]] torch::Tensor positioned_attention_input(const torch::Tensor& target, const torch::Tensor& position, bool training);
 [[nodiscard]] torch::Tensor isolated_group_self_attention(
  torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout, bool force_math = false);
 [[nodiscard]] torch::Tensor keypoint_self_attention(torch::nn::MultiheadAttention&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor& excluded = {}, bool force_math = false);

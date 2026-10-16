@@ -80,7 +80,8 @@ RuntimeStatus RuntimeBackend::RetireIssuedSubmission(const RawSubmission& submis
 RuntimeStatus RuntimeBackend::CloseResources() noexcept {
  const RuntimeStatus selected = lane_.Select();
  if (selected != kRuntimeSuccess) return selected;
- ReleaseBackendResources();
+ const RuntimeStatus released = ReleaseBackendResources();
+ if (released != kRuntimeSuccess) return released;
  return lane_.Close();
 }
 std::uint64_t RuntimeBackend::ClaimIssuing() {

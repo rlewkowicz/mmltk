@@ -309,7 +309,8 @@ private:
    return {};
   }
   if (!analysis->ready()) throw std::runtime_error("Live capture did not complete its semantic product");
-  const auto frame = visual_frame({PresentationSourceKind::Live, 1U}, request_.extent, candidate.revision());
+  auto frame = visual_frame({PresentationSourceKind::Live, 1U}, request_.extent, candidate.revision());
+  frame.content = {0U, 0U, request_.extent.width, request_.extent.height};
   auto metadata = project_live_metadata(frame, *analysis);
   std::shared_ptr<const VisualDocument> document;
   if (metadata) {

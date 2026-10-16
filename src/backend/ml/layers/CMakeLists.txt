@@ -25,9 +25,11 @@ target_link_libraries(mmltk_backend_ml_layers
 )
 mmltk_enable_torch(mmltk_backend_ml_layers PUBLIC)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Isolate Torch custom Function instantiations from GCC 16's cross-unit
+    # tagged-IValue diagnostic merging, matching RF-DETR's autograd sources.
     set_source_files_properties(ms_deform_attn_autograd.cpp PROPERTIES
         COMPILE_OPTIONS
-            "-Wno-stringop-overflow;-Wno-null-dereference;-Wno-array-bounds"
+            "-Wno-stringop-overflow;-Wno-null-dereference;-Wno-array-bounds;-fno-lto"
     )
 endif()
 set_target_properties(mmltk_backend_ml_layers PROPERTIES

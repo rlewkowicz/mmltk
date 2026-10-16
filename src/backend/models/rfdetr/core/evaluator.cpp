@@ -648,7 +648,7 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
  if (keypoint_mode != keypoints.has_value() || (keypoints && ((bbox.count && !keypoints->data) || keypoints->joint_capacity > mmltk::backend::data::catalog::kKeypointsPerClassCapacity ||
                                                               keypoints->prediction_stride < static_cast<std::ptrdiff_t>(keypoints->joint_capacity * sizeof(KeypointPrediction) / sizeof(float)))))
   throw std::invalid_argument("keypoint evaluation prediction extent or task differs");
- if (keypoints) static_cast<void>(checked_prediction_extent(bbox.count, keypoints->prediction_stride, kMaximumPredictionTensorBytes / sizeof(float)));
+ if (keypoints && bbox.count != 0U) static_cast<void>(checked_prediction_extent(bbox.count, keypoints->prediction_stride, kMaximumPredictionTensorBytes / sizeof(float)));
  if ((!mask_mode && (mask || !encoded_masks.empty())) || (mask_mode && bbox.count != 0U && !mask && encoded_masks.size() != bbox.count)) {
   throw std::invalid_argument("staged prediction mask view does not match the dataset metric mode");
  }
@@ -726,7 +726,7 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
   for (size_t category = 0; category < category_count; ++category) {
    const auto& schema = catalog_->keypoints(category);
    if (schema.names.empty()) continue;
-   if (schema.names.size() > keypoints->joint_capacity) throw std::invalid_argument("prediction omitted active keypoints");
+   if (!scratch.predictions_by_category[category].empty() && schema.names.size() > keypoints->joint_capacity) throw std::invalid_argument("prediction omitted active keypoints");
    const auto span = category_ground_truth_span(category);
    const auto annotated = [this, span](size_t index) {
     return std::ranges::any_of(ground_truth_joints_[span.offset + index], [](const auto& joint) { return joint.visibility != mmltk::backend::data::catalog::KeypointVisibility::Unannotated; });

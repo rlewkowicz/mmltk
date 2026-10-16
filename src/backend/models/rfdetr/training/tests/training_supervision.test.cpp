@@ -2166,7 +2166,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
      }
     auto parameters = model.named_parameters(true);
     auto optimizer_request = gradient_update_request();
-    auto built = rfdetr::build_optimizer(parameters, optimizer_request);
+    auto built = rfdetr::build_optimizer(model.named_optimizer_parameters(), optimizer_request);
     ParameterValues before_update;
     const auto is_mask_parameter = [](std::string_view name) { return name.starts_with("segmentation_head.") || name == "training_supervision.mask_projection.weight"; };
     for (const auto name :
@@ -2314,7 +2314,7 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
   }
   const auto parameters = active.named_parameters(true);
   auto optimizer_request = gradient_update_request();
-  auto built = rfdetr::build_optimizer(parameters, optimizer_request);
+  auto built = rfdetr::build_optimizer(active.named_optimizer_parameters(), optimizer_request);
   ParameterValues before_update;
   for (const auto name :
    {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight", "training_supervision.denoising_label_embedding.weight",
@@ -2385,8 +2385,8 @@ TEST_CASE("Native compiled training retains routed objectives gradients optimize
        auto compiled_input = input.detach().clone().set_requires_grad(true);
        // CLEANUP-IGNORE: Independent eager and compiled optimizers must keep separate model parameters and state for numerical parity oracles.
        auto optimizer_request = gradient_update_request(1e-4);
-       auto eager_optimizer = rfdetr::build_optimizer(eager.named_parameters(true), optimizer_request);
-       auto selective_optimizer = rfdetr::build_optimizer(selective.named_parameters(true), optimizer_request);
+       auto eager_optimizer = rfdetr::build_optimizer(eager.named_optimizer_parameters(), optimizer_request);
+       auto selective_optimizer = rfdetr::build_optimizer(selective.named_optimizer_parameters(), optimizer_request);
        // Four accumulated microbatches cover recording, initial executor reuse and
        // the later optimized executor path where the installed payload supports it.
        // K includes accumulation and lanes; the production owner applies both divisions.
@@ -2527,7 +2527,7 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
  const auto found = std::ranges::find_if(oracle.cases(), [](const auto& entry) { return entry.preset == "rf-detr-nano" && entry.training && entry.batch == 2 && entry.precision == "fp32"; });
  REQUIRE(found != oracle.cases().end());
  const auto archive = oracle.archive(*found, 0);
- auto admitted = rfdetr::resolve_model_state(oracle.directory() / "original-rf-detr-nano.pth", "rf-detr-nano", 384);
+ auto admitted = rfdetr::resolve_model_state(oracle.official_checkpoint("rf-detr-nano"), "rf-detr-nano", 384);
  for (const auto dtype : {torch::kFloat16, torch::kBFloat16}) {
   if (dtype == torch::kBFloat16 && at::cuda::getCurrentDeviceProperties()->major < 8) continue;
   for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective}) {
@@ -2556,8 +2556,8 @@ TEST_CASE("Pretrained Nano384 frozen encoder AMP Match-Free production compilati
     const auto mask = archive.tensor("input_mask", torch::kCUDA);
     // CLEANUP-IGNORE: Independent eager and compiled optimizers must keep separate model parameters and state for numerical parity oracles.
     auto request = gradient_update_request(1e-4);
-    auto eager_optimizer = rfdetr::build_optimizer(eager.named_parameters(true), request);
-    auto compiled_optimizer = rfdetr::build_optimizer(compiled.named_parameters(true), request);
+    auto eager_optimizer = rfdetr::build_optimizer(eager.named_optimizer_parameters(), request);
+    auto compiled_optimizer = rfdetr::build_optimizer(compiled.named_optimizer_parameters(), request);
     const auto detection = training_detection_fixture(config);
     const rfdetr::TrainingStep step(1, 1., true, dtype);
     const std::string comparison_name = std::string(dtype == torch::kFloat16 ? "matchfree-nano384-fp16" : "matchfree-nano384-bf16") + (mode == rfdetr::CompilationMode::kNone ? "-eager-repeat" : "");
@@ -2862,8 +2862,8 @@ TEST_CASE("Target slots prime independent uploads and protect delayed backward i
 }
 TEST_CASE("Shared training prepares the next draw with exact continuation and live parameter versions", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; shared training preparation unexecuted");
- rfdetr::testsupport::exercise_prepared_training({}, 0);
- for (const auto preset : {"rf-detr-femto", "rf-detr-xlarge", "rf-detr-keypoint-preview"}) rfdetr::testsupport::exercise_prepared_training({}, 0, preset);
+ for (const std::string_view preset : {"", "rf-detr-femto", "rf-detr-xlarge", "rf-detr-keypoint-preview"})
+  DYNAMIC_SECTION((preset.empty() ? "default" : preset)) { rfdetr::testsupport::exercise_prepared_training({}, 0, preset); }
 }
 TEST_CASE("Partial target DMA failure retains staging and permits bounded recovery", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; partial target upload unexecuted");

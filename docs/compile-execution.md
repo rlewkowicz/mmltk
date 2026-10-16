@@ -2,318 +2,239 @@
 
 [Wiki index](README.md) · [Dataset format](datasets.md) · [Benchmark recipes](benchmark-datasets.md) · [Diagnostics](logging.md#benchmark-compilation-traces)
 
-Directory and benchmark compilation share the data-owned execution, workspace,
-file-service, slot-storage, and compiled-format boundaries below, plus common
-filesystem publication. Their source front ends and codec policies remain
-distinct. Recipe membership, cache repair, source identity, and publication
-decisions stay with their compiler and recipe owners.
-Runtime batch loading uses its existing reader pool, described in
-[compiled loading](datasets.md#loading-a-compiled-file).
+Directory and benchmark compilation share execution, admission, pinned storage,
+file services, slot layout, and atomic filesystem publication. Compiler/recipe
+owners retain source policy, membership, repair, and publication decisions.
+Runtime [batch loading](datasets.md#loading-a-compiled-file) uses its own reader
+pool.
 
 ## Owners and ready work
 
 | Owner under `src/backend/data/` | Responsibility |
 | --- | --- |
-| [CompileExecution](../src/backend/data/detail/compile_execution.h) | Session CPU admission, live work classes, bounded ready/parked records, dependencies, completion, cancellation, and join |
-| [CompileResources and CompileAllowance](../src/backend/data/detail/compile_resources.h) | Bytes, descriptors, dependent commitments, external CPU grants, and shared physical custody |
-| [CompileWorkspacePlan and CompileArenaBank](../src/backend/data/detail/compile_workspace.h) | Checked preparation, fixed NUMA-local pinned backing, aligned task-sized leases, protected windows, and exclusive exceptional storage |
-| [CompileImageDecoder](../src/backend/data/detail/compile_image_decoder.h), [CompilePixelWorkspace](../src/backend/data/detail/compile_pixel_workspace.h), [CompiledLabelWorkspace](../src/backend/data/detail/compiled_label_workspace.h) | Checked codec/resizer plans, supplied scratch, direct pixel output, and complete label-output leases |
-| [FileWorkQueue](../src/backend/data/detail/file_work_queue.h) | Bounded borrowed file operations, class-aware service admission, and physical completion |
-| [CompiledSlotStorage](../src/backend/data/detail/compiled_slot_storage.h) | Stable block mappings, occupied slot preparation, and pixel/label write custody |
-| [StagedArtifact](../src/backend/data/detail/staged_artifact.h), [StorageReservationPool](../src/backend/data/detail/storage_reservation.h) | Per-file mutations and cleanup, destination-filesystem growth promises, and staged-file publication |
+| [CompileExecution](../src/backend/data/detail/compile_execution.h) | Session CPU admission, live classes, bounded ready/parked records, dependencies, completion, cancellation, join |
+| [CompileResources / CompileAllowance](../src/backend/data/detail/compile_resources.h) | Bytes, descriptors, dependent commitments, external CPU grants, shared physical custody |
+| [CompileWorkspacePlan / CompileArenaBank](../src/backend/data/detail/compile_workspace.h) | Checked preparation, fixed NUMA-local backing, aligned leases, protected windows, exceptional storage |
+| [CompileImageDecoder](../src/backend/data/detail/compile_image_decoder.h), [CompilePixelWorkspace](../src/backend/data/detail/compile_pixel_workspace.h), [CompiledLabelWorkspace](../src/backend/data/detail/compiled_label_workspace.h) | Checked codec/resizer plans, supplied scratch, direct pixels, complete label leases |
+| [FileWorkQueue](../src/backend/data/detail/file_work_queue.h) | Bounded borrowed operations, class-aware service admission, physical completion |
+| [CompiledSlotStorage](../src/backend/data/detail/compiled_slot_storage.h) | Stable block mappings, occupied-slot preparation, write custody |
+| [StagedArtifact](../src/backend/data/detail/staged_artifact.h), [StorageReservationPool](../src/backend/data/detail/storage_reservation.h) | Ordered inode mutations, cleanup, destination-filesystem growth promises, staged publication |
 
-[DatasetCompiler](../src/backend/data/compiler/dataset_compiler.cpp) retains
-numbered Directory slots and strict source failures. Its bounded image records
-advance through file preparation, parsing, decoding/resizing, and label output.
+[Directory](../src/backend/data/compiler/dataset_compiler.cpp) retains numbered
+slots and strict source failures. Its bounded image records progress through
+file preparation, parsing, conversion, and labels.
 [BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h)
-retains the source/image join, stable arrival-order slots, selected label
-claims, geometry agreement, and generation-safe withdrawal. Source owners submit
-generic work directly to the shared execution owner.
+retains source/image joins, arrival-order slots, selected label claims, geometry
+agreement, and generation-safe withdrawal. Source owners submit work directly.
 
-Benchmark image work keeps a persistent file service separate from label and
-output file operations. For `W` CPU slots, its record capacity is
-`max(2, min(4, 2 × W))`, with `min(2, W)` service threads. The output service
-has `max(4, 2 × W)` records and the same service-thread limit. Both services
-still acquire CPU grants from `CompileExecution`; these limits do not add CPU
-capacity outside the shared budget.
+| Shared work class | Work |
+| --- | --- |
+| Acquisition | Network/cache |
+| Extraction | Headers, archive/Parquet projection |
+| Annotations | Parse, normalize, recover, project labels |
+| Pixels | Image conversion |
+| Gather | Normalized component assembly |
+| Output | File/cache settlement |
 
-The canonical work classes are Acquisition, Extraction, Annotations, Pixels,
-Gather, and Output. Their task kinds distinguish network/cache work, headers
-and archive/Parquet projection, parsing/normalization/recovery/labels, image
-conversion, normalized-component gathering, and file/cache settlement. Directory
-enables Extraction, Annotations, Pixels, and Output; benchmark sessions can use
-all six. A producer keeps its class live while it can still publish work.
-An empty queue alone does not finish a class: producers, tasks, I/O, and dependent
-callbacks must settle. Repair opens new producer custody before publishing work.
+Directory enables Extraction, Annotations, Pixels, and Output; benchmarks can
+use all six. A class remains live until its producers, tasks, I/O, and dependent
+callbacks settle. An empty queue is insufficient. Repair opens producer custody
+before publishing new work.
 
-The worker pool resolves eligible CPUs in physical-core-first order. For `W`
-CPU slots and `C` live unfinished classes, `W >= C` reserves one baseline lane
-per class and leaves `W - C` elastic lanes. A waiting class retains its baseline.
-Assignments change at safe boundaries; elastic lanes return to shared selection
-after bounded tasks. With fewer CPUs than live classes, fair sharing occurs at
-task/chunk boundaries. Feasible work can pass a blocked task, and aged byte
-demands participate in admission so fitting larger work can progress.
+Eligible CPUs resolve in physical-core-first order. For `W` CPU slots and `C`
+live classes, `W >= C` reserves one baseline lane per class and `W - C` elastic
+lanes. Waiting classes retain their baseline; reassignment occurs at safe
+boundaries. Elastic lanes return after bounded tasks. When `W < C`, classes
+share fairly at task/chunk boundaries. Feasible tasks may pass blocked tasks;
+aged byte demands participate in admission.
 
-Compute workers persist for the session. The bounded task-record bank owns
-independent active and ready links, so enqueue/removal reuses record storage.
-Each physical step still receives fresh completion state; an older retained
-completion cannot observe a recycled record's later work. Exceptional drain
-candidates have their own ordered index, separate from ordinary resource waits.
+Workers persist for the session. Reusable records have independent active and
+ready links, fresh completion state per physical step, and a separate ordered
+index for exceptional drain. A retained old completion cannot observe recycled
+work. `CompileExecution::Continuation` retains one record across external
+preparation without retaining a CPU lane; predecessor completion settles before
+successor use. Cancellation/join retain its physical custody until retirement.
 
-The benchmark image pipeline keeps ready lists for Header, Workspace,
-Input, Output, and Pixels. Successful admission rotates between stages;
-every candidate or admission probe, including a denial, consumes the bounded
-dispatch budget of `max(8, 4 × workers)`. Header admission establishes geometry
-and a checked plan. Workspace admission atomically retains the complete
-input/conversion envelope and a successor record without taking a CPU lane.
-Input preloads encoded bytes, Output prepares the occupied destination, and
-Pixels converts directly into its disjoint extent.
-Resource-denied workspace requests rotate within a pass bounded by the initial
-ready count, allowing fitting successors to progress. The stage, workspace,
-and label cursors survive a budget yield. Unexamined work requests a local
-follow-up; a fully denied unchanged pass parks. A full record bank stops that
-stage until capacity returns. Admission releases the facts lock between
-successful attempts, so completion and source publication can advance alongside
-it. No turn waits for a batch to fill.
+The benchmark image stages are Header → Workspace → Input → Output → Pixels.
+Header establishes geometry/plan; Workspace atomically retains the complete
+conversion envelope and successor record without a CPU lane; Input preloads;
+Output prepares the occupied extent; Pixels writes it directly. Every probe,
+including denial, consumes the `max(8, 4 × W)` dispatch budget. Successful
+admission rotates stages and releases the facts lock between attempts.
+Resource-denied workspace requests rotate through the initial ready count,
+letting fitting peers progress. Stage/workspace/label cursors survive yields:
+unexamined work requests a local follow-up; a fully denied unchanged pass parks;
+a full record bank waits for capacity. No stage waits for a batch to fill.
 
-Curl pumps and file-service calls draw CPU grants from the same owner; a service
-grant replaces a compute lane while active. External archive helpers can use
-admitted elastic capacity. Unstarted file records remain selectable by class
-until both a dispatcher and its CPU grant are available. The completion callback
-retains the record and producer after the physical call returns its CPU grant.
-This preserves service readiness without adding an unaccounted full worker pool.
+Benchmark image-file service has `max(2, min(4, 2 × W))` records; the separate
+label/output service has `max(4, 2 × W)`. Each has `min(2, W)` service threads.
+Curl and file calls borrow the same CPU budget, replacing a compute lane while
+active; archive helpers use admitted elastic capacity. Unstarted file records
+remain selectable by class until dispatcher and CPU are available. After the
+physical call returns its grant, the callback still retains record/producer.
 
-Compute completion returns its CPU grant and scratch before invoking callbacks.
-The settling worker retains its class identity until those callbacks return, so
-another class's floor is assigned to a worker that can dispatch it. File services
-can still borrow the returned CPU while that callback retains its worker.
-
-Dependency registration checks the observed generation atomically with arming
-readiness. Parked records retain inputs, output leases, and completion custody.
-They resume or retire once; they do not retain borrowed lane scratch. Elastic
-lanes do not block on file operations, resource admission, or another task's
-completion. System-owned controllers and the bounded file service own necessary
-waits. Ordinary mapped stores can still incur page faults.
-
-`CompileExecution::Continuation` retains the same bounded scheduler record
-across external preparation without holding a CPU lane. The predecessor's
-completion settles before the successor uses that record; cancellation and
-join retain physical custody until the continuation and its admitted work
-retire. This lets preloaded image input and its workspace survive asynchronous
-file preparation without requiring a second scheduler record.
+Compute completion returns CPU/scratch before callbacks; the settling worker
+retains class identity through callback return, so another class's floor goes
+to a worker able to dispatch it. File services may borrow that returned CPU.
+Parked tasks retain inputs, outputs, and completion custody, never borrowed
+lane scratch. Generation observation and dependency arming are atomic; work
+resumes or retires once. Elastic workers do not wait for file calls, resources,
+or peer completion. Controllers/file services own necessary waits; mapped
+stores can still page fault.
 
 ### Selective readiness and resource pressure
 
-The canonical [CompileChange](../src/backend/data/detail/compile_resources.h)
-causes separate Resources, Cpu, Records, Local, Pressure, Fairness, and
-Interruption. Owner subscriptions select the causes that can change their
-predicates; owner-local notifications address that subscription, and
-interruption reaches every owner. Registration checks its observed generation
-atomically, and subscription destruction joins callbacks. A callback borrows its
-registered subscription through return, including during owner teardown; it
-does not recover that registration through a concurrently retiring owner field.
-Pending notifier causes share one armed eventfd turn. Acknowledgement detaches
-that batch under the admission lock before delivery; arrivals during delivery
-arm another turn.
+[CompileChange](../src/backend/data/detail/compile_resources.h) distinguishes
+Resources, Cpu, Records, Local, Pressure, Fairness, and Interruption. Owners
+subscribe only to causes affecting their predicates; local notices address that
+subscription and interruption reaches all owners. Registration checks generation
+atomically. Destruction joins callbacks, whose borrowed registration survives
+through return, including teardown. Pending causes share one armed eventfd turn;
+acknowledgement detaches the batch under the admission lock before delivery,
+and arrivals during delivery arm another turn.
 
-Compute workers wait on a separate channel from owner-local notices. Physical
-admission changes wake compute selectors when queued work exists, pressure may
-require idle scratch retirement, or interruption/shutdown needs their attention.
-Public admission generations and physical-service subscriptions retain their
-own delivery. Idle selector wake counts are distinct from worker creation.
+Compute selectors wait separately from owner-local notifications. They wake
+for queued compute work, pressure needing idle scratch retirement, or stop.
+Public generations and physical-service subscriptions keep separate delivery.
+Resource eligibility is cached by resource generation: CPU, record, and local
+changes do not invalidate it. A failed local attempt suppresses wakes caused
+only by its temporary reservations; external changes remain effective. Image
+dispatch listens for resources/records/fairness; file service also needs CPU.
 
-Resource eligibility is cached against the resource generation. CPU-only
-changes, returned scheduler records, and local product arrivals do not
-invalidate it. A failed local admission attempt suppresses retries caused only
-by its own temporary reservations; external changes retain their wake. Image
-dispatch listens for resource changes, returned records, and fairness changes,
-while file services additionally need CPU availability.
+`Fairness` parking is distinct from `Bytes`/`Descriptors` exhaustion and does
+not request reclamation. Removing an aged demand wakes fairness dependents
+without invalidating resource eligibility. Completion windows wait only for
+own completions and relevant pressure, preserving archive/Arrow cursors across
+unrelated scheduling. Oversized work has an explicit drain signal.
 
-An aged demand can delay fitting work for fairness without indicating exhausted
-storage. Its parked reason is `Fairness`, separate from `Bytes` and
-`Descriptors`; only actual resource waits request reclamation. Removing an aged
-demand wakes its fairness dependents without changing resource eligibility.
-Completion windows wait on their own completions and relevant pressure, so
-unrelated CPU scheduling does not discard a retained archive/Arrow cursor.
-Oversized workspace demand has an explicit drain signal. Diagnostic counters,
-addresses, and timing never control these decisions.
-
-Reclamation usefulness is derived from blocked requests and the candidate's
-actual byte/descriptor custody. Returning an unsupplied library allocation
-cannot resolve ordinary pinned-arena fragmentation when aggregate bytes and
-descriptors have headroom. Several candidates may each contribute useful
-relief; no single victim has to satisfy the whole request. Changed demand
-notifies pressure subscribers even while pressure remains active. Exceptional
-drain, unknown external pressure, and physical retirement keep their admission
-rules; the archive owner decides whether to suspend its decoder.
+Reclamation uses blocked demand and actual bytes/descriptors held. An opaque
+library charge cannot relieve pinned-arena fragmentation with aggregate
+headroom; several candidates may contribute partial relief. Changed demand
+notifies pressure subscribers even while pressure stays active. Exceptional
+drain, unknown external pressure, and physical retirement retain their rules;
+the archive owner decides decoder suspension. Diagnostics never decide admission.
 
 ## Fixed pinned arenas
 
-[The checked planner](../src/backend/data/compile_workspace.cpp) combines enabled
-class profiles, output geometry, decoder/resizer requirements, complete label
-output, and source windows. Its normal budget is:
+The [planner](../src/backend/data/compile_workspace.cpp) combines enabled class
+profiles, output geometry, codec/resizer needs, complete labels, and source windows:
 
 ```text
 R = page-rounded shared source, compaction, and class-completion windows
-Q = largest enabled normal context that fits below the protected ceiling
+Q = largest enabled normal context fitting below the protected ceiling
 B = min(6 GiB, max(256 MiB, R + W × Q))
 ```
 
-Arithmetic is checked. Protected windows must fit the normal ceiling. The
-planner's context capacities distribute normal backing across CPU/NUMA
-placements; they are sizing inputs, not exclusive image slots. The arena bank
-pools ordinary capacity for each NUMA node into one physical allocation and
-registers the remaining budget tail as usable storage. Protected windows occupy
-separate regions on the first selected node. Class floors guarantee CPU
-availability independently of storage. The complete budget stays pinned,
-including free bytes. Explicit small internal plans support bounded work; the
-public compiler has no memory-budget tuning switch.
+Arithmetic is checked; protected windows must fit. Context capacities size
+CPU/NUMA backing, not exclusive image slots. Each NUMA node pools ordinary
+capacity in one allocation; the budget tail remains usable. Protected regions
+occupy the first selected node. CPU class floors are independent of storage.
+All `B` bytes stay pinned, including free space. Small explicit plans support
+internal bounded work; no public memory-budget switch exists.
 
-Normal image profiles use a 2,048-pixel reference extent to choose reusable
-capacity; actual headers/rows determine each request. That reference is not an
-input-size limit. Benchmark preparation includes its 32 MiB encoded-image
-window and, for COCONut, the 256 MiB Arrow payload profile. Shared source windows
-are counted once. Output geometry and the selected
-[RGB resampling method](datasets.md#rgb-resampling-methods), including Native
-perceptual filtering, also affect the plan.
+Normal image sizing uses a 2,048-pixel reference extent, not an input limit.
+Actual headers/rows size requests. Benchmark preparation includes a 32 MiB
+encoded-image window and COCONut's 256 MiB Arrow profile; shared windows count
+once. [Resize policy](datasets.md#rgb-resampling-methods) also affects sizing.
 
-[NumaMemory](../src/common/system/numa_memory.cpp) binds and prefaults owned pages,
-calls `mlock`, and verifies their retained placement before publishing compiler storage.
-Failed allocation, locking, or placement verification discards the candidate
-and preserves existing storage. Per-page placement errors identify the page offset,
-allocation extent, and required node, distinguishing a per-page kernel error
-from an actual resident-node mismatch.
-Allocation rejects extents larger than the selected node's total memory;
-Linux prefaulting decides whether actual pages can be obtained, including by
-reclaiming file cache. A transient `MemFree` reading is not an allocation limit.
-The wrapper supplies `IPC_LOCK` and unlimited memlock; preparation or locking
-failure fails the operation. CPU compilation uses Linux page locking without
-acquiring a CUDA context. CUDA-registered runtime transfer buffers retain their
-[separate ownership](gpu-execution.md#device-and-numa-placement).
+[NumaMemory](../src/common/system/numa_memory.cpp) binds, prefaults, locks, and
+verifies pages before publication. Allocation, `mlock`, or placement failure
+discards the candidate and preserves prior storage. Per-page errors identify
+offset, allocation extent, and required node, distinguishing kernel errors from
+resident-node mismatch. Extents exceeding the node's total memory are rejected;
+Linux prefaulting determines actual availability, including reclaimable file
+cache. Transient `MemFree` is not an allocation bound. The wrapper supplies
+`IPC_LOCK` and unlimited memlock. CPU compilation requires no CUDA context;
+[runtime CUDA registration](gpu-execution.md#device-and-numa-placement) is separate.
 
-Normal arenas keep their addresses, capacities, and pinning across worker
-reassignment. Each lease claims its actual requested bytes rounded to 64-byte
-alignment. Size-binned free extents split on admission and coalesce on last-borrower
-release within their region. Ordinary space is tried before an eligible protected
-window; coalescing never crosses NUMA allocations or protected boundaries.
-Aliases and subspans retain the complete original allocation until their last
-borrower retires. The stable slices hold encoded
-input, STB decode, RGB/CMYK output, AVIR/perceptual/Torch scratch, masks/parsing,
-Arrow payload, and label output. Completion and named source/compaction windows
-retain their admission constraints. Controllable payload allocations use the
-supplied storage; opaque library bookkeeping, including TurboJPEG's coefficient
-and control storage or ATen resize temporaries, has a separate checked charge.
-Torch resize uses a restored task-local CPU-thread limit, so it does not create
-a nested image-worker pool or change process-wide Torch thread policy.
-Directory preserves its STB
-codec policy; benchmark JPEG uses TurboJPEG and benchmark PNG uses STB.
+Arenas retain addresses/capacity/pinning across reassignment. Leases round actual
+bytes to 64-byte alignment. Size-binned extents split and coalesce on last-borrower
+release within each region; ordinary space precedes eligible protected windows.
+Coalescing never crosses NUMA/protected boundaries. Aliases/subspans retain the
+original allocation. Supplied slices hold encoded input, STB decode, RGB/CMYK,
+AVIR/perceptual/Torch scratch, parsing/masks, Arrow, and labels. Completion/source/
+compaction windows retain their admission rules. Opaque TurboJPEG controls or
+ATen temporaries have separate checked charges. Directory uses STB; benchmark
+JPEG uses TurboJPEG and PNG uses STB. Torch's task-local CPU-thread limit restores
+on return and creates no nested image pool.
 
-Benchmark preload fills a reusable pinned input slice from the admitted file
-generation. If retained pooled source bytes prevent admission of the complete
-conversion envelope, the pipeline releases that source charge and reopens the
-same admitted inode before reserving the consumer workspace. A path replacement
-cannot substitute a different input generation.
+Preload retains the admitted file generation. If pooled source bytes prevent
+complete conversion-envelope admission, the pipeline releases that charge and
+reopens the same admitted inode before reserving workspace; path replacement
+cannot substitute input.
 
-A legal request larger than every compatible normal region enters one exclusive
-exceptional lineage. Busy or fragmented normal space waits for release and
-coalescing; occupancy does not make a normal shape exceptional. Unrelated
-transient borrowers drain while the normal bank stays pinned. One page-rounded
-additional arena is then locked for that input and its admitted descendants.
-It cannot grow while borrowed; its last physical
-consumer retires it before ordinary admission resumes. Allocation or pin failure
-preserves the prior published output.
+A legal shape larger than every compatible normal region uses one exclusive
+exceptional lineage. Ordinary occupancy/fragmentation waits for release and
+coalescing. Unrelated transient borrowers drain while `B` remains pinned;
+one page-rounded additional arena serves the input and admitted descendants.
+It cannot grow while borrowed and retires after its last physical consumer,
+before ordinary admission resumes. Allocation/pin failure preserves prior output.
 
-The peak includes normal pinned `B`, exceptional pinned `E`, and separately
-owned retained products/library controls. The 6 GiB ceiling is a normal-arena
-bound, not process RSS, file-cache residency, or a bound on all immutable
-products. Mapped input/output files are not whole-file pinned arenas. Byte
-charges, live slices, promised capacity, descriptor commitments, and physical
-file allocation remain distinct observations.
+Peak storage includes normal `B`, exceptional `E`, and retained products/library
+controls. The 6 GiB ceiling bounds normal arenas, not RSS, file cache, or all
+immutable products. Mapped files are not whole-file pinned arenas. Charges,
+live slices, promises, descriptors, and physical allocation are distinct.
 
-Reader future allocation and immutable batch backing have separate custody.
-A reader must quiesce before offering unused capacity; finite consumers can
-borrow only participating offers. Aliases and split storage cannot spend a
-commitment twice. Releasing a logical wrapper does not return bytes still held
-by a batch, output span, cooperative frame, or file operation.
-
-Descriptor admission measures process headroom and reserves dependent reader,
-writer, and transport needs before retaining their source. Copied allowances
-share one commitment. Physically closing a reader returns its own descriptors
-and unused promises while published descendants retain theirs. Small retained
-file/lease controls have separate accounting from data-buffer workspace.
+Readers must quiesce before offering unused future capacity; finite consumers
+borrow only participating offers. Immutable batches, aliases, and split storage
+retain backing without spending a commitment twice. Logical wrapper release
+does not free a batch/output/frame/file operation's bytes. Descriptor admission
+measures headroom and reserves dependent reader/writer/transport needs before
+retaining sources. Copied allowances share one commitment; closing a reader
+returns its descriptors/unused promises while descendants retain theirs. Small
+file/lease controls have separate accounting from payload workspace.
 
 ## File preparation and settlement
 
-Slots are claimed under short metadata locks. File-service operations prepare
-occupied page ranges outside source/facts/admission locks, then publish write
-readiness. Pixel workers write directly into disjoint mapped destinations.
-Label output retains its pinned lease through the actual file write. Layout
-compaction remains a separate finalization pass.
+Short metadata locks claim slots. File service prepares occupied pages outside
+source/facts/admission locks, then publishes write readiness. Pixel workers
+write disjoint mapped destinations; label leases survive the physical write.
+[Final compaction](datasets.md#staging-and-in-place-compaction) is separate.
 
-Each staged inode owns its allocation, hole-punch, and truncation ordering.
-The shared ledger keeps one capacity transaction per destination filesystem,
-identified by `st_dev`. Initial reservation and growing outstanding capacity
-sample `statvfs` once while holding that filesystem's ledger lock, check sibling
-promises, then commit together. Shrinking a promise needs no capacity sample.
-Allocation, mapped writes, and sync stay outside this transaction; allocation
-settlement updates the same ledger. Other filesystems use independent locks.
-This coordinates one compilation's users; unrelated processes can still consume
-disk space.
+Each staged inode orders allocation, hole punching, and truncation. The storage
+ledger serializes capacity transactions per destination `st_dev`: initial or
+growing promises sample `statvfs` once under that filesystem's lock, check sibling
+promises, and commit together. Shrink needs no sample. Allocation, mapped writes,
+and sync occur outside the transaction; allocation settlement updates the ledger.
+Other filesystems are independent; unrelated processes may still consume space.
 
-`StagedArtifact` accepts bounded range spans for allocation and reclamation,
-with one capacity admission/reconciliation for the batch. Single-range calls
-use the same path. Occupied-page accounting stays conservative through partial
-mutation failures; a missing occupied-map entry alone does not establish a hole.
-The compactor can split a rejected batch into smaller safe operations without
-requiring more free space than its prior minimum.
-
-[Format-10 finalization](datasets.md#staging-and-in-place-compaction) waits for
-borrowed writers/mappings, uses bounded pinned scratch, and preserves
-source-before-overwrite order within the staged inode. Independently admitted
-split seals may overlap, but the recipe joins their completion before atomic
-directory publication. A file-operation completion includes its callback and
-borrowed context lifetime. Failure/cancellation stops pending work and joins
-physical users before staged files, mappings, or arenas retire.
+`StagedArtifact` accepts bounded range batches with one admission/reconciliation;
+single ranges use the same path. Occupied-page accounting stays conservative
+after partial failure: a missing map entry does not prove a hole. Compaction can
+split rejected batches without increasing its prior minimum free-space need.
+It joins borrowed writers/mappings and preserves source-before-overwrite order.
+Independent split seals may overlap but join before directory publication.
+Physical file completion includes callbacks and borrowed context lifetime.
+Failure/cancellation joins users before files, mappings, or arenas retire.
 
 ### Filesystem publication
 
-[path_publication.h](../src/common/io/path_publication.h) and its
-[implementation](../src/common/io/path_publication.cpp) own the shared atomic
-publication primitive used by staged files, benchmark directories, and the
-outer artifact service. Staging and destination must share a filesystem.
-Callers retain content validation/sync, cancellation, destination admission,
-and overwrite policy.
+[path_publication](../src/common/io/path_publication.cpp) serves staged files,
+benchmark directories, and outer artifact publication. Source/destination share
+a filesystem; callers own validation/sync, cancellation, admission, overwrite.
 
-Publication first attempts a no-replace rename. An occupied destination is
-exchanged only when overwrite is allowed. A failed destination-parent sync
-restores the staged and previous paths; an impossible rollback is fatal.
-After commit, old-generation removal is best effort and never follows symlinks.
-The returned `PathPublicationResult` reports replacement and any cleanup error;
-a cleanup error does not revoke the new output. Benchmark-specific
-[destination admission and outer staging](benchmark-datasets.md#persistent-cache-and-publication)
-remain with their existing owners.
+Publication tries no-replace rename first, exchanging an occupied destination
+only when overwrite is allowed. Parent-sync failure restores staged/prior paths;
+impossible rollback is fatal. After commit, old-generation removal is best effort
+without following symlinks. `PathPublicationResult` reports replacement/cleanup
+error; cleanup failure does not revoke new output. Benchmark-specific
+[destination admission](benchmark-datasets.md#persistent-cache-and-publication)
+remains with that compiler.
 
 ## Progress delivery
 
 [CompileProgressDelivery](../src/backend/data/detail/compile_progress_delivery.h)
-serves Directory `CompileTelemetry` and benchmark `ProgressReporter`. Producers
-update exact counters and mark ordinary progress dirty. One observer worker
-materializes the replaceable snapshot after a 100 ms dirty interval, before
-copying/serialization. It sleeps while clean; producers do not sleep for display
-cadence or observer capacity.
+serves Directory telemetry and benchmark progress. Producers update exact counters
+and mark dirty. One observer materializes the replaceable snapshot after 100 ms,
+before copying/serialization, and sleeps while clean. Producers never wait for
+display cadence/capacity.
 
-Lifecycle and cumulative repair boundaries capture their facts immediately.
-The bounded 64-record queue can replace older cumulative boundaries under
-pressure; warnings are best effort, while indispensable lifecycle exhaustion
-fails delivery. Explicit flushes order observations through publication and
-terminal settlement. An observer therefore need not see every intermediate
-activity or transfer decision. The
-[progress reference](benchmark-datasets.md#reading-compilation-progress) defines
-units and phase selection; the
-[application boundary](application-wire.md#dataset-operation-snapshots) defines
-revision/generation guards and LatestState transport. Render receipts and trace
-identities never authorize native work, publication, or buffer reuse.
-
-[Existing suite coverage](validation.md#benchmark-compilation-evidence) checks
-these ownership and outcome requirements. Gated observations are evidence of
-the captured work, not a sustained-utilization or throughput guarantee.
+Lifecycle/cumulative repair boundaries capture immediately. A bounded 64-record
+queue may replace older cumulative boundaries; warnings are best effort and
+indispensable lifecycle exhaustion fails delivery. Flushes order publication and
+terminal observations. Intermediate activity/transfer decisions may coalesce.
+[Progress units](benchmark-datasets.md#reading-compilation-progress) and
+[application revision guards](application-wire.md#dataset-operation-snapshots)
+have separate homes. Render receipts and trace identities authorize no native
+work, publication, or reuse. [Functional coverage](validation.md#benchmark-compilation-evidence)
+and [performance interpretation](benchmark-performance.md) remain distinct.

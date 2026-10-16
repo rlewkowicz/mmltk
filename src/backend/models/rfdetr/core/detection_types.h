@@ -231,7 +231,7 @@ struct RfdetrOutputProjection final {
   });
  }
 };
-void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, at::ScalarType expected_dtype, const char* context);
+void assert_inference_output_dtype(const OutputLayer&, at::ScalarType expected_dtype, const char* context);
 struct DetectionConfig {
  int64_t num_classes = 0;
  int64_t group_detr = 1;

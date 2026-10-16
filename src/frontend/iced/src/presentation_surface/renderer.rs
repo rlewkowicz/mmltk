@@ -954,6 +954,7 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 notify.wake();
                 return;
             }
+            trace_frame("offer_received", ready);
             // A repeated notification does not own a second physical read.
             // Keep the accepted immutable receipt and its existing custody.
             if metadata::surface(ready).is_some() {
@@ -983,11 +984,35 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 .zip(transfer)
                 .zip(metadata)
                 .is_some_and(|(((width, height), transfer), bytes)| {
-                    bytes.length() as usize <= crate::generated::WORKSPACE_METADATA_BYTE_CAPACITY
-                        && metadata::install(ready, width, height, transfer, &bytes.to_vec())
-                            .is_ok()
+                    if bytes.length() as usize > crate::generated::WORKSPACE_METADATA_BYTE_CAPACITY {
+                        return false;
+                    }
+                    match metadata::install(ready, width, height, transfer, &bytes.to_vec()) {
+                        Ok(()) => {
+                            trace_frame("metadata_installed", ready);
+                            true
+                        }
+                        Err(error) => {
+                            if surface_trace_enabled() {
+                                let detail = js_sys::JSON::stringify(
+                                    &wasm_bindgen::JsValue::from_str(&error),
+                                )
+                                .ok()
+                                .and_then(|value| value.as_string())
+                                .unwrap_or_else(|| "\"metadata admission failed\"".into());
+                                emit_surface_trace(&format!(
+                                    "{{\"event\":\"iced.frame.metadata_rejected\",\"error\":{detail},\"surface\":\"{:016x}{:016x}\"{}}}",
+                                    ready.high,
+                                    ready.low,
+                                    frame_trace_fields(Some(ready)),
+                                ));
+                            }
+                            false
+                        }
+                    }
                 });
             if !decoded {
+                trace_frame("metadata_refused", ready);
                 release(ready);
                 // Preserve any valid queued offer while reporting the lost handoff.
                 remember_rejection(&mut pending.borrow_mut().rejected_publication, ready);

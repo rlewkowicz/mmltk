@@ -332,9 +332,10 @@ void exercise_sparse_capacity(const std::string& path, const bool h2d) {
  auto entries = std::vector<ImageEntry>(original.image_entries().begin(), original.image_entries().end());
  for (std::size_t slot = 0; slot < entries.size(); ++slot)
   if (slot != 0 && slot != 13) entries[slot] = {};
- const auto layout = compute_file_layout(header.num_slots, header.image_stride, header.max_label_bytes);
+ const auto catalog = original.source_metadata_bytes().subspan(sizeof(FileHeader));
+ const auto layout = compute_file_layout(header.num_slots, header.image_stride, header.max_label_bytes, catalog.size());
  {
-  const auto file = create_compiled_fixture_file(sparse_path, header);
+  const auto file = create_compiled_fixture_file(sparse_path, header, catalog);
   file.pwrite_all(entries.data(), layout.index_size, layout.index_offset);
   for (const auto slot : {0U, 13U}) {
    file.pwrite_all(original.image_pixels(slot), header.image_stride, layout.pixel_offset(slot));
@@ -349,6 +350,7 @@ void exercise_sparse_capacity(const std::string& path, const bool h2d) {
  config.shuffle = false;
  config.loading.h2d_dataloader = h2d;
  DatasetLoader loader(config);
+ CHECK(loader.compiled_source()->class_catalog()->ordered_equal(*original.class_catalog()));
  REQUIRE(loader.num_images() == 2);
  CHECK(std::ranges::equal(loader.eligible_slots(), std::array{0U, 13U}));
  Batch batch;

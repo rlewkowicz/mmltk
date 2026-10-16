@@ -98,7 +98,7 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  // CLEANUP-IGNORE: Diagnostic client and runtime lifetimes are explicit inputs to distinct child-OOM and preparation-failure reporting scenarios.
  const auto diagnostic_path = root / "training.jsonl";
  services::DiagnosticsClient diagnostics = enabled ? services::DiagnosticsClient{diagnostic_path} : services::DiagnosticsClient{};
- services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer()};
+ services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer(), false, enabled ? services::RuntimeDiagnosticDelivery::Complete : services::RuntimeDiagnosticDelivery::BestEffort};
  NativeTrainingRuntime training({.training_executable = executable, .diagnostics = runtime_diagnostics.target()});
  mmltk::backend::models::rfdetr::TrainRequest request;
  request.output_dir = root / "output";
@@ -178,7 +178,7 @@ TEST_CASE("training operation reports preparation and native failures exactly on
  // CLEANUP-IGNORE: Diagnostic client and runtime lifetimes are explicit inputs to distinct child-OOM and preparation-failure reporting scenarios.
  const auto diagnostic_path = root / "training.jsonl";
  services::DiagnosticsClient diagnostics = tracing ? services::DiagnosticsClient{diagnostic_path} : services::DiagnosticsClient{};
- services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer()};
+ services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer(), false, tracing ? services::RuntimeDiagnosticDelivery::Complete : services::RuntimeDiagnosticDelivery::BestEffort};
  const auto executable = root / "failed-trainer.sh";
  if (failure_stage == 3) {
   std::ofstream script{executable};

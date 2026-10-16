@@ -8,15 +8,21 @@ export {
  // The packaged acceptance child has two process roles: enumeration enters the
  // executable directly; execution may enter the owned private compositor.
  inline std::vector<std::string> workspace_test_command(
-  bool headless, const std::string& executable, const std::vector<std::string>& arguments, const std::string& runtime_image, const std::string& validation_image) {
+  bool headless, const std::string& executable, const std::vector<std::string>& arguments, const std::string& runtime_image, const std::string& validation_image,
+  const std::vector<std::string>& prefix = {}) {
   std::vector<std::string> result;
+  auto program = prefix;
+  program.push_back(executable);
+  program.insert(program.end(), arguments.begin(), arguments.end());
   if (headless && (arguments.empty() || arguments.front() != "--list-tests")) {
    result = {"--ulimit", "core=1:1", "--entrypoint", "/workspace/build/tools/mmltk", validation_image};
-   auto command = tools::command::self_invocation(Command::headless_compositor, {"--", executable}, {}, "/workspace/build/tools/mmltk");
+   std::vector<std::string> inner{"--"};
+   inner.insert(inner.end(), program.begin(), program.end());
+   auto command = tools::command::self_invocation(Command::headless_compositor, inner, {}, "/workspace/build/tools/mmltk");
    result.insert(result.end(), command.begin() + 1, command.end());
   } else
-   result = {"--entrypoint", executable, runtime_image};
-  result.insert(result.end(), arguments.begin(), arguments.end());
+   result = {"--entrypoint", program.front(), runtime_image};
+  if (!(headless && (arguments.empty() || arguments.front() != "--list-tests"))) result.insert(result.end(), program.begin() + 1, program.end());
   return result;
  }
  inline const std::string configure_release = R"MMLTK(         )MMLTK" + tool(Command::configure_cmake_graph) + R"MMLTK( \
@@ -236,29 +242,41 @@ their restricted container permissions.
 For headless-compositor, arguments after -- run a command in the private compositor.
 For cuda-vulkan, arguments after -- are width height allocation-pairs transfers validation context-mode memory-owner process-mode; use -- --help.
 Test options:
+  --with-upstream             Opt in to RF-DETR upstream references and historical-session preparation (may exceed 1 TiB)
   --executable <target>       Build and run one executable owned by the suite
   --config <release|dev>      Select the containerized CMake graph
   --env <NAME[=VALUE]>        Forward an additional environment variable
   --headless-compositor      Run workspace-wayland in a private NVIDIA GL Weston session
   --gdb                       Run the selected executable through containerized GDB
   --gdb-command <command>     Add an ordered GDB command (repeatable)
+Ordinary all/rfdetr runs never generate upstream references or historical sessions.
+Their external-evidence cases skip unless --with-upstream or an explicit --env evidence path is supplied.
 )MMLTK";
- inline const std::string oracle_help = R"MMLTK(Usage: ./mmltk --diagnose-rfdetr-upstream --upstream PATH --plus-upstream PATH --output PATH [--inventory-only] [--sdpa default|math]
+ inline const std::string oracle_help = R"MMLTK(Usage: ./mmltk --diagnose-rfdetr-upstream [--upstream PATH] [--plus-upstream PATH] [--output PATH] [--inventory-only] [--sdpa default|math]
+       ./mmltk --diagnose-rfdetr-upstream --case ID [--output PATH] [--sdpa default|math]
        ./mmltk --diagnose-rfdetr-upstream --build-only
 --build-only builds the isolated native oracle image without weights, upstream checkout, or numerical execution.
 Requires clean core and Plus source pins from tools/oracle/rfdetr_sources.json.
+Omitted source paths use managed pinned checkouts; omitted output uses the capability-addressed evidence cache.
 --inventory-only verifies/downloads the catalog's official assets through the pinned upstream registries,
 then records topology, class evidence, active joint masks and tensor metadata. No product build,
 forward, training or numerical comparisons run. Only the managed weights cache and evidence are writable.
-Numerical execution requires cached official Nano weights.
+Numerical execution requires CUDA FP32/FP16 and includes BF16 when the current device supports it.
 Builds a validation-only cached image from the pinned full NGC donor.
-Executes upstream Nano/SegNano FP32 and supported AMP evidence, then core/training [upstream_oracle] cases.
+Generates full-stock FP32 and controlled FP32/FP16/supported-BF16 evidence for the complete pinned catalog,
+then runs core, training, inference and export [upstream_oracle] cases against that shared reference.
 --sdpa math selects ATen math attention on both sides; default retains accelerated backend selection.
 Gates matched-state forward/objectives, complete derivative vectors and identical-gradient AdamW.
 Reports per-tensor and independent-trajectory differences separately; success does not certify accuracy or identical training trajectories.
 Exit zero requires both stages. References, comparison JSONL and wrapper.log survive comparison failures.
-Output must be a fresh directory; retry comparisons with --test ... --env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=PATH.
-The upstream mount is read-only. Producer deadline: two hours; signals use bounded wrapper cancellation.
+Completed matching evidence is reused; incompatible provenance is rejected. Each comparison attempt has distinct receipts.
+This is opt-in validation; ordinary test runs do not generate these archives. Full references can exceed 1 TiB.
+--case ID prepares exactly one named case and stops before native comparisons; selected references never certify the full matrix.
+--backward-operators adds bounded intermediate gradient diagnostics to --case; it is disabled by default.
+--export-reference includes CPU/CUDA controls and an actual upstream ONNX export for one controlled FP32 batch-one --case; it is disabled by default.
+Retry comparisons with --test ... --env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=PATH.
+MMLTK_RFDETR_ORACLE_TRACE=1 enables opt-in JSONL producer stages.
+The source mounts are read-only. Producer timeout: 48 hours (172800 seconds); signals use bounded wrapper cancellation.
 )MMLTK";
  inline const std::string gpu_environment_help = R"MMLTK(Usage: ./mmltk --diagnose-gpu-environment [runtime|wayland-validation|development]
 Default: runtime (MMLTK_IMAGE). Other selections reuse existing wrapper images.

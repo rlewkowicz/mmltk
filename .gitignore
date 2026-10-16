@@ -89,6 +89,9 @@ __pycache__/
 !/src/
 !/src/**
 
+# Local plans and review reports are not repository documentation.
+/docs/reviews/
+/reviews/
 /actionplan.md
 /reviewplan.md
 /mapreview.md

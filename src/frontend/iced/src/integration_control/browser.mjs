@@ -2210,14 +2210,24 @@ export function mmltkIntegrationKeypointPixels(receipt, source, presentation, pa
       const cleanImport = stage === 'live-import-clean', catalogImage = stage === 'catalog-pe-image';
       if (cleanImport) {
         if (empty || !patches.length) throw new Error('missing former Live overlay coordinates');
+        const mismatches = [];
+        // Edge anchors can round into the workspace border at fractional image
+        // bounds. Use the nearest pixel fully covered by this exact image.
+        const left = Math.max(0, Math.ceil(region[0])), top = Math.max(0, Math.ceil(region[1]));
+        const right = Math.min(canvas.width, Math.floor(region[0]+region[2])), bottom = Math.min(canvas.height, Math.floor(region[1]+region[3]));
+        if (right <= left || bottom <= top) throw new Error('clean imported image has no covered pixels');
         for (let i=0; i<patches.length; i+=7) {
-          const x = Math.floor(patches[i]), y = Math.floor(patches[i+1]);
+          const x = Math.max(left, Math.min(right-1, Math.floor(patches[i]))), y = Math.max(top, Math.min(bottom-1, Math.floor(patches[i+1])));
           if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) throw new Error('former Live overlay outside canvas');
           const pixel = snapshot.getImageData(x,y,1,1).data;
           ++sampled;
           if (Math.abs(pixel[0]-16) <= 12 && Math.abs(pixel[1]-24) <= 12 && pixel[2] >= 36 && pixel[2] <= 108) ++matched;
+          else if (mismatches.length < 8) mismatches.push({index:i/7, point:[x,y], observed:Array.from(pixel)});
         }
-        if (matched !== sampled) throw new Error('removed Live object left burned analysis pixels');
+        if (matched !== sampled) {
+          report({event:'integration.keypoint.clean_import_mismatch', control:stage, source, presentation, sampled, matched, mismatches});
+          throw new Error('removed Live object left burned analysis pixels');
+        }
       } else if (catalogImage) {
         if (empty || patches.length) throw new Error('catalog PE image has invalid probe inputs');
         const [x,y,w,h] = region;
@@ -2245,17 +2255,26 @@ export function mmltkIntegrationKeypointPixels(receipt, source, presentation, pa
         if (matched < sampled * .7) throw new Error('capture-only or zero-detection pixels lost original source');
       } else {
         if (!patches.length) throw new Error('missing native skeleton coordinates');
+        const mismatches = [];
         for (let i=0; i<patches.length; i+=7) {
           const [x,y,r,g,b,tolerance,radius] = patches.slice(i,i+7);
           const left = Math.max(0, Math.floor(x-radius)), top = Math.max(0, Math.floor(y-radius));
           const width = Math.min(canvas.width-left, Math.ceil(radius*2+1)), height = Math.min(canvas.height-top, Math.ceil(radius*2+1));
           if (width <= 0 || height <= 0) throw new Error('native joint outside canvas');
           const pixels = snapshot.getImageData(left,top,width,height).data;
-          let found = false;
-          for (let j=0; j<pixels.length; j+=4) if (Math.abs(pixels[j]-r) <= tolerance && Math.abs(pixels[j+1]-g) <= tolerance && Math.abs(pixels[j+2]-b) <= tolerance) {found = true; break;}
+          let found = false, nearest = 0, difference = Infinity;
+          for (let j=0; j<pixels.length; j+=4) {
+            const error = Math.max(Math.abs(pixels[j]-r), Math.abs(pixels[j+1]-g), Math.abs(pixels[j+2]-b));
+            if (error < difference) { difference = error; nearest = j; }
+            if (error <= tolerance) {found = true; break;}
+          }
+          if (!found && mismatches.length < 8) mismatches.push({index:i/7, point:[x,y], expected:[r,g,b], tolerance, search:[left,top,width,height], nearest:Array.from(pixels.slice(nearest,nearest+4)), difference});
           ++sampled; if (found) ++matched;
         }
-        if (matched !== sampled) throw new Error('completed skeleton pixels disagree with paired native coordinates/colors');
+        if (matched !== sampled) {
+          report({event:'integration.keypoint.pixel_mismatch', control:stage, source, presentation, sampled, matched, region, mismatches});
+          throw new Error('completed skeleton pixels disagree with paired native coordinates/colors');
+        }
       }
       let oksPixels = 0;
       if (stage === 'keypoint-validate') {

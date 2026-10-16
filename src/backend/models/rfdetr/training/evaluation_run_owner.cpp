@@ -743,7 +743,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     outputs = match_free_loss ? forward_model.forward_for_match_free(NestedTensor{inference_input, validation.nested_mask()})
                               : forward_model.forward(NestedTensor{inference_input, validation.nested_mask()}, true);
    }
-   assert_inference_output_dtype(outputs.main.pred_logits, outputs.main.pred_boxes, autocast_dtype, "RF-DETR training validation");
+   assert_inference_output_dtype(outputs.main, autocast_dtype, "RF-DETR training validation");
    validation.record_preprocess_consumer(torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(options.device_id)).stream());
    if (profiling) {
     evaluation_run.record_model_output(evaluation_precision_name(outputs.main.pred_logits.scalar_type()), evaluation_precision_name(outputs.main.pred_boxes.scalar_type()),

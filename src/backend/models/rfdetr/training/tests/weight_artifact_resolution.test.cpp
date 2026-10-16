@@ -1,6 +1,7 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -9,6 +10,8 @@
 #include <type_traits>
 #include <filesystem>
 #include <string>
+#include <vector>
+#include <utility>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
@@ -122,7 +125,13 @@ TEST_CASE("Native configuration preserves admitted long custom names within its 
   source.metadata.class_layout = rfdetr::unresolved_class_layout(config.num_classes);
   source.metadata.num_queries = config.num_queries;
   source.metadata.num_select = config.num_select;
-  source.replace_entries({{"value", torch::ones({2})}});
+  std::vector<rfdetr::NormalizedModelStateEntry> entries{{"value", torch::ones({2})}};
+  if (config.has_keypoints()) {
+   const rfdetr::KeypointTensorLayout joints(config.keypoints_per_class);
+   entries.push_back({"_kp_active_mask", joints.active_mask()});
+   entries.push_back({"transformer.decoder.keypoint_class_mask", joints.class_mask()});
+  }
+  source.replace_entries(std::move(entries));
   rfdetr::save_native_checkpoint(path, source);
   const auto admitted = rfdetr::decode_native_model_state(path);
   const auto resolved = rfdetr::resolve_admitted_model_artifacts(admitted, path, {}, 0);

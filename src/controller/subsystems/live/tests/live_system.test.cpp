@@ -592,6 +592,7 @@ TEST_CASE("Live metadata capacity refuses only the replacement and stops with us
   kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2),
   [&](LiveSystem::event_type event) {
   if (const auto* failure = std::get_if<LiveFailed>(&event)) {
+   CAPTURE(failure->detail);
    CHECK(failure->detail.find(cleanup_failure ? "cleanup failed" : "aggregate publication capacity") != std::string::npos);
    failed = true;
   }

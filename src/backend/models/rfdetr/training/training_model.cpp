@@ -62,7 +62,7 @@ struct TrainingModel::Impl final {
   owner->train();
   for (auto& item : owner->named_parameters(true))
    if (options.freeze_encoder && is_encoder_param(item.key())) item.value().set_requires_grad(false);
-  optimizer_build = build_optimizer(owner->named_parameters(true), options, owner->config().backbone);
+  optimizer_build = build_optimizer(owner->named_optimizer_parameters(), options, owner->config().backbone);
   clock = std::make_unique<TrainingSchedule>(options.recipe, optimizer_build.base_lrs, optimizer_build.roles, options.epochs, plan.epoch(index, 0).microbatches, contributions);
   continuation.data.model_id = shard.model_id;
   continuation.data.plan_hash = plan.hash();

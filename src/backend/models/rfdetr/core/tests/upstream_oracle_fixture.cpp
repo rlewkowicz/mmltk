@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "checkpoint_fixture_support/upstream_oracle_fixture.h"
 #include "src/backend/ml/torch/scalar_type.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
@@ -15,12 +16,15 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <exception>
 #include <limits>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <nlohmann/json.hpp>
+#include "src/backend/models/rfdetr/contract/output_roles.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
 namespace {
 constexpr std::uint64_t kManifestLimit = 32U * 1024U * 1024U;
@@ -162,6 +166,26 @@ at::ScalarType OracleCase::dtype() const {
 }
 OracleArchive::OracleArchive(const std::filesystem::path& directory, const Json& reference, std::function<void(std::size_t)> physical_load)
     : OracleArchive(archive_record(directory, reference), std::move(physical_load)) {}
+OracleArchive OracleArchive::select(const std::filesystem::path& directory, const Json& reference, std::span<const std::string> names) {
+ if (names.empty() || names.size() > kTensorLimit) invalid("empty or unbounded tensor selection");
+ auto record = archive_record(directory, reference);
+ const std::set<std::string> selected(names.begin(), names.end());
+ auto missing = selected;
+ std::erase_if(record.shards, [&](const auto& shard) {
+  bool needed = false;
+  for (const auto& [name, spec] : shard.tensors)
+   if (selected.contains(name)) {
+    missing.erase(name);
+    needed = true;
+   }
+  return !needed;
+ });
+ if (!missing.empty()) invalid("required tensor missing: " + *missing.begin());
+ OracleArchive result(std::move(record), {});
+ std::erase_if(result.locations_, [&](const auto& item) { return !selected.contains(item.first); });
+ std::erase_if(result.serialized_order_, [&](const auto& name) { return !selected.contains(name); });
+ return result;
+}
 OracleArchive::OracleArchive(OracleArchiveRecord record, std::function<void(std::size_t)> physical_load) : record_(std::move(record)), physical_load_(std::move(physical_load)) {
  for (std::size_t index = 0; index < record_.shards.size(); ++index) {
   for (const auto& [name, spec] : record_.shards[index].tensors) {
@@ -293,7 +317,7 @@ std::set<std::string> OracleArchive::names(const std::string_view prefix) const 
 }
 std::filesystem::path UpstreamOracle::requested() {
  const auto* value = std::getenv("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR");
- if (!value) invalid("required reference preparation is absent; run the owning rfdetr suite through ./mmltk");
+ if (!value) SKIP("upstream validation is opt-in: use --with-upstream or --env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=PATH");
  if (!*value) invalid("explicitly requested evidence path is empty");
  return std::filesystem::path(value);
 }
@@ -307,7 +331,11 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
  std::ifstream pins_input(pins_path);
  const auto pins = Json::parse(pins_input);
  if (manifest.at("sources") != pins || manifest.at("revision") != pins.at("core").at("revision")) invalid("source pins differ");
- if (manifest.at("format") != "mmltk.rfdetr.upstream-oracle.v2" || manifest.at("status") != "references_complete_native_comparison_pending") invalid("incompatible oracle format/revision/status");
+ const auto selected_case = manifest.value("selected_case", std::string{});
+ const bool selected = manifest.contains("selected_case");
+ if ((selected && (selected_case.empty() || selected_case.size() > 128)) || manifest.at("format") != "mmltk.rfdetr.upstream-oracle.v2" ||
+     manifest.at("status") != (selected ? "selected_reference_native_comparison_pending" : "references_complete_native_comparison_pending"))
+  invalid("incompatible oracle format/revision/status");
  if (manifest.at("policy").at("matmul_tf32").get<bool>() || manifest.at("policy").at("cudnn_tf32").get<bool>() || manifest.at("policy").at("gradient_scale") != 1 ||
      manifest.at("policy").at("accumulated_microbatches") != 1)
   invalid("incompatible controlled numerical policy");
@@ -324,7 +352,7 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
  if (!manifest.at("environment").at("torch").get<std::string>().starts_with(TORCH_VERSION) || manifest.at("torch_build_config").get<std::string>().empty())
   invalid("incompatible Torch payload provenance");
  directory_ = child(root, manifest.at("directory").get<std::string>());
- if (manifest.at("presets").size() != kPresetCatalog.size()) invalid("missing required preset");
+ if (manifest.at("presets").size() != (selected ? 1 : kPresetCatalog.size())) invalid("missing required preset");
  std::map<std::string, std::pair<std::string, std::string>> checkpoint_hashes;
  for (const auto& preset : manifest.at("presets")) {
   const auto name = preset.at("name").get<std::string>();
@@ -344,7 +372,8 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   originals_.emplace(name, child(directory_, preset.at("original").get<std::string>()));
   if (!checkpoints_.emplace(name, checkpoint).second) invalid("duplicate preset");
  }
- if (manifest.at("cases").size() < kPresetCatalog.size() * 9 || manifest.at("cases").size() > kPresetCatalog.size() * 13) invalid("incomplete or unbounded model matrix");
+ if (selected ? manifest.at("cases").size() != 1 : manifest.at("cases").size() < kPresetCatalog.size() * 9 || manifest.at("cases").size() > kPresetCatalog.size() * 13)
+  invalid("incomplete or unbounded model matrix");
  std::set<std::string> identities;
  std::set<std::string> case_directories;
  for (const auto& reference : manifest.at("cases")) {
@@ -353,6 +382,18 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   const auto case_directory = child(directory_, case_name);
   const auto item = authenticated_index(case_directory, reference);
   OracleCase entry;
+  if (item.contains("upstream_export") && !item.at("upstream_export").is_null()) {
+   const auto& artifact = item.at("upstream_export");
+   OracleExportArtifact value{child(case_directory, artifact.at("file").get<std::string>()), artifact.at("sha256").get<std::string>(), artifact.at("bytes").get<std::uint64_t>(),
+    artifact.at("outputs").get<std::map<std::string, std::string>>()};
+   if (!value.bytes || value.bytes > kArchiveLimit || value.sha256.size() != 64 || value.outputs.size() < 2 || value.outputs.size() > 3 ||
+       artifact.at("exporter") != "rfdetr.export._onnx.exporter.OnnxExporter" || artifact.at("onnx_version").get<std::string>().empty())
+    invalid("invalid upstream export declaration");
+   std::set<std::string> external_names;
+   for (const auto& [role, name] : value.outputs)
+    if (role.size() > 128 || name.empty() || name.size() > 128 || name.find('\0') != std::string::npos || !external_names.insert(name).second) invalid("invalid upstream export output mapping");
+   entry.upstream_export = std::move(value);
+  }
   entry.id = item.at("id").get<std::string>();
   entry.protocol = item.at("protocol").get<std::string>();
   const bool stock = entry.protocol == "stock";
@@ -362,6 +403,9 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   entry.training = item.at("training").get<bool>();
   entry.math_sdpa = sdpa == "math";
   entry.batch = item.at("batch").get<int>();
+  if (entry.id != entry.preset + "-" + entry.protocol + "-" + entry.precision + "-b" + std::to_string(entry.batch) + (entry.training ? "-train" : "-eval") ||
+      (selected && entry.id != selected_case))
+   invalid("selected case identity differs");
   entry.resolution = item.at("resolution").get<int>();
   entry.groups = item.at("groups").get<int>();
   entry.classes = item.at("classes").get<int>();
@@ -378,6 +422,14 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   entry.recipe.weight_decay = recipe.at("weight_decay");
   const auto* row = find_preset_catalog_entry(entry.preset);
   if (!row) invalid("unknown case preset");
+  if (entry.upstream_export) {
+   std::set<std::string> expected_roles, actual_roles;
+   RfdetrOutputSchema::visit([&]<RfdetrOutputRole>(RfdetrOutputPolicy facts) {
+    if (facts.supports(row->task)) expected_roles.emplace(facts.name);
+   });
+   for (const auto& [role, name] : entry.upstream_export->outputs) actual_roles.insert(role);
+   if (stock || entry.precision != "fp32" || entry.batch != 1 || actual_roles != expected_roles) invalid("upstream export task or output roles differ");
+  }
   if (entry.id.size() > 128 || !identities.insert(entry.id).second || !checkpoints_.contains(entry.preset) || (entry.batch != 1 && entry.batch != 2) ||
       entry.groups != (stock ? row->group_count : 2) || entry.classes != row->class_count || entry.queries != row->query_count || entry.resolution != static_cast<int>(row->resolution) ||
       entry.trainable.empty() || entry.trainable.size() > 2000)
@@ -424,12 +476,12 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   for (const auto& precision : {"fp32", "fp16", "bf16"})
    for (const auto batch : {1, 2})
     for (const bool training : {false, true})
-     if (std::ranges::count_if(cases_, [&](const auto& value) {
+     if (!selected && std::ranges::count_if(cases_, [&](const auto& value) {
       return value.protocol == "controlled-group2" && value.preset == row.preset_name && value.precision == precision && value.batch == batch && value.training == training;
      }) != (std::string_view(precision) == "bf16" && !bf16 ? 0 : 1))
       invalid("missing required model case");
  for (const auto& row : kPresetCatalog)
-  if (std::ranges::count_if(cases_, [&](const auto& value) { return value.protocol == "stock" && value.preset == row.preset_name; }) != 1) invalid("missing full stock training case");
+  if (!selected && std::ranges::count_if(cases_, [&](const auto& value) { return value.protocol == "stock" && value.preset == row.preset_name; }) != 1) invalid("missing full stock training case");
  for (const auto* family : {"resize", "keypoints"})
   if (!case_directories.insert(manifest.at(family).at("directory").get<std::string>()).second) invalid("duplicate supplemental evidence directory");
  const auto resize_directory = child(directory_, manifest.at("resize").at("directory").get<std::string>());
@@ -475,9 +527,17 @@ NativeRfDetrModel UpstreamOracle::model(const OracleCase& entry) const {
  if (trainable != std::set<std::string>(entry.trainable.begin(), entry.trainable.end())) invalid("trainable parameter inventory differs");
  return model;
 }
-OracleArchive UpstreamOracle::archive(const OracleCase& entry, std::size_t step) const {
+OracleArchive UpstreamOracle::archive(const OracleCase& entry, std::size_t step, std::span<const std::string> names) const {
  const auto& reference = entry.steps.at(step);
- return OracleArchive(reference.directory, reference.index);
+ return names.empty() ? OracleArchive(reference.directory, reference.index) : OracleArchive::select(reference.directory, reference.index, names);
+}
+std::filesystem::path UpstreamOracle::export_onnx(const OracleCase& entry) const {
+ if (!entry.upstream_export) invalid("actual upstream ONNX export was not requested");
+ const auto& artifact = *entry.upstream_export;
+ if (!std::filesystem::is_regular_file(artifact.path) || std::filesystem::is_symlink(artifact.path) || std::filesystem::file_size(artifact.path) != artifact.bytes)
+  invalid("upstream ONNX artifact changed");
+ verify_hash(artifact.path, artifact.sha256);
+ return artifact.path;
 }
 OracleArchive UpstreamOracle::keypoint_archive() const { return OracleArchive(keypoints_.directory, keypoints_.index); }
 std::vector<CompilationMode> oracle_execution_modes(const OracleCase& entry) {
@@ -498,8 +558,12 @@ OracleComparison::OracleComparison(const std::filesystem::path& root, std::strin
   if (!std::filesystem::is_directory(reports)) invalid("comparison attempt was not admitted by the wrapper");
  }
  std::filesystem::create_directories(reports);
- report_.open(child(reports, name + ".jsonl"), std::ios::app);
- if (!report_) invalid("cannot write comparison evidence");
+ const auto report_path = child(reports, name + ".jsonl");
+ report_.open(report_path, std::ios::app);
+ if (!report_) {
+  const std::error_code error(errno, std::generic_category());
+  invalid("cannot write comparison evidence " + report_path.string() + (error ? ": " + error.message() : ""));
+ }
  static const auto executable_hash = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file("/proc/self/exe"));
  record(
   {{"boundary", "policy"}, {"precision", dtype_name(precision)}, {"matmul_tf32", at::globalContext().allowTF32CuBLAS()}, {"cudnn_tf32", at::globalContext().allowTF32CuDNN()},
@@ -635,6 +699,14 @@ void OracleComparison::compare_impl(
      result["relative_tolerance"] = relative;
      result["derivative_norm_bound"] = derivative;
      passed &= std::isfinite(normalized) && normalized <= 1.;
+     if (!passed && !observing_ && !policy_difference) {
+      const auto error = derivative ? bounded_error : difference.abs() / (absolute + relative * bv.abs()).clamp_min(std::numeric_limits<double>::min());
+      const auto index = error.argmax().item<int64_t>();
+      result["worst_finite_index"] = index;
+      result["worst_actual"] = av[index].item<double>();
+      result["worst_expected"] = bv[index].item<double>();
+      result["worst_absolute_error"] = std::abs(av[index].item<double>() - bv[index].item<double>());
+     }
     }
    }
   }
@@ -749,14 +821,22 @@ void compare_oracle_outputs(
  comparison.inventory(prefix + "output inventory", keys(tensors), archive.names(prefix + "output/"));
  std::set<std::string> indices;
  for (std::size_t group = 0; group < encoder_indices.size(); ++group) indices.insert(std::to_string(group));
- if (observed_encoder) comparison.inventory(prefix + "encoder identity inventory", indices, archive.names(prefix + "encoder/"));
  std::vector<std::string> read_names;
- for (std::size_t group = 0; group < encoder_indices.size(); ++group) read_names.push_back(prefix + "encoder/" + std::to_string(group));
+ const auto captures = observed_encoder ? archive.names(prefix + "encoder/").size() : 0;
+ for (std::size_t capture = 0; capture < captures; ++capture) read_names.push_back(prefix + "encoder/" + std::to_string(capture));
  for (const auto& [name, value] : tensors) read_names.push_back(prefix + "output/" + name);
  const auto expected = archive.read_tensors(read_names);
+ TensorMap expected_indices;
+ for (std::size_t capture = 0; capture < captures; ++capture) {
+  const auto& value = expected.at(prefix + "encoder/" + std::to_string(capture));
+  if (!value.defined() || value.scalar_type() != torch::kInt64 || (value.dim() != 2 && value.dim() != 3)) invalid("invalid encoder proposal capture");
+  // Upstream topk captures either one [batch, queries] group or a batched
+  // [groups, batch, queries] call. Project both into logical group order.
+  for (const auto& group : (value.dim() == 2 ? value.unsqueeze(0) : value).unbind(0)) expected_indices.emplace(std::to_string(expected_indices.size()), group);
+ }
+ if (observed_encoder) comparison.inventory(prefix + "encoder identity inventory", indices, keys(expected_indices));
  for (std::size_t group = 0; group < encoder_indices.size(); ++group) {
-  const auto name = prefix + "encoder/" + std::to_string(group);
-  comparison.compare(name, encoder_indices[group], expected.at(name), OracleComparisonPolicy::Exact);
+  comparison.compare(prefix + "encoder/" + std::to_string(group), encoder_indices[group], expected_indices.at(std::to_string(group)), OracleComparisonPolicy::Exact);
  }
  std::exception_ptr first_difference;
  for (const auto& [name, value] : tensors) {

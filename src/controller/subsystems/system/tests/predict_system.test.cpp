@@ -1006,6 +1006,7 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
   const auto metadata = prediction.ImageSnapshot(selected.frame);
   REQUIRE(metadata);
   CHECK(metadata->frame == selected.frame);
+  CHECK(metadata->frame.content == VisualRegion{0U, 0U, selected.frame.extent.width, selected.frame.extent.height});
   CHECK(metadata->content_identity == selected.content_identity);
   CHECK(metadata->image_id == selected.image_id);
   REQUIRE(metadata->labels.size() == selected.labels.size());

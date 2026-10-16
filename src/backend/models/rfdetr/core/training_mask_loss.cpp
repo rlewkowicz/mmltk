@@ -24,8 +24,9 @@ torch::Tensor matched_sparse_pred_masks_for_batch(const SparsePredMasks& sparse,
  const auto batch_spatial_features = sparse.spatial_features.index({batch_index});
  auto batch_query_features = sparse.query_features.index({batch_index, device_query_indices});
  if (batch_query_features.scalar_type() != batch_spatial_features.scalar_type()) { batch_query_features = batch_query_features.to(batch_spatial_features.scalar_type()); }
- const auto flattened_spatial = batch_spatial_features.flatten(1).contiguous();
- return torch::matmul(batch_query_features, flattened_spatial).view({batch_query_features.size(0), batch_spatial_features.size(-2), batch_spatial_features.size(-1)}) + sparse.bias;
+ // Preserve upstream's contraction order: uncertainty top-k consumes the
+ // rounded logits, so a transposed GEMM can change sampled point identities.
+ return torch::einsum("chw,nc->nhw", {batch_spatial_features, batch_query_features}) + sparse.bias;
 }
 const PackedTargetMasks& require_target_masks(const PreparedTargets& targets, const char* context) {
  if (!targets.packed_masks.has_value() || !targets.packed_masks->bits.defined()) { throw std::runtime_error(std::string(context) + " requires target masks"); }

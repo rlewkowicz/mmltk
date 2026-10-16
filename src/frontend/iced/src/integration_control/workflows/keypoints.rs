@@ -38,6 +38,7 @@ pub(crate) enum Stage {
     Connect(u8),
     Connected(u8),
     Move(u8),
+    MoveReady(u8),
     Moved(u8),
     Save(u8),
     Saved(u8),
@@ -67,6 +68,8 @@ pub(crate) enum Stage {
     Predicting,
     UpscalePredict,
     UpscaledPredict,
+    LiveResize,
+    LiveResizeReady,
     LivePage(u8),
     StartLive(u8),
     LiveFrame(u8),
@@ -102,8 +105,6 @@ pub(crate) enum Stage {
     PosePrepared,
     PoseEpochs,
     PoseEpochsReady,
-    PoseOutput,
-    PoseOutputReady,
     StartPose,
     PoseTraining,
     LiveDerivedPage,
@@ -111,6 +112,8 @@ pub(crate) enum Stage {
     UpscaledLive,
     ClearImported,
     ClearedImported,
+    CleanImportReveal,
+    CleanImportReady,
     RestoreImported,
     RestoredImported,
     IncompatiblePage,
@@ -128,6 +131,8 @@ pub(super) struct State {
     receipt: Option<probe::ProbeReceipt>,
     patches: Vec<f64>,
     pixel_name: String,
+    pixel_stage: Option<Stage>,
+    pixel_attempts: u8,
     empty: bool,
     retained_frame: Option<VisualFrame>,
     retained_document: Option<VisualDocumentFacts>,
@@ -139,6 +144,7 @@ pub(super) struct State {
     joint_before: Option<AnnotationPoint>,
     oks_bounds: Option<Rectangle>,
     live_revision: u64,
+    live_completed_frames: u64,
     model_row: usize,
     catalog_prediction_index: usize,
     gallery_tile: Option<Rectangle>,
@@ -149,10 +155,16 @@ pub(super) struct State {
     dataset_generation: u64,
     overwrite_revision: u64,
     catalog_frame: Option<VisualFrame>,
-    catalog_output: String,
 }
 fn success(value: &ComputeUiState) -> bool {
     !value.active && value.terminal.outcome == ComputeOperationOutcome::Succeeded
+}
+fn annotation_current(metadata: &AnnotationImageMetadata, snapshot: &AnnotationSnapshot) -> bool {
+    metadata.frame == snapshot.frame
+        && metadata.diagnostics.as_ref().is_some_and(|rendered| {
+            rendered.documentepoch == snapshot.inputdocumentepoch
+                && rendered.scenerevision == snapshot.ui.scenerevision
+        })
 }
 fn phase(driver: &mut Driver, stage: Stage) -> Task<RootMessage> {
     driver.advance_to(Phase::Workflows(Step::Keypoints(stage)))
@@ -210,6 +222,17 @@ impl State {
         requested: Option<Surface>,
     ) -> Task<RootMessage> {
         let settled = !settings.has_local_edits();
+        let primary = |page| {
+            crate::view::workflow::Composition::new(page, 0.0)
+                .stable_id(crate::view::workflow::Region::PrimaryAction)
+        };
+        let can_prepare = |page| {
+            settled
+                && settings
+                    .draft
+                    .as_ref()
+                    .is_some_and(|draft| model.model_selection_available(draft, page))
+        };
         let prepared = |page| {
             settings
                 .draft
@@ -331,7 +354,9 @@ impl State {
                 driver,
                 crate::view::navigation::stable_id(FeatureId::Explore),
             ),
-            Stage::Open if active == FeatureId::Explore => {
+            Stage::Open
+                if active == FeatureId::Explore && settled && model.explore_open_available() =>
+            {
                 control(widgets, driver, crate::view::explore::OPEN_ID)
             }
             Stage::Gallery => {
@@ -378,17 +403,29 @@ impl State {
                     Stage::Import(0),
                 )
             }
-            Stage::Import(index) => control(
-                widgets,
-                driver,
-                match index {
-                    0 => crate::view::explore::DETAIL_ANNOTATE_ID,
-                    1 => "predict.annotate",
-                    _ => "live.annotate",
-                },
-            ),
-            Stage::Imported(index) if active == FeatureId::Annotate => {
-                let Some(snapshot) = annotation else {
+            Stage::Import(index) => {
+                if surface::viewer_annotation_request().is_none() {
+                    return Task::none();
+                }
+                self.annotation_epoch = annotation.map_or(0, |value| value.inputdocumentepoch);
+                control(
+                    widgets,
+                    driver,
+                    match index {
+                        0 => crate::view::explore::DETAIL_ANNOTATE_ID,
+                        1 => "predict.annotate",
+                        _ => "live.annotate",
+                    },
+                )
+            }
+            Stage::Imported(index)
+                if active == FeatureId::Annotate
+                    && settled
+                    && !model.has_pending(ApplicationIntentEndpoint::AnnotationOpen) =>
+            {
+                let Some(snapshot) =
+                    annotation.filter(|value| value.inputdocumentepoch > self.annotation_epoch)
+                else {
                     return Task::none();
                 };
                 if !schema_scene(&snapshot.ui.scene) {
@@ -475,14 +512,32 @@ impl State {
             {
                 phase(driver, Stage::Move(index))
             }
-            Stage::Move(_) => {
+            Stage::Move(_) => control(widgets, driver, crate::view::workspace::STABLE_ID),
+            Stage::MoveReady(_) => {
                 let Some(snapshot) = annotation else {
                     return Task::none();
                 };
+                let Some((display, content)) = requested.and_then(surface::drawable_annotation)
+                else {
+                    return Task::none();
+                };
+                if !annotation_current(&content.metadata, snapshot) {
+                    return Task::none();
+                }
+                let Some(receipt) = probe::current_receipt(crate::view::workspace::STABLE_ID)
+                    .filter(|receipt| {
+                        receipt.surface.frame == display.frame
+                            // GPU scissor bounds round fractional image edges.
+                            && widget_ops::contains_rectangle(receipt.clip.expand(0.5), receipt.image)
+                    })
+                else {
+                    return Task::none();
+                };
+                self.receipt = Some(receipt);
                 self.joint_before =
                     Some(snapshot.ui.scene.objects[0].skeletonnodes[0].point.clone());
                 self.annotation = Some(snapshot.ui.scene.clone());
-                control(widgets, driver, crate::view::annotation::WORKSPACE_ID)
+                control(widgets, driver, crate::view::workspace::STABLE_ID)
             }
             Stage::Moved(index)
                 if annotation.is_some_and(|snapshot| {
@@ -505,9 +560,9 @@ impl State {
                 }
                 phase(driver, Stage::Save(index))
             }
-            Stage::Save(_) => {
+            Stage::Save(_) if settled && model.annotation_save_available() => {
                 self.save_generation = annotation.map_or(0, |value| value.ui.savegeneration);
-                control(widgets, driver, "annotate.primary")
+                control(widgets, driver, primary(FeatureId::Annotate))
             }
             Stage::Saved(index)
                 if annotation.is_some_and(|value| {
@@ -519,7 +574,9 @@ impl State {
                 self.annotation_revision = annotation.unwrap().uirevision;
                 phase(driver, Stage::Reload(index))
             }
-            Stage::Reload(_) => control(widgets, driver, "annotation.load"),
+            Stage::Reload(_) if settled && model.annotation_save_available() => {
+                control(widgets, driver, "annotation.load")
+            }
             Stage::Reloaded(index)
                 if annotation.is_some_and(|value| {
                     value.inputdocumentepoch > self.annotation_epoch
@@ -551,17 +608,17 @@ impl State {
                     driver,
                     match index {
                         0 => Stage::TrainPage,
-                        1 => Stage::LivePage(0),
+                        1 => Stage::LiveResize,
                         2 => Stage::LiveDerivedPage,
                         _ => Stage::ThresholdPage(true),
                     },
                 )
             }
-            Stage::PrepareTrain if active == FeatureId::Train => {
+            Stage::PrepareTrain if active == FeatureId::Train && can_prepare(FeatureId::Train) => {
                 control(widgets, driver, "train.model.action")
             }
             Stage::TrainPrepared if prepared(FeatureId::Train) => phase(driver, Stage::StartTrain),
-            Stage::StartTrain => control(widgets, driver, "train.primary"),
+            Stage::StartTrain => control(widgets, driver, primary(FeatureId::Train)),
             Stage::Training
                 if model
                     .workflow
@@ -613,13 +670,15 @@ impl State {
                 driver,
                 crate::view::navigation::stable_id(FeatureId::Validate),
             ),
-            Stage::PrepareValidate if active == FeatureId::Validate => {
+            Stage::PrepareValidate
+                if active == FeatureId::Validate && can_prepare(FeatureId::Validate) =>
+            {
                 control(widgets, driver, "validate.model.action")
             }
             Stage::ValidatePrepared if prepared(FeatureId::Validate) => {
                 phase(driver, Stage::StartValidate)
             }
-            Stage::StartValidate => control(widgets, driver, "validate.primary"),
+            Stage::StartValidate => control(widgets, driver, primary(FeatureId::Validate)),
             Stage::Validating
                 if model
                     .workflow
@@ -656,13 +715,15 @@ impl State {
                 driver,
                 crate::view::navigation::stable_id(FeatureId::Export),
             ),
-            Stage::PrepareExport if active == FeatureId::Export => {
+            Stage::PrepareExport
+                if active == FeatureId::Export && can_prepare(FeatureId::Export) =>
+            {
                 control(widgets, driver, "export.model.action")
             }
             Stage::ExportPrepared if prepared(FeatureId::Export) => {
                 phase(driver, Stage::StartExport)
             }
-            Stage::StartExport => control(widgets, driver, "export.primary"),
+            Stage::StartExport => control(widgets, driver, primary(FeatureId::Export)),
             Stage::Exporting if model.workflow.export.as_ref().is_some_and(success) => {
                 completed("keypoint-export", [1.0, 0.0, 0.0, 0.0]);
                 phase(driver, Stage::PredictPage)
@@ -672,13 +733,15 @@ impl State {
                 driver,
                 crate::view::navigation::stable_id(FeatureId::Predict),
             ),
-            Stage::PreparePredict if active == FeatureId::Predict => {
+            Stage::PreparePredict
+                if active == FeatureId::Predict && can_prepare(FeatureId::Predict) =>
+            {
                 control(widgets, driver, "predict.model.action")
             }
             Stage::PredictPrepared if prepared(FeatureId::Predict) => {
                 phase(driver, Stage::StartPredict)
             }
-            Stage::StartPredict => control(widgets, driver, "predict.primary"),
+            Stage::StartPredict => control(widgets, driver, primary(FeatureId::Predict)),
             Stage::Predicting
                 if model
                     .predict_snapshot
@@ -719,6 +782,26 @@ impl State {
                     Stage::Import(1),
                 )
             }
+            Stage::LiveResize => {
+                driver.phase = Phase::Workflows(Step::Keypoints(Stage::LiveResizeReady));
+                // Live currently requests the canvas extent. Keep this fixture
+                // within its native capture envelope before starting a run.
+                #[cfg(target_arch = "wasm32")]
+                if !crate::integration_control::canvas_size_js(1200.0, 1000.0) {
+                    driver.fail("Cannot resize the Live acceptance canvas");
+                }
+                Task::none()
+            }
+            Stage::LiveResizeReady => {
+                if model.window_width != 1200 || model.window_height != 1000 {
+                    return Task::none();
+                }
+                #[cfg(target_arch = "wasm32")]
+                if !crate::integration_control::canvas_size_settled_js(1200.0, 1000.0) {
+                    return Task::none();
+                }
+                phase(driver, Stage::LivePage(0))
+            }
             Stage::LivePage(_) => control(
                 widgets,
                 driver,
@@ -726,13 +809,14 @@ impl State {
             ),
             Stage::StartLive(_) if active == FeatureId::Live && model.live_start_available() => {
                 self.live_revision = live.map_or(0, |value| value.revision);
-                control(widgets, driver, "live.primary")
+                self.live_completed_frames = live.map_or(0, |value| value.completedframes);
+                control(widgets, driver, primary(FeatureId::Live))
             }
             Stage::LiveFrame(index) => {
                 let Some(snapshot) = live.filter(|value| {
                     value.running
                         && value.revision > self.live_revision
-                        && value.completedframes > 0
+                        && value.completedframes > self.live_completed_frames
                 }) else {
                     return Task::none();
                 };
@@ -740,6 +824,9 @@ impl State {
                     return Task::none();
                 };
                 if content.frame() != &snapshot.frame {
+                    return Task::none();
+                }
+                if index != 0 && content.analyzed() == Some(false) {
                     return Task::none();
                 }
                 if content.analyzed() != Some(index != 0)
@@ -767,7 +854,7 @@ impl State {
                 }
                 phase(driver, Stage::StopLive(index))
             }
-            Stage::StopLive(_) => control(widgets, driver, "live.primary"),
+            Stage::StopLive(_) => control(widgets, driver, primary(FeatureId::Live)),
             Stage::StoppedLive(index)
                 if live.is_some_and(|value| !value.running && !value.cancellationrequested) =>
             {
@@ -832,9 +919,11 @@ impl State {
             Stage::MutationReady(0) => phase(driver, Stage::LivePage(4)),
             Stage::MutationReady(1) => phase(driver, Stage::Mutate(2)),
             Stage::MutationReady(2) => phase(driver, Stage::LivePage(3)),
-            Stage::FailedStart if active == FeatureId::Live => {
+            Stage::FailedStart
+                if active == FeatureId::Live && settled && model.live_start_available() =>
+            {
                 self.live_revision = live.map_or(0, |value| value.revision);
-                control(widgets, driver, "live.primary")
+                control(widgets, driver, primary(FeatureId::Live))
             }
             Stage::Failed
                 if live.is_some_and(|value| {
@@ -906,7 +995,13 @@ impl State {
             Stage::ClearedImported
                 if annotation.is_some_and(|value| value.ui.scene.objects.is_empty()) =>
             {
-                self.clean_import_pixels(driver, requested, &annotation.unwrap().frame)
+                phase(driver, Stage::CleanImportReveal)
+            }
+            Stage::CleanImportReveal => control(widgets, driver, crate::view::workspace::STABLE_ID),
+            Stage::CleanImportReady
+                if annotation.is_some_and(|value| value.ui.scene.objects.is_empty()) =>
+            {
+                self.clean_import_pixels(driver, requested, annotation.unwrap())
             }
             Stage::RestoreImported => control(widgets, driver, "annotation.undo"),
             Stage::RestoredImported
@@ -932,7 +1027,9 @@ impl State {
                         FeatureId::Predict
                     } else {
                         FeatureId::Train
-                    } =>
+                    }
+                    && settled
+                    && model.settings_edit_available() =>
             {
                 if RFDETR_PRESET_CATALOG.len() != 16 {
                     driver.fail("Model selector omitted a canonical model");
@@ -1000,7 +1097,17 @@ impl State {
                     },
                 )
             }
-            Stage::PeSource => control(widgets, driver, "predict.source.image"),
+            Stage::PeSource => {
+                if settled
+                    && settings.draft.as_ref().is_some_and(|value| {
+                        value.workflows.predict.source.kind == SourceKind::SingleImage
+                    })
+                {
+                    phase(driver, Stage::PreparePe)
+                } else {
+                    control(widgets, driver, "predict.source.image")
+                }
+            }
             Stage::PeSourceReady
                 if settled
                     && settings.draft.as_ref().is_some_and(|value| {
@@ -1009,7 +1116,9 @@ impl State {
             {
                 phase(driver, Stage::PreparePe)
             }
-            Stage::PreparePe => control(widgets, driver, "predict.model.action"),
+            Stage::PreparePe if can_prepare(FeatureId::Predict) => {
+                control(widgets, driver, "predict.model.action")
+            }
             Stage::PePrepared if prepared(FeatureId::Predict) => {
                 if !self.capture_catalog_selection(driver, model, FeatureId::Predict) {
                     return Task::none();
@@ -1025,7 +1134,7 @@ impl State {
                     .predict_snapshot
                     .as_ref()
                     .map(|value| value.frame.clone());
-                control(widgets, driver, "predict.primary")
+                control(widgets, driver, primary(FeatureId::Predict))
             }
             Stage::PeRunning
                 if model.predict_snapshot.as_ref().is_some_and(|value| {
@@ -1065,20 +1174,22 @@ impl State {
                     return Task::none();
                 }
                 let value = model.predict_snapshot.as_ref().unwrap();
-                self.report_catalog("completed", value.operation.generationfrontier);
-                completed(
-                    if self.catalog_prediction_index == 0 {
-                        "catalog-pe-predict"
-                    } else {
-                        "catalog-predict"
-                    },
-                    [
-                        self.model_generation as f64,
-                        value.operation.generationfrontier as f64,
-                        value.execution.admittedcapacity as f64,
-                        self.model_row as f64,
-                    ],
-                );
+                if self.pixel_attempts == 0 {
+                    self.report_catalog("completed", value.operation.generationfrontier);
+                    completed(
+                        if self.catalog_prediction_index == 0 {
+                            "catalog-pe-predict"
+                        } else {
+                            "catalog-predict"
+                        },
+                        [
+                            self.model_generation as f64,
+                            value.operation.generationfrontier as f64,
+                            value.execution.admittedcapacity as f64,
+                            self.model_row as f64,
+                        ],
+                    );
+                }
                 if self.catalog_prediction_index != 0 {
                     return phase(driver, Stage::NextCatalog);
                 }
@@ -1106,53 +1217,39 @@ impl State {
                     },
                 )
             }
-            Stage::PreparePose => control(widgets, driver, "train.model.action"),
+            Stage::PreparePose if can_prepare(FeatureId::Train) => {
+                control(widgets, driver, "train.model.action")
+            }
             Stage::PosePrepared if prepared(FeatureId::Train) => {
                 if !self.capture_catalog_selection(driver, model, FeatureId::Train) {
                     return Task::none();
                 }
                 phase(driver, Stage::PoseEpochs)
             }
-            Stage::PoseEpochs => control(
-                widgets,
-                driver,
-                constraint_workflowstrainrequestepochs()
-                    .stable_field_id
-                    .to_string(),
-            ),
+            Stage::PoseEpochs => {
+                if settled
+                    && settings
+                        .draft
+                        .as_ref()
+                        .is_some_and(|value| value.workflows.train.request.epochs == 1)
+                {
+                    phase(driver, Stage::PoseEpochsReady)
+                } else {
+                    control(
+                        widgets,
+                        driver,
+                        constraint_workflowstrainrequestepochs()
+                            .stable_field_id
+                            .to_string(),
+                    )
+                }
+            }
             Stage::PoseEpochsReady
                 if settled
                     && settings
                         .draft
                         .as_ref()
                         .is_some_and(|value| value.workflows.train.request.epochs == 1) =>
-            {
-                self.catalog_output = format!(
-                    "{}/catalog-keypoint",
-                    settings
-                        .draft
-                        .as_ref()
-                        .unwrap()
-                        .workflows
-                        .train
-                        .output
-                        .directory
-                        .trim_end_matches('/')
-                );
-                phase(driver, Stage::PoseOutput)
-            }
-            Stage::PoseOutput => control(
-                widgets,
-                driver,
-                constraint_workflowstrainoutputdirectory()
-                    .stable_field_id
-                    .to_string(),
-            ),
-            Stage::PoseOutputReady
-                if settled
-                    && settings.draft.as_ref().is_some_and(|value| {
-                        value.workflows.train.output.directory == self.catalog_output
-                    }) =>
             {
                 phase(driver, Stage::StartPose)
             }
@@ -1162,7 +1259,7 @@ impl State {
                     .training
                     .as_ref()
                     .map_or(0, |value| value.local.generationfrontier);
-                control(widgets, driver, "train.primary")
+                control(widgets, driver, primary(FeatureId::Train))
             }
             Stage::PoseTraining
                 if model.workflow.training.as_ref().is_some_and(|value| {
@@ -1194,23 +1291,35 @@ impl State {
                     .iter()
                     .any(Option::is_none)
                     || progress.checkpointpath.is_empty()
+                    || value.local.output.directory.is_empty()
                 {
                     driver.fail("Actual catalog Keypoint training lost admitted model, bounded work, task losses, OKS or checkpoint");
                     return Task::none();
                 }
                 self.report_catalog("completed", value.local.generationfrontier);
                 crate::integration_control::reporting::emit(|sink| {
-                    sink.record(
-                        "integration.keypoint.training-artifact",
-                        &progress.checkpointpath,
-                        &record.runid,
-                        [
-                            self.model_generation as f64,
-                            value.local.generationfrontier as f64,
-                            progress.globaloptimizerstep as f64,
-                            oks.unwrap().ap,
-                        ],
-                    )
+                    for (event, path) in [
+                        (
+                            "integration.keypoint.training-artifact",
+                            &progress.checkpointpath,
+                        ),
+                        (
+                            "integration.keypoint.training-output",
+                            &value.local.output.directory,
+                        ),
+                    ] {
+                        sink.record(
+                            event,
+                            path,
+                            &record.runid,
+                            [
+                                self.model_generation as f64,
+                                value.local.generationfrontier as f64,
+                                progress.globaloptimizerstep as f64,
+                                oks.unwrap().ap,
+                            ],
+                        );
+                    }
                 });
                 completed(
                     "catalog-keypoint-train-oks",
@@ -1228,7 +1337,9 @@ impl State {
                 driver,
                 crate::view::navigation::stable_id(FeatureId::Live),
             ),
-            Stage::SelectIncompatible if active == FeatureId::Live => {
+            Stage::SelectIncompatible
+                if active == FeatureId::Live && settled && model.settings_edit_available() =>
+            {
                 self.model_row = RFDETR_PRESET_CATALOG
                     .iter()
                     .position(|preset| preset.task == ModelTask::Keypoints)
@@ -1239,6 +1350,8 @@ impl State {
                 if settled
                     && settings.draft.as_ref().is_some_and(|value| {
                         value.workflows.predict.modelsource == ModelSelectionSource::Canonical
+                            && value.workflows.predict.request.presetname
+                                == RFDETR_PRESET_CATALOG[self.model_row].presetname.as_ref()
                     }) =>
             {
                 if model.live_start_available() {
@@ -1248,7 +1361,7 @@ impl State {
                 self.live_revision = live.map_or(0, |value| value.revision);
                 phase(driver, Stage::RefuseStart)
             }
-            Stage::RefuseStart => control(widgets, driver, "live.primary"),
+            Stage::RefuseStart => control(widgets, driver, primary(FeatureId::Live)),
             Stage::Refused => {
                 if live.is_some_and(|value| value.running || value.revision != self.live_revision) {
                     driver.fail("Disabled Live admission started capture");
@@ -1337,15 +1450,15 @@ impl State {
         &mut self,
         driver: &mut Driver,
         requested: Option<Surface>,
-        frame: &VisualFrame,
+        snapshot: &AnnotationSnapshot,
     ) -> Task<RootMessage> {
         let Some((display, content)) = requested.and_then(surface::drawable_annotation) else {
             return Task::none();
         };
-        if &content.metadata.frame != frame {
+        if !annotation_current(&content.metadata, snapshot) {
             return Task::none();
         }
-        let Some(receipt) = probe::current_receipt(crate::view::annotation::WORKSPACE_ID)
+        let Some(receipt) = probe::current_receipt(crate::view::workspace::STABLE_ID)
             .filter(|value| value.surface.frame == display.frame)
         else {
             return Task::none();
@@ -1384,7 +1497,7 @@ impl State {
         self.begin_pixels(
             driver,
             display,
-            crate::view::annotation::WORKSPACE_ID,
+            crate::view::workspace::STABLE_ID,
             "live-import-clean",
             false,
             Stage::RestoreImported,
@@ -1408,7 +1521,10 @@ impl State {
         self.pixel_name = name.into();
         self.empty = empty;
         self.next_pixel = Some(next);
-        phase(driver, Stage::Pixels(0))
+        if let Phase::Workflows(Step::Keypoints(stage)) = driver.phase {
+            self.pixel_stage = Some(stage);
+        }
+        phase(driver, Stage::Pixels(self.pixel_attempts))
     }
     fn scene_pixels(
         &mut self,
@@ -1422,6 +1538,9 @@ impl State {
         let Some(receipt) =
             probe::current_receipt(control).filter(|value| value.surface.frame == display.frame)
         else {
+            return Task::none();
+        };
+        let Some(frame) = display.frame else {
             return Task::none();
         };
         self.patches.clear();
@@ -1445,8 +1564,8 @@ impl State {
                     &receipt,
                     joint.point.x,
                     joint.point.y,
-                    scene.framewidth as f32,
-                    scene.frameheight as f32,
+                    frame.content_width as f32,
+                    frame.content_height as f32,
                     color,
                 );
             }
@@ -1537,28 +1656,81 @@ impl State {
         else {
             return Task::none();
         };
+        // Full-color joint evidence needs a visible raster interior. Live's
+        // canvas-sized source can otherwise minify its three-pixel joint radius
+        // below two screen pixels. Exercise the normal viewer zoom first.
+        let input = content.input_frame();
+        let display_scale = (receipt.image.width / input.extent.width as f32)
+            .min(receipt.image.height / input.extent.height as f32);
+        if !empty && input.source.kind == PresentationSourceKind::Live && display_scale < 0.7 {
+            if self.receipt.as_ref() != Some(&receipt) {
+                self.receipt = Some(receipt.clone());
+                #[cfg(target_arch = "wasm32")]
+                if crate::integration_control::wheel_js(
+                    receipt.bounds.center_x() as f64,
+                    receipt.bounds.center_y() as f64,
+                    -400.0,
+                    false,
+                    true,
+                ) != 1
+                {
+                    driver.fail("Cannot zoom the retained Live joint pixels");
+                }
+            }
+            return Task::none();
+        }
         self.patches.clear();
+        let preview = content.preview();
+        let mut visible = 0;
         for object in content.objects() {
             if object.skeleton.schema.names.len() != object.skeleton.joints.len() {
                 driver.fail("Paired prediction skeleton lost joint identities");
                 return Task::none();
             }
+        }
+        let mut sampled_locations = std::collections::HashSet::new();
+        // Skeletons draw in metadata order. Coincident raster points expose
+        // only the last object's color, while every semantic joint is retained.
+        for object in content.objects().iter().rev() {
+            if preview.is_some_and(|value| {
+                !value.keypoints || object.confidence < value.confidencethreshold
+            }) {
+                continue;
+            }
+            visible += 1;
             for joint in object
                 .skeleton
                 .joints
                 .iter()
                 .filter(|joint| joint.confidence >= 0.5)
             {
+                let location = [joint.point.x.round() as i32, joint.point.y.round() as i32];
+                if !sampled_locations.insert(location) {
+                    continue;
+                }
                 self.patch(
                     &receipt,
-                    joint.point.x,
-                    joint.point.y,
+                    location[0] as f32,
+                    location[1] as f32,
                     content.input_frame().extent.width as f32,
                     content.input_frame().extent.height as f32,
                     &object.color,
                 );
             }
         }
+        crate::integration_control::reporting::emit(|sink| {
+            sink.record(
+                "integration.keypoint.display_policy",
+                name,
+                "paired prediction skeletons",
+                [
+                    content.objects().len() as f64,
+                    visible as f64,
+                    preview.map_or(0.0, |value| value.confidencethreshold as f64),
+                    (self.patches.len() / 7) as f64,
+                ],
+            )
+        });
         if empty != content.objects().is_empty() || (!empty && self.patches.is_empty()) {
             driver.fail("Completed Live/Predict product does not match its detection evidence");
             return Task::none();
@@ -1636,7 +1808,7 @@ impl State {
                 return;
             };
             if probe::current_receipt(control).as_ref() != Some(receipt) {
-                driver.fail("Retained Keypoint product changed before sampling");
+                self.retry_pixels(driver, attempt);
                 return;
             }
             driver.phase = Phase::Workflows(Step::Keypoints(Stage::AwaitPixels(attempt)));
@@ -1648,6 +1820,9 @@ impl State {
                 };
                 let canvas = output.canvas_probe.clone();
                 output.receipt = None;
+                // The workflow owns this once completion. Browser receipt
+                // validation must deliver invalidation after a new image draw.
+                output.probe = None;
                 let callback = crate::integration_control::pixel_checks::pixel_result_callback(
                     move |outcome| {
                         output.send(crate::integration_control::Message::WorkflowPixels {
@@ -1703,7 +1878,12 @@ impl State {
                 input = self.gallery_tile.take().unwrap();
                 Stage::Detail
             }
-            Stage::Import(index) => Stage::Imported(index),
+            Stage::Import(index) => {
+                if surface::viewer_annotation_request().is_none() {
+                    return;
+                }
+                Stage::Imported(index)
+            }
             Stage::SelectObject(index) => Stage::SelectedObject(index),
             Stage::SelectJoint(index) => Stage::SelectedJoint(index),
             Stage::Occlude(index) => Stage::Occluded(index),
@@ -1724,10 +1904,20 @@ impl State {
                 return;
             }
             Stage::Move(index) => {
+                driver.phase = Phase::Workflows(Step::Keypoints(Stage::MoveReady(index)));
+                return;
+            }
+            Stage::CleanImportReveal => {
+                driver.phase = Phase::Workflows(Step::Keypoints(Stage::CleanImportReady));
+                return;
+            }
+            Stage::MoveReady(index) => {
                 let Some(_receipt) = probe::current_receipt(control) else {
-                    driver.fail("Joint move has no displayed annotation image");
                     return;
                 };
+                if self.receipt.as_ref() != Some(&_receipt) {
+                    return;
+                }
                 let scene = self.annotation.as_ref().unwrap();
                 let point = self.joint_before.as_ref().unwrap();
                 let _x = point.x as f64 / scene.framewidth as f64;
@@ -1788,13 +1978,6 @@ impl State {
             Stage::CompilePose => Stage::PoseCompiled,
             Stage::PreparePose => Stage::PosePrepared,
             Stage::StartPose => Stage::PoseTraining,
-            Stage::PoseOutput => {
-                driver.phase = Phase::Workflows(Step::Keypoints(Stage::PoseOutputReady));
-                if !widget_ops::replace_number_input(input, &self.catalog_output, 4096) {
-                    driver.fail("Catalog output directory keyboard input failed");
-                }
-                return;
-            }
             Stage::PoseEpochs => {
                 driver.phase = Phase::Workflows(Step::Keypoints(Stage::PoseEpochsReady));
                 if !widget_ops::replace_number_input(input, "1", 32) {
@@ -1835,6 +2018,8 @@ impl State {
         };
         match outcome {
             ProbeOutcome::Observed(samples, matched) if samples > 0 && matched > 0 => {
+                self.pixel_attempts = 0;
+                self.pixel_stage = None;
                 completed(
                     &self.pixel_name,
                     [
@@ -1846,10 +2031,20 @@ impl State {
                 );
                 driver.phase = Phase::Workflows(Step::Keypoints(self.next_pixel.take().unwrap()));
             }
-            ProbeOutcome::Invalidated if attempt < 8 => {
-                driver.phase = Phase::Workflows(Step::Keypoints(Stage::Pixels(attempt + 1)))
-            }
+            ProbeOutcome::Invalidated => self.retry_pixels(driver, attempt),
             _ => driver.fail("Completed Keypoint canvas did not contain its native joint pixels"),
+        }
+    }
+    fn retry_pixels(&mut self, driver: &mut Driver, attempt: u8) {
+        if attempt < 8
+            && let Some(stage) = self.pixel_stage.take()
+        {
+            self.pixel_attempts = attempt + 1;
+            self.receipt = None;
+            self.patches.clear();
+            driver.phase = Phase::Workflows(Step::Keypoints(stage));
+        } else {
+            driver.fail("Keypoint image changed before its pixel evidence settled");
         }
     }
 }

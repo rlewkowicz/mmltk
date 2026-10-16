@@ -23,6 +23,7 @@ namespace gpu = mmltk::frameworks::gpu;
 struct DistributedContext::Transport final {
  c10::intrusive_ptr<c10d::Store> store;
  c10::intrusive_ptr<c10d::Backend> backend;
+ std::optional<std::chrono::milliseconds> timeout;
  std::atomic<bool> aborted{false};
  std::atomic<bool> shutdown{false};
 };
@@ -52,10 +53,12 @@ DistributedContext make_distributed_context(const std::filesystem::path& path, i
  auto store = c10::make_intrusive<c10d::FileStore>(path.string(), world);
  auto options = c10::make_intrusive<c10d::ProcessGroupNCCL::Options>();
  options->timeout = timeout.value_or(c10d::kProcessGroupNCCLDefaultTimeout);
+ const auto operation_timeout = options->timeout;
  auto backend = c10::make_intrusive<c10d::ProcessGroupNCCL>(store, rank, world, std::move(options));
  backend->setBoundDeviceId(tc::cuda_device(device));
  auto result = DistributedContext::from_backend(rank, world, device, std::move(backend));
  result.transport_->store = std::move(store);
+ result.transport_->timeout = operation_timeout;
  return result;
 #else
  (void)device;
@@ -235,9 +238,18 @@ void TrainingCollectiveWork::settle() {
  if (uncertain()) throw std::runtime_error("training collective physical completion is unproved");
  if (!state.completion_recorded) record_completion();
  try {
+  tc::TorchCudaStreamGuard guard(state.stream);
+  // join() only orders CUDA streams. A physical CPU settlement must let the
+  // backend observe peer failure/timeout before waiting on its CUDA fence.
+  for (std::size_t index = 0; index < state.used; ++index) {
+   const auto& slot = state.slots[index];
+   if (slot.work && !slot.work->wait(slot.group.transport_->timeout.value_or(std::chrono::milliseconds::max())))
+    throw std::runtime_error("training collective completion wait returned false");
+  }
   state.completed.synchronize();
  } catch (...) {
   state.failure = cudaErrorUnknown;
+  for (std::size_t index = 0; index < state.used; ++index) distributed_abort(state.slots[index].group);
   throw;
  }
  clear_completed();

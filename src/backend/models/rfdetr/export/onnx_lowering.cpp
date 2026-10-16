@@ -1,6 +1,8 @@
 module;
 #include <ATen/core/jit_type.h>
+#include <ATen/core/grad_mode.h>
 #include <ATen/Context.h>
+#include <ATen/ops/_upsample_bicubic2d_aa.h>
 #include <ATen/ops/scalar_tensor.h>
 #include <ATen/ops/tensor.h>
 #include <c10/core/SymInt.h>
@@ -59,6 +61,7 @@ constexpr int kOnnxTensorProtoBfloat16 = 16;
 const c10::Symbol kAtenTo = c10::Symbol::fromQualString("aten::to");
 const c10::Symbol kAtenTypeAs = c10::Symbol::fromQualString("aten::type_as");
 const c10::Symbol kSegmentationDepthwise = c10::Symbol::fromQualString("mmltk::segmentation_depthwise");
+const c10::Symbol kLinearRelu = c10::Symbol::fromQualString("mmltk::linear_relu");
 const c10::Symbol kMathAttention = c10::Symbol::fromQualString("aten::_scaled_dot_product_attention_math");
 const c10::Symbol kAtenConvolution = c10::Symbol::fromQualString("aten::_convolution");
 const c10::Symbol kAtenFlatten = c10::Symbol::fromQualString("aten::flatten");
@@ -1725,6 +1728,7 @@ void lower_linear_node(torch::jit::Node* node) {
  auto* weight = chain.append_transpose(node->input(1), {1, 0});
  auto* output = chain.append(kOnnxMatMul, {node->input(0), weight->output()});
  if (!is_none_value(node->input(2))) output = chain.append(kOnnxAdd, {output->output(), node->input(2)});
+ if (node->kind() == kLinearRelu) output = chain.append(kOnnxRelu, {output->output()});
  replace_node_with(node, output->output());
 }
 void lower_creation_node(torch::jit::Node* node, double fill_value) {
@@ -2032,6 +2036,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
  NODE(kAtenTopk, lower_topk_node)                                             \
  NODE(kAtenMatmul, lower_matmul_node)                                         \
  NODE(kAtenLinear, lower_linear_node)                                         \
+ NODE(kLinearRelu, lower_linear_node)                                         \
  NODE(kAtenBmm, lower_matmul_node)                                            \
  CREATE(kAtenOnesLike, 1.0)                                                   \
  CREATE(kAtenNewOnes, 1.0)                                                    \
@@ -2235,6 +2240,64 @@ private:
  std::vector<at::Tensor> views;
  std::vector<std::pair<const torch::jit::Value*, std::size_t>> initializers;
 };
+using InitializerViewCache = std::unordered_map<const torch::jit::Value*, std::optional<at::Tensor>>;
+std::optional<at::Tensor> initializer_view(const torch::jit::Value* value, const LoweringContext& context, InitializerViewCache& cache, std::size_t depth = 0U) {
+ if (!value || depth == 64U) return std::nullopt;
+ if (const auto tensor = lookup_initializer_tensor(value, context)) return tensor;
+ if (const auto found = cache.find(value); found != cache.end()) return found->second;
+ auto* node = value->node();
+ const auto kind = node->kind();
+ const bool reshape = kind == kAtenView || kind == kAtenReshape;
+ const bool cast = kind == kAtenTo || kind == kAtenTypeAs;
+ const bool identity = kind == kAtenAlias || kind == kAtenDetach || kind == kAtenContiguous;
+ if (!reshape && !cast && !identity && kind != kAtenPermute && kind != kAtenTranspose && kind != kAtenSlice && kind != kAtenSelect && kind != kAtenUnsqueeze && kind != kAtenSqueeze)
+  return std::nullopt;
+ if (node->inputs().empty()) return std::nullopt;
+ const auto input = initializer_view(node->input(0), context, cache, depth + 1U);
+ if (!input) return std::nullopt;
+ std::optional<at::Tensor> result;
+ if (reshape || kind == kAtenPermute) {
+  if (const auto dimensions = constant_int_list_value(node->input(1)))
+   result = reshape ? input->reshape(*dimensions) : input->permute(*dimensions);
+ } else if (cast) {
+  // Staging already owns CPU values. A traced device transfer changes no
+  // initializer data; retain only its admitted output dtype here.
+  if (const auto dtype = extract_target_scalar_type(node)) result = input->to(*dtype);
+ } else if (identity) {
+  result = kind == kAtenContiguous ? input->contiguous() : *input;
+ } else if (kind == kAtenSlice) {
+  const auto dimension = constant_int_value(node->input(1)), step = constant_int_value(node->input(4));
+  const auto start = is_none_value(node->input(2)) ? std::optional<std::int64_t>{0} : constant_int_value(node->input(2));
+  const auto end = is_none_value(node->input(3)) ? std::optional<std::int64_t>{std::numeric_limits<std::int64_t>::max()} : constant_int_value(node->input(3));
+  if (dimension && start && end && step) result = input->slice(*dimension, *start, *end, *step);
+ } else if (kind == kAtenTranspose || kind == kAtenSelect) {
+  const auto first = constant_int_value(node->input(1)), second = constant_int_value(node->input(2));
+  if (first && second) result = kind == kAtenTranspose ? input->transpose(*first, *second) : input->select(*first, *second);
+ } else if (node->inputs().size() == 1U) {
+  result = input->squeeze();
+ } else if (const auto dimension = constant_int_value(node->input(1))) {
+  result = kind == kAtenUnsqueeze ? input->unsqueeze(*dimension) : input->squeeze(*dimension);
+ }
+ cache.emplace(value, result);
+ return result;
+}
+void fold_initializer_resizes(torch::jit::Block* block, const LoweringContext& context, InitializerViewCache& cache) {
+ for (auto it = block->nodes().begin(); it != block->nodes().end();) {
+  auto* node = *it;
+  ++it;
+  for (auto* child : node->blocks()) fold_initializer_resizes(child, context, cache);
+  if (node->kind() != kAtenUpsampleBicubic2dAa || node->inputs().size() != 5U) continue;
+  const auto size = constant_int_list_value(node->input(1));
+  const auto align_corners = constant_bool_value(node->input(2));
+  if (!size || size->size() != 2U || !align_corners || *align_corners || !is_none_value(node->input(3)) || !is_none_value(node->input(4))) continue;
+  const auto input = initializer_view(node->input(0), context, cache);
+  if (!input || (input->scalar_type() != at::kFloat && input->scalar_type() != at::kDouble)) continue;
+  // Learned positional grids are immutable export inputs. Materialize their
+  // exact antialiased interpolation once, so runtimes need no antialias Resize
+  // support. Dynamic image resizes retain their ordinary ONNX lowering.
+  replace_with_constant_tensor(node, at::_upsample_bicubic2d_aa(*input, *size, false, std::nullopt, std::nullopt));
+ }
+}
 }  // namespace
 void lower_graph_for_onnx_export(const OnnxLoweringRequest& request) {
  auto* const graph = static_cast<torch::jit::Graph*>(request.graph);
@@ -2251,6 +2314,9 @@ void lower_graph_for_onnx_export(const OnnxLoweringRequest& request) {
  ExportTensorStaging staging(*graph, context, *request.readback);
  context.staged_initializers = &staging.completed;
  const LoweringContextScope scope(context);
+ at::NoGradGuard no_grad;
+ InitializerViewCache initializer_views;
+ fold_initializer_resizes(graph->block(), context, initializer_views);
  lower_block_for_onnx_export(graph->block(), context);
  materialize_initializer_getattrs(graph->block(), context);
  materialize_remaining_prim_constants(graph->block());

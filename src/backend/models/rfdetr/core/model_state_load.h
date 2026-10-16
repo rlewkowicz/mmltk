@@ -1,6 +1,7 @@
 #pragma once
 #include <torch/types.h>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -25,6 +26,7 @@ private:
  ModelStateLoadSummary summary_;
 };
 namespace detail {
+inline constexpr std::string_view kQueryFeatureWeight = "query_feat.weight", kReferencePointWeight = "refpoint_embed.weight";
 struct NormalizedModelStateCandidate {
  ModelStateLoadSummary summary;
  std::vector<torch::Tensor> destinations;

@@ -46,6 +46,12 @@ struct OracleParameterGroup final {
  double lr = 0, weight_decay = 0, beta1 = .9, beta2 = .999, eps = 1e-8;
  bool amsgrad = false;
 };
+struct OracleExportArtifact final {
+ std::filesystem::path path;
+ std::string sha256;
+ std::uint64_t bytes = 0;
+ std::map<std::string, std::string> outputs;
+};
 struct OracleCase final {
  std::string id, preset, precision, protocol;
  bool training = false;
@@ -58,12 +64,16 @@ struct OracleCase final {
  double clip_max_norm = .1;
  std::map<std::string, double> loss_weights;
  std::vector<OracleArchiveReference> steps;
+ std::optional<OracleExportArtifact> upstream_export;
  [[nodiscard]] at::ScalarType dtype() const;
 };
 class OracleArchive final {
 public:
  // The optional observation belongs to fixture evidence and never controls reads.
  OracleArchive(const std::filesystem::path& directory, const nlohmann::json& reference, std::function<void(std::size_t)> physical_load = {});
+ // Authenticate the complete index and every retained shard needed by these
+ // tensors. Other payloads may have been retired after their consumers passed.
+ [[nodiscard]] static OracleArchive select(const std::filesystem::path& directory, const nlohmann::json& reference, std::span<const std::string> names);
  // Own only the requested tensor storage, independently of the working shard.
  [[nodiscard]] TensorMap read_tensors(std::span<const std::string> names, torch::Device device = torch::kCPU) const;
  [[nodiscard]] torch::Tensor tensor(const std::string& name, torch::Device device = torch::kCPU) const;
@@ -83,7 +93,7 @@ private:
 };
 class UpstreamOracle final {
 public:
- // Required ordinary-suite evidence. Missing preparation fails acceptance.
+ // External validation is opt-in; absent evidence skips, invalid supplied evidence fails.
  [[nodiscard]] static std::filesystem::path requested();
  explicit UpstreamOracle(const std::filesystem::path& root);
  [[nodiscard]] const std::vector<OracleCase>& cases() const noexcept { return cases_; }
@@ -91,7 +101,8 @@ public:
  [[nodiscard]] std::filesystem::path checkpoint(std::string_view preset) const;
  [[nodiscard]] std::filesystem::path official_checkpoint(std::string_view preset) const;
  [[nodiscard]] NativeRfDetrModel model(const OracleCase& entry) const;
- [[nodiscard]] OracleArchive archive(const OracleCase& entry, std::size_t step) const;
+ [[nodiscard]] OracleArchive archive(const OracleCase& entry, std::size_t step, std::span<const std::string> names = {}) const;
+ [[nodiscard]] std::filesystem::path export_onnx(const OracleCase& entry) const;
  [[nodiscard]] OracleArchive resize_archive() const;
  [[nodiscard]] OracleArchive keypoint_archive() const;
  [[nodiscard]] const nlohmann::json& keypoint_cases() const noexcept { return keypoint_cases_; }

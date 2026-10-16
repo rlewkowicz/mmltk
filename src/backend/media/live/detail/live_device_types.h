@@ -51,7 +51,7 @@ private:
 class LivePhysicalCudaContext final {
 public:
  LivePhysicalCudaContext() noexcept = default;
- LivePhysicalCudaContext(gpu::ResourceOwnerCommandBinding command, gpu::CudaDeviceOwner device) noexcept;
+ LivePhysicalCudaContext(gpu::ResourceOwnerCommandBinding command, gpu::CudaDeviceOwner device, gpu::CudaDeviceApi api) noexcept;
  [[nodiscard]] bool valid() const noexcept;
  [[nodiscard]] int device() const noexcept;
  [[nodiscard]] LiveCudaCommandScope scope() const noexcept;
@@ -61,6 +61,7 @@ private:
  [[nodiscard]] gpu::ResourceOwnerCommandScope EnterCommand() const noexcept;
  gpu::ResourceOwnerCommandBinding command_{};
  gpu::CudaDeviceOwner device_{};
+ gpu::CudaDeviceApi api_{};
  friend class LiveCudaCommandScope;
 };
 [[nodiscard]] inline std::optional<SlotState> retire_live_slot(LiveCudaCommandScope& scope, std::atomic<std::uint32_t>& state, const cudaStream_t stream) noexcept {

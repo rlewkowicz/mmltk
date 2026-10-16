@@ -2,1162 +2,685 @@
 
 [Wiki index](README.md) · [Source guide](architecture.md) · [GPU execution](gpu-execution.md) · [Diagnostics](logging.md)
 
-The [architectural contract](../CONTRACT.md) defines ownership. This page
-explains how input, native state, GPU images, and Iced views cross those
-boundaries. These paths are event-driven; they make no hard frame-rate or
-input-to-display latency guarantee.
+[CONTRACT.md](../CONTRACT.md) defines ownership. This page describes current
+input, native-state, image and Iced behavior. Event-driven execution provides
+no hard frame-rate or input-to-display latency guarantee.
 
 ## Workflow layout and navigation
 
-The header order is **Train, Validate, Predict, Export, Live, Annotate,
-Explore**. [navigation.rs](../src/frontend/iced/src/view/navigation.rs) owns
-that visual order; ordinary workflow traversal derives from it, excluding
-Explore.
+Header order: **Train, Validate, Predict, Export, Live, Annotate, Explore**.
+[Navigation](../src/frontend/iced/src/view/navigation.rs) owns visual order and
+ordinary workflow traversal (excluding Explore). **Status** centers after Explore;
+the connection label precedes bordered **Settings** at the right. These remain
+outside the tab scroller. Narrow tabs retain button height; at minimum widths
+connection text yields to Status/Settings. The Status popup follows measured
+trigger bounds.
 
-**Status** is centered in the available space after Explore. The connection
-label sits immediately before the bordered **Settings** button at the right
-edge. These controls stay outside the workflow tab scroller; tabs retain their
-ordinary button height when the window narrows. Status owns session notices
-across every page, and its popup follows the trigger's measured bounds. At the
-narrowest widths, the connection label yields space to Status and Settings.
-
-The destination page owns foreground source selection. Navigating directly from
-Validate to Explore restores Explore's native product even when Validation
-retains results or later publishes another update. A retained Upscale request
-survives only when it belongs to that destination's viewer. Dataset readiness
-and drawable-image readiness remain separate, as described under
-[gallery restoration](#explore-gallery-and-displayed-geometry).
+Destination pages select foreground sources. Validate→Explore restores Explore
+even when Validation later updates. Upscale requests survive only for their
+owning destination viewer. Dataset readiness does not imply drawable readiness.
 
 The [page canvas](../src/frontend/iced/src/view/mod.rs) is at least 1020 logical
-pixels wide and centers a page of at most 1500 logical pixels. A narrower
-window exposes horizontal scrolling, with space reserved for its scrollbar so
-the rail cannot cover bottom-row controls. Ordinary workflows use one vertical page
-scroll beneath the header; Explore retains its gallery and sidebar scroll
-owners.
+pixels wide, centers content up to 1500, and scrolls horizontally below that
+minimum with reserved scrollbar space. Ordinary pages have one vertical scroller;
+Explore owns its gallery/sidebar scrollers. The [workflow compositor](../src/frontend/iced/src/view/workflow/mod.rs)
+uses 19% setup, 62% workspace/Advanced, 19% tools/status. Annotate shares it:
 
-The shared [workflow compositor](../src/frontend/iced/src/view/workflow/mod.rs)
-assigns 19% of page width to setup, 62% to the workspace with Advanced below,
-and 19% to tools/status. Annotate uses those same columns:
-
-| Left: setup | Center: workspace and Advanced | Right: tools and status |
+| Setup | Center | Tools/status |
 | --- | --- | --- |
-| Source, output destination, Open, Save annotations | Viewer controls and image; Timeline in Advanced underneath | Tools, objects, classes, editing controls, operation status, Stop |
+| Source, output, Open, Save annotations | Viewer; Advanced Timeline below | Tools, objects/classes, edits, operation progress, Stop |
 
-[Annotate](../src/frontend/iced/src/view/annotation.rs) supplies these regions
-to the compositor. Its [sidebar](../src/frontend/iced/src/view/annotation/sidebar.rs)
-keeps tools, object/class lists, and long labels within the right column.
-Those lists grow with the page's vertical content; Annotate has no separate
-compact layout or nested inspector, object, or class scroll area. Viewer and
-editor widget identities survive ordinary layout and native-state updates.
+Annotation lists/long labels remain in the right column and grow with page
+content, without nested object/class inspectors or a compact alternative.
+Viewer/editor identities survive ordinary layout and native updates.
 
 ## Training, validation, and prediction
 
-Train, Validate, Predict, and Export place **Output** at the top of the right
-column and **GPU** immediately below, with setup and the primary action on the
-left. Output provides Auto
-Output, Browse Output, and admitted/completed paths; Train adds saved history,
-Predict adds source-specific saving. [Output policy](rfdetr-workflows.md#run-output-directories)
-owns reservations, defaults, and artifact names.
+Train/Validate/Predict/Export place **Output** then **GPU** at right, setup/primary
+action at left. [Workflow reference](rfdetr-workflows.md) owns weights, inputs,
+reservations, metrics, artifacts and continuation. Shared weights controls provide
+confirmation/preparation/cancellation, without manual backend-kind/Class layout.
 
-All four share the **RF-DETR Weights** card's confirmation, preparation, and
-cancellation. [Weights selection](rfdetr-workflows.md#shared-weights-selection)
-owns supported extensions and native admission; these cards have no manual
-artifact-kind or Class layout controls. Page-specific composition is:
-
-| Page | Controls and workspace |
+| Page | Controls/workspace |
 | --- | --- |
-| Train | Center [dashboard](#training-dashboard), shared aspect selector, separate live progress card; no native image workspace. Dataset exposes manual split fields when inference is off, keeping optional test independent. Weights adds Transfer/Resume; Output loads saved charts. Advanced includes default-off EMA, separate augmentation/perceptual settings, and [lanes/recipes](#lane-and-recipe-controls). |
-| Validate | Open Dataset displays the explicit override or inherited Train validation split; [fixed workspace](#validation-workspace-and-shared-viewer). |
-| Predict | Compiled/image/video inputs, an image-only RGB resampling selector, preview threshold, aspect selector, video Pause/Resume/Stop; batch size is always 1 with no field. Output has image Save sample, compiled Percent %/Total with count inspection, and video Samples/Full. Shared disclosures retain each source's choices when switching; [saving semantics](rfdetr-workflows.md#prediction-samples-and-full-video). |
-| Export | Left-column independent ONNX/TensorRT checkboxes; Run Export requires at least one. |
+| Train | Aspect-selected dashboard and separate live progress; Dataset inference/manual split fields with independent optional test; Transfer/Resume; saved Output history; Advanced EMA, augmentation/perceptual, lanes/recipes |
+| Validate | Open Dataset override or inherited validation split; fixed metrics/preview workspace |
+| Predict | Compiled/image/video sources; image-only RGB resize; threshold/aspect; video Pause/Resume/Stop; batch one, no batch field; source-specific saving disclosures retain choices |
+| Export | Independent ONNX/TensorRT checkboxes; at least one required |
 
-Train, Validate, and Predict hide H2D/NUMA controls while retaining generated
-settings/backend support; Explore keeps loading controls. [Workflow details](rfdetr-workflows.md)
-own input admission, progress, metrics, formats, and continuation.
-
-The primary action retains one preparation request across settings settlement,
-model selection/preparation, and native start. Changing its inputs or leaving
-the workflow cancels an unstarted request. Repeated clicks do not create
-duplicate starts. Progress shows the preparation stage and then the owning
-operation's completed work; unknown totals stay indeterminate. Video controls
-use the same pending-system admission as their typed requests, including an
-event arriving before its reply.
-Validation, Prediction, and Export keep progress inside setup; Train uses its
-live progress card. [Primary-action spacing](#shared-primary-actions) remains
-empty in every state. Training preparation reports GPU connection, compiled
-dataset opening, sampling plan construction, model initialization, and optimizer
-setup before measurements exist.
-Validation and prediction also retain the save-preview options captured at
-that accepted Start through preparation. Later viewer edits do not mutate the
-admitted save payload. Predict inspection replies enter the same revision-aware
-snapshot reduction as events, so a late reply cannot replace newer source facts.
+Train/Validate/Predict hide H2D/NUMA controls while retaining native/generated
+settings; Explore keeps loading controls. An explicit primary action retains
+one request through settings settlement, model preparation and Start. Changing
+inputs/leaving cancels unstarted work; repeated clicks cannot duplicate starts.
+Unknown totals stay indeterminate. Video controls share pending-system admission,
+including events before replies. Progress stays in setup except Train's live card;
+card-to-action gaps remain empty. Preparation reports GPU connection, compiled
+opening, sampling, initialization and optimizer setup before measurements exist.
+Validate/Predict retain saving options captured at Start through preparation;
+later viewer edits do not change them. Prediction inspection replies use the
+same revision-aware reduction as events and cannot overwrite newer source facts.
 
 ### Lane and recipe controls
 
-Train offers **Shared gradients**, **Independent models**, and **Periodic
-averaging**. The [native training contract](rfdetr-training.md#logical-lanes-and-global-batch)
-owns global batch, accumulation, model membership, and capacity. Train lanes
-and validation lanes are independent controls. One Advanced card groups
-training batches and lanes, validation, model recipes, learning-rate schedules,
-precision/encoder settings, data sampling/augmentation, supervision, and model
-merging/final soup. The [shared dividers](#shared-form-expansion-and-dividers)
-use ten-pixel gaps above/below in this card. The 18 px Advanced title and its
-unchanged 12 px subtitle precede the first divider. H2 section headings are
-16 px with 8 px before settings. Recipe scope
-and Global optimizer defaults (or Model optimizer) are H3, 14 px with 8 px before
-the heading and 6 px before controls.
+Train offers **Shared gradients**, **Independent models**, **Periodic averaging**.
+[Native batch policy](rfdetr-training.md#logical-lanes-and-global-batch) owns
+logical membership/effective batch/capacity. Training and validation lanes are
+independent. Advanced groups batches/lanes, validation, recipes/schedules,
+precision/encoder, sampling/augmentation, supervision and merging/soup. Dividers
+have ten-pixel gaps here. The Advanced title/subtitle are 18/12 px; H2 is 16 px
+with 8 px before settings; Recipe scope/optimizer H3 is 14 px with 8 px before
+and 6 px after.
 
-**Global batch (all GPUs)** is the editable microbatch size. Native facts supply
-**Batch / GPU / microbatch** (a range for uneven splits), **Effective batch /
-model update**, and **Images / session round**. Calculated values retain the
-numeric field's size and alignment without an outline or edit callback.
-Matching revision-bound training calculations remain visible through Start and
-worker preparation; admitted facts replace them when the current operation
-publishes them. Stale drafts or unsettled lane membership show **Updating**.
-Validation distinguishes pre-admission and admitted capacity. Rust does not
-derive a second batch formula.
-Independent and periodic modes display their experimental limitation.
+**Global batch (all GPUs)** edits microbatch images. Native facts supply
+**Batch / GPU / microbatch** (range for uneven ranks), **Effective batch / model
+update**, **Images / session round**. Calculated values use numeric-field size/
+alignment without outline/callback. Revision-matched calculations remain during
+preparation until admitted facts arrive; stale drafts/membership show **Updating**.
+Validation distinguishes configured/admitted capacity. Rust does not duplicate
+formulas. Independent/periodic modes display their experimental limitation.
 
-**Recipe scope** selects Global defaults or a stable model ID. New models copy
-the settled global recipe; existing models retain overrides through mode
-changes. Model scope also exposes its seed and soup coefficient. AdamW, Muon,
-and SGD use generated catalog defaults; changing optimizer preserves explicit
-overrides. **Use optimizer defaults** clears the selected scope's overrides
-without changing its optimizer. Step, Cosine, and Ultralytics linear scheduler
-availability comes from native policy. The
-[recipe reference](rfdetr-training.md#recipes-and-schedules) owns equations,
-defaults, and continuation clocks.
+Recipe scope chooses globals/stable model ID. New models copy settled globals;
+existing models retain overrides through mode changes. Model scope adds seed and
+soup coefficient. AdamW/Muon/SGD use generated defaults; switching optimizer
+preserves explicit overrides. **Use optimizer defaults** clears only that scope,
+preserving optimizer. Native policy determines Step/Cosine/Ultralytics linear
+availability; [recipe reference](rfdetr-training.md#recipes-and-schedules) owns
+values/clocks. Task loss summaries show native coefficients, including joint
+L1/findability/visibility/NLL and dataset-owned joint meaning. Unsupported
+Match-Free/DN choices follow native task/decoder capabilities.
 
-Class balancing offers Off, Stratified, and Rare repeats + Stratified, revealing
-the native rare-threshold/repeat limits when needed. Periodic mode exposes
-Each epoch or Every N rounds and the merge interval. **Final model soup**
-offers Mode default, Off, Uniform, Explicit, and Validation-greedy. Native
-[merging policy](model-merging.md) resolves defaults and selection. Final-epoch
-encoder unfreezing and augmentation disabling are separate numeric policies;
-zero disables each. These are configuration edits, not implicit starts.
-
-Validate, Predict, and training validation have separate inference-lane
-settings. Native source/backend capacity admission can reduce physical lanes;
-single-image prediction admits one. The
-[execution guide](gpu-execution.md#inference-lanes-and-borrowed-inputs) owns
-resource reuse, ordered delivery, and drain behavior.
+Class balancing offers Off/Stratified/Rare repeats + Stratified, revealing rare
+limits when needed. Periodic cadence is Each epoch/Every N rounds. Final soup is
+Mode default/Off/Uniform/Explicit/Validation-greedy. [Merging](model-merging.md)
+owns resolution. Encoder-unfreeze and augmentation-disable final-epoch counts
+are independent, zero-disabled edits, never implicit starts. Inference lanes are
+separate for Validate/Predict/training validation; native admission may reduce
+physical capacity, and single-image prediction admits one.
 
 ### GPU selection
 
-The shared [GPU card](../src/frontend/iced/src/view/workflow/gpu.rs) displays
-each native CUDA ordinal, device name, and total VRAM in GiB. Validate, Export,
-and Predict select one device. Train uses checkboxes for an ordered device
-list and displays **Rank order**; adding a GPU appends a rank, removing one
-preserves the remaining order and associated NUMA choices. At least one
-training GPU remains selected.
-
-Selections use ordinary generated settings edits, preserve other pending
-drafts, and are disabled while the owning primary action is active or settings
-are unavailable. A saved device absent from the native inventory remains
-visible as **unavailable**; an empty inventory shows **No CUDA GPUs available**.
-The card does not silently choose a replacement. Native admission and
-device-dependent model preparation use the settled selection. The
-[GPU execution reference](gpu-execution.md#workflow-device-selection) owns
-inventory, persistence, locality, runtime replacement, and the independent
-graphics-device boundary.
+The [GPU card](../src/frontend/iced/src/view/workflow/gpu.rs) shows native CUDA
+ordinal/name/total GiB. Validate/Export/Predict select one. Train edits an ordered
+checkbox list with **Rank order**: add appends, remove preserves remaining order/
+NUMA choices, and one GPU must remain. Edits use ordinary generated settings,
+preserve pending drafts and disable while the primary action/settings are busy.
+Missing saved devices remain **unavailable**; empty inventory shows **No CUDA GPUs
+available**, without replacement selection. Native preparation/admission uses
+settled choices; [GPU execution](gpu-execution.md#workflow-device-selection)
+owns persistence/locality/retirement and independent display-device selection.
 
 ### Dataset compilation controls
 
-The [Dataset component](../src/frontend/iced/src/view/train/dataset.rs) offers
-Stretch/Letterbox geometry radios and a separate **Resize method** group:
-**AVIR**, **Perceptual downscaling**, **PyTorch bilinear**, and **PyTorch bilinear +
-antialias**. The group edits the existing method and perceptual settings together.
-Native [resize defaults and semantics](datasets.md#rgb-resampling-methods)
-drive these choices. Predict exposes AVIR and the two PyTorch methods for
-**Image file** only and retains the selection across compiled/image/video source
-switches. C++ reflected settings own the values; the shared Rust field component
-owns labels and presentation.
-**Compile Benchmark Dataset Override** switches the explicit compile
-action between a source directory and a built-in recipe.
+Dataset exposes Stretch/Letterbox geometry and **Resize method**:
+AVIR, Perceptual downscaling, PyTorch bilinear, PyTorch bilinear + antialias.
+The group edits method/perceptual settings together; [data reference](datasets.md#rgb-resampling-methods)
+owns native semantics/defaults. Predict Image file offers AVIR/two PyTorch methods,
+retaining choice across source switches. Rust owns labels, native declarations
+own values.
 
-With the override on, **Coco custom** and **Coconut** radios appear. Coco custom
-is the native default. Selecting Coconut additionally reveals **Coconut
-validation**, **Stock validation**, and **Coconut stock**; Coconut validation
-is the native initial choice. The
-[recipe membership table](benchmark-datasets.md#recipes-and-validation-membership)
-defines exactly which images and labels each choice compiles.
+**Compile Benchmark Dataset Override** chooses Directory or built-in recipes,
+disabling source text/Browse while on. **Coco custom** is default; **Coconut**
+reveals validation (Coconut validation default, Stock validation, Coconut stock)
+and default-off dropped-mask recovery. [Benchmark reference](benchmark-datasets.md)
+owns membership/recovery; changed recovery requires recompilation. Coconut's
+group is indented 16 px; descriptions/recovery use 12 px and radio-label alignment.
+Hidden choices persist: Coco custom ignores Coconut options, Directory ignores
+benchmark options. Edits never start compilation.
 
-Coconut also reveals **Recover dropped masks from original annotations**, off
-by default. Its [recovery policy](benchmark-datasets.md#optional-dropped-mask-recovery)
-uses eligible original COCO masks without changing validation membership.
-Recompile existing datasets to apply a changed recovery setting.
-The recovery checkbox and validation choices form one group indented 16 logical
-pixels beneath Coconut. Recovery text and the validation descriptions use
-text at 12 logical pixels; each description sits beneath its radio, aligned
-with its label.
+Compile requires settled settings/native admission and captures them for the
+operation. While active, recipe/validation/recovery choices disable, other controls
+retain their rules. The action becomes **Cancel compilation**. Progress shows
+current work, Acquisition/Labels/masks/Pixels and source details with native
+[units](benchmark-datasets.md#reading-compilation-progress). [Coalesced revisioned
+snapshots](application-wire.md#dataset-operation-snapshots) preserve Stop/terminal/
+reconnect ordering. Remaining work replaces Indexing captions; track state is
+independent. Compacting then reports processed pixel/label bytes before sync/
+publication; completed tracks do not settle Compile. Rejected images/annotations
+remain distinct from successful pixels and healthy-subset admission.
 
-Recipe, validation, and recovery choices persist when hidden. Coco custom ignores
-hidden validation/recovery values; Directory ignores benchmark selection.
-Override disables source-directory text/Browse and restores them when off.
-Control edits never start compilation.
-
-**Compile Benchmark Dataset** or **Compile Dataset** requires settled settings
-and native admission. The accepted native request captures those settings for
-the entire operation. While compilation is active, the two recipe radios,
-three validation radios, and recovery checkbox are disabled; the other Dataset
-controls keep their existing enablement rules. The action becomes **Cancel
-compilation**, using the Dataset system's Stop operation. Progress shows the
-current work, separate **Acquisition**, **Labels/masks**, and **Pixels** tracks,
-and benchmark source details. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
-defines their units, readable quantities, and source summaries.
-Native ordinary progress is coalesced at the
-[compiler observer](compile-execution.md#progress-delivery), and revisioned
-[Dataset snapshots](application-wire.md#dataset-operation-snapshots) guard
-delivery through cancellation, terminal state, and reconnect. The current-work
-caption follows remaining native work when Indexing finishes; track state is
-independent of that caption.
-After those tracks settle, **Compacting** reports the live pixel/label bytes
-processed before sync and publication. Completed track bars alone do not settle
-the Compile action. Rejected-image and annotation counts remain distinct from
-successful pixel work; the benchmark guide owns
-[healthy-subset admission](benchmark-datasets.md#recipes-and-validation-membership).
-
-Progress retains its greatest measured height for the active generation/width,
-keeping the action stationary on shorter updates. Width changes remeasure; new
-generations reset the reservation. Native cancellation-requested state changes
-action/progress to **Cancelling…**, immediately hides work/tracks/source rows,
-and disables duplicate cancellation. Reserved space remains until native inactivity.
-
-Only the native terminal result settles the operation. **Completed** or
-**Cancelled** replaces live progress with supplied detail and artifact path.
-Failure and refusal publish a session Status notice and collapse the terminal
-progress body. Releasing the active reservation animates to its natural height.
-Retained late progress cannot revive bars or turn cancellation into success.
+Progress reserves its greatest measured height per generation/width; width changes
+remeasure, new generations reset. Native cancellation shows **Cancelling…**, hides
+tracks/details and disables repeat Stop while retaining reserved space. Only the
+native terminal settles it: Completed/Cancelled show supplied detail/path;
+failure/refusal posts Status and collapses terminal body. Reservation releases
+through the shared transition. Late progress cannot revive work or undo cancellation.
 
 ## Session Status
 
-The header [Status component](../src/frontend/iced/src/view/status.rs) is the
-single operational warning/error surface. With no retained notices it shows
-only green **Ok**. Otherwise it shows a warning triangle and white outline with
-a pink two-second border pulse. Only a visible active pulse requests redraws;
-reduced motion keeps a static border and hidden windows stay quiet. Arriving
-notices do not open the panel or steal focus.
-Healthy Status returns to its borderless appearance when the pointer leaves,
-including after hover-close restores trigger focus. Keyboard interaction shows
-the focus outline again without changing the retained focus target.
+[Status](../src/frontend/iced/src/view/status.rs) is the single operational
+warning/error surface. Empty history shows green **Ok**. Notices add a warning
+triangle/white outline and pink two-second border pulse. Only visible active
+motion redraws; reduced motion is static, hidden windows quiet. Arrival neither
+opens the panel nor steals focus. Healthy hover-close restores borderless
+appearance after pointer leave; keyboard use restores focus outline without
+changing focus target.
 
-Click, keyboard activation, or touch toggles the panel. Mouse hover opens it
-across the trigger, connecting gap, and panel; leaving that boundary closes a
-hover-opened panel. Explicit close or Escape while still inside latches it
-closed until leave/reentry or a new explicit activation. The panel is a root
-overlay, so page and sidebar clipping cannot cut it off. Its width is bounded by
-60% of the page and the viewport with 12-pixel margins; its rows scroll
-vertically. Complete title/detail text wraps in selectable read-only editors,
-without compact-text fitting or ellipses. **Copy** copies exactly the title,
-two newlines, and detail. Each row has **Dismiss**; there is no clear-all action.
+Click/key/touch toggles. Hover opens across trigger/gap/panel; leaving closes a
+hover-opened panel. Explicit close/Escape inside latches closed until leave/
+reentry or activation. Root-overlay placement avoids page/sidebar clipping;
+width is bounded by 60% of page/viewport with 12 px margins, rows scroll. Complete
+selectable read-only title/detail text wraps; Copy emits title, two newlines,
+detail exactly. Rows support Dismiss, without clear-all.
 
-Status remains available over custom-model and file-dialog modals, while
-workflow navigation remains disabled. Its input boundary consumes pointer,
-scroll, and keyboard events so they do not reach the page, modal behind it,
-viewer gestures, or annotation shortcuts. Focus traverses the active panel's
-eligible controls. Closing/restoring focus checks interaction ownership,
-including delayed annotation focus replies. Clipboard completion is checked
-against notice identity, content version, and copy attempt; stale completion
-cannot mutate another row.
+Status remains available over model/file dialogs while navigation is disabled.
+It captures pointer/scroll/keyboard so underlying pages/modals/viewers/shortcuts
+cannot act. Focus traverses eligible panel controls; restoration checks ownership,
+including delayed annotation replies. Clipboard completion is checked by notice,
+content version and copy attempt.
 
-[NoticeStore](../src/frontend/iced/src/view_model/notices.rs) retains at most 128
-ordinary notices plus one overflow notice in memory. Sources include native
-owners, transport/protocol, dialogs, checkpoints, remote/providers, annotation
-saving, history/charts, and clipboard. Stable typed source identity deduplicates
-snapshot/event/reply delivery; updates preserve rows. Dismissal/eviction
-acknowledges the occurrence through bounded frontiers that survive row removal,
-preventing replay. Reconnect retains session notices and rebases only changed
-native owners. Bootstrap seeds prior terminals without replaying old failures;
-running/cancelling work can still report a later failure. Nothing is persisted.
+[NoticeStore](../src/frontend/iced/src/view_model/notices.rs) retains 128 ordinary
+notices plus overflow in memory. Typed sources include native/transport/dialog/
+checkpoint/provider/annotation/history/clipboard failures. Identity deduplicates
+snapshot/event/reply occurrences, updating existing rows. Bounded acknowledgment
+frontiers survive dismissal/eviction and prevent replay. Reconnect retains notices,
+rebasing only changed owners; Bootstrap seeds old terminals without replaying
+failures, while active work may later fail. Nothing persists.
 
-Native owners still decide activity, recovery, retry, Stop/cancellation, result
-state, and artifact custody. Progress, output paths, and recovery controls stay
-in their components; notices replace operational Status cards, inline warnings,
-and error modals. Static help and validation rules remain local. Diagnostics
-retain separate opt-in detailed evidence and do not drive product state.
-
-The browser's [emergency recovery page](../src/frontend/iced/index.html) remains
-available when Iced cannot render. Asynchronous WebGPU errors stop further
-canvas configuration and rendering, preserving the first failure. GPU memory
-exhaustion shows a manual reload button immediately: native work continues,
-and the user can free GPU memory before retrying. Other device failures allow
-one automatic reload per failure episode and then manual recovery; a healthy
-interval clears that episode.
-Its session-storage counter is separate from the nonpersistent notice store.
+Systems still own recovery/retry/Stop/results/resources; progress/paths/recovery
+controls stay local. Static help remains local; diagnostics are separately opt-in.
+The [emergency page](../src/frontend/iced/index.html) works when Iced cannot render.
+Async WebGPU failure stops configuration/rendering and preserves first cause.
+GPU OOM immediately offers manual reload while native work continues. Other device
+failures allow one automatic reload/episode, then manual recovery; a healthy
+interval clears the session-storage counter, independently of notices.
 
 ## Shared form expansion and dividers
 
-The shared [height transition](../src/frontend/iced/src/view/shared/transition.rs)
-keeps conditional form bodies mounted with stable widget identities. It reveals
-their natural layout through a clip fixed at the top over 200 ms with ease-in/out
-motion; text and controls retain their normal scale. Reversal starts at the
-currently displayed height. The first layout and width changes measure directly;
-ordinary updates do not restart unchanged motion. Nested sections follow their
-children's reflow without applying the same animation twice.
+[Transitions](../src/frontend/iced/src/view/shared/transition.rs) keep conditional
+bodies mounted with stable widget identities, revealing natural-scale layout
+through a top-fixed 200 ms ease-in/out clip. Reversal starts at current height;
+first layout/width changes measure directly; unchanged updates do not restart.
+Nested bodies follow reflow without double animation. Consumers: Dataset choices/
+splits/size/progress, custom weights, Export Advanced, Predict saving and diagnostics
+(the latter retains its bottom Show/Hide trigger).
 
-Dataset uses it for benchmark choices, Coconut options, manual split paths,
-Compile size, and progress reflow. The [model card](../src/frontend/iced/src/view/workflow/model_card.rs)
-uses it for custom-artifact controls and replacement content; [Export](../src/frontend/iced/src/view/export.rs)
-uses it for conditional Advanced fields, and [Predict saving](../src/frontend/iced/src/view/predict/output.rs)
-uses it for source and sampling choices. The
-[diagnostics card](../src/frontend/iced/src/view/diagnostics.rs) uses the same
-transition while retaining its Show/Hide trigger at the card's bottom edge.
+Drawing/input share reveal and scroller clips. Closing disables input immediately,
+retires gestures without activation, releases hidden/partial focus and exposes
+only eligible controls to traversal/operations. Popups require full reveal;
+offscreen pressed controls still receive release cleanup. Only visible motion redraws.
 
-Drawing and pointer input share the revealed clip and the enclosing scroller's
-viewport. Closing content stops accepting input immediately, retires held
-gestures without activating controls, and releases focus from hidden or partly
-clipped controls. Focus traversal and widget operations expose only eligible
-controls; popups require a fully revealed body. Scrolling a pressed control
-offscreen still delivers its release for local cleanup. Only visible motion
-requests further redraws; settled or hidden sections remain quiet.
-
-The [shared section divider](../src/frontend/iced/src/view/shared.rs) draws a
-centered line one logical pixel thick across 75% of the available width, using
-the current theme's card outline color. It owns four logical pixels of empty space
-above and below, for a total height of nine. Dataset places one after the entire
-**Compile Benchmark Dataset Override** section, including its revealed choices,
-and before **Dataset source**. The other sits immediately after **Overwrite**
-and before **Compile dimensions**. Neither boundary adds outer spacing to the
-divider's gaps.
+[Section dividers](../src/frontend/iced/src/view/shared.rs) are centered 1 px lines
+at 75% width in theme outline color, with 4 px above/below (9 px total). Dataset
+places them after the entire benchmark override and after Overwrite, without
+extra boundary spacing; Advanced uses the spacing specified above.
 
 ## Compact operational text
 
-Shared [status text](../src/frontend/iced/src/view/shared/status_text.rs) keeps
-operational status, progress/activity, and output paths on one
-normal-height line. It starts at the caller's normal font size and fits width
-in 0.5 logical-pixel steps down to 8; short text never grows. At the minimum it
-ellipsizes, while hover exposes the complete original message. Line breaks
-display as spacing; selection and copy preserve the original text, including
-its line breaks. Semantic colors and retained text-widget identities survive
-fitting. Headings, descriptions, editable fields, tables, and complete session
-Status notice text retain ordinary wrapping and typography.
-
-Fitting uses a bounded binary search over the size steps. Retained measurements
-key content, width, normal size, renderer font and scale; finite/intrinsic
-layouts keep separate cached sizes. Compact toolbar intrinsic widths also
-retain their own paragraph. Unchanged redraws reuse these measurements and do
-not restart disclosure or Dataset progress-height reservations.
+[Status text](../src/frontend/iced/src/view/shared/status_text.rs) fits ordinary
+status/progress/paths on one line, reducing by 0.5 px to minimum 8, then ellipsizing.
+Short text never grows. Hover exposes original; display replaces line breaks
+with spacing while selection/copy retain them. Colors/widget identity survive.
+Headings/help/fields/tables/Status notices retain ordinary wrapping.
+Bounded binary search caches content/width/normal size/font/scale; intrinsic and
+finite layouts retain separate sizes, toolbars separate paragraphs. Unchanged
+redraw reuses measurements and leaves disclosure/progress reservations intact.
 
 ## Shared primary actions
 
-The [primary-action widget](../src/frontend/iced/src/view/workflow/primary_action.rs)
-owns the common presentation:
-
-| Workflow | Green idle action | Red active action |
+| Workflow | Green idle | Red active |
 | --- | --- | --- |
 | Train | Start Training | Stop Training |
 | Validate | Start Validation | Stop Validation |
 | Predict | Run Predict | Stop Predict |
 | Export | Run Export | Stop Export |
 | Live | Start Live | Stop Live |
-| Annotate | Save Annotations | Remains green and save-only |
+| Annotate | Save Annotations | Green save-only; duplicate save disabled |
 
-Native activity and accepted explicit preparation/save state determine the
-active presentation. Stop keeps each owner's cancellation behavior. An accepted
-save disables duplicate saves until settlement without changing its label.
-Train, Validate, Predict, and Export share the ten-pixel card-to-action gap.
-Every workflow leaves that gap empty in every operation state. Native progress
-remains inside its owning card and failures enter session Status.
-
-During active work, ten equal blue segments move clockwise by perimeter distance
-through the existing white, three-logical-pixel rounded border. They use the
-theme color of Browse dataset source without changing bounds, radius, or the
-button core. The [border renderer](../src/frontend/iced/src/view/workflow/primary_action/border.rs)
-retains one small uniform binding per widget and a shared pipeline per Iced
-device. It draws narrow strips and corner regions; it builds no per-frame mesh.
-Only an active, visible widget requests continuing redraws. Animation is local
-presentation state and adds no native protocol field or polling loop.
+[Primary action](../src/frontend/iced/src/view/workflow/primary_action.rs) uses
+native activity and accepted preparation/save state; Stop preserves owner policy.
+Train/Validate/Predict/Export retain an empty 10 px card gap in every state;
+progress stays in cards, failures in Status. Active visible buttons animate ten
+blue segments clockwise around the existing white 3 px rounded border, using
+Browse-source blue. Bounds/radius/core remain unchanged. The retained renderer
+uses small per-widget uniforms/shared device pipeline, narrow strips/corners,
+no per-frame mesh, native field or polling. Settled/hidden buttons stop redraws.
 
 ## Validation workspace and shared viewer
 
-Validate preserves the outer setup/status columns. Its center image/metrics
-region is always 16:9, independent of the aspect selected on other pages.
-**Metrics** and **Validation Preview** share a centered heading strip of the
-same height as the other pages' aspect selector. Equal 8:9 halves contain the
-[twelve COCO summaries](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
-and a non-scrolling native atlas of two columns by three rows. Each cell is
-4:3. Smaller sample sets retain explicit empty cells.
-
-The atlas reuses Explore's native image containment and padding plus the shared
-surface border, spacing, placeholder, and hit geometry. Source images retain
-their aspect rather than stretching into cells. Shared
-[image containment](../src/backend/imaging/raster/image_containment.h) has no
-Explore scheduler or dataset dependency. Validation keeps its own bounded
-sample products and composition owner. Capture continues while detail is open;
-closing detail after successful validation reveals the retained completed
+Validate's center is fixed 16:9 regardless of other pages' aspect. Equal 8:9
+halves contain twelve [COCO summaries](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
+and a non-scrolling 2×3 atlas with 4:3 cells/explicit empties. Metrics/Validation
+Preview share a heading strip matching aspect-selector height. Atlas uses shared
+containment/padding/border/spacing/hits, preserving source aspect; sample ownership
+stays Validation-local. Capture continues during detail; closing returns to retained
 population. [Sample retention](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
-defines the separate progressive and displayed memberships and retry behavior.
+owns generation/refusal behavior. Boxes and available Masks/OKS columns retain
+their actual native detection caps and unavailable values.
 
-Explore and Validation call the complete
-[image-viewer panel](../src/frontend/iced/src/view/image_viewer.rs): Sample
-heading, Previous/Next, Fit, wheel zoom, right-drag pan, source/overlay controls,
-Close, Basic/Fast/Neural Upscale, and Open in Annotation. Validation navigation
-stays within its retained available samples. Its opaque modal covers both
-headings and the center workspace, constrains the image there, and leaves the
-sidebars outside the overlay.
+Explore/Validate share the [image-viewer panel](../src/frontend/iced/src/view/image_viewer.rs):
+Sample, Previous/Next, Fit, wheel zoom, right-drag pan, overlays, Close,
+Basic/Fast/Neural Upscale, Open in Annotation. Validation navigates retained samples
+only. Its opaque modal covers headings/center while leaving sidebars visible.
+Selection uses displayed atlas metadata; a held target is admitted once until
+it changes/release, not on every publication. Requests use common connection/
+settings/system admission. Upscale targets selected native sample; Annotation
+captures drawn sample/view and imports GT (including masks/joints), not detections.
 
-Sample selection uses metadata paired with the displayed atlas. A held pointer
-admits a target once until that target changes or the hold ends; a publication
-revision alone does not create another selection. Navigation and overlay
-requests use the common connection/settings/system admission. Upscale follows
-the current selected sample; Annotation captures the exact displayed sample and
-view at dispatch. Annotation receives the sample's ground truth, including
-masks; detections remain a Validation viewer overlay.
+Groundtruth/Detections checkboxes control complete layers, retaining finer Labels/
+Masks/Boxes/Skeletons. Labels are Iced-local; native plane changes recompose
+retained products. Joint uncertainty is independently selectable. Atlas groups
+sit under preview, not metrics; complete groups wrap with 20 px gaps. Explore
+keeps Fit/Original left and overlays right with ≥20 px separation. Hidden atlas
+controls retain measured footprint during detail without duplicate identities/input.
 
-Validation's atlas and detail panel have **Groundtruth** and **Detections**
-groups. Each group checkbox controls its entire ground-truth or detection layer—text,
-boxes, and masks—while retaining that layer's finer Labels/Masks/Boxes choices.
-Fine label toggles stay local to Iced; layer and box/mask changes request native
-composition from retained products.
-
-The atlas groups sit beneath the preview half, leaving the metrics half clear.
-Validation viewer controls preserve natural text and control sizes and wrap
-complete groups with 20 logical pixels between them. Explore keeps Fit/Original
-on the left and Labels/Masks/Boxes on the right, with at least 20 logical pixels
-between the groups. While Validation detail is open,
-the hidden atlas controls retain their measured footprint without exposing
-duplicate widget identities or input, so opening the modal preserves page bounds.
-
-For one class, GT RGB is `255 - Det RGB` per channel, preserving the established
-alpha. Overlapping native masks and box outlines use Direct Addition / Linear
-Dodge: sum RGB with saturation at 255, then apply the existing alpha. Matching
-complements therefore have white overlap RGB before alpha application. Text and
-caption backgrounds use ordinary painter order, with GT drawn first and Det
-drawn second. Separate Iced layers keep Det backgrounds above GT glyphs as well
-as GT backgrounds. The existing font, glyph layout, contrast, and alpha policy
-remain. These layer controls and color/composition rules belong to Validation;
-Explore keeps its existing palette and single caption layer.
-
-The [caption owner](../src/frontend/iced/src/presentation_surface/labels.rs)
-prepares separate GT and Det collections with the paired image metadata. Each
-paint layer visits only its collection, and a hidden layer contributes no
-captions. Prepared colors, contrast, text, and paragraphs are shared by retained
-draws; an upscale projects their bounds with the derived image. Combined
-diagnostic visits retain the original sample/label order independently of paint
-layer order.
+GT RGB complements Det RGB per channel (`255−value`) with existing alpha. Native
+mask/outline overlap sums saturated RGB (Linear Dodge), then applies alpha;
+complements yield white before alpha. Captions use painter order GT then Det,
+including Det backgrounds above GT glyphs. Font/contrast/alpha stay shared.
+Validation owns this dual-layer policy; Explore uses its single palette/layer.
+[Caption preparation](../src/frontend/iced/src/presentation_surface/labels.rs)
+retains separate GT/Det collections, shared paragraphs/colors and derived bounds;
+hidden layers paint nothing. Diagnostic visits preserve original sample/label order.
 
 ### Display confidence
 
-Validate's Advanced card contains **Display confidence** with **Preview only**
-help text. It accepts a finite value in `[0, 1]`, defaults to `0.4`, and uses the
-shared 450 ms settings debounce. Typed decimals such as `0.437` keep their
-entered precision within the native `float` representation; there is no 0.01
-quantization or button, wheel, or arrow-key increment. Empty or out-of-range
-input does not replace the last accepted setting. The
-[numeric editor](#numeric-editing) retains partial decimal text through view
-rebuilds.
-
-The canonical [ValidationDisplaySettings](../src/controller/contracts/validation_display.h)
-persists at `workflows.validate.display`, separately from `ValidateRequest`.
-Changing it recomposes retained atlas/detail detections whose score is greater
-than or equal to the threshold. It applies to detection labels, boxes, and
-masks; ground truth, raw retained predictions, inference, metrics, reports, and
-ground-truth import are unaffected. Lowering it can reveal the same retained
-detections without another evaluation.
-
-`ValidationImageMetadata.display` records the setting used for that completed
-image. Native overlays and Iced captions follow those paired facts, so a pending
-edit cannot filter the captions of an older displayed image with a newer
-threshold. Settings settlement and display completion remain independent.
+Advanced **Display confidence**, help **Preview only**, accepts finite `[0,1]`,
+default 0.4, with 450 ms debounce. Decimal precision survives native float storage;
+there is no 0.01 quantization, button/wheel/arrow increment. Partial text survives
+rebuilds; empty/out-of-range input cannot replace accepted setting.
+[ValidationDisplaySettings](../src/controller/contracts/validation_display.h)
+persists under `workflows.validate.display`, separately from evaluation request.
+Scores ≥threshold recompose retained detection labels/boxes/masks/joints;
+GT/raw predictions/inference/metrics/reports/import are unchanged. Lowering reveals
+retained detections without evaluation. Image metadata records the completed
+setting, so pending newer edits cannot misfilter old captions.
 
 ## Original view and annotation import
 
-Explore's **Original content** and Validation's **Original** controls restore
-the source aspect ratio using completed pixels. With Original on, Stretch uses
-the full content and Letterbox crops the stored padding; the source extent
-determines the displayed proportions. With Original off, the whole product is
-displayed at the native input canvas's aspect, including any padding. A restored
-Upscale product can therefore appear at the compiled aspect while reusing its
-restored pixels. Missing source dimensions fall back to the sampled pixel
-extent. No source image file is opened and no discarded source-resolution detail
-is recovered.
+Explore **Original content**/Validate **Original** restores source aspect using
+completed pixels: Stretch uses full content, Letterbox crops stored padding.
+Off shows whole product at native input-canvas aspect, even for restored Upscale
+pixels. Missing source extent falls back to sampled pixels. It opens no source
+file and recovers no discarded detail.
 
-The exact displayed `VisualFrame` carries canvas extent, content rectangle,
-source extent, and optional compiled resize provenance through the graphics
-metadata. Upscale keeps the native input separate from prepared and output
-geometry. The Iced [surface geometry](../src/frontend/iced/src/presentation_surface/geometry.rs)
-keeps pixel sampling and displayed aspect distinct while applying one coherent
-mapping to boxes, masks, labels, fit, pan, zoom, clipping, and inverse input
-coordinates. This view choice reuses completed pixels; toggling Original does
-not launch another upscale or alter its processing identity.
+Paired `VisualFrame` contains canvas/content/source extents and optional resize
+provenance. Upscale separates native/prepared/output geometry. [Surface geometry](../src/frontend/iced/src/presentation_surface/geometry.rs)
+applies a coherent transform to pixels, boxes, masks, joints, labels, fit/pan/zoom,
+clipping and inverse input while distinguishing sampling from displayed aspect.
+Original reuses completed pixels without launching/changing processing.
 
-Basic, Fast, and Neural Upscale use the currently selected native detail source
-and its document facts. A previous image can remain visible while navigation
-settles, but it does not become the source of a new explicit Upscale request.
-Every method uses the same
-[native input preparation](gpu-execution.md#upscale-input-preparation), restoring
-known Stretch input before processing and retaining Letterbox geometry.
-Preparation is independent of Original. The derived product retains its native
-source identity and source extent alongside the prepared and scaled geometry;
-the same Original preference applies to the result.
+Basic/Fast/Neural Upscale uses current selected native detail/document, even while
+an older fallback remains visible. Shared [input preparation](gpu-execution.md#upscale-input-preparation)
+restores known Stretch before processing and retains Letterbox, independently of
+Original. Derived products retain source identity/extent and prepared/scaled
+geometry; the same view preference applies.
 
-**Open in Annotation** captures the exact drawn image, crop, and target extent
-at dispatch, including a displayed derived result. The reflected `AnnotationOpen`
-request carries those three facts; it does not ask the receiver to reinterpret
-a later Original setting. The target uses the displayed aspect fitted within
-the sampled content's pixel extent, rounded to integer dimensions. Import uses
-that image region independently of screen zoom or window clipping. The receiving
-owner completes its pixel copy before releasing the borrow and materializes
-continuous annotation coordinates through the same crop and aspect transform.
-Later navigation or a preference change cannot alter that accepted import.
-
-Masks retain their own support bounds independently of boxes. Import can
-therefore preserve mask pixels beyond a detection box, and a present empty
-mask stays present with no runs. The native
-[document materializer](../src/controller/presentation/visual_document.cpp)
-owns this conversion and validates it before replacing the editable document.
+Open in Annotation captures exact drawn image, crop and target extent at dispatch,
+including derived output. `AnnotationOpen` does not reinterpret later settings.
+Target aspect fits sampled extent and rounds to integer dimensions; screen zoom/
+clipping does not change import. Receiver copies settle before borrow release;
+continuous annotations/joints/uncertainty use the same crop/aspect mapping.
+Navigation/preferences cannot alter accepted import. Masks have support independent
+of boxes, including pixels beyond them and present-empty masks. [Materialization](../src/controller/presentation/visual_document.cpp)
+validates before replacing the editable document.
 
 ## Training dashboard
 
-The dashboard fits the center column's available width and page-body height
-using the selected workspace aspect ratio. The default is 16:9; the shared
-selector also offers 9:16, 4:3, 3:2, 1:1, and 16:10. Charts fit this bounded
-region without an internal scrollbar. Clicking a chart title expands that
-chart in the same region; **Back to charts** restores the grid. Setup, session Status,
-and the [live progress card](rfdetr-workflows.md#live-training-progress) remain
-part of the page.
+Charts fit center width/body height and selected aspect: default 16:9, also 9:16,
+4:3, 3:2, 1:1, 16:10, without internal scroll. Title click expands within that
+region; Back restores grid, preserving sidebars/progress. **Charts** selects:
 
-**Charts** opens the multi-select list:
-
-| Initially selected | Additional charts |
+| Initial | Additional |
 | --- | --- |
 | Training loss | Loss components |
 | AP50 | AP75 |
-| AP50:95 | Class / cardinality errors |
+| AP50:95 | Class/cardinality errors |
 | Average recall | Mask metrics |
-| Precision / recall / F1 | Area breakdowns |
-| Learning rates | Images / second |
-| | GPU utilization |
-| | GPU memory |
-| | GPU temperature |
+| Precision/recall/F1 | Area breakdowns |
+| Learning rates | Images/second; GPU utilization/memory/temperature |
 
-**Reset to main charts** restores the six initial selections and closes an
-expanded chart. Selecting no charts leaves an explicit empty-selection state.
-Charts with no measurements show a waiting/empty state instead of fabricated zero values.
-Average-recall labels use the recorded detection caps. Mask and area values
-remain unavailable when the selected evaluation did not produce them.
-Point tooltips show values with four significant figures, using scientific
-notation for very small or large values. Formatting leaves plotted coordinates
-unchanged.
+Reset restores six main selections and closes expansion; no selections/no data
+have explicit empty/waiting views. Joint losses and OKS metrics join generated
+task-aware series. AR labels use actual caps; unavailable mask/area/sensor values
+leave gaps. Tooltips use four significant figures/scientific notation without
+changing coordinates. Sources select model/weight or synchronized trajectories;
+live/saved state remains independent. Selected output shows method/path/ingredients/
+validation separately from curves; [history](rfdetr-workflows.md#saved-history-and-plots)
+owns identity/defaults/sparse observations.
 
-Source controls select a native model/weight trajectory or synchronized ordinary
-session results. Live and saved history keep separate source selections and
-storage. **Selected output** shows the final method, artifact path, ingredients,
-and validation summary without adding a synthetic epoch curve. The
-[history reference](rfdetr-workflows.md#saved-history-and-plots) owns source
-identity, default selection, and sparse observations.
+Epoch axis defaults on with fractional live positions; off uses global optimizer
+steps. Log loss scale affects training loss/components only; no validation-loss
+curve. Throughput is epoch-average; GPU units are %, GiB and °C. A loss-scale
+change preserves non-loss cameras/legends/geometry, including hidden/saved views;
+reapplying the same value does not invalidate. Preparation keys retain effective
+per-chart scale.
 
-**Epoch axis** is on initially and uses fractional epoch positions for live
-training; turning it off selects the global optimizer-step axis.
-**Log loss scale** changes only training-loss and loss-component charts. There
-is no validation loss curve. **Images / second** plots the epoch-average
-throughput also shown in the live progress card. GPU cards show utilization in
-percent, used/total memory in GiB, and temperature in °C. Their
-[sampling and device scope](rfdetr-workflows.md#saved-history-and-plots) are
-shared by live and saved history. Unavailable sensors and older records leave
-gaps instead of zero-valued samples.
-A loss-scale change preserves non-loss cameras, legends, and prepared geometry,
-including hidden charts and explicitly selected saved history. Reapplying the
-current loss-scale value does not invalidate charts. Each chart's preparation
-key records its effective scale, so later non-loss updates cannot apply the
-global loss setting to that chart. The
-[workflow guide](rfdetr-workflows.md#saved-history-and-plots) explains sparse
-validation observations, loss conventions, and saved-history selection.
+Plots retain series/camera/legend through expansion, hiding and navigation.
+Unchanged remounts preserve view; data/limit/scale changes follow autoscale.
+Grid wheel/trackpad (including modifiers) scrolls the page. Expanded plots bind
+unmodified/Ctrl-wheel to camera zoom and capture handled gestures; outside or
+unbound input reaches the page. Returning clears bindings; other gestures remain.
 
-Each chart retains its plot, series, camera, and legend interaction through
-expansion, hiding/revealing, and navigation. A remount with unchanged data and
-axis configuration preserves the settled view; actual data, limit, or scale
-changes still follow the plot's autoscale policy. Grid charts leave wheel and
-trackpad scrolling, including modified input, to the ordinary page scroller.
-An expanded chart binds unmodified and Ctrl-wheel input inside the plot to
-zoom its retained camera and captures those handled gestures so the enclosing
-page stays still. Input outside the plot, or without a matching scroll binding,
-remains available to the page. Returning to the grid clears the zoom bindings.
-The [retained chart controls](../src/frontend/iced/src/view/metrics/chart.rs)
-own those bindings; other plot gestures remain available.
+[Metrics history](../src/frontend/iced/src/view/metrics/history.rs) retains ≤128
+endpoint/extrema buckets per curve, independently live/saved. Sequence gaps,
+unavailable values, missing records and new attempts break lines; isolated points
+remain markers. Retired disconnected summaries post Status omissions and remove
+their extrema; coalesced live data preserves pending gaps, saved history is
+unchanged. Hidden charts ingest without geometry work; visible changed charts
+prepare, retaining plots/series/GPU capacity.
 
-The [metrics component](../src/frontend/iced/src/view/metrics.rs) owns separate
-live and saved histories. Each curve retains at most 128 summary buckets with
-endpoints and extrema. Sequence gaps, unavailable values, missing records, and
-new attempts break lines, while isolated points remain visible as markers.
-When older disconnected summaries must be retired, session Status reports
-chart omissions; retired extrema do not affect the retained plot. Missing
-observations keep a pending gap even when live display samples are coalesced.
-Saved history is unchanged. Hidden views continue ingesting records without
-rebuilding geometry; only visible changed charts prepare their retained
-summaries. Plot objects, series, and GPU buffers retain useful capacity.
-
-The vendored [plot widget](../third_party/iced_plot/src/plot_widget.rs) keeps
-settled view state independently of the temporary Iced widget tree. Axis labels
-sit outside the shader region, with a rotated Y title and theme-aware text.
-Cursor captions reconcile after each event's final camera and bounds changes.
-Their immutable payload is shared by pending publication, messages, and settled
-state; unchanged views reuse it, and leaving an active caption clears it once.
-The [plot shader](../third_party/iced_plot/src/plot_renderer/shader.rs) draws
-content, selection/highlights, and crosshairs in painter order within one
-chart-sized MSAA pass and resolve, followed by the existing clipped composite
-pass.
-These ownership and bounded-work properties are not measured overhead or
-throughput guarantees. Vendored
-[plot picking](../third_party/iced_plot/src/picking.rs) bounds pending GPU
-readbacks and settles cancellation without reusing an unsettled mapping.
+Owned [iced_plot](../third_party/iced_plot/src/plot_widget.rs) preserves settled
+state outside transient widget trees. Axis text is outside shaders, rotated Y
+and themed. Cursor captions reconcile after camera/bounds, share immutable
+publication payloads and clear once on leave. Rendering uses painter-order
+content/highlight/crosshair in one chart-sized MSAA pass/resolve, then clipped
+composite. [Picking](../third_party/iced_plot/src/picking.rs) bounds GPU readbacks
+and never reuses unsettled mappings. These are ownership guarantees, not measured
+performance claims.
 
 ## Numeric editing
 
-Application integer inputs omit increment/decrement buttons and ignore wheel
-mutation. Keyboard editing, selection, paste, and bounded arrow-key adjustment
-remain available. The shared
-[numeric fields](../src/frontend/iced/src/view/workflow/fields.rs) retain their
-generated signed or unsigned type, field identity, and native constraints;
-integer values do not round through floating-point text conversion.
+Integer fields have no increment buttons/wheel mutation; keyboard edit/select/
+paste and bounded arrows remain. [Typed fields](../src/frontend/iced/src/view/workflow/fields.rs)
+retain native signed/unsigned identity/constraints without floating conversion.
+Explore min/max instances are full-width 0–10,000 fields, clamping to each other.
+Seeds/index inputs preserve exact u64/range policy. Compiled ranges address
+physical IDs through `slot_count−1`, not eligible `image_count−1`; filters/
+navigation skip holes.
 
-Explore's [dataset controls](../src/frontend/iced/src/view/explore/dataset.rs)
-show Minimum instances and Maximum instances as labeled, full-width integer
-inputs. Both retain the native 0–10,000 range. Raising the minimum past the
-current maximum stops at that maximum; lowering the maximum past the current
-minimum stops at that minimum. Shuffle seed and compiled-index inputs retain
-their exact `u64` values and existing range/unlimited policy.
-First/last compiled indices bound physical sample IDs through `slot_count - 1`,
-which can exceed `image_count - 1`. Inactive holes are skipped by filters and
-navigation; typing a range does not make an inactive sample selectable.
+Unavailable mutation disables callbacks without remounting, preserving focus
+through admission. Explore borrows submitted drafts or ready snapshots; only
+editing allocates requests. Class checklists derive membership once per list,
+retaining All/None/Subset without per-row vector scans.
 
-These filter inputs remain mounted with stable native field identities when
-mutation is temporarily unavailable. Disabling their input callback preserves
-focus through pending filter admission and settlement. Settings and filters
-still use their owning typed mutation paths.
-
-Explore reads pending submitted filter/overlay values, or the ready native
-snapshot, through borrowed presentation views. Only an edit constructs an owned
-request. Class checklists derive dense catalog membership once per list
-construction, preserving All/None/Subset meaning without searching the selected
-class vector for every row.
-
-The vendored [NumberInput](../third_party/iced_aw/src/widget/number_input.rs)
-retains its text-input and modifier child trees through diff and layout.
-Layout and widget operations share the modifier construction and reconcile
-existing child state, including row/column changes driven by padding. This
-preserves focus, selection, and editing state under the application policy above.
-It also retains incomplete or equivalent numeric spellings such as an empty
-string, `0.`, and `0.40` across unrelated rebuilds while the accepted value is
-unchanged. A different authoritative value replaces that retained edit; rejected
-numbers restore the accepted text. Validation's
-[typed decimal field](#display-confidence) additionally disables arrow-key
-increments.
+Vendored NumberInput retains child text/modifier trees through diff/layout and
+row/column padding changes. Incomplete/equivalent spellings (empty text, `0.`, `0.40`) survive
+unrelated rebuilds while accepted value is unchanged. Changed authoritative values
+replace it; rejected numbers restore accepted text. Display confidence additionally
+disables arrow increments.
 
 ## Typed application boundary
 
-The [generated Rust and CBOR reference](application-wire.md) owns canonical
-schema/generator inputs, record shapes, codec limits, session admission and
-failure policy. Native endpoints/events/snapshots and presentation ownership
-follow [the contract](../CONTRACT.md#model-presentation-model-and-views).
-The Iced client installs native state only after a compatible Bootstrap;
-workspace mouse and Explore interactions use the same session-bound WebSocket.
-Generated routing connects those native facts to the handwritten reducers
-located in the [source guide](architecture.md#nativerust-boundary). Rust owns
-the interaction and presentation behavior described on this page.
-
-The WebSocket carries controls and logical UI facts. The independent FD graphics
-channel carries completed images and immutable `WorkspaceImageMetadata`:
-schema identity, [paired frame geometry](#original-view-and-annotation-import), and the
-corresponding native product projection, including atlas layout and labels where
-applicable.
-Firefox transports this payload opaquely. The
-[metadata decoder](../src/frontend/iced/src/presentation_surface/metadata.rs)
-validates its extent, schema, exact image identity, and product/source pairing
-before installing it. Malformed or mismatched metadata rejects that candidate
-while preserving safe read custody and the last valid image.
+[Application wire](application-wire.md) owns schema/generation, record formats,
+limits and connection failures. Compatible complete Bootstrap precedes native
+state installation. Generated dispatch reaches handwritten reducers; Rust owns
+presentation/interaction. WebSocket carries controls/logical facts; independent
+FD graphics carries completed images with schema/frame/product/source metadata.
+Firefox transports it opaquely. [Metadata decoding](../src/frontend/iced/src/presentation_surface/metadata.rs)
+checks extent/schema/exact image/product pairing. Invalid candidates preserve
+safe read custody and last valid image.
 
 ## Shared immediate workspace input
 
-[workspace_input.rs](../src/frontend/iced/src/workspace_input.rs) captures
-movement, every button press/release, enter/leave, wheel, and cancellation for
-all workspace tabs. Click count accompanies a press, so one physical gesture
-has one native effect. Iced converts coordinates through the local view
-transform and retains pan, zoom, hover, and other component interaction state.
-Native Annotation resolves editing targets; passive products consume the same
-vocabulary without acquiring editing tools.
+[Input capture](../src/frontend/iced/src/workspace_input.rs) records movement,
+all button edges, enter/leave, wheel and cancellation across workspaces; click
+count belongs to press, giving one native effect per gesture. Iced transforms
+coordinates and retains pan/zoom/hover; native Annotation resolves editing targets.
+Passive products use the same vocabulary without tools.
 
 ```text
-Iced capture
-    → ordered connection, retaining unsent records during transport pressure
-    → generated compact interaction on the existing socket
-    → the selected native owner's queue and domain effects
-          └─ changed content → dirty renderer → completed graphics image
+Iced capture → ordered connection → generated compact interaction
+    → native owner queue/effects → dirty render → completed graphics image
 ```
 
-The connection preserves the order of mouse records and ordinary commands,
-including records waiting for Bootstrap's peer epoch. It reuses encoding
-storage and retains mouse records through temporary pressure. Admission does
-not depend on frontend consumption credits, document-settlement barriers, or
-display completion. Allocation or essential transport failure closes the peer;
-it cannot silently shorten an accepted stroke.
+Mouse records and commands retain order even before Bootstrap epoch, reuse
+encoding storage and survive temporary pressure. Admission waits on neither
+frontend credits nor document/display settlement. Essential allocation/transport
+failure closes the peer rather than shortening a stroke.
 
 ## Ordered annotation input and retained storage
 
-The shared native
-[WorkspaceInputQueue](../src/controller/presentation/workspace_input.h)
-starts with 64 entries, grows geometrically, retains high-water capacity, and
-pops in constant time. Each domain owns its synchronization and execution.
-[AnnotationSystem](../src/controller/subsystems/annotation/annotation_system.h)
-places mouse input, document commands, and peer boundaries in one native
-queue. Its independent input worker owns `AnnotationDocument`, the reducer,
-and history. It validates peer ownership on admission, consumes stale-document
-records as cancellation, and preserves every accepted path-dependent sample.
-Peer replacement queues old-gesture cleanup before replacement input.
+[WorkspaceInputQueue](../src/controller/presentation/workspace_input.h) starts
+at 64, grows geometrically, retains capacity and pops O(1). Annotation queues
+mouse/document/peer records together; its input worker owns document/reducer/
+history and synchronization. Peer admission is checked; stale-document records
+cancel; accepted path-dependent samples are preserved. Peer replacement queues
+gesture cleanup before replacement input.
 
-Undo/Redo uses a directional view of the retained journal entry, then moves that
-entry to the opposite journal after admission and live-payload preparation.
-It preserves the bounded history, stored editor facts, object/element identities,
-and complete mutation payloads without constructing a reversed entry copy.
+Undo/Redo directionally reads the journal then moves the entry after admission/
+live-payload preparation, preserving bounded history, editor facts, stable runtime
+object/element identity and full payloads without reversed copies.
 
 ## Document commands and settlement
 
-Annotation Open, Edit, and Save execute after earlier admitted mouse records
-and commands on the input owner. Ordinary document editing and saving settle
-independently of display publication. Source opening and color sampling use
-asynchronous GPU continuations that suspend later dependent document effects.
-Transport can continue admitting ordered records, independent systems keep
-running, and Stop can request cancellation.
+Open/Edit/Save follow admitted mouse/commands. Edits/save settle independently of
+display. Opening/color sampling use GPU continuations that suspend dependent
+document effects while transport/other systems progress; Stop remains available.
+`busy=true` means queued admission; later state reports completion with separate
+revisions and potentially reversed reply/event arrival. Neither proves texture
+validity or GPU read settlement. Rejection, wire/resource failures and cancellation
+retain typed outcomes.
 
-An admission reply with `busy=true` describes queued work. Completion produces
-later native state; admission and completion can advance separate revisions,
-and reply/event arrival order may differ. These are logical operation facts.
-They neither validate a texture nor acknowledge a GPU read. Domain rejection,
-wire failure, resource failure, and cancellation retain their typed outcomes.
+Named class/joint schemas preserve connections, flip meaning and visibility.
+Skeleton controls select/edit connections and set Unannotated/Occluded/Visible;
+skip selects next and reset clears the selected point to Unannotated. Known
+schemas initialize all named joints and retain matching joints by name on category
+changes; free-form skeleton editing remains available. Import/save/history keep
+joint meaning independently of labels.
+
+[Saving](../src/controller/subsystems/annotation/annotation_persistence.cpp) writes
+named CBOR through exclusive sibling staging, file sync, rename and parent sync.
+Directory destinations use document-identity filenames. Publication failure keeps
+the incumbent; failed parent sync after rename reports uncertain durability.
+[Decoding](../src/controller/contracts/annotation_serialization.cpp) also admits
+older documents without joint schemas, converting boolean node visibility to
+Visible/Unannotated without inventing joint names. Explicit Load can attach
+legacy constant-resource documents only to a ready image with matching geometry;
+it reports that conversion and never falls back from a malformed modern document.
 
 ## Reduction, publication, and source changes
 
-[annotation_system.cpp](../src/controller/subsystems/annotation/annotation_system.cpp)
-separates ordered reduction from a dedicated renderer. The input owner captures
-an immutable description with shared scene storage, editor facts, and preview
-geometry. Three reusable descriptions cover input scratch, newest pending work,
-and active GPU work. The renderer retains its active description through
-settlement and may replace the newest unsubmitted description. If output storage
-is occupied, it retains the clean baseline and pending work and arms a real
-availability notification while input progresses.
+Annotation input captures immutable scene/editor/preview descriptions for a
+separate renderer. Three reusable descriptions cover scratch/newest pending/
+active GPU work; only unsubmitted newest work coalesces. Occupied output retains
+baseline/pending work and arms actual availability while input proceeds.
+[Document reduction](../src/controller/subsystems/annotation/annotation_reducer.cpp)
+keeps four revisioned immutable scene backings, separately capturing editor/
+gesture facts. Readers can hold old content; replacement invalidates even equal
+revision numbers.
 
-The [document owner](../src/controller/subsystems/annotation/annotation_reducer.cpp)
-retains committed scene/identity content by document revision in four reusable
-immutable backings. Editor facts and gesture previews are captured separately,
-so a selection or tool change can reuse scene content while readers hold older
-descriptions. A capture after a document edit selects an available backing;
-source replacement invalidates retained content even when revision numbers coincide.
+[Raster execution](../src/controller/subsystems/annotation/native_annotation_algorithm.cpp)
+tracks packed geometry/masks separately from allocation-local damage. Reuse checks
+content, offsets, dimensions and capacity; changed words upload one enclosing
+range, removed/disabled objects invalidate membership. Upload events protect
+staging; growth/failure requires refill. Raster clips conservative bounds to
+damage, including mask support/handles, preserving painter order; flat runs visit
+only admitted pixels.
 
-The [native renderer](../src/controller/subsystems/annotation/native_annotation_algorithm.cpp)
-keeps packed mask/geometry upload content separately from each output allocation's
-semantic damage. Reuse follows actual content, packed offsets, dimensions, and
-backing capacity. Changed words upload as one enclosing range; removed or disabled
-objects invalidate their packed membership. Upload validity is restored only
-after the existing upload event settles, and pinned staging stays protected
-until then. Growth or failure requires refilling affected storage.
-Raster work intersects each object's conservative bounds with output damage,
-including mask support beyond boxes and selection handles, while preserving
-painter order. Shared flat-run rasterization enumerates only pixels admitted
-by the run and clip.
+Logical UI follows latest committed document; frame facts describe completed
+pixels even when input leads. Full UI and compact frame progress have separate
+revisions; preview-only events omit document. Bootstrap restores logical facts
+independently of graphics. Import/size validation precedes committed replacement.
+Press resolves current document/tool with selected-handle precedence/image
+coordinate tolerances, then retains that target through samples/history. Runtime
+identities are not saved. Fractional boxes truncating to empty raster skip only
+outline, preserving gesture/mask/selection/damage.
 
-Logical UI facts describe the latest committed document; rendered scene and
-frame facts describe the exact completed pixels, even when newer input has
-overtaken them. Full Annotation UI state and compact frame progress have
-separate revisions. Preview-only publications do not resend the document.
-Bootstrap restores logical UI state; graphics binding and image custody
-progress independently. Document import and size validation complete before
-committed state is replaced.
+Mask hits find one normalized row/start predecessor in O(log R), preserving
+painter/handle order. Cleanup caches disk reach per absolute row offset across
+erosion/dilation; preview construction accumulates exclusive support bounds while
+writing, retaining empty/HSV semantics without another scan.
 
-A press resolves its target against the current native document and logical
-tool, preserving selected-handle precedence and image-coordinate tolerances.
-The accepted gesture retains that target through subsequent samples, with
-runtime object/element identities preserved by history and Undo/Redo. These
-identities are not part of the saved named format. A positive fractional Box
-preview whose bounds truncate to empty integer raster coverage skips just the
-outline; the gesture, mask content, selection, and damage processing remain
-valid.
-
-Mask hit testing uses the document's normalized row/start run order to find one
-predecessor in O(log R) for R runs in a candidate mask, while object painter
-order and selected-handle precedence stay unchanged. The
-[mask cleanup owner](../src/controller/subsystems/annotation/annotation_mask.cpp)
-computes each disk reach once per absolute row offset within one cleanup and
-reuses it across erosion/dilation stages. The backend
-[resolved-mask builder](../src/backend/imaging/annotation/core_preview.cpp)
-accumulates tight, exclusive support bounds as it writes foreground pixels,
-preserving empty-mask and HSV-filter behavior without another full-mask bounds
-scan.
-
-All six visual producers use the shared
-[VisualRuntimeOwner](../src/controller/presentation/visual_runtime_owner.h).
-Content/input changes, workspace admission, and actual GPU/storage completion
-wake dirty work. Clean and semantic planes, allocation-local damage, geometry,
-and staging retain reusable capacity. An idle native renderer has no repeating
-render timer. Redrawing a completed browser image does not rerun inference,
-upscaling, decoding, capture, or document edits.
-
-Producer events notify native Presentation directly through
-[ApplicationEventPublisher](../src/controller/browser/application_event_publisher.h)
-and [the shell wiring](../src/controller/shell/application_system_storage.cpp).
-`PresentationSystem::SourceChanged` schedules the currently selected source.
-The frontend selects a source when the viewed product changes; it does not
-reselect that source for each new frame.
-
-Presentation keeps one submitted selection and the newest pending selection
-or source notification. If a borrow is rejected, newer observed source facts
-can trigger immediate catch-up. An unchanged unavailable observation waits
-for the owner's next notification. It cannot make progress by repeatedly
-borrowing the same stale observation.
+All six visual producers share [VisualRuntimeOwner](../src/controller/presentation/visual_runtime_owner.h).
+Input/content, workspace admission and actual completion wake dirty work;
+planes/damage/geometry/staging reuse capacity. Idle renderers have no repeating
+timer. Browser redraw does not rerun domain processing. Producer events notify
+Presentation directly; frontend selects only on viewed-product changes.
+Presentation retains one submitted/latest pending selection/notification. Newer
+source facts can retry a refused borrow; unchanged unavailable state waits for
+notification, never stale polling.
 
 ## Native GPU custody and completion
 
-Firefox opens the native workspace channel only for an explicitly bound
-`WebGPUParent` actor. A process-wide exclusive claim prevents another actor
-from attaching to the same channel; ordinary WebGPU actors create no workspace
-dispatcher or channel connection. Bind/unbind operations run on the actor's
-serialized IPC path. Each replacement binding has its own generation, checked
-with device and owner identity before admitting work or accepting an admission
-callback.
+Only an explicitly bound Firefox `WebGPUParent` actor opens the workspace
+channel. A process-exclusive claim and serialized bind/unbind protect generation/
+device/owner admission. Supersession closes old admission while reads/submissions/
+callbacks retain obligations; claim lasts until final physical owner releases.
+Replacement gets a fresh connection. Peer loss is authoritative; logical selection
+never proves GPU completion.
 
-Supersession stops new admission from the old binding while its physical reads,
-submissions, and completion callbacks retain their existing obligations. The
-connection claim survives dispatcher retirement until its last physical owner
-releases it; a replacement actor then obtains a fresh connection. Native peer
-loss remains an authoritative connection failure. Logical selection changes
-never establish GPU completion or permit early storage reuse.
-
-Each visual producer owns its raw processing products and display preparation:
-
-| Producer | Raw product and retained work | Display preparation |
+| Producer | Retained raw products | Display |
 | --- | --- | --- |
-| [Explore](../src/controller/subsystems/explore/native_explore_algorithm.cpp) | Individual thumbnail cache, gallery clean/semantic atlas, and separate detail document/product | Fused clean/semantic finalization; changed atlas regions update the matching workspace |
-| [Annotation](../src/controller/subsystems/annotation/native_annotation_algorithm.cpp) | Receiver-owned clean baseline and clean/semantic output from the input owner's immutable document description | Fused finalization after native raster work |
-| [Predict](../src/controller/subsystems/system/predict_system.cpp) | Latest prediction pixels with retained boxes, masks, class meaning, and receiver-owned preview storage | Fused finalization in the prediction visual runtime |
-| [Validate](../src/controller/subsystems/validate/detail/validation_samples.cpp) | Up to six selected sample products with prediction/ground-truth meaning and retained atlas/detail selection | Fused composition into reusable atlas/detail output |
-| [Live](../src/controller/subsystems/live/native_live_algorithm.cpp) | Media composite output lease and a clean system output | The existing media receiver copy writes the system output; admitted same-device output uses final workspace storage directly |
-| [Upscale](../src/controller/subsystems/upscale/upscale_system.cpp) | Receiver-owned clean/semantic input, transformed document, and cached derived products | Fused finalization of the selected retained result |
+| Explore | Thumbnail cache, clean/semantic atlas, separate detail | Fused finalization; changed atlas regions |
+| Annotation | Copied clean baseline and immutable scene planes | Fused raster finalization |
+| Predict | Latest pixels/annotations and owned preview | Fused visual-runtime finalization |
+| Validate | Six captures, progressive/displayed selection | Fused reusable atlas/detail |
+| Live | Composite lease and clean output | Receiver copy; same-device final storage where admitted |
+| Upscale | Copied clean/semantic input, document, derived cache | Fused selected-result finalization |
 
-The retained product pool has three slots for Explore, four for Upscale, and
-two each for Annotation, Predict, Validate composition, and Live. Validation's
-selected raw samples have separate custody from its two composed outputs.
-These product pools include inactive
-gallery/detail/derived results. The foreground graphics binding separately owns
-two persistent display buffers. Selection reuses that pair; growth or device
-replacement may temporarily retain old buffers until their readers settle.
+Raw pools: Explore 3, Upscale 4, others 2, including inactive results; Validation
+captures are separate. Foreground graphics owns two persistent display buffers,
+reused across selection; growth/replacement retains older backing through readers.
+Raw reads and browser acquisition protect distinct storage. Clean-only same-device
+work may alias final storage when lifetimes permit; otherwise independent raw
+work continues despite display pressure. Semantic products retain both planes.
+Front/back changes need not copy, and allocation identity is not product revision.
 
-Raw product readers and actual browser acquisitions protect their own storage.
-A same-device clean-only output may alias available final storage when both
-lifetimes permit it. Otherwise raw work continues in independent retained
-storage while display buffers are occupied. Clean/semantic products retain both
-raw planes and use fused finalization. Completed products and front/back display
-roles can be selected without copying pixels. Allocation and logical product
-revision remain independent.
+Live and fresh/warm Upscale overwrite every active pixel via `PublishRetained`;
+semantic-only Upscale preserves clean through ordinary Publish. Partial producers
+retain initialization rules. Pending finalization holds its completion-draining
+owner even after cross-device raw read release: workspace replacement/writes
+still wait for final display work. [GPU interop](gpu-execution.md#shared-workspace-interoperability)
+owns admission/layout/growth and physical imports.
 
-Live capture and fresh/warm Upscale writers replace every active output pixel
-through `PublishRetained`, reusing storage without preparing an overwritten
-baseline. Semantic-only Upscale publications use ordinary `Publish` with clean
-plane preservation. Other partial producers retain their existing initialization
-and preservation requirements. Provider warm execution is described in
-[GPU execution](gpu-execution.md#upscale-warm-execution).
+BorrowFrame/BorrowDocument receivers complete copies before release; device
+mismatch uses producer-owned peer/pinned transfers, separate from display.
+Presentation borrows exact metadata and admits finalization on the producer;
+Firefox owns allocation, native writer import/publication/timeline. There is no
+extra Presentation pixel pass. Offers alone grant no browser read.
 
-Pending workspace finalization retains its completion-draining product owner.
-Even if a cross-device transfer has released its raw input read, that product
-cannot detach, replace its workspace, or become writable before final display
-work settles. Raw-reader release and completed finalization are separate facts.
+[Native writer](../src/controller/presentation/native_presentation_writer.cpp)
+waits GPU readiness, signals odd ready value, publishes exact frame/metadata then
+eventfd. Firefox nonblockingly acquires latest completed offer without matching
+application snapshot/unfinished work. Misses retain fallback and retry on a
+readiness edge. Direct samples GENERAL; copy mode writes one reusable sample.
+Source reuse requires the final Vulkan ownership release's even timeline signal
+and actual native settlement. Acquired, ReleaseSubmitted and ReadSettled are
+different receipts. Callbacks wake the worker; ordinary pumping is nonblocking,
+initialization/terminal retirement synchronize where required.
 
-The linked runtime factories and [SystemImageRuntime](../src/frameworks/gpu/runtime/system_image_runtime.h)
-define these inventories. `VisualRuntimeOwner` services layout/admission on the
-producer worker; `ImageWorkspace` owns the admitted Vulkan layout and native
-custody. [Workspace interoperability](gpu-execution.md#shared-workspace-interoperability)
-defines allocation/import and filling from retained raw products, including late
-layout, first admission, and growth without repeating domain work.
+Ready-flag visibility does not prove callback return. Counted completion retains
+backing until callback settlement. Outstanding ownership defers retirement via
+wake notifications; unproven completion retains custody/closes unsafe admission.
+Dead-browser cleanup cannot await its timeline. Source/arena identities differ:
+≤2 sources/arena, ≤6 records total, ≤3 active/candidate/retiring arena generations.
+High-water growth prepares unpublished candidates without losing fallback.
 
-Raw `BorrowFrame` and `BorrowDocument` consumers keep their existing meaning.
-Annotation, Upscale, and other processing receivers finish their required
-copies before releasing borrowed inputs. Device mismatch uses the
-producer-owned same-device/peer/pinned transfer facilities. Those processing
-and device-boundary transfers are separate from display publication.
-
-Presentation observes the selected product through `VisualSourceReader`,
-captures that product's metadata, and coordinates admission/finalization on
-the producer execution owner. Firefox owns the display allocation; the native
-writer owns its imported custody, publication, and timeline signaling. There
-is no additional Presentation pixel-copy/composition pass. A short producer
-borrow protects readiness publication; a completed offer itself grants no
-browser read permission.
-
-[native_presentation_writer.cpp](../src/controller/presentation/native_presentation_writer.cpp)
-awaits producer readiness on its own GPU execution path, signals an odd ready
-value, publishes the exact frame identity with paired metadata, and raises the
-source's `eventfd`. Publication completes the metadata before exposing the slot.
-During draw preparation, Firefox's stable graphics binding acquires the latest
-completed offer through the physical allocation's nonblocking generation gate.
-It does not require a matching application snapshot or wait for unfinished
-production. An acquisition miss retains the completed fallback and retries on
-a real readiness edge.
-
-Direct mode samples the exact source image in `GENERAL`. Copy mode transfers
-it once into an available reusable sample slot. An acquired source stays
-protected until its final Vulkan read/ownership-release submission signals
-the matching even timeline value and native completion actually settles.
-`Acquired`, `ReleaseSubmitted`, and `ReadSettled` are separate graphics receipts;
-release submission alone grants no reuse. CUDA callbacks report status and wake
-the Presentation worker. Its ordinary pump is nonblocking; initialization and
-terminal retirement perform their required synchronization.
-
-Reading a callback's ready flag does not prove that the callback has returned.
-Counted completion retains the backing allocation until callback settlement.
-Healthy outstanding workspace ownership can defer runtime retirement; a
-wake-only notification lets the existing worker finish it. Unestablished
-physical completion retains the affected custody and closes unsafe admission.
-Terminal cleanup does not rely on a dead browser advancing its semaphore.
-
-Source allocations and sample arenas have separate identities and lifetimes.
-The native writer admits at most two source allocations per arena and six
-source records in total, with at most three live arena generations across
-active, candidate, and retiring state. Arena capacity retains its high-water
-extent; growth prepares an unpublished candidate while preserving the completed
-fallback.
-
-Copy mode reuses a two-slot Primary-layer sample arena across source and
-pool-slot rotation: a completed fallback and an incoming sample. Direct mode
-keeps the arena's negotiation/control identity but allocates no sample-arena
-pixel storage and performs no presentation copy. A copied source can retire
-after its GPU read while copied pixels remain drawable. A direct fallback
-continues to retain the source it samples. Page references, encoded draws,
-physical source reads, and arena retirement settle independently.
-
-[Physical import owners](gpu-execution.md#shared-workspace-interoperability)
-retain Vulkan device, backing FD, and CUDA context custody through removal,
-partial failure, and completed uses. Browser exit is not a completion receipt;
-terminal rescue never waits for an unavailable peer's timeline.
-The browser's separate canvas path carries its validated texture descriptor
-through DMA-BUF allocation/import/recycling and retains signal semaphores
-through the [actual submission fence](gpu-execution.md#browser-canvas-descriptors-and-submission-custody).
-
-Live's requested rate configures capture and its system-owned consumption
-cadence. Firefox's graphics queue, swapchain, compositor, and Wayland determine
-display cadence. Reusing storage and the next eligible graphics submission
-introduces no intentional frame delay, but makes no hard one-frame guarantee.
+Copy uses two Primary sample slots (fallback/incoming), shared across rotation;
+direct retains control identity without arena pixels/copy. Copied source may
+retire while sample remains; direct fallback holds source. Page/draw/source/
+arena obligations settle independently. Vulkan devices/FDs/CUDA contexts outlive
+registry/IPC removal and partial failure. Browser exit is not completion. Canvas
+DMA-BUF descriptors/semaphores retain actual [submission custody](gpu-execution.md#browser-canvas-descriptors-and-submission-custody).
+Live rate controls capture/consumption; Firefox queue/swapchain/compositor/Wayland
+controls display. Reuse adds no intentional frame delay or hard one-frame promise.
 
 ## Explore gallery and displayed geometry
 
-Explore's **Stop** remains available while opening or while a dataset is open,
-including Detail. It cancels outstanding work, closes the session, and releases
-dataset, thumbnail, preview, and runtime resources after physical reads settle.
-The view returns to **Waiting for a dataset** and can be opened again with the
-saved settings. **Close** in Detail returns to the retained gallery.
+Stop is available during opening/open/Detail, cancels/closes and retires resources
+after reads, then returns **Waiting for a dataset** with saved settings. Detail
+Close returns retained gallery. [Dataset residency](datasets.md#explore-thumbnails-and-atlas-residency)
+owns caching/tile admission. Demand includes partial rows, so measured N/N+1 rows
+may alternate without card raster changes.
 
-[Explore residency](datasets.md#explore-thumbnails-and-atlas-residency) owns the
-cache, tile geometry, priority, and physical atlas rules. The GUI includes every
-partially visible row in demand. Its measured viewport may alternate between
-N and N+1 rows while card raster extent remains unchanged.
+Eligible image_count differs from physical slot_count. Matches/navigation count
+eligible filtered samples; displayed IDs, selection, donors/cache retain physical
+IDs. Holes are never background/dense substitute samples. A ready nonempty gallery
+without paired drawable pixels shows Preparing visible tiles while work/readiness
+is pending, otherwise Restoring gallery. Refused/failed presentation shows Gallery
+unavailable; domain failure keeps its own cause. Logical status is Dataset ready.
+Counts/scroll persist, and the GPU/input surface stays mounted beneath status so
+first/replacement binding can form.
 
-The generated dataset facts expose eligible `image_count` separately from
-physical `slot_count`. Gallery matches and Next/Previous count eligible filtered
-samples, while displayed compiled IDs, detail selection, augmentation donors,
-and cache identities retain their physical IDs. Holes never become background
-samples or dense replacement indices. See the
-[compiled metadata rules](datasets.md#per-image-index).
+[Routing](../src/frontend/iced/src/app/presentation.rs) retains restoration for
+current dataset/frame. Return requests publication; reply settles selection but
+only matching paired drawable metadata satisfies restoration. Obsolete Detail
+retirement still protects SampleRead/encoded draws. Capacity waits for real
+readers. Rejected offers retain exact product through settlement/reconnect gaps;
+receipts are consumed once and stale duplicates cannot displace newer gallery
+work. Recovery uses retained products/notifications without reopening/polling.
 
-Native dataset readiness and a drawable atlas are independent. A ready,
-nonempty gallery without a paired image shows **Preparing visible tiles** while
-native work or tile readiness is pending, otherwise **Restoring gallery**.
-A presentation selection that cannot be admitted or returns failure shows
-**Gallery unavailable**; an actual Explore failure retains its own error.
-The settled logical status is **Dataset ready**. Logical match counts and the
-retained scroll row remain available. The gallery keeps
-its GPU/input surface mounted beneath the status overlay, so graphics binding
-can establish the first or replacement image without waiting for an already
-displayed atlas.
+The gallery sensor measures under Detail, retaining size/capacity/columns/row/
+fraction without submitting viewport edits. Return reconciles via native events,
+including repeated orientation changes. First usable measurement wakes pending
+Open; zero capacity keeps it pending without another click/event. Independent
+gallery/detail handles preserve unchanged gallery revision under newer domain
+observation; changed requirements resume cache work without discarding neighbors
+or waiting for unrelated disk lanes.
 
-[Presentation routing](../src/frontend/iced/src/app/presentation.rs) retains
-restoration demand for the current dataset and gallery frame. Returning from
-Detail or another tab requests publication of that retained product. A matching
-selection reply settles the request; only matching paired gallery metadata and
-a drawable image satisfy the demand. Logical retirement of an obsolete Detail
-publication leaves its live `SampleRead` and encoded GPU draws protected.
+Paired `ExploreAtlasLayout` records first row/count/capacity/origin/columns/card
+extent. Visible rows differ from high-water storage. Pending/displayed metadata
+controls cropping, captions, circular placement and hits, even with newer layout
+pending. Identified placeholders can hover/select before thumbnail readiness;
+blank final-row padding cannot. Same-image revisions preserve transforms/identity.
+Zero paired matches adds an opaque No samples match the filters overlay without
+retiring native empty publication/read custody.
 
-Capacity pressure waits for actual reader settlement and availability. Rejected
-offers remain associated with their exact product across selection settlement
-or a temporary reconnect snapshot gap. Each rejection is consumed once; delayed
-duplicate receipts or viewer offers cannot displace useful newer gallery work.
-Recovery uses retained native products and ordinary graphics notifications
-without reopening the dataset or polling.
+Labels use local checkbox over paired geometry; toggling needs no GPU image and
+persists with view settings. Boxes/Masks/Skeletons dirty native planes, including
+idle viewport. Augmentation replacements preserve clean pixels/meaning until
+completion. Metadata installation prepares shared caption text/paragraph/color/
+contrast; category index is O(1) and constructs referenced categories only.
+Detail folds selection into that index. Pending edits cannot recolor older captions.
 
-The retained gallery sensor continues measuring beneath Detail. The component
-records the latest size, native capacity, column count, scroll row, and row
-fraction independently of the current Gallery/Detail mode. Measurements alone
-do not submit gallery viewport changes while Detail is open. Returning to
-Gallery reconciles the retained measurement through the ordinary native-state
-event path, including repeated landscape-to-portrait and portrait-to-landscape
-changes, without requiring another resize or scroll.
-The first usable measurement also wakes a pending Open. A zero-capacity
-measurement leaves that request pending until usable geometry arrives; it does
-not require a second click or an unrelated native event.
-
-Explore retains independent completed gallery and detail handles in its shared
-output pool. An unchanged return selects the real retained gallery product
-revision under a newer domain observation. Changed requirements
-reconcile cached content and resume necessary work. An unfinished gallery
-can resume after detail without discarding ready neighbors or waiting on an
-unrelated held disk lane.
-
-The reflected `ExploreAtlasLayout` travels with readiness and the exact
-product: `first_row`, `row_count`, `row_capacity`, `row_origin`, `columns`, and
-`card_extent`. Logical visible rows and physical high-water dimensions are
-different facts. The [gallery presentation module](../src/frontend/iced/src/presentation_surface/gallery.rs)
-uses metadata paired with the eligible pending sample or retained displayed
-sample. Cropping, label placement, hit tests, and selection use that image,
-including circular row placement, while a newer layout is pending.
-
-A known placeholder cell already has a compiled-image identity. Hover and
-selection remain available before its thumbnail is ready; readiness controls
-pixels and labels. Blank padding in a partial final row has no selectable
-image. Same-image detail revisions preserve pan/zoom and widget identity.
-
-When the displayed gallery's paired metadata has zero matching samples, an
-opaque workspace-background overlay shows “No samples match the filters” and
-covers the empty atlas tiles. The underlying native empty-gallery publication,
-paired metadata, encoded draw, and resource custody remain intact.
-
-Gallery and Detail Labels use the current local checkbox state over the labels
-and geometry paired with the displayed image. A label-only toggle needs no new
-GPU image. Explore's Labels preference is saved and restored with its other
-view settings. Boxes and Masks update native semantic planes through dirty work
-and completion notifications, including while the viewport stays still.
-During an augmentation refresh, retained clean pixels and their meaning remain
-paired until each replacement completes; see the
-[thumbnail cache rules](datasets.md#explore-thumbnails-and-atlas-residency).
-
-The [paired content owner](../src/frontend/iced/src/presentation_surface/metadata.rs)
-prepares caption text, paragraphs, background colors, and foreground contrast
-when validated image metadata is installed, then shares them through pending
-and retained display content. Detail reads its original or
-derived scene from that same immutable metadata owner. The
-[category-caption index](../src/frontend/iced/src/presentation_surface/labels.rs)
-provides constant-time lookup by catalog reference while constructing text and
-paragraphs only for referenced categories. Detail folds the paired class
-selection into that index during construction, so each object visit needs no
-selection-vector scan. Local label visibility still applies during drawing.
-Pending controls do not change the colors or membership of an older displayed
-image's captions.
-
-Select, Next, Previous, and Close cancel the departed detail viewer's derived
-request while retaining the last displayed GPU frame for replacement.
-While another Explore request settles, Next/Previous accumulate a bounded net
-offset modulo the matching-image count. Opposite clicks cancel pending movement;
-explicit selection or Close clears it. The ordinary typed navigation route
-consumes the remaining movement after admission becomes available.
-Explicit route departure or component teardown retires its display custody.
-Transforms use component identity and paired image geometry. An accepted
-Original content preference stays with the same image through route changes
-and reconnect; a different image starts from its own native preference.
-The [Original and import rules](#original-view-and-annotation-import) also apply
-when a retained fallback is visible during navigation or derived work.
+Select/Next/Previous/Close cancels departed derived work while retaining last
+frame. While requests settle, navigation accumulates bounded net offset modulo
+match count; opposite clicks cancel, explicit select/Close clears, admission later
+drains it. Route teardown releases display custody. Original preference remains
+with same image through routes/reconnect; another image uses its own preference,
+even while fallback is displayed.
 
 ## Browser draw eligibility and retained fallback
 
-The graphics binding chooses a completed image locally and returns its immutable
-metadata with read custody. The frontend constructs labels and layout from that
-pair. Application snapshots independently update logical controls; they neither
-grant graphics permission nor select the image for a draw.
-Iced samples the direct source texture or copied arena slice without an
-additional full-image capture texture or capture pass. Copy and subsequent draw
-share queue ordering, so a submitted copy can be drawn before its completion
-callback arrives.
+Graphics acquisition returns immutable metadata/read permission; Iced derives
+labels/layout from that pair. Logical snapshots never grant draw permission.
+Direct sources/copied arena slices are sampled without full-image capture pass;
+queue ordering allows drawing after submitted copy before callback. Direct completed
+acquisition can become fallback immediately; copy requires actual completion.
+Obsolete completion cannot promote another source/release newer sample/metadata.
+Capacity retry may retain logical publication with newer physical transfer sequence.
 
-An authorized direct acquisition already refers to completed source pixels and
-can become the retained fallback. Copy mode additionally requires physical copy
-completion. An obsolete completion cannot promote a different current source,
-release a newer sample, or replace its metadata. A capacity retry may reuse a
-logical publication while advancing its physical source transfer sequence.
+SampleRead independently protects fallback, encoded draws and enabled probes.
+Vendored Iced resource batches attach to the actual encoder and release after
+submission settlement/abandoned encoding, including screenshots. View construction/
+diagnostic callbacks cannot release encoded reads; work-done means settlement,
+including failure, not successful rendering.
 
-`SampleRead` retains exact source/sample permission independently for displayed
-fallback, encoded/submitted draws, and enabled probes. Vendored Iced's
-`shader::Resources` attaches one reusable resource batch to the actual command
-encoder. It releases draw holds after submission settlement or abandoned
-encoding, including the screenshot route. Constructing a view or receiving a
-diagnostic callback cannot release an encoded GPU read. A work-done callback
-proves resource settlement, including terminal failure, rather than successful
-rendering.
-
-| Event | What it permits |
+| Event | Permission |
 | --- | --- |
-| Native command admission/completion | Update logical operation state independently of graphics |
-| Native image publication | Expose a completed image and its paired metadata through graphics |
-| Browser acquisition and validated paired metadata | Draw the direct image, or queue a draw after the capability copy, with that image's geometry |
-| Source read-release submission | Arm native observation of the matching even timeline value; no reuse yet |
-| Actual even-value GPU settlement and `ReadSettled` | Settle the exact physical source read |
-| Direct acquisition, or completed copy, with matching metadata | Promote that exact image as the retained completed fallback |
-| Actual encoder/submission settlement | Release that draw's independent sample hold |
-| Final display/draw/probe hold release | Release page custody of the exact sample; direct source reuse also requires GPU read settlement |
+| Command admission/completion | Logical state change |
+| Image publication | Expose completed pixels/metadata |
+| Acquisition + valid metadata | Direct draw or queue copy-ordered draw |
+| Source-release submission | Arm even-value observation; no reuse |
+| Actual even settlement/ReadSettled | Settle exact physical source read |
+| Direct acquisition/completed copy + matching metadata | Promote exact fallback |
+| Encoder/submission settlement | Release independent draw hold |
+| Final display/draw/probe release | Release page sample; direct reuse also needs read settlement |
 
-[presentation_surface.rs](../src/frontend/iced/src/presentation_surface.rs)
-owns page sample custody, completed images, and draw preparation;
-[its gallery module](../src/frontend/iced/src/presentation_surface/gallery.rs)
-keeps atlas metadata attached to the image it describes.
-[app/presentation.rs](../src/frontend/iced/src/app/presentation.rs) owns
-foreground routing, viewer transitions, and graphics notifications.
+[presentation_surface](../src/frontend/iced/src/presentation_surface.rs) owns page
+custody/draw preparation; its gallery module retains atlas pairing, app routing
+owns source/view transitions. Last completed pixels remain drawable during work,
+growth/copy. Fit/pan/zoom/clipping/redraw reuse them. Same-image revisions preserve
+transforms; changed source or connection identity resets, even with repeated revisions.
 
-The last valid completed browser image remains drawable while native work,
-capacity growth, or a newer copy is pending. Iced fit, pan, zoom, clipping,
-sampling, and redraws reuse browser-owned images. Same-image revisions retain
-viewer identity and transforms. New source identity resets them; a reconnect
-also carries its own connection identity, even when revision numbers repeat.
-
-The [surface renderer](../src/frontend/iced/src/presentation_surface/renderer.rs)
-caches each draw's two actual `TextureView` handles and replaces a bind group
-only when its view changes. A direct source returning in the other mailbox slot
-can reuse its existing texture/view. Source replacement refreshes all affected
-cached bindings before releasing displaced backing; page teardown drops those
-bindings before imported textures enter final retirement. View equality permits
-binding reuse only: `SampleRead`, encoded draws, and physical completion still
-govern sampling and destruction.
-
-Ordinary redraw events skip unused mouse-coordinate projection while still
-reconciling input ownership and cancellation, viewer state, and the FPS meter.
-Pointer events retain the complete coordinate mapping.
-
-Unacquired offers require no source-read settlement. An acquired image rejected
-by the page still completes its GPU read and ownership release.
-Hidden/idle pages and capacity pressure do not turn unused offers into GPU reads.
-Page-local `ArenaTexture` retirement
-explicitly destroys textures after views, bindings, probes, and exact readers
-release them; normal retirement does not depend on JavaScript collection.
+Renderer caches actual TextureViews/bind groups, reusing returning direct views.
+Replacement refreshes affected bindings before backing release; teardown drops
+bindings before texture retirement. View equality authorizes binding reuse only;
+SampleRead/completion still govern lifetime. Redraw skips unused coordinate
+projection but reconciles input cancellation/view/FPS; pointer input maps fully.
+Unacquired offers require no read settlement; rejected acquisitions still release
+GPU ownership. Hidden/pressure state does not acquire unused offers. ArenaTexture
+explicit retirement waits for views/bindings/probes/readers, not JavaScript GC.
 
 ## Browser redraws and FPS
 
-The visible graphics/window loop can continuously redraw the completed fallback;
-native dirty rendering progresses independently on events.
+Visible browser redraw may continuously reuse fallback; native dirty rendering
+progresses independently. Canvas resize and real Wayland fullscreen entry/exit
+retain layout/configuration/presentation during compilation; a document fullscreen
+flag alone does not prove window resize. [Validation](validation.md#dataset-presentation-and-lifecycle)
+and [gated observations](logging.md#dataset-presentation-evidence) define evidence
+without driving work/redraws.
 
-During native compilation, canvas resizing and actual Wayland fullscreen
-entry/exit retain Iced layout, surface configuration, and presentation. The
-[Dataset acceptance sequence](validation.md#dataset-presentation-and-lifecycle)
-joins advancing native revisions with actual root bounds and successful present
-after each resize, without pointer, wheel, or keydown stimuli. A document fullscreen
-flag alone does not establish that the Wayland window resized. Gated
-[window and resize observations](logging.md#dataset-presentation-evidence)
-observe these boundaries without driving native work or requesting redraws.
-
-Show FPS enables one component-owned counter of actual browser queue
-submissions containing workspace draws, including retained pixels. Several
-workspace primitives using the same meter in one submission count once.
-Clipped, abandoned, or unsubmitted work counts zero. Encoding, swapchain
-presentation, and work-done callbacks are separate events.
-
-[workspace_fps.rs](../src/frontend/iced/src/workspace_fps.rs) caches the text and
-paragraph, refreshing them every 500 ms. The counter sits six pixels inside the
-workspace's upper-right corner. Disabling it removes the meter, clock, counter,
-and submission observer. This product setting is independent of diagnostics;
-opt-in acceptance uses an asynchronous canvas capture to check its placement
-and rendered text.
+Show FPS counts actual queue submissions containing workspace draws, once per
+meter/submission; clipped/abandoned/unsubmitted work counts zero. Encoding,
+presentation and work-done are separate. [FPS owner](../src/frontend/iced/src/workspace_fps.rs)
+refreshes retained text every 500 ms, six pixels inside upper-right. Disabling
+removes meter/clock/counter/submission observer. It is a product setting independent
+of diagnostics; rendered placement checks use asynchronous capture.
 
 ## Diagnostics and acceptance
 
-Diagnostic identities do not govern input order, draw authorization,
-cache validity, or resource lifetime. Ordinary `./mmltk --gui` leaves diagnostic
-collection and probes inactive. The [logging guide](logging.md) owns activation,
-delivery modes, and artifact formats, including the quiet acceptance driver's
-separate control and reporting responsibilities.
-
-The [validation guide](validation.md#gui-behavior-and-evidence-ownership) maps
-input, schema, rendering, physical-custody, and retained-session checks to their
-existing executables. Native unit fixtures establish causal ordering and
-failure behavior; packaged Wayland acceptance establishes actual browser
-interaction and physical image evidence.
+Diagnostics never authorize input order, drawing, cache validity or lifetime.
+Ordinary `./mmltk --gui` leaves collection/probes off. [Logging](logging.md) defines
+activation/formats and independent acceptance control/reporting; [validation](validation.md#gui-behavior-and-evidence-ownership)
+maps causal native tests and actual packaged Wayland evidence.

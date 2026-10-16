@@ -2422,13 +2422,31 @@ void test_help_documents_grammar_and_native_wrapper_is_executable() {
  FileFixture f;
  auto result = f.query({"--help"});
  EQ(result.status, 0);
- includes(result.out, {"Grammar", "--correlate"});
+ includes(result.out, {"Grammar", "--correlate", "has(field)"});
  support::RunOptions options;
  options.capture_stdout = options.capture_stderr = true;
  EQ(support::read_text(repository() / "mmltk").substr(0, 4), std::string("\x7f"
                                                                          "ELF",
                                                               4));
  EQ(support::run({"bash", "-n", (repository() / "tools/bootstrap/bootstrap_mmltk.sh").string()}, options).exit_code, 0);
+ WrapperFixture wrapper("#!/bin/sh\nexit 99\n");
+ const auto test_help = wrapper.invoke({"--test", "help"});
+ EQ(test_help.exit_code, 0);
+ includes(test_help.out, {"--with-upstream", "Ordinary all/rfdetr runs never generate upstream references"});
+ const auto oracle_help = wrapper.invoke({"--diagnose-rfdetr-upstream", "--help"});
+ EQ(oracle_help.exit_code, 0);
+ includes(oracle_help.out, {"--case ID", "selected references never certify the full matrix"});
+ wrapper.write("tools/oracle/rfdetr_sources.json", support::read_text(repository() / "tools/oracle/rfdetr_sources.json"));
+ const auto invalid_case = wrapper.invoke({"--diagnose-rfdetr-upstream", "--case", "invalid"});
+ EQ(invalid_case.exit_code, 1);
+ HAS(invalid_case.err, "--case requires one exact numerical case identity");
+ wrapper.write("retired/retention.json", "{\"status\":\"consumed_payloads_pruned\"}\n");
+ const auto retired = wrapper.invoke({"--diagnose-rfdetr-upstream", "--case", "rf-detr-nano-controlled-group2-fp32-b1-eval", "--output", (wrapper.root / "retired").string()});
+ EQ(retired.exit_code, 1);
+ HAS(retired.err, "reference payloads were retired");
+ const auto invalid = wrapper.invoke({"--test", "core", "--with-upstream"});
+ EQ(invalid.exit_code, 1);
+ HAS(invalid.err, "--with-upstream is only valid with --test rfdetr or all");
 }
 void test_wrapper_retains_both_streams_and_queryable_terminal_status() {
  WrapperFixture f(R"SH(#!/usr/bin/env bash
@@ -2811,6 +2829,7 @@ int package_docker(const Strings& args) {
    for (const auto& argument : args)
     if (argument.starts_with("MMLTK_PACKAGE_FINGERPRINT=")) support::write_text(stage / ".mmltk-package-fingerprint", argument.substr(26) + '\n');
   }
+  if (name.ends_with("-upstream-capability")) std::cout << R"({"fp32":true,"fp16":true,"bf16":true})" << '\n';
   if (name.ends_with("-upstream")) return 41;  // Stop before native numerical comparisons.
  } else if (args[0] != "version" && args[0] != "rm" && args[0] != "ps" && args[0] != "tag" && args[0] != "buildx")
   throw Failure("unexpected package Docker operation: " + args[0]);
@@ -3078,10 +3097,36 @@ void test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly() {
  PackageFixture f;
  const auto tidy = f.invoke({"--tidy-tools"});
  if (tidy.exit_code) throw Failure(tidy.err);
- f.write("upstream/src/rfdetr/models/lwdetr.py", "fixture\n");
- f.write(".cache/mmltk/weights/rf-detr-nano.pth", "fixture\n");
- f.write(".cache/mmltk/weights/rf-detr-seg-nano.pt", "fixture\n");
- const auto oracle = f.invoke({"--diagnose-rfdetr-upstream", "--upstream", (f.root / "upstream").string(), "--output", (f.root / "evidence").string()});
+ for (const auto* directory : {"backend", "common", "frameworks"}) {
+  fs::remove_all(f.root / "src" / directory);
+  fs::create_directory_symlink(repository() / "src" / directory, f.root / "src" / directory);
+ }
+ const auto pins = support::read_json(repository() / "tools/oracle/rfdetr_sources.json");
+ for (const auto* kind : {"core", "plus"}) {
+  const auto& pin = pins.at(kind);
+  const std::string source = std::string(kind) == "core" ? "upstream" : "plus-upstream";
+  fs::create_directories(f.root / source / ".git");
+  f.write(source + "/src/" + pin.at("package").get<std::string>() + "/__init__.py", "fixture\n");
+  f.options.env[std::string("TEST_ORACLE_") + kind + "_REVISION"] = pin.at("revision").get<std::string>();
+  f.options.env[std::string("TEST_ORACLE_") + kind + "_TREE"] = pin.at("tree").get<std::string>();
+ }
+ f.write("bin/git", R"SH(#!/bin/sh
+while [ "$#" -gt 0 ]; do
+ if [ "$1" = -C ]; then shift; source=$1; break; fi
+ shift
+done
+case "$source" in
+ */plus-upstream) revision=$TEST_ORACLE_plus_REVISION; tree=$TEST_ORACLE_plus_TREE;;
+ *) revision=$TEST_ORACLE_core_REVISION; tree=$TEST_ORACLE_core_TREE;;
+esac
+case "$*" in
+ *--absolute-git-dir*|*--git-common-dir*) printf '%s/.git\n' "$source";;
+ *'rev-parse HEAD') printf '%s\n' "$revision";;
+ *'rev-parse HEAD^{tree}') printf '%s\n' "$tree";;
+esac
+)SH");
+ const auto oracle = f.invoke({"--diagnose-rfdetr-upstream", "--upstream", (f.root / "upstream").string(), "--plus-upstream", (f.root / "plus-upstream").string(), "--output", (f.root / "evidence").string()});
+ if (oracle.exit_code != 41) throw Failure(oracle.err);
  EQ(oracle.exit_code, 41);
  std::set<std::string> checked;
  for (const auto& path : matching_files(f.root / "containers", "", ".json")) {
@@ -3098,9 +3143,11 @@ void test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly() {
   CHECK(fs::exists(f.root / "build/tools/mmltk"));
   CHECK(std::find(arguments.begin(), arguments.end(), "com.mmltk.wrapper=1") != arguments.end());
   if (oracle) {
-   for (const auto* value : {"--read-only", "ALL", "no-new-privileges", "none", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "7200s"})
+   EQ(option_value(arguments, "--network"), "bridge");
+   for (const auto* value : {"--read-only", "ALL", "no-new-privileges", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "172800s"})
     CHECK(std::find(arguments.begin(), arguments.end(), value) != arguments.end());
    CHECK(std::find(arguments.begin(), arguments.end(), (f.root / "upstream").string() + ":/upstream:ro") != arguments.end());
+   CHECK(std::find(arguments.begin(), arguments.end(), (f.root / "plus-upstream").string() + ":/plus-upstream:ro") != arguments.end());
    CHECK(std::find(arguments.begin(), arguments.end(), (f.root / "evidence").string() + ":/evidence:rw") != arguments.end());
   } else {
    CHECK(std::find(arguments.begin(), arguments.end(), "/workspace/build/tools/mmltk") != arguments.end());

@@ -4,6 +4,7 @@
 #include "src/frameworks/serialization/json_wire.h"
 #include "src/frameworks/serialization/serialization.h"
 #include <string>
+#include <string_view>
 #include <vector>
 namespace catalog = mmltk::backend::data::catalog;
 TEST_CASE("Catalog preserves ordered foreground identity and exact names", "[catalog]") {
@@ -44,8 +45,10 @@ TEST_CASE("COCO source IDs retain their sparse external domain", "[catalog]") {
 }
 TEST_CASE("Class catalogs admit persisted names without a joint schema", "[catalog][keypoint]") {
  namespace serial = mmltk::frameworks::serialization;
- const auto bytes = serial::json_to_cbor(R"({"names":[{"value":"person"},{"value":"car"}]})", {});
- const auto decoded = serial::decode<catalog::OrderedClassCatalog>({bytes, {}}, {});
+ constexpr std::string_view persisted = R"({"names":[{"value":"person"},{"value":"car"}]})";
+ constexpr serial::wire::Limits limits{.max_bytes = persisted.size(), .max_items = 16U};
+ const auto bytes = serial::json_to_cbor(persisted, limits);
+ const auto decoded = serial::decode<catalog::OrderedClassCatalog>({bytes, {}}, limits);
  REQUIRE(decoded);
  CHECK_FALSE(decoded->keypoints.has_value());
  const catalog::ClassCatalog admitted(*decoded);

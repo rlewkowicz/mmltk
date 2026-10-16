@@ -407,6 +407,7 @@ TEST_CASE("Pinned upstream tied selection retains physical schema and original-s
  for (const auto& item : oracle.keypoint_cases()) {
   const auto id = item.at("id").get<std::string>(), prefix = id + "/selection/";
   const auto counts = item.at("counts").get<std::vector<std::uint16_t>>();
+  CAPTURE(id, counts);
   r::OutputTensors outputs{archive.tensor(prefix + "logits", torch::kCUDA), archive.tensor(prefix + "input_boxes", torch::kCUDA), {}, archive.tensor(id + "/padded", torch::kCUDA), counts};
   // Physical top-k is observed before any named-layout filtering. This keeps
   // the upstream tie ordering independent of the application class mapping.
@@ -444,6 +445,7 @@ TEST_CASE("Pinned upstream tied selection retains physical schema and original-s
   layout.foreground.keypoints.emplace();
   for (std::size_t slot = 0; slot < counts.size(); ++slot) {
    if (item.at("classes").at(slot).is_null()) {
+    layout.no_object = r::NoObjectEncoding::ExplicitBackground;
     layout.slots.push_back({r::ClassSlotRole::Background, {}});
     continue;
    }
@@ -460,6 +462,7 @@ TEST_CASE("Pinned upstream tied selection retains physical schema and original-s
   r::KeypointTensorLayout(counts).require_class_layout(*admitted);
   CHECK(admitted->record() == layout);
   r::PostprocessLane lane(admitted);
+  lane.Prepare(outputs.pred_logits.device());
   const auto semantic = r::select_output_batch_fixed_size(outputs, 200, 400, 2 * counts.size(), false, &lane);
   const auto references = admitted->physical_references();
   const auto mapped = torch::tensor(std::vector<int64_t>(references.begin(), references.end()), torch::kInt64).index_select(0, archive.tensor(prefix + "labels"));

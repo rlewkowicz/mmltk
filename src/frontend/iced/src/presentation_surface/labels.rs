@@ -200,6 +200,12 @@ impl PredictionContent {
             ObjectMetadata::Live(value) => &value.labels,
         }
     }
+    pub(crate) fn preview(&self) -> Option<&crate::generated::PredictionRunPreview> {
+        match &self.metadata {
+            ObjectMetadata::Prediction(value) => Some(&value.preview),
+            ObjectMetadata::Live(_) => None,
+        }
+    }
     pub(crate) fn analyzed(&self) -> Option<bool> {
         match &self.metadata {
             ObjectMetadata::Live(value) => Some(value.analyzed),

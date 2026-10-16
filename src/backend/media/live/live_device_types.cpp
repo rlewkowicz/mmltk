@@ -1,8 +1,9 @@
 #include "detail/live_device_types.h"
 namespace mmltk::backend::media::live {
 thread_local detail::ActiveLiveCudaContext detail::active_live_cuda_context{};
-LivePhysicalCudaContext::LivePhysicalCudaContext(gpu::ResourceOwnerCommandBinding command, gpu::CudaDeviceOwner device) noexcept : command_(std::move(command)), device_(device) {}
-bool LivePhysicalCudaContext::valid() const noexcept { return command_.valid() && device_.device >= 0 && device_.record_failure != nullptr; }
+LivePhysicalCudaContext::LivePhysicalCudaContext(gpu::ResourceOwnerCommandBinding command, gpu::CudaDeviceOwner device, gpu::CudaDeviceApi api) noexcept
+    : command_(std::move(command)), device_(device), api_(api) {}
+bool LivePhysicalCudaContext::valid() const noexcept { return command_.valid() && device_.device >= 0 && device_.record_failure != nullptr && api_.get != nullptr && api_.set != nullptr; }
 int LivePhysicalCudaContext::device() const noexcept { return device_.device; }
 LiveCudaCommandScope LivePhysicalCudaContext::scope() const noexcept { return LiveCudaCommandScope{*this}; }
 void LivePhysicalCudaContext::Record(const cudaError_t status) const noexcept {
@@ -15,7 +16,7 @@ LiveCudaCommandScope::LiveCudaCommandScope(const LivePhysicalCudaContext& contex
       device_(command_ && !(detail::active_live_cuda_context.worker == context.command_.worker_identity() && detail::active_live_cuda_context.owner == context.device_.context &&
                             detail::active_live_cuda_context.device == context.device_.device)
                ? context.device_
-               : gpu::CudaDeviceOwner{}),
+               : gpu::CudaDeviceOwner{}, context.api_),
       nested_(command_ && detail::active_live_cuda_context.worker == context.command_.worker_identity() && detail::active_live_cuda_context.owner == context.device_.context &&
               detail::active_live_cuda_context.device == context.device_.device) {
  if (!command_ || (!nested_ && !device_)) {

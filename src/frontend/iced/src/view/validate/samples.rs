@@ -527,7 +527,7 @@ mod tests {
                 }
             }
         }
-        for width in [600.0, 300.0] {
+        for width in [1000.0, 300.0] {
             let mut controls = component.controls(&model);
             let mut tree = widget::Tree::new(&controls);
             tree.diff(&mut controls);

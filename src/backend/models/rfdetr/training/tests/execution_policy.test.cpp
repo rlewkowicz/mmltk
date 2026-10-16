@@ -340,6 +340,7 @@ TEST_CASE("Denoising owner preserves valid semantic annotations across local pad
  config.num_classes = 3;
  config.hidden_dim = 8;
  config.num_queries = 4;
+ config.dec_layers = 1;
  config.training_supervision.denoising.enabled = true;
  config.training_supervision.denoising.groups = 2;
  r::TrainingSupervisionImpl supervision(config, 2);

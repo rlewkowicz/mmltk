@@ -22,7 +22,7 @@ ARG WESTON_VERSION
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        weston="${WESTON_VERSION}" libweston-13-0="${WESTON_VERSION}" wayland-utils \
+        weston="${WESTON_VERSION}" libweston-13-0="${WESTON_VERSION}" wayland-utils gdb \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=seat-builder /tmp/weston-stage/lib/weston/mmltk-headless-seat.so /usr/lib/weston/mmltk-headless-seat.so
 

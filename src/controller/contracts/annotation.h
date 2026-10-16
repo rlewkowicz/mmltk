@@ -192,43 +192,29 @@ struct AnnotationObject final {
   }
   return std::ranges::all_of(skeleton_edges, [this](const auto& edge) { return edge.source < skeleton_nodes.size() && edge.target < skeleton_nodes.size() && edge.source != edge.target; });
  }
+ [[nodiscard]] bool schema_matches(std::span<const mmltk::backend::data::catalog::ClassKeypointSchema> schemas) const noexcept {
+  if (shape != AnnotationShape::Skeleton || category >= schemas.size()) return true;
+  const auto& names = schemas[category].names;
+  if (names.size() != skeleton_nodes.size()) return false;
+  for (std::size_t index = 0; index < names.size(); ++index)
+   if (names[index] != skeleton_nodes[index].key) return false;
+  return true;
+ }
  auto operator<=>(const AnnotationObject&) const = default;
 };
 // Aggregate admission is shared by complete scenes and prospective journal views.
 class AnnotationDocumentBudget final {
 public:
- [[nodiscard]] bool AddSchema(const mmltk::backend::data::catalog::ClassKeypointSchema& schema) noexcept {
-  if (!Bytes(1, 128) || !Bytes(schema.names.size(), 32) || !Bytes(schema.skeleton.size(), 32)) return false;
-  for (const auto& name : schema.names)
-   if (!Add(name.size(), names_, kAnnotationDocumentJointNameBytes) || !Bytes(name.size(), 1)) return false;
-  return true;
- }
- [[nodiscard]] bool AddObject(const AnnotationObject& object, std::span<const mmltk::backend::data::catalog::ClassKeypointSchema> schemas) noexcept {
-  if (!Add(object.mask.runs.size(), runs_, kAnnotationMaskRunCapacity) || !Add(object.skeleton_nodes.size(), joints_, kAnnotationDocumentJointCapacity) ||
-      !Add(object.skeleton_edges.size(), edges_, kAnnotationDocumentEdgeCapacity))
-   return false;
-  if (!Bytes(1, 1024) || !Bytes(object.mask.runs.size(), 32) || !Bytes(object.mask_points.size(), 32) || !Bytes(object.spline_knots.size(), 256) || !Bytes(object.skeleton_nodes.size(), 96) ||
-      !Bytes(object.skeleton_edges.size(), 32))
-   return false;
-  for (const auto& node : object.skeleton_nodes)
-   if (!Add(node.key.size(), names_, kAnnotationDocumentJointNameBytes) || !Bytes(node.key.size(), 1)) return false;
-  if (object.shape == AnnotationShape::Skeleton && object.category < schemas.size()) {
-   const auto& schema = schemas[object.category];
-   if (schema.names.size() != object.skeleton_nodes.size()) return false;
-   for (std::size_t index = 0; index < schema.names.size(); ++index)
-    if (schema.names[index] != object.skeleton_nodes[index].key) return false;
-  }
-  return true;
- }
+ [[nodiscard]] bool AddSchema(const mmltk::backend::data::catalog::ClassKeypointSchema& schema) noexcept;
+ [[nodiscard]] bool AddObject(const AnnotationObject& object) noexcept;
 
 private:
- // Conservative CBOR envelope costs include field names, maximal scalar encodings,
- // and fixed object content. Admission computes these without serializing or
- // allocating a second scene during pointer edits. The reserve covers the
- // category palette, resource identity, editor facts and publication wrapper.
- bool Bytes(std::size_t count, std::size_t cost) noexcept {
-  if (count > (kAnnotationUiStateByteBudget - bytes_) / cost) return false;
-  bytes_ += count * cost;
+ // Reflected transport measurement allocates no second scene or payload.
+ // The reserve covers category/palette arrays, resource identity, editor facts
+ // and the publication wrapper independently of per-object contents.
+ bool Bytes(std::size_t count) noexcept {
+  if (count > kAnnotationUiStateByteBudget - bytes_) return false;
+  bytes_ += count;
   return true;
  }
  std::size_t bytes_ = 512U * 1024U;
@@ -297,7 +283,7 @@ struct AnnotationSceneContent final {
    }
   } catch (...) { return false; }
   for (const auto& object : objects)
-   if (!budget.AddObject(object, keypoint_schemas)) return false;
+   if (!object.schema_matches(keypoint_schemas) || !budget.AddObject(object)) return false;
   if (frame_ready && (frame_width == 0U || frame_height == 0U)) return false;
   const auto point_in_frame = [this](const AnnotationPoint point) { return !frame_ready || (point.x >= 0.0F && point.y >= 0.0F && point.x <= frame_width && point.y <= frame_height); };
   if (!std::ranges::all_of(categories, [](const auto& item) { return item.valid(); }) || !std::ranges::all_of(objects, [this, &point_in_frame](const auto& item) {

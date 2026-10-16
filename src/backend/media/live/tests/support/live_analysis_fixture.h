@@ -2,6 +2,7 @@
 #include "src/backend/media/live/live_analysis_product.h"
 #include "src/backend/data/catalog/tests/keypoint_schema_fixture.h"
 #include <array>
+#include <algorithm>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
@@ -71,42 +72,49 @@ struct LiveAnalysisFixture final {
  }
  static void DeliverLargeSchema(LiveAnalysisProduct& product, LiveFrameId frame, std::uint32_t count) {
   namespace catalog = mmltk::backend::data::catalog;
+  constexpr auto capacity = static_cast<std::uint32_t>(mmltk::backend::ml::runtime::kMaximumAnalysisRegions);
+  if (!count || count > capacity * capacity) throw std::invalid_argument("fixture exceeds Live region capacity");
   const auto schema = catalog::test_support::maximum_keypoint_schema();
   auto classes = std::make_shared<const catalog::ClassCatalog>(catalog::OrderedClassCatalog{{{"custom"}}, std::vector{schema}});
-  std::vector<std::array<float, 4>> boxes(count, {0, 0, 3, 3});
-  std::vector<std::int32_t> categories(count, 0), counts(count, 256);
-  std::vector<float> scores(count, .9F);
-  std::vector<std::array<std::uint8_t, 3>> colors(count, {255, 0, 0});
-  std::vector<Joint> joints(std::size_t(count) * 256, {2, 2, .9F, 1, 0, 1});
+  std::vector<std::array<float, 4>> boxes(capacity, {0, 0, 3, 3});
+  std::vector<std::int32_t> categories(capacity, 0), counts(capacity, 256);
+  std::vector<float> scores(capacity, .9F);
+  std::vector<std::array<std::uint8_t, 3>> colors(capacity, {255, 0, 0});
+  std::vector<Joint> joints(std::size_t(capacity) * 256, {2, 2, .9F, 1, 0, 1});
   RuntimeAnnotation annotation{
    .source_region = {0, 0, 4, 4},
-   .value_capacity = count,
-   .boxes_xyxy = Buffer(boxes, {count, 4}, Element::Float32),
-   .class_references = Buffer(categories, {count}, Element::Int32),
-   .confidences = Buffer(scores, {count}, Element::Float32),
-   .colors_rgb = Buffer(colors, {count, 3}, Element::Uint8),
+   .value_capacity = capacity,
+   .boxes_xyxy = Buffer(boxes, {capacity, 4}, Element::Float32),
+   .class_references = Buffer(categories, {capacity}, Element::Int32),
+   .confidences = Buffer(scores, {capacity}, Element::Float32),
+   .colors_rgb = Buffer(colors, {capacity, 3}, Element::Uint8),
    .keypoint_capacity = 256,
-   .keypoints = Buffer(joints, {count, 256, static_cast<std::uint32_t>(mmltk::backend::ml::runtime::kAnalysisKeypointChannels)}, Element::Float32),
-   .keypoint_counts = Buffer(counts, {count}, Element::Int32),
+   .keypoints = Buffer(joints, {capacity, 256, static_cast<std::uint32_t>(mmltk::backend::ml::runtime::kAnalysisKeypointChannels)}, Element::Float32),
+   .keypoint_counts = Buffer(counts, {capacity}, Element::Int32),
    .keypoints_available = true,
    .class_domain = catalog::ClassReferenceDomain::Foreground,
    .class_catalog = std::move(classes)
   };
-  annotation.count.SetKnown(count, count);
-  DeliverAnnotation(product, frame, annotation);
+  // Reach aggregate metadata admission through valid bounded regions.
+  std::vector<RuntimeAnnotation> regions;
+  for (std::uint32_t begin = 0; begin < count; begin += capacity) {
+   regions.push_back(annotation);
+   regions.back().count.SetKnown(std::min(count - begin, capacity), capacity);
+  }
+  DeliverAnnotations(product, frame, regions);
  }
  static cudaError_t Copy(void* target, const void* source, std::size_t bytes, std::uintptr_t) noexcept {
   std::memcpy(target, source, bytes);
   return cudaSuccess;
  }
- static void DeliverAnnotation(LiveAnalysisProduct& product, LiveFrameId frame, RuntimeAnnotation& annotation) {
-  product.PrepareDevice(frame, 4, 4, std::span{&annotation, 1});
+ static void DeliverAnnotations(LiveAnalysisProduct& product, LiveFrameId frame, std::span<const RuntimeAnnotation> annotations) {
+  product.PrepareDevice(frame, 4, 4, annotations);
   if (product.EnqueueDeviceCopy(1, &Copy) != cudaSuccess) throw std::runtime_error("fixture copy failed");
   product.CompleteDeviceCopy();
  }
  void Deliver(LiveAnalysisProduct& product, LiveFrameId frame, bool pending = true) {
   auto annotation = Annotation(pending);
-  DeliverAnnotation(product, frame, annotation);
+  DeliverAnnotations(product, frame, std::span{&annotation, 1});
  }
 };
 }  // namespace mmltk::backend::media::live::test_support

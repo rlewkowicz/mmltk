@@ -21,6 +21,7 @@
 #include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/keypoint_layout.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/detail/modules_technical.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
@@ -2387,6 +2388,14 @@ TEST_CASE("Native keypoint validation maps classes and named joints in both metr
    parameters["class_embed.bias"].fill_(-10);
    parameters["class_embed.bias"][0].fill_(10);
    parameters["keypoint_embed.layers.2.weight"].normal_(0, .01);
+   // This fixture needs all twelve foreground query/class pairs before
+   // thresholding. Keep joint-derived class boosts neutral and unused slots
+   // below every bound class; coordinates retain their independent variation.
+   constexpr auto class_channel = static_cast<std::int64_t>(rfdetr::KeypointPredictionPacket::index<^^rfdetr::KeypointPrediction::class_logit>());
+   parameters["keypoint_embed.layers.2.weight"][class_channel].zero_();
+   parameters["keypoint_embed.layers.2.bias"][class_channel].zero_();
+   for (std::size_t slot = 0; slot < layout.slots.size(); ++slot)
+    if (layout.slots[slot].role != rfdetr::ClassSlotRole::Foreground) parameters["class_embed.bias"][static_cast<std::int64_t>(slot)].fill_(-100);
   }
   auto checkpoint = native_checkpoint(rfdetr::collect_module_state(model), config, layout);
   rfdetr::save_native_checkpoint(weights, checkpoint);

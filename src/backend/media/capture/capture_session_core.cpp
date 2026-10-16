@@ -329,12 +329,15 @@ void CaptureSession::Impl::PublishStopTerminal(CaptureLoopResult result) {
  terminal_storage_->status = std::move(result.status);
  terminal_storage_->final_stats = snapshot_stats();
  terminal_storage_->streamoff_skipped = result.teardown == CaptureTeardownDisposition::kNoStreamOrDeviceLost;
- NotifyFilledFramePublished();
- NotifyState();
  std::shared_ptr<const CaptureStopTerminal> immutable = terminal_storage_;
  terminal_.store(std::move(immutable), std::memory_order_release);
  terminal_published_.store(true, std::memory_order_release);
  static_cast<void>(mmltk::common::io::signal_event_fd(terminal_event_fd_));
+ // Listener consumers must be able to take the terminal when awakened. A
+ // pre-publication notification can be consumed before this owner exits,
+ // leaving an event-driven consumer asleep with no subsequent wake.
+ NotifyFilledFramePublished();
+ NotifyState();
 }
 void CaptureSession::Impl::CloseFilledAdmission() noexcept { shutdown_.store(true, std::memory_order_release); }
 void CaptureSession::Impl::ReportCameraFault(const std::string& message) {

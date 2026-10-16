@@ -367,7 +367,7 @@ private:
  void ExecuteNative(const torch::Tensor& input, AnnotationBatch& annotations) {
   if (!nested_mask_.defined() || nested_mask_.size(0) != input.size(0)) nested_mask_ = torch::zeros({input.size(0), input.size(2), input.size(3)}, input.options().dtype(torch::kBool));
   const ModelOutputs outputs = (*native_).forward(NestedTensor{input, nested_mask_}, annotations.want_masks);
-  assert_inference_output_dtype(outputs.main.pred_logits, outputs.main.pred_boxes, native_input_type_, "native RF-DETR inference");
+  assert_inference_output_dtype(outputs.main, native_input_type_, "native RF-DETR inference");
   PredictionCountStorage::Prepare(count_storage_, annotations.storage.size(), device_, retirement_, operations_);
   for (std::size_t index = 0U; index < annotations.storage.size(); ++index) {
    auto& storage = annotations.storage[index];

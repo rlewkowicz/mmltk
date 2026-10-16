@@ -312,7 +312,7 @@ EvidenceFile admitted_file_record(const fs::path& directory, const Json& referen
 }
 Json authenticated_json(const fs::path& directory, const Json& reference) {
  const auto [path, bytes] = admitted_file_record(directory, reference);
- if (!bytes || bytes > MaxManifest || fs::file_size(path) != bytes || digest(path) != reference.at("sha256")) throw std::runtime_error("completed evidence index changed");
+ if (!bytes || bytes > MaxManifest || fs::file_size(path) != bytes || digest(path) != reference.at("sha256").get<std::string>()) throw std::runtime_error("completed evidence index changed");
  return read_json(path);
 }
 void publish_file(const fs::path& destination, const std::function<void(const fs::path&)>& write) {
@@ -339,7 +339,7 @@ void verify_archive(const fs::path& directory, const Json& reference) {
   for (const auto& [name, spec] : shard.at("tensors").items())
    if (!names.insert(name).second || names.size() > MaxTensors) throw std::runtime_error("duplicate completed tensor");
   const auto [path, bytes] = admitted_file_record(directory, shard);
-  if (!files.insert(path.filename().string()).second || !bytes || bytes > MaxArchive || bytes > MaxStepStorage - total || fs::file_size(path) != bytes || digest(path) != shard.at("sha256"))
+  if (!files.insert(path.filename().string()).second || !bytes || bytes > MaxArchive || bytes > MaxStepStorage - total || fs::file_size(path) != bytes || digest(path) != shard.at("sha256").get<std::string>())
    throw std::runtime_error("completed tensor shard changed");
   total += bytes;
  }
@@ -444,19 +444,39 @@ class ForwardOperators {
 public:
  struct State {
   NamedTensors outputs;
+  NamedTensors gradients;
+  std::vector<std::unique_ptr<PythonContext>> gradient_hooks;
   std::map<std::string, std::size_t> counts;
   bool active = true;
+  bool backward = false;
  };
- ForwardOperators() : state_(std::make_shared<State>()) {
+ explicit ForwardOperators(bool backward) : state_(std::make_shared<State>()) {
+  state_->backward = backward;
   const auto functional = module("torch.nn.functional");
   for (const char* name : {"conv2d", "layer_norm", "linear", "gelu", "scaled_dot_product_attention"}) {
    const py::object original = functional.attr(name);
    auto callback = py::cpp_function([state = state_, name = std::string(name), original](py::args args, py::kwargs kwargs) {
     auto output = invoke(original, args, kwargs);
-    if (state->active) {
+    if (state->active || state->backward) {
      if (state->outputs.size() >= 256) throw std::runtime_error("forward operator observation exceeds its bound");
-     const auto index = state->counts[name]++;
-     state->outputs.emplace_back("forward-operator/" + name + "/" + std::to_string(index), detached_clone(output));
+     auto prefix = "forward-operator/" + name;
+     if (!state->active) {
+      prefix = "decoder-" + prefix + "/";
+      for (py::handle dimension : output.attr("shape")) prefix += std::to_string(integer(dimension)) + "x";
+     }
+     const auto ordinal = state->counts[prefix]++;
+     auto key = prefix + "/" + std::to_string(ordinal);
+     state->outputs.emplace_back(key, detached_clone(output));
+     if (state->backward) {
+      key.replace(key.find("forward"), 7, "backward");
+      const auto slot = state->gradients.size();
+      state->gradients.emplace_back(key, py::none());
+      if (truth(output.attr("requires_grad")))
+       state->gradient_hooks.push_back(std::make_unique<PythonContext>(output.attr("register_hook")(py::cpp_function([state, slot](py::object gradient) {
+        state->gradients[slot].second = gradient.attr("detach")();
+        return gradient;
+       }))));
+     }
     }
     return output;
    });
@@ -466,6 +486,10 @@ public:
  void close() { patches_.restore(); }
  void save(Archive& archive) const {
   for (const auto& [name, value] : state_->outputs) archive.add(name, value);
+ }
+ void save_gradients(Archive& archive) {
+  state_->gradient_hooks.clear();
+  for (const auto& [name, value] : state_->gradients) archive.add(name, value);
  }
  const std::shared_ptr<State>& state() const { return state_; }
 
@@ -777,8 +801,56 @@ Json optimizer_groups(py::object optimizer, const NamedTensors& names) {
  }
  return groups;
 }
+Json save_export_reference(Archive& archive, py::object model, py::object configuration, py::object input, bool diagnostic, const fs::path& directory) {
+ const auto torch = module("torch");
+ // Execute the pinned export preparation and export forward on an owned copy.
+ // Its normal CPU tracing policy is distinct from the eager CUDA reference.
+ PythonContext random_state(torch.attr("random").attr("fork_rng")("devices"_a = py::list(py::make_tuple(torch.attr("cuda").attr("current_device")()))));
+ PythonContext no_grad(torch.attr("no_grad")());
+ const auto snapshot = module("copy").attr("deepcopy")(model);
+ const auto shape = py::make_tuple(configuration.attr("resolution"), configuration.attr("resolution"));
+ const auto graph = module("rfdetr.export.prepare").attr("prepare_export_graph")(
+  snapshot, configuration, "shape"_a = shape, "device"_a = input.attr("device"), "batch_size"_a = integer(input.attr("size")(0)));
+ const auto export_model = graph.attr("model");
+ module("rfdetr.export._backend").attr("_switch_to_export_mode")(export_model);
+ const bool masks = truth(configuration.attr("segmentation_head")), joints = truth(configuration.attr("use_grouppose_keypoints"));
+ std::vector<std::string> roles{"pred_boxes", "pred_logits"};
+ if (masks || joints) roles.emplace_back(masks ? "pred_masks" : "pred_keypoints");
+ const auto capture = [&](const std::string& prefix, py::object pixels) {
+  Observe observation;
+  const auto result = export_model(pixels);
+  observation.close();
+  observation.save(archive, prefix);
+  if (py::len(result) != roles.size()) throw std::runtime_error("upstream export output inventory changed");
+  // The external export tuple is (boxes, logits[, masks or keypoints]).
+  for (std::size_t role = 0; role < roles.size(); ++role) archive.add(prefix + "output/main/" + roles[role], index(result, role));
+ };
+ if (diagnostic) capture("export/", input.attr("detach")().attr("cpu")());
+ export_model.attr("cuda")();
+ if (diagnostic) capture("export-cuda/", input.attr("detach")());
+ // Native export uses portable math attention. Preserve the ordinary case's
+ // policy and training trajectory while evaluating its owned export copy under
+ // the same backend; changed proposal order otherwise changes decoder slots.
+ const auto attention = module("torch.nn.attention");
+ PythonContext math(attention.attr("sdpa_kernel")(attention.attr("SDPBackend").attr("MATH")));
+ capture("export-math/", input.attr("detach")());
+ if (!diagnostic) return nullptr;
+ export_model.attr("cpu")();
+ const auto onnx = module("rfdetr.export._onnx.exporter");
+ const auto options = onnx.attr("OnnxConfig")("output_dir"_a = directory.string(), "output_name"_a = "upstream", "opset_version"_a = 17);
+ const fs::path artifact = string(onnx.attr("OnnxExporter")(options)(graph));
+ if (fs::canonical(artifact.parent_path()) != fs::canonical(directory) || fs::is_symlink(artifact)) throw std::runtime_error("upstream exporter returned an unowned artifact");
+ auto record = file_record(artifact);
+ record["outputs"] = Json::object();
+ const auto output_names = graph.attr("output_names");
+ if (py::len(output_names) != roles.size()) throw std::runtime_error("upstream export graph output names changed");
+ for (std::size_t role = 0; role < roles.size(); ++role) record["outputs"][roles[role]] = string(index(output_names, role));
+ record["exporter"] = "rfdetr.export._onnx.exporter.OnnxExporter";
+ record["onnx_version"] = string(module("onnx").attr("__version__"));
+ return record;
+}
 Json run_case(const fs::path& directory, py::object model, py::dict initial, py::object mc, py::object tc, py::object defaults, const std::string& preset, const std::string& dtype_name, int batch,
- bool training, int steps, const std::string& protocol) {
+ bool training, int steps, const std::string& protocol, bool backward_operators, bool export_reference) {
  const auto torch = module("torch");
  const auto build_criterion = module("rfdetr.models.lwdetr").attr("build_criterion_from_config");
  const auto get_param_dict = module("rfdetr.training.param_groups").attr("get_param_dict");
@@ -808,6 +880,7 @@ Json run_case(const fs::path& directory, py::object model, py::dict initial, py:
  const int resolution = py::cast<int>(mc.attr("resolution"));
  Json records = Json::array();
  Json execution_policy;
+ Json upstream_export;
  for (int step = 0; step != steps; ++step) {
   Archive archive(directory, identity + "-step" + std::to_string(step));
   torch.attr("manual_seed")(731 + step);
@@ -819,7 +892,7 @@ Json run_case(const fs::path& directory, py::object model, py::dict initial, py:
   archive.add("input_mask", mask);
   optimizer.attr("zero_grad")("set_to_none"_a = true);
   std::unique_ptr<ForwardOperators> operators;
-  if (step == 0) operators = std::make_unique<ForwardOperators>();
+  if (step == 0) operators = std::make_unique<ForwardOperators>(backward_operators);
   Observe forward_observation(operators.get());
   py::dict outputs;
   {
@@ -867,6 +940,7 @@ Json run_case(const fs::path& directory, py::object model, py::dict initial, py:
    for (const auto& [key, value] : trainable) vjp_names.emplace_back("parameter/" + key, value);
    const auto vjps = torch.attr("autograd").attr("grad")(sum, parameter_values(vjp_names), "allow_unused"_a = true, "retain_graph"_a = training);
    save_gradients(archive, "vjp/", vjp_names, vjps.cast<py::sequence>());
+   operators->save_gradients(archive);
   }
   if (training) {
    const auto rng = torch.attr("cuda").attr("get_rng_state")();
@@ -935,9 +1009,11 @@ Json run_case(const fs::path& directory, py::object model, py::dict initial, py:
     held_observation.save(archive, "held/");
    }
    for (const auto& [key, value] : output_tensors(held_outputs)) archive.add("held/output/" + key, value);
+   if (fp32 && batch == 1 && protocol == "controlled-group2") upstream_export = save_export_reference(archive, model, mc, held, export_reference, directory);
    model.attr("train")(true);
    held_criterion.attr("train")(true);
-  }
+  } else if (fp32 && batch == 1 && protocol == "controlled-group2")
+   upstream_export = save_export_reference(archive, model, mc, images, export_reference, directory);
   auto record = archive.write();
   record["step"] = step;
   records.push_back(std::move(record));
@@ -952,7 +1028,7 @@ Json run_case(const fs::path& directory, py::object model, py::dict initial, py:
   {"comparison_policy", fp32 || !training ? "untouched_stock" : "upstream_with_fp32_matcher_boundary"}, {"training", training}, {"resolution", resolution}, {"groups", to_json(mc.attr("group_detr"))},
   {"classes", py::cast<int>(mc.attr("num_classes")) + 1}, {"queries", to_json(mc.attr("num_queries"))}, {"keypoints_per_class", to_json(mc.attr("num_keypoints_per_class"))},
   {"trainable", trainable_names}, {"parameter_groups", groups}, {"loss_weights", to_json(criterion.attr("weight_dict"))}, {"clip_max_norm", to_json(tc.attr("clip_max_norm"))},
-  {"optimizer", optimizer_settings}, {"steps", records}
+  {"optimizer", optimizer_settings}, {"steps", records}, {"upstream_export", upstream_export}
  };
 }
 Json constructor_evidence(py::object model) {
@@ -1173,6 +1249,9 @@ struct Arguments {
  std::string weights;
  std::string fingerprint;
  std::string sdpa = "default";
+ std::string selected_case;
+ bool backward_operators = false;
+ bool export_reference = false;
  bool help = false;
 };
 py::object checkpoint_value(py::handle checkpoint, py::handle arguments, const char* name) {
@@ -1415,6 +1494,13 @@ Json checked_native_configuration(const Json& evidence, const int groups, py::ha
  return config;
 }
 void generate(const Arguments& args) {
+ const char* trace_value = std::getenv("MMLTK_RFDETR_ORACLE_TRACE");
+ const bool tracing = trace_value && std::string_view(trace_value) == "1";
+ const auto trace = [tracing](std::string_view stage, std::string_view preset = {}) {
+  if (!tracing) return;
+  std::cerr << Json{{"event", "oracle.stage"}, {"stage", stage}, {"preset", preset}}.dump() << std::endl;
+ };
+ trace("generate.begin");
  const auto torch = module("torch");
  const auto source = fs::weakly_canonical(fs::absolute(args.upstream));
  const auto source_hashes = verify_source(source);
@@ -1455,6 +1541,7 @@ void generate(const Arguments& args) {
  if (admitted_inventory.at("sources") != source_pins() || admitted_inventory.at("fingerprint") != args.fingerprint || admitted_inventory.at("status") != "verified_inventory_complete" ||
      admitted_inventory.at("native_catalog") != Json::parse(rfdetr_native_catalog_json()))
   throw std::runtime_error("cached inventory provenance differs");
+ trace("inventory.admitted");
  const py::object build_config = torch.attr("__config__").attr("show")();
  const auto build_config_size = py::len(build_config);
  const auto build_config_prefix = item(build_config, py::slice(py::none(), py::int_(65536), py::none()));
@@ -1477,33 +1564,52 @@ void generate(const Arguments& args) {
   {"inventory_sha256", digest(fs::path(inventory_args.output) / "manifest.json")},
   {"preprocessing", "RGB unit float32 -> upstream RFDETR.means/stds; deterministic source pixels and exact normalized input retained"},
   {"tensor_families",
-   Json::array({"backbone", "grouppose", "forward-operator", "output", "vjp", "assignment", "loss", "gradient", "clipped", "updated", "optimizer", "held", "schema", "selection", "oks"})}
+   Json::array({"backbone", "grouppose", "forward-operator", "output", "vjp", "assignment", "loss", "gradient", "clipped", "updated", "optimizer", "held", "schema", "selection", "oks", "export-math"})},
+  {"export_policy", {{"device", "cuda"}, {"sdpa_backend", "math"}, {"prefix", "export-math/"}}}
  };
+ trace("precision.inspect");
  const auto capability = precision_capability();
+ trace("precision.ready");
  manifest["precision_capability"] = capability;
+ if (!args.selected_case.empty()) manifest["selected_case"] = args.selected_case;
+ manifest["backward_operators"] = args.backward_operators;
+ manifest["export_reference"] = args.export_reference;
+ if (args.export_reference) {
+  module("rfdetr.export._onnx.exporter").attr("OnnxExporter").attr("check_dependencies")();
+  for (const auto* family : {"export", "export-cuda", "upstream-export"}) manifest["tensor_families"].push_back(family);
+ }
+ if (args.backward_operators)
+  for (const auto* family : {"backward-operator", "decoder-forward-operator", "decoder-backward-operator"}) manifest["tensor_families"].push_back(family);
  std::vector<std::string> precisions{"fp32", "fp16"};
  if (capability.at("bf16").get<bool>())
   precisions.emplace_back("bf16");
  else
   manifest["unsupported"].push_back("bf16: CUDA device does not support BF16");
+ trace("defaults.construct");
  const auto defaults = defaults_type("force_no_pretrain"_a = true);
+ trace("defaults.ready");
  for (const auto& record : admitted_inventory.at("assets")) {
   const auto evidence_path = output / "inventory" / record.at("path").get<std::string>();
-  if (digest(evidence_path) != record.at("sha256")) throw std::runtime_error("cached asset evidence changed");
+  if (digest(evidence_path) != record.at("sha256").get<std::string>()) throw std::runtime_error("cached asset evidence changed");
   const auto evidence = read_json(evidence_path);
   const auto name = evidence.at("preset").get<std::string>(), filename = evidence.at("filename").get<std::string>();
+  if (!args.selected_case.empty() && !args.selected_case.starts_with(name + "-")) continue;
   const auto weights = fs::path(args.weights) / filename;
-  if (digest(weights) != evidence.at("sha256")) throw std::runtime_error("official asset changed: " + name);
+  if (digest(weights) != evidence.at("sha256").get<std::string>()) throw std::runtime_error("official asset changed: " + name);
   const auto original = admitted_file(directory, "original-" + filename);
   if (!fs::exists(original)) publish_file(original, [&](const auto& temporary) { fs::copy_file(weights, temporary); });
-  if (digest(original) != evidence.at("sha256")) throw std::runtime_error("retained official asset changed: " + name);
+  if (digest(original) != evidence.at("sha256").get<std::string>()) throw std::runtime_error("retained official asset changed: " + name);
   const bool platform = evidence.at("registry").get<std::string>().starts_with("rfdetr_plus.");
-  const auto model_type = (platform ? plus : core).attr(evidence.at("upstream_class").get<std::string>().c_str());
+  trace("model.class_accessor", name);
+  const py::object model_type = (platform ? plus : core).attr(evidence.at("upstream_class").get<std::string>().c_str());
+  trace("model.class_ready", name);
   for (const std::string protocol : {"controlled-group2", "stock"}) {
    const bool stock = protocol == "stock";
    const int groups = stock ? evidence.at("configured_topology").at("group_detr").get<int>() : 2;
    torch.attr("manual_seed")(731);
+   trace("model.construct", name);
    const auto instance = model_type("pretrain_weights"_a = weights.string(), "group_detr"_a = groups, "device"_a = "cuda");
+   trace("model.constructed", name);
    const auto mc = instance.attr("model_config"), model = instance.attr("model").attr("model");
    const auto tc =
     instance.attr("get_train_config")("dataset_dir"_a = ".", "output_dir"_a = ".", "lr"_a = 1e-4, "lr_encoder"_a = 1e-4, "grad_accum_steps"_a = 1, "clip_max_norm"_a = .1, "weight_decay"_a = 1e-4);
@@ -1552,6 +1658,7 @@ void generate(const Arguments& args) {
       if (stock && (precision != "fp32" || !training || batch != 1)) continue;
       const int steps = !stock && training && batch == 2 ? 8 : 1;
       const auto id = name + "-" + protocol + "-" + precision + "-b" + std::to_string(batch) + (training ? "-train" : "-eval");
+      if (!args.selected_case.empty() && id != args.selected_case) continue;
       const auto completed = admitted_file(directory, id), staging = admitted_file(directory, id + ".partial");
       Json entry;
       if (fs::exists(completed)) {
@@ -1561,10 +1668,16 @@ void generate(const Arguments& args) {
            entry.at("protocol") != protocol || entry.at("groups") != groups || entry.at("steps").size() != steps)
         throw std::runtime_error("completed numerical case provenance changed: " + id);
        for (const auto& step : entry.at("steps")) verify_archive(completed, step);
+       if (args.export_reference) {
+        const auto& artifact = entry.at("upstream_export");
+        const auto [file, bytes] = admitted_file_record(completed, artifact);
+        if (!bytes || bytes > MaxArchive || fs::file_size(file) != bytes || digest(file) != artifact.at("sha256").get<std::string>())
+         throw std::runtime_error("completed upstream ONNX export changed");
+       }
       } else {
        fs::remove_all(staging);
        fs::create_directory(staging);
-       entry = run_case(staging, model, initial, mc, tc, defaults, name, precision, batch, training, steps, protocol);
+       entry = run_case(staging, model, initial, mc, tc, defaults, name, precision, batch, training, steps, protocol, args.backward_operators, args.export_reference);
        entry["producer_sha256"] = manifest.at("producer_sha256");
        entry["fingerprint"] = args.fingerprint;
        entry["checkpoint_sha256"] = checkpoint_hash;
@@ -1598,7 +1711,9 @@ void generate(const Arguments& args) {
   manifest[name] = std::move(reference);
  }
  if (source_hashes != verify_source(source) || plus_hashes != verify_source(plus_source, "plus")) throw std::runtime_error("upstream source changed during production");
- manifest["status"] = "references_complete_native_comparison_pending";
+ if (!args.selected_case.empty() && (manifest["cases"].size() != 1 || manifest["cases"].front().at("directory") != args.selected_case || manifest["presets"].size() != 1))
+  throw std::runtime_error("requested case is not in the supported upstream matrix: " + args.selected_case);
+ manifest["status"] = args.selected_case.empty() ? "references_complete_native_comparison_pending" : "selected_reference_native_comparison_pending";
  manifest["directory"] = "references";
  json_write(output / "manifest.json", manifest);
 }
@@ -1621,6 +1736,9 @@ void usage(std::ostream& stream, const char* program) {
            "  --weights PATH         official cached pretrained artifacts\n"
            "  --fingerprint VALUE    wrapper-provided image fingerprint\n"
            "  --sdpa {default,math}  upstream SDPA policy (default: default)\n";
+ stream << "  --case ID              produce exactly one named case, not full-matrix evidence\n";
+ stream << "  --backward-operators   include intermediate gradients for the selected case\n";
+ stream << "  --export-reference    include CPU/CUDA controls and an actual upstream ONNX export for one FP32 batch-one case\n";
 }
 bool optional_token(std::string_view value) {
  if (value.size() < 2 || value.front() != '-' || value.find(' ') != std::string_view::npos) return false;
@@ -1637,9 +1755,9 @@ bool optional_token(std::string_view value) {
 }
 Arguments parse_arguments(int argc, char** argv) {
  Arguments result;
- const std::array<std::string_view, 12> options{
-  "--capabilities", "--payload-snapshot", "--check-environment", "--upstream", "--plus-upstream", "--inventory-only", "--output", "--weights", "--fingerprint", "--sdpa", "--help", "-h"
- };
+ const std::array<std::string_view, 15> options{
+  "--capabilities", "--payload-snapshot", "--check-environment", "--upstream", "--plus-upstream", "--inventory-only", "--output", "--weights", "--fingerprint", "--sdpa", "--case",
+  "--backward-operators", "--export-reference", "--help", "-h"};
  for (int i = 1; i < argc; ++i) {
   const std::string argument = argv[i];
   const auto equals = argument.find('=');
@@ -1663,9 +1781,13 @@ Arguments parse_arguments(int argc, char** argv) {
    result.help = true;
    return result;
   }
-  if (option == "--check-environment" || option == "--inventory-only" || option == "--capabilities") {
+  if (option == "--check-environment" || option == "--inventory-only" || option == "--capabilities" || option == "--backward-operators" || option == "--export-reference") {
    if (equals != std::string::npos) throw support::ToolError("argument " + option + ": ignored explicit argument", 2);
-   (option == "--inventory-only" ? result.inventory_only : option == "--capabilities" ? result.capabilities : result.check_environment) = true;
+   (option == "--inventory-only" ? result.inventory_only
+    : option == "--capabilities" ? result.capabilities
+    : option == "--backward-operators" ? result.backward_operators
+    : option == "--export-reference" ? result.export_reference
+                                    : result.check_environment) = true;
    continue;
   }
   std::string value;
@@ -1687,6 +1809,8 @@ Arguments parse_arguments(int argc, char** argv) {
    result.weights = value;
   else if (option == "--fingerprint")
    result.fingerprint = value;
+  else if (option == "--case")
+   result.selected_case = value;
   else if (option == "--sdpa") {
    if (value != "default" && value != "math") throw support::ToolError("argument --sdpa: invalid choice: '" + value + "' (choose from 'default', 'math')", 2);
    result.sdpa = value;
@@ -1695,6 +1819,9 @@ Arguments parse_arguments(int argc, char** argv) {
  if (result.payload_snapshot.empty() && !result.check_environment && !result.capabilities &&
      (result.upstream.empty() || result.plus_upstream.empty() || result.output.empty() || result.weights.empty() || result.fingerprint.empty()))
   throw support::ToolError("generation requires --upstream, --plus-upstream, --output, --weights and --fingerprint", 2);
+ if (result.export_reference && (result.inventory_only || !result.selected_case.contains("-controlled-group2-fp32-b1-") ||
+                               !(result.selected_case.ends_with("-train") || result.selected_case.ends_with("-eval"))))
+  throw support::ToolError("--export-reference requires one controlled FP32 batch-one --case", 2);
  return result;
 }
 int execute(const Arguments& args) {

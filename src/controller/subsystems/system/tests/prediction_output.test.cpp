@@ -21,6 +21,10 @@
 #include <memory>
 #include <stop_token>
 #include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
+#include <nlohmann/json.hpp>
 #include "src/backend/media/video/video_file_source.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 namespace {
@@ -76,9 +80,21 @@ TEST_CASE("Predict publishes full custom schemas and refuses aggregate excess be
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("prediction-schema-publication")};
  auto [settings, dataset, model] = fixture.PrepareModel(contracts::FeatureId::Predict);
  std::promise<void> first, first_done, refused, second_done;
+ const auto* trace_flag = std::getenv("MMLTK_TEST_PREDICTION_PUBLICATION_TRACE");
+ const bool trace = trace_flag && std::string_view{trace_flag} == "1";
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64, .maximum_height = 64}, [count, catalog_ptr](DirectComputeConfiguration) {
   return std::make_unique<Runtime>(count, catalog_ptr);
  }, [&](PredictSystem::event_type event) {
+  if (trace) {
+   std::visit([](const auto& value) {
+    if constexpr (requires { value.snapshot.frame; value.snapshot.labels; }) {
+     nlohmann::json record{{"event", "test.prediction_publication"}, {"generation", value.snapshot.operation.generation_frontier},
+      {"active", value.snapshot.operation.active}, {"frame_valid", value.snapshot.frame.valid()}, {"labels", value.snapshot.labels.size()}};
+     if constexpr (requires { value.detail; }) record["detail"] = value.detail;
+     std::fprintf(stderr, "%s\n", record.dump().c_str());
+    }
+   }, event);
+  }
   if (const auto* changed = std::get_if<PredictChanged>(&event)) {
    const auto& snapshot = changed->snapshot;
    if (snapshot.frame.valid() && snapshot.operation.generation_frontier == 1) mmltk::testsupport::release_test_promise(first);

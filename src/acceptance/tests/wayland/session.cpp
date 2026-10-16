@@ -59,6 +59,7 @@
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/backend/data/tests/test_fixture.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "artifact_cursor.h"
 #include "surface_audit.h"
 #include "pixel_audit.h"
@@ -608,6 +609,7 @@ int WaylandSession::PollEvents(std::array<pollfd, 4U>& events) const {
  return ready;
 }
 void WaylandSession::RunWorkflows() {
+ if (profile_ == "keypoints") surface_audit.draw_limit = kAcceptanceRecordLimit * mmltk::backend::models::rfdetr::kPresetCatalog.size();
  std::unique_ptr<mmltk::testsupport::WorkflowArtifactMutation> artifacts;
  if (profile_ == "keypoints") artifacts = std::make_unique<mmltk::testsupport::WorkflowArtifactMutation>(working.path(), inputs_->workflows(true).alternate_model());
  auto& process = *process_;
@@ -619,6 +621,9 @@ void WaylandSession::RunWorkflows() {
   ConsumeRecords();
   if (browser_failed_ || native.failed_before_termination() || !surface_audit.failure.empty()) {
    diagnostics_on_exit();
+   INFO("browser failure: " << browser.failure_blocker());
+   INFO("native failure: " << native.failure_blocker());
+   INFO("physical evidence: " << surface_audit.failure << "; draws=" << surface_audit.draws.size() << "/" << surface_audit.draw_limit);
    FAIL("workflow browser reported a product or physical ownership failure");
   }
   if (frontend_settled_ && surface_audit.evidence_settled()) break;
@@ -724,7 +729,9 @@ void WaylandSession::RunWorkflows() {
   const auto& artifact = browser.keypoint_training_artifact;
   const auto& preset = persisted.workflows.train.request.preset_name;
   REQUIRE(native.CatalogTrainingCompleted(scalar(artifact, "b"), preset, persisted.workflows.train.request.resolution));
-  REQUIRE_NOTHROW(inputs_->workflows(true).VerifyCatalogTraining(working.path(), persisted.workflows.train.output.directory, artifact.value("control", ""), artifact.value("detail", ""), preset));
+  const auto directory = browser.keypoint_training_output.value("control", "");
+  REQUIRE(mmltk::testsupport::canonical_fixture_path(persisted.workflows.train.output.directory, directory));
+  REQUIRE_NOTHROW(inputs_->workflows(true).VerifyCatalogTraining(working.path(), directory, artifact.value("control", ""), artifact.value("detail", ""), preset));
  } else {
   CHECK(
    (workflow_steps_ == std::set<std::string>{

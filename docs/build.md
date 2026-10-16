@@ -4,111 +4,88 @@
 
 ## Host and container boundary
 
-Build and run through the native `./mmltk` wrapper, whose source is
-[tools/mmltk.cpp](../tools/mmltk.cpp). The supported target
-is Linux with NVIDIA CUDA; the desktop additionally requires Wayland. Docker
-must be usable by the invoking account, with Buildx available for image builds
-and NVIDIA GPU access available to runtime/test containers. The wrapper probes
-Docker and attempts a noninteractive daemon start for ordinary build/runtime
-operations. Read-only diagnostic commands require an already-running daemon.
+Use the native [./mmltk wrapper](../tools/mmltk.cpp) for builds and execution.
+Linux and NVIDIA CUDA are required; the desktop additionally requires Wayland.
+The invoking account needs Docker, Buildx for image builds, and NVIDIA container
+GPU access. Ordinary build/runtime operations probe Docker and attempt a
+noninteractive daemon start; read-only diagnostics require a running daemon.
 
-The wrapper builds the toolchains in containers. Its normal runtime uses a
-repository-scoped reusable container, while build, test, and image-based
-diagnostics own their execution containers. The
-[process snapshot](commands.md#process-snapshots) inspects existing wrapper
-containers without creating one. GUI/runtime and Wayland acceptance
-use privileged containers and host resource mounts. Log and I/O diagnostic
-containers use restricted, read-only mounts; see [logging](logging.md) and
-[GPU execution](gpu-execution.md).
+Toolchains run in containers. Normal runtime reuses a repository-scoped container;
+builds, tests, and image diagnostics own theirs. [Process snapshots](commands.md#process-snapshots)
+inspect existing containers without creating one. GUI/runtime and Wayland
+acceptance use privileged containers and host mounts; [log](logging.md) and
+[I/O diagnostics](gpu-execution.md) use restricted read-only mounts.
 
 Execution containers receive `SYS_NICE`, `IPC_LOCK`, unlimited memlock, and the
-configured nice limit. CPU compiler arenas use that page-locking capability
-without CUDA registration; failed placement or pinning fails preparation.
-The [compilation reference](compile-execution.md#fixed-pinned-arenas) owns the
-normal and exceptional storage budgets.
+configured nice limit. CPU compiler arenas use page locking without CUDA
+registration; failed placement or pinning fails preparation. [Fixed pinned arenas](compile-execution.md#fixed-pinned-arenas)
+own the storage budgets.
 
 ## Native tools and checkout bootstrap
 
-The root `./mmltk` is a generated, optimized, stripped Linux ELF executable.
-On a checkout without it, run the narrow bootstrap from the repository root:
+The generated root `./mmltk` is an optimized, stripped Linux ELF. Bootstrap a
+checkout without it from the repository root:
 
 ```bash
 ./tools/bootstrap/bootstrap_mmltk.sh --launch "$PWD" --build-tools
 ```
 
-[bootstrap_mmltk.sh](../tools/bootstrap/bootstrap_mmltk.sh) prepares the GCC/tools
-images, builds the tools in a container, publishes the executable and its library
-closure, then executes the requested native operation. It needs no host C++
-compiler. Once published, use the native operations:
+After bootstrap, use `./mmltk --build-tools` to rebuild tools and
+`./mmltk --tidy-tools` for analysis.
 
-```bash
-./mmltk --build-tools
-./mmltk --tidy-tools
-```
+[bootstrap_mmltk.sh](../tools/bootstrap/bootstrap_mmltk.sh) prepares GCC/tools
+images, builds in a container, publishes the executable/library closure, then
+launches the requested operation. It needs no host compiler. `--build-tools`
+reconfigures/builds/installs only the standalone graph; `--tidy-tools` formats
+and validates its registered units without publication. Rebuild changed tools
+before exercising them. Full `--build` also ensures current tools.
 
-`--build-tools` rebuilds and republishes the standalone tools; it does not
-configure the product graph. `--tidy-tools` formats and validates that graph's
-registered translation units; [tool tidy](validation.md#native-tool-analysis)
-owns selection and isolated-owner limits. Rebuild after tool edits, including
-formatter changes, before running their new behavior. The full product
-`--build` also ensures that current tools are published.
-
-The [standalone module graph](#standalone-tools-module-graph) owns its source
-membership and compiler state independently of the product presets in
-[CMakePresets.json](../CMakePresets.json).
-[Dockerfile.tools](../docker/Dockerfile.tools) supplies its build environment;
+[tools/CMakeLists.txt](../tools/CMakeLists.txt) owns the independent graph;
+[Dockerfile.tools](../docker/Dockerfile.tools) supplies its environment.
 `MMLTK_TOOLS_IMAGE` defaults to `mmltk-tools:latest`.
 
-Publication creates `build/.tools-generations/<generation>/` containing
-`mmltk`, the separate `mmltk-tests` fixture runner, `lib/`, and
-`.inputs.sha256`. The bootstrap atomically points `build/tools` at that
-completed generation, then atomically replaces the root ELF. The executable's
-RPATH finds the adjacent container libraries or its immutable host generation;
-older generations remain available to already-running processes. Retain the
-closure with the executable. Tools mutations share a lock, and native user
-resolution owns the published/cache paths after the cold-bootstrap handoff.
-[RuntimeClosure.cmake](../tools/cmake/RuntimeClosure.cmake) owns the installed
-shared-library closure; [fixture isolation](#composition-and-fixture-isolation)
+Publication writes `build/.tools-generations/<generation>/` with `mmltk`,
+`mmltk-tests`, `lib/`, and `.inputs.sha256`, atomically points `build/tools` at
+it, then atomically replaces the root ELF. RPATH resolves adjacent container
+libraries or the immutable host generation. Keep the closure: older generations
+remain usable by running processes. Mutations share a lock; resolved native-user
+ownership applies after cold-bootstrap handoff. [RuntimeClosure.cmake](../tools/cmake/RuntimeClosure.cmake)
+owns installed libraries; [fixture isolation](#composition-and-fixture-isolation)
 keeps production and test executables separate.
 
-Bootstrap freshness hashes tool inputs and their names, including untracked
-edits, vendored JSON headers, the GCC/tools Dockerfiles, and the NVIDIA payload
-manifest. The published `.inputs.sha256` permits `--build` to reuse current
-tools; `--build-tools` explicitly reruns their configure/build/install operation.
-This freshness inventory does not define CMake target membership.
+Freshness hashes tool input names/contents, including untracked edits, vendored
+JSON, GCC/tools Dockerfiles, and the NVIDIA manifest. `.inputs.sha256` lets
+`--build` reuse current tools; `--build-tools` explicitly reruns preparation.
+Freshness inventory does not define CMake membership.
 
 ## Standalone tools module graph
 
-[tools/CMakeLists.txt](../tools/CMakeLists.txt) owns the independent Ninja graph
-at `.cache/cmake/tools`. It requires GCC 16.2, C++26 reflection, exactly
-CMake 4.4.3, CMake module scanning, and mold. Named modules use the C++26
-language mode. Its Release policy adds `-Os`, LTO, function/data sections, and
-dead-section removal; bootstrap installation strips the driver and fixture
-runner. The tools graph builds its own compiler launcher without using it;
-the product graph consumes the published `module-safe-compiler-launcher`
+[tools/CMakeLists.txt](../tools/CMakeLists.txt) owns `.cache/cmake/tools`: GCC
+16.2, C++26 reflection/module mode, exactly CMake 4.4.3, module scanning, and mold.
+Release adds `-Os`, LTO, function/data sections, and dead-section removal;
+bootstrap strips both executables. This graph builds its own compiler launcher
+without using it; the product consumes published `module-safe-compiler-launcher`
 through [MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake).
 
-The `tools/` root contains only `CMakeLists.txt` and `mmltk.cpp`. The remaining
-sources and build inputs are grouped by owner:
+Only `CMakeLists.txt` and `mmltk.cpp` live at `tools/` root:
 
-| Directory below `tools/` | Responsibility |
+| Directory | Owner |
 | --- | --- |
-| `driver/` | Canonical command vocabulary, production dispatch, and container command construction |
-| `support/` | Text, process/JSON, digest, Linux, locale, dynamic-library, and time utilities |
-| `toolchain/`, `bootstrap/`, `cmake/` | Native build/analysis/package operations, cold bootstrap/publication, and explicit CMake registration helpers |
-| `cleanup/` | Deduplication, declaration formatting, include auditing, and their shared lexical patterns |
-| `logging/` | Log-query interface, private partition, and runtime definitions |
-| `diagnostics/` | Capability, process, native-artifact, and data inspection; product-dependent helpers keep their separate targets |
-| `maintenance/`, `profiling/` | Repository maintenance and build/command trace operations |
-| `oracle/` | Upstream reference producer and pinned Python requirements |
-| `wayland/` | Compositor supervision, Weston input-seat plugin, and compositor configuration |
-| `tests/` | Fixture composition, runner, support, and fixture data |
+| `driver/` | Reflected command vocabulary, dispatch, container commands |
+| `support/` | Text, process/JSON, digest, Linux, locale, library, time utilities |
+| `toolchain/`, `bootstrap/`, `cmake/` | Build, analysis, packaging, publication, registration |
+| `cleanup/` | Deduplication, declaration formatting, include audit, lexical patterns |
+| `logging/` | Query interface, private partition, runtime |
+| `diagnostics/` | Capability, process, native-artifact, data inspection; product helpers have separate targets |
+| `maintenance/`, `profiling/` | Maintenance and build/command traces |
+| `oracle/` | Upstream producer and pinned Python requirements |
+| `wayland/` | Supervisor, Weston seat, compositor configuration |
+| `tests/` | Fixture composition, runner, support, inputs |
 
 ### Composition and fixture isolation
 
-CMake explicitly registers sources, module providers/partitions, generated
-entry adapters, and link dependencies. The target spine is acyclic; arrows
-mean consumer links provider:
+CMake registers sources, module providers/partitions, generated adapters, and
+links explicitly. Consumer → provider:
 
 ```mermaid
 flowchart LR
@@ -118,80 +95,61 @@ flowchart LR
     mmltk_tool_modules --> mmltk_tool_support
 ```
 
-[tool_command.cpp](../tools/driver/tool_command.cpp) owns one reflected command
-enum, derived spelling and logical program names, parsing, argument storage,
-and exhaustive command visitation. It imports support only.
-[tool_dispatch.cpp](../tools/driver/tool_dispatch.cpp) imports production command
-implementations and binds that vocabulary to their entrypoints. Command and
-support modules consume their actual lower providers directly; they do not
-import a dispatcher or rely on an umbrella re-export.
+[tool_command.cpp](../tools/driver/tool_command.cpp) owns the reflected enum,
+spellings/logical program names, parsing/storage, and exhaustive visitation;
+it imports support only. [tool_dispatch.cpp](../tools/driver/tool_dispatch.cpp)
+binds production implementations. Lower modules consume actual providers,
+without dispatcher imports or umbrella re-exports.
 
-The fixture runner's private
-[dispatch module](../tools/tests/tool_dispatch.cpp) selects fixtures and delegates
-production commands to production dispatch. Production dispatch starts the
-external `mmltk-tests` runner for a fixture request. Fixture objects share the
-module archive but only the runner references and extracts them; the driver
-neither imports fixture composition nor uses whole-archive linkage.
+The fixture runner's [private dispatch](../tools/tests/tool_dispatch.cpp)
+selects fixtures and delegates production commands. Production dispatch launches
+external `mmltk-tests` for fixtures. Fixture objects share the module archive,
+but only the runner extracts them; the driver imports no fixture composition
+and uses no whole-archive link.
 
-The log-query `:internal` and `:tests` partitions remain one module family.
-Its primary interface imports neither partition; runtime definitions and the
-fixture partition consume the primary interface and private implementation.
-This keeps observation state private and exercises one compiled production
-implementation. No lower module or fixture partition imports a dispatcher.
+Log-query `:internal`/`:tests` belong to one module family. Its primary interface
+imports neither; runtime and fixtures consume that interface and private
+implementation, testing one compiled production implementation. Lower modules
+and fixtures never import dispatchers.
 
 ### Standard-library provider and textual boundaries
 
-All authored tools C++ units import `std` directly, including the independently
-deployed diagnostic, oracle, and Weston modules.
-[StdModules.cmake](../tools/cmake/StdModules.cmake) sets the feature gate for the
-pinned CMake version before CXX discovery in both CMake entry projects.
-[Toolchain.cmake](../tools/cmake/Toolchain.cmake) enables `CXX_MODULE_STD` on each
-tools-owned target and requires C++26 standard-module availability. The product
-project uses this helper for its two diagnostic targets; product and vendored
-targets do not acquire a global standard-module policy.
+All authored tools C++ units import `std`, including isolated diagnostics,
+oracle, and Weston modules. [StdModules.cmake](../tools/cmake/StdModules.cmake)
+sets the pinned-CMake feature gate before CXX discovery in both entry projects.
+[Toolchain.cmake](../tools/cmake/Toolchain.cmake) requires C++26 standard-module
+availability and sets `CXX_MODULE_STD` per tools target. Product uses it only
+for its two diagnostic targets; no global product/vendor policy is imposed.
 
-CMake reads GCC's installed `libstdc++.modules.json` and builds the provider
-from `bits/std.cc`. It also synthesizes compatible BMIs for the consumers'
-C++26/reflection settings. The generated graph can therefore contain a base
-standard-library target and compatible variants while every first-party named
-module has one provider in its graph. CMake owns compilation and dependency
-ordering; BMIs remain build artifacts, outside the source tree and installed
-runtime closure.
+CMake reads GCC `libstdc++.modules.json`, builds `bits/std.cc`, and creates
+compatible BMI variants for consumer C++26/reflection settings. It owns providers,
+compilation, and dependency order. BMIs remain build artifacts, excluded from
+source and installed runtime closure. `CXXDependInfo.json`, `CXXModules.json`,
+and `.ddi` files beneath `CMakeFiles/<target>.dir/` record dependencies;
+`compile_commands.json` records settings. CMake registration owns membership.
+Standard-module setup participates in product/isolated-image fingerprints.
 
-The configured graph's `CMakeFiles/<target>.dir/CXXDependInfo.json`,
-`CXXModules.json`, and scanner `.ddi` files record providers and dependencies;
-`compile_commands.json` records their compiler settings. Source membership
-comes from CMake registration. The standard-module setup is also included in
-product configuration and isolated-image fingerprints.
-
-Remaining textual includes supply C/POSIX and vendor declarations, required
-macros, and canonical ordinary product headers for isolated diagnostics.
-The Weston module and its generated C ABI adapter include `<cmath>` before
-`libweston.h`: Weston's headers reach `math.h` inside `extern "C"`, so that
-ordering avoids a linkage conflict with imported standard declarations.
-Application declaration headers retain their ordinary self-contained include
-policy; [header isolation and PCH ownership](#target-declarations-and-precompiled-headers)
-remain separate from this tools graph.
+Textual includes supply C/POSIX/vendor declarations, macros, and canonical
+ordinary product headers. Weston and its generated C adapter include `<cmath>`
+before `libweston.h`, whose `extern "C"` path reaches `math.h`; this avoids linkage
+conflicts with imported standard declarations. Product headers remain
+[self-contained ordinary headers](#target-declarations-and-precompiled-headers).
 
 ### Isolated process and plugin owners
 
-The host wrapper and `/opt/mmltk-tools/mmltk` container copy remain separate
-from the application's `/opt/mmltk/bin/mmltk`. Driver startup needs neither
-GPU initialization nor a Python runtime. These tools retain separate execution
-owners:
+The host wrapper and `/opt/mmltk-tools/mmltk` differ from product
+`/opt/mmltk/bin/mmltk`; driver startup needs no GPU initialization or Python.
 
-| Owner | Build and execution boundary |
+| Owner | Boundary |
 | --- | --- |
-| Compiled-sample and COCONut mask diagnostics | Product-dependent module executables registered by [src/entrypoints/tools](../src/entrypoints/tools/CMakeLists.txt); [diagnostic graph](#benchmark-diagnostic-builds) |
-| Upstream RF-DETR reference producer | Native module executable embedding the pinned donor's CPython runtime; [oracle image](#upstream-reference-image) |
-| Weston input seat | Named module behind the generated Weston C ABI adapter; [validation image](headless-wayland.md#validation-input-seat) |
+| Compiled-sample / COCONut mask helpers | Product-dependent [entrypoint targets](../src/entrypoints/tools/CMakeLists.txt); [diagnostic graph](#benchmark-diagnostic-builds) |
+| Upstream RF-DETR producer | Native executable embedding donor CPython; [oracle image](#upstream-reference-image) |
+| Weston seat | Named module with generated C ABI adapter; [validation image](headless-wayland.md#validation-input-seat) |
 
-[Toolchain.cmake](../tools/cmake/Toolchain.cmake) generates the minimal process
-and C ABI adapters from each owner's registered module and entrypoint. Those
-owners' libraries do not enter the standalone driver. The
-[command reference](commands.md#native-tool-entrypoints) describes the internal
-invocation boundary; ordinary operations retain their container admission,
-mounts, process ownership, and diagnostics.
+[Toolchain.cmake](../tools/cmake/Toolchain.cmake) generates adapters from registered
+modules/entrypoints. Isolated libraries do not enter the driver. Use [public
+commands](commands.md#native-tool-entrypoints) for container admission, mounts,
+process ownership, and diagnostics.
 
 ## Release builds
 
@@ -199,56 +157,37 @@ mounts, process ownership, and diagnostics.
 ./mmltk --build
 ```
 
-`--build` configures the Release CMake/Ninja graph, builds and installs native
-deliverables, publishes the Iced bundle, builds the owned Firefox runtime, and
-assembles the runtime image. The toolchain/Release branch and the independently
-fingerprinted runtime-base branch can run concurrently before packaging.
-Within Ninja, native compilation, the browser bundle, and the coarse Firefox
-edge can overlap. Firefox runs its own Mach/RecursiveMake/Cargo build.
+`--build` configures Release CMake/Ninja, installs native deliverables, publishes
+Iced, builds owned Firefox, and assembles the runtime image. Toolchain/Release
+and independently fingerprinted runtime-base preparation can overlap; Ninja can
+overlap native compilation, browser bundling, and Firefox's coarse edge.
+Firefox internally uses Mach/RecursiveMake/Cargo.
 
-The build publishes the canonical bundle at `build/browser-app/dist`; every
-`--gui` launch mounts that bundle read-only at the packaged browser-app
-location. A missing or incompatible bundle fails launch, so rebuild after a
-native contract change.
+The canonical bundle is `build/browser-app/dist`, mounted read-only by `--gui`.
+Missing/incompatible bundles fail launch; rebuild after native contract changes.
+[Frontend CMake](../src/frontend/iced/CMakeLists.txt) tracks Iced, iced_aw,
+iced_plot, iced-fluent-theme sources/manifests, and plot WGSL. Host Rust tests
+compile with `--no-run`, independently of optimized `trunk build --release` Wasm;
+[validation](validation.md#native-and-browser-suites) owns actual execution.
 
-The [frontend CMake inputs](../src/frontend/iced/CMakeLists.txt) include Iced,
-iced_aw, iced_plot, and `iced-fluent-theme` Rust sources/manifests; plot WGSL
-also invalidates the bundle. Configured host Rust tests compile with `--no-run`,
-separately from the optimized `trunk build --release` Wasm bundle. Execution and
-package selection belong to [validation](validation.md#native-and-browser-suites).
+The [bundle publisher](../src/frontend/iced/browser_dist_publish.cpp) skips
+HTML/JavaScript comments when resolving quoted hashed Wasm URLs, rejects
+ambiguous/escaping references, and requires the selected asset. Browser
+JavaScript fixtures exercise admission and optional window-trace hooks.
 
-The native [bundle publisher](../src/frontend/iced/browser_dist_publish.cpp)
-admits the hashed Wasm URL selected by the generated index before publication.
-It skips HTML/JavaScript comments while scanning quoted references, rejects
-ambiguous or escaping URLs, and requires the selected asset inside the bundle.
-The registered browser JavaScript suite exercises that publisher and checks
-the index's optional Iced window-trace hooks.
+Keep the native CLI beside `mmltk-browser-host`: desktop passes that sibling to
+local training. The bundle alone cannot provide it. `--build-gui` formats/checks
+Iced and rebuilds only the GUI graph's bundle; it can precede `--gui` in one
+invocation. Native/Firefox changes require full `--build`.
 
-Desktop startup resolves the native CLI beside `mmltk-browser-host` and gives
-that executable to the training process owner. Keep both installed siblings in
-the package; a browser bundle alone cannot supply local training.
-
-`./mmltk --build-gui` formats/checks the owned Iced frontend and rebuilds only
-the browser bundle in the GUI graph. It can be followed by `--gui` in the same
-invocation. Native host and Firefox changes still require the full
-`./mmltk --build` package operation.
-
-Firefox source comes from `third_party/firefox`; the wrapper does not fetch a
-replacement source checkout. Its host toolchain and sysroot have separate
-cached preparation. Validation uses the repository's first-party browser
-suites and packaged application acceptance, as described in [validation](validation.md).
-
-The required Firefox runtime inventory is
-[firefox_runtime_files.txt](../src/entrypoints/desktop/firefox_runtime_files.txt).
-CMake derives runtime byproducts from it, and
-[build_firefox_runtime.sh](../src/entrypoints/desktop/build_firefox_runtime.sh)
-uses it for completeness and its successful-build fingerprint. That script
-passes the required `--runtime-manifest` to Firefox's
-[`mmltk-stage-runtime`](../third_party/firefox/python/mozbuild/mozbuild/mach_commands.py).
-The staging command reads the manifest once, checks both the current and
-candidate runtime against that inventory, and includes its bytes in the inner
-staging fingerprint before atomic publication. The wrapper's outer Firefox
-input fingerprint also includes the manifest.
+Firefox source is `third_party/firefox`; no replacement checkout is fetched.
+Its toolchain/sysroot preparation is separately cached. Test it only through
+first-party suites and packaged acceptance.
+[firefox_runtime_files.txt](../src/entrypoints/desktop/firefox_runtime_files.txt)
+owns required files and derived CMake byproducts. [build_firefox_runtime.sh](../src/entrypoints/desktop/build_firefox_runtime.sh)
+passes `--runtime-manifest` to Firefox's [mmltk-stage-runtime](../third_party/firefox/python/mozbuild/mozbuild/mach_commands.py),
+which checks current/candidate completeness and includes manifest bytes in the
+atomic-staging fingerprint. The wrapper's outer fingerprint includes it too.
 
 ## Toolchain and image inputs
 
@@ -312,77 +251,53 @@ Reports include locations, package ownership, direct includes, and selection.
 
 ### Numerical compilation policy
 
-First-party Release arithmetic retains normal optimization and FMA. The
-[retained RF-DETR command inspection](reviews/rfdetr-math/current-results.md#build-wrapper-and-acceptance-limits)
-found no unsafe fast-math, flush-to-zero, imprecise-division, or
-imprecise-square-root override on the seven inspected numerical units.
-Generated compile commands describe first-party compilation; they do not reveal
-NVRTC options used later by TorchScript or certify every packaged library.
+First-party Release retains normal optimization and FMA, with configured IPO
+and explicit per-source exclusions. Compile commands describe first-party
+compilation, not TorchScript's later NVRTC options or every packaged library.
 
-NVCC and NVRTC document fast math as a collection of options, including changed
-denormal/division/square-root behavior. FMA is also enabled in the normal
-defaults and is not itself evidence of unsafe fast math. See the primary
-[NVCC options](https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#use-fast-math-use-fast-math),
-[NVRTC options](https://docs.nvidia.com/cuda/nvrtc/index.html#supported-compile-options),
-and [floating-point guide](https://docs.nvidia.com/cuda/floating-point/index.html).
-Installed-payload JIT observations and the native function-local precision
-policy have separate [evidence](reviews/rfdetr-math/current-results.md) and
-[runtime ownership](rfdetr-training.md#native-selective-compilation).
+Fast math combines denormal/division/square-root changes; FMA is also normally
+enabled and alone does not establish fast math. See [NVCC](https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#use-fast-math-use-fast-math),
+[NVRTC](https://docs.nvidia.com/cuda/nvrtc/index.html#supported-compile-options),
+and [floating-point behavior](https://docs.nvidia.com/cuda/floating-point/index.html).
+[Native selective compilation](rfdetr-training.md#native-selective-compilation)
+owns function-local precision policy.
 
 ### Upstream reference image
 
-`./mmltk --diagnose-rfdetr-upstream` builds/reuses the validation-only image
-defined by [Dockerfile.rfdetr-oracle](../docker/Dockerfile.rfdetr-oracle).
-Unlike the application's independently based development/runtime images, this
-diagnostic image starts from the complete pinned NGC donor so the actual
-upstream Python package can execute against its compatible Torch/CUDA payload.
-It is not a production Python training runtime.
+[Dockerfile.rfdetr-oracle](../docker/Dockerfile.rfdetr-oracle) starts from the
+complete pinned NGC donor to run actual upstream Python with compatible Torch/CUDA.
+It is validation-only, separate from independently based product images.
 
-[Pinned validation requirements](../tools/oracle/rfdetr_oracle_requirements.txt)
-install as binary wheels into `/opt/rfdetr-oracle/python` using `--no-deps`.
-This private overlay preserves the donor packages; the
-[native producer](../tools/oracle/generate_rfdetr_upstream_oracle.cpp) embeds CPython
-and imports the actual upstream libraries to snapshot and verify payload
-versions and dependency/import closure. The image builds the separate
-`mmltk-rfdetr-upstream-oracle` executable from the tools graph with the driver
-disabled. `./mmltk --diagnose-rfdetr-upstream --build-only` builds or reuses this
-image, with environment checks during image creation, without generating
-references or running native comparisons.
-The image fingerprint includes the required upstream revision, donor, payload
-manifest, Dockerfile, requirements, selected native tools sources/build rules,
-and published tools-input fingerprint. Each reference run additionally binds
-the upstream tree and selected SDPA comparison policy. Reference generation mounts
-upstream source/Git metadata and cached weights read-only; the selected evidence
-destination is the writable host mount, with temporary storage inside the container.
-[Validation](validation.md#independent-upstream-diagnostic)
-owns admission, fresh output directories, comparison retries, and verdicts.
+[Pinned wheels](../tools/oracle/rfdetr_oracle_requirements.txt) install with
+`--no-deps` into private `/opt/rfdetr-oracle/python`, preserving donor packages.
+The separate native `mmltk-rfdetr-upstream-oracle` [producer](../tools/oracle/generate_rfdetr_upstream_oracle.cpp)
+embeds CPython, imports upstream libraries, and verifies payload/dependency closure.
+Its tools graph disables the driver. `./mmltk --diagnose-rfdetr-upstream --build-only`
+prepares/checks this image without weights, references, or native comparisons.
+
+The image fingerprint binds upstream revision, donor/payload manifest, Dockerfile,
+requirements, selected native sources/rules, and actual tools-image identity.
+Runs additionally bind upstream tree and SDPA policy. Sources/Git metadata and
+weights mount read-only; only evidence is a writable host mount, with temporary
+storage inside the container. [Upstream validation](validation.md#independent-upstream-diagnostic)
+owns explicit opt-in, storage/retention, admission, retries, and verdicts.
 
 ### Native Parquet dependency
 
-[Dockerfile.dependencies](../docker/Dockerfile.dependencies) pins Apache
-Arrow/Parquet **25.0.1** and verifies the source archive's SHA-512. It builds
-static, position-independent libraries with GCC 16.2 and upstream C++20 policy,
-without applying first-party C++26 reflection settings to this dependency.
-Bundled dependencies follow the pins in that Arrow source release.
+[Dockerfile.dependencies](../docker/Dockerfile.dependencies) verifies Apache
+Arrow/Parquet **25.0.1** by SHA-512 and builds static PIC libraries with GCC
+16.2/upstream C++20. Bundled pins follow that release. Enabled: Parquet/IPC,
+Snappy, Zstandard, zlib, xsimd, Thrift, RapidJSON, and transitive Boost. Disabled:
+cloud filesystems, Dataset/Compute/Flight, Python, utilities, examples, tests,
+and benchmarks. No Arrow runtime DSO or replacement allocator is installed.
 
-The selected closure enables Parquet/IPC, Snappy, Zstandard, and zlib, with
-xsimd, Thrift, and RapidJSON. Boost is a transitive build dependency in that
-closure. Cloud filesystems, Arrow Dataset/Compute/Flight, Python, utilities,
-examples, and Arrow tests/benchmarks are disabled; the build installs no
-Arrow runtime DSO or replacement allocator.
-
-[The data target](../src/backend/data/CMakeLists.txt) requires that exact package
-from `/opt/arrow` and links `Arrow::arrow_static` and
-`Parquet::parquet_static` privately. The native
-[COCONut importer](benchmark-datasets.md#native-import-and-provenance) owns their
-format use. Existing libcurl, libarchive, and rapidgzip owners retain download
-and extraction responsibilities.
-
-Arrow's licenses/notices and the bundled/transitive source notices install
-under `share/mmltk/licenses/arrow`, including the six selected dependency
-directories and the captured Boost notices. The
-[runtime package inventory](../tools/toolchain/runtime_package.cpp) includes this tree at
-`/opt/mmltk/share/mmltk/licenses/arrow`; [NOTICE](../NOTICE) records the attribution.
+[The data target](../src/backend/data/CMakeLists.txt) requires exact `/opt/arrow`
+and privately links `Arrow::arrow_static`/`Parquet::parquet_static`. [Native
+COCONut import](benchmark-datasets.md#native-import-and-provenance) owns formats;
+libcurl, libarchive, and rapidgzip retain acquisition/extraction.
+Arrow and six selected dependency notice directories, plus Boost notices,
+install under `share/mmltk/licenses/arrow`; [runtime inventory](../tools/toolchain/runtime_package.cpp)
+includes `/opt/mmltk/share/mmltk/licenses/arrow`. See [NOTICE](../NOTICE).
 
 ### Native caption and video assets
 
@@ -407,66 +322,43 @@ owns selection and settlement.
 
 ## Target declarations and precompiled headers
 
-Component `CMakeLists.txt` files register sources, ordinary declaration headers,
-retained module units, and dependency visibility through
-[MmltkSourceRegistration.cmake](../cmake/MmltkSourceRegistration.cmake).
-Declaration-only projections use the owner's compile usage requirements
-without linking its implementation. Registered header-isolation targets
-compile each header in a generated one-include translation unit using the
-owner's usage requirements. They run as dependencies of that owner, with
-unity and PCH disabled and no forced includes; selected boundaries also
-register both include orders.
+Component CMake registers sources, ordinary headers, retained modules, and
+visibility through [MmltkSourceRegistration.cmake](../cmake/MmltkSourceRegistration.cmake).
+Declaration-only projections consume owner usage requirements without linking
+implementation. Header-isolation dependencies compile generated one-include
+units with those requirements, no unity/PCH/forced includes; selected boundaries
+also check both include orders.
 
-The normal product graph uses target-local PCHs for these ordinary C++ sources:
+Normal product PCH groups:
 
-| Owner | Shared header contents |
+| Owner | Explicit shared headers |
 | --- | --- |
 | `mmltk_backend_data`, `mmltk_controller_direct_services` | `src/pch_std.h`, `src/pch_linux.h`, `src/pch_json.h` |
 | `mmltk_backend_models_rfdetr_core`, `mmltk_backend_models_rfdetr_training` | `src/pch_std.h`, `src/pch_linux.h`, `src/pch_torch.h` |
 | `mmltk_backend_ml_cuda` | `src/pch_std.h`, `src/pch_torch.h` |
 
-Implementations using a compiled PCH include its shared headers explicitly
-instead of repeating their member includes. The standard and Linux/POSIX groups collect headers
-found in at least three distinct first-party files in the initial inventory.
-The JSON group contains nlohmann JSON; the Torch group contains only C10 CUDA
-stream/guard declarations. C++26-only standard headers are language-gated;
-reflection also requires the compiler's reflection feature macro.
+Consuming implementations include group headers instead of their individual
+members. Standard/Linux groups contain headers observed in at least three
+first-party files; JSON contains nlohmann, Torch only C10 CUDA stream/guard
+headers. C++26 headers are language-gated; reflection also requires its feature
+macro. Group membership is reviewed, never inferred from a `pch_` name or
+expanded/pruned by the audit.
 
-Declaration headers, CUDA, and product sources without a compiled PCH retain
-their direct library includes. The standalone tools use the
-[standard-module policy above](#standard-library-provider-and-textual-boundaries).
-A header's `pch_` name alone does not justify replacing narrow includes with it.
-Each registered owner creates its own compiled artifact with its own compiler,
-options, definitions, and include environment. C, CUDA,
-retained module providers/implementations/importers, header-isolation units,
-and sources with distinct per-source compile settings do not consume it.
-For example, ordinary `native_optimizer.cpp` uses the training owner's PCH;
-that target's module importers do not. The data owner's
-`compiled/compiled_image_stream.cpp` is a retained module importer without a
-forced PCH, so its direct standard/Linux includes remain necessary. Includes
-outside an actually consumed group's contents also remain direct.
-
-The [include audit](validation.md#pch-include-audit) inventories includes and
-previews or applies replacements from the checked-in groups. It retains every
-compiler context for a source and requires consistent target-local consumption
-in all of them before replacing a direct include. Group membership is reviewed;
-it is neither expanded by the audit nor automatically pruned when direct
-includes disappear after consolidation.
+Each owner compiles its own PCH with its own environment. Declaration headers,
+C/CUDA, retained module providers/implementations/importers, header-isolation
+units, standalone/no-PCH code, and sources with distinct settings retain direct
+includes. Includes outside a consumed group stay direct. The [tools standard
+module policy](#standard-library-provider-and-textual-boundaries) is separate.
 
 [MmltkComponent.cmake](../cmake/MmltkComponent.cmake) derives
-`CMakeFiles/<target>.dir/mmltk-pch-policy.txt` from the target registration.
-The generated `cmake_pch.hxx` and `.gch` live beside it under that component's
-build directory.
-[check_toolchain_invariants.cpp](../tools/toolchain/check_toolchain_invariants.cpp) checks
-the compilation database against this policy, including creation/use
-environment equality, exclusions, and fatal invalid-PCH diagnostics.
-The include tool checks those generated policies and forced-include paths;
-`fix` also runs the invariant checker before editing. Contradictory evidence is
-reported as an inconsistency, not permission to rewrite a source.
-The analysis graph retains these registrations and independent header-isolation
-checks; [tidy](validation.md#formatting-and-static-analysis) selects GCC objects
-or clang-tidy by reflection support. PCH use and declaration isolation are part
-of the normal product build, without a benchmarking gate or measured speedup claim.
+`CMakeFiles/<target>.dir/mmltk-pch-policy.txt`; generated `cmake_pch.hxx`/`.gch`
+remain beside it. [Toolchain invariants](../tools/toolchain/check_toolchain_invariants.cpp)
+verify compile-database creation/use equality, exclusions, and fatal invalid-PCH
+diagnostics. [Include auditing](validation.md#pch-include-audit) requires all
+source contexts and exact forced includes to agree, and runs those invariants
+before fixes. Contradictory evidence blocks rewriting. Analysis retains
+registration/isolation, selecting [GCC objects or clang-tidy](validation.md#formatting-and-static-analysis)
+by reflection support. These checks establish build policy, not PCH speedup.
 
 ## Cache and output locations
 
@@ -505,18 +397,13 @@ provide non-package development graphs. A `tsan` configure preset exists, but
 `./mmltk --test tsan` is currently rejected. Use the supported wrapper
 operations in [validation](validation.md).
 
-The data-owned `mmltk_backend_data_profile_runner` is also `EXCLUDE_FROM_ALL`.
-`./mmltk --test data-profile -- ...` explicitly builds and runs that target in
-the selected test graph (Release by default); ordinary product builds and
-`--test all` do not invoke it. It reuses the production data/resampling owners
-and test fixtures. Shared options, input admission, geometry ordering, and trace
-selection live in `src/backend/data/tests/profile_support.{h,cpp}`;
-Pipeline/archive and compaction work live in `profile_pipeline.cpp` and
-`profile_compaction.cpp`.
-These sources share the same opt-in target and build graph.
-CPU modes need no CUDA context, while Loader uses CUDA.
-Profile modes, scratch paths, retained inputs, and explicit full Coconut runs
-are documented in [validation](validation.md#data-compilation-and-resampling-profiles).
+The data-owned `mmltk_backend_data_profile_runner` is `EXCLUDE_FROM_ALL`.
+`--test data-profile` explicitly builds it (Release by default); ordinary builds
+and `all` omit it. It reuses production owners/test fixtures. `profile_support.{h,cpp}`
+own options, admission, geometry ordering, and trace selection; `profile_pipeline.cpp`
+and `profile_compaction.cpp` own those modes. CPU modes need no CUDA context;
+Loader does. [Profiles](validation.md#data-compilation-and-resampling-profiles)
+own scratch, retained inputs, and explicit complete Coconut runs.
 
 ### Benchmark diagnostic builds
 

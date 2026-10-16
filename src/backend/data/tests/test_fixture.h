@@ -84,7 +84,7 @@ public:
 [[nodiscard]] benchmark_internal::BenchmarkTraceSink benchmark_trace();
 // Seed the mixed known/unknown Coconut extents at the reported progress boundary.
 [[nodiscard]] benchmark_internal::IndexingProgressTotals& mixed_coconut_row_progress(benchmark_internal::ProgressReporter&);
-[[nodiscard]] mmltk::common::io::FileHandle create_compiled_fixture_file(const std::filesystem::path&, const FileHeader&);
+[[nodiscard]] mmltk::common::io::FileHandle create_compiled_fixture_file(const std::filesystem::path&, const FileHeader&, std::span<const std::byte> catalog = {});
 [[nodiscard]] std::string benchmark_semantics(const std::filesystem::path&);
 void bind_benchmark_slots(benchmark_internal::BenchmarkCompilePipeline&, benchmark_internal::BenchmarkSplitWriter&, const benchmark_internal::PreparedBenchmarkSplit&);
 // Materialize input and file extents before holding a CPU in cooperation cases.

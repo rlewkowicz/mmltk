@@ -2,45 +2,34 @@
 
 [Wiki index](README.md) · [Declaration authoring](reflection.md) · [Generation and artifacts](build.md#generated-bindings-and-dependency-maintenance) · [GUI interaction](gui-interaction.md#typed-application-boundary)
 
-This page owns the native-to-Rust schema projection, application record format,
-and connection admission. Protocol **17** is a package boundary: the native
-host, generated bindings, Iced bundle, and cross-language fixtures must agree.
-The graphics ABI is an independent boundary; saved settings and annotation
-documents retain their own named persistence formats.
+Protocol **17** requires matching native host, generated bindings, Iced bundle
+and cross-language fixtures. This page defines schema projection, records and
+connection admission. Graphics ABI, saved settings and annotation documents
+have independent formats.
 
 ## Canonical declarations and generator ownership
 
-[ApplicationSystems](../src/controller/contracts/application_systems.h) is the
-composition root for the application schema. Its named, nonowning system
-pointers identify the native owners; their annotated methods, snapshot types,
-and event variants define the exposed application vocabulary. The shell owns
-the actual systems. Rust owns component state, layout, copy, styling,
-navigation, and interaction behavior.
+[ApplicationSystems](../src/controller/contracts/application_systems.h) names
+nonowning system pointers. Their annotated methods, snapshots and event variants
+define native vocabulary; the shell owns the systems, Rust owns presentation.
+[Schema validation](../src/controller/browser/application_schema.h) and
+[materialization](../src/controller/browser/application_materializer.h) derive
+request decoding, direct dispatch, snapshots, replies, events and compact
+interactions through C++26 reflection. [Reflection authoring](reflection.md)
+defines declaration syntax; there is no source scanner or parallel inventory.
 
-[application_schema.h](../src/controller/browser/application_schema.h) validates
-and projects these declarations through C++26 reflection.
-[application_materializer.h](../src/controller/browser/application_materializer.h)
-uses that schema for native request decoding, direct endpoint dispatch,
-snapshots, replies, events, and compact interactions. Neither file scans source
-text or supplies a second member inventory. The reusable declaration syntax
-and annotation rules belong in [reflection.md](reflection.md).
+The compiled [binding generator](../src/controller/browser/application_binding_generator.cpp)
+emits:
 
-The compiled C++ executable
-[application_binding_generator.cpp](../src/controller/browser/application_binding_generator.cpp)
-emits Rust from the same materialized schema. Its responsibilities include:
-
-- Native objects, enums and variants; named and transport codecs; constraints,
-  defaults, settings/catalog relationships, and presentation metadata.
-- Stable system, endpoint, event and field identities, typed request builders,
-  compact interaction opcodes, and the schema fingerprint.
-- Exhaustive snapshot/event/reply types, bootstrap completeness and projection
-  traits through [the outer-routing emitter](../src/controller/browser/application_outer_routing_emitter.h).
-- Visual source/geometry observations through
-  [the visual emitter](../src/controller/browser/application_visual_projection_emitter.h),
-  and typed training/evaluation scalar selectors. Rust selects these native
-  facts for display without repeating their structural inventories.
-- The separate data-only Firefox graphics projection through
-  [the workspace ABI emitter](../src/controller/browser/application_workspace_abi_emitter.h).
+- Objects, enums, variants, named/transport codecs, bounds, defaults,
+  settings/catalog relationships and presentation metadata.
+- Stable system/endpoint/event/field IDs, request builders, interaction opcodes
+  and the schema fingerprint.
+- Exhaustive [outer routing/projection traits](../src/controller/browser/application_outer_routing_emitter.h)
+  and Bootstrap completeness.
+- [Visual observations](../src/controller/browser/application_visual_projection_emitter.h)
+  and typed training/evaluation scalar selectors.
+- The separate data-only [Firefox graphics ABI](../src/controller/browser/application_workspace_abi_emitter.h).
 
 Booleans, fixed-width integers and floating-point values retain typed Rust
 equivalents. Native strings and paths project to `String`; static catalog text
@@ -71,28 +60,21 @@ change compatibility even while the package protocol remains 17.
 ## Generation and consumption
 
 [Browser CMake](../src/controller/browser/CMakeLists.txt) compiles the generator
-against declaration-only composition/schema dependencies and serialization.
-Its custom command depends on canonical declarations and emitter inputs.
-The generator writes temporary files, flushes them, then renames the graphics
-projection, bindings, and package marker into place. Each replacement is atomic;
-the three files are not one filesystem transaction. The executable reports
-generation exceptions with `application binding generation failed` and exits
-unsuccessfully.
+against declaration-only schema/composition and serialization dependencies.
+Canonical declarations and emitters are custom-command inputs. The generator
+writes temporary files, flushes, then atomically renames each graphics projection,
+bindings file and package marker. The three replacements are not one transaction.
+Exceptions report `application binding generation failed` and exit unsuccessfully.
 
-[Frontend CMake](../src/frontend/iced/CMakeLists.txt) supplies the binding path
-to Cargo as `MMLTK_APPLICATION_BINDINGS_PATH`;
-[generated.rs](../src/frontend/iced/src/generated.rs) includes that artifact.
-The native fixture generator emits server records. The Rust
-[client fixture executable](../src/frontend/iced/src/bin/protocol_v17_client_fixture.rs)
-consumes the generated boundary and emits client records. Both wrapper
-generation commands select their shared `mmltk_protocol_v17_generation`
-dependency target. The [build reference](build.md#generated-bindings-and-dependency-maintenance)
-owns exact commands, graph/output locations, fixture filenames, packaging and
-Firefox cache invalidation.
-
-Generated Rust stays in build output. Change the native declaration, projection,
-or build dependency, then regenerate through `./mmltk`. Generation produces
-artifacts; it does not establish test or packaged-runtime acceptance.
+[Frontend CMake](../src/frontend/iced/CMakeLists.txt) sets
+`MMLTK_APPLICATION_BINDINGS_PATH`; [generated.rs](../src/frontend/iced/src/generated.rs)
+includes it. Native fixtures emit server records; the generated-boundary
+[Rust fixture](../src/frontend/iced/src/bin/protocol_v17_client_fixture.rs) emits
+client records. Both wrapper generation commands use
+`mmltk_protocol_v17_generation`. [Build generation](build.md#generated-bindings-and-dependency-maintenance)
+owns commands, paths, fixtures, packaging and Firefox invalidation. Generated
+Rust stays in build output: change canonical inputs and regenerate through
+`./mmltk`. Generation alone does not establish runtime acceptance.
 
 ## Record shapes
 
@@ -226,10 +208,9 @@ owned value graph, then performs typed projection.
 | Error detail | 512 bytes |
 | Native WebSocket inbound message | 8 MiB, nonempty binary messages only |
 
-The application shell configures the server's outbound capacity from the
-32 MiB record ceiling. Snapshot declarations have their own per-system bounds;
-generation statically checks the aggregate Bootstrap structural bound against
-that ceiling. Bounds do not preallocate maximum-sized payload graphs.
+The shell sets outbound capacity from the 32 MiB ceiling. Per-system snapshot
+bounds and aggregate Bootstrap bounds are checked at generation; they do not
+preallocate maximum-sized payloads.
 
 Generated failures retain type/member context and array indexes. Bootstrap and
 event projection add system/event context. The low-level native codec retains
@@ -281,12 +262,9 @@ Its custody and retained-image behavior belong in the
 
 ## Boundary coverage
 
-Native [record tests](../src/controller/browser/tests/client_record.test.cpp),
-[schema tests](../src/controller/browser/tests/application_browser_contract.test.cpp),
-[host tests](../src/controller/browser/tests/application_browser_host.test.cpp),
-serialization tests, and Rust protocol tests exercise malformed encodings,
-budgets, projected constraints, compact interactions, complete Bootstrap,
-delivery, and peer continuity. Native server and Rust client fixtures cross the
-language boundary using generated artifacts. These are coverage locations,
-not evidence that a particular checkout or package passed; the
-[validation reference](validation.md) owns execution and acceptance.
+[Record](../src/controller/browser/tests/client_record.test.cpp),
+[schema](../src/controller/browser/tests/application_browser_contract.test.cpp),
+[host](../src/controller/browser/tests/application_browser_host.test.cpp),
+serialization and Rust protocol tests cover encoding, budgets, constraints,
+interactions, Bootstrap, delivery and continuity. Native/Rust fixtures cross the
+generated boundary. [Validation](validation.md) owns execution and acceptance.

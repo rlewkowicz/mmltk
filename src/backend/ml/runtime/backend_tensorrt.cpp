@@ -70,6 +70,7 @@ using ExecutionContextOwner = std::unique_ptr<nvinfer1::IExecutionContext, declt
  result.device = options.device;
  // Preserve the request permission; TensorRT 11 builds the model's declared types.
  result.allow_fp16 = options.allow_fp16;
+ result.allow_tf32 = options.allow_tf32;
  result.save_engine_path = options.save_compiled_model_path;
  return result;
 }
@@ -128,7 +129,10 @@ private:
   cuda_lane().Record(continuation);
   return cuda_lane().Receipt(outputs.size());
  }
- void ReleaseBackendResources() noexcept override { context_.reset(); }
+ [[nodiscard]] RuntimeStatus ReleaseBackendResources() noexcept override {
+  context_.reset();
+  return kRuntimeSuccess;
+ }
  std::shared_ptr<const TensorRtSharedState> shared_;
  ExecutionContextOwner context_;
 };

@@ -2,654 +2,299 @@
 
 [Wiki index](README.md) · [Quick start](../README.md#codebase) · [Build graph](build.md)
 
-This guide locates implementation owners; [CONTRACT.md](../CONTRACT.md) governs
-architecture, product outcomes, resource lifetime, and shutdown.
+[CONTRACT.md](../CONTRACT.md) defines architecture and product guarantees. This
+page locates implementation owners; linked references define their behavior.
 
 ## Entrypoints and application construction
 
-| Location | Responsibility |
+| Owner | Responsibility |
 | --- | --- |
-| [tools/mmltk.cpp](../tools/mmltk.cpp), [tools/CMakeLists.txt](../tools/CMakeLists.txt) | Native container driver and independent tools graph; [source ownership, module DAG, and isolated processes](build.md#standalone-tools-module-graph) |
-| [src/entrypoints/cli/cli.cpp](../src/entrypoints/cli/cli.cpp) | Dataset compile/info/benchmark commands and root dispatch |
-| [src/entrypoints/cli/rfdetr_cli.cpp](../src/entrypoints/cli/rfdetr_cli.cpp) | RF-DETR command parsing and execution |
-| [src/entrypoints/cli/cli_options.h](../src/entrypoints/cli/cli_options.h), [rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h) | Root and RF-DETR reflected option tables, scopes, explicit codecs, and exposure decisions |
-| [src/entrypoints/desktop/browser_runtime_entry.cpp](../src/entrypoints/desktop/browser_runtime_entry.cpp) | Packaged `mmltk-browser-host` startup |
-| [src/entrypoints/desktop/browser_runtime_options.h](../src/entrypoints/desktop/browser_runtime_options.h) | Reflected desktop execution options |
-| [src/entrypoints/tools](../src/entrypoints/tools) | ONNX inspection/simplification and CMake-owned benchmark diagnostic executables |
-| [src/controller/shell/application_shell.h](../src/controller/shell/application_shell.h) | Application construction, browser loop, and system lifetime |
-| [src/controller/shell/application_system_storage.h](../src/controller/shell/application_system_storage.h) | Owns the connected system instances and materialized visual-source readers |
-| [src/frontend/iced/src/main.rs](../src/frontend/iced/src/main.rs) | Browser application entrypoint |
-| [src/frontend/iced/src/app.rs](../src/frontend/iced/src/app.rs) | Iced app composition and mapped messages |
+| [Native wrapper](../tools/mmltk.cpp), [tools CMake](../tools/CMakeLists.txt) | Container operations and the independent [tools graph](build.md#standalone-tools-module-graph) |
+| [Root CLI](../src/entrypoints/cli/cli.cpp), [RF-DETR CLI](../src/entrypoints/cli/rfdetr_cli.cpp) | Command admission and execution; reflected options in the adjacent `cli_options.h` and `rfdetr_cli_options.h` |
+| [Desktop entrypoint](../src/entrypoints/desktop/browser_runtime_entry.cpp) | Packaged `mmltk-browser-host`; options in `browser_runtime_options.h` |
+| [Tool entrypoints](../src/entrypoints/tools) | ONNX inspection/simplification and benchmark diagnostics |
+| [Application shell](../src/controller/shell/application_shell.h), [system storage](../src/controller/shell/application_system_storage.h) | Construction, connections, browser loop, system lifetime and visual-source readers |
+| [Iced main](../src/frontend/iced/src/main.rs), [app](../src/frontend/iced/src/app.rs) | Browser entrypoint, composition and mapped messages |
 
-The root [CMakeLists.txt](../CMakeLists.txt) registers component directories;
-each component's `CMakeLists.txt` declares its sources, ordinary headers,
-retained modules, links, and tests. Product executable targets install as
-`/opt/mmltk/bin/mmltk` and `/opt/mmltk/bin/mmltk-browser-host`, independently of
-the root driver and its container copy. The [build reference](build.md#target-declarations-and-precompiled-headers)
-owns declaration-only dependencies, header isolation, and target-local PCHs.
-
-Root CLI startup scans logging overrides once and passes the result through
-RF-DETR dispatch, including sibling ONNX-tool configuration. Prediction
-finalization captures each image's source name and ordinal before moving its
-parsed path into the admitted request. Command validation and backend preflight
-still precede device work.
+Root CMake registers component directories. Each component declares its own
+sources, headers, retained modules, links and tests. Product executables install
+as `/opt/mmltk/bin/mmltk` and `/opt/mmltk/bin/mmltk-browser-host`, independently
+of the wrapper. [Build declarations](build.md#target-declarations-and-precompiled-headers)
+own declaration-only dependencies, header isolation and target-local PCHs.
+CLI startup captures logging overrides once, including sibling ONNX-tool policy;
+validation and backend preflight precede device work. Prediction retains each
+source name and ordinal when moving paths into the admitted request.
 
 ## Native domain work
 
-`src/controller/subsystems/` contains product systems. Dataset/model and
-prediction systems are grouped under `system/`; training, validation, export,
-annotation, Explore, Live, and Upscale have their own implementation directories. Shared settings,
-file dialogs, external-provider access, Firefox process ownership, and
-diagnostics live under `src/controller/services/`.
+`src/controller/subsystems/` contains product systems. Dataset, model and
+prediction live under `system/`; training, validation, export, annotation,
+Explore, Live and Upscale have dedicated directories. Shared services live in
+`src/controller/services/{file_dialog,settings,training,firefox,vast,diagnostics}`.
+The [local runtime](../src/controller/runtime/local_run.h) owns worker startup,
+stop and join; systems retain admission, state, failures and events.
 
-Services are grouped into `file_dialog/`, `settings/`, `training/`, `firefox/`,
-`vast/`, and `diagnostics/` within that owner. These folders retain the same
-component target and public declarations; they add no coordinating layer.
-
-`src/backend/data/` separates benchmark acquisition and recipes in `benchmark/`
-(including `benchmark/coconut/`), compiled-file storage in `compiled/`, dataset
-construction in `compiler/`, and loader configuration/execution in `loading/`.
-Private benchmark and compiler declarations live in each family's `detail/`.
-The root `compiled_file.h` provides the shared format/layout/validation surface.
-
-The neutral [controller runtime](../src/controller/runtime/local_run.h) owns a
-local job's worker, startup settlement, stop, and join; product systems retain
-admission, state, failure translation, and events. Visual workers use the
-[presentation runtime](#presentation-and-browser-integration).
-
-[SettingsSystem](../src/controller/services/settings/settings_system.h) owns live
-settings and mutation admission, plus the immutable native CUDA inventory
-supplied by the shell outside persisted preferences. The
-[GPU execution reference](gpu-execution.md#workflow-device-selection) owns
-device facts, workflow selection, admission, and runtime retirement.
-[SettingsStore](../src/controller/services/settings/settings_store.h) owns parsing,
-repair, revision admission, durable writes, and persistence failures;
-[SettingsLocation](../src/controller/services/settings/settings_location.h) carries the
-owned path bytes across worker calls.
-
-| Workflow owner | Implementation and handoff |
+| System | Mutable responsibility |
 | --- | --- |
-| [DatasetSystem](../src/controller/subsystems/system/dataset_system.cpp) | Captures explicit compile settings, owns compile/inspect admission and cancellation, and invokes `ArtifactStore` through its retained runtime |
-| [TrainingSystem](../src/controller/subsystems/train/training_system.cpp) | Starts the sibling CLI through `TrainProcessClient`, owns run inspection/history through `TrainRunStore`, and admits checkpoint resume |
-| [ValidationSystem](../src/controller/subsystems/validate/validation_system.cpp) | Owns the selected evaluation session, result pages, retained samples and captured sample saving |
-| [PredictSystem](../src/controller/subsystems/system/predict_system.cpp) | Owns incremental prediction, video playback control, latest previews and source-specific saved output |
-| [ExportSystem](../src/controller/subsystems/export/export_system.cpp) | Owns the requested ONNX/TensorRT chain and artifact publication |
+| [Settings](../src/controller/services/settings/settings_system.h) | Live settings and mutation admission; immutable shell-supplied CUDA inventory remains outside persisted preferences |
+| [Settings store](../src/controller/services/settings/settings_store.h) | Parsing, repair, revision admission and durable writes; `SettingsLocation` owns path bytes across worker calls |
+| [Dataset](../src/controller/subsystems/system/dataset_system.cpp) | Captured compile/inspect requests, cancellation and retained `ArtifactStore` runtime |
+| [Training](../src/controller/subsystems/train/training_system.cpp) | Sibling CLI via `TrainProcessClient`; history/Resume via `TrainRunStore` |
+| [Validation](../src/controller/subsystems/validate/validation_system.cpp) | Evaluation, metrics, retained samples and captured saving |
+| [Prediction](../src/controller/subsystems/system/predict_system.cpp) | Incremental inference, playback, previews and source-specific output |
+| [Export](../src/controller/subsystems/export/export_system.cpp) | Requested ONNX/TensorRT chain and publication |
+| [Annotation](../src/controller/subsystems/annotation/annotation_system.cpp) | Ordered input, document and history; a separate GPU owner consumes immutable render descriptions |
 
-[RF-DETR workflows](rfdetr-workflows.md) owns model/class admission, metrics,
-checkpoint and history formats, and prediction behavior. Canonical
-[training](../src/backend/models/rfdetr/contract/training_metrics.h) and
-[evaluation](../src/backend/models/rfdetr/contract/evaluation_metrics.h)
-declarations generate the browser payloads. The backend's
-[catalog](../src/backend/data/catalog/class_catalog.h) supplies immutable class
-identity independently of model execution.
+[Workflows](rfdetr-workflows.md) defines admission, artifacts and metrics;
+[GUI interaction](gui-interaction.md) defines presentation. Annotation's
+[document](../src/controller/subsystems/annotation/detail/annotation_document.h)
+owns mutation/history; [persistence](../src/controller/subsystems/annotation/annotation_persistence.cpp)
+publishes its named CBOR representation. [GPU selection](gpu-execution.md#workflow-device-selection)
+defines device inventory and runtime replacement.
 
-The native [training session](../src/backend/models/rfdetr/training/train.cpp)
-orders logical models and distributed work. Its
-[model owner](../src/backend/models/rfdetr/training/detail/training_model.h)
-retains working parameters, recipe, optimizer, scaler, EMA, and continuation.
-[TrainingDataPlan](../src/backend/models/rfdetr/training/detail/training_data_plan.h)
-owns sparse membership and draws;
-[TrainingSchedule](../src/backend/models/rfdetr/training/detail/training_schedule.h)
-owns recipe clocks; the
-[gradient reducer](../src/backend/models/rfdetr/training/detail/training_gradient_reducer.h)
-owns asynchronous gradient custody. [TrainingLanes](../src/backend/models/rfdetr/training/detail/training_lanes.h)
-owns physical workers, augmentation/target preparation and target consumer leases;
-the [count owner](../src/backend/models/rfdetr/training/detail/training_ops_private.h)
-retains attempt work until the [metric handoff](../src/backend/models/rfdetr/training/detail/training_metrics.h)
-completes the numerical decision. These are ordinary runtime owners. Canonical
-[execution](../src/backend/models/rfdetr/contract/execution_plan.h),
-[recipe](../src/backend/models/rfdetr/contract/train_recipe.h), and
-[artifact](../src/backend/models/rfdetr/contract/training_artifacts.h)
-declarations supply reflected values and projections. The
-[training](rfdetr-training.md) and [merging/continuation](model-merging.md)
-references own the detailed contracts. Shared
-[inference lanes](gpu-execution.md#inference-lanes-and-borrowed-inputs) retain
-their separate immutable-model and borrowed-input boundary.
-
-Annotation's [input executor](../src/controller/subsystems/annotation/annotation_system.cpp)
-owns the mutable document and ordered history through
-[AnnotationDocument](../src/controller/subsystems/annotation/detail/annotation_document.h).
-Mouse records and document commands share its native ordered queue. Its
-separate GPU execution owner receives
-[immutable render descriptions](../src/controller/subsystems/annotation/detail/annotation_render_state.h).
-The [interaction guide](gui-interaction.md#ordered-annotation-input-and-retained-storage)
-describes their retained storage and command continuations.
-[annotation_persistence.cpp](../src/controller/subsystems/annotation/annotation_persistence.cpp)
-owns file publication for the document owner's named CBOR representation;
-document/history mutation stays with `AnnotationDocument`.
-
-The implementation layers below those systems are:
-
-| Directory | Contents |
+| Backend directory | Responsibility |
 | --- | --- |
-| [src/backend/data](../src/backend/data) | Source compilation, compiled formats, loaders, and dataset artifacts |
-| [src/backend/models/rfdetr](../src/backend/models/rfdetr) | RF-DETR contract, architecture, augmentation, export, inference, training |
-| [src/backend/ml](../src/backend/ml) | Torch/CUDA layers and model-runtime integration |
-| [src/backend/imaging](../src/backend/imaging) | Shared image primitives, resampling, annotation, raster, Explore rendering, and upscaling algorithms |
-| [src/backend/media](../src/backend/media) | Capture, Live, video decoding, timing/audio delivery, encoding and muxing |
-| [src/frameworks](../src/frameworks) | GPU, process, transport, serialization, and reflection facilities |
-| [src/common](../src/common) | Shared types, math, I/O, concurrency, logging, and Linux system support |
+| [data](../src/backend/data) | Benchmark recipes/acquisition, compiled storage, compilation and loading |
+| [models/rfdetr](../src/backend/models/rfdetr) | Model contract, architecture, augmentation, training, inference and export |
+| [ml](../src/backend/ml) | Torch/CUDA layers and runtime integration |
+| [imaging](../src/backend/imaging) | Sampling, resize, annotation, raster, Explore and upscale primitives |
+| [media](../src/backend/media) | Capture, Live, video decode, timing/audio, encoding and muxing |
+| [frameworks](../src/frameworks) | GPU, processes, transport, serialization and reflection |
+| [common](../src/common) | Types, math, I/O, concurrency, logging and Linux support |
 
-Shared image declarations live below dataset and model policy:
-[sampling.h](../src/backend/imaging/sampling.h) owns shared CPU/CUDA affine-point,
-normalized-pixel-center, pixel-index, and RLE sampling operations,
-[class_palette.h](../src/backend/imaging/raster/class_palette.h) owns class
-colors, [image_operations.h](../src/backend/imaging/raster/image_operations.h)
-owns reusable raster operations, and
-[resample](../src/backend/imaging/resample) owns CPU/CUDA resizing.
-[Dataset compilation](datasets.md) owns acquisition, annotations, cache
-identity, progress, and the [compiled format](datasets.md#compiled-binary-format)
-while consuming those operations. The resample owner declares resize mode,
-geometry, and RGB method below the data layer. Compilers apply geometry to
-pixels, continuous boxes, and categorical masks; the RGB method also serves
-file-image prediction. Compiled readers expose stored mode, original extents,
-annotation metadata, and provenance without a model-layer dependency.
+Shared imaging stays below dataset/model policy: [sampling](../src/backend/imaging/sampling.h)
+owns affine points, normalized pixel centers, pixel indices and RLE sampling;
+[raster](../src/backend/imaging/raster) owns class colors and reusable painting;
+[resample](../src/backend/imaging/resample) owns resize geometry and RGB methods.
+Compilers transform pixels, continuous boxes and categorical masks; ordinary
+file-image prediction also consumes RGB resize. Readers expose stored geometry,
+annotation meaning and provenance without depending on model policy.
 
-[FileLayout](../src/backend/data/compiled/compiled_file_layout.h) owns checked
-fixed-block address and payload arithmetic. The shared
-[CompiledSlotStorage](../src/backend/data/detail/compiled_slot_storage.h) owns
-occupied-range preparation and borrowed pixel/label writes; its staged inode
-retains mutation and growth custody. The
-[compactor](../src/backend/data/compiled/compiled_file_compaction.cpp) finalizes
-both directory and benchmark output in the staged inode.
-[CompiledDataset](../src/backend/data/compiled/compiled_dataset.h) owns bounded
-resident slot metadata and mapped per-image views; [DatasetLoader](../src/backend/data/loading/dataset_loader.h)
-owns eligible-ID schedules and leased batches over prepared
-[CompiledImageStream](../src/backend/data/compiled/compiled_image_stream.h) slots.
-The [format and loading reference](datasets.md#compiled-binary-format) owns the
-persisted layout, eligibility, capacity, and read rules.
+### Dataset owners
 
-The [benchmark recipes](benchmark-datasets.md) supply source membership and
-annotation policy to the same acquisition, resize, writer, and publication
-owners. Native
-[BenchmarkDatasetSelection](../src/backend/data/benchmark/benchmark_dataset_options.h)
-owns the recipe/validation/recovery vocabulary and defaults. Settings persistence
-and generated Rust project that declaration; the Dataset component owns control
-copy, visibility, and interaction.
-
-[dataset_compile_progress.h](../src/backend/data/compiler/dataset_compile_progress.h)
-owns the shared acquisition, labels/masks, and pixel tracks plus benchmark source
-observations. `ArtifactProgress` carries those declarations directly into generated
-Rust; `ArtifactCompileState` supplies the revisioned operation projection shared
-by full Dataset snapshots and LatestState progress. The
-[application boundary](application-wire.md#dataset-operation-snapshots) owns
-its wire/reduction rules. The [benchmark guide](benchmark-datasets.md#overlapping-acquisition-labels-and-pixels)
-locates the ordinary readiness, generation-custody, and split-writer owners;
-its [progress reference](benchmark-datasets.md#reading-compilation-progress)
-defines the units for both benchmark and Directory compilation.
-
-Directory and benchmark execution share
-[CompileExecution](../src/backend/data/detail/compile_execution.h), its fixed
-pinned arena bank and allowances, and the bounded
-[FileWorkQueue](../src/backend/data/detail/file_work_queue.h). The
-[execution reference](compile-execution.md) owns class floors, elastic CPU
-admission, selective readiness, task-sized normal/exceptional storage,
-physical completion, and progress delivery. Both source front ends use
-[CompilePixelWorkspace](../src/backend/data/detail/compile_pixel_workspace.h)
-for checked prepared CPU decoding/resizing, retaining their codec policies.
-[BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h)
-retains its source/image join, selected claims, withdrawal, and attempt drain.
-It owns separate bounded image and output file services using the shared CPU
-budget; retained continuations carry image preparation through to conversion.
-Recipes retain membership and recovery policy; Curl owns transport, archives
-retain opened generations,
-[BenchmarkImagePublication](../src/backend/data/benchmark/detail/benchmark_image_publication.h)
-owns bounded encoded-input/cache-write custody for generic extraction and
-Coconut, and split writers retain physical placement and
-sealing. Recipe and artifact-service owners select final publication. Pixels
-and labels advance independently through those joins.
-[CoconutRecipeInputs](../src/backend/data/benchmark/coconut/coconut_recipe.cpp)
-owns release-scoped original providers and final
-[source reconciliation](benchmark-datasets.md#persistent-cache-and-publication).
-[coconut_import.h](../src/backend/data/benchmark/coconut/detail/coconut_import.h)
-owns import continuations and retained row/recovery readiness;
-[coconut_annotations.h](../src/backend/data/benchmark/coconut/detail/coconut_annotations.h)
-owns component products and persisted admission.
-[coconut_annotation_identity.h](../src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h)
-owns shared source/recovery policy, component identities, and metadata used by
-those independent runtime owners.
-[coconut_input.h](../src/backend/data/benchmark/coconut/detail/coconut_input.h)
-owns parsed records, segment backing, import limits, and lexical member admission.
-Reflected inventory facts remain in
-[coconut_inventory.h](../src/backend/data/benchmark/coconut/detail/coconut_inventory.h);
-its [I/O boundary](../src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h)
-owns checked encoding and retained serialization seals.
-[BenchmarkMappedArtifact](../src/backend/data/benchmark/detail/benchmark_staging.h)
-combines immutable mappings with the neutral
-[StagedArtifact](../src/backend/data/detail/staged_artifact.h).
-[CoconutStaging](../src/backend/data/benchmark/coconut/detail/coconut_staging.h)
-retains generation-owned immutable ranges and their last-consumer block custody.
-The benchmark guide owns
-[parser continuation](benchmark-datasets.md#archive-and-parser-continuation),
-[memory/storage admission](benchmark-datasets.md#memory-descriptors-and-storage),
-and [immutable cache custody](benchmark-datasets.md#persistent-cache-and-publication).
-
-The shell supplies its shared `RuntimeDiagnosticTarget` to the dataset runtime
-factory. `ArtifactDatasetRuntime` retains the target by value and creates its
-borrowed artifact observer only for synchronous `Compile`. The data layer
-consumes its existing benchmark trace callbacks without a controller dependency.
-[CompileTraceSelection](../src/backend/data/compile_trace_selection.h) carries
-immutable event demand across serialized and native delivery. Execution demand
-is declared independently in
-[compile_execution_observer.h](../src/backend/data/detail/compile_execution_observer.h);
-canonical reflected observations supply structural projection while ordinary
-owners retain scheduling, resources, and failures.
-[Benchmark diagnostics](logging.md#benchmark-compilation-traces) retain the
-shared service's disablement, delivery, and shutdown policy.
-
-RF-DETR's ordinary [model.h](../src/backend/models/rfdetr/core/model.h),
-[model_state.h](../src/backend/models/rfdetr/core/model_state.h), and
-[model_state_load.h](../src/backend/models/rfdetr/core/model_state_load.h)
-expose typed model execution, decoded state ownership, and staged state
-admission. The [RF-DETR source map](rfdetr-workflows.md#backend-ownership)
-locates training lanes, metric handoff, snapshots, optimizer, and checkpoint
-declarations. The model [registry](../src/backend/models/catalog/model_registry.cpp)
-projects descriptors from canonical model-contract contributions.
-
-[GpuBatchPreprocessor](../src/backend/models/rfdetr/core/gpu_batch_preprocessor.h)
-owns reusable normalized input for evaluation and prediction. The core
-[postprocessor](../src/backend/models/rfdetr/core/postprocess.h) owns physical
-candidate ranking, class projection, and query alignment; the shared
-[evaluator](../src/backend/models/rfdetr/core/evaluator.h) owns box/mask matching
-and COCO accumulation for standalone and training validation. Model candidate
-defaults come from the existing preset/configuration owner, while evaluation
-defaults come from the metric contract. The
-[workflow reference](rfdetr-workflows.md#model-input-and-detection-selection)
-defines their distinct counts, normalization, and annotation semantics.
-The [training reference](rfdetr-training.md) locates stock mathematics,
-supervision adaptations and guarded tensor execution; resource state remains
-with the model, supervision, lane and optimizer owners.
-
-Capture's ordinary [capture_session.h](../src/backend/media/capture/capture_session.h)
-owns device/session access and depends on the GPU framework.
-Live's [live_session_controller.h](../src/backend/media/live/live_session_controller.h)
-connects capture, analysis, overlays, fanout, and compositing through private
-owners under `media/live/detail/`. Its public declarations directly name
-capture, annotation, ML-runtime, and GPU dependencies; raster composition
-remains private to the implementation.
-
-## Workflow output and media handoffs
-
-Canonical [WorkflowOutputSelection/WorkflowOutputFacts](../src/controller/contracts/workflow_output.h)
-separate configured destinations from run directory, committed artifacts,
-sample summaries and partial-video facts. The shared
-[run reservation](../src/controller/services/training/run_output.h) is an ordinary
-filesystem utility; workflow systems retain admission, execution and failure
-policy. `TrainRunStore` additionally owns current-format history and Resume.
-[ExportRunRequest](../src/controller/subsystems/export/export_run.h) retains
-independent format choices through one weights-to-ONNX-to-engine chain.
-
-Rust's [PendingStart owner](../src/frontend/iced/src/app/workflows.rs) captures
-typed [validation](../src/controller/contracts/validation_display.h) and
-[prediction](../src/controller/contracts/prediction_output.h) save-preview
-options before settings/model preparation. Native systems retain them for the
-accepted run; viewer settings continue to evolve independently.
-The [shared weights card](../src/frontend/iced/src/view/workflow/model_card.rs)
-owns dialog confirmation and pending selection; the
-[Output card](../src/frontend/iced/src/view/workflow/output.rs) owns common
-presentation, with Train history and Predict saving in their local components.
-The [GPU card](../src/frontend/iced/src/view/workflow/gpu.rs) owns selection
-interaction; the shared compositor supplies its
-[Output/GPU placement](gui-interaction.md#gpu-selection).
-
-[ValidationSampleOutput](../src/controller/subsystems/validate/detail/validation_sample_output.h)
-captures selected borrowed samples into receiver-owned immutable products.
-Interactive `ValidationSamples` can adopt those same products without another
-copy and retains progressive capture separately from displayed detail
-membership. [PredictionOutput](../src/controller/subsystems/system/detail/prediction_output.h)
-owns sampled/full saving and publication; its
-[selection helpers](../src/controller/subsystems/system/detail/prediction_sampling.h)
-own compiled subsets and observed-frame reservoirs. Both output owners reuse
-`PredictionPreviewComposition`, with display admission optional.
-
-[PredictionDelivery](../src/backend/models/rfdetr/inference/prediction_delivery.h)
-keeps semantic/JSON, interactive-preview and save demands distinct. It requests
-native pixels/masks only for their actual consumers and carries timing/audio
-through the same inference pass. Borrowed source reads settle before release.
-[VideoFileSource](../src/backend/media/video/video_file_source.h) owns demux,
-decode, timestamps and typed audio delivery;
-[VideoFileSink](../src/backend/media/video/video_file_sink.h) owns admitted
-encoder, conversion storage, packet custody, audio remux and incremental MKV
-publication. These media declarations depend on image/GPU facilities rather
-than RF-DETR or GUI policy. Worker-side backpressure bounds queued work.
-
-[CaptionRaster](../src/backend/imaging/raster/caption_raster.h) retains a native
-glyph atlas and ordered batched painting for saved output.
-[RenderedImageWriter](../src/backend/imaging/raster/rendered_image_writer.h)
-owns a bounded PNG worker, reusable pinned transfer, private staging and checked
-atomic publication. Their [build inputs](build.md#native-caption-and-video-assets)
-include the embedded font and packaged encoder dependencies. Interactive caption
-layout/cache remains with Iced. The [workflow guide](rfdetr-workflows.md)
-owns output filenames, sampling semantics and partial-media behavior.
-
-## Shared native facilities
-
-[ScopedFd](../src/common/io/scoped_fd.h) owns descriptors, and
-[event_fd.h](../src/common/io/event_fd.h) centralizes counter reads, signal,
-drain, and blocking worker-wait behavior. Counter reads retry `EINTR` and return
-the count, byte count, and captured error; callers retain their own short-read,
-empty-read, and failure policies.
-[ScopedEventCancellation](../src/common/concurrency/event_cancellation.h)
-bridges a worker's stop token to a domain's minted cancellation source/token.
-It supports borrowed or consumed tokens and destroys the stop callback before
-its owned cancellation storage, settling any in-flight callback first.
-The borrowed [CancellationObservation](../src/common/types/cancellation_observation.h)
-value belongs to shared types; it carries the caller's cancellation observation
-without owning its execution source.
-
-[file_memory.h](../src/common/io/file_memory.h) owns file handles, mappings, and
-shared destination-parent creation, treating a bare filename's parent as `.`.
-Its checked positional/vectored I/O handles interrupted and short calls;
-per-file allocation and reclaim policy remains with the staged owner.
-[WorkspaceBuffer](../src/common/types/workspace_buffer.h) supplies bounded typed
-views over caller-owned scratch. [NumaMemory](../src/common/system/numa_memory.h)
-owns Linux NUMA allocation and optional page-lock custody; compiler arena
-selection remains data-owned.
-[json_file.h](../src/common/io/json_file.h) supplies append and atomic JSON
-publication; [StagingDirectory](../src/common/io/staging_directory.h) owns
-temporary-directory cleanup until publication.
-[path_publication.h](../src/common/io/path_publication.h) owns shared
-[filesystem publication](compile-execution.md#filesystem-publication) for
-staged files and directories. Domain owners retain staging, content-sync
-requirements, cancellation, destination admission, and persistence-format policy.
-[file_digest.cpp](../src/common/io/file_digest.cpp) reads file snapshots through
-overwrite-only scratch bounded to 16 MiB, hashing only bytes filled by completed
-reads. Cancellation and before/after file-identity checks remain with that owner.
-
-[runtime_paths.h](../src/common/system/runtime_paths.h) resolves repository,
-executable, installation, and packaged asset paths for native consumers.
-[subprocess_utils.h](../src/frameworks/process/subprocess_utils.h) owns shared
-process execution support. Test-only filesystem, process, CUDA, asynchronous
-wait, console, and CLI-option helpers live under
-[src/test_support](../src/test_support); domain fixtures remain with their
-components.
-
-[utf8.h](../src/common/types/utf8.h) recognizes complete UTF-8 scalars and valid
-text without choosing a replacement policy. Native AVX2 execution skips bounded
-32-byte ASCII spans; non-ASCII scalars, short tails, and constant evaluation keep
-the scalar recognition rules without reading beyond the input. The
-[visual diagnostic owner](../src/controller/presentation/visual_diagnostics.cpp)
-replaces malformed native exception bytes with U+FFFD and truncates only between
-scalars. The benchmark compiler applies its own bounded, flagged replacement to
-diagnostic path text. These projections do not rewrite native paths or change
-product failures. The runtime JSON encoder rejects invalid text that reaches it;
-the [CBOR owner](../src/frameworks/serialization/cbor_wire.cpp) rejects malformed
-wire text with `InvalidUtf8`, including split owned input and borrowed/view
-decoding. Recognition is shared; diagnostic repair and wire rejection remain
-separate boundary policies.
-
-The retained
-[logging module](../src/common/logging/mmltk_logging.cppm) owns optional native
-logging and bounded fatal reporting at ordinary terminal boundaries. Its
-[implementation](../src/common/logging/mmltk_logging.cpp) keeps stderr failure
-visibility independent of logger initialization and optional file sinks.
-Entrypoints choose the failure context and exit policy; the
-[logging guide](logging.md#fatal-stderr-reports) defines the report and process
-status behavior.
-The private [profiling registry](../src/common/logging/profile_utils.cpp)
-looks up existing metric names through borrowed text and constructs an owned key
-only when inserting a new metric. Its opt-in activation remains independent
-of product work.
-
-## Reflected value and persistence boundaries
-
-See [declaration authoring](reflection.md) for canonical registration,
-all annotation macros, scoped CLI authoring, structural projection, and safe
-formatting. [cli_declarations.h](../src/frameworks/reflection/cli_declarations.h)
-binds request/member paths and derives ordinary option names at compile time;
-its compact authoring lowers to the existing descriptors.
-
-[reflected_descriptors.h](../src/frameworks/reflection/reflected_descriptors.h)
-owns CLI assignment and emission. Non-boolean scalar, optional, and repeatable
-values share parsing and scalar validation before mutation; repeatable
-admission then checks the declared item limit and physical fixed capacity in
-that order.
-[reflected_field_policy.h](../src/frameworks/reflection/reflected_field_policy.h)
-owns the `std::inplace_vector` capacity traits used by both runtime assignment
-and compile-time descriptor validation. Without a declared item limit, a
-physically full destination rejects a valid next value with the typed capacity
-error; rejected input preserves its existing values.
-
-[cbor_wire.h](../src/frameworks/serialization/cbor_wire.h) owns bounded CBOR
-reading, including non-consuming lookahead across split input storage. Owned
-text and byte decoding copies admitted payload spans directly from at most two
-input segments; borrowed decoding exposes those same ranges under its existing
-input lifetime. Owned leaf values move into their destination containers.
-[reflected_cbor_detail.h](../src/frameworks/serialization/reflected_cbor_detail.h)
-derives typed decoding and contextual key errors. Named-object lookup uses a
-compile-time sorted index derived from materialized native declarations, with
-one lookup per incoming key. Validation still follows base/member declaration
-order, followed by the first unknown key in wire order. Opaque relations retain
-their separate wire-order decoding. Application positional
-records and named persistence retain their separate
-[wire policies](application-wire.md#record-shapes).
-
-The browser host moves owned Bootstrap, Reply, and Event temporaries into their
-server records. CBOR encoding measures the required byte count before reserving
-output storage. The writer emits map keys from borrowed text through the same
-UTF-8-checked text body as string values, preserving depth/item admission and
-output-limit error order without temporary key values. Rust map decoding moves
-its decoded key strings into the map. Const encoding APIs, validation limits,
-error precedence, and transport delivery policy retain their existing contracts.
-
-[gui_settings.cpp](../src/controller/contracts/gui_settings.cpp) projects
-same-name source, UI, training-target, shared loading, and complete
-`ExploreViewState` fields through their materialized native declarations.
-Explore includes inherited loading fields and `show_labels` in both save and
-load, using the existing named-field reader/writer and subsequent normalization.
-Renamed keys and field-specific conversion and repair remain local to settings
-persistence. Benchmark rejection counters
-likewise derive their binary and named JSON projections from one declaration;
-their [cache-format guards](benchmark-datasets.md#cache-formats-and-capacity) preserve
-the persisted order and representation.
-COCONut's external JSON/Parquet field projection uses its own canonical
-[JSON declarations](../src/backend/data/benchmark/coconut/detail/coconut_json.h)
-and [Parquet declarations](../src/backend/data/benchmark/coconut/detail/coconut_parquet.h).
-Parsing policy, resource admission, source joins, and execution remain ordinary
-data-layer ownership.
-
-RF-DETR's [preset catalog](../src/backend/models/rfdetr/contract/preset_catalog.h)
-owns exact, case-sensitive preset-name lookup.
-[model_config.cpp](../src/backend/models/rfdetr/contract/model_config.cpp)
-retains the separate weight-filename and path-inference policies.
-
-## Native/Rust boundary
-
-The [generated Rust and application CBOR reference](application-wire.md) owns
-canonical schema inputs, emitters, generation/consumption, record formats and
-connection compatibility. The native application schema/materializer connect
-system declarations to generated typed Rust and projection traits.
-[view_model/reduction.rs](../src/frontend/iced/src/view_model/reduction.rs)
-calls that generated dispatch; the owning modules under `view_model/`
-implement the traits and their presentation-state reductions.
-The [visual projection](../src/controller/presentation/visual_source_projection.h)
-declares each producer's frame/revision relation and image projection;
-schema materialization derives native readers and Rust observations from the
-same facts.
-[Canonical visual frames](../src/controller/presentation/visual_system_types.h)
-keep geometry and optional compiled resize provenance paired with each product.
-Upscale separately projects native input, prepared input, and output
-geometry; [input preparation](gpu-execution.md#upscale-input-preparation) owns
-their meaning. Rust owns the Original view preference and uses those facts for
-its sampling and display transform; it does not repeat native geometry inventories
-or infer a processing request from the currently retained fallback image.
-
-The Rust chart catalog selects generated scalar identities and owns visual
-grouping, labels, and ordering. Generated scalar access retains nested/array
-identity, checked indexes, optional values, and nonnumeric metadata without
-inventing floating-point chart values. [Build outputs](build.md#generated-bindings-and-dependency-maintenance)
-owns the separate native/Firefox graphics artifact and invalidation rules.
-
-The physical listener and transport owner is
-[BrowserServer](../src/frameworks/transport/browser_server.h).
-Application-level dispatch and snapshots live under
-`src/controller/browser/`. On the Rust side, `application_codec.rs`,
-`transport_connection.rs`, and `view_model/` handle typed records, connection
-behavior, and state reduction. UI layout, styling, navigation, and component
-messages live in `app/`, `view/`, and the owning widgets. Use
-[generation commands](build.md#generated-bindings-and-dependency-maintenance)
-after changing the native schema.
-
-Frontend shared owners:
+[Datasets](datasets.md), [benchmark recipes](benchmark-datasets.md) and
+[compile execution](compile-execution.md) define formats, policy, resource
+admission and publication. Source ownership is:
 
 | Owner | Responsibility |
 | --- | --- |
-| [Page canvas](../src/frontend/iced/src/view/mod.rs), [workflow compositor](../src/frontend/iced/src/view/workflow/mod.rs) | Page width, scrolling, and ordinary columns, including Annotate |
-| [Navigation](../src/frontend/iced/src/view/navigation.rs) | Visual order |
-| [Numeric fields](../src/frontend/iced/src/view/workflow/fields.rs) | Typed widgets; Explore retains local filter editing |
-| [Transition](../src/frontend/iced/src/view/shared/transition.rs) | Retained expansion, clipping, input visibility; [consumers and policy](gui-interaction.md#shared-form-expansion-and-dividers) |
-| [Status text](../src/frontend/iced/src/view/shared/status_text.rs) | Retained single-line fitting and intrinsic measurement |
-| [Dataset progress](../src/frontend/iced/src/view/train/dataset/progress.rs) | Native-fact formatting and active-height reservation |
+| [compiled_file.h](../src/backend/data/compiled_file.h), [FileLayout](../src/backend/data/compiled/compiled_file_layout.h) | Shared format/validation surface and checked block/payload arithmetic |
+| [CompiledSlotStorage](../src/backend/data/detail/compiled_slot_storage.h), [compactor](../src/backend/data/compiled/compiled_file_compaction.cpp) | Borrowed writes and occupied ranges in the staged inode; common finalization for Directory and benchmark output |
+| [CompiledDataset](../src/backend/data/compiled/compiled_dataset.h), [DatasetLoader](../src/backend/data/loading/dataset_loader.h) | Bounded resident metadata, mapped image views, eligible-ID schedules and leased prepared stream slots |
+| [CompileExecution](../src/backend/data/detail/compile_execution.h), [FileWorkQueue](../src/backend/data/detail/file_work_queue.h) | Fixed pinned arenas, allowances, bounded CPU/file work and physical completion |
+| [CompilePixelWorkspace](../src/backend/data/detail/compile_pixel_workspace.h) | Checked prepared CPU decode/resize with front-end-specific codec policy |
+| [BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h) | Source/image joins, claims, withdrawal, drain and separate bounded image/output file services sharing the CPU budget |
+| [BenchmarkImagePublication](../src/backend/data/benchmark/detail/benchmark_image_publication.h) | Encoded-input/cache-write custody for generic extraction and Coconut |
+| [BenchmarkDatasetSelection](../src/backend/data/benchmark/benchmark_dataset_options.h) | Canonical recipe, validation and recovery defaults; generated settings project it, Rust owns controls |
+| [Compile progress](../src/backend/data/compiler/dataset_compile_progress.h) | Acquisition, labels/masks, pixels and source observations; revisioned [application projection](application-wire.md#dataset-operation-snapshots) |
 
-[GUI interaction](gui-interaction.md) defines their layout and input behavior.
+Recipes own membership and recovery; Curl owns transport, archives retain
+opened generations, split writers own placement/sealing, and recipe/artifact
+services choose final publication. Pixels and labels advance independently.
+Coconut's `benchmark/coconut/detail/` separates parsed records/import limits
+(`coconut_input.h`), import continuations (`coconut_import.h`), component products
+(`coconut_annotations.h`), shared identities (`coconut_annotation_identity.h`),
+reflected inventory and checked I/O (`coconut_inventory*.h`), and immutable
+range/block custody (`coconut_staging.h`). `CoconutRecipeInputs` owns original
+providers and final source reconciliation. `BenchmarkMappedArtifact` combines
+immutable mappings with neutral `StagedArtifact` ownership.
 
-Train's [metrics component](../src/frontend/iced/src/view/metrics.rs) owns chart
-selection and expansion. Its [catalog](../src/frontend/iced/src/view/metrics/catalog.rs)
-owns visual metric policy, [history](../src/frontend/iced/src/view/metrics/history.rs)
-owns independent bounded live/saved summaries and gaps, and
-[chart](../src/frontend/iced/src/view/metrics/chart.rs) owns retained plot/series
-projection. The separate
-[progress card](../src/frontend/iced/src/view/train/progress.rs) presents current
-native operation facts independently of selected history. The
-[GUI guide](gui-interaction.md#training-dashboard) owns interaction and rendering
-details; [RF-DETR workflows](rfdetr-workflows.md#live-training-progress) owns
-the native counts and timing semantics.
+The shell supplies `RuntimeDiagnosticTarget` by value to the artifact runtime;
+a borrowed observer exists only during synchronous Compile. Data code consumes
+trace callbacks without a controller dependency. [CompileTraceSelection](../src/backend/data/compile_trace_selection.h)
+and [execution observation](../src/backend/data/detail/compile_execution_observer.h)
+carry demand separately from scheduling/resources. [Logging](logging.md#benchmark-compilation-traces)
+owns disablement, delivery and shutdown.
 
-The [lane component](../src/frontend/iced/src/view/train/lanes.rs) and
-[Advanced](../src/frontend/iced/src/view/train/advanced.rs) edit canonical
-recipe/model settings and display native execution facts. Metrics retain
-separate sources per live/saved history and selected-output presentation.
-[NoticeStore](../src/frontend/iced/src/view_model/notices.rs) owns bounded
-session notice identity and acknowledgment; the root
-[Status view](../src/frontend/iced/src/view/status.rs) owns its interaction,
-focus, clipboard, and presentation. Native system recovery and cancellation
-remain with their existing owners. See [session Status](gui-interaction.md#session-status).
+### Model and media owners
 
-The [application wire reference](application-wire.md) owns the protocol and
-compact input representation; the [GUI interaction guide](gui-interaction.md#shared-immediate-workspace-input)
-owns command ordering and state publication. The physical transport ring lives in
-[browser_record_ring.h](../src/frameworks/transport/browser_record_ring.h);
-shared mouse capture and immediate submission live in
-[workspace_input.rs](../src/frontend/iced/src/workspace_input.rs), with ordered
-outbound retention in
-[transport_connection.rs](../src/frontend/iced/src/transport_connection.rs).
-Canonical records come from
-[contracts/workspace_input.h](../src/controller/contracts/workspace_input.h);
-the shared native queue is
-[presentation/workspace_input.h](../src/controller/presentation/workspace_input.h).
+RF-DETR's [model](../src/backend/models/rfdetr/core/model.h),
+[decoded state](../src/backend/models/rfdetr/core/model_state.h) and
+[state admission](../src/backend/models/rfdetr/core/model_state_load.h) are ordinary
+public boundaries. The [model registry](../src/backend/models/catalog/model_registry.cpp)
+projects canonical descriptors. [Workflow source ownership](rfdetr-workflows.md#backend-ownership)
+locates training lanes, metrics, snapshots, optimizer and checkpoints.
+[Training](rfdetr-training.md) owns equations/execution; [merging](model-merging.md)
+owns synchronization, selection and Resume.
+
+[GpuBatchPreprocessor](../src/backend/models/rfdetr/core/gpu_batch_preprocessor.h)
+owns reusable normalized inference input; [postprocess](../src/backend/models/rfdetr/core/postprocess.h)
+owns physical ranking, class projection and query-aligned outputs;
+[evaluator](../src/backend/models/rfdetr/core/evaluator.h) owns box/mask/OKS
+accumulation. [Input and selection](rfdetr-workflows.md#model-input-and-detection-selection)
+distinguishes model candidate defaults from evaluation limits. Immutable class
+and joint meaning comes from the [data catalog](../src/backend/data/catalog/class_catalog.h).
+
+[CaptureSession](../src/backend/media/capture/capture_session.h) depends on the
+GPU framework. [LiveSessionController](../src/backend/media/live/live_session_controller.h)
+connects capture, analysis, overlays, fanout and compositing through private
+`media/live/detail/` owners; raster composition remains private.
+
+## Workflow output and media handoffs
+
+[WorkflowOutputSelection/Facts](../src/controller/contracts/workflow_output.h)
+separate configured destinations from admitted directories, committed artifacts,
+samples and partial-video facts. [Run reservation](../src/controller/services/training/run_output.h)
+is a shared filesystem utility; systems retain admission/failure policy.
+`TrainRunStore` additionally owns history/Resume. [ExportRunRequest](../src/controller/subsystems/export/export_run.h)
+retains independent format choices through one weights→ONNX→engine chain.
+
+Rust's [PendingStart](../src/frontend/iced/src/app/workflows.rs) captures typed
+validation/prediction saving options before preparation; accepted runs retain
+them independently of later viewer edits. Shared [model](../src/frontend/iced/src/view/workflow/model_card.rs),
+[Output](../src/frontend/iced/src/view/workflow/output.rs) and
+[GPU](../src/frontend/iced/src/view/workflow/gpu.rs) cards own selection interaction;
+Train history and Predict saving remain local components.
+
+[ValidationSampleOutput](../src/controller/subsystems/validate/detail/validation_sample_output.h)
+copies borrowed captures into immutable receiver-owned products; interactive
+samples can adopt them. [PredictionOutput](../src/controller/subsystems/system/detail/prediction_output.h)
+owns samples/full video and publication, with bounded subset/reservoir selection.
+Both reuse `PredictionPreviewComposition`; display admission is optional.
+[PredictionDelivery](../src/backend/models/rfdetr/inference/prediction_delivery.h)
+separates semantic/JSON, preview and saving demand, retaining borrowed reads
+until copies finish. Timing/audio travels through the same inference pass.
+
+[VideoFileSource](../src/backend/media/video/video_file_source.h) owns demux,
+decode and timestamps/audio. [VideoFileSink](../src/backend/media/video/video_file_sink.h)
+owns encoder admission, conversion, bounded packet custody, audio remux and MKV
+publication. Media depends on image/GPU facilities rather than RF-DETR/GUI.
+[CaptionRaster](../src/backend/imaging/raster/caption_raster.h) owns native glyph
+painting; [RenderedImageWriter](../src/backend/imaging/raster/rendered_image_writer.h)
+owns bounded PNG work, pinned transfer, staging and atomic publication. Iced
+retains interactive caption layout. [Workflow output](rfdetr-workflows.md#prediction-samples-and-full-video)
+owns names, sampling and interrupted-output behavior; [build inputs](build.md#native-caption-and-video-assets)
+own fonts and encoder dependencies.
+
+## Shared native facilities
+
+| Facility | Contract |
+| --- | --- |
+| [ScopedFd](../src/common/io/scoped_fd.h), [eventfd](../src/common/io/event_fd.h) | Descriptor custody; EINTR-safe counter reads report count, byte count and captured error; callers choose short/empty/failure policy |
+| [ScopedEventCancellation](../src/common/concurrency/event_cancellation.h) | Bridges stop tokens to borrowed/consumed domain cancellation; settles and destroys its callback before owned token storage |
+| [CancellationObservation](../src/common/types/cancellation_observation.h) | Borrowed observation, without execution-source ownership |
+| [File memory](../src/common/io/file_memory.h) | Handles, mappings, checked interrupted/short positional/vectored I/O and parent creation (`.` for bare filenames); staged owners choose allocation/reclaim policy |
+| [WorkspaceBuffer](../src/common/types/workspace_buffer.h), [NumaMemory](../src/common/system/numa_memory.h) | Bounded caller-owned scratch views; NUMA allocation and optional page-lock custody |
+| [JSON files](../src/common/io/json_file.h), [staging](../src/common/io/staging_directory.h), [publication](../src/common/io/path_publication.h) | Append/atomic JSON and temporary cleanup; domains retain content sync, cancellation, destination and format policy |
+| [File digest](../src/common/io/file_digest.cpp) | Snapshot identity/cancellation checks and overwrite scratch bounded to 16 MiB; hashes only completed reads |
+| [Runtime paths](../src/common/system/runtime_paths.h), [subprocess support](../src/frameworks/process/subprocess_utils.h) | Repository/install/assets resolution and process execution |
+| [Test support](../src/test_support) | Neutral filesystem, process, CUDA, asynchronous wait, console and CLI helpers; domain fixtures stay colocated |
+
+[UTF-8 recognition](../src/common/types/utf8.h) shares scalar rules and bounded
+AVX2 ASCII scanning. Visual diagnostics replace malformed bytes with U+FFFD and
+truncate between scalars; benchmark diagnostic paths use bounded flagged repair.
+Native paths/failures remain intact. JSON rejects invalid text; CBOR reports
+`InvalidUtf8`, including segmented/borrowed input. Repair and wire rejection are
+separate policies. [Logging](logging.md#fatal-stderr-reports) owns optional native
+logging and initialization-independent fatal stderr; entrypoints choose exit
+policy. The opt-in profiling registry allocates a metric-name key only on first
+insertion.
+
+## Reflected value and persistence boundaries
+
+[Reflection authoring](reflection.md) owns registration, annotations and CLI
+syntax. [Reflected descriptors](../src/frameworks/reflection/reflected_descriptors.h)
+parse/validate scalar, optional and repeatable values before mutation; repeatable
+admission checks declared item limits before physical `inplace_vector` capacity.
+Rejected input preserves the destination. Shared field traits serve compile-time
+and runtime checks.
+
+[CBOR](../src/frameworks/serialization/cbor_wire.h) supports non-consuming
+lookahead and direct copies/borrows across at most two segments. Owned leaves
+move into containers. [Reflected decoding](../src/frameworks/serialization/reflected_cbor_detail.h)
+uses compile-time named-key indexes; validation follows base/member declaration
+order, then the first unknown key in wire order. Opaque relations preserve wire
+order. [Application records](application-wire.md#record-shapes) distinguish
+positional transport from named persistence. Encoding measures before reserving,
+checks borrowed map keys as UTF-8, and preserves depth/item/error order. Browser
+records and Rust map keys move owned values rather than copying them.
+
+[Settings persistence](../src/controller/contracts/gui_settings.cpp) structurally
+projects same-name source/UI/training/loading fields and complete
+`ExploreViewState`, including inherited loading and `show_labels`; renamed keys,
+repair and conversions remain explicit. Benchmark rejection counters derive
+binary/JSON projections from one declaration under their [format guards](benchmark-datasets.md#cache-formats-and-capacity).
+Coconut's external JSON/Parquet declarations retain separate format conversion;
+parsing, joins and resource policy remain ordinary data owners.
+[Preset lookup](../src/backend/models/rfdetr/contract/preset_catalog.h) accepts
+exact case-sensitive canonical/upstream names and declared 2XLarge aliases;
+[model configuration](../src/backend/models/rfdetr/contract/model_config.cpp)
+separately owns weight-filename/path inference.
+
+## Native/Rust boundary
+
+[Application wire](application-wire.md) owns schema inputs, generators, typed
+records and compatibility. [Reduction](../src/frontend/iced/src/view_model/reduction.rs)
+calls generated dispatch; owning `view_model/` modules implement presentation
+traits. [Visual projection](../src/controller/presentation/visual_source_projection.h)
+derives source readers and observations from canonical frame/revision facts.
+[Visual frames](../src/controller/presentation/visual_system_types.h) pair geometry
+and optional resize provenance with each product. Upscale separately projects
+native input, prepared input and output; Rust owns Original view and transforms.
+
+Native dispatch/snapshots live in `src/controller/browser/`; [BrowserServer](../src/frameworks/transport/browser_server.h)
+owns the listener/physical transport. Rust `application_codec.rs`,
+`transport_connection.rs` and `view_model/` own records, connection and reduction;
+`app/`, `view/` and widgets own interaction/layout. The chart catalog selects
+generated scalar identities with checked nested/array access, optional values
+and nonnumeric metadata. [Build generation](build.md#generated-bindings-and-dependency-maintenance)
+owns separate application/Firefox artifacts and invalidation.
+
+Shared frontend owners are page/workflow layout (`view/mod.rs`, `view/workflow/`),
+visual order (`view/navigation.rs`), typed numeric fields (`workflow/fields.rs`),
+retained disclosures (`shared/transition.rs`), fitted text (`shared/status_text.rs`)
+and Dataset progress (`train/dataset/progress.rs`). `view/metrics/` separates
+catalog, bounded history and retained plots; `train/progress.rs` displays native
+live facts. `view_model/notices.rs` owns session notices; `view/status.rs` owns
+focus, clipboard and display. [GUI interaction](gui-interaction.md) defines their
+behavior. Mouse records come from [canonical workspace input](../src/controller/contracts/workspace_input.h),
+with Rust capture in `workspace_input.rs`, ordered retention in
+`transport_connection.rs`, and native queues in `presentation/workspace_input.h`.
 
 ## Presentation and browser integration
 
-[src/controller/presentation](../src/controller/presentation) contains native
-source selection, workspace admission/publication, shared visual-worker
-support, and visual diagnostics. Final display products belong to Explore,
-Annotation, Predict, Validate, Live, and Upscale. Predict's implementation is in
-[predict_system.cpp](../src/controller/subsystems/system/predict_system.cpp).
+`src/controller/presentation/` owns routing, admission/publication, visual workers
+and diagnostics. Explore, Annotation, Predict, Validate, Live and Upscale own
+final products; Train charts are ordinary Iced drawing. [VisualDocument](../src/controller/presentation/visual_document.h)
+preserves continuous coordinates and independent mask support during import.
+[VisualRuntimeOwner](../src/controller/presentation/visual_runtime_owner.h) runs
+event-driven dirty work and continuations on each producer worker.
 
-Validation adds its own retained atlas/detail producer through
-[validation_samples.cpp](../src/controller/subsystems/validate/detail/validation_samples.cpp).
-Its canonical [display settings](../src/controller/contracts/validation_display.h)
-live beside the evaluation request in settings and travel with the composed
-image metadata. The [Validation viewer](gui-interaction.md#validation-workspace-and-shared-viewer)
-owns preview controls and their interaction policy.
-Train's charts are ordinary Iced drawing and use no native image workspace.
+The GPU framework groups CUDA/context/retirement in `cuda/`, pinned/GDRCopy
+storage in `memory/`, images/interop in `image/`, and runtime/model/workers in
+`runtime/`. [SystemImageRuntime](../src/frameworks/gpu/runtime/system_image_runtime.h)
+owns retained products/countable reads; [ImageWorkspace](../src/frameworks/gpu/image/image_workspace.h)
+owns native final-allocation custody/layout; [ImportedImageBuffer](../src/frameworks/gpu/image/imported_image_buffer.h)
+retains CUDA mapping, context and backing descriptor. Controller finalization
+connects them to raster code without a reverse GPU-framework dependency.
+Explore's thumbnail cache, stream, atlas and read scheduler retain distinct
+identity, coordination, allocation-local meaning and disk/GPU admission;
+[dataset residency](datasets.md#explore-thumbnails-and-atlas-residency) defines their handoffs.
 
-[VisualDocument](../src/controller/presentation/visual_document.h) retains
-continuous annotation coordinates and mask support independently of box
-bounds. Its materializer projects spatial members from the canonical
-annotation declarations and rasterizes masks for the receiving document.
-Annotation captures the exact displayed frame, crop, and target extent before its
-receiver copy; Upscale requests use the current selected native source. The
-[viewer reference](gui-interaction.md#original-view-and-annotation-import)
-owns the Original/canvas, aspect-restoration, and import behavior.
+Rust's [presentation surface](../src/frontend/iced/src/presentation_surface.rs)
+and [metadata decoder](../src/frontend/iced/src/presentation_surface/metadata.rs)
+retain paired images/facts. Owned Firefox integration lives in
+`third_party/firefox`: `WebGPUParent.cpp` serializes binding changes,
+`gfx/wgpu_bindings/src/server.rs` owns generations/dispatcher custody, and
+`mmltk_workspace_channel.rs` owns exclusive channel claims. Only an explicitly
+bound actor claims a workspace channel. Ordinary WebGPU remains independent.
+Physical Vulkan images/semaphores retain device custody beyond IPC removal.
+The completion worker retires semaphores at the actual submission fence;
+Iced's [primitive resource batch](../third_party/iced/wgpu/src/primitive.rs)
+retains encoded resources through submission or abandonment.
 
-[VisualRuntimeOwner](../src/controller/presentation/visual_runtime_owner.h)
-runs dirty work and completion continuations on each producer's worker.
-The GPU framework groups CUDA execution, context and retirement facilities in
-`frameworks/gpu/cuda/`, pinned and GDRCopy buffers in `memory/`, image storage
-and graphics interop in `image/`, and image runtime/model/worker coordination
-in `runtime/`. These folders share the existing GPU component; each ordinary
-header exposes its own dependencies.
-[SystemImageRuntime](../src/frameworks/gpu/runtime/system_image_runtime.h) owns retained
-product storage and counted reads;
-[ImageWorkspace](../src/frameworks/gpu/image/image_workspace.h) owns native custody
-of a final Vulkan allocation and its immutable display layout;
-[ImportedImageBuffer](../src/frameworks/gpu/image/imported_image_buffer.h) retains
-its CUDA mapping, context, and independent backing descriptor. The controller's
-[finalization policy](../src/controller/presentation/visual_runtime.cpp)
-connects these GPU owners to the raster backend. The GPU framework has no
-reverse dependency on that backend.
-
-Explore's
-[GalleryThumbnailCache](../src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h),
-[GalleryStream](../src/controller/subsystems/explore/detail/gallery_stream.h),
-and [GalleryAtlas](../src/controller/subsystems/explore/detail/gallery_atlas.h)
-own retained thumbnail identity, stream coordination, and allocation-local cell
-meaning respectively. `GalleryReadScheduler` owns disk/GPU admission and prepares
-each card's stored-content crop and rectangle fitted to source proportions.
-[Dataset loading and Explore residency](datasets.md#explore-thumbnails-and-atlas-residency)
-explains their handoffs.
-
-The Rust browser-image boundary is
-[presentation_surface.rs](../src/frontend/iced/src/presentation_surface.rs)
-and its child modules. Firefox allocation/export and WebGPU/Vulkan integration
-live in the owned [third_party/firefox](../third_party/firefox) tree.
-`dom/webgpu/ipc/WebGPUParent.cpp` serializes workspace binding changes;
-`gfx/wgpu_bindings/src/server.rs` owns binding generations and dispatcher custody;
-`gfx/wgpu_bindings/src/mmltk_workspace_channel.rs` owns the exclusive channel
-claim. Only an explicitly bound workspace actor acquires that claim; ordinary
-WebGPU actors retain their independent behavior. Iced owns view transforms and rendering;
-its stable graphics binding acquires the latest completed workspace with paired
-image metadata, independently of application snapshot delivery.
-[metadata.rs](../src/frontend/iced/src/presentation_surface/metadata.rs)
-validates that opaque payload against generated native types.
-Physical Vulkan image and semaphore owners retain device custody beyond
-registry and IPC removal.
-Ordinary wgpu texture validation supplies canvas descriptors through HAL and
-DMA-BUF reuse. The existing completion worker retires semaphore custody at the
-actual submission fence; the
-[GPU reference](gpu-execution.md#browser-canvas-descriptors-and-submission-custody)
-owns these mechanics. The
-[fatal-report reference](logging.md#firefox-fatal-causes-and-process-identity)
-distinguishes graphics causes, surviving-parent content-channel failure, and
-native root-process classification.
-The vendored Iced [primitive resource batch](../third_party/iced/wgpu/src/primitive.rs)
-retains sampled resources through the actual encoder's submission or
-abandonment; it carries no application schema or selection policy.
-[workspace_fps.rs](../src/frontend/iced/src/workspace_fps.rs) owns the optional
-component meter, observing actual queue submissions separately from settlement.
-
-For lifetime and synchronization invariants, follow the contract's
-[GPU buffer flow](../CONTRACT.md#gpu-buffer-flow) and
-[shutdown rules](../CONTRACT.md#execution-failure-and-shutdown).
-Detailed [input, buffer, and presentation mechanics](gui-interaction.md) have
-one home. The [logging guide](logging.md) explains diagnostic activation and
-how captures connect these boundaries. Frontend acceptance control lives in
-`integration_control.rs`; its private `integration_control/reporting.rs`
-owns effect-only collection and reporting.
-
-Train's metrics component uses the owned [iced_plot](../third_party/iced_plot)
-crate. Validation's [results](../src/frontend/iced/src/view/validate/results.rs)
-and [samples](../src/frontend/iced/src/view/validate/samples.rs) own local UI
-interaction; `PendingStart`, described [above](#workflow-output-and-media-handoffs),
-owns preparation. The real-model acceptance [workflow driver](../src/frontend/iced/src/integration_control/workflows.rs)
-exercises the native systems.
+[GUI input/presentation](gui-interaction.md) owns ordering, retained images and
+transforms; [GPU execution](gpu-execution.md) owns allocation/transfers;
+[logging](logging.md) owns fatal process classification and diagnostics.
+`integration_control.rs` is frontend acceptance control; its `reporting.rs`
+collects effect-only evidence. Train uses owned `third_party/iced_plot`;
+Validate's results/samples remain local UI components.
 
 ## Tests and vendor changes
 
-Tests are generally colocated with their owning component; shared acceptance
-scenarios and the packaged Wayland integration suite live under
-[src/acceptance](../src/acceptance). Neutral support lives in
-`src/test_support`; Explore, Upscale, Live, Annotation, and presentation each
-register their own tests and domain fixtures. The
-[validation ownership map](validation.md#gui-behavior-and-evidence-ownership)
-locates those suites; [packaged acceptance](validation.md#packaged-wayland-acceptance)
-locates the Wayland session/audit owners. Wrapper suite
-selection is defined in [tools/mmltk.cpp](../tools/mmltk.cpp), with native target
-registration in component CMake files. Native tool fixtures use the independent
-[tools runner](validation.md#native-tool-fixtures).
-
-`third_party` is maintained as part of this codebase, including the owned
-Firefox and Iced changes. It retains upstream notices and per-project build
-policies. Development and review procedures are in [AGENTS.md](../AGENTS.md);
-available checks are described in [validation](validation.md).
+Tests are colocated with owners; [acceptance](../src/acceptance) contains shared
+scenarios and packaged Wayland integration. [Validation](validation.md#gui-behavior-and-evidence-ownership)
+maps suites, fixtures and evidence. Component CMake registers native tests;
+`tools/mmltk.cpp` selects wrapper suites. [Tool fixtures](validation.md#native-tool-fixtures)
+use the independent tools runner. Owned Firefox/Iced changes retain upstream
+notices and per-project build policies; [AGENTS.md](../AGENTS.md) defines working rules.

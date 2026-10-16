@@ -7,13 +7,16 @@
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/ml/torch/scalar_type.h"
+#include "src/backend/ml/layers/ms_deform_attn.h"
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/serialize.h>
+#include <torch/autograd.h>
 #include "src/common/io/file_digest.h"
 #include <ATen/record_function.h>
+#include <ATen/ops/_addmm_activation.h>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -26,6 +29,8 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <set>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
@@ -38,57 +43,186 @@ namespace {
 using ComparisonPolicy = rf::testsupport::OracleComparisonPolicy;
 using Json = nlohmann::json;
 class ForwardOperatorObservation final {
+ struct Probe {
+  bool feed_forward = false;
+  std::vector<torch::Tensor> inputs;
+  torch::Tensor output;
+  std::shared_ptr<torch::Tensor> incoming;
+  int64_t im2col_step = 0;
+ };
  struct Event final : at::ObserverContext {
   std::string name;
+  std::optional<Probe> probe;
   explicit Event(std::string value) : name(std::move(value)) {}
  };
  inline static thread_local ForwardOperatorObservation* active_ = nullptr;
  at::CallbackHandle callback_ = 0;
  std::map<std::string, std::size_t> counts_;
  rf::TensorMap outputs_;
+ std::shared_ptr<rf::TensorMap> backward_;
+ rf::TensorMap watched_;
+ std::vector<std::pair<torch::Tensor, unsigned>> gradient_hooks_;
  std::size_t depth_ = 0;
  bool finished_ = false;
+ bool diagnostic_ = false;
+ std::set<const c10::TensorImpl*> feed_forward_weights_;
+ std::vector<Probe> probes_;
 
 public:
- explicit ForwardOperatorObservation(bool enabled) {
+ explicit ForwardOperatorObservation(bool enabled, const rf::NativeRfDetrModel& model, bool backward = false) {
   if (!enabled) return;
+  if (backward) backward_ = std::make_shared<rf::TensorMap>();
+  const auto* diagnostic = std::getenv("MMLTK_RFDETR_ORACLE_OPERATOR_TRACE");
+  diagnostic_ = diagnostic && std::string_view(diagnostic) == "1";
+  if (diagnostic_)
+   for (const auto& parameter : model.named_parameters())
+    if (parameter.key().ends_with(".linear1.weight")) feed_forward_weights_.insert(parameter.value().unsafeGetTensorImpl());
   TORCH_CHECK(!active_, "forward operator observation is already active");
   callback_ = at::addThreadLocalCallback(at::RecordFunctionCallback(
    [](const at::RecordFunction& event) -> std::unique_ptr<at::ObserverContext> {
    const std::string_view name(event.name());
+   if (active_->diagnostic_ && active_->probes_.size() < 32) {
+    const auto inputs = event.inputs();
+    const bool feed_forward = name == "aten::linear" && inputs.size() == 3 && inputs[1].isTensor() && active_->feed_forward_weights_.contains(inputs[1].toTensor().unsafeGetTensorImpl());
+    if (feed_forward || name == "mmltk::ms_deform_attn") {
+     auto probe = std::make_unique<Event>(std::string(name));
+     probe->probe.emplace();
+     probe->probe->feed_forward = feed_forward;
+     if (!feed_forward && inputs.size() == 6 && inputs[5].isInt()) probe->probe->im2col_step = inputs[5].toInt();
+     for (const auto& input : inputs)
+      if (input.isTensor()) probe->probe->inputs.push_back(input.toTensor().detach());
+     return probe;
+    }
+   }
    if (name == "aten::topk") active_->finished_ = true;
-   if (active_->finished_) return {};
+   if (active_->finished_ && !active_->backward_) return {};
    if (name != "aten::conv2d" && name != "aten::layer_norm" && name != "aten::linear" && name != "aten::gelu" && name != "aten::scaled_dot_product_attention") return {};
    ++active_->depth_;
    return std::make_unique<Event>(std::string(name.substr(6)));
   },
    [](const at::RecordFunction& event, at::ObserverContext* context) {
    if (!context) return;
+   auto& observed = *static_cast<Event*>(context);
+   if (observed.probe) {
+    if (event.outputs().size() == 1 && event.outputs().front().isTensor()) {
+     observed.probe->output = event.outputs().front().toTensor();
+     active_->probes_.push_back(std::move(*observed.probe));
+    }
+    return;
+   }
    if (--active_->depth_) return;
-   const auto& name = static_cast<Event*>(context)->name;
+   auto name = observed.name;
    if (active_->outputs_.size() >= 256 || event.outputs().size() != 1 || !event.outputs().front().isTensor()) {
     active_->finished_ = true;
     return;
    }
-   const auto index = active_->counts_[name]++;
-   active_->outputs_.emplace("forward-operator/" + name + "/" + std::to_string(index), event.outputs().front().toTensor().detach().clone());
+   auto value = event.outputs().front().toTensor();
+   auto prefix = "forward-operator/" + name;
+   if (active_->finished_) {
+    prefix = "decoder-" + prefix + "/";
+    for (const auto dimension : value.sizes()) prefix += std::to_string(dimension) + "x";
+   }
+   const auto index = active_->counts_[prefix]++;
+   auto key = prefix + "/" + std::to_string(index);
+   active_->outputs_.emplace(key, value.detach().clone());
+   if (active_->backward_) {
+    key.replace(key.find("forward"), 7, "backward");
+    active_->backward_->emplace(key, torch::Tensor{});
+    active_->watched_.emplace(key, value);
+   }
   })
     .needsOutputs(true)
+    .needsInputs(diagnostic_)
     .scopes({at::RecordScope::FUNCTION}));
   active_ = this;
  }
  ~ForwardOperatorObservation() {
+  stop_forward();
+  for (const auto& [value, handle] : gradient_hooks_) value.remove_hook(handle);
+ }
+ void stop_forward() {
   if (!callback_) return;
   at::removeCallback(callback_);
+  callback_ = 0;
   active_ = nullptr;
+  for (const auto& [key, value] : watched_) {
+   if (!value.requires_grad()) continue;
+   const auto handle = value.register_hook([values = backward_, key](const torch::Tensor& gradient) {
+    values->at(key) = gradient.detach();
+    return gradient;
+   });
+   gradient_hooks_.emplace_back(value, handle);
+  }
+  watched_.clear();
+  for (auto& probe : probes_) {
+   if (probe.feed_forward || !probe.output.requires_grad()) continue;
+   probe.incoming = std::make_shared<torch::Tensor>();
+   const auto handle = probe.output.register_hook([incoming = probe.incoming](const torch::Tensor& gradient) {
+    *incoming = gradient.detach();
+    return gradient;
+   });
+   gradient_hooks_.emplace_back(probe.output, handle);
+  }
  }
- void report(rf::testsupport::OracleComparison& comparison, const rf::testsupport::OracleArchive& archive) const {
+ void report(rf::testsupport::OracleComparison& comparison, const rf::testsupport::OracleArchive& archive) {
   std::vector<std::string> read_names;
   for (const auto& [name, value] : outputs_)
    if (archive.contains(name)) read_names.push_back(name);
   const auto expected = archive.read_tensors(read_names);
   for (const auto& [name, value] : outputs_)
    if (archive.contains(name)) comparison.compare(name, value, expected.at(name), ComparisonPolicy::Value, true);
+  std::array<std::size_t, 2> counts{};
+  for (const auto& probe : probes_) {
+   if (probe.output.scalar_type() != torch::kFloat32) continue;
+   const auto name = std::string("diagnostic/") + (probe.feed_forward ? "feed-forward" : "deformable-attention") + "/" + std::to_string(counts[probe.feed_forward]++);
+   torch::Tensor actual, reference;
+   if (probe.feed_forward) {
+    if (probe.inputs.size() != 3 || probe.inputs[0].scalar_type() != torch::kFloat32) continue;
+    actual = torch::relu(probe.output.detach());
+    reference = at::_addmm_activation(probe.inputs[2], probe.inputs[0].reshape({-1, probe.inputs[0].size(-1)}), probe.inputs[1].t()).reshape_as(actual);
+    comparison.fact(name + "/activation-sign-differences", actual.gt(0).ne(reference.gt(0)).sum().item<int64_t>());
+   } else {
+    if (probe.inputs.size() != 5) continue;
+    actual = probe.output.detach();
+    reference = mmltk::backend::ml::layers::ms_deform_attn_reference(probe.inputs[0], probe.inputs[1], probe.inputs[3], probe.inputs[4]);
+   }
+   comparison.compare(name, actual, reference, ComparisonPolicy::Value, true);
+  }
+  outputs_.clear();
+ }
+ void report_backward(rf::testsupport::OracleComparison& comparison, const rf::testsupport::OracleArchive& archive) const {
+  if (backward_) {
+   std::vector<std::string> names;
+   for (const auto& [name, value] : *backward_)
+    if (archive.contains(name)) names.push_back(name);
+   const auto references = archive.read_tensors(names);
+   comparison.fact("diagnostic/backward-operator-count", names.size());
+   for (const auto& name : names) comparison.compare(name, backward_->at(name), references.at(name), ComparisonPolicy::Derivative, true);
+  }
+  std::size_t count = 0;
+  for (const auto& probe : probes_) {
+   if (probe.feed_forward || probe.inputs.size() != 5 || !probe.incoming || !probe.incoming->defined()) continue;
+   mmltk::backend::ml::cuda::TorchAutocastScope scope(false, torch::kFloat32);
+   const auto name = "diagnostic/deformable-attention-vjp/" + std::to_string(count++);
+   std::vector<torch::Tensor> native, reference;
+   for (const auto index : {0U, 3U, 4U}) {
+    native.push_back(mmltk::backend::ml::testsupport::independent_leaf(probe.inputs[index]));
+    reference.push_back(mmltk::backend::ml::testsupport::independent_leaf(probe.inputs[index]));
+   }
+   const auto actual = mmltk::backend::ml::layers::ms_deform_attn_cuda_autograd(native[0], probe.inputs[1], probe.inputs[2], native[1], native[2], probe.im2col_step);
+   // Upstream materializes contiguous [batch, heads, channels, spatial] before
+   // grid_sample. Preserve that layout as well as its AMP float32 arithmetic.
+   const auto source_value = reference[0].permute({0, 2, 3, 1}).contiguous().permute({0, 3, 1, 2});
+   const auto expected = mmltk::backend::ml::layers::ms_deform_attn_reference(source_value.to(torch::kFloat32), probe.inputs[1], reference[1].to(torch::kFloat32), reference[2].to(torch::kFloat32))
+                          .to(actual.scalar_type());
+   comparison.fact(name + "/incoming-norm", probe.incoming->to(torch::kFloat32).norm().item<double>());
+   comparison.compare(name + "/output", actual, expected, ComparisonPolicy::Value, true);
+   const auto actual_gradients = torch::autograd::grad({actual}, native, {*probe.incoming});
+   const auto expected_gradients = torch::autograd::grad({expected}, reference, {*probe.incoming});
+   constexpr std::array operands{"value", "sampling-locations", "attention-weights"};
+   for (std::size_t index = 0; index < operands.size(); ++index)
+    comparison.compare(name + "/" + operands[index], actual_gradients[index], expected_gradients[index], ComparisonPolicy::Derivative, true);
+  }
  }
 };
 std::vector<Json> oracle_comparison_records(const std::filesystem::path& root, const std::string& name) {
@@ -357,6 +491,34 @@ TEST_CASE("Oracle shard indexes retain ordered tensors and reject incomplete or 
   return write("step.json", {{"format", "mmltk.rfdetr.step.v2"}, {"shards", refs}, {"bytes", bytes}, {"tensor_count", tensors}});
  };
  auto committed = publish();
+ SECTION("selected tensors authenticate retained payload after unrelated consumers retire") {
+  std::filesystem::remove(root.path() / "1.pt");
+  std::filesystem::remove(root.path() / "2.pt");
+  const std::array<std::string, 2> selected{"loss/z", "loss/z"};
+  const auto archive = support::OracleArchive::select(root.path(), committed, selected);
+  CHECK(archive.tensor("loss/z").item<float>() == 1.F);
+  CHECK((archive.names("loss/") == std::set<std::string>{"z"}));
+  CHECK((archive.ordered_defined_names("loss/") == std::vector<std::string>{"z"}));
+  CHECK_FALSE(archive.contains("gradient/z"));
+  CHECK_THROWS(archive.tensor("gradient/z"));
+  CHECK_THROWS(archive.tensor("loss/a"));
+  CHECK_THROWS(support::OracleArchive(root.path(), committed));
+  const std::array<std::string, 1> absent{"missing"};
+  CHECK_THROWS_AS(support::OracleArchive::select(root.path(), committed, absent), std::runtime_error);
+ }
+ SECTION("selected tensors still require their payload and the complete authenticated index") {
+  const std::array<std::string, 1> selected{"loss/z"};
+  SECTION("missing retained payload") {
+   std::filesystem::remove(root.path() / "0.pt");
+   CHECK_THROWS(support::OracleArchive::select(root.path(), committed, selected));
+  }
+  SECTION("altered unselected metadata") {
+   std::ofstream changed(root.path() / "2.json", std::ios::app);
+   changed << ' ';
+   changed.close();
+   CHECK_THROWS(support::OracleArchive::select(root.path(), committed, selected));
+  }
+ }
  SECTION("complete multi-shard view retains order and borrowed values") {
   const support::OracleArchive archive(root.path(), committed);
   CHECK((archive.ordered_defined_names("loss/") == std::vector<std::string>{"z", "a", "m"}));
@@ -607,17 +769,20 @@ TEST_CASE("Actual pinned upstream catalog forward and fixed cotangent VJPs", "[r
     }
     std::vector<torch::Tensor> indices;
     rf::ModelOutputs outputs;
+    const bool backward_operators = archive.contains("backward-operator/linear/0");
+    ForwardOperatorObservation operators((mode == rf::CompilationMode::kNone || backward_operators) && archive.contains("forward-operator/linear/0"), model, backward_operators);
     {
-     ForwardOperatorObservation operators(mode == rf::CompilationMode::kNone && archive.contains("forward-operator/linear/0"));
      mmltk::backend::ml::cuda::TorchAutocastScope scope(entry.dtype() != torch::kFloat32, entry.dtype());
      comparison.fact("forward autocast", {{"enabled", at::autocast::is_autocast_enabled(at::kCUDA)}, {"dtype", static_cast<int>(at::autocast::get_autocast_dtype(at::kCUDA))}});
      outputs = mode == rf::CompilationMode::kNone ? model.forward_observed({input, mask}, model.config().has_masks(), indices) : model.forward({input, mask}, model.config().has_masks());
-     if (mode == rf::CompilationMode::kNone) operators.report(comparison, archive);
+     operators.stop_forward();
+     if (mode == rf::CompilationMode::kNone || backward_operators) operators.report(comparison, archive);
     }
     comparison.fact("execution", {{"mode", static_cast<int>(mode)}, {"input", "identical admitted normalized tensor"}, {"training", entry.training}});
     comparison.compare_all([&] {
      rf::testsupport::compare_oracle_outputs(comparison, archive, outputs, indices, "", mode == rf::CompilationMode::kNone);
      rf::testsupport::compare_oracle_vjp(comparison, archive, model, outputs, input, false);
+     operators.report_backward(comparison, archive);
     });
    }
   }
@@ -648,7 +813,16 @@ TEST_CASE("Independent upstream repetitions measure the numerical noise floor", 
       std::vector<std::string> read_names;
       for (const auto& name : expected.names(prefix)) read_names.push_back(std::string(prefix) + name);
       const auto actual_values = actual.read_tensors(read_names), expected_values = expected.read_tensors(read_names);
-      for (const auto& key : read_names) comparison.compare(key, actual_values.at(key), expected_values.at(key), policy);
+      if (policy == ComparisonPolicy::Derivative) {
+       rf::TensorMap actual_derivatives, expected_derivatives;
+       for (const auto& key : read_names) {
+        actual_derivatives.emplace(key.substr(std::string_view(prefix).size()), actual_values.at(key));
+        expected_derivatives.emplace(key.substr(std::string_view(prefix).size()), expected_values.at(key));
+       }
+       comparison.derivatives(prefix, actual_derivatives, expected_derivatives);
+      } else {
+       for (const auto& key : read_names) comparison.compare(key, actual_values.at(key), expected_values.at(key), policy);
+      }
      }
     }
    });

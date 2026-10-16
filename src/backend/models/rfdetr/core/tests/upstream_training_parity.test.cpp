@@ -271,8 +271,8 @@ TEST_CASE("Detector construction preserves pinned zero copy and DINO distributio
   if (name.starts_with("transformer.decoder.") && (name.ends_with("sampling_offsets.weight") || name.ends_with("attention_weights.weight") || name.ends_with("attention_weights.bias")))
    CHECK(torch::count_nonzero(value).item<int64_t>() == 0);
   if (name.starts_with("transformer.") && value.dim() > 1 && name.find("enc_out_") == std::string::npos) {
-   const auto bound = std::sqrt(6.0 / static_cast<double>(value.size(0) + value.size(1)));
-   CHECK(value.abs().max().item<double>() <= bound);
+   const auto bound = static_cast<float>(std::sqrt(6.0 / static_cast<double>(value.size(0) + value.size(1))));
+   CHECK(value.abs().max().item<float>() <= bound);
   }
  }
  for (int group = 0; group < config.group_detr; ++group) {
@@ -878,7 +878,7 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
       // contraction with a tripled cotangent moves its Half rounding boundary.
       totals[route] = torch::zeros({}, options);
       for (const auto& layer_samples : samples) {
-       const auto dense = sparse ? torch::matmul(query[0], spatial[0].flatten(1)).reshape({1, 1, 4, 4}) + bias : spatial;
+       const auto dense = sparse ? (torch::einsum("chw,nc->nhw", {spatial[0], query[0]}) + bias).unsqueeze(1) : spatial;
        const auto uncertainty = reference_mask_sample(dense.detach(), layer_samples.uncertain_candidates, false).abs().neg();
        const auto indices = std::get<1>(uncertainty.topk(selected_count, 1));
        const auto coords = torch::cat({layer_samples.uncertain_candidates[0].index_select(0, indices.flatten()).unsqueeze(0), layer_samples.uncertain_random}, 1);

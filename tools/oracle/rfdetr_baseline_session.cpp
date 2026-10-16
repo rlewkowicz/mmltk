@@ -86,6 +86,7 @@ TEST_CASE("Original application produces immutable continuation evidence", "[his
  REQUIRE(original.test_summary);
  rf::TrainingSessionAdmission saved(original.checkpoint_path);
  REQUIRE(std::ranges::any_of(saved.manifest().models, [](const auto& value) { return value.best.has_value(); }));
+ request.weights_path.clear();
  request.resume_path = original.checkpoint_path;
  request.output_dir = root / "continued";
  request.epochs = 2;

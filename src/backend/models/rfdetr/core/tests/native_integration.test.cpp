@@ -15,6 +15,7 @@
 // Import-bearing support follows every textual standard-library and POSIX test helper.
 #include "asset_cache_support.h"
 #include "checkpoint_fixture_support.h"
+#include "checkpoint_fixture_support/upstream_oracle_fixture.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/common/io/file_digest.h"
 #include "parity_fixture_support.h"
@@ -176,15 +177,15 @@ TEST_CASE("Python artifacts preserve explicit layouts and keep ambiguous names r
  CHECK(native.metadata.class_layout.class_name_evidence == source.metadata.class_layout.class_name_evidence);
  CHECK(native.tensor_count() == raw.tensor_count());
 }
-TEST_CASE("All official asset digests admit their exact native topology independently of filename", "[model][rfdetr][checkpoint][official][integration]") {
+TEST_CASE("All official asset digests admit their exact native topology independently of filename", "[model][rfdetr][checkpoint][official][integration][upstream_oracle]") {
  namespace r = mmltk::backend::models::rfdetr;
  namespace fixture = r::testsupport;
+ const fixture::UpstreamOracle oracle(fixture::UpstreamOracle::requested());
  mmltk::testsupport::ScopedTempDir directory("rfdetr-official-admission");
  for (const auto& preset : r::kPresetCatalog) {
   CAPTURE(preset.preset_name);
   const auto& asset = fixture::require_weight_asset(preset.canonical_weight_filename);
-  const auto original = fixture::cached_model_assets_root() / std::string(preset.preset_name) / std::string(asset.filename);
-  fixture::ensure_downloaded_weight(original, asset);
+  const auto original = oracle.official_checkpoint(preset.preset_name);
   const auto renamed = directory.path() / "opaque.pth";
   fixture::remove_if_exists(renamed);
   fs::create_symlink(fs::absolute(original), renamed);

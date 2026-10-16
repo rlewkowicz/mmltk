@@ -269,7 +269,10 @@ impl ApplicationModel {
     pub fn set_foreground_feature(&mut self, feature: FeatureId) {
         let destination = Self::page_visual_source(feature);
         let foreground = self.foreground_visual();
-        let viewer_page = matches!(feature, FeatureId::Explore | FeatureId::Validate);
+        let viewer_page = matches!(
+            feature,
+            FeatureId::Explore | FeatureId::Validate | FeatureId::Predict | FeatureId::Live
+        );
         let request_belongs = self
             .requested_upscale
             .as_ref()
@@ -411,7 +414,12 @@ mod tests {
 
     #[test]
     fn an_upscale_source_without_a_viewer_cannot_claim_destination_ownership() {
-        for page in [FeatureId::Explore, FeatureId::Validate] {
+        for page in [
+            FeatureId::Explore,
+            FeatureId::Validate,
+            FeatureId::Predict,
+            FeatureId::Live,
+        ] {
             let mut model = bootstrapped();
             model.set_foreground_visual(Some(PresentationSourceKind::Upscale));
             model.set_foreground_feature(page);
@@ -424,11 +432,18 @@ mod tests {
 
     #[test]
     fn same_page_preserves_only_its_own_upscale_request() {
-        for page in [FeatureId::Explore, FeatureId::Validate] {
+        for page in [
+            FeatureId::Explore,
+            FeatureId::Validate,
+            FeatureId::Predict,
+            FeatureId::Live,
+        ] {
             let native = ApplicationModel::page_visual_source(page).unwrap();
             for source in [
                 PresentationSourceKind::Explore,
                 PresentationSourceKind::Validation,
+                PresentationSourceKind::Predict,
+                PresentationSourceKind::Live,
             ] {
                 for foreground in [native, source, PresentationSourceKind::Upscale] {
                     let mut model = bootstrapped();
@@ -1065,24 +1080,49 @@ mod tests {
         );
         assert!(model.source_for(PresentationSourceKind::Predict).is_some());
 
-        let mut upscale = model.upscale_snapshot.clone().unwrap();
-        let source = select_upscale_source(&mut model, upscale.kernel);
-        upscale.input = source;
-        upscale.revision += 1;
-        upscale.ready = true;
-        upscale.frame = visual_frame(PresentationSourceKind::Upscale, 1);
-        upscale.methods[0].available = true;
-        upscale.methods[0].completed = model.requested_upscale.clone();
-        upscale.methods[0].frame = upscale.frame.clone();
-        assert_eq!(
-            model.reduce_event(ApplicationEvent::UpscaleUpscaleChanged(
-                crate::generated::UpscaleChanged {
-                    snapshot: upscale.clone(),
-                },
-            )),
-            Some(upscale.frame.clone())
-        );
-        assert!(model.source_for(PresentationSourceKind::Upscale).is_some());
+        for (page, kind) in [
+            (FeatureId::Predict, PresentationSourceKind::Predict),
+            (FeatureId::Live, PresentationSourceKind::Live),
+        ] {
+            let source = visual_frame(kind, 1);
+            let document = match kind {
+                PresentationSourceKind::Predict => {
+                    let snapshot = model.predict_snapshot.as_mut().unwrap();
+                    snapshot.frame = source.clone();
+                    snapshot.document.clone()
+                }
+                PresentationSourceKind::Live => {
+                    let snapshot = model.live_snapshot.as_mut().unwrap();
+                    snapshot.frame = source.clone();
+                    snapshot.document.clone()
+                }
+                _ => unreachable!(),
+            };
+            model.set_foreground_feature(page);
+            let mut upscale = model.upscale_snapshot.clone().unwrap();
+            model.request_upscale(crate::generated::UpscaleRequest {
+                source: source.clone(),
+                document,
+                kernel: upscale.kernel,
+            });
+            upscale.input = source;
+            upscale.revision += 1;
+            upscale.ready = true;
+            upscale.frame = visual_frame(PresentationSourceKind::Upscale, upscale.revision);
+            upscale.methods[0].available = true;
+            upscale.methods[0].completed = model.requested_upscale.clone();
+            upscale.methods[0].frame = upscale.frame.clone();
+            assert_eq!(
+                model.reduce_event(ApplicationEvent::UpscaleUpscaleChanged(
+                    crate::generated::UpscaleChanged {
+                        snapshot: upscale.clone(),
+                    },
+                )),
+                Some(upscale.frame.clone())
+            );
+            assert_eq!(model.current_upscale(), Some(&upscale));
+            assert!(model.source_for(PresentationSourceKind::Upscale).is_some());
+        }
     }
 
     #[test]

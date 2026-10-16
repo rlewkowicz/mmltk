@@ -2,12 +2,10 @@
 
 [Wiki index](README.md) · [Quick start](../README.md#build) · [Build details](build.md) · [Validation](validation.md)
 
-Run commands from the repository root through the native `./mmltk` executable.
-A cold checkout first needs the [tools bootstrap](build.md#native-tools-and-checkout-bootstrap).
-The wrapper rewrites
-supported host paths into container mounts; absolute host paths become
-`/host/...`, with repository paths mapped into `/workspace`. Each runtime
-invocation owns a repository-labeled container and streams application output.
+Run from the repository root through native `./mmltk`; cold checkouts need
+[bootstrap](build.md#native-tools-and-checkout-bootstrap). Supported host paths
+map to container mounts: checkout → `/workspace`, other absolute paths →
+`/host/...`. Runtime containers are repository-labeled and stream app output.
 
 ## Wrapper operations
 
@@ -30,6 +28,7 @@ invocation owns a repository-labeled container and streams application output.
 | `./mmltk --audit-includes [--refresh] [report\|preview\|fix] [--output PREFIX] [--build-dir PATH]` | Inventory all compiler contexts and include-retention reasons; preview/apply replacements only under verified target-local PCH policy |
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, log-query, and compositor fixtures |
+| `./mmltk --test rfdetr --with-upstream` | Explicitly prepare and run external upstream and historical-session validation; full reference tensors can exceed 1 TiB |
 | `./mmltk --test data-profile -- --help` | Prepare the opt-in target and show CPU compile/pipeline/archive/compaction/resample, full Coconut, and CUDA loader options |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
@@ -38,75 +37,58 @@ invocation owns a repository-labeled container and streams application output.
 | `./mmltk --diagnose-io FILE` | Report eligible CPU/core/SMT/frequency-policy facts and a compiled file's storage/GPU capabilities |
 | `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
 | `./mmltk --diagnose-gpu-program [--torch] SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic, optionally linked to pinned PyTorch, using existing images |
-| `./mmltk --diagnose-rfdetr-upstream --upstream PATH --output PATH [--sdpa default\|math]` | Produce pinned actual upstream references in a fresh directory, run native core/training comparisons, and publish the required-check verdict |
+| `./mmltk --diagnose-rfdetr-upstream [--upstream PATH] [--plus-upstream PATH] [--output PATH] [--sdpa default\|math]` | Explicit pinned references plus core/training/inference/export comparisons; selected `--case ID` prepares one case without comparisons |
 | `./mmltk --diagnose-nvidia-payload donor\|development HEADER...` | Inspect public NVIDIA headers and payload selection |
 | `./mmltk --diagnose-native-symbols [OPTIONS] ARTIFACT...` | Inspect cached native `.a`/`.o` symbols or resolve `--address HEX` values in one ELF artifact with the existing development image |
 | `./mmltk --diagnose-native-link [OPTIONS] TARGET` | Repeat one generated Release link into separate diagnostic storage |
 | `./mmltk --tool build-time-trace -- [OPTIONS]` | Run an [isolated build measurement](build.md#isolated-build-timing) through the native driver |
 
-The `|` entries above mean choose one value; they are not shell pipelines.
-Build, test, tidy, cleanup, export, and diagnostics are separate operations.
-Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
-`--diagnose-gpu-environment`, `--diagnose-gpu-program`, `--diagnose-native-symbols`,
-`--diagnose-native-link`, `--diagnose-processes`, `--diagnose-benchmark-image`,
-`--diagnose-rfdetr-upstream`,
-`--cleanup-report`, `--raw-cpd`, `--format-declarations`, or `--audit-includes`
-first when invoking that standalone operation.
+`|` means choose a value, not a shell pipeline. Build, test, tidy, cleanup,
+export, and diagnostics are separate operations. Standalone `--logs`,
+`--diagnose-*`, `--cleanup-report`, `--raw-cpd`, `--format-declarations`, and
+`--audit-includes` must be the first operation.
 
-Detailed references: [CUDA/Vulkan diagnostics](validation.md#standalone-cudavulkan-diagnostic),
-[upstream numerical evidence](validation.md#independent-upstream-diagnostic),
-[native symbols/links](validation.md#native-symbol-and-link-diagnostics),
-[test selectors](validation.md#selection-environment-deadlines-and-debugging),
-[data profiles](validation.md#data-compilation-and-resampling-profiles),
-[declaration tooling](validation.md#raw-cpd-and-declaration-formatting),
-[PCH include audits](validation.md#pch-include-audit), and
-[log queries/provenance](logging.md).
+| Detail | Reference |
+| --- | --- |
+| Selectors, profiles, CUDA/Vulkan, native symbols/links | [Validation](validation.md) |
+| Upstream opt-in, single-case preparation, retention/verdicts | [Upstream validation](validation.md#independent-upstream-diagnostic) |
+| Cleanup/declaration/PCH tools | [Validation tooling](validation.md#deduplication-reports) |
+| Log queries and capture provenance | [Logging](logging.md) |
 
-Build, tool build, test, and both tidy operations automatically retain output in
-[wrapper transcripts](logging.md#wrapper-build-test-and-tidy-transcripts).
-`MMLTK_BUILD_LOG_FILE`, `MMLTK_TEST_LOG_FILE`, and `MMLTK_TIDY_LOG_FILE`
-override their destinations; relative paths use the invocation directory.
-Test help/list routes skip capture. A new `--test all` replaces earlier tests
-owned by this checkout; [replacement scope and failures](validation.md#replacing-an-active-test-run)
-also apply when `all` has filters.
+Build/tools-build/test/tidy automatically retain [transcripts](logging.md#wrapper-build-test-and-tidy-transcripts).
+Overrides: `MMLTK_BUILD_LOG_FILE`, `MMLTK_TEST_LOG_FILE`, `MMLTK_TIDY_LOG_FILE`;
+relative paths use the invocation directory. Test help/list skips capture. New
+`--test all`, including filtered runs, [replaces earlier checkout-owned tests](validation.md#replacing-an-active-test-run).
 
 ### Native tool entrypoints
 
-The wrapper and CMake invoke compiled tool modules through
-`mmltk --tool COMMAND [--argv0 LOGICAL] -- ARGS...` inside the owning process
-or container. The [canonical command vocabulary and composition](build.md#composition-and-fixture-isolation)
-supply command identities, spelling, child invocations, and exhaustive
-entrypoint selection. Logical program names may retain an earlier script suffix
-in help or evidence; they identify native commands rather than script files.
-Use the public operations above for their image admission, path rewriting,
-mounts, limits, ownership, and transcripts. The build-timing entrypoint is
-itself an orchestrator that calls `./mmltk --build`.
+The wrapper/CMake invoke compiled modules as
+`mmltk --tool COMMAND [--argv0 LOGICAL] -- ARGS...` in their owning process or
+container. [Reflected vocabulary/dispatch](build.md#composition-and-fixture-isolation)
+own names and exhaustive entrypoint selection; logical names may retain script
+suffixes without identifying script files. Public operations supply image
+admission, paths, mounts, limits, ownership, and transcripts. Build timing is an
+orchestrator calling `./mmltk --build`.
 
-[Build ownership](build.md#standalone-tools-module-graph) describes the
-driver and isolated process/plugin boundaries.
-[Native fixture selection](validation.md#native-tool-fixtures) maps the six
-fixture commands to their public suites and separate runner.
+[Build ownership](build.md#standalone-tools-module-graph) covers process/plugin
+boundaries; [fixtures](validation.md#native-tool-fixtures) map six commands to
+public suites and the separate runner.
 
 ### GUI session replacement
 
-A new `./mmltk --gui` stops earlier GUI and raw application invocations owned
-by this checkout before starting its browser host. Runtime admission is
-serialized, and the lifetime lock remains exclusive to the active GUI. An
-older launch delayed before admission cannot replace an already admitted
-newer runtime.
+`--gui` retires earlier GUI/raw app invocations from this checkout before
+launching. Admission is serialized; the GUI holds the runtime lifetime lock.
+An older delayed invocation cannot replace a newer admitted runtime.
 
-Owner registrations under `.cache/locks/runtime-run-*.owner` cover startup
-before a container exists. Container labels also identify sessions started
-before registrations were introduced. Replacement matches the repository,
-wrapper mode, PID, and process-start identity. It requests graceful shutdown,
-uses bounded waits and forced retirement if needed, and confirms the old
-containers and runtime lock have retired before starting the new session.
-Normal exit removes the owner's registration.
+`.cache/locks/runtime-run-*.owner` covers pre-container startup; labels also
+identify earlier container sessions. Matching uses repository, mode, PID, and
+process-start identity. Replacement requests graceful stop, waits with bounded
+force if needed, then verifies both containers and lock retired. Exit removes
+registration.
 
-Builds, tests, other repositories, and unrelated processes remain outside this
-replacement scope. Raw application invocations may run together, but a new raw
-invocation is refused while the GUI is active. `--prepare-gui-container` also
-refuses an occupied runtime instead of replacing it.
+Builds, tests, other checkouts, and unrelated processes are excluded. Raw apps
+may coexist; new raw execution and `--prepare-gui-container` are refused while
+the GUI occupies runtime.
 
 ### Process snapshots
 
@@ -117,21 +99,16 @@ refuses an occupied runtime instead of replacing it.
 ./mmltk --diagnose-processes test
 ```
 
-The default selects all running containers labeled as wrapper-owned by this
-repository. The optional argument matches the exact wrapper mode label; `test`
-includes both test compilation and execution. Output identifies each container
-and mode, then reports PID, parent PID, elapsed time, CPU time, CPU/memory
-percentages, process state, wait channel, and process name. It omits command
-arguments and environment variables.
+Default selects this checkout's running wrapper containers; an optional mode
+matches its exact label (`test` covers compilation and execution). Each prints
+container/mode, PID/PPID, elapsed/CPU time, CPU/memory percentages, state, wait
+channel, and process name; arguments/environment are omitted. No match succeeds
+silently. A snapshot alone proves neither stall, completion, nor performance.
 
-Snapshots require a running daemon and are read-only: no daemon start,
-container creation/mutation, process attachment, or image build/pull. Each daemon
-query has a 15-second deadline. A selection with no matching container succeeds
-with empty output. A snapshot alone establishes neither a stall, completion,
-nor performance.
-
-Explicit process actions accept `mmltk` or a native executable basename of the
-form `mmltk[_-][A-Za-z0-9_-]+` and require exactly one matching wrapper container:
+Read-only snapshots require a running daemon, with 15 seconds per query: no
+daemon start, container creation/mutation/attachment, or image build/pull.
+Explicit actions require exactly one container and a running `mmltk` or
+`mmltk[_-][A-Za-z0-9_-]+` executable, verified through `/proc/PID/exe`:
 
 ```bash
 ./mmltk --diagnose-processes test --backtrace mmltk_backend_models_rfdetr_training_tests
@@ -139,79 +116,52 @@ form `mmltk[_-][A-Za-z0-9_-]+` and require exactly one matching wrapper containe
 ./mmltk --diagnose-processes test --terminate mmltk_backend_models_rfdetr_training_tests --pid 123
 ```
 
-The examples require that executable to be running. `--pid` is a container PID
-selector for an action, not a host PID. Selection verifies `/proc/PID/exe`,
-rather than command text. Backtrace attaches GDB as container root, collects
-all thread stacks, and detaches under a 35-second debugger deadline. Read-file
-uses the selected process's root namespace, accepts an absolute regular-file
-path, and prints escaped bytes up to 4 MiB. Terminate sends SIGTERM through a
-pidfd to the selected process and can fail the interrupted operation. These
-explicit actions are distinct from the read-only snapshot; none creates or
-builds a container. Wrapper action execution is bounded to 45 seconds.
+| Action | Behavior |
+| --- | --- |
+| `--backtrace NAME` | Root GDB attach, all threads, detach; 35-second debugger limit |
+| `--read-file NAME --file PATH` | Absolute regular file through selected process root; escaped bytes, ≤4 MiB |
+| `--terminate NAME` | pidfd SIGTERM; can fail the interrupted operation |
+
+Optional `--pid` is a **container PID** selector. Actions take ≤45 seconds,
+build/create no container, and are distinct from read-only snapshots.
 
 ### Benchmark image geometry
 
-`./mmltk --diagnose-benchmark-image --help` describes the numeric image ID and
-repository-relative inputs. Alternatively, `--compiled PATH --sample N`
-resolves an eligible zero-based physical compiled slot to its source identity
-and objects. `N` is the displayed compiled ID, not its filtered gallery position
-or a dense ordinal among eligible images. Inactive/out-of-range slots and
-unsupported formats fail. The native record includes eligible `image_count`,
-physical `slot_count`, used `label_bytes`, and header `max_label_bytes`.
-Add `--profile-compiled WORKERS` (1–64) to time the shared trusted
-`CompiledDataset` open. The `opening` record reports elapsed nanoseconds,
-recorded label/run totals, and actual worker affinity/NUMA/nice settings.
-One worker runs serially on the calling thread. Opening copies and summarizes
-the index without verifying sample metadata or payloads.
-`--cold-compiled` requests cache eviction for
-that file before opening; it neither drops global caches nor modifies data.
-The diagnostic permits native memory-policy inspection and worker priority
-selection while retaining read-only input mounts and no network. Without this
-option, inspection reads only the selected sample. `./mmltk info --compiled
-PATH` also prints the header's maximum complete label payload in bytes.
-
-Repeat `--index PATH` to inspect version-3 normalized annotation rows; add
-`--objects` for their object records. Use `--image PATH` for a cached image or
-`--archive PATH` to find the image in a retained tar archive. JSONL output includes
-dimensions, archive member, image identity, encoded SHA-256, and JPEG EXIF
-orientation when present. Headers establish geometry, not full decodability.
-`--parquet PATH` inspects the matching COCONut row's original embedded PNG and
-segment metadata; `--panoptic PATH` inspects an extracted panoptic PNG. These
-count exact RGB segment IDs and report each declared segment's pixel support
-when metadata is available. The wrapper prepares only the required
-[CMake diagnostic targets](build.md#benchmark-diagnostic-builds) with the existing
-development image. The compiled-sample helper uses the Dataset system's checked
-layout and trusted annotation views; the mask helper links native Arrow/Parquet and the
-vendored PNG decoder. No Python Parquet package or new dependency is installed.
-
-`--export-mask-runs` requires exactly one `--index` and writes the selected
-image's normalized objects to
-`build/validation/benchmark-image/ID.originals.json`. It retains the annotation
-identity, dimensions, boxes, flags, source IDs/ordinals, area, and exact row-major
-runs. Export is bounded to 65,535 objects, 65,535 runs per object, and 1,048,576
-runs per image. For example:
-
 ```bash
+./mmltk --diagnose-benchmark-image --help
 ./mmltk --diagnose-benchmark-image --image-id 2212 \
   --index .cache/benchmark-dataset/v1/indexes/coco/train2017.normalized.bin \
   --export-mask-runs
 ```
 
-This inspects the selected retained index; it does not compile or enable
-[mask recovery](benchmark-datasets.md#optional-dropped-mask-recovery).
+Inputs are repository-relative; select a numeric `--image-id`, or
+`--compiled PATH --sample N`. Compiled `N` is the zero-based physical/displayed
+ID, not filtered position or eligible-image ordinal. Inactive/out-of-range
+slots and unsupported formats fail. Records retain `image_count`, physical
+`slot_count`, used `label_bytes`, and header `max_label_bytes`; `./mmltk info
+--compiled PATH` also prints the maximum complete label payload.
 
-The inspection runs in the existing development image with networking disabled,
-read-only source mounts, no image build or pull, and a ten-minute deadline.
-Required native-target preparation uses the separate reusable CMake cache and
-writes build output to stderr, preserving JSONL on stdout. Help and
-index/image/archive queries use the native tool without configuring or building
-product-dependent targets. Optional
-`--export` copies the matched encoded image to
-`build/validation/benchmark-image/ID.jpg` or `ID.png` for inspection, replacing
-an earlier diagnostic copy. Mask inspection additionally exports the exact
-`ID.mask.png` and a segment-color visualization `ID.segments.png`. It does not
-change the source cache. Tar scans are sequential, and each inspected image is
-bounded to 64 MiB.
+| Option | Inspection |
+| --- | --- |
+| Repeat `--index PATH` | Version-3 normalized rows; `--objects` adds objects |
+| `--image PATH`, `--archive PATH` | Cached image or retained tar member; dimensions, identity, SHA-256, member, JPEG EXIF orientation. Header geometry does not prove decodability |
+| `--parquet PATH`, `--panoptic PATH` | Original COCONut PNG/segment metadata or extracted panoptic PNG; exact RGB IDs and declared segment pixel support |
+| `--profile-compiled WORKERS` | Trusted shared open, 1–64 workers (one runs on caller); nanoseconds, recorded totals, actual affinity/NUMA/nice. Copies/aggregates index without payload/per-sample verification |
+| `--cold-compiled` | Request eviction for this file only, without global cache drop or data changes |
+| `--export-mask-runs` | Exactly one index; `build/validation/benchmark-image/ID.originals.json` with identity, geometry, flags, source IDs/ordinals, area, exact row-major runs; ≤65,535 objects/runs per object and ≤1,048,576 runs per image |
+| `--export` | Replace diagnostic `ID.jpg`/`.png`; mask inspection also writes exact `ID.mask.png` and colored `ID.segments.png` |
+
+The tool never changes source cache or enables [mask recovery](benchmark-datasets.md#optional-dropped-mask-recovery).
+Tar scans are sequential; each image is ≤64 MiB. Existing-development-image
+inspection uses read-only mounts, no network/build/pull, and a ten-minute limit.
+Profiling permits memory-policy inspection/worker priority. Without profiling,
+only the selected sample is read.
+
+Only compiled/Parquet/panoptic requests prepare [CMake-owned helpers](build.md#benchmark-diagnostic-builds)
+in a reusable separate graph, logging preparation to stderr and JSONL to stdout.
+Compiled helpers use checked Dataset layout/trusted annotations; masks use native
+Arrow/Parquet and vendored PNG. Help/index/image/archive need no product graph,
+Python package, or new dependency.
 
 ## Native CLI
 
@@ -235,17 +185,13 @@ The wrapper prevents raw native CLI invocation while its GUI is active,
 including `--help`. Close that GUI before invoking the native CLI. Command
 declarations remain available in the source links below.
 
-Top-level commands compile source datasets, inspect compiled metadata,
-benchmark loading, or dispatch RF-DETR work. RF-DETR exposes `compile`, `info`,
-`build-engine`, `export-onnx`, `predict`, `evaluate`, `validate`, `train`, and
-`normalize-weights`. Their options come from
-[rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h) and the native contract;
-use command help for required fields and current defaults.
-Root compile/info/bench declarations live in
-[cli_options.h](../src/entrypoints/cli/cli_options.h); command execution remains
-in the corresponding `.cpp` owners. The
-[authoring reference](reflection.md#compact-cli-declarations) explains derived
-names, explicit spelling exceptions, aliases, negation, and exposure audits.
+Root compile/info/bench options come from [cli_options.h](../src/entrypoints/cli/cli_options.h).
+RF-DETR exposes `compile`, `info`, `build-engine`, `export-onnx`, `predict`,
+`evaluate`, `validate`, `train`, and `normalize-weights`, declared in
+[rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h). Execution
+stays with corresponding `.cpp` owners. Command help owns required fields and
+defaults; [declaration authoring](reflection.md#compact-cli-declarations) covers
+names, exceptions, aliases, negation, and exposure audits.
 
 For example, with existing input artifacts:
 
@@ -277,17 +223,12 @@ Key option groups (required fields and defaults remain in command help):
 | `rfdetr evaluate`, `validate` | One backend or ordered multi-backend report, respectively; independent `--candidate-count` and `--eval-max-dets` |
 | Train / Predict counts | Train exposes `--eval-max-dets`; Predict uses `--max-dets-per-image`; [count semantics and zero defaults](rfdetr-workflows.md#model-input-and-detection-selection) |
 
-Both `compile` routes expose `--workers` as a shared CPU budget. It respects
-eligible CPUs; live work classes and bounded file/Curl service use that budget.
-The [compilation reference](compile-execution.md) owns scheduling, checked
-page-locked storage preparation, and exceptional inputs. Worker count is not
-a count of independent per-source controller pools or a process-memory cap.
-CPU compiler profiling uses the separate `--test data-profile` operation;
-ordinary `bench` measures compiled loading. Production-size Coconut profiling
-requires explicit `--mode Coconut` and `--cache-dir`, and can acquire missing
-sources. It is outside ordinary `all` tests; the
-[profile reference](validation.md#data-compilation-and-resampling-profiles)
-defines modes, byte-rate meaning, and bounded input options.
+Both compile routes share `--workers` across live work classes and file/Curl
+services within eligible CPUs; it counts neither per-source pools nor a memory
+cap. [Compilation](compile-execution.md) owns scheduling, checked pinning, and
+exceptional inputs. `bench` measures compiled loading; [data-profile](validation.md#data-compilation-and-resampling-profiles)
+measures compilation. Full Coconut requires explicit mode/cache selection and
+may acquire sources; ordinary `all` omits it.
 
 [RF-DETR workflows](rfdetr-workflows.md) owns checkpoint, metric, and history behavior.
 Train, predict and evaluate accept `--compile-mode none|selective|full`.

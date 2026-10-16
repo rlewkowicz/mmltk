@@ -1,4 +1,5 @@
 #include <ATen/Context.h>
+#include <c10/core/TensorImpl.h>
 #include <ATen/CPUGeneratorImpl.h>
 #include <cuda_runtime_api.h>
 #include <ATen/TensorIndexing.h>
@@ -111,7 +112,8 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
 };
 namespace {
 using namespace torch::indexing;
-constexpr std::string_view kQueryFeatureWeight = "query_feat.weight", kReferencePointWeight = "refpoint_embed.weight";
+using detail::kQueryFeatureWeight;
+using detail::kReferencePointWeight;
 // Backbone features come out at their own spatial resolution, so the padding mask has to be rebound
 // to each feature map. Every backbone path does it the same way, so the resize lives here once.
 torch::Tensor resize_mask_to_feature(const torch::Tensor& mask, const torch::Tensor& feature) {
@@ -134,6 +136,7 @@ struct NativeTransformerOutput {
  torch::Tensor enc_boxes;
  torch::Tensor keypoint_hidden_states;
  torch::Tensor enc_keypoints;
+ torch::Tensor enc_logits;
 };
 torch::Tensor gen_sineembed_for_position(const torch::Tensor& pos_tensor, int64_t dim) {
  const double scale = 2.0 * M_PI;
@@ -308,7 +311,7 @@ public:
   const torch::Tensor& keypoint_memory = {}) {
   const auto attended = isolated_group_self_attention(self_attn, tgt, query_pos, query_layout, force_math_attention_);
   auto output = norm1->forward(tgt + attended);
-  auto cross = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
+  auto cross = cross_attn->forward(positioned_attention_input(output, query_pos, is_training()), reference_points, memory, feature_layout, memory_key_padding_mask);
   output = post_cross_attention(output, cross);
   if (keypoints) {
    auto& joints = *keypoints;
@@ -353,7 +356,7 @@ private:
   // These RF-DETR dropout probabilities are permanently zero. Calling dropout
   // still records it, and JIT autodiff's native_dropout consumes CUDA RNG at p=0.
   auto output = norm2->forward(residual + cross);
-  auto feed_forward = detail::linear_forward(*linear2, torch::relu(detail::linear_forward(*linear1, output)));
+  auto feed_forward = detail::linear_forward(*linear2, detail::linear_relu_forward(*linear1, output));
   return norm3->forward(output + feed_forward);
  }
  torch::nn::Linear inst_in_proj{nullptr}, inst_pos_in_proj{nullptr}, inst_out_proj{nullptr}, memory_in_proj{nullptr}, kp_linear1{nullptr}, kp_linear3{nullptr};
@@ -501,6 +504,7 @@ std::pair<torch::Tensor, torch::Tensor> gen_encoder_output_proposals(const torch
 }
 class NativeTransformerImpl : public torch::nn::Module {
 public:
+ [[nodiscard]] std::vector<torch::Tensor> decoder_parameters() const { return decoder->parameters(); }
  explicit NativeTransformerImpl(const NativeRfDetrConfig& config, const KeypointTensorLayout& keypoints)
      : decoder(register_module("decoder", std::make_shared<NativeDecoderImpl>(config, keypoints))),
        enc_output(register_module("enc_output", torch::nn::ModuleList())),
@@ -616,40 +620,66 @@ public:
   torch::Tensor refs_unsigmoid;
   torch::Tensor enc_memory;
   torch::Tensor enc_boxes;
+  torch::Tensor enc_logits;
   torch::Tensor decoder_refpoints;
   torch::Tensor keypoint_hidden_states, enc_keypoints;
   const auto keypoint_memory = keypoint_features.defined() ? keypoint_features.flatten(2).transpose(1, 2) : torch::Tensor{};
   if (config_.two_stage) {
    mmltk::common::logging::ScopedProfile profile_rfdetr_model_transformer_two_stage{"rfdetr.model.transformer.two_stage"};
    auto [output_memory, output_proposals] = gen_encoder_output_proposals(memory, mask_flatten_tensor, layout.spatial_shapes(), !config_.bbox_reparam);
-   std::vector<torch::Tensor> refpoint_embed_ts;
-   std::vector<torch::Tensor> memory_ts;
-   std::vector<torch::Tensor> boxes_ts;
    const int64_t groups = training_mode ? std::max<int64_t>(1, config_.group_detr) : 1;
-   refpoint_embed_ts.reserve(static_cast<size_t>(groups));
-   memory_ts.reserve(static_cast<size_t>(groups));
-   boxes_ts.reserve(static_cast<size_t>(groups));
-   for (int64_t group_index = 0; group_index < groups; ++group_index) {
-    auto output_memory_group = enc_output_norm->at<torch::nn::LayerNormImpl>(static_cast<size_t>(group_index))
-                                .forward(detail::linear_forward(enc_output->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)), output_memory));
-    auto enc_outputs_class = detail::linear_forward(enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)), output_memory_group);
-    auto proposal_scores = std::get<0>(enc_outputs_class.max(-1));
+   torch::Tensor topk_refs;
+   if (groups > 1) {
+    const auto expanded_memory = output_memory.unsqueeze(0).expand({groups, -1, -1, -1});
+    auto all_memory = detail::grouped_linear_forward(expanded_memory, groups,
+     [&](std::size_t group) -> const torch::nn::LinearImpl& { return enc_output->at<torch::nn::LinearImpl>(group); });
+    std::vector<torch::Tensor> norm_weights, norm_biases;
+    std::vector<const RfDetrMlpImpl*> box_heads;
+    norm_weights.reserve(groups);
+    norm_biases.reserve(groups);
+    box_heads.reserve(groups);
+    for (int64_t group = 0; group < groups; ++group) {
+     const auto& norm = enc_output_norm->at<torch::nn::LayerNormImpl>(group);
+     norm_weights.push_back(norm.weight);
+     norm_biases.push_back(norm.bias);
+     box_heads.push_back(&enc_out_bbox_embed->at<RfDetrMlpImpl>(group));
+    }
+    const auto normalized = F::layer_norm(all_memory, F::LayerNormFuncOptions({config_.hidden_dim}).eps(enc_output_norm->at<torch::nn::LayerNormImpl>(0).options.eps()));
+    all_memory = normalized * torch::stack(norm_weights).view({groups, 1, 1, config_.hidden_dim}) + torch::stack(norm_biases).view({groups, 1, 1, config_.hidden_dim});
+    const auto all_logits = detail::grouped_linear_forward(all_memory, groups,
+     [&](std::size_t group) -> const torch::nn::LinearImpl& { return enc_out_class_embed->at<torch::nn::LinearImpl>(group); });
+    const int64_t topk = std::min<int64_t>(config_.num_queries, output_memory.size(1));
+    const auto topk_indices = std::get<1>(std::get<0>(all_logits.max(-1)).topk(topk, -1));
+    if (encoder_indices) *encoder_indices = topk_indices.unbind(0);
+    const auto selected_memory = all_memory.gather(2, topk_indices.unsqueeze(-1).expand({groups, batch, topk, config_.hidden_dim}));
+    const auto selected_proposals = output_proposals.unsqueeze(0).expand({groups, -1, -1, -1}).gather(2, topk_indices.unsqueeze(-1).expand({groups, batch, topk, 4}));
+    const auto coord_delta = RfDetrMlpImpl::grouped_forward(selected_memory, box_heads);
+    const auto gathered_boxes = config_.bbox_reparam ? reparam_box_refine(selected_proposals, coord_delta) : coord_delta + selected_proposals;
+    const auto merge_groups = [&](const torch::Tensor& value) { return value.permute({1, 0, 2, 3}).reshape({batch, groups * topk, value.size(-1)}); };
+    enc_memory = merge_groups(selected_memory);
+    const auto boxes = merge_groups(gathered_boxes);
+    enc_boxes = config_.bbox_reparam ? boxes : boxes.sigmoid();
+    topk_refs = merge_groups(gathered_boxes.detach());
+    enc_logits = merge_groups(all_logits.gather(2, topk_indices.unsqueeze(-1).expand({groups, batch, topk, all_logits.size(-1)})));
+   } else {
+    const auto output_memory_prenorm = detail::linear_forward(enc_output->at<torch::nn::LinearImpl>(0), output_memory);
+    auto output_memory_group = enc_output_norm->at<torch::nn::LayerNormImpl>(0).forward(output_memory_prenorm);
+    const auto enc_outputs_class = detail::linear_forward(enc_out_class_embed->at<torch::nn::LinearImpl>(0), output_memory_group);
     const int64_t topk = std::min<int64_t>(config_.num_queries, enc_outputs_class.size(1));
-    auto topk_indices = std::get<1>(proposal_scores.topk(topk, 1));
+    const auto topk_indices = std::get<1>(std::get<0>(enc_outputs_class.max(-1)).topk(topk, 1));
     if (encoder_indices) encoder_indices->push_back(topk_indices);
-    auto selected_memory = output_memory_group.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, config_.hidden_dim}));
+    // Upstream normalizes only the gathered rows for the differentiable
+    // proposal path. Gathering the full norm's output preserves values but
+    // changes its backward reduction and AMP rounding.
+    enc_memory = enc_output_norm->at<torch::nn::LayerNormImpl>(0).forward(output_memory_prenorm.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, config_.hidden_dim})));
     const auto selected_proposals = output_proposals.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, 4}));
-    const auto coord_delta = enc_out_bbox_embed->at<RfDetrMlpImpl>(static_cast<size_t>(group_index)).forward(selected_memory);
-    auto gathered_boxes = config_.bbox_reparam ? reparam_box_refine(selected_proposals, coord_delta) : coord_delta + selected_proposals;
-    refpoint_embed_ts.push_back(gathered_boxes.detach());
-    boxes_ts.push_back(gathered_boxes);
-    memory_ts.push_back(std::move(selected_memory));
+    const auto coord_delta = enc_out_bbox_embed->at<RfDetrMlpImpl>(0).forward(enc_memory);
+    const auto boxes = config_.bbox_reparam ? reparam_box_refine(selected_proposals, coord_delta) : coord_delta + selected_proposals;
+    topk_refs = boxes.detach();
+    enc_boxes = config_.bbox_reparam ? boxes : boxes.sigmoid();
    }
-   enc_memory = torch::cat(memory_ts, 1);
-   enc_boxes = config_.bbox_reparam ? torch::cat(boxes_ts, 1) : torch::cat(boxes_ts, 1).sigmoid();
    if (config_.dec_layers > 0) {
     decoder_refpoints = refpoint_embed.unsqueeze(0).repeat({batch, 1, 1});
-    auto topk_refs = torch::cat(refpoint_embed_ts, 1);
     const int64_t ts_len = topk_refs.size(1);
     auto refpoints_ts_subset = decoder_refpoints.narrow(1, 0, ts_len);
     auto refpoints_subset = decoder_refpoints.narrow(1, ts_len, decoder_refpoints.size(1) - ts_len);
@@ -703,6 +733,7 @@ public:
    std::move(enc_boxes),
    std::move(keypoint_hidden_states),
    std::move(enc_keypoints),
+   std::move(enc_logits),
   };
  }
 
@@ -768,15 +799,6 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout
   if (auto* weight = params.find("layers.2.weight")) { weight->zero_(); }
   if (auto* bias = params.find("layers.2.bias")) { bias->zero_(); }
   std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->initialize_detector_heads(class_embed, *bbox);
- }
- if (config_.dec_layers == 0) {
-  // These official Atto tensors are state, but never participate in its graph.
-  // Excluding them from the active optimizer inventory also avoids invented moments.
-  for (auto& parameter : named_parameters()) {
-   const auto& name = parameter.key();
-   if (name.starts_with("class_embed.") || name.starts_with("bbox_embed.") || name == kQueryFeatureWeight || name == kReferencePointWeight || name.starts_with("transformer.decoder."))
-    parameter.value().set_requires_grad(false);
-  }
  }
  if (training_supervision_enabled(config_.training_supervision)) {
   auto generator = at::detail::getDefaultCPUGenerator();
@@ -1065,7 +1087,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_ordinary(
  if (config_.two_stage && transformed.enc_memory.defined() && transformed.enc_boxes.defined()) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_encoder_heads{"rfdetr.model.forward.encoder_heads"};
   OutputLayer enc_output;
-  enc_output.pred_logits = transformer->encoder_class_logits(transformed.enc_memory, is_training());
+  enc_output.pred_logits = transformed.enc_logits.defined() ? transformed.enc_logits : transformer->encoder_class_logits(transformed.enc_memory, is_training());
   enc_output.pred_boxes = transformed.enc_boxes;
   if (keypoint_embed_) {
    enc_output.pred_keypoints = keypoint_layout_.pad(transformed.enc_keypoints);
@@ -1391,6 +1413,8 @@ std::shared_ptr<NativeRfDetrModel> NativeRfDetrModel::make_inference_clone(std::
   };
   bind(clone->impl_->named_parameters(true), weights->parameters);
   bind(clone->impl_->named_buffers(true), weights->buffers);
+  // Migrate module-owned derived caches after rebinding registered state.
+  clone->impl_->to(source_device);
   clone->impl_->immutable_weights_ = std::move(weights);
   clone->eval();
   clone->optimize_for_inference(batch_size, false, mode);
@@ -1411,6 +1435,22 @@ std::shared_ptr<NativeRfDetrModel> NativeRfDetrModel::make_inference_clone(std::
 }
 std::vector<torch::Tensor> NativeRfDetrModel::parameters(bool recurse) const { return impl_->parameters(recurse); }
 torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_parameters(bool recurse) const { return impl_->named_parameters(recurse); }
+torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_optimizer_parameters() const {
+ auto parameters = impl_->named_parameters();
+ if (impl_->config_.dec_layers != 0) return parameters;
+ std::unordered_set<const c10::TensorImpl*> inactive;
+ const auto append = [&](const std::vector<torch::Tensor>& values) {
+  for (const auto& tensor : values) inactive.insert(tensor.unsafeGetTensorImpl());
+ };
+ append(impl_->class_embed->parameters());
+ append(impl_->bbox_embed_->parameters());
+ append(impl_->refpoint_embed->parameters());
+ append(impl_->query_feat->parameters());
+ append(static_cast<const NativeTransformerImpl&>(*impl_->transformer_).decoder_parameters());
+ for (auto& item : parameters)
+  if (inactive.contains(item.value().unsafeGetTensorImpl())) item.value() = item.value().detach();
+ return parameters;
+}
 torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_buffers(bool recurse) const { return impl_->named_buffers(recurse); }
 void NativeRfDetrModel::replicate_training_supervision_runtime_from(const NativeRfDetrModel& source) {
  impl_->require_mutable();

@@ -91,16 +91,18 @@ if(BUILD_RFDETR_NATIVE)
     mmltk_register_ordinary_sources(
         mmltk_backend_ml_runtime
         backend_factory.cpp
-        backend_onnx.cpp
         backend_tensorrt.cpp
         onnx_environment.cpp
         runtime_validation.cpp
         tensorrt_runtime.cpp)
+    mmltk_register_retained_module_importers(
+        mmltk_backend_ml_runtime backend_onnx.cpp)
     mmltk_register_private_headers(
         mmltk_backend_ml_runtime detail/tensorrt_engine_access.h)
     target_link_libraries(mmltk_backend_ml_runtime
         PRIVATE
             CUDA::cudart
+            mmltk::common::logging
             mmltk::frameworks::gpu
             mmltk::vendor::onnxruntime
             mmltk::vendor::tensorrt_nvinfer

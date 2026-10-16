@@ -500,11 +500,12 @@ private:
      throw std::runtime_error("Prediction preview metadata exceeds the visual product limits");
    }
    auto document = product.raw->Document(contracts::WorkspaceResource::From("predict://image", pending.content_identity), static_cast<std::uint32_t>(product.source_index));
-   const auto frame = visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, candidate.revision());
-   PredictImageMetadata metadata{pending.content_identity, frame, document->facts(), std::move(labels), product.image_id, preview};
-   if (!visual_metadata_admitted(metadata, kPredictImageByteBudget)) throw std::runtime_error("Prediction preview metadata exceeds the aggregate publication capacity");
    const std::array regions{detail::PredictionPreviewComposition::Region{product.raw, {0U, 0U, product.extent.width, product.extent.height}}};
    detail::PredictionPreviewComposition::Draw(runtime, candidate, product.extent, regions, detail::PredictionPreviewComposition::Options::Prediction(preview));
+   auto frame = visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, candidate.revision());
+   frame.content = {0U, 0U, product.extent.width, product.extent.height};
+   PredictImageMetadata metadata{pending.content_identity, frame, document->facts(), std::move(labels), product.image_id, preview};
+   if (!visual_metadata_admitted(metadata, kPredictImageByteBudget)) throw std::runtime_error("Prediction preview metadata exceeds the aggregate publication capacity");
    detail::VisualRuntimeOwner::Notification notification = [this, frame, labels = std::move(metadata.labels), identity = product.image_id, content_identity = pending.content_identity, preview,
                                                             document = std::move(document)]() mutable {
     PredictSnapshot changed;

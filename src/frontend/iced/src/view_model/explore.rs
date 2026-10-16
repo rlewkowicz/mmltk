@@ -253,6 +253,8 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                                 Some(
                                     PresentationSourceKind::Explore
                                         | PresentationSourceKind::Validation
+                                        | PresentationSourceKind::Predict
+                                        | PresentationSourceKind::Live
                                         | PresentationSourceKind::Upscale
                                 )
                             )

@@ -2965,7 +2965,7 @@ TEST_CASE("Keypoint evidence requires current paired catalog retained derived an
   PixelCase{"live-new-model-restart", "workflow.visual.workspace", 17, 17, 17, 0, false, false, false},
   PixelCase{"live-failure-retained", "workflow.visual.workspace", 100, 80, 0, 0, true, false, false},
   PixelCase{"live-upscale", "workflow.visual.workspace", 17, 17, 17, 0, false, false, false},
-  PixelCase{"live-import-clean", "annotation.workspace.surface", 17, 17, 0, 17, false, true, false},
+  PixelCase{"live-import-clean", "workflow.visual.workspace", 17, 17, 0, 17, false, true, false},
   PixelCase{"catalog-pe-image", "workflow.visual.workspace", 17, 17, 0, 17, false, false, true},
  };
  for (const auto& record : cases) {
@@ -3018,6 +3018,8 @@ TEST_CASE("Catalog workflow evidence joins canonical prepared models to actual n
  }
  audit.consume(
   {{"event", "integration.keypoint.training-artifact"}, {"control", "/session/training/catalog-keypoint/model.pt"}, {"detail", "actual-run"}, {"a", pose_model}, {"b", 2U}, {"c", 4U}, {"d", .5}});
+ audit.consume(
+  {{"event", "integration.keypoint.training-output"}, {"control", "/session/training/catalog-keypoint"}, {"detail", "actual-run"}, {"a", pose_model}, {"b", 2U}, {"c", 4U}, {"d", .5}});
  REQUIRE(audit.keypoint_catalog_complete());
  SECTION("selection only") { audit.keypoint_catalog.erase({pe, "completed"}); }
  SECTION("custom compact model") { audit.keypoint_catalog.at({pose, "prepared"})["control"] = "rf-detr-nano"; }
@@ -3026,6 +3028,8 @@ TEST_CASE("Catalog workflow evidence joins canonical prepared models to actual n
  SECTION("wrong prepared model") { audit.keypoint_catalog.at({pose, "completed"})["a"] = 11; }
  SECTION("no native execution") { audit.workflow_gpu_runs.erase({"train", 2}); }
  SECTION("wrong artifact run") { audit.keypoint_training_artifact["b"] = 1; }
+ SECTION("wrong output run") { audit.keypoint_training_output["detail"] = "another-run"; }
+ SECTION("missing output identity") { audit.keypoint_training_output.erase("a"); }
  CHECK_FALSE(audit.keypoint_catalog_complete());
 }
 TEST_CASE("Catalog keypoint training requires matching native admission and successful settlement", "[workspace][audit][keypoints][model]") {

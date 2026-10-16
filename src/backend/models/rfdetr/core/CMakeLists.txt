@@ -25,6 +25,14 @@ add_library(
     mmltk::backend::models::rfdetr::core
     ALIAS mmltk_backend_models_rfdetr_core
 )
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC 16 misdiagnoses Torch compiled_autograd's tagged IValue packing.
+    # LTO can merge its inline definitions with differently diagnosed consumers,
+    # so keep these custom Function instantiations outside cross-unit LTO as
+    # well as suppressing the vendor false positive in their own compilation.
+    set_source_files_properties(linear.cpp segmentation_depthwise.cpp PROPERTIES
+        COMPILE_OPTIONS "-Wno-stringop-overflow;-Wno-null-dereference;-fno-lto")
+endif()
 mmltk_configure_component(
     mmltk_backend_models_rfdetr_core PUBLIC_DECLARATIONS)
 
@@ -90,6 +98,7 @@ mmltk_register_ordinary_sources(
     keypoint_ops.cpp
     keypoint_evaluation.cpp
     decoder_attention.cpp
+    linear.cpp
     segmentation_depthwise.cpp
     gpu_batch_preprocessor.cpp
     detection_geometry.cpp

@@ -132,6 +132,7 @@ struct RuntimeBackendOptions final {
  std::int32_t device = 0;
  BorrowedCommandStream command_stream{};
  bool allow_fp16 = true;
+ bool allow_tf32 = true;
 };
 class RuntimeBackend : public std::enable_shared_from_this<RuntimeBackend> {
 public:
@@ -185,7 +186,7 @@ protected:
  [[nodiscard]] CudaLane& cuda_lane() noexcept { return lane_; }
  [[nodiscard]] const CudaLane& cuda_lane() const noexcept { return lane_; }
  [[nodiscard]] virtual RawSubmission Submit(const RuntimeTensorBuffer& input, std::span<RuntimeTensorBuffer> outputs, RuntimeContinuation continuation) = 0;
- virtual void ReleaseBackendResources() noexcept = 0;
+ [[nodiscard]] virtual RuntimeStatus ReleaseBackendResources() noexcept = 0;
 
 private:
  enum class LaneState : std::uint8_t {

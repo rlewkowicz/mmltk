@@ -2,24 +2,19 @@
 
 [Wiki index](README.md) · [Architecture](architecture.md#reflected-value-and-persistence-boundaries) · [Rust generator and CBOR](application-wire.md) · [Declaration tooling](validation.md#raw-cpd-and-declaration-formatting)
 
-Canonical C++ declarations own native vocabulary, defaults, constraints, field
-identity, and structural projections. Ordinary systems own resources, execution,
-and product policy; Rust/Iced owns presentation and interaction, as defined by
-[the contract](../CONTRACT.md#model-presentation-model-and-views).
-This page owns authoring syntax; [the application boundary](application-wire.md)
-owns schema admission, generated projections, wire representations and compatibility.
-The independent driver's reflected command vocabulary belongs to its
-[native tools composition](build.md#composition-and-fixture-isolation).
+Canonical C++ declarations own vocabulary, defaults, constraints and projections;
+ordinary systems own execution/resources; Rust/Iced owns presentation.
+[Application wire](application-wire.md) defines schema admission and compatibility;
+[native tools](build.md#composition-and-fixture-isolation) defines wrapper commands.
+This page defines authoring syntax.
 
 ## Declare once, project structurally
 
-Declare canonical product types beside their systems in self-contained ordinary
-headers with direct dependencies. Materialize reflection there; publish ordinary
-types, functions, constants, or reusable template specializations so consumers
-need neither re-reflection nor include-order assumptions.
-[CMake registration](build.md#target-declarations-and-precompiled-headers) owns
-source/header membership and generation inputs, without a parallel scanner or
-field inventory.
+Declare types beside their systems in self-contained ordinary headers with
+direct dependencies. Materialize reflection there and publish ordinary APIs so
+consumers need neither re-reflection nor include-order assumptions.
+[CMake](build.md#target-declarations-and-precompiled-headers) owns membership,
+generation inputs and header isolation.
 
 Use [reflected_declarations.h](../src/frameworks/reflection/reflected_declarations.h)
 when authoring annotated reflected types. This ordinary surface includes
@@ -57,23 +52,17 @@ MMLTK_REFLECT_FIELDS(ExportOptions)
 }  // namespace example
 ```
 
-The struct, initializer, equality, and registration remain explicit C++.
-Register its header with the owning CMake target and include its dependencies
-directly. Declaration consumers use the owner's compile requirements;
-[header isolation](build.md#target-declarations-and-precompiled-headers) checks
-that the header does not rely on a PCH or a preceding include.
+Keep the type, initializer, equality and registration explicit. Register the
+header with its CMake owner; consumers inherit that owner's compile requirements.
+Header isolation checks independence from PCHs and preceding includes.
 
 ## Short annotation syntax
 
 [declaration_annotations.h](../src/frameworks/reflection/declaration_annotations.h)
-is a syntax-only header directly over `field_policy.h`. Each macro expands to
-the same absolutely qualified annotation type and braced initialization that a
-long declaration would use. Values occur once, and normal type checking and
-narrowing rules remain in force.
-
-These are the twelve public annotation authoring macros. Apply them immediately
-before the canonical data member; their spelling introduces no runtime storage
-or execution policy.
+provides these twelve syntax-only macros over `field_policy.h`. Apply them before
+the member. Each expands to the absolutely qualified annotation and braced
+initializer, evaluates its value once, and retains C++ typing/narrowing rules.
+They introduce no runtime storage or execution policy.
 
 | Spelling | Canonical annotation | Use and admission |
 | --- | --- | --- |
@@ -206,15 +195,12 @@ finite marker, nonzero maximum bytes, or nonzero maximum items; it is not a rule
 that every unannotated member must become a flag. Training also audits its
 recipe-provider relation and single/list device selectors against the table.
 
-The complete production declarations live in `cli_options.h`,
-[rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h), and
+Production options live in `cli_options.h`,
+[rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h) and
 [browser_runtime_options.h](../src/entrypoints/desktop/browser_runtime_options.h).
-Their CMake owners register the headers; the CLI owner also registers isolation
-checks for its new declaration headers. Ordinary option additions belong in
-those declarations; special request finalization stays with the command owner.
-For example, root compile fills an absent height from an
-explicit width by canonical member presence, as described in
-[dataset compilation](datasets.md#compile-and-inspect).
+Their CMake owners register headers/isolation checks. Add ordinary options there;
+command-specific finalization stays local, including [height inferred from an
+explicit width](datasets.md#compile-and-inspect).
 
 ## Local repetition and aliases
 
@@ -225,20 +211,11 @@ the existing materialized-member visitor for complete same-name records,
 including `ExploreViewState`; renamed keys and conversions remain explicit in
 [settings persistence](architecture.md#reflected-value-and-persistence-boundaries).
 
-Purposeful local macro families retain narrow owners and are undefined after
-use:
-
-| Owner | Local family and purpose |
-| --- | --- |
-| `rfdetr_cli_options.h` | `MMLTK_AUGMENTATION_OPTIONS` emits probability, minimum-strength, and maximum-strength descriptors for the six ordered geometry/resize/color/noise/blur/occlusion groups. |
-| `reflected_field_policy.h` | `MMLTK_VALUE_ANNOTATION` defines the five value predicates with the same marker/convertibility contract. |
-| `application_schema.h` | `MMLTK_SYSTEM_METHOD_SIGNATURE` defines zero/one-request member signatures for ordinary, const, noexcept, and const-noexcept methods. |
-| [onnx_lowering.cpp](../src/backend/models/rfdetr/export/onnx_lowering.cpp) | `MMLTK_ONNX_LOWERING_TABLE` and `MMLTK_LOWER_*` emit the existing typed lowering callbacks for node, context, symbol, creation, and resize entries. |
-| [ms_deform_im2col_cuda.cuh](../src/backend/ml/layers/detail/ms_deform_im2col_cuda.cuh) | `MMLTK_ML_LAYERS_*` shares fixed CUDA parameter, body, launch, and specialized dispatch syntax while ordinary functions/templates retain the algorithms. |
-
-These implementation-local expansions are not extension points for a universal
-DSL. Prefer an existing ordinary owner or a small constexpr function when it
-already represents the repeated behavior.
+Implementation-local macros are undefined after use: RF-DETR augmentation
+option triples, field-policy value predicates, ordinary member-signature forms,
+ONNX lowering callbacks and CUDA deformable-attention dispatch. They consolidate
+syntax within those owners; they are not general extension points. Prefer an
+existing owner or constexpr function for repeated behavior.
 
 ## Safe mechanical formatting
 

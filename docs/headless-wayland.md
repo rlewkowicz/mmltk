@@ -2,8 +2,7 @@
 
 [Wiki index](README.md) · [Validation](validation.md) · [Logging](logging.md) · [Build prerequisites](build.md)
 
-Run the existing packaged Firefox/NVIDIA acceptance suite with a private
-GPU-rendered Weston output:
+Run packaged Firefox/NVIDIA acceptance on a private GPU-rendered Weston output:
 
 ```sh
 ./mmltk --test workspace-wayland --headless-compositor
@@ -11,108 +10,84 @@ GPU-rendered Weston output:
 ./mmltk --test workspace-wayland --headless-compositor -- workspace_wayland_workflows
 ```
 
-Omit `--headless-compositor` to use the existing visible host Wayland session.
-The headless option creates a cached validation image from the exact packaged
-runtime image. It installs pinned Weston packages, a Wayland inspection client,
-and a validation-only input-seat module compiled in the build image. It does
-not rebuild or replace the packaged application or Firefox.
+Build the package first with `./mmltk --build`. Omit `--headless-compositor` for
+the active host Wayland session. The validation image extends the exact packaged
+runtime with pinned Weston, a Wayland inspection client, and an input-seat module;
+it does not rebuild the application or Firefox. Both display routes use the
+same [application assertions and progress deadlines](validation.md#packaged-wayland-acceptance).
 
-The [acceptance reference](validation.md#packaged-wayland-acceptance) owns the
-workflow cases and their independent native, rendered, and physical-settlement
-assertions. Headless cases share this compositor and the same progress deadlines.
-
-Two focused checks avoid building the native acceptance graph:
+## Preflight and supervisor fixtures
 
 ```sh
 ./mmltk --test headless-compositor
+./mmltk --test headless-compositor -- /usr/bin/wayland-info
 ./mmltk --test headless-compositor-tool
 ```
 
-The first starts the real NVIDIA compositor, checks the initialized EGL/GL
-vendor and DMA-BUF import-modifier extension, performs a Wayland roundtrip,
-checks the output, shell and DMA-BUF protocol globals and an input seat with
-both pointer and keyboard capabilities, then shuts down.
-Only `workspace-wayland` additionally validates application native import,
-WebGPU/Vulkan, swapchain, presentation, and shutdown. The second check exercises
-supervisor ownership, readiness, failure, deadlines, and signals in the existing
-build image without GPU access. It uses the separate native `mmltk-tests`
-runner and also runs within unfiltered `all`;
-[fixture selection](validation.md#selection-environment-deadlines-and-debugging)
-supports listing or retrying individual cases.
+These avoid building the native acceptance graph:
 
-`headless-compositor` also accepts a command after `--`; its default command
-is `/usr/bin/true`. This is the wrapper entrypoint for diagnostics that need
-the packaged runtime and private compositor:
+| Suite | Coverage |
+| --- | --- |
+| `headless-compositor` | Real NVIDIA EGL/GL vendor, DMA-BUF import-modifier extension, Wayland roundtrip, output/shell/DMA-BUF globals, pointer+keyboard seat, and shutdown; command after `--` defaults to `/usr/bin/true` |
+| `headless-compositor-tool` | Supervisor ownership, readiness, failure, deadlines, and signals in the existing build image, without GPU; separate `mmltk-tests` runner, also included in unfiltered `all` |
 
-```sh
-./mmltk --test headless-compositor -- /usr/bin/wayland-info
-```
+Only `workspace-wayland` additionally checks application import, WebGPU/Vulkan,
+swapchain, presentation, and shutdown. See [fixture selection](validation.md#selection-environment-deadlines-and-debugging)
+for listing and retrying supervisor cases.
 
-Each compositor invocation records `weston.log`, `weston-stderr.log`,
-`wayland-info.log`, and lifecycle `supervisor.jsonl` in a unique
-`build/validation/headless-compositor-*` directory printed by the runner.
-The acceptance executable retains its normal artifacts and assertions.
-`./mmltk --logs build/validation --recursive -q headless` includes lifecycle
-records; pass the printed directory to inspect one compositor run.
+Each real compositor run prints a unique `build/validation/headless-compositor-*`
+directory containing `weston.log`, `weston-stderr.log`, `wayland-info.log`, and
+`supervisor.jsonl`. Application acceptance retains its own artifacts. Query one
+printed directory with `./mmltk --logs PATH`; `--logs build/validation --recursive
+-q headless` searches lifecycle records across runs.
 
-The supervisor selects a 1920×1080, scale-one virtual output, the desktop shell,
-and disabled idle blanking. Its
-[configuration](../tools/wayland/headless-weston.ini) disables Xwayland, locking,
-and the panel. The process owns a private runtime directory and socket; it does
-not connect to the host display or session bus.
-Startup waits up to 30 seconds for Weston's `systemd-notify.so` READY datagram,
-then up to 10 seconds for the protocol roundtrip. The supervised command has
-no whole-executable deadline. The acceptance executable retains its own
-[granular progress and settlement deadlines](validation.md#selection-environment-deadlines-and-debugging),
-and the supervisor continues monitoring compositor death and interruption.
-Owned process groups receive TERM at shutdown and KILL after a five-second
-grace period. Linux process descriptors wait for surviving descendants even
-when their group leader has exited. A second bounded wait follows KILL;
-compositor loss, failed preflight and unclean shutdown fail the wrapper.
+## Output, readiness, and shutdown
 
-Headless containers inherit a one-byte soft and hard core limit. Linux uses
-that exact value to suppress piped OS core handlers as well as ordinary core
-files; a zero limit alone does not suppress piped handlers such as
-systemd-coredump. This policy applies to the compositor, probe, acceptance
-command and their descendants without changing the host's core configuration.
-Firefox also retains its application-owned crash-reporter disable setting.
-See the [Linux core-handler implementation](https://github.com/torvalds/linux/blob/master/fs/coredump.c).
+[headless-weston.ini](../tools/wayland/headless-weston.ini) selects a 1920×1080,
+scale-one virtual output, desktop shell, and no idle blanking, Xwayland, locking,
+or panel. A private runtime directory/socket isolates it from the host display
+and session bus.
 
-NVIDIA's driver must support the surfaceless EGL platform, DMA-BUF imports and
-modifiers exposed by Weston. The runner forces the NVIDIA EGL vendor and GL
-renderer and fails if those capabilities are unavailable. It never selects
-Pixman, a software renderer, X11 or Firefox's headless mode. Successful startup
-does not prove that every exported native format/modifier is accepted: those
-negotiations remain covered by the application hardware assertions. The
-compositor's DMA-BUF capability is distinct from the producer's
-[Vulkan opaque-FD export and CUDA import](gpu-execution.md#shared-workspace-interoperability).
-A headless output also does not exercise physical KMS scanout, monitor timing,
-or the host desktop compositor; retain visible runs when those are required.
+| Boundary | Limit |
+| --- | --- |
+| Weston `systemd-notify.so` READY datagram | 30 seconds |
+| Protocol roundtrip | 10 seconds |
+| Supervised command | No whole-executable deadline; application checks retain granular deadlines |
+| Process-group shutdown | TERM, five-second grace, KILL, then a second bounded wait |
+
+The supervisor monitors compositor death and interruption. Linux process
+descriptors wait for surviving descendants after their leader exits. Compositor
+loss, failed preflight, or unclean shutdown fails the wrapper.
+
+The container gives the compositor, probe, command, and descendants one-byte soft
+and hard core limits. Linux treats that exact value as suppression of both core
+files and piped handlers such as systemd-coredump; zero alone does not suppress
+piped handlers. Host core configuration is unchanged. Firefox's application-owned
+crash-reporter disable setting also applies. See [Linux coredump handling](https://github.com/torvalds/linux/blob/master/fs/coredump.c).
+
+NVIDIA must provide surfaceless EGL and Weston's required DMA-BUF imports/modifiers.
+The runner forces NVIDIA EGL and GL and fails when unavailable. It uses no
+Pixman/software renderer, X11, or Firefox headless path. Preflight does not prove
+all native format/modifier negotiations; application acceptance owns those.
+Compositor DMA-BUF support is distinct from [Vulkan opaque-FD export/CUDA import](gpu-execution.md#shared-workspace-interoperability).
+Virtual output does not exercise physical KMS scanout, monitor timing, or host
+compositor behavior; use visible acceptance when those matter.
 
 ## Validation input seat
 
-Ubuntu Weston `13.0.0-4build3` is pinned for both the module builder's
-`libweston-13-dev` and the validation runtime's `weston`/`libweston-13-0`.
-[headless_weston_seat.cpp](../tools/wayland/headless_weston_seat.cpp) uses the packaged
-public structures and four version-scoped exported lifecycle functions:
-`weston_seat_init`, `weston_seat_init_pointer`, `weston_seat_init_keyboard`,
-and `weston_seat_release`. Its named module retains an ordinary shared-library
-C ABI through a CMake-generated `wet_module_init` adapter. Those lifecycle
-declarations are private Weston API, so a package update requires rechecking
-their signatures and lifetimes.
+[Dockerfile.wayland-validation](../docker/Dockerfile.wayland-validation) pins
+Ubuntu Weston `13.0.0-4build3` for builder `libweston-13-dev` and runtime
+`weston`/`libweston-13-0`. [headless_weston_seat.cpp](../tools/wayland/headless_weston_seat.cpp)
+uses packaged structures and private, version-scoped exports `weston_seat_init`,
+`weston_seat_init_pointer`, `weston_seat_init_keyboard`, and `weston_seat_release`.
+A package update requires rechecking signatures and lifetimes.
 
-The module installs a `default` seat and releases it through the compositor's
-destroy signal. Partial construction also releases initialized state. It loads
-from `/usr/lib/weston/mmltk-headless-seat.so` before the readiness module.
-[Dockerfile.wayland-validation](../docker/Dockerfile.wayland-validation) owns
-the package pin and isolated tools-graph build. The native
-[headless_compositor.cpp](../tools/wayland/headless_compositor.cpp) module owns session
-startup, seat/protocol readiness, and teardown in the wrapper-selected child
-process. The seat plugin stays in Weston; its libraries are independent of the
-[standalone driver](build.md#isolated-process-and-plugin-owners). The build
-reference also records the plugin's
-[standard-library and vendor-header boundary](build.md#standard-library-provider-and-textual-boundaries).
-
-The synthetic seat supplies Firefox/GTK and acceptance capabilities; it certifies
-neither physical input devices nor host-desktop focus. Preflight proves setup
-and teardown; application scenarios own interaction and image assertions.
+The named module exposes a CMake-generated `wet_module_init` C ABI adapter and
+loads from `/usr/lib/weston/mmltk-headless-seat.so` before readiness. It installs
+`default`, releasing initialized state on partial construction or compositor
+destruction. [headless_compositor.cpp](../tools/wayland/headless_compositor.cpp)
+owns session startup, readiness, and teardown in the wrapper-selected child.
+The plugin's libraries remain in Weston, separate from the
+[driver](build.md#isolated-process-and-plugin-owners); its [header boundary](build.md#standard-library-provider-and-textual-boundaries)
+is also documented there. The synthetic seat supplies Firefox/GTK acceptance
+capabilities, not physical-device or host-focus certification.

@@ -4,38 +4,15 @@ This is the authoritative architecture for the Linux, CUDA, and Wayland
 application. It defines system boundaries, resource ownership, and stable
 product outcomes. Implementation and action plans converge toward it.
 
-## Application shape
-
-The application shell constructs and connects independent product systems:
-
-```text
-Application shell
-├─ Browser server
-├─ Settings
-├─ File dialogs
-├─ Dataset compilation and inspection
-├─ Model selection and preparation
-├─ Training
-├─ Validation
-├─ Export
-├─ Prediction
-├─ Exploration
-├─ Annotation
-├─ Upscaling
-├─ Live capture
-├─ Presentation
-└─ Firefox process ownership
-```
-
-Each product domain is an independent ordinary C++ system with a cohesive
-public API, direct typed methods, minimal reflected snapshots, and typed UI
-events. The shell supplies narrow dependencies and the application event sink.
-Each system owns its mutable domain state and execution for its workload.
-
 ## Ownership
 
-Consumers use the owner's typed API, snapshots, or borrowed reads. Generated
-bindings project native facts; mutation remains with the owning system.
+The application shell constructs independent ordinary C++ product systems and
+supplies narrow dependencies and the application event sink. Each system owns
+its mutable domain state and workload execution, exposing a cohesive public API,
+direct typed methods, minimal reflected snapshots, and typed UI events.
+Consumers use that owner's
+API, snapshots, or borrowed reads. Generated bindings project native facts;
+mutation remains with the owner.
 
 | Concept | Sole mutable owner |
 | --- | --- |

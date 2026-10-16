@@ -174,7 +174,7 @@ TEST_CASE("RF-DETR complete catalog projects task-aware topology and stock coeff
  atto.two_stage = false;
  CHECK_FALSE(native_model_config_valid(atto));
  auto pose = native_config_from_preset(*find_preset_catalog_entry("rf-detr-keypoint-preview"));
- CHECK(pose.keypoints_per_class == std::vector<std::uint16_t>{17U});
+ CHECK(pose.keypoints_per_class == std::vector<std::uint16_t>{0U, 17U});
  CHECK(find_preset_catalog_entry("rf-detr-keypoint-preview")->official_class_layout == OfficialClassLayout::PersonBackgroundFirst);
  CHECK(pose.cls_loss_coef == 2.0);
  CHECK(pose.keypoint_l1_loss_coef == 1.0);

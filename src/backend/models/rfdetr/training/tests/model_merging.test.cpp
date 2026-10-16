@@ -376,7 +376,10 @@ TEST_CASE("native artifact metadata remains authoritative under misleading legac
  unnamed.metadata.preset_name.clear();
  const auto path = temp.path() / "checkpoint.pt";
  r::save_native_checkpoint(path, unnamed);
- CHECK_THROWS(r::resolve_model_state(path, {}, 0));
+ CHECK(r::resolve_model_state(path, {}, 0).artifacts.config.preset_name == "rf-detr-nano");
+ unnamed.metadata.native_configuration.clear();
+ CHECK_THROWS(r::save_native_checkpoint(path, unnamed));
+ CHECK(r::resolve_model_state(path, {}, 0).artifacts.config.preset_name == "rf-detr-nano");
 }
 TEST_CASE("native averaging checks mixed storage and invalid inputs before receiver mutation", "[model][rfdetr][training][merge]") {
  std::vector<r::NormalizedModelStateEntry> a{{"half", torch::ones({2}, torch::kFloat16)}, {"double", torch::ones({2}, torch::kFloat64)}, {"integer", torch::ones({2}, torch::kInt64)}};

@@ -31,25 +31,21 @@ direction into one coherent implementation and complete the phase.
 
 ## Optimization
 
-Minimize loops, CPU/GPU transfer, memory churn, blocking, and unnecessary
-allocation; maximize useful parallelism. Prefer pinned application memory
-where appropriate and O(1) algorithms where practical. Use compact, well-defined
-types and tightly task-sized buffers; allocate long-lived buffers once and
-reuse aggressively.
+Minimize loops, CPU/GPU transfers, memory churn, blocking, and allocations;
+maximize useful parallelism. Prefer appropriate pinned memory and practical
+O(1) algorithms. Use compact, well-defined types and task-sized buffers;
+allocate long-lived buffers once and reuse them.
 
 ## Platform
 
-This is a Linux-only data system. Optimize for Linux and spend no effort on
-macOS or Windows compatibility.
+Linux only; spend no effort on macOS or Windows compatibility.
 
 ## third_party
 
-`third_party` may be modified as part of this codebase. Keep application logic
-in the application layer.
-
-Preserve vendored build/language policies unless explicitly changed by the task;
-the core toolchain policy does not migrate `third_party`. Firefox retains its
-cached Clang toolchain and bootstrap sysroot.
+`third_party` may be modified; application logic stays in the application layer.
+Preserve vendored build/language policies unless the task changes them explicitly.
+Core toolchain changes do not migrate dependencies. Firefox retains its cached
+Clang toolchain and bootstrap sysroot.
 
 ## Containerization
 
@@ -92,12 +88,16 @@ Keep each document within its audience and purpose:
   and operations. Put detailed commands, formats, code explanations, diagrams,
   and procedures here. Give each fact one authoritative home; link instead of
   duplicating it.
+- Review reports are local artifacts under ignored `build/validation/`, not
+  documentation. Never add or commit review reports.
 
-The documentation agent chooses and evolves the smallest coherent hierarchy
-for the material, updates stale facts, names, links, and examples, adds missing
-index entries, and removes obsolete duplication while preserving nuance.
-Do not manufacture architecture or infer behavior from old prose when source,
-generated artifacts, or wrapper help can establish it.
+Keep references terse, accurate, human-readable, and limited to current state.
+Preserve semantic information; remove duplication and historical run narratives.
+Pages must stand alone without prior conversation context. Link authoritative
+pin/configuration files instead of embedding literal Git commit hashes.
+Use the smallest coherent hierarchy, maintain its index, and verify facts, names,
+links, and examples against source, generated artifacts, or wrapper help.
+Do not infer architecture or behavior from old prose.
 
 ## Building
 
@@ -487,11 +487,9 @@ or `remediationplan.md`.
 
 ## Tests
 
-Tests must verify the desired outcomes in `actionplan.md` and `CONTRACT.md`.
-Do not fork production logic for tests or add or retain fallback paths merely
-to make tests pass. Fix the implementation to meet those requirements. Change
-stale expectations only when the required outcome explicitly supersedes them;
-never weaken required behavior to obtain a passing result.
+Tests verify `actionplan.md` and `CONTRACT.md` outcomes. Fix implementation;
+never fork production logic, retain test-only fallbacks, or weaken required
+behavior to pass. Update stale expectations only when requirements supersede them.
 
 Do not add regression tests. You may add standard tests that exercise required
 behavior, boundaries, failure handling, resource safety, and integration.
@@ -499,6 +497,11 @@ During `actionplan.md` execution, final test selection is fixed by
 [Final Validation](#final-validation-workflow). Outside an action plan, select
 focused tests for the changed behavior and affected boundaries; running all
 tests is optional.
+External upstream tensor references and historical-session preparation are
+opt-in with `--with-upstream`; ordinary suites must not generate them. Reuse
+explicit evidence paths for remaining checks, retain completed results, and
+remove tensor payloads after their last required consumer. See
+[upstream validation](docs/validation.md#independent-upstream-diagnostic).
 A new `--test all`, including filtered invocations, replaces earlier test runs
 owned by this checkout; [focused suite names preserve them](docs/validation.md#replacing-an-active-test-run).
 

@@ -134,7 +134,7 @@ struct DocumentState final {
  return {.first = {.x = std::min(first.x, second.x), .y = std::min(first.y, second.y)}, .second = {.x = std::max(first.x, second.x), .y = std::max(first.y, second.y)}};
 }
 [[nodiscard]] bool object_valid_for(const domain::AnnotationObject& object, const std::size_t categories, const AnnotationSceneContent& scene) {
- if (!object.valid() || object.category >= categories || !point_in_frame(scene, object.point) || !point_in_frame(scene, object.box.first) || !point_in_frame(scene, object.box.second)) {
+ if (!object.valid() || !object.schema_matches(scene.keypoint_schemas) || object.category >= categories || !point_in_frame(scene, object.point) || !point_in_frame(scene, object.box.first) || !point_in_frame(scene, object.box.second)) {
   return false;
  }
  return std::ranges::all_of(object.mask_points, [&scene](const auto& point) { return point_in_frame(scene, point); }) && std::ranges::all_of(object.spline_knots, [&scene](const auto& knot) {
@@ -188,36 +188,37 @@ struct ObjectAfterView final {
  }
  return false;
 }
-[[nodiscard]] bool facts_valid_for(const AnnotationSceneContent& scene, const AnnotationEditorFacts& facts, const JournalView* entry = nullptr) {
- if (!mmltk::frameworks::reflection::enum_contains(facts.tool)) { return false; }
+[[nodiscard]] DocumentOutcome facts_admission(const AnnotationSceneContent& scene, const AnnotationEditorFacts& facts, const JournalView* entry = nullptr) {
+ if (!mmltk::frameworks::reflection::enum_contains(facts.tool)) { return DocumentOutcome::Rejected; }
  ObjectAfterView objects{.scene = scene, .entry = entry};
- if (facts.selected_object && *facts.selected_object >= objects.size()) return false;
+ if (facts.selected_object && *facts.selected_object >= objects.size()) return DocumentOutcome::Rejected;
  const auto* category = entry ? std::get_if<JournalEntry::Category>(&entry->entry.mutation) : nullptr;
  const std::size_t category_count = scene.categories.size() +
                                     ((category && !entry->Before(category->before_present, category->after_present) && entry->After(category->before_present, category->after_present)) ? 1U : 0U) -
                                     ((category && entry->Before(category->before_present, category->after_present) && !entry->After(category->before_present, category->after_present)) ? 1U : 0U);
- if (facts.selected_category && *facts.selected_category >= category_count) return false;
+ if (facts.selected_category && *facts.selected_category >= category_count) return DocumentOutcome::Rejected;
  if (facts.selected_spline_segment) {
-  if (!facts.selected_object) return false;
+  if (!facts.selected_object) return DocumentOutcome::Rejected;
   const auto* object = objects.at(*facts.selected_object);
-  if (!object || *facts.selected_spline_segment >= object->spline_knots.size()) return false;
+  if (!object || *facts.selected_spline_segment >= object->spline_knots.size()) return DocumentOutcome::Rejected;
  }
  if (facts.selected_skeleton_joint) {
-  if (!facts.selected_object) return false;
+  if (!facts.selected_object) return DocumentOutcome::Rejected;
   const auto* object = objects.at(*facts.selected_object);
-  if (!object || *facts.selected_skeleton_joint >= object->skeleton_nodes.size()) return false;
+  if (!object || *facts.selected_skeleton_joint >= object->skeleton_nodes.size()) return DocumentOutcome::Rejected;
  }
  domain::AnnotationDocumentBudget budget;
  for (const auto& schema : scene.keypoint_schemas)
-  if (!budget.AddSchema(schema)) return false;
+  if (!budget.AddSchema(schema)) return DocumentOutcome::Capacity;
  for (std::size_t index = 0U; index != objects.size(); ++index) {
   const auto* object = objects.at(index);
-  if (!object || !object_valid_for(*object, category_count, scene) || !budget.AddObject(*object, scene.keypoint_schemas)) return false;
+  if (!object || !object_valid_for(*object, category_count, scene)) return DocumentOutcome::Rejected;
+  if (!budget.AddObject(*object)) return DocumentOutcome::Capacity;
  }
- return true;
+ return DocumentOutcome::Applied;
 }
-[[nodiscard]] bool entry_forward_valid(const DocumentState& state, const JournalView& entry) {
- if (entry.before != state.ui.editor || entry.entry.mutation.valueless_by_exception()) return false;
+[[nodiscard]] DocumentOutcome entry_admission(const DocumentState& state, const JournalView& entry) {
+ if (entry.before != state.ui.editor || entry.entry.mutation.valueless_by_exception()) return DocumentOutcome::Rejected;
  const auto& scene = state.ui.scene;
  const bool mutation_valid = std::visit([&scene, &entry](const auto& mutation) {
   using Mutation = std::remove_cvref_t<decltype(mutation)>;
@@ -245,7 +246,7 @@ struct ObjectAfterView final {
    return entry.Before(mutation.before_index, mutation.after_index) == scene.frame_index && entry.Before(mutation.before_ready, mutation.after_ready) == scene.frame_ready;
   }
  }, entry.entry.mutation);
- return mutation_valid && facts_valid_for(scene, entry.after(), &entry);
+ return mutation_valid ? facts_admission(scene, entry.after(), &entry) : DocumentOutcome::Rejected;
 }
 template <class T>
 void prepare_append(std::vector<T>& values) {
@@ -395,19 +396,10 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
 }
 [[nodiscard]] DocumentOutcome commit(DocumentState& state, JournalEntry entry) {
  if (!current(state)) return refused(state);
- if (!entry_forward_valid(state, JournalView{entry, false, entry.before})) return refused(state);
+ if (const auto outcome = entry_admission(state, JournalView{entry, false, entry.before}); outcome != DocumentOutcome::Applied)
+  return outcome == DocumentOutcome::Capacity ? capacity(state) : refused(state);
  if (!entry_changes(entry)) return DocumentOutcome::Applied;
  if (!next_revision_available(state)) return refused(state);
- if (const auto* object = std::get_if<JournalEntry::Object>(&entry.mutation)) {
-  std::size_t runs = object->after_present ? object->after.mask.runs.size() : 0U;
-  if (runs > domain::kAnnotationMaskRunCapacity) return capacity(state);
-  for (std::size_t index = 0U; index < state.ui.scene.objects.size(); ++index) {
-   if (object->before_present && index == object->index) continue;
-   const auto count = state.ui.scene.objects[index].mask.runs.size();
-   if (count > domain::kAnnotationMaskRunCapacity - runs) return capacity(state);
-   runs += count;
-  }
- }
  identify_mutation(state, entry);
  if (state.undo.size() == kHistoryCapacity) state.undo.pop_front();
  std::vector<domain::AnnotationColor> palette;
@@ -422,7 +414,8 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
 [[nodiscard]] DocumentOutcome change_editor_facts(DocumentState& state, const std::function_ref<void(AnnotationEditorFacts&)> mutate) {
  auto after = state.ui.editor;
  mutate(after);
- if (!facts_valid_for(state.ui.scene, after)) return refused(state);
+ if (const auto outcome = facts_admission(state.ui.scene, after); outcome != DocumentOutcome::Applied)
+  return outcome == DocumentOutcome::Capacity ? capacity(state) : refused(state);
  if (after == state.ui.editor) return DocumentOutcome::Applied;
  state.pointer = {};
  state.ui.editor = after;
@@ -442,7 +435,8 @@ enum class JournalDirection : std::uint8_t {
  if (destination.size() == kHistoryCapacity) destination.pop_front();
  if (!next_revision_available(state)) return refused(state);
  const JournalView applied{source.back(), direction == JournalDirection::Undo, state.ui.editor};
- if (!entry_forward_valid(state, applied)) return refused(state);
+ if (const auto outcome = entry_admission(state, applied); outcome != DocumentOutcome::Applied)
+  return outcome == DocumentOutcome::Capacity ? capacity(state) : refused(state);
  std::vector<domain::AnnotationColor> palette;
  auto prepared = prepare_application(state, applied, palette);
  // Allocate the deque node while the source still owns the complete history.

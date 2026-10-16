@@ -1,346 +1,280 @@
 # RF-DETR training and native compilation
 
-[Wiki index](README.md) · [Workflow and artifacts](rfdetr-workflows.md) · [Model merging and Resume](model-merging.md) · [Validation evidence](validation.md#training-mathematics-and-compilation-evidence) · [Compilation diagnostics](logging.md#native-selective-compilation)
+[Wiki index](README.md) · [Workflows](rfdetr-workflows.md) · [Merging and Resume](model-merging.md) · [Validation](validation.md#training-mathematics-and-compilation-evidence) · [Compilation diagnostics](logging.md#native-selective-compilation)
 
 ## Reference scope
 
-Stock Hungarian training targets the mathematics of
-[RF-DETR commit e9a138f70cc14e3fddca029a0683055e34ab8f35](https://github.com/roboflow/rf-detr/tree/e9a138f70cc14e3fddca029a0683055e34ab8f35).
-Comparisons require equivalent model configuration, admitted tensors,
-stochastic samples, and optimizer settings. Native compiled-data membership,
-augmentation choices, class layouts and model catalog dimensions retain their
-own contracts. Native training drops incomplete effective batches; the pinned
-upstream can repeat or pad data to fill accumulation windows. Equal equations
-on an admitted sequence therefore do not imply identical epoch trajectories.
+[Source pins](../tools/oracle/rfdetr_sources.json) identify the upstream core,
+plus models and dependencies used by numerical references. Comparisons require
+equivalent configuration, admitted tensors, stochastic samples and optimizer
+settings. Native compiled-data membership, augmentation, class layout and catalog
+dimensions remain native policy. Training drops incomplete effective batches;
+upstream may repeat/pad data to fill accumulation windows, so matched equations
+do not imply matching epoch trajectories.
 
 The native [runtime](../src/backend/models/rfdetr/core/runtime.cpp) disables
-cuBLAS and cuDNN TF32. Upstream selects float32 matmul precision `high`.
-Tensor dtype, autocast, and internal matrix/convolution precision are separate
-policies. Numerical fixtures control precision and stochastic inputs;
-checkpoint import equivalence alone is not a training-mathematics oracle.
-The [validation reference](validation.md#training-mathematics-and-compilation-evidence)
-owns coverage, tolerances and evidence limits. These checks establish neither
-COCO AP, convergence, throughput nor bitwise equivalence to upstream's default
-kernel selection.
-
-[nvidia-payload.json](../docker/nvidia-payload.json) pins NGC 26.08 and Torch
-`2.14.0a0+4fdf77b940`. Upstream dependency links below explain equations, not the
-installed payload's entire implementation. [GPU selection](gpu-execution.md#workflow-device-selection)
-and [failure/OOM handling](rfdetr-workflows.md#local-training-failures) have
-separate operational contracts.
-
-The [four source reviews and their closure](reviews/rfdetr-math/README.md)
-distinguish the reviewed baseline from the completed native repairs and actual
-upstream execution. Matched-state equations and optimizer updates have required
-numerical gates; independent training trajectories retain their measured
-differences. Neither is an AP experiment.
+cuBLAS/cuDNN TF32; upstream selects float32 matmul precision `high`. Tensor
+dtype, autocast and internal matrix/convolution precision are distinct. The
+[container payload](../docker/nvidia-payload.json) pins NGC/Torch;
+[validation](validation.md#training-mathematics-and-compilation-evidence) defines
+numerical gates, controlled inputs and evidence limits. Checkpoint equivalence
+alone establishes neither mathematical parity nor AP, convergence, throughput
+or bitwise agreement under default kernels. Independent trajectories retain
+measured differences. [Device selection](gpu-execution.md#workflow-device-selection)
+and [failure handling](rfdetr-workflows.md#local-training-failures) are separate.
 
 ## Stock objective and mask mathematics
 
-[NativeRfDetrConfig](../src/backend/models/rfdetr/contract/model_config.h) and
-the [preset catalog](../src/backend/models/rfdetr/contract/preset_catalog.h)
-own the recipe. Fresh training applies current stock loss coefficients
-independently of loss metadata embedded in imported weights. Resume retains its
-admitted configuration. Stock catalog coefficients are classification 1,
-L1 box 5 and GIoU 2; segmentation additionally uses mask BCE 5 and Dice 5,
-with point-sampling ratio 16. Matcher classification/L1/GIoU weights remain
-2/5/2. Objective coefficients and matching costs have distinct roles.
+[Configuration](../src/backend/models/rfdetr/contract/model_config.h) and the
+[preset catalog](../src/backend/models/rfdetr/contract/preset_catalog.h) own task
+coefficients. Fresh training applies the stock recipe independently of imported
+loss metadata; Resume retains admitted configuration. Detection/segmentation
+classification/L1/GIoU coefficients are 1/5/2; mask BCE/Dice are 5/5 with point
+ratio 16. Keypoint Preview uses classification 2 and joint L1/findability/
+visibility/NLL coefficients 1/1/1/1. Matcher classification/L1/GIoU costs are
+2/5/2; matching costs and objective coefficients are distinct.
 
-The ordinary [criterion](../src/backend/models/rfdetr/core/detection_ops.cpp)
-retains configured classification policy, including stock IA-BCE and the
-focal/varifocal/position-supervised alternatives. Group-DETR assignment operates
-independently within each query group. The target normalizer remains a device
-scalar: the summed target count for one global logical microbatch, multiplied
-by the group count when group losses are averaged, then clamped to at least one. Main,
-selected auxiliary decoder, and two-stage encoder outputs contribute their
-weighted classification, L1, GIoU and applicable mask losses.
-Disabling `aux_loss` omits intermediate ordinary decoder outputs and their
-criterion terms while retaining the final and configured encoder outputs.
+The [criterion](../src/backend/models/rfdetr/core/detection_ops.cpp) supports
+stock IA-BCE and configured focal/varifocal/position-supervised alternatives.
+Group-DETR assigns independently within query groups. The target denominator
+is a device scalar: summed targets in one global logical microbatch, multiplied
+by group count when group losses are averaged, then clamped to at least one.
+Final, selected auxiliary decoder and configured encoder outputs contribute
+weighted task losses. `aux_loss=false` omits intermediate ordinary decoder
+outputs/terms while retaining final and configured encoder outputs.
 
-Both compact CUDA and dense matcher routes calculate costs in FP32. Untouched
-upstream AMP can round intermediate classification, box, and mask costs
-differently and choose different assignments. The executable reference retains
-that stock policy as a separate observation; its main AMP comparison supplies
-FP32 operands to the original upstream matcher functions. IA-BCE casts detached
-quality separately to the positive and negative weight destinations before
-scattering matched entries, preserving each destination's rounded target boundary.
+Dense and compact CUDA matcher costs use FP32. Untouched upstream AMP may round
+costs differently and change assignments; references retain that stock result
+as an observation and supply FP32 operands to upstream matcher functions for
+the main comparison. IA-BCE separately casts detached quality into positive
+and negative destination dtypes before scattering matched entries.
 
-Training geometry follows the pinned
-[box operations](https://github.com/roboflow/rf-detr/blob/e9a138f70cc14e3fddca029a0683055e34ab8f35/src/rfdetr/utilities/box_ops.py):
-nonnegative center-box extents, FP16/BF16 area promotion, and `1e-7` clamps on
-union and enclosing-area denominators. Deployment's box projection remains its
-own consumer. Weighted matcher costs retain nonfinite values until the full
-layer Cartesian domain is sanitized before image/group slicing. The replacement
-uses finite maximum plus maximum absolute magnitude plus one, bounded by the
-dtype maximum. A zero-point stock mask matcher retains its exceptional
-nonfinite/sentinel behavior.
+Training boxes use nonnegative center-box extents, FP16/BF16 area promotion and
+`1e-7` union/enclosing-area clamps. Deployment projection is separate. Weighted
+matcher costs keep nonfinite values until the complete layer Cartesian domain
+is sanitized before slicing groups/images. Replacement is finite maximum plus
+maximum absolute magnitude plus one, bounded by dtype maximum. Zero-point stock
+mask matching retains its exceptional nonfinite/sentinel behavior.
 
-The shared [mask-loss implementation](../src/backend/models/rfdetr/core/training_mask_loss.cpp)
-owns dense/sparse projection, packed categorical target sampling, uncertain
-point selection, BCE and Dice. Sparse masks retain spatial features, query
-features and bias until selected projection is needed. Both decoder and
-encoder skip-block paths apply the learned spatial projection.
-Projection adds the original FP32 bias after the autocast matrix product, so
-the sparse result retains upstream's promotion rather than rounding the bias
-into the product dtype.
-Categorical target samples follow nearest `grid_sample` identities, including
-half-pixel rounding, without interpolating class membership. Explicit fixture
-coordinates use the same production sampling entrypoints.
+[Mask losses](../src/backend/models/rfdetr/core/training_mask_loss.cpp) own
+projection, packed categorical sampling, uncertain points, BCE and Dice.
+Sparse masks retain spatial/query features and bias until selected projection;
+decoder and encoder skip paths both apply learned spatial projection. Original
+FP32 bias is added after the autocast matrix product, preserving promotion.
+Categorical samples use nearest `grid_sample` identities, including half-pixel
+rounding, without interpolating membership. Explicit fixture coordinates use
+production sampling.
 
-For sampled logits `z`, targets `y` and mask normalizer `N`, BCE averages
-pointwise binary cross entropy per mask and sums those means over `N`.
-Dice contributes
-`[1 - (2 * sum(sigmoid(z) * y) + 1) / (sum(sigmoid(z)) + sum(y) + 1)] / N`
-per mask. Pairwise variants retain every admitted query/target pair with the
-same point normalization. Empty matched dense masks sum the empty projection;
-empty sparse masks sum each spatial/query/bias operand before multiplication
-by zero. These expressions preserve both connected zero gradients and their
-representation-specific nonfinite behavior.
+For sampled logits `z`, targets `y` and normalizer `N`, BCE averages points per
+mask then sums over `N`. Dice per mask is
+`[1 − (2 sum(sigmoid(z)y) + 1) / (sum(sigmoid(z)) + sum(y) + 1)] / N`.
+Pairwise variants use the same normalization for every admitted pair. Empty
+dense matches sum the empty projection; empty sparse matches sum each spatial,
+query and bias operand before multiplying by zero. Both preserve connected zero
+gradients and representation-specific nonfinite behavior.
 
-The [segmentation depthwise derivative](../src/backend/models/rfdetr/core/segmentation_depthwise.cpp)
-follows the pinned
-[segmentation head](https://github.com/roboflow/rf-detr/blob/e9a138f70cc14e3fddca029a0683055e34ab8f35/src/rfdetr/models/heads/segmentation.py):
-forward follows convolution autocast, while backward retains original input
-and weights, casts incoming gradients and input to original weight precision,
-and computes input/weight derivatives and bias reduction there. This is an
-operation-local dispatcher/autograd boundary. Its recorded operator carries the
-selected autocast dtype and saves the original operands. CUDA forward locally
-disables cuDNN selection; ordinary backward calls the pinned exported depthwise
-CUDA kernel. A caller requesting differentiable VJPs additionally retains ATen's
-convolution double-backward tape. Parallel lanes do not toggle process-global
-cuDNN policy. Encoder box heads run on selected memory rather
-than every spatial position, preserving selected values and derivatives while
-reducing pointwise work to the admitted query count per group.
+[Depthwise segmentation autograd](../src/backend/models/rfdetr/core/segmentation_depthwise.cpp)
+follows forward convolution autocast but saves original input/weights. Backward
+casts incoming gradients/input to original weight precision and calculates
+input/weight derivatives and bias reduction there. Its recorded custom operator
+retains autocast dtype and original operands. CUDA forward locally bypasses
+cuDNN selection; ordinary backward uses the pinned depthwise CUDA kernel, with
+ATen double-backward tape when differentiable VJPs are requested. Parallel lanes
+do not toggle global cuDNN policy. Encoder box heads operate on selected memory,
+retaining selected derivatives while bounding pointwise work by admitted queries.
 
-The [custom deformable attention](../src/backend/ml/layers/ms_deform_attn_autograd.cpp)
-also has a registered dispatcher/autograd boundary, keeping the CUDA operation
-and its VJP present in full traces. Sampling preserves the selected derivative
-at the lower support boundary and nonfinite multiplication outside support;
-batch chunking admits tails. Its normalized-coordinate conversion and short
-weighted reduction retain the pinned ATen operation order. CUDA atomic backward
-accumulation still permits rounding differences.
+[Deformable attention](../src/backend/ml/layers/ms_deform_attn_autograd.cpp) is a
+registered CUDA/autograd operation retained in FullTrace. It preserves lower
+support-boundary derivatives, nonfinite multiplication outside support, tail
+batch chunks, normalized-coordinate conversion and short weighted-reduction
+order. CUDA atomic backward accumulation permits rounding differences.
+
+### Keypoint objective
+
+[GroupPose losses](../src/backend/models/rfdetr/core/keypoint_ops.cpp) use the
+admitted per-class joint schema. Unannotated, occluded and visible targets remain
+distinct: findability supervises annotated joints, visibility supervises visible
+joints, and coordinate losses use finite annotated locations with valid positive
+box area. L1 is divided by square-root area and active-joint count. Precision
+uses lower-triangular parameters `(exp(log_l11), l21, exp(log_l22))`; Gaussian NLL
+uses area-normalized Mahalanobis error and the log determinant. Invalid local
+operands are sanitized before differentiable arithmetic; an empty valid set
+contributes a connected zero. Pairwise matching uses the same four task costs
+with class-local joint populations. [Prediction/OKS semantics](rfdetr-workflows.md#model-input-and-detection-selection)
+remain separate from supervision visibility.
 
 ## Construction and tensor operation order
 
-[Model construction](../src/backend/models/rfdetr/core/model.cpp) owns fresh
-initialization: DINO token/position initialization, the transformer Xavier
-sweep followed by deformable-attention resets, cloned decoder vector state,
-zero reference points and final box-head layers, and independent encoder heads
-copied from the initialized detector heads. Loading weights replaces the admitted
-tensors; these constructor rules do not reinitialize loaded state. Explicit
-partial transfer retains initialized destination state, as described under
-[model admission](rfdetr-workflows.md#class-identity-and-model-admission).
+[Model construction](../src/backend/models/rfdetr/core/model.cpp) owns DINO
+initialization, the Xavier sweep/deformable resets, cloned decoder vectors,
+zero references/final box layers and independent encoder heads copied from
+initialized detector heads. PE-Core-T and DINOv2-Small/Base topology comes from
+the preset configuration; zero-decoder Atto uses encoder proposals directly.
+GroupPose retains its class/joint masks, conditional query initialization and
+joint attention. Loading replaces admitted tensors; partial transfer keeps
+unmatched initialized destinations.
 
-Native linear calls use ATen `linear`, projector activation uses ATen SiLU,
-and grouped self-attention preserves upstream's sequence/group layouts and
-batched head operation order. Algebraically equivalent slicing, bias addition,
-or activation expansion can change finite-precision values and derivatives.
-PyTorch's [numerical-accuracy reference](https://docs.pytorch.org/docs/2.14/notes/numerical_accuracy.html)
-explains the batched-versus-sliced distinction; installed-payload comparisons,
-rather than that general caveat alone, establish the native choices.
+Native linear calls retain ATen operation order; the registered
+[linear/ReLU boundary](../src/backend/models/rfdetr/core/linear.cpp) preserves
+the upstream fused operation and derivative. Projector SiLU and grouped
+attention preserve their native tensor layouts. Proposal ranking normalizes
+full projected encoder memory; the single-group differentiable path normalizes
+gathered pre-normalization rows. Algebraically equivalent slicing or bias/
+activation expansion can change finite-precision values and gradients.
+Installed-payload comparisons establish these choices; [numerical accuracy](https://docs.pytorch.org/docs/stable/notes/numerical_accuracy.html)
+explains the general batched-versus-sliced limitation.
 
 ## Logical lanes and global batch
 
-The canonical [execution configuration](../src/backend/models/rfdetr/contract/execution_plan.h)
-separates logical training lanes from physical worker capacity. Defaults are
-one lane and **Shared gradients**. Let `B` be the global microbatch image count,
-`A` the fixed accumulation count, `L` the configured lane count, and `W` the
-selected GPU count:
+[Execution configuration](../src/backend/models/rfdetr/contract/execution_plan.h)
+separates logical lanes from physical capacity. Defaults: one lane, Shared
+gradients. Let `B` be global microbatch images, `A` accumulation, `L` lanes and
+`W` selected GPUs:
 
-| Mode | Model/optimizer owners | Microbatches per model attempt, K | Effective batch per model | Images in a full session round |
+| Mode | Models/optimizers | Microbatches per attempt K | Effective batch/model | Images/full session round |
 | --- | --- | --- | --- | --- |
 | Shared gradients | One | L × A | B × L × A | B × L × A |
 | Independent models | L | A | B × A | B × L × A |
 | Periodic averaging | L | A | B × A | B × L × A |
 
-Every model uses all selected GPUs through DDP. Each rank retains the complete
-model and its optimizer state; GPU memory is not pooled or sharded. Independent
-and periodic modes admit at most 16 models and can use different optimizer
-recipes. They begin from the same verified complete initialization, then use
-their own seeds and state. [Periodic and final merging](model-merging.md) own
-the subsequent synchronization and deployment selection.
+Every model uses all selected GPUs through DDP, with complete model/optimizer
+state per rank; memory is not pooled or sharded. Independent/periodic modes
+admit at most 16 models with one verified initialization and independent seeds,
+recipes and state. [Merging](model-merging.md) defines synchronization/selection.
 
-Physical workers can be clamped differently on different ranks. This changes
-when contributions execute, never `B`, `K`, the logical draw order, or the
-intended objective. Complete `B × K` windows are admitted before rank slicing.
-Uneven `B % W` and `B < W` are valid; an empty rank contributes zero without
-constructing an empty forward batch and still participates in the collective
-protocol. Every model must have at least one complete window in an admitted
-epoch. Unused tails are reported separately.
+Rank-specific worker clamps change execution timing, never `B`, `K`, logical
+draw order or objective. Complete `B × K` windows precede rank slicing. Uneven
+`B % W` and `B < W` are valid: empty ranks skip forward and contribute zero while
+participating in collectives. Every model needs one complete window per admitted
+epoch; unused tails are reported separately.
 
-Each GPU rank shares one immutable compiled mapping/index per admitted file
-and one NUMA-local reader pool across its model, validation, and final-test
-loaders. Relative paths resolve before matching admitted metadata; alternate
-path spellings and hard links reuse the same file generation. Loaders retain
-independent schedules, cursors, staging buffers, and cancellation. Stopping one
-loader settles its own reads without stopping other users of the pool.
-Separate rank processes retain their own GPU/NUMA execution resources while
-file-backed pages share the operating system's page cache.
+Each rank shares one immutable compiled mapping/index per admitted file and a
+NUMA-local reader pool across model, validation and final-test loaders. Resolved
+aliases/hard links reuse file generations. Loaders keep independent schedules,
+cursors, staging and cancellation; stopping one settles only its reads. Rank
+processes retain separate GPU/NUMA resources; file pages share the OS page cache.
 
-The [training session](../src/backend/models/rfdetr/training/train.cpp) orders
-communication by epoch, round, and stable model ID. A round attempts at most
-one update per nonexhausted model. Count collectives precede gradient buckets,
-usage, and finite/overflow agreement within a model's turn. The
-[gradient reducer](../src/backend/models/rfdetr/training/training_gradient_reducer.cpp)
-uses tensor hooks with native `autograd::grad`, c10d bucket assignment, and
-NCCL transport to overlap ready reductions with remaining backward work.
-Hook, bucket, stream, and collective Work custody survive cancellation until
-physical use settles.
-
-Native facts bind configuration calculations to settings revision and runtime
-capacity to operation generation; [GUI controls](gui-interaction.md#lane-and-recipe-controls)
-display them without repeating the arithmetic. More lanes cost memory without
-guaranteeing throughput.
+The [session](../src/backend/models/rfdetr/training/train.cpp) orders epoch,
+round and stable model ID, attempting at most one update per nonexhausted model
+per round. Counts precede gradient buckets, usage and finite/overflow agreement.
+The [reducer](../src/backend/models/rfdetr/training/training_gradient_reducer.cpp)
+combines tensor hooks/`autograd::grad`, c10d buckets and NCCL to overlap reduction
+with backward. Hooks, buckets, streams and collective Work survive cancellation
+until physical settlement. [GUI facts](gui-interaction.md#lane-and-recipe-controls)
+are bound to settings revision or operation generation; Rust does not repeat
+batch arithmetic. More lanes consume memory without guaranteeing throughput.
 
 ## Attempt execution and target lifetime
 
-[TrainingLanes](../src/backend/models/rfdetr/training/training_lanes.cpp) binds
-each physical lane to its device stream, model state, augmenter, matcher and
-target scratch. One physical lane uses the working model directly; parallel
-lanes retain versioned replicas and copy changed parameters before their next
-admitted forward. RF-DETR's active backbone/projector/decoder use LayerNorm,
-including spatial LayerNorm. There is no training SyncBatchNorm collective;
-parallel lanes reject models with mutable running-statistic buffers.
+[TrainingLanes](../src/backend/models/rfdetr/training/training_lanes.cpp) owns
+per-worker streams, model state, augmentation, matcher and target scratch.
+One worker uses the working model; parallel workers copy changed parameters to
+versioned replicas before forward. Active backbones/projectors/decoders use
+LayerNorm, including spatial LayerNorm. There is no SyncBatchNorm collective;
+parallel lanes reject mutable running-statistic buffers.
 
 [TargetScratch](../src/backend/models/rfdetr/training/target_builder.cpp) retains
-a per-lane ring of pinned metadata/packed-mask storage and device destinations.
-A nonempty lane has depth `max(2, A)`; empty lanes allocate no forward payload.
-Compatible shapes reuse allocations and bound views, and larger shapes retain
-high-water capacity. Host staging can be filled again after its own H2D event;
-device overwrite additionally waits on that slot's final consumer event on
-the copy stream. If every host slot is busy, bounded backpressure waits for
-one slot's DMA rather than synchronizing the whole device.
+pinned metadata/packed-mask staging and device destinations. Nonempty lanes have
+`max(2,A)` slots; empty lanes allocate no forward payload. Compatible views reuse
+high-water capacity. Host refill waits for its H2D event; device overwrite also
+waits for the final consumer event. Full rings wait for one DMA, not the device.
 
-A `TargetConsumerLease` accompanies each prepared target set. It orders the
-copy before DN forward when needed, otherwise before criterion consumption,
-and remains live through loss, backward/gradient harvesting and matcher
-assignment completion. Retirement records the actual consumer stream before
-allowing device reuse. Partial upload failures mark the destination unavailable
-for reuse until ownership is safely resolved; stale aliases do not authorize
-reuse of replacement storage. Loader pixel custody ends independently after
-augmentation's final source read.
+Each `TargetConsumerLease` orders upload before DN forward or criterion and
+survives loss, backward/gradient harvesting and matcher completion. Retirement
+records the actual consumer stream. Partial upload failure cannot authorize
+reuse, and stale aliases cannot authorize replacement-storage reuse. Loader
+pixels independently release after augmentation's last source read.
 
-[TrainingTargetCounts](../src/backend/models/rfdetr/training/training_ops.cpp)
-publishes one int64 target count per global logical microbatch. Distributed
-SUMs retain that order even when physical wave packing differs across ranks.
-Each consumer waits through stream events and uses a device FP32 normalizer.
-The count owner reserves Work custody for all `K` contributions in the attempt;
-closing a wave neither waits for every collective on the host nor releases its
-Work. Count-slot reuse waits for the previous scalar conversion, and the
-attempt's final dependency joins the numerical decision stream.
+[Target counts](../src/backend/models/rfdetr/training/training_ops.cpp) publish
+one int64 per global microbatch in logical order, independent of wave packing.
+Consumers wait through events and use FP32 device normalizers. All `K` count
+Work objects survive wave closure; scalar conversion protects slot reuse, and
+a final dependency joins the optimizer-decision stream.
 
-The reducer separately retains gradient and usage-reduction Work. On one rank
-it uses host usage bookkeeping without usage H2D/D2H or collective traffic.
-The single-rank, single-contribution, single-slot path can adopt exclusive,
-resizable dense gradient storage with matching layout directly. Aliased,
-expanded or otherwise unsuitable gradients copy into retained bucket views.
-Ordinary accumulated/distributed paths keep their bucket protocol. Device
-events order all paths with the optimizer; globally unused parameters retain
-undefined gradients. Each recipe applies its existing missing-gradient policy.
+The reducer retains gradient/usage Work separately. Single-rank execution uses
+host usage bookkeeping without usage transfers/collectives. One rank,
+one contribution and one slot may adopt exclusive resizable dense gradients
+with matching layout; aliases/expanded gradients copy to retained buckets.
+Accumulated/distributed paths retain bucket semantics. Events order optimization;
+globally unused gradients remain undefined under each recipe's missing-gradient
+policy. Atto's unused decoder inputs/heads retain declared trainability while
+optimizer admission excludes inactive state.
 
-[TrainingMetricHandoff](../src/backend/models/rfdetr/training/training_metrics.cpp)
-packs loss/gradient finite controls, loss sums, scalar sums/availability and
-per-microbatch detection sufficient statistics into one retained FP32 packet.
-Distributed execution performs one SUM for that packet; single-rank execution
-needs none. Ratios are calculated from globally reduced rows, then aggregated
-with the existing temporal weighting. A pinned readback and one physical
-completion expose the numerical decision to the host. Count and reducer
-finalization then release already-completed Work without another host wait.
-This is the optimizer decision boundary, not a claim that the whole training
-attempt has no other CPU or GPU synchronization.
+[Metric handoff](../src/backend/models/rfdetr/training/training_metrics.cpp)
+packs finite controls, loss/scalar sums and availability plus per-microbatch
+sufficient statistics into one FP32 packet. Distributed execution performs one
+SUM; one rank needs none. Ratios follow global reduction and retain temporal
+weighting. One pinned readback/completion exposes the numerical decision; count/
+reducer finalization releases completed Work without another host wait. Other
+training boundaries can still synchronize.
 
 ### Bounded next-batch preparation
 
-After current forward/backward submission and before the metric decision
-completes, [TrainingModel](../src/backend/models/rfdetr/training/training_model.cpp)
-may submit exactly one future preparation to the **existing lane worker pool**.
-Eligibility requires Shared gradients, `K = 1`, a nonempty local rank, and a
-next microbatch in the same epoch. The work reads immutable scheduled
-annotations and prospective logical donor descriptors, builds the augmentation
-plan, and prepares/uploads targets. It owns no future loader pixel lease and
-does not run a future model forward.
+[TrainingModel](../src/backend/models/rfdetr/training/training_model.cpp) may
+prepare exactly one future batch on the existing worker pool after submitting
+current backward, before metric settlement. Eligibility: Shared gradients,
+`K=1`, nonempty local rank and a next batch in the same epoch. It reads immutable
+annotations/prospective donors, constructs augmentation and uploads targets;
+it holds no future loader pixels and performs no future forward or collective.
 
-Admission verifies epoch, rank, microbatch identity, draw keys, image indices
-and batch shape against the real acquired batch before using the preparation.
-Only then does ordinary execution commit donor history, consume the schedule
-clock/cursor, submit count collectives and forward work, and observe the current
-parameter version. Future pixel augmentation and selected donor upload also
-wait for this admission. No additional worker, speculative forward, future
-collective or completed-attempt accounting is introduced.
-
-The future's exception is retained and raised only if that batch is admitted.
-Discard joins the worker and retires prepared storage without making an
-unadmitted failure replace the current attempt's result. Epoch transitions,
-Resume admission, reconfiguration and failure discard pending preparation
-before changing ownership. Checkpoint publication can proceed while a future
-preparation exists and records only committed clocks, cursor and donor history;
-that transient state is reconstructed by
-[exact Resume](model-merging.md#whole-session-resume). Cancellation wakes count
-consumers and closes new admission. Submitted streams, collective Work, hooks
-and target storage retain custody through physical completion; an unprovable
-settlement cannot free live GPU resources.
+Admission verifies epoch/rank/microbatch, draw keys, image IDs and shape against
+the acquired batch. Only then are donor history/clocks/cursors committed and
+counts/forward submitted against current parameters; future pixel augmentation
+and selected donor uploads also wait. Exceptions surface only if that batch is
+admitted. Discard joins/retire storage without replacing the current result
+with an unadmitted failure. Epoch changes, Resume, reconfiguration and failures
+discard pending preparation first. Checkpoints record only committed state;
+transient preparation is reconstructed. Cancellation closes admission and wakes
+count consumers; submitted GPU/collective resources remain held through proven
+physical completion.
 
 ## Accumulation, optimizer and EMA
 
-For the mode's `K` admitted global logical microbatches, each loss contributes
-its gradient divided by **K²**. The pinned
-[training module](https://github.com/roboflow/rf-detr/blob/e9a138f70cc14e3fddca029a0683055e34ab8f35/src/rfdetr/training/module_model.py)
-divides its automatic-optimization return by K, then
-[Lightning 2.6.0's closure](https://github.com/Lightning-AI/pytorch-lightning/blob/2.6.0/src/lightning/pytorch/loops/optimization/automatic.py)
-divides it again. Native
-[TrainingStep](../src/backend/models/rfdetr/training/detail/training_step.h)
-combines that exact factor with AMP scaling. Learning rate is not adjusted to
-cancel the extra division or multiplied by `W`. Each microbatch retains its
-own target denominator; this is not a single concatenated-batch objective.
-With globally summed target count `N`, effective group count `G` (one when
-group losses are summed), and DN repetition count `D`, ordinary losses divide
-by `max(G × N, 1)`, Match-Free by `G × max(N, 1)`, and DN by `max(D × N, 1)`.
+Each of `K` admitted global microbatch losses contributes its gradient divided
+by **K²**: upstream automatic optimization divides by K, then Lightning's
+closure divides again. [TrainingStep](../src/backend/models/rfdetr/training/detail/training_step.h)
+combines that factor with AMP scaling. LR does not cancel it or multiply by W.
+Each microbatch keeps its own denominator; this is not concatenated-batch loss.
+For global targets `N`, effective groups `G` (one when summing group losses) and
+DN repetitions `D`, denominators are:
 
-This target-count normalization is independent of activation normalization:
-the active model uses LayerNorm, including spatial LayerNorm, rather than
-BatchNorm running statistics. For stock losses, upstream divides by
-`max(G × N / W, 1)` before ordinary DDP gradient averaging, giving the effective
-denominator `max(G × N, W)`. Native SUM reduction keeps `max(G × N, 1)`.
-They agree on one GPU and when `G × N >= W`; sparse or empty global target
-batches can differ at the clamp. For `W=2, G=1, N=1`, upstream's effective
-gradient is half the native gradient. Native retains its world-size-independent
-global objective and empty-rank support.
+| Objective | Denominator |
+| --- | --- |
+| Ordinary | max(G × N, 1) |
+| Match-Free | G × max(N, 1) |
+| DN | max(D × N, 1) |
 
-Forward and criterion run inside the selected autocast scope. Backward and
-parallel gradient harvesting run after it exits, retaining FP32 probe
-derivatives. Distributed gradient **SUM**, unscaling and global clipping follow;
-neither counts nor gradients are divided by `W`. Ranks agree finite-loss and
-overflow decisions before mutation. A nonfinite loss fails the session;
-recoverable FP16 gradient overflow skips the update on every rank.
-FP16 scaler growth installs a multiplied scale only when the candidate is
-finite, resets its growth tracker at the interval, and retains ordinary overflow
-backoff. BF16 does not use that FP16 growth policy.
+Upstream stock loss divides by `max(G × N / W,1)` before DDP averaging, giving
+`max(G × N,W)`; native SUM uses `max(G × N,1)`. They agree for one GPU or
+`G × N >= W`; with `W=2,G=1,N=1`, upstream gradients are half native gradients.
+Native retains a world-size-independent objective and empty-rank support.
+This is separate from activation LayerNorm.
+
+Forward/criterion use selected autocast; backward and parallel harvesting occur
+afterward, retaining FP32 probe derivatives. Gradient SUM, unscale and global
+clipping never divide by W. Ranks agree before mutation: nonfinite loss fails;
+finite-loss FP16 gradient overflow skips optimization everywhere. Scaler growth
+installs only finite multiplied scales, resets its interval tracker and retains
+backoff; BF16 has no FP16 scaler-growth policy.
+
 [NativeOptimizer](../src/backend/models/rfdetr/training/native_optimizer.cpp)
-keeps each AdamW parameter's own age, including undefined-gradient gaps and
-unequal resumed ages. Bias correction uses those device scalars, following
-[PyTorch multi-tensor Adam](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/optim/adam.py).
-Fused AdamW is requested by default. When requested, real floating-point CUDA
-parameters on devices with compute capability 8.0 or newer use LibTorch's fused
-multi-tensor update; otherwise the optimizer selects its supported foreach or
-eager implementation. Batches group compatible device/dtype parameters while
-retaining each parameter's age. Muon and SGD keep their own
-native update paths; selecting fused AdamW does not fuse those recipes or
-the training loop.
-Clipping retains the device global norm and
-`min(max_norm / (norm + 1e-6), 1)` scaling without requesting an unused host
-norm. Loss numerators and other sufficient statistics are reduced before
-ratios are computed. Each global microbatch and processed image is counted
-once, preserving the ordinary temporal weighting of epoch losses.
+retains each AdamW parameter's device age through missing gradients and Resume.
+Fused AdamW is requested by default and uses LibTorch fused multi-tensor updates
+for real CUDA parameters on compute capability ≥8.0; supported foreach/eager
+paths cover other cases. Compatible device/dtype groups retain individual ages.
+Muon/SGD remain independent update paths. Clipping uses the device global norm
+and `min(max_norm/(norm+1e-6),1)` without an unused host norm. Statistics reduce
+before ratios; each global microbatch/image counts once.
 
 ### Recipes and schedules
 
-Canonical [TrainRecipeSettings](../src/backend/models/rfdetr/contract/train_recipe.h)
-serves global defaults and each model. New entries copy settled globals and
-retain independent overrides through mode changes. Reset clears only the
-selected scope's overrides, retaining its optimizer. IDs are stable/nonreused;
-new seeds derive from session seed and ID.
+[TrainRecipeSettings](../src/backend/models/rfdetr/contract/train_recipe.h)
+serves globals and each model. New entries copy settled globals; existing entries
+retain overrides through mode changes. Reset clears only the selected scope's
+overrides, preserving optimizer. IDs are stable/nonreused; seeds derive from
+session seed and model ID.
 
-| Catalog default | AdamW | Muon | SGD |
+| Default | AdamW | Muon | SGD |
 | --- | ---: | ---: | ---: |
 | Decoder LR | 0.0001 | 0.0002 | 0.01 |
 | Encoder LR | 0.00015 | 0.0003 | 0.001 |
@@ -352,352 +286,258 @@ new seeds derive from session seed and ID.
 | Minimum LR factor | 0 | 0.01 | 0.01 |
 | Bias warmup LR | 0 | 0 | 0.1 |
 
-All catalog rows use component decay `0.7`, encoder-layer decay `0.8`, and
-Step drop epoch `100`; Nesterov defaults off. The momentum setting applies to
-Muon and SGD. Native SGD uses coupled weight decay, zero dampening, and skips
-undefined gradients. Its first momentum buffer copies the
-decayed gradient; later buffers use `momentum × buffer + decayed_gradient`.
-Nesterov requires SGD with positive momentum. Existing AdamW/Muon equations,
-parameter-group LR factors, and decay selection retain their native policy.
-For trainable parameters, Muon substitutes zero for an undefined gradient in
-both its matrix and auxiliary Adam branches. Momentum, decay, and auxiliary
-Adam ages therefore still advance on an update.
+All use component decay 0.7, encoder-layer decay 0.8 and Step drop epoch 100;
+Nesterov defaults off. Momentum applies to Muon/SGD. SGD uses coupled decay,
+zero dampening and skips undefined gradients. Its first momentum buffer copies
+the decayed gradient; later buffers use `momentum × buffer + decayed_gradient`.
+Nesterov requires SGD and positive momentum. Muon substitutes zero for undefined
+trainable gradients in matrix and auxiliary Adam branches, advancing momentum,
+decay and auxiliary ages on an update.
 
-Muon routing is native policy retained by the persisted optimizer groups.
-[Parameter eligibility](../src/backend/models/rfdetr/training/native_optimizer.cpp)
-selects rank-two/rank-four weights with explicit detector/embedding exclusions.
-The singularly named DN label/task embeddings currently enter Muon, while the
-packed self-attention `in_proj_weight` enters auxiliary Adam because it lacks
-the `.weight` name fragment. These are documented routing exceptions, not
-upstream recipe parity or an automatic migration of saved state. Changing the
-route would require coherent optimizer-group and Resume admission changes.
+Muon routes rank-two/rank-four weights with explicit detector/embedding
+exclusions. Singular DN label/task embeddings enter Muon; packed self-attention
+`in_proj_weight` enters auxiliary Adam because its name lacks `.weight`.
+Persisted groups retain that policy; changes require coherent Resume admission.
+Encoder LR includes layer-position decay and component factor squared; selected
+transformer groups use decoder LR × component factor, others decoder LR. SGD
+bias warmup uses names containing `bias`, independently of decay; bias/nonbias
+groups remain distinct even when base LR/decay match.
 
-Encoder groups use encoder LR with layer-position decay and the square of
-the component factor; selected transformer groups use decoder LR times the
-component factor, and remaining groups use decoder LR. SGD bias-warmup roles
-derive from full parameter names containing `bias`, without changing which
-parameters receive decay. Bias/nonbias groups stay distinct even when their
-base LR and decay happen to match.
-
-Frozen parameters remain outside autograd, reduction, decay, and optimizer
-updates. State is allocated lazily when a parameter becomes active, preserving
-previous named state and per-parameter ages. EMA owns the complete eligible
-model independently of optimizer-state allocation.
+Frozen parameters are excluded from autograd/reduction/decay/updates. State is
+allocated lazily on activation, retaining named state/ages. EMA independently
+owns the complete eligible model.
 
 [TrainingSchedule](../src/backend/models/rfdetr/training/training_schedule.cpp)
-persists consumed attempts and microbatches separately from successful updates:
+separates consumed attempts/microbatches from successful updates:
 
-- **Step/Cosine** capture the first admitted epoch's attempt count as their
-  reference. LR warmup truncates `reference_attempts × warmup_epochs`; Step
-  drops to `0.1` at `lr_drop × reference_attempts`, while Cosine uses the
-  post-warmup fraction of the planned attempt budget, clamped to `[0, 1]`.
-  Native momentum warmup uses the untruncated reference and restores the target
-  at its boundary. Epoch extension keeps the saved reference and consumed
-  attempts while extending the planned budget.
-- **UltralyticsLinear**, admitted only for SGD, uses
-  `f(e) = max(1 − e / E, 0) × (1 − q) + q`, with zero-based epoch `e`, original
-  epoch horizon `E`, and minimum factor `q`. Before each epoch, group LR becomes
-  `base_group_lr × f(e)`. Warmup length is round-to-nearest-even of
-  `min(warmup_epochs, E − 1) × first_epoch_microbatches`, with no 100-step floor.
-  Each warmup microbatch interpolates from zero (bias groups: `warmup_bias_lr`)
-  to the epoch LR, and from warmup momentum to target momentum. At warmup exit
-  it holds the last interpolated LR until the next epoch event and holds the
-  last interpolated momentum thereafter. It does not force the target value.
-  The original horizon survives Resume; extended epochs use the minimum clamp.
+- **Step/Cosine:** retain the first admitted epoch's attempt count. LR warmup
+  truncates `reference_attempts × warmup_epochs`. Step drops to 0.1 at
+  `lr_drop × reference_attempts`; Cosine uses the post-warmup planned-budget
+  fraction clamped to `[0,1]`. Momentum warmup uses the untruncated reference
+  and restores target at the boundary. Extension retains reference/consumption
+  and extends planned attempts.
+- **UltralyticsLinear:** SGD only. Epoch factor is
+  `max(1−e/E,0) × (1−q)+q`, with zero-based epoch, original horizon E and minimum
+  factor q. Epoch LR is base group LR × factor. Warmup length rounds to nearest
+  even `min(warmup_epochs,E−1) × first_epoch_microbatches`, without a 100-step
+  floor. Each warmup microbatch interpolates LR from zero (bias: `warmup_bias_lr`)
+  to epoch LR and momentum from warmup to target. At exit the last LR holds
+  until the next epoch and the last momentum holds thereafter; target is not
+  forced. Resume keeps the original horizon; extended epochs use minimum clamp.
 
-The SGD scheduler follows the linear/warmup behavior of
-[Ultralytics commit 7547229b124fa117215e20f28364b4201bad01a4](https://github.com/ultralytics/ultralytics/blob/7547229b124fa117215e20f28364b4201bad01a4/ultralytics/engine/trainer.py),
-with the native recipe values above. Native
-[scheduler fixtures](../src/backend/models/rfdetr/training/tests/execution_policy.test.cpp)
-retain its warmup-exit behavior.
-For example, `E=4`, four microbatches per epoch, warmup `0.375`, base LR `0.01`,
-`q=0.01`, and momentum `0.9` produce two warmup microbatches. Bias/nonbias LR
-are `0.1/0` then `0.055/0.005`; momentum is `0.8` then `0.85`. Those values hold
-until epoch one sets both LRs to `0.007525`, leaving momentum `0.85`.
-The policy does not import changing accumulation, nominal-batch decay scaling,
-or an automatic optimizer choice. Schedule events follow logical order;
-overflow consumes data and schedule time but adds no successful-update images.
+For `E=4`, four microbatches/epoch, warmup 0.375, base LR 0.01, q=0.01 and
+momentum 0.9: two warmup microbatches yield bias/nonbias LR `0.1/0`, then
+`0.055/0.005`, and momentum `0.8`, then `0.85`. Epoch one sets both LRs to
+0.007525, leaving momentum 0.85. This scheduler does not import changing
+accumulation, nominal-batch decay scaling or automatic optimizer selection.
+Overflow consumes data/schedule time but contributes no successful-update images.
 
 ### Final-epoch policies
 
-`unfreeze_encoder_last_epochs` and `disable_augmentation_last_epochs` default
-to zero and are independent. A positive `N` applies before zero-based epoch
-`max(0, epochs − N)`. Encoder means `backbone.0.encoder`. Each applied latch
-survives Resume and later epoch extension; a pending policy uses the new horizon.
-Exact Resume rejects changes to `N` or recipe/data policy. Activation occurs
-after work drains, updating active optimizer/reducer bindings and compiled
-assumptions while retaining optimizer, scaler, scheduler, EMA, and reusable
-augmentation storage.
+`unfreeze_encoder_last_epochs` and `disable_augmentation_last_epochs` default to
+zero independently. Positive N applies before epoch `max(0,epochs−N)`; encoder
+means `backbone.0.encoder`. Applied latches survive Resume/extension; pending
+policies follow the new horizon. Exact Resume rejects changed N/recipe/data
+policy. Activation drains work and refreshes optimizer/reducer/graph bindings
+while retaining optimizer, scaler, scheduler, EMA and augmentation storage.
 
 ### EMA
 
-Optional [EMA](../src/backend/models/rfdetr/training/model_ema.cpp) is off by
-default. Its first update copies current parameters, as
-[AveragedModel](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/optim/swa_utils.py)
-does before later averaging. Subsequent updates use
-`decay * (1 - exp(-completed_updates / tau))` when tau is positive, or the
-configured decay otherwise. On a recoverable finite-loss FP16 gradient
-overflow, the optimizer leaves parameters/moments unchanged and the scaler
-backs off; the completed attempt still advances EMA over those unchanged
-parameters. This follows the pinned automatic-optimization cadence and
-[Lightning mixed precision](https://github.com/Lightning-AI/pytorch-lightning/blob/2.6.0/src/lightning/pytorch/plugins/precision/amp.py).
-Current-format Resume restores optimizer ages, scaler and EMA count/state.
-Overflow diagnostic collection is gated independently of required failure
-handling. The [workflow guide](rfdetr-workflows.md#training-and-query-limits)
-owns selected-weight evaluation and saved artifacts.
+[EMA](../src/backend/models/rfdetr/training/model_ema.cpp) is off by default.
+First update copies current parameters; later decay is
+`decay × (1−exp(−completed_updates/tau))` for positive tau, otherwise configured
+decay. Recoverable finite-loss FP16 overflow leaves parameters/moments unchanged
+and backs off the scaler, but the completed attempt still advances EMA over
+unchanged parameters. Resume restores ages, scaler and EMA state/count.
+Overflow diagnostics remain independently gated. [Workflows](rfdetr-workflows.md#training-and-query-limits)
+defines evaluation weight selection and artifacts.
 
 ## Sparse data planning and stochastic identity
 
 [TrainingDataPlan](../src/backend/models/rfdetr/training/training_data_plan.cpp)
-owns sparse distinct class presence per eligible physical image, immutable model
-shards, and deterministic epoch schedules. Schedules and Resume identities keep
-the compiled physical slot IDs, skipping inactive holes without renumbering.
-Crowd contributes no support; empty/crowd-only images
-remain members. Shared mode uses one full-dataset shard; independent/periodic
-modes partition between models before rank-slicing global microbatches.
+owns sparse class support, immutable shards and deterministic epoch schedules.
+Physical compiled IDs survive holes; crowd supplies no class support, while
+empty/crowd-only images remain members. Shared uses the whole dataset;
+independent/periodic partition between models before slicing ranks.
 
-**Off** uses approximately equal deterministic image shards. **Stratified**
-prioritizes scarce support while respecting shard capacity. **Rare repeats +
-Stratified** additionally uses `max(1, sqrt(t / f_c))` per supported class,
-where `f_c` is its supporting-image fraction in the complete training dataset,
-and the largest factor on each image. Empty images use one. Defaults are
-threshold `0.001`, maximum factor `10`, and maximum total-draw multiplier `4`.
-Admission requires finite threshold
-in `(0, 1]`, factor in `[1, 64]`, and multiplier in `[1, 16]`.
+| Policy | Meaning |
+| --- | --- |
+| Off | Approximately equal deterministic image shards |
+| Stratified | Prioritize scarce support within shard capacities |
+| Rare repeats + Stratified | Image factor is the maximum supported-class `max(1,sqrt(t/f_c))`; f_c is full-dataset supporting-image fraction; empty images use one |
 
-Every image has a base occurrence. Seeded fractional rounding proposes extras;
-bounded reservoir thinning enforces the draw budget without discarding bases.
-The final schedule is shuffled, then complete-window admission reports unused
-tails. Unique support, repeated exposure, missing shard classes, and tails are
-separate native facts. Repeats change exposure and cannot invent missing support.
+Rare-repeat defaults: threshold 0.001, maximum factor 10, total-draw multiplier 4;
+admitted ranges are finite `(0,1]`, `[1,64]` and `[1,16]`. Every image keeps its
+base occurrence. Seeded fractional rounding proposes extras, bounded reservoir
+thinning enforces the budget, then shuffle/complete-window admission reports
+tails. Support, exposure, missing shard classes and tails are distinct facts;
+repeats cannot create missing support.
 
-The loader consumes the explicit schedule and Resume offset without reshuffling
-or choosing shards. Draw and microbatch identities govern augmentation, DN noise,
-and mask samples independently of rank, physical worker, completion order, or
-padding. Copy-paste donors come from compact logical source descriptors retained
-per contribution stream; physical decoded caches only supply the selected data.
-Session checkpoints retain/reconstruct these identities and cursors, as described
-under [exact Resume](model-merging.md#whole-session-resume).
+Loaders consume schedules/Resume offsets without reshuffling. Draw/microbatch
+identity governs augmentation, DN noise and mask samples independently of rank,
+worker, completion or padding. Copy-paste donors use retained logical descriptors;
+physical caches supply selected pixels. Checkpoints retain/reconstruct identities,
+cursors and donor history.
 
 ### Augmentation preparation and transfer
 
-The canonical [augmentation defaults](../src/backend/models/rfdetr/contract/workflow_requests.h)
-give geometry, resize, color, noise, blur, and occlusion each a `0.25`
-probability and a `0.0375`–`0.375` strength range. Strength scales signed
-effects about zero and size/contrast/saturation deviations about their neutral
-factor of one. Copy-paste has probability `0.80` and scales donor objects within
-`0.625`–`1.375` of their original size. Saved settings retain the full strength
-precision; explicit saved overrides remain authoritative for subsequent runs.
+[Defaults](../src/backend/models/rfdetr/contract/workflow_requests.h): geometry,
+resize, color, noise, blur and occlusion each use probability 0.25 and strengths
+0.0375–0.375. Strength scales signed effects about zero and size/contrast/
+saturation about one. Copy-paste probability is 0.80, donor scale 0.625–1.375.
+Saved overrides retain full precision and authority.
 
 The [training augmenter](../src/backend/models/rfdetr/training/gpu_augment.cpp)
-resolves the immutable plan before submission. Logical donor descriptors carry
-original image/annotation meaning. Only selected copy-paste donors that differ
-from the materialized slot trigger reads/uploads; selecting another annotation
-from an already resident image reuses its original pixels and updates the
-required support. Skipped pastes do not upload unselected donor images. Donor
-history follows admitted contributions whether or not a paste was selected.
-The separate physical cache path retains original source pixels and uploads
-support only for replaced slots.
+resolves plans before submission. Only selected donors differing from the
+materialized slot cause reads/uploads; another annotation from resident pixels
+updates support only. Skipped pastes never upload unselected donors. Donor
+history follows admitted contributions even without a paste. Physical caches
+retain original pixels and upload support only for replaced slots.
 
-The shared [GPU executor](../src/backend/models/rfdetr/augmentation/gpu_augment.cpp)
-has two parameter-staging slots. Their completion event follows the last host
-staging read/upload, before final pixel work; a distinct consumer event retains
-images, donor storage and execution resources. The pointwise CUDA route processes
-four adjacent pixels per thread with aligned `float4` loads/stores where valid,
-including horizontal reversal, and scalar handling at incompatible widths/edges.
-Remapping and copy-paste retain their existing sampling path. These choices
-reduce transfers and repeated work; they do not establish a measured throughput
-gain.
+The [GPU executor](../src/backend/models/rfdetr/augmentation/gpu_augment.cpp)
+uses two parameter-staging slots. Staging completion follows its last host read/
+upload; a separate consumer event protects pixels/donors/resources. Pointwise
+CUDA processes four adjacent pixels with aligned float4 where valid, scalar
+edges/widths otherwise, including reversal. Remapping/copy-paste retain their
+sampling path; this is not a measured throughput claim.
 
 [Annotation support](../src/backend/models/rfdetr/augmentation/annotation_support.cpp)
-uses analytic continuous-box visibility for pure geometry when sufficient.
-Erasure, donor occlusion and mask support use output pixel-center semantics;
-visibility-only checks stop after the first surviving sample. Full target
-construction still calculates required area/bounds and keeps continuous
-detection boxes independent of raster mask disappearance. Original donor RLE,
-known-empty masks, half-open erasure edges and category identity retain the
-same meaning for training and preview.
+uses analytic continuous-box visibility when geometry permits; erasure, donor
+occlusion and masks use output pixel centers. Visibility-only queries stop at
+first support; target construction computes complete area/bounds. Continuous
+boxes survive mask disappearance. Donor RLE, known-empty masks, half-open
+erasure and categories retain common training/preview meaning. Joint geometry,
+flip correspondence and visibility follow the admitted schema; [data semantics](datasets.md)
+defines their persisted meaning.
 
 ## Match-Free and denoising adaptations
 
-The canonical [supervision declaration](../src/backend/models/rfdetr/contract/training_supervision.h)
-selects Hungarian by default, optional Match-Free assignment, and independently
-enabled denoising. All four combinations support detection and segmentation.
-[TrainingSupervisionImpl](../src/backend/models/rfdetr/core/training_supervision.cpp)
-owns probes, correspondence, noise, isolated query layout and routed objectives.
-Deployment omits training-only supervision while preserving ordinary outputs;
-full current-format continuation retains its state.
+[Supervision](../src/backend/models/rfdetr/contract/training_supervision.h)
+defaults to Hungarian, with optional Match-Free and independent DN. Detection/
+segmentation models with decoder layers support all four combinations.
+Zero-decoder Atto and keypoint models require stock Hungarian without DN;
+capability admission rejects unsupported combinations. [TrainingSupervisionImpl](../src/backend/models/rfdetr/core/training_supervision.cpp)
+owns probes, correspondence, noise, isolated queries and routed objectives.
+Deployment omits training-only state; full continuation retains it.
 
-Match-Free takes its learned dense correspondence and sparse weighted-pair
-objective from [Beyond Hungarian, sections 3.2–3.4](https://arxiv.org/html/2603.08514v1).
-The review found no author-released implementation; native sparsification and
-the extensions below are explicit RF-DETR adaptations, not verified parity
-with author code. Native sparse topology is chosen from detached dense values:
-retain each valid row's winning query to establish positive column maxima,
-admit dense entries at least `rho` times that column maximum, and normalize
-the retained differentiable row values with a small denominator epsilon.
-Dense and sparse weights apply to the same pairwise objective, with independently
-configured correspondence/query coefficients.
+Match-Free adapts learned dense correspondence and sparse pair objectives from
+[Beyond Hungarian, §§3.2–3.4](https://arxiv.org/html/2603.08514v1), without an
+established author-code parity claim. Detached topology retains each valid row's
+winning query, admits entries ≥rho times the column maximum, then normalizes
+retained differentiable rows with epsilon. Dense/sparse weights use the same
+pair objective with independent correspondence/query coefficients.
 
-Segmentation adds target-mask-pooled spatial features to each class/box probe
-through a learned projection. Thus different masks can condition distinct
-probes even with identical class and box. Shared sampled logits/targets supply
-pairwise BCE and Dice for both correspondence and query objectives, alongside
-classification/L1/GIoU. Mask work is omitted when both mask coefficients are
-zero. Storage follows admitted query/target/point populations, not a full
-query-by-target-by-image-pixel tensor. Empty images receive a background focal
-classification term once per supervised layer with the same target/group
-normalizer; they need no dummy target or correspondence row. These mask and
-empty-image behaviors extend the box paper.
+Segmentation adds learned target-mask-pooled spatial features to class/box
+probes. Shared sampled logits/targets provide pairwise BCE/Dice alongside class/
+L1/GIoU; zero mask coefficients omit mask work. Storage follows query/target/
+point populations, not image pixels for every pair. Empty images add one
+background focal term per supervised layer with target/group normalization,
+without dummy targets. These mask/empty-image rules extend the box paper.
 
-DN uses noisy labels/boxes and direct reconstruction with known target
-identities, following [DN-DETR](https://arxiv.org/html/2203.01305v3) and its
-[official DN components](https://github.com/IDEA-Research/DN-DETR/blob/main/models/DN_DAB_DETR/dn_components.py).
-Native Group-DETR groups and DN groups retain isolation; ordinary queries
-cannot see DN queries, and DN groups do not see each other or ordinary queries.
-The additive task embedding and noise draw over alternative labels are explicit
-adaptations. Noise and mask sampling use owned seeded draws without consuming
-the ordinary stock sampling stream.
+DN follows [DN-DETR](https://arxiv.org/html/2203.01305v3): noisy labels/boxes
+reconstruct known targets. Ordinary queries cannot see DN queries; DN groups
+see neither ordinary nor other DN groups. Native task embeddings and
+alternative-label noise are adaptations. Owned seeded DN/mask draws leave the
+ordinary stock stream untouched.
 
-For segmentation, ordinary and DN queries share the existing mask head.
-DN reconstructs the directly corresponding target masks using RF-DETR's BCE,
-Dice, sampling and normalizer, including selected auxiliary decoder layers;
-there is no DN encoder objective. The denominator includes DN group count.
-Invalid padding contributes nothing, while empty enabled mask reconstruction
-retains connected sparse zeros. Mask reconstruction from noisy box/label
-queries is supported by [Mask DINO appendix B.2](https://arxiv.org/html/2206.02777v2)
-and its [official criterion](https://github.com/IDEA-Research/MaskDINO/blob/main/maskdino/modeling/criterion.py).
-This reuses RF-DETR architecture and mathematics rather than importing Mask
-DINO or contrastive DINO. Tests exercise real mask/probe gradients and optimizer
-updates; no measured accuracy or convergence benefit is asserted.
+Ordinary/DN segmentation shares the mask head and RF-DETR BCE/Dice/sampling;
+selected auxiliary decoder layers contribute, encoder DN does not. Denominators
+include DN repetitions. Invalid padding contributes nothing; empty enabled mask
+reconstruction retains connected sparse zeros. [Mask DINO appendix B.2](https://arxiv.org/html/2206.02777v2)
+supports mask reconstruction from noisy queries, without importing its complete
+architecture. No accuracy/convergence benefit is asserted.
 
 ## Native selective compilation
 
-Native **Selective** and **FullTrace** modes use LibTorch/TorchScript tracing;
-pinned upstream uses
-`torch.compile(model, dynamic=True)` with Dynamo/Inductor, graph breaks, and
-suppressed failures. Their capture/optimization coverage differs: upstream
-partial compilation does not establish a single full graph; native tracing
-implies neither equivalent fusion nor speed.
-Selective mode is the native training default. It also enables lane-owned
-criterion traces; `none` runs those operators directly. Fused optimizer
-selection is independent of graph tracing.
+Native Selective/FullTrace use pinned LibTorch/TorchScript. Upstream uses
+`torch.compile(model,dynamic=True)` with Dynamo/Inductor graph breaks and
+suppressed failures. Capture, fusion and performance are not equivalent.
+Selective is the native training default and includes lane-owned criterion
+traces. Optimizer fusion is independent.
 
-| Native mode / CLI value | Captured boundary |
+| Mode / CLI | Captured boundary |
 | --- | --- |
-| None / `none` | Ordinary compiled C++ orchestration, ATen operators, and native custom CUDA/autograd |
-| Selective / `selective` | The bounded model and lane-owned criterion regions below |
-| FullTrace / `full` | Guarded whole-model forward with registered custom operations; criterion, backward invocation, optimizer, and host orchestration remain independently owned |
+| None / `none` | Ordinary C++ orchestration, ATen and custom CUDA/autograd |
+| Selective / `selective` | Bounded model/criterion regions below |
+| FullTrace / `full` | Guarded whole-model forward, including registered operations; criterion, backward invocation, optimizer and host policy stay separate |
 
-The current bounded tensor regions are:
-
-| Native region | Captured work | Ordinary boundary |
+| Selective region | Captured work | Ordinary boundary |
 | --- | --- | --- |
-| Backbone/projector | Backbone tensor operations and feature projection | Native model orchestration and spatial layout |
-| Decoder tail, per layer | Cross-attention residual normalization, two linear layers/ReLU, final residual normalization | Grouped self-attention, DN isolation and custom deformable attention |
-| Segmentation spatial tail, per block | Pointwise/residual tail and learned spatial projection | Resize and the custom depthwise derivative |
-| Segmentation query transform | Shared query MLP and projection for ordinary, encoder and DN queries | Sparse output structure and supervision policy |
-| Lane-owned loss operators | Selected classification, BCE/Dice and pairwise contractions | Target preparation, sampling policy, matching, normalization and optimizer orchestration |
+| Backbone/projector | Backbone tensors and projection | Orchestration/spatial layout |
+| Decoder tail/layer | Cross-attention residual norm, linear/ReLU pair, final residual norm | Group self-attention, DN isolation, deformable attention |
+| Segmentation spatial tail/block | Pointwise/residual tail and spatial projection | Resize/custom depthwise derivative |
+| Segmentation query transform | Shared ordinary/encoder/DN MLP and projection | Sparse structure/supervision |
+| Lane loss operators | Selected classification/BCE/Dice/pair contractions | Targets, sampling, assignment, normalization, optimizer |
 
 [SelectiveTensorRegion](../src/backend/models/rfdetr/core/detail/selective_compilation.h)
-uses the shared [TensorTrace](../src/backend/models/rfdetr/core/tensor_trace.cpp)
-owner with one slot per training/evaluation mode. Preparation arms the requested
-batch; the first compatible **real forward** records and returns that execution's
-outputs. It does not run a dummy training pass or replay the first result.
-Identical preparation reuses state; explicit `none` disables selective execution.
-At most two input/output tensors use fixed-capacity handoff storage.
+uses [TensorTrace](../src/backend/models/rfdetr/core/tensor_trace.cpp), with one
+slot per train/eval mode. Preparation arms a batch; the first compatible real
+forward records and returns its own outputs, with no dummy pass or first-result
+replay. Identical preparation reuses state; `none` disables it. Handoffs support
+at most two input/output tensors.
 
-Guards cover device, dtype, rank, admitted extents, gradient mode,
-requires-grad, effective autocast policy, attention backend/precision policy,
-and registered owner tensor signatures. Backbone/spatial slots require
-the prepared batch and fixed dimensions. Decoder-tail and query-transform
-slots permit varying batch/query extents while retaining rank and hidden width.
-Incompatible extents/signatures run ordinary tensor code without overwriting
-the usable slot; an initial short batch leaves the full-batch slot armed.
-Changed preparation can replace a slot, but only a fully constructed graph
-replaces its predecessor. A recording failure propagates without replaying
-failed GPU work and preserves the previous usable graph.
+Guards include device/dtype/rank/extents, grad mode/requires-grad, effective
+AMP dtype/cache policy, attention backend/precision and registered owner tensor
+signatures. Backbone/spatial regions require prepared batch/fixed dimensions;
+decoder/query regions allow varying batch/query extents with fixed rank/width.
+Mismatch runs ordinary code while retaining the usable slot; an initial short
+batch leaves the full-batch slot armed. Replacement is transactional: recording
+failure propagates without replaying failed GPU work or losing the prior graph.
 
-Registered parameters and buffers remain live aliases, so in-place optimizer,
-Resume and EMA weight copies are observed. Device changes invalidate the
-registered owner. Training/evaluation modes and their autograd graphs retain
-separate custody, including outstanding backwards. Permanently zero-probability
-dropout is omitted from the backbone and decoder because TorchScript's
-optimized CUDA backward otherwise consumed RNG even at probability zero.
-Recording, initial reuse and optimized reuse must all preserve the required RNG
-stream.
+Registered parameters/buffers are live aliases, observing in-place optimizer,
+Resume and EMA copies. Device changes invalidate owner registration. Train/eval
+graphs retain separate custody, including outstanding backwards. Permanently
+zero dropout is omitted where optimized CUDA backward would otherwise consume
+RNG. Recording and every reuse preserve required stochastic identity.
 
-Recording disables the local autocast weight cache so registered live weights
-remain authoritative. The installed graph disables its own JIT autocast rewrite;
-replay excludes ambient dispatcher autocast while preserving the casts recorded
-by eager execution. This prevents protected FP32 operations from being downcast
-again during replay. Graphs containing FP16/BF16 values use the function-local
-simple executor to preserve native ATen rounding and autograd on the pinned
-payload; FP32 graphs retain the profiling executor. No process-global fuser or
-autocast switch implements this policy. The [AMP documentation](https://docs.pytorch.org/docs/2.14/amp.html)
-describes local precision regions and warns about the JIT autocast pass; the
-[retained installed-payload evidence](reviews/rfdetr-math/current-results.md)
-identifies the additional replay and executor defects this policy addresses.
+Recording preserves the caller's autocast weight cache, including shared and
+pre-cached parameter casts, so gradient accumulation follows ordinary eager
+execution. The graph disables its local JIT autocast rewrite; replay excludes
+ambient dispatcher autocast while keeping recorded casts, protecting FP32
+operations from recasting. FP16/BF16 graphs use the function-local simple
+executor; FP32 retains profiling. No process-global fuser/cache/autocast toggle
+implements this policy. [AMP](https://docs.pytorch.org/docs/stable/amp.html)
+explains local precision regions and JIT autocast limitations.
 
 [Loss traces](../src/backend/models/rfdetr/core/detail/traced_loss_cache.h)
-have dynamic tensor extents and guard coefficients plus effective CUDA
-autocast state; point-count normalization stays outside the trace.
-Candidate construction is transactional. Ordinary
-[decoder attention](../src/backend/models/rfdetr/core/decoder_attention.cpp)
-uses explicit Q/K/V projections and scaled-dot-product attention, preserving
-distinct parameter/position gradients even for coincident tensor values.
-Grouping, padding and leakage protection remain ordinary native policy.
-This does not promise a particular SDPA kernel backend.
-The explicit model-local math-SDPA route casts eligible inputs once and locally
-excludes autocast during the math primitive, preserving boolean/additive mask
-meaning. Ordinary accelerated backend selection remains the default.
+guard coefficients/effective CUDA autocast and allow dynamic extents; point
+normalization stays outside. [Decoder attention](../src/backend/models/rfdetr/core/decoder_attention.cpp)
+uses explicit Q/K/V plus SDPA, preserving distinct parameter/position gradients
+when values coincide. Grouping/padding/leakage remain native policy. Accelerated
+backend selection is default; model-local math SDPA casts once and locally
+excludes autocast, preserving boolean/additive masks without promising a kernel.
 
-Host scheduling, annotations/target topology, recipe clocks, failure handling,
-and the completed metric decision remain ordinary CPU work. Hungarian training
-also retains CPU assignment after GPU cost construction/readback. Match-Free
-uses its learned correspondence instead of Hungarian assignment, but still
-retains native host orchestration and target policy. Neither selective mode nor
-the next-batch preparation slot captures a complete training step.
+Annotations, target topology, schedules, failure/metric decisions and host work
+remain ordinary CPU policy. Hungarian retains CPU assignment after GPU costs;
+Match-Free replaces assignment, not orchestration. Neither tracing nor future
+preparation captures an entire training step.
 
-Training admits complete effective batches. Training-owned evaluation pads
-model input to its configured batch, zero-fills inactive images and trims
-predictions before metrics/losses. Native weights prediction and standalone
-evaluation carry their requested compilation mode to model construction;
-short direct inference batches use the guarded fallback. GUI prediction is
-batch one. ONNX and TensorRT retain their own execution engines. CLI
-`--compile-mode none|selective|full` controls native selection.
+Training admits complete effective batches. Its evaluation pads to configured
+batch with zero inactive images, then trims predictions before metrics/losses.
+Standalone native prediction/evaluation carries compilation mode to construction;
+short batches use guarded fallback. GUI prediction is batch one. ONNX/TensorRT
+use independent engines. CLI selection is `--compile-mode none|selective|full`.
 
 ### FullTrace and export
 
-FullTrace uses the same first-real-forward recording, live aliases,
-transactional replacement, mode slots, and guarded fallback. Its specialization
-includes input-mask presence and requested mask outputs. Reflected traversal of
-the native output records packs and reconstructs the complete tensor inventory,
-including configured decoder/encoder and sparse-mask outputs. FullTrace retains
-the explicit rejection of target-dependent DN and Match-Free feature capture;
-those training extensions use None or Selective.
+FullTrace shares first-real-forward recording, live aliases, transactional mode
+slots and fallback. Specialization includes input-mask presence and requested
+mask outputs. Reflected output traversal retains the complete decoder/encoder/
+sparse-mask tensor inventory. Target-dependent DN/Match-Free capture is rejected;
+those extensions use None or Selective.
 
-ONNX export obtains an independent inference clone with private mode, caches,
-and graphs. Mutable sources copy weights; sealed immutable sources may share
-their immutable storage. Reference deformable attention and math SDPA are
-selected on that clone, without changing another model or global SDPA policy.
-Lowering retains depthwise precision and maps native SiLU to ONNX Sigmoid/Mul.
-Failure and publication follow the ordinary [export boundary](rfdetr-workflows.md#export-formats).
+ONNX export uses an independent inference clone with private mode/caches/graphs.
+Mutable sources copy weights; sealed immutable sources may share immutable
+storage. Only the clone selects reference deformable attention/math SDPA.
+Lowering retains depthwise precision, linear/ReLU and SiLU→Sigmoid/Mul.
+[Export](rfdetr-workflows.md#export-formats) defines failure/publication.
 
 ### Compiler choices and native feasibility
 
-These mechanisms have different contracts. The current repair preserves the
-native training owners and selectable modes; it does not establish that every
-backend has identical arithmetic or better throughput.
-
-| Mechanism | Native fit and limits |
-| --- | --- |
-| Pinned TorchScript with guarded regions and registered operations | Current implementation. Preserves native autograd, live state, and first-real-call recording; specialization and opaque operations need explicit contracts. PyTorch's [compiler tutorial](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html#benefits-over-torchscript) marks TorchScript deprecated, so this is a pinned integration, not a new general compiler recommendation. |
-| Dispatcher operators and native autograd | The boundary for opaque CUDA work in eager and traced execution. Torchvision's [deformable-convolution dispatcher](https://github.com/pytorch/vision/blob/v0.24.0/torchvision/csrc/ops/deform_conv2d.cpp) and [C++ autograd implementation](https://github.com/pytorch/vision/blob/v0.24.0/torchvision/csrc/ops/autograd/deform_conv2d_kernel.cpp) are concrete references. Registration checks alone do not validate derivative equations, as the [custom-op guide](https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html) states. |
-| `torch.export` / AOTInductor C++ inference | A possible separate deployment path: export/compile a model, then load its package in C++, as in the [official tutorial](https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/torch.compiler_aot_inductor.html) and [pinned package loader](https://github.com/pytorch/pytorch/blob/4fdf77b940/torch/csrc/inductor/aoti_package/model_package_loader.h). This repository has not established it as a replacement for native training, optimizer mutation, lane ownership, or Resume. |
-| CUDA graphs | Replay admitted CUDA work to reduce launch overhead, with [capture and storage constraints](https://docs.pytorch.org/docs/2.14/notes/cuda.html#cuda-graphs). They neither capture arbitrary host policy nor certify forward equations, gradients, or precision. |
-
-[Diagnostics](logging.md#native-selective-compilation) distinguishes recorded
-versus executed optimized graphs, fusion node forms, autocast, and TF32.
-[Validation](validation.md#training-mathematics-and-compilation-evidence) records
-the observed fusion boundary and evidence limits.
+TorchScript is a pinned integration and is [deprecated upstream](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html#benefits-over-torchscript).
+Registered dispatcher/autograd operators keep opaque CUDA forward/VJP inside
+eager/traced execution; registration alone does not validate derivatives.
+[Diagnostics](logging.md#native-selective-compilation) distinguishes recording,
+executed graphs, fusion forms, autocast and TF32. [Validation](validation.md#training-mathematics-and-compilation-evidence)
+defines evidence limits; selectable modes do not establish identical arithmetic
+or faster execution.

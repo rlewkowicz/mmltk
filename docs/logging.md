@@ -4,29 +4,27 @@
 
 ## Activation and quiet execution
 
-Ordinary `./mmltk --gui` creates no active diagnostic sink, integration driver,
-reporting state, or pixel-probe owner. Disabled diagnostics perform no collection,
-formatting, clock reads, counter updates, or I/O. Product state, input order,
-and physical custody/completion remain independent of diagnostic identities.
-[Fatal stderr](#fatal-stderr-reports) remains active.
+Ordinary `--gui` has no diagnostic sink, integration/reporting state, or pixel
+probe. Disabled diagnostics do no collection, formatting, clock reads, counter
+updates, or I/O. Product ordering/custody stays independent of diagnostic IDs.
+[Fatal stderr](#fatal-stderr-reports) remains active. [Training history](rfdetr-workflows.md#saved-history-and-plots)
+(`run.json`, `metrics.jsonl`, progress, incomplete-history notices) is product
+output, independent of diagnostics.
 
-Training run history and incomplete-history notices are product output,
-independent of diagnostic activation. `run.json`/`metrics.jsonl`, progress
-projections, and their writer/reader ownership are documented in
-[saved history](rfdetr-workflows.md#saved-history-and-plots).
-
-| Explicit setting | Effect |
+| Opt-in | Effect |
 | --- | --- |
-| `MMLTK_LOG_LEVEL`, `MMLTK_LOG_FILE`, `MMLTK_LOG_DIR` | Native application logging to stderr and a rotating file |
-| CLI `--log-level`, `--log-file`, `--log-dir` | Override the corresponding native logging environment values |
-| `MMLTK_GUI_TRACE_FILE` | Native runtime JSONL, benchmark compilation, and browser surface lifecycle diagnostics |
-| `MMLTK_GUI_PIXEL_TRACE=1` with a GUI trace path | Additional pixel probes |
-| `MMLTK_FIREFOX_LOG_FILE` | Redirect Firefox stdout/stderr to a separate file; does not itself enable native lifecycle or pixel collection |
+| `MMLTK_LOG_LEVEL`, `MMLTK_LOG_FILE`, `MMLTK_LOG_DIR` | Native stderr and rotating file |
+| CLI `--log-level`, `--log-file`, `--log-dir` | Override matching environment settings |
+| `MMLTK_GUI_TRACE_FILE` | Native JSONL, benchmark compilation, browser surface lifecycle |
+| `MMLTK_GUI_PIXEL_TRACE=1` plus GUI trace path | Pixel probes |
+| `MMLTK_FIREFOX_LOG_FILE` | Separate Firefox stdout/stderr capture; enables no native/pixel collection |
 
-Native logging is enabled by a non-`off` level, or a destination with the build's
-default enabled level. Explicit `off` wins over destinations but leaves separately
-requested GUI traces active. Desktop logging uses the environment; native CLI
-and ONNX tools also accept the three flags.
+A non-`off` level or destination enables native logging at the build default;
+explicit `off` wins over destinations without disabling separately requested
+GUI tracing. Desktop uses environment settings; native CLI/ONNX tools accept
+flags too. With only a level, the wrapper prepares `.mmltk-data/logs` for the
+runtime UID/GID. Explicit destinations retain host-path rewriting. Native files
+use application names, 10 MiB rotation, and five archives.
 
 ```bash
 MMLTK_LOG_LEVEL=info ./mmltk --gui
@@ -34,65 +32,41 @@ MMLTK_LOG_LEVEL=info ./mmltk --gui
 ./mmltk rfdetr info --onnx ./model.onnx --log-level info
 ```
 
-When only an enabled level is supplied, the wrapper prepares the writable
-repository directory `.mmltk-data/logs` for the resolved runtime UID/GID.
-Explicit file/directory overrides retain their destination and host-path
-rewriting. Native logs use the application name, a 10 MiB rotation threshold,
-and five archived files.
-
-ONNX inspection/simplification needs explicit diagnostics for routine metadata;
-default/`off` still reports fatal stderr and failure status. `rfdetr info --onnx`
-forwards logging overrides to its sibling tool. Ordinary CLI result stdout
-(e.g. compiled-dataset `info`) is independent.
+Routine ONNX inspection/simplification metadata needs diagnostics; `rfdetr info
+--onnx` forwards overrides to its sibling tool. Fatal stderr/status and ordinary
+CLI result stdout remain independent.
 
 ## Wrapper build, test, and tidy transcripts
 
-Explicit `./mmltk --build`, `--build-tools`, `--test ...`, `--tidy`, and
-`--tidy-tools` operations retain their stdout and stderr automatically, as does
-`--diagnose-rfdetr-upstream --build-only`.
-The native [driver](../tools/mmltk.cpp) owns capture and prints the selected
-path when it starts:
+The native [driver](../tools/mmltk.cpp) automatically tees explicit build/test/
+tidy stdout+stderr to the printed repository-local path:
 
-| Operation | Default path below the repository | Destination override |
+| Operation | Default `build/logs/` filename | Override |
 | --- | --- | --- |
-| Build | `build/logs/mmltk-build-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
-| Tools build | `build/logs/mmltk-build-tools-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
-| Oracle image build | `build/logs/mmltk-build-rfdetr-oracle-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
-| Test | `build/logs/mmltk-test-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TEST_LOG_FILE` |
-| Tidy / tools tidy | `build/logs/mmltk-tidy-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TIDY_LOG_FILE` |
+| `--build` | `mmltk-build-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
+| `--build-tools` | `mmltk-build-tools-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
+| `--diagnose-rfdetr-upstream --build-only` | `mmltk-build-rfdetr-oracle-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
+| `--test` | `mmltk-test-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TEST_LOG_FILE` |
+| `--tidy`, `--tidy-tools` | `mmltk-tidy-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TIDY_LOG_FILE` |
 
-Relative overrides resolve against the invocation's working directory. Capture
-appends to an existing override path, so choose a new filename to isolate a
-run. Test `list`, `help`, `-h`, and `--help` routes skip capture, as does
-`--build-tools --help`. Initial wrapper startup text emitted before operation
-selection is outside the transcript.
-Automatic command capture does not enable GUI traces, pixel probes, or routine
-application diagnostics.
+Relative overrides use the invocation directory and append if present; use new
+filenames per run. Test list/help/`-h`/`--help` and tools-build help skip capture.
+Startup text before operation selection is excluded. Transcripts enable no GUI
+tracing, probes, or routine diagnostics. [Cold bootstrap](build.md#native-tools-and-checkout-bootstrap)
+uses `mmltk-tools-bootstrap-YYYYMMDD-HHMMSS-PID.log`; its launched operation
+captures separately. Bootstrap nested inside build/tidy uses the parent capture.
 
-The [cold bootstrap](build.md#native-tools-and-checkout-bootstrap) retains its
-initial build output in
-`build/logs/mmltk-tools-bootstrap-YYYYMMDD-HHMMSS-PID.log`. The native operation
-launched afterward owns its usual separate transcript. Bootstrap work invoked
-by an already-running build or tidy operation uses that operation's capture.
-
-The caller still receives stdout on stdout and stderr on stderr. Separate tees
-retain both streams in one file; this does not establish a total ordering
-between them. On ordinary exit the wrapper drains both capture pipes before
-printing and appending its terminal line:
+The caller keeps separate stdout/stderr; merging tees establishes no total
+order. Ordinary exit drains both pipes before appending/printing:
 
 ```text
 mmltk: test exited with status 0
 ```
 
-Build, tools build, and tidy use `build`, `build-tools`, and `tidy` respectively;
-tools tidy also uses `tidy`, and oracle image preparation uses
-`build-rfdetr-oracle`. Capture/cleanup failures
-report an error and turn an otherwise successful command into a nonzero result.
-An abrupt termination can leave a transcript without a terminal; EOF alone
-does not establish success. The log parser exposes observed exit lines as
-`process.terminal`, with `@exit_code` and `@terminal` available for queries.
-
-For example:
+Other labels are `build`, `build-tools`, `tidy` (both tidy routes), and
+`build-rfdetr-oracle`. Capture/cleanup failure makes otherwise successful work
+nonzero. Abrupt termination can leave no terminal; EOF proves no success.
+Observed terminal lines normalize to `process.terminal`, `@exit_code`, `@terminal`.
 
 ```bash
 MMLTK_TEST_LOG_FILE=build/logs/test-investigation.log ./mmltk --test core
@@ -101,76 +75,64 @@ MMLTK_TEST_LOG_FILE=build/logs/test-investigation.log ./mmltk --test core
   -q '@event=process.terminal' --fields @event,@exit_code,@terminal --format timeline
 ```
 
-Use the printed path for a specific build or test. The default `--logs` input
-is `build/validation`, so select `build/logs` or a transcript explicitly.
-[Test replacement](validation.md#replacing-an-active-test-run) may explain a
-cancelled earlier run; its terminal records that run's outcome independently
-of its replacement.
+Default log-query input is `build/validation`; select transcripts explicitly.
+[Test replacement](validation.md#replacing-an-active-test-run) can explain a
+cancelled run, whose terminal remains independent of its replacement.
 
 ## Fatal stderr reports
 
-Native CLI errors, RF-DETR command errors, ONNX tool failures, and desktop
-startup/runtime failures use the common bounded reporter. Each report is a
-single line:
+Native CLI, RF-DETR, ONNX, and desktop terminal failures use the common reporter:
 
 ```text
 fatal: <component>: <detail> (status=<available status>)
 ```
 
-The status suffix is omitted when no status is supplied. Component and detail
-are capped at 160 and 800 bytes, with truncation markers; control bytes become
-spaces. The fixed 1024-byte buffer bounds the complete report independently of
-optional logger state. A disabled, uninitialized, or failed diagnostic sink does
-not hide the stderr attempt. The reporter preserves `errno`; a broken stderr
-pipe does not terminate reporting through SIGPIPE or consume a signal already
-pending on the calling thread.
+Status is omitted when unavailable. Component/detail caps are 160/800 bytes
+with truncation markers; control bytes become spaces in a fixed 1024-byte
+buffer. Reporting preserves `errno` and attempts stderr with disabled,
+uninitialized, or failed sinks. Broken pipes neither terminate through SIGPIPE
+nor consume a previously pending signal. Enabled file sinks receive a best-effort
+critical copy without duplicate stderr; RF-DETR/ONNX retain named identities.
+Healthy execution/requested shutdown is quiet.
 
-When enabled, the rotating file sink receives a best-effort critical copy
-without emitting a second stderr copy. RF-DETR and ONNX tools retain their
-named diagnostic identities. Routine successful execution and requested
-healthy shutdown remain quiet when diagnostics are disabled.
+Owners preserve original errors: Firefox launch/infrastructure retains OS error
+separately from mapped status; unsuccessful exit retains its code; unexpected
+signal reports its number and maps desktop status to `128 + signal`. Requested
+healthy SIGINT/SIGTERM is not failure.
 
-Desktop failure context comes from the owning boundary. Firefox launch and
-process-infrastructure failures retain the OS error separately from the mapped
-process status. An unsuccessful child exit preserves its exit status; an
-unexpected child signal is reported by number and yields `128 + signal` as the
-desktop exit status. This does not turn an intentional healthy SIGINT/SIGTERM
-shutdown into a failure.
-
-The [logging module](../src/common/logging/mmltk_logging.cppm) and
-[implementation](../src/common/logging/mmltk_logging.cpp) own this path.
-`report_fatal` is for ordinary terminal boundaries, **not signal handlers**;
-it must not be called from a fatal signal handler.
+[Logging interface](../src/common/logging/mmltk_logging.cppm) and
+[implementation](../src/common/logging/mmltk_logging.cpp) own `report_fatal`.
+It serves ordinary terminal boundaries and **must not run in signal handlers**.
 
 ### Firefox fatal causes and process identity
 
-Unrecoverable Firefox WebGPU, dispatcher, queue, and completion boundaries
-report their original OS, wgpu, or Vulkan cause before aborting, independently
-of diagnostics:
+Unrecoverable Firefox WebGPU/dispatcher/queue/completion boundaries report the
+original OS/wgpu/Vulkan cause before aborting, independently of diagnostics:
 
 ```text
 fatal: firefox.webgpu: operation=<name> pid=<pid> ppid=<ppid> pgid=<pgid> <available context>status=<original error>
 ```
 
-The ordinary-boundary reporter uses a 2048-byte stack buffer, UTF-8-safe
-truncation, control-byte replacement, at most eight write attempts, and preserved
-`errno`. Available context identifies the actor, device, queue, semaphore, or
-submission. This reporter is not a signal handler and does not enable tracing.
+Ordinary reporting uses a 2048-byte stack buffer, UTF-8-safe truncation,
+control-byte replacement, ≤8 writes, preserved `errno`, and available
+actor/device/queue/semaphore/submission. It is not a signal handler or trace opt-in.
 
-Unexpected content-channel loss is classified by the surviving `ContentParent`,
-which knows whether shutdown was requested. Its bounded 1024-byte report uses
-component `firefox.ipc`, operation `content_channel_error`, `child_pid`, `actor`,
-`channel=PContentParent`, `side=parent`, and `status=AbnormalShutdown`, with the
-same PID/PPID/PGID envelope. The native
+Surviving `ContentParent` classifies unexpected channel loss using shutdown
+intent: bounded 1024-byte `firefox.ipc` report, operation `content_channel_error`,
+`child_pid`, `actor`, `channel=PContentParent`, `side=parent`,
+`status=AbnormalShutdown`, and the PID/PPID/PGID envelope.
 [FirefoxProcessOwner](../src/controller/services/firefox/firefox_process_owner.cpp)
-classifies the root process's exit or signal and shutdown intent. Child-side EOF
-during a requested root SIGTERM does not by itself establish a fatal cause;
-healthy disabled-diagnostic shutdown stays quiet.
+classifies root exit/signal/intent. Child EOF during requested root SIGTERM
+alone establishes no fatal cause.
 
-The query parser exposes these lines as `fatal.report` with level `fatal`,
-retaining the original text and opaque status. Only fields before `status=`
-establish structured context; text inside an error cannot manufacture an
-identity. For a selected capture:
+Parser event `fatal.report` has level `fatal`, original text, opaque status,
+and structured context only **before** `status=`. Error text cannot forge IDs.
+`@process`, `@parent_process`, `@process_group` require exact positive Linux IDs;
+process-owner child/stop uses observed child PID and spawn-established PGID.
+Unknown zero IDs stay unknown. Automatic joins stay within one capture and
+label exact-process, parent/child, and group relationships separately. Shared
+parents do not join siblings; group membership attributes no crash cause or
+parent terminal to a particular child.
 
 ```bash
 ./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
@@ -179,131 +141,76 @@ identity. For a selected capture:
   --auto-correlate --format timeline --limit 40
 ```
 
-`@process`, `@parent_process`, and `@process_group` admit exact positive Linux
-IDs. Firefox process-owner child/stop records use the observed child PID and
-spawn-established process group; historical zero terminal IDs remain unknown.
-Automatic fatal/channel/process joins remain within one capture run and label
-exact-process, parent/child, and process-group relationships separately. A
-shared parent does not join siblings. Group membership establishes neither a
-crash cause nor which child supplied a parent's terminal status.
-
 ## Local training failures
 
-[TrainProcessClient](../src/controller/services/training/train_process_client.cpp) scans
-the child's consumed output for line-start `fatal: ` envelopes even after the
-64 KiB console-retention budget fills. Its current-line and retained-cause
-buffers are each bounded to 3072 bytes. It finishes chunked and unterminated
-fatal lines before publishing the terminal and preserves a useful worker cause
-when a later parent line reports only generic distributed failure. Progress
-text and allocator warnings do not select a cause.
+[TrainProcessClient](../src/controller/services/training/train_process_client.cpp)
+scans consumed child output for line-start `fatal: ` beyond its 64 KiB console
+retention. Current-line and retained-cause buffers are each 3072 bytes. It
+finishes chunked/unterminated lines before terminal publication and preserves
+specific worker causes over generic distributed-parent failures; progress and
+allocator warnings do not select a cause.
 
-A complete fatal line publishes a failed training observation immediately,
-while the process group remains active until physical retirement. The Train
-view and session Status panel show the cause during that interval, and Start
-remains unavailable. The first fatal cause also arms the existing five-second
-cleanup deadline; surviving peers receive SIGKILL when it expires. Captured
-children unblock SIGINT and SIGTERM inherited from the desktop's signal owner,
-so ordinary distributed peer termination works without waiting for escalation.
+A complete fatal publishes failed state immediately while the group retires;
+Train/Status show it and Start remains unavailable. The first cause arms a
+five-second cleanup deadline before surviving peers receive SIGKILL. Children
+unblock inherited SIGINT/SIGTERM for ordinary peer termination. Cancellation
+and retirement remain independent of diagnostics.
 
-[NativeTrainingRuntime](../src/controller/subsystems/train/training_system.cpp)
-projects the decoded exit/signal status and UTF-8-safe cause into the existing
-`ComputeTerminal.detail` for the [session Status panel](gui-interaction.md#session-status).
-An explicit CUDA OOM cause adds the
-[batch-size/lane guidance](rfdetr-workflows.md#local-training-failures).
-`TrainingSystem` owns the single settled fatal stderr report when it hosts the
-runtime, including preparation failures; standalone runtime use retains its
-own reporting responsibility. Cancellation and process-group retirement are
-independent of diagnostic activation.
+[Training runtime](../src/controller/subsystems/train/training_system.cpp)
+projects decoded exit/signal and UTF-8-safe cause into `ComputeTerminal.detail`;
+explicit CUDA OOM adds [batch/lane guidance](rfdetr-workflows.md#local-training-failures).
+TrainingSystem owns one settled fatal stderr, including preparation failure;
+standalone runtime retains its reporting responsibility.
 
-Enabled GUI trace records `child.exited`, `child.signaled`, and `training.failed`
-include bounded batch/lane, output, device, and available run/attempt context.
-`training.worker_failed` records each newly selected fatal cause before process
-retirement, with the process-group ID in `value` and the output directory in
-`document_resource`. Its message admits the complete retained cause and OOM
-guidance within a 4096-byte bound.
+| Enabled trace | Fields/boundary |
+| --- | --- |
+| `child.exited`, `child.signaled`, `training.failed` | Bounded batch/lane, output, device, available run/attempt |
+| `training.worker_failed` | Each newly selected cause before retirement; `value`=process group, `document_resource`=output, ≤4096-byte cause/guidance |
+| `training.progress.read.begin`, `.end` | Progress-file read/decode/validation/projection span; end duration and output identity; no disabled-trace clocks |
+| `training.inputs` | Before dataset inspection: `sequence`=operation generation, `value`=captured settings revision, requested/prepared preset/resolution, split paths |
+| `training.operation.failed`, `.settled` | Typed outcome, including pre-process failures; `sequence`=generation, `value`=snapshot revision |
+| `training.preparation` | Startup stage before metrics, operation generation; native `preparation.json` changes only on transitions and is watched alongside metrics |
+| `iced.notice.added`, `.updated`, `.dismissed` | Frontend notice ID, origin, content version, title/detail; independent of native settlement |
 
-`training.progress.read.begin` / `training.progress.read.end` measure the GUI
-process client's progress-file read, decode, validation, and status projection.
-The end record carries the span duration and the output directory identifies
-the run. These spans collect nothing when GUI tracing is disabled. GPU counters
-are ordinary [saved training metrics](rfdetr-workflows.md#saved-history-and-plots)
-and do not require tracing. To compare launch settings and throughput before
-attributing a difference to rendering:
+Input/operation messages are bounded to 1024 UTF-8 bytes; UI retains full bounded
+terminal detail. Resolution errors identify file, actual geometry/channels,
+and requirements. Preparation covers GPU connection, dataset admission,
+checkpoint/model construction, GPU weight loading, synchronization, optimizer
+setup. [Dataset identity](model-merging.md#whole-session-resume) uses metadata,
+without payload scans or startup console parsing.
+
+Distributed CLI forwards logging overrides. Worker filenames insert `.rank-N`
+before the extension; absent explicit file, use `mmltk.rank-N.log` in selected
+log/output directory. Disabled logging creates no worker files.
+
+TrainingRecord format 3 projects lowercase `training.<role>.<phase>`.
+Every `Terminal` is terminal evidence; `progress.phase="Error"` anchors failure.
+Counters such as `class_error` do not. Triage prioritizes run/attempt, role,
+sequence, phase, session/model, and first cause over configuration, follows exact
+run/attempt, and excludes training records from generic suffix balancing.
 
 ```bash
+./mmltk --logs output/train/RUN/metrics.jsonl --errors --format timeline
+./mmltk --logs output/train/RUN/metrics.jsonl --triage
+./mmltk --logs output/train/RUN/metrics.jsonl \
+  -q '@model=2 AND (@phase=Merge OR @role=Terminal)' --format timeline
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl .mmltk-data/logs/firefox.log \
+  -q '@event=training.inputs OR @event=training.operation.failed OR @event=iced.notice.added' \
+  --format timeline --fields @event,sequence,value,notice_id,origin,message
 ./mmltk --logs checkpoints/CLI_RUN/metrics.jsonl output/train/GUI_RUN/metrics.jsonl \
-  -q '@event=training.boundary.starting' \
-  --fields attempt_configuration --format jsonl
+  -q '@event=training.boundary.starting' --fields attempt_configuration --format jsonl
 ./mmltk --logs output/train/GUI_RUN/metrics.jsonl \
   -q '@event=training.live.train' \
   --fields progress.completed_images,progress.images_per_second,progress.scalars \
   --tail --limit 10 --format jsonl
 ```
 
-Compare effective encoder-freeze, denoising, batch, GPU, loading, and
-augmentation settings. The throughput field is an epoch average; startup and
-different amounts of training work make isolated values incomparable.
-
-The training system also emits `training.inputs` before dataset inspection,
-including the operation generation (`sequence`), captured settings revision
-(`value`), requested and prepared preset/resolution, and compiled split paths.
-`training.operation.failed` and `training.operation.settled` record the resulting
-typed terminal, including failures before a training process exists. Their
-`sequence` is the operation generation and `value` is the snapshot revision.
-Resolution errors identify the file, actual geometry/channels, and required
-geometry. These diagnostic messages remain bounded to 1024 UTF-8 bytes; the UI retains
-the full bounded terminal detail.
-
-`training.preparation` reports the worker's startup stage before metrics exist.
-Its `sequence` is the operation generation. The small native
-`preparation.json` document is watched alongside metric documents and changes
-only at stage transitions. No console parsing is needed for startup
-progress. Query `@event=training.preparation` for GPU connection, dataset
-admission, checkpoint loading, model construction, GPU weight loading,
-GPU/session synchronization, and optimizer setup. [Dataset identity](model-merging.md#whole-session-resume)
-uses admitted metadata without scanning image payloads.
-Distributed CLI training forwards explicit logging options to each worker, so
-`--log-level` and `--log-file` also cover the native training processes. Each
-worker inserts `.rank-N` before the log file extension to keep rotating sinks
-independent. Without an explicit file, workers use `mmltk.rank-N.log` in the
-configured log directory or the training output directory. Disabled logging
-creates no worker log files.
-
-With GUI lifecycle tracing enabled, Firefox output records
-`iced.notice.added`, `iced.notice.updated`, and `iced.notice.dismissed` with the
-notice ID, typed origin, content version, and title/detail text. These records
-track the frontend notice store independently of native operation settlement.
-For example:
-
-```bash
-./mmltk --logs .mmltk-data/logs/gui-trace.jsonl .mmltk-data/logs/firefox.log \
-  -q '@event=training.inputs OR @event=training.operation.failed OR @event=iced.notice.added' \
-  --format timeline --fields @event,sequence,value,notice_id,origin,message
-```
-
-The query tool projects canonical [TrainingRecord format 3](rfdetr-workflows.md#saved-history-and-plots)
-role/phase as lowercase `training.<role>.<phase>`. Every `Terminal` is terminal
-evidence; `progress.phase: "Error"` additionally anchors failure triage. Counters
-such as `class_error` imply no failure. Bounded triage prioritizes `run_id`, `attempt_id`,
-role, sequence, phase, session/model, and first cause over optional configuration,
-follows run/attempt identity, and excludes these records from generic suffix
-balancing.
-
-For a captured run:
-
-```bash
-./mmltk --logs output/train/run-0002/metrics.jsonl --errors --format timeline
-./mmltk --logs output/train/run-0002/metrics.jsonl --triage
-./mmltk --logs output/train/run-0002/metrics.jsonl \
-  -q '@model=2 AND (@phase=Merge OR @role=Terminal)' --format timeline
-./mmltk --logs --family latest-wayland-test \
-  -q '@owner=training AND (@event=child.exited OR @event=child.signaled OR @event=training.failed)' \
-  --format timeline --limit 20
-```
-
-Replace the run path with the selected Output directory. A Terminal/Error
-record establishes failed training; use the owning operation's terminal detail
-or captured fatal stderr to establish the cause.
+Replace `RUN` with the selected Output directory. Terminal/Error proves failed
+training; owning terminal/fatal stderr establishes cause. GPU counters are
+[saved metrics](rfdetr-workflows.md#saved-history-and-plots), not tracing.
+Compare encoder freezing, DN, batch/GPU, loading, and augmentation before
+attributing throughput to rendering. `images_per_second` is an epoch average;
+different startup/work makes isolated values incomparable.
 
 ## Capture one reproduction
 
@@ -314,116 +221,85 @@ MMLTK_FIREFOX_LOG_FILE=.mmltk-data/logs/firefox.log \
 ./mmltk --gui
 ```
 
-`MMLTK_GUI_TRACE_FILE` opts into native JSONL command, transport, worker,
-benchmark compilation, presentation, cleanup, and failure diagnostics. The native
-sink opens a new capture and truncates that path; preserve earlier evidence
-before reusing it.
-`MMLTK_FIREFOX_LOG_FILE` captures the separate browser log.
-The native trace file and Firefox output file must be separate destinations.
-Their parent directories must already exist and be writable by the runtime user.
+Native tracing covers command/transport/worker/compiler/presentation/cleanup/
+failure JSONL and **truncates** the chosen path. Preserve prior captures.
+Firefox output needs a separate path; both parents must exist and be runtime-user
+writable. Add `MMLTK_GUI_PIXEL_TRACE=1` with the native trace path for probes;
+lifecycle traces alone prove no pixels. [Normalized IDs](#fields-and-correlation)
+join native high/low and browser 32-hex identities within distinct source/arena
+namespaces.
 
-Add `MMLTK_GUI_PIXEL_TRACE=1` for pixel probes; desktop startup enables them
-only when the native trace path is also set. Lifecycle-only traces do not
-prove pixel continuity. Native high/low values and browser 32-hex-digit
-identities join the same physical source or arena within their respective
-namespaces; [normalized identity fields](#fields-and-correlation) keep them
-separate.
-
-Enabled Iced pixel probes retain small reusable compute/readback storage and
-the exact sampled slot through completion. They preserve the shared sample's
-shader-read layout and do not introduce a full-image capture texture. Ordinary
-display execution has no pixel-probe owner.
-
-Native and Iced frame probes compare the same 25 points: the Cartesian product
-of five positions per axis, bounded by the exact content extent. Explore also
-records 25 samples per card at 5%, 35%, 50%, 65%, and 95% along each axis, plus
-rendered semantic/padding checks. Card records include clean, semantic, and
-retained-reference RGBA arrays and their actual integer coordinates. Probes are
-explicit GPU readback, separate from the same-GPU display path. Native kernel
-probes and direct CUDA source-to-host samples are independent observations.
-Optional Firefox direct-image probes require successful completion and valid
-readback markers; undefined buffer-alias samples cannot prove image contents.
-
-GPU-specific trace variables are covered in [GPU execution](gpu-execution.md).
+Enabled Iced probes reuse small compute/readback storage, hold the exact sample
+slot, preserve shader-read layout, and create no full-image capture texture.
+Ordinary display has no probe owner. Frame probes sample the same 5×5 Cartesian
+points bounded by content; Explore cards use 5%, 35%, 50%, 65%, 95% on each axis
+plus semantic/padding checks, retaining clean/semantic/reference RGBA and actual
+integer coordinates. These explicit readbacks are separate from GPU display;
+native kernel probes and direct CUDA samples are independent. Optional Firefox
+direct-image probes require completion and valid markers; undefined alias
+samples prove no contents. [GPU tracing](gpu-execution.md) owns other variables.
 
 ## Native selective compilation
 
-Native application logging at `debug` enables the
-[shared tensor-trace diagnostics](../src/backend/models/rfdetr/core/tensor_trace.cpp),
-used by Selective regions and FullTrace.
-These are `rfdetr compilation` messages, separate from GUI lifecycle JSONL.
-The query tool extracts their named fields from the native log:
+Native `debug` logging enables [tensor-trace diagnostics](../src/backend/models/rfdetr/core/tensor_trace.cpp)
+for Selective/FullTrace, as `rfdetr compilation` messages separate from GUI JSONL:
 
 ```bash
 ./mmltk --logs .mmltk-data/logs/rfdetr.log \
   -q '"rfdetr compilation"' \
-  --fields region,owner,reason,training,signature,grad,amp,amp_dtype,torch,graph_available,operators,fusion_groups,tensor_expr_groups \
+  --fields region,owner,reason,training,signature,grad,amp,amp_cache,amp_dtype,torch,graph_available,operators,fusion_groups,tensor_expr_groups \
   --format jsonl --limit 40
 ```
 
-Supply the actual captured native application file. `region` identifies the
-backbone, per-layer decoder tail, segmentation spatial/query, or full-model region; `owner`
-distinguishes instances within the process. `preparation` reports armed,
-disabled or identical requests. Execution `reason` distinguishes recorded
-graphs, reuse with an optimized graph when available, signature/prepared-batch
-fallback and registered-owner/attention-policy invalidation. `signature`, `training`, `grad`, `amp`
-and numeric `amp_dtype` describe actual invocation state. `torch` is the
-compiled version macro, while the [payload manifest](../docker/nvidia-payload.json)
-owns the complete pinned build identity.
+| Fields | Meaning |
+| --- | --- |
+| `region`, `owner` | Backbone, decoder tail, segmentation spatial/query, or full-model region; process-local instance |
+| `preparation`, `reason` | Armed/disabled/identical request; record/reuse, signature/prepared-batch fallback, owner/attention-policy invalidation |
+| `signature`, `training`, `grad`, `amp`, `amp_cache`, `amp_dtype` | Actual invocation, including autocast cache and numeric dtype |
+| `torch` | Compiled version macro; [payload manifest](../docker/nvidia-payload.json) owns full build identity |
+| `executor_optimize`, `fuse_cpu`, `fuse_gpu`, `tf32_matmul`, `tf32_cudnn` | Runtime policy |
+| `graph_available`, `operators` | Inspected graph |
+| `fusion_groups`, `tensor_expr_groups` | Recursive FusionGroup/CudaFusionGroup/TensorExprGroup total; last form separately |
 
-`executor_optimize`, `fuse_cpu`, `fuse_gpu`, `tf32_matmul` and `tf32_cudnn`
-report runtime policy. `graph_available` and `operators` describe the inspected
-graph. `fusion_groups` recursively counts `prim::FusionGroup`,
-`prim::CudaFusionGroup` and `prim::TensorExprGroup`; `tensor_expr_groups`
-separately counts the last form. Reuse queries inspect the last executed
-optimized graph when available, rather than treating the recorded graph as
-optimization evidence. Enabled graph inspection is diagnostic work; disabled
-debug logging collects and formats none of it.
-
-Capture/reuse, fuser availability and graph fusion are different facts. Fused
-ATen operators such as SDPA are not graph fusion groups. Neither these counts
-nor the native TorchScript path establish a throughput advantage over upstream
-Dynamo/Inductor. [Validation](validation.md#training-mathematics-and-compilation-evidence)
-owns the actual observed fusion boundary.
+Reuse inspects the last optimized executed graph when available. Disabled debug
+performs no graph inspection/formatting. Capture/reuse, fuser availability,
+graph fusion, and fused ATen (e.g. SDPA) differ. None alone proves a training
+speedup over upstream Dynamo/Inductor; [validation](validation.md#training-mathematics-and-compilation-evidence)
+defines evidence boundaries.
 
 ## Upstream numerical comparisons
 
-The [independent upstream diagnostic](validation.md#independent-upstream-diagnostic)
-retains `wrapper.log`, one log per native comparison executable,
-`manifest.json`, checked tensor archives, and `comparisons/*.jsonl` under its
-selected evidence directory. A successful combined run additionally publishes
-`verdict.json`; reference production alone is not a comparison pass.
+[Upstream validation](validation.md#independent-upstream-diagnostic) retains
+`wrapper.log`, native executable logs, `manifest.json`, authenticated archives,
+and `comparisons/*.jsonl`. Only successful combined required comparisons publish
+`verdict.json`; reference preparation alone proves no native parity.
 
-Comparison JSONL uses `boundary` for tensor/identity/inventory scope. The
-`policy` record retains precision, backend facts, and native executable SHA-256.
-Retries append records with a new `run_unix_ns`; filter/group that field to
-avoid treating multiple runs as one sample. Important numeric fields are
-`max_absolute`, `l2_error`, `expected_l2`, `normalized_error`, and the declared
-relative/absolute tolerances. Parameter deltas additionally retain
-`parameter_quantization_max` and `unadjusted_normalized_error` beside raw errors.
+| Field | Meaning |
+| --- | --- |
+| `boundary` | Tensor/identity/inventory scope |
+| `policy` record | Precision, backend, executable SHA-256 |
+| `run_unix_ns` | Appended retry identity; filter/group to separate attempts |
+| `max_absolute`, `l2_error`, `expected_l2`, `normalized_error` | Raw error and reference scale, alongside declared rtol/atol |
+| `parameter_quantization_max`, `unadjusted_normalized_error` | Update-delta interval and original error |
+| `measurement_only`, `policy_difference`, `first_difference` | Interpret `passed=false` observations under [required gates](validation.md#numerical-gates-and-trajectory-observations) |
 
-`passed=false` can be an intentionally retained per-tensor or trajectory
-observation. Inspect `measurement_only`, `policy_difference`, and
-`first_difference` with the [required numerical gates](validation.md#numerical-gates-and-trajectory-observations).
-Inventory, dtype, shape, definedness, and nonfinite failures still fail
-measurement-only trajectories. A complete-vector derivative gate does not erase
-the individual tensor records or imply trajectory equality.
+Inventory/dtype/shape/definedness/nonfinite failures fail even measurement-only
+trajectories. Complete-vector derivative gates retain individual tensor facts
+and establish no trajectory equality. Keep reports with execution ledger and
+terminal; preserve failed attempts separately from completed checks.
 
 ```bash
-./mmltk --logs 'build/validation/rfdetr-math/upstream-final/comparisons/core-*.jsonl' \
+./mmltk --logs 'build/validation/rfdetr-math/upstream/comparisons/*.jsonl' \
   -q 'boundary="vjp/complete-vector"' \
   --fields @file,run_unix_ns,boundary,max_absolute,l2_error,expected_l2,passed \
   --format jsonl --limit 100
-./mmltk --logs 'build/validation/rfdetr-math/upstream-final/comparisons/*.jsonl' \
+./mmltk --logs 'build/validation/rfdetr-math/upstream/comparisons/*.jsonl' \
   -q 'first_difference=true' \
   --fields @file,run_unix_ns,boundary,measurement_only,policy_difference,normalized_error \
   --format jsonl --limit 40
 ```
 
-Use `:` for substring and `~` for regex matching, for example
-`boundary:"held/loss"`; `contains` is not a query operator. The
-[results page](reviews/rfdetr-math/current-results.md) identifies final projections
-and the chronological ledger without conflating older failed runs with closure.
+Use substring `:` or regex `~`, e.g. `boundary:"held/loss"`; `contains` is invalid.
 
 ## Benchmark compilation traces
 
@@ -511,44 +387,23 @@ then publishes and returns final split paths. Its failure record preserves the
 original cause and both locations. Paths and JSON are formatted only when the
 observer is installed. Diagnostic delivery cannot change the operation result.
 
-For a capture produced by [the GUI example](#capture-one-reproduction):
+For a [GUI capture](#capture-one-reproduction):
 
 ```bash
 ./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event=artifact.compile.failed' \
-  --fields @event,operation,staged_path,final_path,error --format jsonl --limit 20
+  -q '@event=artifact.compile.failed OR @event=benchmark.compile.paths' --format jsonl --limit 20
 ./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event=benchmark.compile.paths OR @event=benchmark.progress.activity' \
-  --format timeline --limit 40
-./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event:benchmark.download AND artifact="objects365-v2-train-patch-17"' \
+  -q '@event:benchmark.download' --where 'artifact="objects365-v2-train-patch-17"' \
   --fields @event,artifact,completed_bytes,total_bytes,attempt,resumed,retained_bytes,durable_bytes,redownload \
   --format jsonl --limit 60
 ./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event:benchmark.images OR @event:benchmark.archive' \
-  --where 'source="objects365" AND shard="patch-17"' \
-  --format timeline --limit 40
-./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event:benchmark.annotations OR @event:benchmark.labels OR @event:benchmark.pixel_compile' \
-  --format timeline --limit 60
-./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event=benchmark.archive.admission_wait' \
-  --fields @event,reason,bytes,descriptors,committed_descriptors,descriptor_capacity,producer_ceiling,active_cpus \
-  --format timeline --limit 20
-./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event=benchmark.resource.wait' \
-  --format jsonl --limit 10
-./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event=compile.execution OR @event=benchmark.progress.delivery' \
-  --fields @event,live,baseline,elastic,ready,running,parked,normal_locked,leased,exceptional,exceptional_reserved,opaque_library,produced,materialized,coalesced,delivered,pending,high_water \
+  -q '@event=compile.execution OR @event=benchmark.resource.wait OR @event=benchmark.progress.delivery' \
   --format jsonl --limit 20
-./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event=benchmark.archive.image_ready OR @event=benchmark.annotations.cache_row OR @event:benchmark.labels' \
-  --where 'image_id=2212' --format jsonl --limit 30
-./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event:file. OR @event:benchmark.image.stage OR @event=benchmark.pipeline.ready OR @event:benchmark.annotations.inputs_' \
-  --format jsonl --limit 60
 ```
+
+Use exact catalog event names, `--where` source/shard/image identity, and
+`--fields` for bounded projections; query stage/input/file/annotation events
+together to follow independent progress.
 
 [Compilation progress](benchmark-datasets.md#reading-compilation-progress) defines
 actual-write bytes, unknown totals, retry withdrawals, independent tracks,
@@ -679,19 +534,11 @@ not a trace or current recovery-count ledger. Healthy images with incomplete
 source-ordinal provenance can appear in that report without being omitted;
 inspect its reason and the component manifest's `incomplete_ordinal_images`.
 
-For measured fixture output, query the retained wrapper transcript with JSONL
-projection so complete fields are visible:
-
-```bash
-./mmltk --logs build/logs/mmltk-test-20260929-232113-2554469.log \
-  -q 'benchmark_label_fixture OR benchmark_pipeline_fixture OR compiled_stream_fixture OR compiled_used_read_fixture OR compiled_compaction_fixture OR native_png_fixture' \
-  --fields @text --format jsonl --limit 20
-```
-
-[Validation](validation.md#fixed-storage-measurements) owns these recorded values
-and their scope. Output-vector growth and prepared-buffer growth are narrower
-observations than total allocation activity; mapped bytes and process RSS are
-different measures.
+For fixture output, select its actual wrapper transcript and query
+`benchmark_label_fixture`, `benchmark_pipeline_fixture`, `compiled_stream_fixture`,
+`compiled_used_read_fixture`, `compiled_compaction_fixture`, or `native_png_fixture`
+with `--fields @text --format jsonl`. Output-vector/prepared-buffer growth counts
+cover only those owners, not all allocation, mapped bytes, or process RSS.
 
 Transfer observers exist only for progress/tracing; unobserved segmented downloads
 skip progress locking and clock reads. Trace construction/serialization/callback
@@ -701,162 +548,120 @@ failure. Complete-delivery acceptance may independently fail its evidence gate.
 
 ## Compiled Explore opening
 
-`MMLTK_GUI_TRACE_FILE` includes `explore.dataset.open.started`/`.completed` and
-`explore.dataset.summaries.started`/`.completed`. These use the ordinary
-diagnostic span duration and outcome fields. `explore.dataset.admission`
-reports summarized index slots in `value` and total slots in `detail`;
-worker callbacks may arrive out of order. Opening cancellation covers the
-index copy and recorded-count aggregation, before Explore summary generation.
-These observations do not imply payload or per-sample metadata verification.
-Disabled tracing installs no progress observer or diagnostic clocks.
+GUI tracing includes `explore.dataset.open.started`/`.completed` and
+`explore.dataset.summaries.started`/`.completed`, using ordinary span duration/
+outcome. `explore.dataset.admission` reports summarized slots in `value`, total
+in `detail`; callbacks may be out of order. Opening cancellation covers index
+copy/count aggregation before summaries. No record implies payload/per-sample
+verification. Disabled tracing installs no observer/clocks.
 
 ```bash
 ./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event:explore.dataset OR @event:shutdown.explore_join' \
-  --format timeline --limit 80
+  -q '@event:explore.dataset OR @event:shutdown.explore_join' --format timeline --limit 80
 ```
 
-For isolated file-opening measurements, use the
-[compiled image diagnostic](commands.md#wrapper-operations) with
-`--profile-compiled WORKERS`; keep cache state and worker placement explicit
-when comparing captures.
+For isolated open timings use [compiled diagnostics](commands.md#benchmark-image-geometry)
+`--profile-compiled WORKERS`, retaining cache and placement conditions.
 
 ## Delivery and acceptance ownership
 
-Ordinary enabled runtime diagnostics are bounded and best effort. The existing
-background writer has 256 queued records of at most 16 KiB each; contention or
-capacity pressure may drop ordinary diagnostics. Disabled execution creates
-none of that active state.
+Ordinary enabled diagnostics use a best-effort background writer: 256 queued
+records, ≤16 KiB each; contention/capacity can drop records. Disabled execution
+creates no active state. Explicit Wayland integration with a lifecycle sink
+selects complete delivery on the same bounded writer, can wait for capacity,
+fails acceptance on encoding/delivery failure, and drains at shutdown. Sources:
+[client](../src/controller/services/diagnostics/diagnostics_client.h),
+[runtime](../src/controller/services/diagnostics/runtime_diagnostics.cpp),
+[startup](../src/entrypoints/desktop/browser_runtime_entry.cpp).
 
-Explicit Wayland integration with a lifecycle sink selects complete delivery
-on this same bounded queue and writer. It may wait for capacity. Encoding or
-delivery failure is an acceptance failure, and shutdown drains the writer.
-Complete delivery is an acceptance mode, not the ordinary GUI's policy.
-Sources are [diagnostics_client.h](../src/controller/services/diagnostics/diagnostics_client.h),
-[runtime_diagnostics.cpp](../src/controller/services/diagnostics/runtime_diagnostics.cpp),
-and [desktop startup](../src/entrypoints/desktop/browser_runtime_entry.cpp).
-
-Enabled native application transport emits `browser.record.serialized` with
-encoded bytes in `value` and record priority in `detail`.
-`browser.server.record_coalesced`, `.stale_state_discarded`, and
-`.queue_high_water` report accumulated replacement/discard counts and peak
-pending occupancy since the preceding diagnostic flush. With surface tracing,
-Rust emits `iced.transport.produced`, `.coalesced`, `.stale`, `.enqueued`, and
-`.delivered`; queued records include occupancy and the 64-record capacity.
-These distinguish source materialization, encoding, transport retention, and
-model delivery. Coalescing preserves intervening discrete events, as described
-in [Dataset snapshot delivery](application-wire.md#dataset-operation-snapshots).
-
-Quiet acceptance still uses real receipts/input, accepted-unsent pressure,
-command settlement, and exact drawn-frame readiness. Its driver is separate
-from [Rust reporting](../src/frontend/iced/src/integration_control/reporting.rs)
-and [JavaScript reporting](../src/frontend/iced/src/integration_control/browser.mjs).
-Disabled reporting performs no payload callbacks, phase/revision/style
-deduplication, passive viewport/gallery scans, benchmark widget measurements,
-or sink work. Failed control receipts still retain static source-line context
-and up to 4096 UTF-8-safe detail bytes, including available native error
-kind/title/body, without reporting/probes. Successful receipts have no failure
-payload; inactive drivers collect none.
-
-The Wayland session assigns one writer to each artifact under
-`build/validation`:
-
-| Default family member | Writer and contents |
+| Enabled transport record | Meaning |
 | --- | --- |
-| `latest-wayland-test.jsonl` | Native runtime lifecycle sink |
-| `latest-wayland-test-acceptance.jsonl` | Acceptance process decisions, stage blockers, and terminal evidence |
-| `latest-wayland-test-native.log` | Native host stdout/stderr |
-| `latest-wayland-test-application.log` | Native application logger |
-| `latest-wayland-test-firefox.log` | Captured Firefox output and browser evidence |
-| `latest-wayland-test-mozilla-…moz_log` | Explicit Mozilla module logs, with separate process/child and rotation identities |
+| `browser.record.serialized` | `value`=encoded bytes, `detail`=priority |
+| `browser.server.record_coalesced`, `.stale_state_discarded`, `.queue_high_water` | Replacement/discard accumulation and peak pending occupancy since last diagnostic flush |
+| `iced.transport.produced`, `.coalesced`, `.stale`, `.enqueued`, `.delivered` | Surface-trace source/retention/delivery; queued occupancy and 64-record capacity |
 
-The harness rejects aliased writer destinations and rotates previous family
-members into their `.history` directories. The
-[wrapper test transcript](#wrapper-build-test-and-tidy-transcripts) is another
-source; it does not substitute for independently owned native or browser
-evidence. The headless supervisor owns a separate unique artifact
-directory, described in [headless Wayland](headless-wayland.md).
-Use [capture selection](#select-captures-and-histories) to find the scenario's
-archived family after later browser lifetimes have rotated it.
+Coalescing preserves discrete events; [Dataset delivery](application-wire.md#dataset-operation-snapshots)
+owns product behavior. Materialization, encoding, retention, and delivery differ.
 
-Enabled acceptance requires complete physical and rendered evidence.
-Missing-record exceptions cannot establish a successful handoff or sample.
-Ordinary best-effort captures and the query tool's generic hypotheses have
-different purposes from these strict acceptance assertions.
+Quiet acceptance retains real control receipts/input pressure/settlement/exact
+drawn readiness, independent of [Rust](../src/frontend/iced/src/integration_control/reporting.rs)
+and [JavaScript](../src/frontend/iced/src/integration_control/browser.mjs) reporting.
+Disabled reporting performs no payload callbacks, phase/revision/style dedup,
+passive viewport/gallery scans, widget measurement, or sink work. Failed receipts
+still retain static source context and ≤4096 UTF-8-safe detail bytes with native
+kind/title/body. Successful receipts have no failure payload; inactive drivers
+collect none.
+
+Each `build/validation` artifact has one writer:
+
+| Default family member | Writer/content |
+| --- | --- |
+| `latest-wayland-test.jsonl` | Native lifecycle |
+| `latest-wayland-test-acceptance.jsonl` | Harness decisions, blockers, terminal |
+| `latest-wayland-test-native.log` | Host stdout/stderr |
+| `latest-wayland-test-application.log` | Native logger |
+| `latest-wayland-test-firefox.log` | Firefox/browser evidence |
+| `latest-wayland-test-mozilla-…moz_log` | Explicit Mozilla modules, process/child/rotation identities |
+
+Aliased destinations are rejected; preceding families rotate to `.history`.
+[Wrapper transcript](#wrapper-build-test-and-tidy-transcripts) and [headless supervisor](headless-wayland.md)
+are separately owned evidence. [Select the scenario archive](#select-captures-and-histories)
+after rotation. Enabled acceptance requires complete physical/rendered chains;
+missing-record exceptions or generic query hypotheses cannot prove handoffs.
 
 ## Physical presentation evidence
 
 ```bash
-./mmltk --logs --family latest-wayland-test \
-  -q '@event=presentation.frame.edge' \
+./mmltk --logs --family latest-wayland-test -q '@event=presentation.frame.edge' \
   --correlate @workspace_source+transfer_sequence --format timeline --limit 80
-./mmltk --logs --family latest-wayland-test \
-  -q '@event=acceptance.physical_inventory' --format jsonl
-./mmltk --logs --family latest-wayland-test \
-  -q '@event=iced.surface.draw_submitted' \
+./mmltk --logs --family latest-wayland-test -q '@event=acceptance.physical_inventory' --format jsonl
+./mmltk --logs --family latest-wayland-test -q '@event=iced.surface.draw_submitted' \
   --correlate @surface+draw_identity --format timeline --limit 60
 ```
 
-The packaged harness independently joins native source admission,
-`workspace_allocation`, exact acquisition and ready/release, Firefox forwarding,
-child dispatch, and physical read settlement. Copy mode also requires actual
-copy completion. Arena identity does not replace producer-source identity.
-Capacity retry can repeat a logical publication with a new `transfer_sequence`;
-source plus transfer identifies that physical attempt. Unacquired offers own
-no GPU read. Acquired direct reads require `firefox.workspace.read_settled`;
-copied samples require `firefox.workspace.copy_completed`, each after matching
-forwarding and child-dispatch evidence.
+The harness independently joins native source admission/allocation, acquisition,
+ready/release, Firefox forwarding/child dispatch, and physical settlement. Source
+and arena differ. Retry of one publication can have a new `transfer_sequence`;
+source+transfer identifies physical attempt. Unacquired offers own no read.
+Acquired direct mode requires `firefox.workspace.read_settled`; copy mode requires
+`firefox.workspace.copy_completed`, each after exact forwarding/dispatch.
 
-Each enabled Iced draw has a diagnostic-only `draw_identity` that joins exact
-selection/acquisition, `draw_encoded`, `draw_submitted`, and terminal
-`draw_settled` or `draw_abandoned` observations. Submission is recorded after
-the actual queue call. Independent draws may settle out of order; their exact
-identities preserve the join. Resource holds and physical timelines govern
-release even with diagnostics disabled.
+Diagnostic `draw_identity` joins selection/acquisition → `draw_encoded` →
+`draw_submitted` (after actual queue call) → `draw_settled`/`draw_abandoned`.
+Exact IDs allow out-of-order settlement. Product holds/timelines govern release
+with diagnostics disabled; drawing additionally needs paired image/pixels.
+Independent drains retain incomplete joins through retirement; final missing
+evidence fails acceptance.
 
-Canvas semaphore records are separate from workspace image reads:
-`firefox.canvas.signal_created`, `.signal_cancelled`, `.signal_handle_released`,
-`.signal_batch_submitted`, `.signal_submitted`, `.signal_completed`, and
-`.signal_retired`. They carry available `actor`, `queue`, `vk_device`,
-`vk_queue`, `vk_semaphore`, `submission`, `count`, `signal_count`, `batch_count`,
-`queue_submit_calls`, and `age_ns`. Handle release does not prove completion;
-`signal_completed` follows the exact submission fence. A timeline-backed
-`batch_count=2` can still have `queue_submit_calls=1`, as explained in
-[canvas submission custody](gpu-execution.md#browser-canvas-descriptors-and-submission-custody).
+Canvas signal events are separate from image reads: `firefox.canvas.signal_created`,
+`.signal_cancelled`, `.signal_handle_released`, `.signal_batch_submitted`,
+`.signal_submitted`, `.signal_completed`, `.signal_retired`. Available fields:
+`actor`, `queue`, `vk_device`, `vk_queue`, `vk_semaphore`, `submission`, `count`,
+`signal_count`, `batch_count`, `queue_submit_calls`, `age_ns`. Handle release is
+not completion; completed follows exact fence. Timeline `batch_count=2` may have
+`queue_submit_calls=1`; [submission custody](gpu-execution.md#browser-canvas-descriptors-and-submission-custody)
+owns that path.
 
-`acceptance.physical_inventory` reports these observed facts:
-
-| Fields | Interpretation |
+| `acceptance.physical_inventory` | Meaning |
 | --- | --- |
-| `live_workspaces`, `workspace_bytes` | Nonretired admitted native source allocations and their allocation bytes |
-| `live_sample_arenas`, `live_sample_slots` | Live copied-sample arenas and their physical sample capacity; direct source wrappers are separate from sample storage |
-| `completed_browser_copies`, `settled_direct_reads` | Fully joined copy receipts or direct GPU-read settlement, according to the acquired mode |
-| `settled_release_only_reads` | Acquisitions returned through the physical ownership-release path without a displayed sample |
-| `unacquired_offers` | Observed offers without an acquired/releasing transfer |
-| `encoded_draws`, `settled_draws`, `abandoned_draws` | Actual Iced encoding and its terminal resource-custody outcomes |
-| `final_reader_releases` | Exact samples returned after their final read hold |
-| `explore_peak_pinned_bytes` | Observed Explore staging high-water footprint |
+| `live_workspaces`, `workspace_bytes` | Nonretired source allocations/bytes |
+| `live_sample_arenas`, `live_sample_slots` | Copy arenas/physical capacity; direct wrappers separate |
+| `completed_browser_copies`, `settled_direct_reads` | Fully joined mode-specific completion |
+| `settled_release_only_reads` | Acquired reads returned without display |
+| `unacquired_offers` | Offered without acquired/releasing transfer |
+| `encoded_draws`, `settled_draws`, `abandoned_draws` | Encoding and terminal custody |
+| `final_reader_releases` | Samples returned after final hold |
+| `explore_peak_pinned_bytes` | Observed Explore staging high-water |
 
-These retained-session lifetime/inventory facts and cumulative operation counts
-measure neither latency nor throughput and do not count every internal algorithm
-transfer. Workspace allocations,
-raw pools, and copied sample storage remain separate. A complete direct-read/draw
-chain establishes its physical path; absent best-effort events cannot prove zero
-copies. [Draw settlement](gui-interaction.md#browser-draw-eligibility-and-retained-fallback)
-releases resources; rendering additionally requires matching image/pixel evidence.
-Independent drains retain incomplete joins across scenario/source retirement
-until final settlement; missing evidence fails acceptance.
+These lifetime/inventory counts measure neither latency/throughput nor every
+internal transfer. Workspace/raw pools/sample storage differ. A complete chain
+proves its path; absent best-effort events prove no zero-copy claim.
 
-The acceptance-only undersized-candidate gate uses typed control to hold and
-release a synthetic pending allocation while the completed fallback is drawn.
-It is independent of product acknowledgement and render cadence. Empty-gallery
-acceptance likewise waits until paired zero-match atlas metadata reaches its
-exact draw before consuming the empty notice.
-
-Show FPS is a separate opt-in product meter. Its submission count does not
-replace these draw and lifetime records. The
-[FPS behavior](gui-interaction.md#browser-redraws-and-fps) and asynchronous
-acceptance canvas probe have separate activation and ownership.
+Typed acceptance-only undersized-candidate holds prove retained fallback before
+release, independent of product acknowledgment/cadence. Empty-gallery acceptance
+waits for paired zero-match atlas draw before consuming notice. [FPS](gui-interaction.md#browser-redraws-and-fps)
+is a separate opt-in product meter; its submissions do not replace custody or
+the separately activated async canvas probe.
 
 ## Workflow GPU evidence
 
@@ -1136,72 +941,45 @@ then replace `ARCHIVE_ID` with that run's identity:
 ./mmltk --logs --family latest-wayland-test --triage
 ./mmltk --logs build/validation/latest-wayland-test-firefox.log --triage
 ./mmltk --logs --family latest-wayland-test --triage -q 'probe_failed OR "rendered probe"'
-```
-
-Triage ranks explicit failures, assertions, terminal events, damaged records,
-and incomplete stages, then selects one run and follows bounded identity
-chains. Each evidence row explains its inclusion. Use `--query` to narrow
-anchors and `--where` to constrain every pass.
-
-For a quiet build or test interval, the wrapper's
-[process snapshots](commands.md#process-snapshots) show current activity in
-this repository's running containers. Use the snapshot alongside the captured
-command log; elapsed time or one wait-channel observation does not establish
-a stalled operation.
-
-A single-file triage input discovers same-family current siblings, or only
-the matching archive batch for an archived file. It does not mix an
-archived-only input with the current run. Added sources carry `@discovery`
-metadata; rotation-based relationships remain labeled as inferred. Ordinary
-explicit path queries do not automatically add sibling files.
-
-Paste a complete Status notice, including title and blank line:
-
-```bash
 ./mmltk --logs --error 'Presentation unavailable
 
 Explore requires a measured non-empty gallery.'
 ```
 
-`--error` searches whitespace-normalized full phrases first, accepting the
-colon used between logged titles and bodies. If no phrase matches, it reports
-an all-words fallback. It includes histories, prefers physical records over
-copied Catch context, and focuses the earliest matching capture by file
-modification time. It preserves original file/line and timestamp/clock data.
-Combine it with `--triage` for automatic identity investigation around that
-error.
+Triage ranks explicit failures/assertions/terminals/damaged records/incomplete
+stages, selects one run, and follows bounded identities, explaining each row.
+`--query` narrows anchors; `--where` constrains every pass. [Process snapshots](commands.md#process-snapshots)
+show current activity beside a quiet transcript, without establishing a stall.
+
+Single-file triage discovers current family siblings or only its matching
+archive batch; it never mixes archived-only input with current captures.
+`@discovery` labels additions; rotation joins remain inferred. Ordinary explicit
+path queries add no siblings.
+
+`--error` accepts complete pasted Status title/body, searches normalized phrases
+first (including logged colon separators), then reports an all-words fallback.
+It searches histories, prefers physical records to copied Catch context, and
+focuses the earliest matching capture by mtime, retaining physical provenance
+and clocks. Add `--triage` to investigate identities around that error.
 
 ## Catch selection and terminal evidence
 
-The [native log parser](../tools/logging/log_query_internal.cpp) treats Catch's **No test cases matched**
-as `catch.test_selection_failed` with error level. **No tests ran** becomes an
-error `catch.summary` with `tests: 0`. Both appear under `--errors` and in
-terminal context, alongside existing Catch assertion failures. The original
-selection text remains in `message`; `catch.filters` retains the requested
-filter. A normal summary or successful log parsing does not establish that the
-intended cases ran.
+| Parsed evidence | Meaning |
+| --- | --- |
+| **No test cases matched** | Error `catch.test_selection_failed`; requested text stays in `message`/`catch.filters` |
+| **No tests ran** | Error `catch.summary`, `tests: 0` |
+| Assertion/exception headers, uppercase `FAILED:`/`FATAL ERROR:` | Source file/line retained, including headers without inline text |
+| Dashed title + source location | Restores named test after delayed stderr follows another test's `RUN` |
+| Exact `{Unknown expression after the reported line}` | `catch.expression` transcript text |
+
+Selection errors appear under `--errors` and terminal context. Parsed summaries
+alone prove no intended execution. Use a [comma-separated union](validation.md#selection-environment-deadlines-and-debugging)
+for alternative case names and inspect the command terminal. Exception follow-on
+text retains test identity. Genuine malformed/truncated JSON still sets
+`@parse_error` and fails `--strict`.
 
 ```bash
-./mmltk --logs build/logs --errors \
-  -q '@event:catch.test_selection OR @event=catch.summary' \
-  --format timeline --limit 20
-```
-
-Use the [test-selection syntax](validation.md#selection-environment-deadlines-and-debugging)
-for a comma-separated union of case names, and inspect the selected command's
-actual terminal result.
-
-Catch assertion/exception headers retain `source_file` and `source_line`,
-including uppercase `FAILED:` or `FATAL ERROR:` and a header with no inline
-message. A dashed report title followed by its source location restores the
-reported test identity when delayed stderr follows another test's stdout
-`RUN` record. Following exception text stays under that test context. The
-exact `{Unknown expression after the reported line}` placeholder becomes
-`catch.expression` transcript text. This narrow handling does not make
-malformed JSON diagnostics valid; genuine malformed/truncated records still
-appear under `@parse_error` and fail `--strict`.
-
-```bash
+./mmltk --logs build/logs/test-investigation.log --errors --format timeline
 ./mmltk --logs build/logs/test-investigation.log \
   -q '@event=catch.assertion_failed OR @event=catch.assertion_fatal_error' \
   --fields @event,@test,source_file,source_line,message --context 3 --format timeline
@@ -1209,28 +987,19 @@ appear under `@parse_error` and fail `--strict`.
 
 ### JavaScript and Rust outcomes
 
-TAP records normalize to `tap.test_started`, `tap.test_passed`,
-`tap.test_failed`, and `tap.test_skipped`; `SKIP` and `TODO` remain skipped
-observations. `tap.summary` marks nonzero failures/cancellations or zero tests
-as failure candidates. Indented TAP diagnostic fragments, including assertion
-objects and diffs, remain searchable transcript context under the named test
-instead of becoming malformed JSON.
-
-Rust libtest results normalize to `libtest.test_passed`, `libtest.test_failed`,
-and `libtest.test_skipped`, with `libtest.summary` preserving the overall
-result. Named stdout/stderr sections restore test context for following panic,
-assertion, and left/right values. Query `@test` to collect that context:
+| Format | Normalized events/context |
+| --- | --- |
+| TAP | `tap.test_started`, `.test_passed`, `.test_failed`, `.test_skipped`; SKIP/TODO remain skips. `tap.summary` flags failures, cancellations, or zero tests. Indented assertion objects/diffs remain named-test transcript context |
+| Rust libtest | `libtest.test_passed`, `.test_failed`, `.test_skipped`, `.summary`; named stdout/stderr sections restore context for panic/assertion/left-right values |
 
 ```bash
-./mmltk --logs build/logs/browser-app-investigation.log --errors --format timeline
 ./mmltk --logs build/logs/browser-app-investigation.log \
   -q '@test:"atlas_pixel_evidence"' --format timeline --limit 40
 ```
 
-Use the actual command transcript path. Failure-related words inside passed or
-skipped test names, successful summaries, compiler progress, and numbered
-compiler source excerpts are not failures. Explicit failing outcomes, compiler
-errors, and failed build terminals retain their error classification.
+Failure words in passed/skipped names, successful summaries, compiler progress,
+or numbered source excerpts are not failures. Explicit failures, compiler
+errors, and failed build terminals retain error classification.
 
 ## Query expressions
 
@@ -1242,7 +1011,7 @@ errors, and failed build terminals retain their error classification.
 ./mmltk --logs --where '@file:"latest-wayland-test"' --group-by @event
 ```
 
-Quote the entire expression for the shell:
+Quote the expression for the shell:
 
 ```text
 expr      := expr OR expr | expr [AND] expr | NOT expr | '(' expr ')'
@@ -1250,47 +1019,32 @@ primary   := text | '*' | has(field) | field operator value
 operator  := = != : ~ !~ > >= < <=
 ```
 
-`NOT` binds most tightly, then `AND`, then `OR`. Adjacent terms imply `AND`.
-Bare/quoted text and `:` perform case-insensitive literal substring matches.
-`=` and `!=` compare exact typed values; ordering compares numbers.
-`~` and `!~` use Python regexes, case-sensitive unless you supply `(?i)`.
-Quote values containing spaces or punctuation.
+Precedence: `NOT`, `AND`, `OR`; adjacent terms imply AND. Bare/quoted text and
+`:` are case-insensitive literal substrings; `=`/`!=` compare exact typed values;
+ordering is numeric. `~`/`!~` use Python regex, case-sensitive unless `(?i)`.
+Quote values containing spaces/punctuation. Missing fields fail comparisons,
+even `!=`; `NOT` can include them. `has` includes null/zero.
 
-Missing fields do not satisfy comparisons, including `!=`; `NOT` can include
-them. `has(field)` tests presence, including null and zero. `--errors` adds
-`@error=true`; it and failure-candidate counts are broad search aids, not test
-verdicts. Use terminal status and the owning suite's assertions to establish
-success or failure. An `error=0` metric alone is not an error.
+`--errors` adds `@error=true`. Error flags/counts aid search, not verdicts;
+`error=0` alone is no failure. Use owner assertions and terminal status.
 
 ## Fields and correlation
 
-JSON paths such as `fields.name` work directly. Canonical nonnegative decimal
-segments index nested lists: `referenced_objects.0.handle` and
-`message_fields.clean_rgba.24` are examples. Negative, out-of-range, or noncanonical
-indices such as `01` are missing fields. Unqualified names also look inside
-`fields`; qualified paths specify the complete location.
-
-Explicit `.json` inputs such as training `progress.json`, `preparation.json`,
-and `run.json` are read as one bounded document, preserving nested fields and
-the physical line span. The limit is 1 MiB; oversized or damaged input remains
-searchable with a parse error. For example:
+JSON paths work directly. Unqualified names also inspect `fields`; qualified
+paths specify location. Canonical nonnegative list indices work, e.g.
+`referenced_objects.0.handle`; negative/out-of-range/`01` indices are missing.
+Explicit `.json` files (`progress.json`, `preparation.json`, `run.json`) parse as
+one ≤1 MiB document with physical span; damaged/oversized input stays searchable
+with parse error. Complete object-valued `message`/`fields.message` JSON ≤4096
+characters is additionally projected as `message_fields`, preserving original
+text; invalid/oversized/non-object messages remain text.
 
 ```bash
-./mmltk --logs output/train/run-0021/progress.json --format jsonl \
+./mmltk --logs output/train/RUN/progress.json --format jsonl \
   --fields record.progress.phase,record.progress.completed_images,record.progress.images_per_second
-```
-
-A `message` or `fields.message` containing a complete JSON object of at most
-4096 characters is also exposed as `message_fields`. Its original message stays
-verbatim. Invalid, oversized, or non-object message content stays ordinary text.
-This supports filters and projections over structured diagnostic details
-without maintaining an event-specific schema:
-
-```bash
 ./mmltk --logs --family latest-wayland-test \
   -q '@event=explore.card.pixel_samples AND has(message_fields.clean_rgba.24)' \
-  --fields @event,message_fields.compiled_index,message_fields.clean_rgba.24 \
-  --format jsonl
+  --fields @event,message_fields.compiled_index,message_fields.clean_rgba.24 --format jsonl
 ```
 
 Useful metadata includes:
@@ -1312,198 +1066,139 @@ Useful metadata includes:
 | `@proximity_ns`, `@time_link` | Pasted-error proximity and its time-link method |
 | `@triage_reason`, `@triage_payload_truncated`, `@discovery` | Triage inclusion and limits |
 
-`@event` projects canonical [training records](#local-training-failures);
-otherwise it resolves wrapped `fields.event`/`fields.name` before top-level names.
-Bare searches also examine test/tag/run/signal metadata. Catch INFO copies keep
-their original timestamps and are labeled as copies. A `child.signaled` value
-of 139 decodes to SIGSEGV and 143 to SIGTERM; the signal does not establish
-whether termination was expected.
+`@event` projects [training records](#local-training-failures), otherwise
+wrapped `fields.event`/`fields.name` before top-level names. Bare searches include
+test/tag/run/signal metadata. Catch INFO copies preserve clocks and are labeled.
+`child.signaled` 139/143 decodes to SIGSEGV/SIGTERM, without classifying intent.
 
 ```bash
 ./mmltk --logs -q 'trace_id=42' --correlate trace_id --format timeline --limit 80
-./mmltk --logs -q '@event=firefox.workspace.ready' --correlate @surface
 ./mmltk --logs -q 'source_session=42' --correlate source_session+source_instance
 ```
 
-Ordinary correlation requires a query or error seed. Repeat `--correlate FIELD`
-for alternative identities; join field names with `+` for a composite
-identity. It joins original matches, excludes empty/zero identities, and
-does not expand transitively. Family/history correlations are scoped to each
-run. `--where` filters correlated and context rows too.
+Correlation needs query/error seeds. Repeat `--correlate` for alternatives,
+`+` for composites. It joins original matches only, ignores empty/zero IDs,
+never expands transitively, scopes family/history to each run, and applies
+`--where` to all correlated/context rows.
 
-`@intent_request` projects `control` from `integration.intent` and `value` from
-`browser.intent.received`, `.accepted`, `.rejected`, and `.reply_rejected`.
-It accepts exact positive uint64 integers or decimal strings, excluding zero,
-booleans, overflow, and approximate floating-point values. It is an explicit
-correlation field, not an automatic timeline identity: counters can repeat
-after a browser peer changes. Select one peer lifetime before querying it.
-The following example requires the selected capture to contain exactly one peer
-lifetime; `--run` isolates an archive, but does not establish that condition:
-
-```bash
-./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
-  -q '@intent_request=42' --correlate @intent_request --format timeline --limit 60
-```
+`@intent_request` projects `integration.intent.control` and browser intent
+received/accepted/rejected/reply_rejected `value`. Only exact positive uint64
+integers/decimal strings qualify (no bool, zero, overflow, approximate floats).
+Explicitly query/correlate it within one peer lifetime: counters may repeat on
+peer replacement, so automatic timeline identity excludes it. `--run` selects
+an archive, not necessarily one peer lifetime.
 
 ## Vulkan diagnostics and descriptor provenance
 
 ```bash
 ./mmltk --logs --family latest-wayland-test -q '@event=vulkan.validation' \
   --group-by validation_id --representatives --format timeline --limit 40
-./mmltk --logs --family latest-wayland-test \
-  -q 'validation_id:SYNC-HAZARD' \
+./mmltk --logs --family latest-wayland-test -q 'validation_id:SYNC-HAZARD' \
   --group-by validation_id --representatives --format jsonl --auto-correlate
-./mmltk --logs --family latest-wayland-test \
-  -q 'workspace_allocation=34' --descriptor-lineage --format timeline --limit 32
+./mmltk --logs --family latest-wayland-test -q 'workspace_allocation=34' \
+  --descriptor-lineage --format timeline --limit 32
 ```
 
-Adjacent Rust `VALIDATION` headers, indented bodies, and matching logger object
-lines form one searchable `vulkan.validation` record, bounded to 128 lines and
-1 MiB. Original text and physical line spans remain available. Overflow becomes
-a parse error and subsequent lines remain searchable.
+Adjacent Rust VALIDATION header/body/matching logger-object lines form one
+`vulkan.validation` record, ≤128 lines/1 MiB. Original text/spans stay available;
+overflow sets parse error and leaves subsequent lines searchable.
 
-`validation_id` identifies a VUID or SYNC-HAZARD; `message_id`, `api`, and `level`
-retain reported facts. `objects` contains typed callback objects and names.
-`referenced_objects` separately contains explicitly typed handles mentioned in
-the message, such as `VkImage` or `VkSemaphore`. Types normalize to Vulkan
-object names and handles to hexadecimal. A name or bare hexadecimal number
-does not establish another resource. Both collections share a 64-entry bound;
-overflow preserves the original text and reports the limit.
+| Fields | Interpretation |
+| --- | --- |
+| `validation_id`, `message_id`, `api`, `level` | VUID/SYNC-HAZARD and reported facts |
+| `objects` | Typed callback objects/names |
+| `referenced_objects` | Explicit typed handles mentioned in message, separate from callbacks |
+| `vk_image`, `vk_memory`, `vk_command_buffer` | Sole reported handle of that type |
 
-Use `referenced_objects.0.type` or `objects.0.handle` for an exact list entry.
-A sole reported image or memory handle is also available as `vk_image` or
-`vk_memory`; a sole command buffer is available as `vk_command_buffer`.
-The message is a validation-layer allegation; a handle match does not establish
-its cause.
+Types normalize to Vulkan object names and handles to hex. Both collections
+share 64 entries; overflow retains text and reports limits. Bare hex/names
+create no resource. Use exact list paths. Layer reports remain allegations;
+handle equality alone establishes no cause.
 
-`--representatives` retains one first record per `--group-by` value, preferring
-physical records to copied test context. Full occurrence counts remain
-available as `@representative_count`. Add `api` or `message` when one VUID covers
-different conditions. This option cannot combine with `--tail`, `--error`, or
-`--triage`.
+`--representatives` keeps first physical-preferred row per `--group-by`, with
+full count in `@representative_count`; add `api`/`message` for VUID variants.
+It rejects `--tail`, `--error`, `--triage`.
 
-Automatic correlation adds bounded image/memory creation, allocation, binding,
-and direct-binding evidence for exact typed handles. Explicit matching process
-IDs may join files within one run; conflicting device, process, source, or
-allocation facts reject the join. PID-free stderr yields only labeled
-same-file candidates. Handle reuse and ambiguous owners suppress uncertain
-matches. Missing provenance is not evidence of an unrelated object.
+Automatic joins add bounded creation/allocation/binding/direct-binding evidence
+for exact typed image/memory handles. Same-run exact process IDs may cross files;
+conflicting device/process/source/allocation blocks joins. PID-free stderr yields
+labeled same-file candidates only. Reused handles/ambiguous owners suppress
+uncertain joins; missing provenance establishes no unrelatedness.
 
-`--descriptor-lineage` follows Vulkan allocation/export, `SCM_RIGHTS` send
-attempts and exact send results, native receipt, CUDA import/mapping, and
-retirement. It also understands historical CUDA-export captures. Numeric FDs
-are process-local and never join different processes; `fstat` metadata does
-not prove common GPU backing. `descriptor_send` is only an attempt. An exact
-record-length `descriptor_send_result` with `send_errno=0` proves send success.
-The native `retained_memory_descriptor` owns backing; `import_descriptor` is
-the duplicate consumed by successful CUDA import.
+`--descriptor-lineage` follows allocation/export, SCM_RIGHTS attempt/result,
+receipt, CUDA import/mapping, retirement, and supported CUDA-export capture
+formats. FDs are process-local; `fstat` does not identify common GPU backing.
+Only exact record-length `descriptor_send_result` with `send_errno=0` proves send
+success. `retained_memory_descriptor` owns backing; `import_descriptor` is the
+duplicate consumed by successful import. Reports use retained rows under
+`--where`/`--limit`/`--top`, exposing missing/ambiguous links. Diagnostics retain
+no extra FDs/GPU resources.
 
-This report uses retained rows only, subject to `--where`, `--limit`, and
-`--top`; missing and ambiguous links stay explicit. Diagnostics retain no extra
-FDs or GPU resources. `loaded_library`/`library_inventory` observe existing
-`/proc/self/maps` once at native first import or Firefox first export, bounded
-to 1 MiB and 32 paths shorter than 1024 bytes. Query those by process separately
-so they do not consume an allocation chain's row budget.
+`loaded_library`/`library_inventory` observe existing `/proc/self/maps` once at
+native first import or Firefox first export: ≤1 MiB, ≤32 paths, each <1024 bytes.
+Query separately by process to preserve allocation-chain row capacity.
 
 ## Automatic timeline context
 
-Human `--format timeline` queries with `--query` or `--errors` add bounded
-direct frame, publication, snapshot, and lifecycle matches beside the query
-rows. `--no-auto-correlate` disables this addition. Summary and JSONL formats
-require `--auto-correlate`; explicit correlation, related-run, pasted-error,
-and triage modes retain their own selection behavior.
+Timeline queries with `--query`/`--errors` add bounded direct frame/publication/
+snapshot/lifecycle evidence. `--no-auto-correlate` disables it; summary/JSONL
+require `--auto-correlate`. Explicit correlation, related-run, pasted-error,
+and triage keep their own selection rules.
 
-```bash
-./mmltk --logs --family latest-wayland-test \
-  -q 'probe_failed' --format timeline --limit 60
-./mmltk --logs --family latest-wayland-test \
-  -q 'probe_failed' --format jsonl --auto-correlate --limit 60
-```
+Original matches retain order/priority. Added rows use spare `--limit`, explain
+their reason, and never seed expansion. Recent matches drive one streaming
+pass with bounded nearest-identity indexes, not an all-run index. Shared
+source/surface/publication/allocation/trace facts must agree; bare counters
+and generic numeric slots are not IDs.
 
-Original matches keep their order and priority. Added rows use spare `--limit`
-capacity, are labeled with their reason, and never become new seeds.
-Specific recent matches seed one extra streaming pass with bounded nearest
-identity indexes; the tool does not build an all-run index. Shared source,
-surface, publication, allocation, or trace identities must agree wherever both
-records provide them. Bare counters and generic numeric report slots do not
-establish identity.
+Pixel chains compare source→Iced in direct mode and source→Firefox import→mailbox→
+Iced in copy mode. Source/arena forwarding plus exact transfer chooses source;
+direct settlement and copy completion remain distinct. Valid optional probes
+extend required evidence. Indexes accept either arrival order, report conflicts,
+and distinguish missing from capacity-discarded evidence.
 
-For pixel chains, direct mode compares native source to Iced sample; copy mode
-compares native source, Firefox import, mailbox, and Iced sample. The observed
-source-to-arena forwarding record and exact physical transfer choose the source.
-Direct read settlement and copy completion remain separate mode-specific facts.
-Optional valid direct-image and source-copy probes extend those comparisons
-without replacing required evidence. The bounded query indexes accept either
-arrival order, report conflicting source facts, and distinguish missing
-evidence from evidence discarded at an index limit.
-
-Phase/control proximity matches are weaker evidence and are labeled as such.
-They use at most 250 ms of comparable time, or eight same-source lines when
-clocks cannot be aligned. Cross-clock identity matches never align clocks.
-`--where` constrains every added row. Current limits and event-specific
-identity projections are in `./mmltk --logs --help`.
+Weaker phase/control proximity is labeled: ≤250 ms comparable time, or eight
+same-source lines when clocks cannot align. Cross-clock IDs do not align clocks.
+`--where` applies throughout; help owns current event-specific identity limits.
 
 ## Select captures and histories
 
 ```bash
 ./mmltk --logs --family latest-wayland-test --history --list-runs
 ./mmltk --logs --family latest-wayland-test --run current --errors
-./mmltk --logs --family latest-wayland-test --errors --related-run --tail
-./mmltk --logs build/validation/viewer-copy-ownership-trace.log \
-  --family latest-wayland-test --history -q 'buffer="BufferId(21,1)"' --context 2
-```
-
-Use a returned archive ID with `--run` to select a historical capture;
-`--run` implies `--history`. `--family STEM` selects the artifact members above,
-plus `STEM.log`, under `build/validation` or an explicit repository path.
-Families are repeatable. `--history` adds rotated `.history` siblings.
-Mozilla main/child filenames retain physical and logical child identities;
-each process can have four bounded module-log rotation files. Native
-application rotations `STEM-application.1.log` through `.5.log` also belong
-to that family.
-
-Each new logged Wayland browser lifetime rotates the prior family, including
-successful workflow captures. The current `latest-wayland-test` members therefore
-describe the latest logged lifetime, not every scenario in the suite. Successful
-caption and other browser diagnostics live in the matching Firefox artifact;
-the Catch transcript need not repeat them. List the runs, select the workflow archive,
-then query its successful observations explicitly. For example, replace
-`ARCHIVE_ID` with the returned identity:
-
-```bash
-./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID --strict \
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
   -q '@event=integration.workflow.caption_pixels' \
   --fields @event,case,stage,patches,backgrounds,glyphs,compared,verified \
-  --format jsonl --limit 100
+  --strict --format jsonl --limit 100
+./mmltk --logs --family latest-wayland-test --errors --related-run --tail
 ```
 
-A later capture's empty result says nothing about earlier records. `--strict`
-checks parsing, independently of record presence, rendered assertions, and test
-outcome.
+| Selection | Behavior |
+| --- | --- |
+| `--family STEM` (repeatable) | Artifact siblings plus `STEM.log` below `build/validation` or explicit repository path |
+| `--history` | Add rotated `.history` siblings |
+| `--run ID` / `current` | Exact capture; implies history |
+| `--related-run` | Other records from matched captures |
+| Explicit paths/quoted globs | Repository-relative or absolute inside checkout; any file suffix, deduplicated |
+| Directories | `.jsonl`, `.log`, `.out`, `.txt`, Mozilla process logs; `--recursive` adds nested/history directories |
+| No input | `build/validation`, without recursive archives |
 
-Failure excerpts in a Catch transcript or a bounded query may omit the decisive
-browser records. First use the transcript's test name, source location, and
-terminal status to identify the failure, then list the artifact-family histories
-and select its archive. Query the native/acceptance/Firefox siblings for that
-lifetime; increasing a transcript excerpt cannot recover records that only
-the owning artifact contains. A historical transcript that was never fully
-captured remains partial evidence.
+Direct history directories work without current artifacts. Mozilla main/child
+names retain physical/logical IDs, with up to four module-log rotations per
+process; application `.1.log` through `.5.log` belong to the family.
 
-The current Wayland harness uses one rotation identity for its artifact family.
-Older or independently produced captures can have separate rotation IDs.
-The tool groups adjacent same-PID rotations within 10 ms and labels that
-relationship inferred. Identical event/steady-time anchors join transcript
-segments to native captures and
-propagate known tests/tags; missing anchors leave them separate. IDs and
-monotonic timestamps may repeat between runs, so select one reproduction.
-`--related-run` includes other records from a matched run.
+Every logged Wayland browser lifetime rotates its family, including successful
+workflows. Latest means latest **logged lifetime**, not the full suite. Find the
+scenario via transcript test/location/terminal, list runs, then query that
+archive's native/acceptance/Firefox siblings. Successful browser evidence need
+not appear in Catch excerpts; an empty later capture says nothing about it.
+`--strict` proves parse validity, independently of record presence/assertions.
+Partial transcripts remain partial regardless of excerpt size.
 
-Inputs are repository-relative/absolute paths or quoted globs inside the
-repository. Explicit files may have any suffix. Directories select
-`.jsonl`, `.log`, `.out`, `.txt`, and Mozilla process logs; `--recursive`
-includes nested histories. Repeated files are deduplicated. Direct history
-directories can be queried even when the current artifact is absent.
-The default is `build/validation` without recursive archived captures.
+Current harness siblings share one rotation ID. Independently rotated captures
+may be grouped within 10 ms for equal PID, labeled inferred. Exact event/steady
+anchors join transcript segments and propagate test/tags; missing anchors leave
+separate runs. Select one reproduction because IDs/monotonic times can repeat.
 
 ## Triage conventions and limits
 
@@ -1515,106 +1210,76 @@ The default is `build/validation` without recursive archived captures.
 | `--triage-gap-ms` | 1000 | 1–600000 |
 | `--near-ms` | 1000 | 0–600000 |
 | `--limit` | 20 | 1–10000 |
-| `--top` | 5 in triage, 10 otherwise | 1–100 |
+| `--top` | 5 triage / 10 otherwise | 1–100 |
 
-Triage follows strong run-qualified surface IDs, typed handles, nonempty
-`*_id`/`*_identity` fields, and source-session composites. Fatal/channel/process
-evidence has the bounded [process relationship rules](#firefox-fatal-causes-and-process-identity)
-above. Other ambient process, thread, device, user, and session IDs are excluded
-unless explicitly selected with `--correlate`. Related identities co-occurring
-on evidence can seed the
-next hop. Sequence/generation/slot values only join as nearby multi-field
-composites; they do not start further identity expansion.
+Strong run-qualified surfaces, typed handles, nonempty `*_id`/`*_identity`, and
+source-session composites can expand hops. [Fatal/process rules](#firefox-fatal-causes-and-process-identity)
+apply separately. Ambient process/thread/device/user/session IDs require explicit
+correlation. Sequence/generation/slot joins use nearby composites, without
+further expansion.
 
-Generic event suffixes identify possible unclosed starts, duplicate endings,
-failed textual outcomes, incomplete stages, and handoffs. Lifecycle balances
-use the most specific operation/resource identity and exact event families.
-Hand-off hypotheses require shared identities without conflicting operation
-IDs. Copied INFO does not inflate balances; numeric outcome enums are not
-guessed. These are investigative leads: disabled diagnostics, truncated
-captures, or a completion in another source may explain missing counterparts.
+Generic suffix analysis suggests unmatched starts/ends, duplicate terminals,
+failed text, incomplete stages, and handoffs, using specific operation/resource
+IDs and exact families. Shared-identity handoffs reject conflicting operations;
+copied INFO does not inflate balances, and numeric outcome enums are not guessed.
+Missing counterparts may reflect disabled/truncated/other-source evidence.
 
-Gap findings require comparable timestamps in the same physical source.
-Triage also reports bounded terminal evidence independently of the row budget;
-without terminals, it shows source ends without inferring successful exit,
-timeout, or failure. Internal identity/event/payload capacities are bounded,
-and reports state when those limits truncate evidence.
-
-`--triage` rejects `--related-run`, `--tail`, and `--list-runs`. In JSONL mode,
-only bounded evidence rows go to stdout; triage summaries go to stderr.
+Gaps require comparable timestamps within one physical source. Bounded terminal
+evidence is reported separately from row budget; absent terminals show source
+ends without inferred success/timeout/failure. Capacity truncation is explicit.
+`--triage` rejects related-run/tail/list-runs; JSONL rows go to stdout, summary
+to stderr.
 
 ## Time, output, and exit status
 
-Ordinary time ordering groups steady, UTC wall, timezone-free wall, per-file
-elapsed, and untimed records separately. It does not guess clock offsets.
-`--order file` preserves physical ordering; `--order capture` orders files by
-captured modification time, then by line. Modification time describes an
-artifact, not causality. `--tail` selects the last records of the chosen order
-and prints them ascending.
+| Ordering/window | Meaning |
+| --- | --- |
+| `time` | Separate steady, UTC, timezone-free wall, per-file elapsed, untimed groups; no guessed offsets |
+| `file` | Physical file/line order |
+| `capture` | Captured file mtime then lines; recency is not causality |
+| `--tail` | Last selected records, printed ascending |
+| `--last-lines N` | Parse only final 1–100,000 physical lines per file, found with bounded byte scan; report byte/line start and preserve absolute lines |
+| `proximity` | Pasted-error default; requires `--error`, not causal order |
 
-`--last-lines N` instead limits parsing to the last 1–100,000 physical lines
-of each selected file. A bounded-memory byte scan locates line starts without
-decoding older payloads; parsing then seeks to that window. It reports the
-byte/line start and preserves absolute line numbers. Counts, statistics,
-context, and correlation then cover only that window; earlier failures or
-identities are excluded.
-It is useful for a large completed trace's retirement record:
+Windows restrict all counts/statistics/context/correlation and exclude older
+identities/failures. Proximity uses same-clock recorded distance; cross-clock
+estimates align each source's final timestamp to mtime, optionally borrowing a
+preceding timestamp for untimed rows. `@time_link` labels estimates.
+
+Output formats are `summary`, `timeline`, `jsonl`. `--fields` projects
+comma-separated fields with provenance; `--group-by` selects summary groups.
+`--context` admits ≤100 neighboring nonblank same-file records per side. Counts
+cover all selected records even when displayed rows are limited; group/correlation
+cardinality is ≤10,000.
+
+`--stats FIELD` (≤32 distinct fields) aggregates exact query matches, independent
+of row limit; related/context rows never contribute. It keeps source, capture,
+explicit run_id, clock, and group values separate. Numeric count/sum/min/max/mean,
+missing/null, and invalid/nonfinite counts remain distinct. Integer arithmetic
+is exact; nonintegral results can use numerator/denominator strings. Accumulators
+are ≤8192 bits, total groups/buckets ≤10,000; overflow fails explicitly.
+
+`--bucket-ms N` (1–86,400,000) adds clock-local half-open buckets and rates divided
+by full requested width; capture edges can be partial. Untimed rows contribute
+only totals. Statistics retain line/time anchors without clock alignment or
+completeness claims. Stats/buckets reject triage/list-runs. JSONL rows use stdout,
+Statistics JSON stderr.
 
 ```bash
-./mmltk --logs build/validation/benchmark-coconut-batched.jsonl \
+./mmltk --logs build/validation/compile-trace.jsonl \
   --last-lines 100 -q '@event=compile.execution.retired' --format jsonl
-```
-
-Pasted-error lookup uses `--order proximity` by default. Same-clock distances
-use recorded times. Cross-clock estimates align each source's last timestamp
-with its file modification time; untimed rows may borrow a preceding timestamp
-for proximity only. `@time_link` labels these estimates. Proximity ordering
-requires `--error` and does not establish causal order.
-
-`--format summary`, `timeline`, and `jsonl` control output.
-`--fields` projects comma-separated fields while retaining provenance;
-`--group-by` controls summary groups. `--context` includes up to 100 nearby
-nonblank records on either side in the same file. Counts cover all selected
-records even when `--limit` bounds the displayed sample. Group/correlation
-cardinality is capped at 10,000.
-
-`--stats FIELD` aggregates all exact query matches independently of the displayed
-row limit; repeat it for up to 32 distinct fields. It reports numeric
-count/sum/min/max/mean and separate missing/null and invalid/nonfinite counts.
-Source, artifact
-run, explicit `run_id`, clock, and `--group-by` values remain separate.
-Related/context rows do not contribute. Integer arithmetic is exact;
-nonintegral results can be numerator/denominator strings. `--bucket-ms N`
-(1–86,400,000) adds clock-local half-open buckets and event rates using the full
-requested bucket width; edge buckets can be partial captures. Untimed records
-contribute only to totals. At most 10,000 aggregate rows and 8,192-bit
-accumulators are admitted; overflow fails explicitly. These options cannot
-combine with `--triage` or `--list-runs`.
-
-```bash
-./mmltk --logs build/validation/benchmark-coconut-batched.jsonl \
+./mmltk --logs build/validation/compile-trace.jsonl \
   -q '@event=benchmark.cost.completed' --group-by kind,split \
   --stats duration_ns --stats bytes --format jsonl --limit 10
 ```
 
-In JSONL mode, projected records go to stdout and Statistics JSON objects to
-stderr. Statistics retain physical line/timestamp anchors; they do not align
-clocks or establish capture completeness.
+Malformed/oversized records remain searchable with warnings; `--strict` fails
+on malformed/truncated input. Exit 0=output, 1=no matches, 2=invalid query,
+unreadable/changing inputs, or strict parse failure.
 
-Malformed or oversized records remain searchable with warnings.
-`--strict` makes malformed/truncated input an error. Status 0 indicates
-successful output, 1 indicates no matches, and 2 reports invalid queries,
-unreadable/changing inputs, or strict parse failures.
-
-The wrapper invokes the native log-query module through the published container
-tool executable in the existing build image, with no GPU or network and a
-read-only repository mount. It reads files only up to captured sizes; multi-pass
-correlation requires unchanged inputs. There is no follow mode or persistent
-index. The [module interface](../tools/logging/log_query.cpp),
-[runtime definitions](../tools/logging/log_query_runtime.cpp), and
-[private implementation/help](../tools/logging/log_query_internal.cpp) share
-[one module family with private fixture access](build.md#composition-and-fixture-isolation).
-Unfiltered `./mmltk --test all`
-includes its fixture suite. The standalone `./mmltk --test log-query-tool`
-route and focused selectors are documented under
-[test selection](validation.md#selection-environment-deadlines-and-debugging).
+The published native query tool runs in the existing build image, read-only,
+without GPU/network. Reads stop at captured sizes; multipass queries require
+unchanged input. There is no follow mode/persistent index. [Interface](../tools/logging/log_query.cpp),
+[runtime](../tools/logging/log_query_runtime.cpp), and [private implementation/help](../tools/logging/log_query_internal.cpp)
+share [one module family](build.md#composition-and-fixture-isolation). Fixtures
+run in unfiltered `all` or [focused log-query selection](validation.md#selection-environment-deadlines-and-debugging).

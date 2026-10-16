@@ -236,14 +236,14 @@ void require_checkpoint_model_topology(const NativeRfDetrConfig& destination, co
  }(source, destination);
 }
 bool same_native_model_semantics(const NativeCheckpointMetadata& left, const NativeCheckpointMetadata& right) {
- return []<class Metadata>(const Metadata& a, const Metadata& b) {
-  template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^Metadata, std::meta::access_context::current()))) {
-   if constexpr (std::meta::identifier_of(field) != "source_path" && std::meta::identifier_of(field) != "source_kind" && std::meta::identifier_of(field) != "external_topology" &&
-                 std::meta::identifier_of(field) != "native_configuration")
-    if (a.[:field:] != b.[:field:]) return false;
-  }
-  return encode_checkpoint_configuration(checkpoint_configuration(a)) == encode_checkpoint_configuration(checkpoint_configuration(b));
- }(left, right);
+ if (left.class_layout != right.class_layout) return false;
+ const auto a = checkpoint_configuration(left);
+ auto b = checkpoint_configuration(right);
+ // Optional metadata records supplied evidence; the admitted configuration
+ // owns its effective meaning. Resolution belongs to the execution context
+ // and was not persisted by format 4. Session/data identities bind that context.
+ b.resolution = a.resolution;
+ return a == b;
 }
 void validate_decoded_model_state(const DecodedNativeModelState& state) {
  const ResolvedClassLayout layout(state.metadata.class_layout);
@@ -386,6 +386,27 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  return result;
 }
 namespace {
+void normalize_legacy_official_queries(DecodedNativeModelState& state, const NativeRfDetrConfig& config) {
+ const int64_t rows = static_cast<int64_t>(config.num_queries) * config.group_detr;
+ const std::array specifications{std::pair{detail::kQueryFeatureWeight, static_cast<int64_t>(config.hidden_dim)}, std::pair{detail::kReferencePointWeight, int64_t{4}}};
+ auto entries = state.consume_entries();
+ std::array<NormalizedModelStateEntry*, specifications.size()> queries{};
+ int64_t source_rows = 0;
+ for (std::size_t index = 0; index < specifications.size(); ++index) {
+  const auto& [name, width] = specifications[index];
+  const auto found = std::ranges::find(entries, name, &NormalizedModelStateEntry::name);
+  if (found == entries.end() || !found->tensor.defined() || found->tensor.dim() != 2 || found->tensor.size(0) < rows || found->tensor.size(1) != width ||
+      (source_rows && found->tensor.size(0) != source_rows))
+   throw std::invalid_argument("verified legacy asset has incompatible query tensor: " + std::string(name));
+  queries[index] = &*found;
+  source_rows = found->tensor.size(0);
+ }
+ // Pinned upstream weights.load_pretrain_weights retains this flat prefix
+ // when published legacy assets omit both query-count and group metadata.
+ if (source_rows > rows)
+  for (auto* query : queries) query->tensor = query->tensor.narrow(0, 0, rows).clone();
+ state.replace_entries(std::move(entries));
+}
 void normalize_legacy_keypoint_projection(DecodedNativeModelState& state, const NativeRfDetrConfig& config) {
  constexpr std::string_view prefix = "keypoint_head.keypoint_proj.";
  if (std::ranges::none_of(state.entries(), [&](const auto& entry) { return entry.name.starts_with(prefix); })) return;
@@ -431,6 +452,7 @@ DecodedNativeModelState decode_model_state(
  if (digests->snapshot != snapshot) throw std::runtime_error("checkpoint changed during archive identification");
  digests->snapshot.RequireUnchanged(canonical);
  DecodedNativeModelState result;
+ bool normalize_legacy_queries = false;
  if (native) {
   result = load_native_model_state(canonical, stop);
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
@@ -438,6 +460,8 @@ DecodedNativeModelState decode_model_state(
 #if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
   result = decode_upstream_python_model_state(canonical);
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+  const bool lacks_query_layout = result.metadata.num_queries <= 0 && result.metadata.native_configuration.empty() &&
+                                  (result.metadata.external_topology.empty() || !nlohmann::json::parse(result.metadata.external_topology).contains("group_detr"));
   result.metadata.source_kind = "upstream-python";
   result.metadata.source_path = canonical.string();
   const PresetCatalogEntry* preset = nullptr;
@@ -469,6 +493,7 @@ DecodedNativeModelState decode_model_state(
   }
   for (const auto& asset : weight_catalog()) {
    if (asset.md5_hash != digests->md5) continue;
+   normalize_legacy_queries = lacks_query_layout;
    if (asset.classifier_width != result.metadata.num_classes) throw std::invalid_argument("verified asset classifier width disagrees with its hash-bound evidence");
    const auto embedded = result.metadata.class_layout;
    auto source_evidence = std::move(result.metadata.class_layout.class_name_evidence);
@@ -525,6 +550,7 @@ DecodedNativeModelState decode_model_state(
    }
   }
   KeypointTensorLayout(config.keypoints_per_class).require_class_layout(ResolvedClassLayout(result.metadata.class_layout));
+  if (normalize_legacy_queries) normalize_legacy_official_queries(result, config);
   normalize_legacy_keypoint_projection(result, config);
   result.metadata.native_configuration = encode_checkpoint_configuration(config);
   // External keypoint counts may be stale after upstream head resizing. The

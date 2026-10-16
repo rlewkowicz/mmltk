@@ -111,6 +111,16 @@ torch::Tensor MlpImpl::forward(torch::Tensor x) {
  }
  return x;
 }
+torch::Tensor MlpImpl::grouped_forward(torch::Tensor x, std::span<const MlpImpl* const> groups) {
+ TORCH_CHECK(!groups.empty() && groups.front(), "grouped MLP requires its parameter groups");
+ const auto layers = groups.front()->num_layers_;
+ for (const auto* group : groups) TORCH_CHECK(group && group->num_layers_ == layers, "grouped MLP layers must agree");
+ for (int64_t index = 0; index < layers; ++index) {
+  x = detail::grouped_linear_forward(x, groups.size(), [&](std::size_t group) -> const torch::nn::LinearImpl& { return groups[group]->layers->at<torch::nn::LinearImpl>(index); });
+  if (index + 1 < layers) x = torch::relu(x);
+ }
+ return x;
+}
 DetectionHeadImpl::DetectionHeadImpl(int64_t hidden_dim, int64_t num_classes)
     : class_embed(register_module("class_embed", torch::nn::Linear(hidden_dim, num_classes))), bbox_embed(register_module("bbox_embed", Mlp(hidden_dim, hidden_dim, 4, 3))) {}
 std::pair<torch::Tensor, torch::Tensor> DetectionHeadImpl::forward(const torch::Tensor& hs) {

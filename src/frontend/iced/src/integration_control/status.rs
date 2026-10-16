@@ -134,6 +134,40 @@ impl Evidence {
         if matches!(phase, Phase::Disabled | Phase::Complete | Phase::Failed) {
             return true;
         }
+        if let Phase::Workflows(super::workflows::Step::Keypoints(stage)) = phase {
+            let live_failure = |notice: &Notice| {
+                notice.origin == Origin::Compute(crate::generated::FeatureId::Live)
+                    && notice.severity == Severity::Error
+                    && notice.kind == UiErrorKind::Failed
+                    && notice.title == "Operation failed"
+            };
+            if *stage == super::workflows::keypoints::Stage::Failed
+                && self.allowed.is_none()
+                && model.notices.len() == 1
+                && let (Some(notice), Some(selection)) =
+                    (model.notices.latest(), model.model_snapshot.as_ref())
+            {
+                let artifact = &selection.selection.artifact;
+                if !artifact.is_empty()
+                    && live_failure(notice)
+                    && notice.detail
+                        == format!(
+                            "Live capture session failed to start: Live RF-DETR analysis provider for {artifact}: open failed: {artifact}: No such file or directory"
+                        )
+                {
+                    self.allowed = Some(notice.id);
+                    self.payload = Some(notice.detail.clone());
+                }
+            }
+            return if let Some(id) = self.allowed {
+                model.notices.len() == 1
+                    && model.notices.get(id).is_some_and(|notice| {
+                        live_failure(notice) && Some(&notice.detail) == self.payload.as_ref()
+                    })
+            } else {
+                model.notices.is_empty()
+            };
+        }
         if matches!(phase, Phase::ViewerAwaitDisconnect | Phase::ViewerReconnect) {
             if model.notices.is_empty() {
                 if self.outage.is_none() {

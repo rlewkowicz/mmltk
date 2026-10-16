@@ -6,6 +6,19 @@
 #include "src/pch_std.h"
 #include <limits>
 namespace mmltk::backend::models::rfdetr {
+torch::Tensor positioned_attention_input(const torch::Tensor& target, const torch::Tensor& position, bool training) {
+ if (!position.defined()) return target;
+ auto result = target + position;
+ if (training && target.is_cuda() && target.scalar_type() == torch::kFloat32 && target.sizes() == position.sizes() && at::autocast::is_autocast_enabled(at::kCUDA)) {
+  const auto dtype = at::autocast::get_autocast_dtype(at::kCUDA);
+  if ((dtype == torch::kFloat16 || dtype == torch::kBFloat16) && (position.scalar_type() == torch::kFloat32 || position.scalar_type() == dtype)) {
+   // Pinned eager training shares one compute-dtype sum across its two
+   // projections. Their gradients must combine there before the upcast.
+   return result.to(dtype);
+  }
+ }
+ return result;
+}
 torch::Tensor model_scaled_dot_product_attention(
  const torch::Tensor& query, const torch::Tensor& key, const torch::Tensor& value, const torch::Tensor& admitted_mask, std::optional<double> scale, bool force_math) {
  if (force_math) {
@@ -71,7 +84,7 @@ torch::Tensor isolated_group_self_attention(
   // operands. Preserve both its group-major ordering and strides: ATen linear
   // chooses a different rounded bias operation for noncontiguous operands.
   const auto sequence_first = [&](const torch::Tensor& input) { return input.view({batch, groups, queries, width}).transpose(0, 1).reshape({groups * batch, queries, width}).transpose(0, 1); };
-  const auto positioned = sequence_first(target + query_position);
+  const auto positioned = sequence_first(positioned_attention_input(target, query_position, attention->is_training()));
   const auto q = project(positioned, 0), k = project(positioned, 1), v = project(sequence_first(target), 2);
   auto output = grouped_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), heads, 1, force_math);
   output = detail::linear_forward(*attention->out_proj, output.permute({2, 0, 1, 3}).reshape({queries * groups * batch, width}));

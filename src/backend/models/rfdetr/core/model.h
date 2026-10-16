@@ -74,6 +74,9 @@ public:
  void to(const torch::Device& device);
  [[nodiscard]] std::vector<torch::Tensor> parameters(bool recurse = true) const;
  [[nodiscard]] torch::OrderedDict<std::string, torch::Tensor> named_parameters(bool recurse = true) const;
+ // Complete eligible inventory. Permanently unused paths return inactive,
+ // storage-sharing views without changing the model's autograd flags.
+ [[nodiscard]] torch::OrderedDict<std::string, torch::Tensor> named_optimizer_parameters() const;
  [[nodiscard]] torch::OrderedDict<std::string, torch::Tensor> named_buffers(bool recurse = true) const;
 
 private:

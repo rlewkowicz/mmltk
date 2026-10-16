@@ -14,6 +14,16 @@ namespace mmltk::backend::models::rfdetr::detail {
 namespace {
 namespace F = torch::nn::functional;
 using namespace torch::indexing;
+torch::Tensor rotary_embedding(int64_t height, int64_t width, int64_t head_dim, torch::TensorOptions options) {
+ // timm 1.0.27 uses reciprocal positive powers, xy indexing, grid_offset=1
+ // and a 24x24 reference grid. Preserve those rounding boundaries.
+ const auto bands = 1.0 / torch::pow(10000.0, torch::arange(head_dim / 4, options) / static_cast<double>(head_dim / 4));
+ const auto xs = (torch::arange(width, options) + 1.0) / static_cast<double>(width) * 24.0;
+ const auto ys = (torch::arange(height, options) + 1.0) / static_cast<double>(height) * 24.0;
+ const auto grid = torch::stack({xs.unsqueeze(0).expand({height, width}), ys.unsqueeze(1).expand({height, width})}, -1);
+ const auto angles = (grid.unsqueeze(-1) * bands).reshape({height * width, -1}).repeat_interleave(2, -1);
+ return torch::cat({angles.sin(), angles.cos()}, -1);
+}
 class PeAttention final : public torch::nn::Module {
 public:
  explicit PeAttention(const BackboneConfig& config) : heads_(config.heads), dimension_(config.dimension) {
@@ -72,6 +82,9 @@ public:
   blocks_ = register_module("blocks", torch::nn::ModuleList());
   for (int64_t index = 0; index < config.backbone.layers; ++index) blocks_->push_back(std::make_shared<PeBlock>(config.backbone));
   norm_ = register_module("norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({config.backbone.dimension}).eps(1.e-5)));
+  // Upstream constructs its nonpersistent stored-grid embedding on the CPU,
+  // then moves it with the module. This derived cache is not checkpoint state.
+  rope_ = rotary_embedding(config.positional_encoding_size, config.positional_encoding_size, config.backbone.dimension / config.backbone.heads, torch::TensorOptions().dtype(torch::kFloat32));
   torch::NoGradGuard guard;
   for (const auto& module : modules(false))
    if (auto* linear = dynamic_cast<torch::nn::LinearImpl*>(module.get())) {
@@ -87,6 +100,18 @@ public:
    block.mlp->fc2->weight.div_(scale);
   }
  }
+ void to(torch::Device device, torch::Dtype dtype, bool non_blocking = false) override {
+  torch::nn::Module::to(device, dtype, non_blocking);
+  rope_ = rope_.to(device, dtype, non_blocking);
+ }
+ void to(torch::Dtype dtype, bool non_blocking = false) override {
+  torch::nn::Module::to(dtype, non_blocking);
+  rope_ = rope_.to(dtype, non_blocking);
+ }
+ void to(torch::Device device, bool non_blocking = false) override {
+  torch::nn::Module::to(device, non_blocking);
+  rope_ = rope_.to(device, non_blocking);
+ }
  std::vector<torch::Tensor> forward(const torch::Tensor& pixels) {
   const int64_t windows = config_.num_windows, squares = windows * windows, dim = config_.backbone.dimension;
   const int64_t batch = pixels.size(0), h = pixels.size(2) / config_.patch_size, w = pixels.size(3) / config_.patch_size;
@@ -99,16 +124,10 @@ public:
   }
   auto tokens = projection_->forward(pixels).flatten(2).transpose(1, 2);
   tokens = norm_pre_->forward(torch::cat({cls_token_.expand({batch, -1, -1}), tokens}, 1) + positions);
-  // timm uses xy indexing, grid_offset=1 and a 24x24 reference grid.
   const auto options = pixels.options().dtype(torch::kFloat32);
   const int64_t head_dim = dim / config_.backbone.heads;
-  auto bands = torch::pow(torch::full({head_dim / 4}, 10000.0, options), -torch::arange(head_dim / 4, options) / static_cast<double>(head_dim / 4));
-  auto xs = (torch::arange(w, options) + 1.0) / static_cast<double>(w) * 24.0;
-  auto ys = (torch::arange(h, options) + 1.0) / static_cast<double>(h) * 24.0;
-  auto grid = torch::stack({xs.unsqueeze(0).expand({h, w}), ys.unsqueeze(1).expand({h, w})}, -1);
-  auto angles = (grid.unsqueeze(-1) * bands).reshape({h * w, -1}).repeat_interleave(2, -1);
-  auto rope = torch::cat({angles.sin(), angles.cos()}, -1);
-  auto no_op = torch::cat({torch::zeros({1, head_dim}, options), torch::ones({1, head_dim}, options)}, -1);
+  auto rope = h == config_.positional_encoding_size && w == config_.positional_encoding_size ? rope_ : rotary_embedding(h, w, head_dim, options).to(rope_.scalar_type());
+  auto no_op = torch::cat({torch::zeros({1, head_dim}, rope.options()), torch::ones({1, head_dim}, rope.options())}, -1);
   torch::Tensor full_rope, window_rope;
   if (windows > 1) {
    auto patches = tokens.narrow(1, 1, h * w).reshape({batch, windows, h / windows, windows, w / windows, dim}).permute({0, 1, 3, 2, 4, 5}).reshape({batch * squares, h * w / squares, dim});
@@ -140,7 +159,7 @@ public:
 private:
  NativeRfDetrConfig config_;
  torch::nn::Conv2d projection_{nullptr};
- torch::Tensor cls_token_, pos_embed_;
+ torch::Tensor cls_token_, pos_embed_, rope_;
  torch::nn::LayerNorm norm_pre_{nullptr}, norm_{nullptr};
  torch::nn::ModuleList blocks_{nullptr};
 };

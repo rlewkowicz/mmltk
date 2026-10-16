@@ -15,10 +15,12 @@
 #include <torch/serialize.h>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <numeric>
 #include <set>
 #include <span>
 #include <sstream>
+#include <string_view>
 #include <utility>
 namespace rf = mmltk::backend::models::rfdetr;
 namespace support = rf::testsupport;
@@ -72,8 +74,59 @@ void compare_assignments(support::OracleComparison& comparison, const support::O
    selected_masks.push_back(value.sparse_pred_masks ? rf::matched_sparse_pred_masks_for_batch(*value.sparse_pred_masks, static_cast<int64_t>(image), query)
                                                     : value.pred_masks->index({static_cast<int64_t>(image)}).index_select(0, query));
   }
-  const auto sampled = rf::sample_direct_masks(torch::cat(selected_masks), targets, torch::cat(selected_targets), config.mask_point_sample_ratio, samples[index]);
+  const auto masks = torch::cat(selected_masks), target_indices = torch::cat(selected_targets);
+  const auto sampled = rf::sample_direct_masks(masks, targets, target_indices, config.mask_point_sample_ratio, samples[index]);
   const auto key = prefix + "direct/" + std::to_string(index) + "/";
+  const auto* trace = std::getenv("MMLTK_RFDETR_MASK_SELECTION_TRACE");
+  if (trace && std::string_view(trace) == "1" && !torch::equal(sampled.coordinates.cpu(), expected.at(key + "point_coords"))) {
+   torch::NoGradGuard no_grad;
+   const auto& output_layer = *output_layers[index];
+   REQUIRE(output_layer.sparse_pred_masks.has_value());
+   const auto output_key = prefix + "output/" + (index == 0 ? std::string("main") : index + 1 == output_layers.size() && outputs.enc_outputs ? std::string("enc") : "aux." + std::to_string(index - 1)) + "/pred_masks/";
+   const std::array names{output_key + "spatial_features", output_key + "query_features", output_key + "bias"};
+   const auto source = archive.read_tensors(names);
+   const auto device = masks.device();
+   const rf::SparsePredMasks reference{source.at(names[0]).to(device), source.at(names[1]).to(device), source.at(names[2]).to(device)};
+   const auto project = [&](const rf::SparsePredMasks& sparse, bool einsum) {
+    std::vector<torch::Tensor> projected;
+    for (std::size_t image = 0; image < matches.size(); ++image) {
+     const auto query = matches[image].first.to(device);
+     if (query.numel() == 0) continue;
+     projected.push_back(einsum ? torch::einsum("chw,nc->nhw", {sparse.spatial_features[image], sparse.query_features[image].index_select(0, query)}) + sparse.bias
+                                : rf::matched_sparse_pred_masks_for_batch(sparse, static_cast<int64_t>(image), query));
+    }
+    return torch::cat(projected);
+   };
+   comparison.observe_values([&] {
+    for (const auto& [variant, value] : {std::pair{"native-einsum", project(*output_layer.sparse_pred_masks, true)}, std::pair{"source-matmul", project(reference, false)}, std::pair{"source-einsum", project(reference, true)}}) {
+     const auto control = rf::sample_direct_masks(value, targets, target_indices, config.mask_point_sample_ratio, samples[index]);
+     comparison.compare(key + variant + "/point_coords", control.coordinates, expected.at(key + "point_coords"), ComparisonPolicy::Exact);
+     comparison.compare(key + variant + "/point_logits", control.logits, expected.at(key + "point_logits"), ComparisonPolicy::Value);
+    }
+   });
+   const auto candidates = samples[index].uncertain_candidates;
+   const auto count = static_cast<int64_t>(.75 * static_cast<double>(sampled.coordinates.size(1)));
+   const auto identities = [&](const torch::Tensor& coordinates) {
+    return candidates.unsqueeze(1).eq(coordinates.to(device).narrow(1, 0, count).unsqueeze(2)).all(-1).to(torch::kInt64).argmax(-1).cpu();
+   };
+   const auto actual_ids = identities(sampled.coordinates), expected_ids = identities(expected.at(key + "point_coords"));
+   comparison.observe_values([&] {
+    comparison.compare(key + "candidate-order", actual_ids, expected_ids, ComparisonPolicy::Exact);
+    comparison.compare(key + "candidate-set", std::get<0>(actual_ids.sort(-1)), std::get<0>(expected_ids.sort(-1)), ComparisonPolicy::Exact);
+   });
+   const auto uncertainty = -rf::point_sample(masks.unsqueeze(1), candidates, torch::kBilinear).squeeze(1).abs().cpu();
+   const auto source_uncertainty = -rf::point_sample(project(reference, true).unsqueeze(1), candidates, torch::kBilinear).squeeze(1).abs().cpu();
+   const auto changed = actual_ids.ne(expected_ids).nonzero();
+   nlohmann::json points = nlohmann::json::array();
+   for (int64_t point = 0; point < std::min<int64_t>(changed.size(0), 16); ++point) {
+    const auto row = changed[point][0].item<int64_t>(), column = changed[point][1].item<int64_t>();
+    const auto actual_id = actual_ids[row][column].item<int64_t>(), expected_id = expected_ids[row][column].item<int64_t>();
+    points.push_back({{"row", row}, {"column", column}, {"actual_id", actual_id}, {"expected_id", expected_id},
+                      {"native_actual_uncertainty", uncertainty[row][actual_id].item<double>()}, {"native_expected_uncertainty", uncertainty[row][expected_id].item<double>()},
+                      {"source_actual_uncertainty", source_uncertainty[row][actual_id].item<double>()}, {"source_expected_uncertainty", source_uncertainty[row][expected_id].item<double>()}});
+   }
+   comparison.fact(key + "selection-difference", {{"changed_positions", changed.size(0)}, {"points", points}});
+  }
   // Exact coordinates expose uncertainty top-k selection, including ties;
   // equal-looking interpolated logits cannot conceal different selected points.
   comparison.compare(key + "point_coords", sampled.coordinates, expected.at(key + "point_coords"), ComparisonPolicy::Exact);
@@ -145,6 +198,8 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
  REQUIRE(serialization::require_double(archive, "beta2") == .999);
  REQUIRE(serialization::require_double(archive, "eps") == 1e-8);
  const auto parameters = serialization::require_int(archive, "param_count");
+ REQUIRE(parameters == static_cast<int64_t>(optimizer.eligible_parameters().size()));
+ REQUIRE(optimizer.eligible_parameter_names().size() == optimizer.eligible_parameters().size());
  constexpr std::array state_fields{std::pair{"step", ComparisonPolicy::Exact}, std::pair{"exp_avg", ComparisonPolicy::Derivative}, std::pair{"exp_avg_sq", ComparisonPolicy::SecondMoment}};
  std::vector<std::string> names;
  std::vector<torch::serialize::InputArchive> parameter_archives;
@@ -153,6 +208,7 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
   auto& parameter = parameter_archives.emplace_back();
   archive.read(serialization::archive_entry_name("param", static_cast<std::size_t>(index)), parameter);
   const auto name = serialization::require_string(parameter, "name");
+  REQUIRE(name == optimizer.eligible_parameter_names()[static_cast<std::size_t>(index)]);
   names.push_back(name);
   if (!state || !std::ranges::contains(entry.trainable, name)) continue;
   for (const auto& [field, policy] : state_fields) {
@@ -167,14 +223,17 @@ void compare_optimizer(support::OracleComparison& comparison, const support::Ora
   auto& parameter = parameter_archives[index];
   if (!state || !std::ranges::contains(entry.trainable, name)) continue;
   for (const auto& [field, policy] : state_fields) {
+   CAPTURE(name, field);
    torch::Tensor value;
    (void)parameter.try_read(field, value);
    const auto key = "optimizer/" + name + "/" + field;
    const auto& expected = references.at(key);
-   // Native eagerly owns zero moments/age for unused eligible parameters;
-   // PyTorch lazily omits that state. Verify the zero state explicitly.
-   // This branch retains the oracle's value tolerance for floating zeros.
-   if (!expected.defined()) {
+   // Explicitly inactive native optimizer views keep no state. Both sides
+   // must omit it; active but unused native parameters instead own zeros.
+   if (!optimizer.eligible_parameters()[index].requires_grad()) {
+    REQUIRE(serialization::require_int(parameter, "initialized") == 0);
+    comparison.compare(key, value, expected, ComparisonPolicy::Exact);
+   } else if (!expected.defined()) {
     REQUIRE(value.defined());
     comparison.compare(key + "/unused-zero", value, torch::zeros_like(value), ComparisonPolicy::Value);
    } else {
@@ -237,18 +296,29 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
      rf::TrainRequest request;
      static_cast<rf::TrainRecipeValues&>(request.recipe) = entry.recipe;
      request.fused_optimizer = false;
-     auto built = rf::build_optimizer(model.named_parameters(true), request, model.config().backbone);
+     auto built = rf::build_optimizer(model.named_optimizer_parameters(), request, model.config().backbone);
      const rf::TrainingStep step(1, 1., entry.dtype() != torch::kFloat32, entry.dtype());
      support::OracleComparison comparison(requested, (matched_state ? "training-" : "trajectory-") + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype());
      comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
-     std::set<std::string> actual_weights, expected_weights;
+     std::set<std::string> actual_weights, expected_weights, inactive_source_weights;
      for (const auto& [name, weight] : entry.loss_weights) expected_weights.insert(name);
      for (const auto& weight : config.weights) {
       const auto name = rf::criterion_external_name(weight.key);
       actual_weights.insert(name);
       comparison.compare(
        "parameter-group/loss-weight/" + name, torch::tensor(weight.coefficient, torch::kFloat64), torch::tensor(entry.loss_weights.at(name), torch::kFloat64), ComparisonPolicy::Hyperparameter);
+      // Pinned upstream declares encoder coefficients even when its zero-layer
+      // forward emits only main predictions. Native retains only active weights;
+      // still verify every unused source coefficient against its canonical term.
+      if (config.dec_layers == 0 && config.two_stage && config.aux_loss && weight.key.layer.kind() == rf::CriterionLayer::Kind::Main) {
+       const auto inactive = rf::criterion_external_name({weight.key.term, rf::CriterionLayer::encoder()});
+       REQUIRE(expected_weights.erase(inactive) == 1);
+       inactive_source_weights.insert(inactive);
+       comparison.compare("parameter-group/inactive-source-loss-weight/" + inactive, torch::tensor(weight.coefficient, torch::kFloat64),
+        torch::tensor(entry.loss_weights.at(inactive), torch::kFloat64), ComparisonPolicy::Hyperparameter);
+      }
      }
+     if (!inactive_source_weights.empty()) comparison.fact("declared source weights without encoder outputs", inactive_source_weights);
      comparison.inventory("loss weight inventory", actual_weights, expected_weights);
      rf::TensorMap expected_before;
      for (const auto& parameter : model.named_parameters(true))

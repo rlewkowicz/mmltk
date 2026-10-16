@@ -62,7 +62,7 @@ auto SurfaceAudit::admit(const std::string& id) -> bool {
   if (state.source_steps.size() < kAcceptanceRecordLimit && state.publication_steps.size() < kAcceptanceRecordLimit && state.reads.size() < kAcceptanceRecordLimit &&
       state.transfers.size() < kAcceptanceRecordLimit && state.receipts.size() < kAcceptanceRecordLimit && state.ended_spans.size() < kAcceptanceRecordLimit &&
       state.samples.size() < kAcceptanceRecordLimit && state.failed_source_operations.size() < kAcceptanceRecordLimit && state.failed_publications.size() < kAcceptanceRecordLimit &&
-      draws.size() < kAcceptanceRecordLimit)
+      draws.size() < draw_limit)
    return true;
  }
  reject("physical lifecycle evidence exceeded its bounded acceptance capacity");
@@ -532,7 +532,7 @@ auto SurfaceAudit::browser(const nlohmann::json& record) -> void {
    if (!custody.acquired) reject("Iced selected image without an exact sample lease");
    ++custody.selected;
    if (!valid_identity(record.value("requested_surface", ""))) reject("Iced selected draw lacks requested capability identity");
-   if (draws.size() >= kAcceptanceRecordLimit) {
+   if (draws.size() >= draw_limit) {
     reject("Iced draw identity inventory exhausted");
     return;
    }

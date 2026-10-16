@@ -666,7 +666,7 @@ TEST_CASE("Explore fixed storage retries every retained leaf and preserves the f
  using mmltk::controller::explore_detail::NativeExploreStorageTestAccess;
  NativeExploreStorageTestAccess::Storage inventory;
  const auto leaf_count = NativeExploreStorageTestAccess::Leaves(inventory).size();
- REQUIRE(leaf_count == 15U);  // eleven buffers and both two-element caches
+ REQUIRE(leaf_count == 17U);  // thirteen buffers, including joints/edges, and both two-element caches
  for (std::size_t selected = 0U; selected != leaf_count; ++selected) {
   for (const auto status : {cudaErrorUnknown, cudaErrorContextIsDestroyed}) {
    INFO("leaf=" << selected << " failure=" << static_cast<int>(status));

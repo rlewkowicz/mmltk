@@ -1120,9 +1120,11 @@ impl State {
                         .is_some_and(|draft| draft.workflows.train.compiledimensions) =>
             {
                 driver.phase = Phase::CompileResizeMode;
-                widgets.arm(driver, self.compile_resize_control())
+                widgets.arm_scrolled(driver, self.compile_resize_control(), RelativeOffset::START)
             }
-            Phase::CompileResizeMode => widgets.arm(driver, self.compile_resize_control()),
+            Phase::CompileResizeMode => {
+                widgets.arm_scrolled(driver, self.compile_resize_control(), RelativeOffset::START)
+            }
             Phase::AwaitCompileResizeMode
                 if !settings.has_local_edits()
                     && settings.draft.as_ref().is_some_and(|draft| {
@@ -1161,7 +1163,11 @@ impl State {
                 if self.compile_method_step < 3 {
                     self.compile_method_step += 1;
                     driver.phase = Phase::CompileResizeMode;
-                    return widgets.arm(driver, self.compile_resize_control());
+                    return widgets.arm_scrolled(
+                        driver,
+                        self.compile_resize_control(),
+                        RelativeOffset::START,
+                    );
                 }
                 driver.phase = Phase::CompileResolution;
                 widgets.arm(driver, COMPILE_RESOLUTION)

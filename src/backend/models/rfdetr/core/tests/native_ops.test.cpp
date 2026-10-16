@@ -1368,8 +1368,9 @@ TEST_CASE("Conditional joint queries match linear primitive outputs and VJPs acr
   }
  }
 }
-TEST_CASE("PE-Core positions and RoPE admit dynamic geometry without learned-state mutation", "[rfdetr][backbone][pe_core]") {
+TEST_CASE("PE-Core positions and RoPE admit dynamic geometry without learned-state mutation", "[rfdetr][backbone][pe_core][gpu]") {
  namespace r = mmltk::backend::models::rfdetr;
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  for (const auto filename : {"rf-detr-atto.pth", "rf-detr-femto.pth", "rf-detr-pico.pth"}) {
   auto config = r::native_config_from_preset(*r::find_model_preset_by_weight_filename(filename));
   config.group_detr = 1;
@@ -1388,6 +1389,22 @@ TEST_CASE("PE-Core positions and RoPE admit dynamic geometry without learned-sta
    CHECK(torch::equal(parameters["backbone.0.encoder.model.pos_embed"], position));
    CHECK(model.named_buffers().size() == buffers_before);
   }
+  model.to(torch::Device(torch::kCUDA, 0));
+  const auto side = config.patch_size * config.positional_encoding_size;
+  const auto input = torch::rand({1, 3, side, side}, torch::TensorOptions().device(torch::Device(torch::kCUDA, 0)));
+  const auto expected = model.forward({input, {}}, false);
+  for (const bool sealed : {false, true}) {
+   if (sealed) model.freeze_inference_weights();
+   auto clone = model.make_inference_clone(1, r::CompilationMode::kNone);
+   const auto copied = clone->named_parameters();
+   for (const auto& entry : model.named_parameters())
+    CHECK((copied[entry.key()].data_ptr() == entry.value().data_ptr()) == sealed);
+   const auto actual = clone->forward({input, {}}, false);
+   CHECK(torch::allclose(actual.main.pred_logits, expected.main.pred_logits, 2e-4, 2e-4));
+   CHECK(torch::allclose(actual.main.pred_boxes, expected.main.pred_boxes, 2e-4, 2e-4));
+   CHECK(clone->named_buffers().size() == buffers_before);
+  }
+  CHECK(torch::equal(model.named_parameters()["backbone.0.encoder.model.pos_embed"].cpu(), position));
  }
 }
 TEST_CASE("Keypoint objectives keep visibility masks finite derivatives and class-local normalizers", "[rfdetr][criterion][keypoints]") {
@@ -1442,6 +1459,8 @@ TEST_CASE("Keypoint objectives keep visibility masks finite derivatives and clas
 }
 TEST_CASE("Keypoint criterion includes every grouped auxiliary and encoder loss in the shared objective", "[rfdetr][criterion][keypoints]") {
  namespace r = mmltk::backend::models::rfdetr;
+ r::testsupport::MatcherExecutionFixture matcher;
+ r::ScopedRuntimeContext runtime(nullptr, 0, &matcher.workspace);
  for (const auto& device : mmltk::backend::ml::testsupport::available_devices()) {
   const auto options = torch::TensorOptions().device(device);
   r::DetectionConfig config;

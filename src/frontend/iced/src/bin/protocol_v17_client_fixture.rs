@@ -1217,6 +1217,16 @@ fn annotation_edit_fixtures() -> Result<
         ),
         (
             "Intent:annotation.Edit.10",
+            generated::AnnotationEdit::AnnotationSkeletonConnectionEdit(
+                generated::AnnotationSkeletonConnectionEdit {
+                    first: 0,
+                    second: 1,
+                    connected: true,
+                },
+            ),
+        ),
+        (
+            "Intent:annotation.Edit.11",
             generated::AnnotationEdit::AnnotationMaskCleanupEdit(
                 generated::AnnotationMaskCleanupEdit {
                     operation: generated::AnnotationMaskCleanup::LargestComponent,
@@ -1225,7 +1235,7 @@ fn annotation_edit_fixtures() -> Result<
             ),
         ),
         (
-            "Intent:annotation.Edit.11",
+            "Intent:annotation.Edit.12",
             generated::AnnotationEdit::AnnotationMaskColorsEdit(
                 generated::AnnotationMaskColorsEdit {
                     sup: range.clone(),
@@ -1234,19 +1244,19 @@ fn annotation_edit_fixtures() -> Result<
             ),
         ),
         (
-            "Intent:annotation.Edit.12",
+            "Intent:annotation.Edit.13",
             generated::AnnotationEdit::AnnotationSceneEdit(generated::AnnotationSceneEdit {}),
         ),
         (
-            "Intent:annotation.Edit.13",
+            "Intent:annotation.Edit.14",
             generated::AnnotationEdit::AnnotationUndoEdit(generated::AnnotationUndoEdit {}),
         ),
         (
-            "Intent:annotation.Edit.14",
+            "Intent:annotation.Edit.15",
             generated::AnnotationEdit::AnnotationRedoEdit(generated::AnnotationRedoEdit {}),
         ),
         (
-            "Intent:annotation.Edit.15",
+            "Intent:annotation.Edit.16",
             generated::AnnotationEdit::AnnotationClassEdit(generated::AnnotationClassEdit {
                 category: 0,
             }),

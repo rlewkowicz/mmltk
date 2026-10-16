@@ -1,11 +1,21 @@
 
 #include "src/backend/models/rfdetr/core/detection_types.h"
 namespace mmltk::backend::models::rfdetr {
-void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, const at::ScalarType expected_dtype, const char* context) {
+void assert_inference_output_dtype(const OutputLayer& output, const at::ScalarType expected_dtype, const char* context) {
+ const auto& pred_logits = output.pred_logits;
+ const auto& pred_boxes = output.pred_boxes;
  if (!pred_logits.defined() || !pred_boxes.defined()) { throw std::runtime_error(std::string(context) + " returned undefined detection outputs"); }
- if (pred_logits.scalar_type() != expected_dtype) { throw std::runtime_error(std::string(context) + " returned logits with the wrong element type"); }
+ // GroupPose adds its refined keypoint class contribution to the classifier.
+ // FP32 reference coordinates promote the joint packet and this sum under AMP.
+ const bool promoted_keypoints = expected_dtype != at::kFloat && output.pred_keypoints && output.pred_keypoints->defined() && output.pred_keypoints->scalar_type() == at::kFloat;
+ if (pred_logits.scalar_type() != expected_dtype && !(promoted_keypoints && pred_logits.scalar_type() == at::kFloat)) {
+  throw std::runtime_error(
+   std::string(context) + " returned logits of type " + c10::toString(pred_logits.scalar_type()) + "; expected " + c10::toString(expected_dtype) + " or FP32 keypoint promotion");
+ }
  const bool valid_box_dtype = pred_boxes.scalar_type() == expected_dtype || (expected_dtype != at::kFloat && pred_boxes.scalar_type() == at::kFloat);
- if (!valid_box_dtype) { throw std::runtime_error(std::string(context) + " returned boxes with the wrong element type"); }
+ if (!valid_box_dtype) {
+  throw std::runtime_error(std::string(context) + " returned boxes of type " + c10::toString(pred_boxes.scalar_type()) + "; expected " + c10::toString(expected_dtype) + " or FP32 refinement");
+ }
 }
 void populate_default_detection_weights(DetectionConfig& config) {
  config.weights.clear();

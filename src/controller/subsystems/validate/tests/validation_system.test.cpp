@@ -1333,7 +1333,10 @@ TEST_CASE("validation saved and interactive skeletons share independent layer jo
  const auto admitted = options;
  catalog::ClassKeypointSchema schema{.names = {"joint"}, .horizontal_flip = {0}, .oks_sigmas = {.1}};
  const auto classes = std::make_shared<const catalog::ClassCatalog>(catalog::OrderedClassCatalog{{{"object"}}, std::vector{schema}});
- rfdetr::Prediction detection{.class_reference = 0, .score = .5F, .bbox_xyxy = {0, 0, 64, 64}, .keypoints = {{16, 16, .9F, {.125F, 0, .125F}}}};
+ // Stored precision uses log-diagonal Cholesky entries. A diagonal of 1/8
+ // therefore gives the eight-pixel uncertainty radius sampled below.
+ const float log_precision = std::log(.125F);
+ rfdetr::Prediction detection{.class_reference = 0, .score = .5F, .bbox_xyxy = {0, 0, 64, 64}, .keypoints = {{16, 16, .9F, {log_precision, 0, log_precision}}}};
  auto truth = detection;
  truth.keypoints.front().x = 48;
  truth.keypoint_visibility = {catalog::KeypointVisibility::Visible};

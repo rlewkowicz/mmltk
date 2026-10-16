@@ -905,6 +905,20 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
  mmltk::testsupport::ScopedTempDir temporary("mmltk-artifact-progress");
  const mmltk::backend::data::testsupport::FixtureSpec fixture{.root_dir = temporary.path().string(), .split = "train", .width = 16, .height = 16, .num_images = 1};
  mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
+ const auto categories_path = std::filesystem::path(data::testsupport::dataset_dir(fixture)) / "categories.json";
+ nlohmann::json categories;
+ {
+  std::ifstream stream(categories_path);
+  REQUIRE(stream);
+  stream >> categories;
+ }
+ categories["classes"][0]["name"] = std::string(data::COMPILED_CLASS_NAME_CAPACITY, 'n');
+ {
+  std::ofstream stream(categories_path);
+  REQUIRE(stream);
+  stream << categories;
+  REQUIRE(stream.good());
+ }
  ArtifactStore store;
  ArtifactCancellationFixture cancellation;
  struct Reports {
@@ -925,14 +939,9 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
  const auto compiled = result.output / "train.bin";
  data::FileHeader header{};
  {
-  std::fstream stream(compiled, std::ios::binary | std::ios::in | std::ios::out);
+  std::ifstream stream(compiled, std::ios::binary);
   REQUIRE(stream);
   stream.read(reinterpret_cast<char*>(&header), sizeof(header));
-  REQUIRE(stream);
-  header.class_names[0].fill('n');
-  header.class_names[0].back() = '\0';
-  stream.seekp(0);
-  stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
   REQUIRE(stream);
  }
  std::array<std::filesystem::path, domain::kArtifactSplitCapacity> paths{};

@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <onnxruntime_cxx_api.h>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -14,6 +15,7 @@
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
+import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::ml::runtime {
 namespace {
 [[nodiscard]] RuntimeElementType runtime_element_type(const ONNXTensorElementDataType value) {
@@ -69,16 +71,22 @@ public:
   session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
   session_options_.SetIntraOpNumThreads(1);
   session_options_.SetInterOpNumThreads(1);
-  OrtCUDAProviderOptions cuda_options{};
-  cuda_options.device_id = options_.device;
-  cuda_options.do_copy_in_default_stream = 1;
-  cuda_options.has_user_compute_stream = 1;
-  cuda_options.user_compute_stream = reinterpret_cast<cudaStream_t>(cuda_lane().native_stream());
-  session_options_.AppendExecutionProvider_CUDA(cuda_options);
+  const auto& api = Ort::GetApi();
+  OrtCUDAProviderOptionsV2* provider = nullptr;
+  Ort::ThrowOnError(api.CreateCUDAProviderOptions(&provider));
+  const std::unique_ptr<OrtCUDAProviderOptionsV2, decltype(api.ReleaseCUDAProviderOptions)> cuda_options(provider, api.ReleaseCUDAProviderOptions);
+  const auto device = std::to_string(options_.device);
+  const std::array<const char*, 3> keys{"device_id", "do_copy_in_default_stream", "use_tf32"};
+  const std::array<const char*, 3> values{device.c_str(), "1", options_.allow_tf32 ? "1" : "0"};
+  Ort::ThrowOnError(api.UpdateCUDAProviderOptions(cuda_options.get(), keys.data(), values.data(), keys.size()));
+  Ort::ThrowOnError(api.UpdateCUDAProviderOptionsWithValue(cuda_options.get(), "user_compute_stream", reinterpret_cast<void*>(cuda_lane().native_stream())));
+  session_options_.AppendExecutionProvider_CUDA_V2(*cuda_options);
   session_ = std::make_unique<Ort::Session>(environment_.get(), options_.model_path.string().c_str(), session_options_);
   binding_ = std::make_unique<Ort::IoBinding>(*session_);
   ReadModelInfo();
   output_values_.reserve(info_.output_count);
+  const Ort::MemoryInfo pinned_memory("CudaPinned", OrtArenaAllocator, options_.device, OrtMemTypeCPUOutput);
+  pinned_allocator_ = std::make_unique<Ort::Allocator>(*session_, pinned_memory);
  }
  ~OnnxRuntimeBackend() override { static_cast<void>(Close()); }
  [[nodiscard]] const RuntimeModelInfo& model_info() const noexcept override { return info_; }
@@ -104,9 +112,24 @@ public:
   cuda_lane().Record(continuation);
   return cuda_lane().Receipt(outputs.size());
  }
- void ReleaseBackendResources() noexcept override {
+ [[nodiscard]] RuntimeStatus ReleaseBackendResources() noexcept override {
+  mmltk::common::logging::trace([&](auto& logger) {
+   logger.trace("event=onnx.runtime.release phase=before_session stream={} status={} last_error={}", cuda_lane().native_stream(),
+    static_cast<int>(cudaStreamQuery(reinterpret_cast<cudaStream_t>(cuda_lane().native_stream()))), static_cast<int>(cudaPeekAtLastError()));
+  });
   binding_.reset();
+  output_values_.clear();
   session_.reset();
+  // Session destruction can enqueue deferred CPU frees. Keep its actual arena
+  // alive until those callbacks finish, so its final cudaFreeHost runs here.
+  const auto settled = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(cuda_lane().native_stream()));
+  if (settled != cudaSuccess) return static_cast<RuntimeStatus>(settled);
+  pinned_allocator_.reset();
+  mmltk::common::logging::trace([&](auto& logger) {
+   logger.trace("event=onnx.runtime.release phase=after_session stream={} status={} last_error={}", cuda_lane().native_stream(),
+    static_cast<int>(cudaStreamQuery(reinterpret_cast<cudaStream_t>(cuda_lane().native_stream()))), static_cast<int>(cudaPeekAtLastError()));
+  });
+  return kRuntimeSuccess;
  }
  [[nodiscard]] std::shared_ptr<RuntimeBackend> MakeLane(BorrowedCommandStream command_stream) const override {
   auto options = options_;
@@ -145,6 +168,7 @@ private:
  RuntimeBackendOptions options_;
  RuntimeModelInfo info_;
  Ort::SessionOptions session_options_;
+ std::unique_ptr<Ort::Allocator> pinned_allocator_;
  std::unique_ptr<Ort::Session> session_;
  std::unique_ptr<Ort::IoBinding> binding_;
  std::vector<Ort::Value> output_values_;

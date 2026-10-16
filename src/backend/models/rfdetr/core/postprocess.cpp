@@ -98,7 +98,7 @@ std::optional<torch::Tensor> postprocess_keypoints(const OutputTensors& outputs,
      layout.slot_count() == 0 || !raw.is_floating_point() || raw.device() != outputs.pred_logits.device() || outputs.pred_masks)
   throw std::invalid_argument("keypoint postprocessing schema disagrees with output");
  const auto batch = raw.size(0), queries = raw.size(1), k = layout.maximum_joints();
- static_cast<void>(checked_prediction_extent(batch * core.scores.size(1), k * sizeof(KeypointPrediction), kMaximumPredictionTensorBytes));
+ if (core.scores.numel() && k > 0) static_cast<void>(checked_prediction_extent(batch * core.scores.size(1), k * sizeof(KeypointPrediction), kMaximumPredictionTensorBytes));
  const auto shaped = raw.reshape({batch, queries, layout.slot_count(), k, Packet::size});
  const auto slots = core.physical_labels.clamp_max(layout.slot_count() - 1);
  const auto batch_indices = torch::arange(batch, slots.options()).unsqueeze(1).expand_as(slots);

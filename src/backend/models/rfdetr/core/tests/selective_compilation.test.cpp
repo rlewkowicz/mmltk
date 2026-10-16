@@ -71,6 +71,63 @@ struct AttentionPair {
   for (const auto& item : actual->named_parameters()) oracle->named_parameters()[item.key()].copy_(item.value());
  }
 };
+TEST_CASE("Tensor recording preserves shared parameter AMP accumulation", "[rfdetr][compilation][cuda]") {
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+ const tensor_fixture::FullMatrixPrecision precision;
+ for (const auto dtype : {torch::kFloat16, torch::kBFloat16}) {
+  if (dtype == torch::kBFloat16 && at::cuda::getCurrentDeviceProperties()->major < 8) continue;
+  for (const bool primed : {false, true}) {
+   CAPTURE(dtype, primed);
+   torch::manual_seed(947);
+   torch::nn::Linear actual(16, 16), expected(16, 16);
+   actual->to(torch::kCUDA);
+   expected->to(torch::kCUDA);
+   {
+    torch::NoGradGuard guard;
+    for (const auto& entry : actual->named_parameters()) expected->named_parameters()[entry.key()].copy_(entry.value());
+   }
+   Region region("shared_amp_parameters");
+   region.prepare(true, true, 2);
+   int forwards = 0;
+   const auto run = [](torch::nn::Linear& layer, const torch::Tensor& first, const torch::Tensor& second) {
+    const auto project = [&](const torch::Tensor& input) { return at::linear(input, layer->weight, layer->bias); };
+    return project(first) + project(second) * .3 + project(first - second * .25) * .7;
+   };
+   for (int replay = 0; replay != 3; ++replay) {
+    CAPTURE(replay);
+    actual->zero_grad();
+    expected->zero_grad();
+    auto first = torch::randn({2, 7, 16}, actual->weight.options()).set_requires_grad(true);
+    auto second = torch::randn_like(first).set_requires_grad(true);
+    auto reference_first = independent_leaf(first), reference_second = independent_leaf(second);
+    torch::Tensor output, reference;
+    {
+     mmltk::backend::ml::cuda::TorchAutocastScope amp(true, dtype);
+     if (replay == 2) at::autocast::set_autocast_cache_enabled(false);
+     if (primed && replay != 2) {
+      (void)at::autocast::cached_cast(dtype, actual->weight, at::kCUDA);
+      (void)at::autocast::cached_cast(dtype, expected->weight, at::kCUDA);
+     }
+     output = region.invoke(true, {first, second}, {actual.get()}, [&](const auto& inputs) {
+      ++forwards;
+      return Region::Tensors{run(actual, inputs[0], inputs[1])};
+     }).front();
+     reference = run(expected, reference_first, reference_second);
+    }
+    REQUIRE(torch::equal(output, reference));
+    REQUIRE(forwards == (replay == 2 ? 2 : 1));
+    output.to(torch::kFloat32).square().sum().backward();
+    reference.to(torch::kFloat32).square().sum().backward();
+    REQUIRE(torch::equal(first.grad(), reference_first.grad()));
+    REQUIRE(torch::equal(second.grad(), reference_second.grad()));
+    for (const auto& entry : actual->named_parameters()) {
+     CAPTURE(entry.key());
+     REQUIRE(torch::equal(entry.value().grad(), expected->named_parameters()[entry.key()].grad()));
+    }
+   }
+  }
+ }
+}
 TEST_CASE("Selective tensor slots record once preserve live weights and guard mismatches", "[rfdetr][compilation]") {
  Region region("fixture");
  torch::nn::Linear linear(4, 4);
@@ -198,11 +255,17 @@ TEST_CASE("Query tensor regions reuse varying extents and independent promoted i
  }
 }
 // An independent dense matrix equation: no MultiheadAttention or SDPA call.
-torch::Tensor dense_attention(torch::nn::MultiheadAttention& module, const torch::Tensor& target, const torch::Tensor& position, const torch::Tensor& admitted = {}) {
+torch::Tensor dense_attention(torch::nn::MultiheadAttention& module, const torch::Tensor& target, const torch::Tensor& position, const torch::Tensor& admitted = {},
+ bool sequence_first_projection = true) {
  const auto width = target.size(-1);
  const auto heads = module->options.num_heads();
  const auto project = [&](const torch::Tensor& x, int64_t offset) {
-  return torch::linear(x, module->in_proj_weight.narrow(0, offset * width, width), module->in_proj_bias.narrow(0, offset * width, width));
+  // Ordinary upstream MHA projects sequence-first operands. Their strides
+  // select matmul plus bias instead of fused addmm rounding under AMP.
+  // The attention reference still evaluates the full masked dense equation.
+  const auto operand = sequence_first_projection ? x.transpose(0, 1) : x;
+  const auto projected = torch::linear(operand, module->in_proj_weight.narrow(0, offset * width, width), module->in_proj_bias.narrow(0, offset * width, width));
+  return sequence_first_projection ? projected.transpose(0, 1) : projected;
  };
  const auto split = [&](const torch::Tensor& x) { return x.view({x.size(0), x.size(1), heads, width / heads}).transpose(1, 2); };
  const auto q = split(project(target + position, 0));
@@ -259,6 +322,12 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
    REQUIRE(torch::allclose(output, expected, 2e-2, 3e-3));
    mmltk::backend::ml::testsupport::backward_squared({output, expected});
    tensor_fixture::require_gradients_close({{target, reference_target}, {position, reference_position}}, 2e-2, 3e-3);
+   if (device.is_cuda() && dtype != torch::kFloat32) {
+    // Pinned eager training shares its compute-dtype positional sum between
+    // Q and K. Their combined derivative rounds there before returning to
+    // the FP32 positional operand, independently of SDPA reduction noise.
+    REQUIRE(torch::equal(position.grad(), position.grad().to(dtype).to(position.scalar_type())));
+   }
    if (queries == 1) {
     // Fused AMP backward can retain rounding residue in the cancelling Q/K
     // derivatives. Use the same absolute bound as the dense gradient oracle.
@@ -314,7 +383,7 @@ TEST_CASE("Ordinary and DN grouped SDPA match masked dense equations with retain
     {
      mmltk::backend::ml::cuda::TorchAutocastScope amp(device.is_cuda() && dtype != torch::kFloat32, dtype);
      output = rf::isolated_group_self_attention(actual, target, position, layout);
-     expected = dense_attention(oracle, clean_target, clean_position, admitted);
+    expected = dense_attention(oracle, clean_target, clean_position, admitted, !dn);
     }
     REQUIRE(torch::allclose(output, expected, 1e-2, 3e-3));
     actual_losses.push_back(output.square().sum());

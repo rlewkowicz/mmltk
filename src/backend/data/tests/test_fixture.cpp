@@ -434,11 +434,11 @@ detail::CompileExecution::Task prepare_benchmark_pixel(benchmark_internal::Bench
   writer.write_pixel(slot, lane, input, allowance, *scratch);
  }, .parent = writer.pixel_input_allowance(*input), .finite_consumer = true, .retain_workspace = false};
 }
-mmltk::common::io::FileHandle create_compiled_fixture_file(const std::filesystem::path& path, const FileHeader& header) {
+mmltk::common::io::FileHandle create_compiled_fixture_file(const std::filesystem::path& path, const FileHeader& header, std::span<const std::byte> catalog) {
  (void)validate_compiled_file_sections(header, header.total_file_size);
  auto file = mmltk::common::io::FileHandle::create_output(path.string(), 0);
  file.resize_sparse(header.total_file_size);
- file.pwrite_all(&header, sizeof(header), 0);
+ write_compiled_header(file, header, catalog);
  return file;
 }
 std::string benchmark_semantics(const std::filesystem::path& path) {

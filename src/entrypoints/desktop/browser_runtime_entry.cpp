@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <charconv>
 #include <exception>
+#include <execinfo.h>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -34,6 +35,21 @@
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::entrypoints::desktop {
 namespace {
+// Ordinary std::terminate diagnostics only; this is not a signal handler.
+[[noreturn]] void integration_terminate_trace() noexcept {
+ const auto failure = std::current_exception();
+ std::string_view detail = "terminated without an active exception";
+ try {
+  if (failure) std::rethrow_exception(failure);
+ } catch (const std::exception& error) { detail = error.what(); } catch (...) {
+  detail = "uncaught nonstandard exception";
+ }
+ mmltk::common::logging::report_fatal("native termination", detail);
+ std::array<void*, 40U> frames{};
+ const int count = ::backtrace(frames.data(), static_cast<int>(frames.size()));
+ ::backtrace_symbols_fd(frames.data(), count, STDERR_FILENO);
+ std::abort();
+}
 class UwsLoopOwner final {
 public:
  UwsLoopOwner() : loop_(uWS::Loop::get()) {}
@@ -158,6 +174,12 @@ int main(int argc, char** argv) {
    if (logging_config.enabled()) { logging_config.app_name = "mmltk-browser-host"; }
    mmltk::common::logging::initialize(logging_config);
    mmltk::common::logging::trace([](auto& logger) { logger.trace("workspace Wayland native runtime logging initialized"); });
+  }
+  const char* const terminate_trace = integration ? std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_TERMINATE_TRACE") : nullptr;
+  if (terminate_trace != nullptr && std::string_view{terminate_trace} == "1" && mmltk::common::logging::enabled(spdlog::level::trace)) {
+   std::array<void*, 1U> warm{};
+   static_cast<void>(::backtrace(warm.data(), static_cast<int>(warm.size())));
+   std::set_terminate(&integration_terminate_trace);
   }
   UwsLoopOwner loop_owner;
   if (!mmltk::controller::services::block_browser_runtime_signals()) {

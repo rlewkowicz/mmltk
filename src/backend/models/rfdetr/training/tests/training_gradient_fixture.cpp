@@ -31,6 +31,8 @@
 #include <chrono>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -787,7 +789,7 @@ struct CollectiveGate final {
  }
 };
 struct CollectiveFacts final {
- int reductions = 0, broadcasts = 0, waits = 0, live_work = 0, aborts = 0;
+ int reductions = 0, broadcasts = 0, stream_joins = 0, completion_waits = 0, live_work = 0, aborts = 0;
  std::set<const void*> broadcast_storage;
  std::set<const void*> reduction_storage;
  std::vector<std::pair<at::ScalarType, std::int64_t>> reduction_shapes;
@@ -800,11 +802,17 @@ public:
   completed_.record(stream);
  }
  ~FixtureCollectiveWork() override { --facts_->live_work; }
- bool wait(std::chrono::milliseconds = kNoTimeout) override {
-  ++facts_->waits;
+ bool wait(std::chrono::milliseconds timeout = kNoTimeout) override {
+  if (timeout == kNoTimeout)
+   ++facts_->stream_joins;
+  else
+   ++facts_->completion_waits;
   if (outcome_ == CollectiveOutcome::WaitThrow) throw std::runtime_error("injected collective wait exception");
   if (outcome_ == CollectiveOutcome::WaitFalse) return false;
-  completed_.block(tc::getCurrentCUDAStream(completed_.device_index()));
+  if (timeout == kNoTimeout)
+   completed_.block(tc::getCurrentCUDAStream(completed_.device_index()));
+  else
+   completed_.synchronize();
   return true;
  }
 
@@ -1114,7 +1122,8 @@ void exercise_collective_custody(int device) {
     for (std::size_t micro = 0; micro < k; ++micro)
      require(values[micro].item<float>() == static_cast<float>(16777217 + 2 * micro + (distributed ? 1 : 0)), "count scalar overwrite or FP32-before-SUM changed normalization");
   }
-  require(facts->waits == facts->reductions && facts->aborts == 0, "successful count attempts changed stream joins or aborted transport");
+  require(facts->stream_joins == facts->reductions && facts->aborts == 0, "successful count attempts changed stream joins or aborted transport");
+  require(facts->completion_waits == (distributed ? 3 : 0), "count waves introduced blocking waits before the three metric boundaries");
   require(facts->reduction_storage.size() == (distributed ? capacity + 1 : 0), "count/metric storage grew across waves or attempts");
   if (distributed) {
    constexpr auto metric_elements = 5 + 2 * TrainingScalarPacket::size + k * DetectionStatisticsPacket::size;
@@ -1393,14 +1402,21 @@ std::vector<NormalizedModelStateEntry> host_training_state(TrainingModel& model)
  for (auto& value : state) value.tensor = value.tensor.detach().cpu().clone();
  return state;
 }
-void equal_training_state(const std::vector<NormalizedModelStateEntry>& actual, const std::vector<NormalizedModelStateEntry>& expected, std::string_view transition) {
+// Permit about one part per million of FP32 rounding. Parameter cancellation
+// uses the fixture's clipped SGD path length as its absolute scale; persisted
+// identities remain exact. Neither budget is fitted to observed differences.
+constexpr double kPreparationRelativeRoundoff = 8.0 * std::numeric_limits<float>::epsilon();
+constexpr double kPreparationLossFloor = kPreparationRelativeRoundoff * std::numeric_limits<float>::epsilon();
+void equal_training_state(const std::vector<NormalizedModelStateEntry>& actual, const std::vector<NormalizedModelStateEntry>& expected, std::string_view transition, double absolute_roundoff) {
  require(actual.size() == expected.size(), "prepared training parameter inventory differs");
  for (std::size_t i = 0; i < actual.size(); ++i) {
   require(actual[i].name == expected[i].name, "prepared training parameter identity differs");
+  require(actual[i].tensor.scalar_type() == expected[i].tensor.scalar_type() && actual[i].tensor.sizes() == expected[i].tensor.sizes(), "prepared training parameter type or shape differs");
   if (torch::equal(actual[i].tensor, expected[i].tensor)) continue;
+  if (actual[i].tensor.scalar_type() == torch::kFloat32 && torch::allclose(actual[i].tensor, expected[i].tensor, kPreparationRelativeRoundoff, absolute_roundoff)) continue;
   std::ostringstream message;
   message.precision(17);
-  message << transition << " changed the exact parameter trajectory: " << actual[i].name
+  message << transition << " changed the parameter trajectory beyond Float32 rounding: " << actual[i].name
           << ", maximum difference=" << (actual[i].tensor.to(torch::kFloat64) - expected[i].tensor.to(torch::kFloat64)).abs().max().item<double>();
   throw std::runtime_error(message.str());
  }
@@ -1408,14 +1424,23 @@ void equal_training_state(const std::vector<NormalizedModelStateEntry>& actual, 
 }  // namespace
 void exercise_prepared_training(const DistributedContext& distributed, int device, std::string_view preset) {
  namespace data = mmltk::backend::data;
+ const auto* diagnostic = std::getenv("MMLTK_TEST_TRAINING_PREPARATION_TRACE");
+ const bool tracing = diagnostic && std::string_view(diagnostic) == "1";
+ const auto trace = [&](std::string_view phase, std::size_t step = 0) {
+  if (!tracing) return;
+  const nlohmann::json record{{"event", "test.training_preparation"}, {"phase", phase}, {"preset", preset.empty() ? "default" : preset}, {"rank", distributed.rank}, {"device", device}, {"step", step},
+   {"steady_ns", std::chrono::steady_clock::now().time_since_epoch().count()}};
+  std::fprintf(stderr, "%s\n", record.dump().c_str());
+ };
+ trace("begin");
  const bool deterministic = at::globalContext().deterministicCuDNN();
  const bool benchmark = at::globalContext().benchmarkCuDNN();
  const mmltk::testsupport::ScopedTestCleanup restore_convolution([=] {
   at::globalContext().setDeterministicCuDNN(deterministic);
   at::globalContext().setBenchmarkCuDNN(benchmark);
  });
- // Exact trajectory comparison requires repeatable convolution reductions;
- // seeding alone does not select deterministic cuDNN backward algorithms.
+ // Bound convolution reduction noise independently of preparation; seeding
+ // alone does not select deterministic cuDNN backward algorithms.
  at::globalContext().setDeterministicCuDNN(true);
  at::globalContext().setBenchmarkCuDNN(false);
  tc::TorchCudaDeviceGuard device_guard(tc::checked_device_index(device));
@@ -1481,12 +1506,25 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   populate_default_detection_weights(detection);
   std::shared_ptr<PreparedUploadSignal> signal;
   std::atomic<std::size_t> failures{0};
-  const auto construct = [&](const std::filesystem::path& resume = {}) {
+  const auto construct = [&](const std::filesystem::path& resume = {}, PreparedBackwardGate** backward_gate = nullptr) {
+   trace("construct");
    torch::manual_seed(719);
    auto native = std::make_shared<NativeRfDetrModel>(config, native_training_class_layout(*catalog_loader->class_catalog()));
    native->initialize_training_supervision(request.seed);
    native->to(tc::cuda_device(device));
-   native->set_force_pytorch_deformable_attn(true);
+   // Exercise the production CUDA attention path for preparation and Resume.
+   if (backward_gate) {
+    // Register before TrainingModel's reducer hooks. The first projector's
+    // convolution produces a late gradient, whose real reducer copy must stay
+    // behind the hold without filling CUDA's queue with the remaining graph.
+    static_cast<void>(native->named_parameters(true)["backbone.0.projector.stages.0.0.cv1.conv.weight"].register_hook([backward_gate, &trace](const torch::Tensor& gradient) {
+     if (!*backward_gate) return gradient;
+     trace("backward_hold_begin", 2);
+     auto retained = (*backward_gate)->hold(gradient);
+     trace("backward_hold_enqueued", 2);
+     return retained;
+    }));
+   }
    auto owner = std::make_unique<TrainingModel>(
     request, 0, runtime, std::make_unique<data::DatasetLoader>(loader_config), native, plan, distributed, TrainingPrecision{}, detection, [&](std::uint64_t, std::exception_ptr error) {
     ++failures;
@@ -1501,6 +1539,7 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
    }
    owner->start(workers);
    owner->begin_epoch(0, plan.epoch(0, 0));
+   trace("constructed");
    return owner;
   };
   const auto save = [&](TrainingModel& owner, const std::filesystem::path& path) {
@@ -1518,7 +1557,9 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   {
    auto immediate = construct();
    while (!immediate->exhausted()) {
+    trace("immediate_attempt_begin", clocks.size());
     require(immediate->attempt() == request.batch_size, "immediate training skipped a finite update");
+    trace("immediate_attempt_completed", clocks.size());
     // Exercise normal admission with the very same owner, seed, and schedule.
     // Discarding ephemeral work changes neither RNG nor saved donor history.
     TrainingPreparationTestAccess::lanes(*immediate).discard_prepared();
@@ -1529,9 +1570,40 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
    immediate->end_epoch();
    expected = host_training_state(*immediate);
   }
+  require(request.recipe.optimizer == TrainOptimizerKind::SGD && request.clip_max_norm > 0 && request.recipe.weight_decay == 0, "preparation rounding scale requires clipped SGD without weight decay");
+  double momentum_bound = 0, update_path_bound = 0;
+  for (const auto& clock : clocks) {
+   momentum_bound = clock.held_momentum * momentum_bound + request.clip_max_norm;
+   const auto direction_bound = request.recipe.nesterov ? request.clip_max_norm + clock.held_momentum * momentum_bound : momentum_bound;
+   update_path_bound += *std::ranges::max_element(clock.absolute_lrs) * direction_bound;
+  }
+  const double absolute_roundoff = kPreparationRelativeRoundoff * update_path_bound;
+  if (tracing) {
+   const nlohmann::json record{{"event", "test.training_preparation_roundoff"}, {"preset", preset.empty() ? "default" : preset}, {"rank", distributed.rank},
+    {"relative", kPreparationRelativeRoundoff}, {"absolute", absolute_roundoff}, {"clipped_sgd_path_bound", update_path_bound}, {"updates", clocks.size()}};
+   std::fprintf(stderr, "%s\n", record.dump().c_str());
+  }
+  if (tracing && config.has_keypoints()) {
+   // Separate execution-policy differences from the workload's own repeated
+   // CUDA reductions. This diagnostic never supplies acceptance expectations.
+   auto repeated = construct();
+   while (!repeated->exhausted()) {
+    require(repeated->attempt() == request.batch_size, "immediate control skipped an update");
+    TrainingPreparationTestAccess::lanes(*repeated).discard_prepared();
+   }
+   repeated->end_epoch();
+   const auto state = host_training_state(*repeated);
+   for (std::size_t index = 0; index < state.size(); ++index) {
+    if (torch::equal(state[index].tensor, expected[index].tensor)) continue;
+    const nlohmann::json record{{"event", "test.training_preparation_control"}, {"preset", preset}, {"parameter", state[index].name},
+     {"maximum_difference", (state[index].tensor.to(torch::kFloat64) - expected[index].tensor.to(torch::kFloat64)).abs().max().item<double>()}};
+    std::fprintf(stderr, "%s\n", record.dump().c_str());
+   }
+  }
   const auto checkpoint = root.path() / "prepared.pt";
   {
-   auto prepared = construct();
+   PreparedBackwardGate* held_backward = nullptr;
+   auto prepared = construct({}, &held_backward);
    auto& lanes = TrainingPreparationTestAccess::lanes(*prepared);
    for (std::size_t step = 0; !prepared->exhausted(); ++step) {
     if (step == 2 && slice.count) {
@@ -1539,10 +1611,10 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
      // attempts before the deterministic hold; first-use growth is separate.
      lanes.discard_prepared();
      PreparedBackwardGate gate(device);
+     held_backward = &gate;
+     const mmltk::testsupport::ScopedTestCleanup clear_gate([&] { held_backward = nullptr; });
      signal = std::make_shared<PreparedUploadSignal>();
      auto uploaded = signal->uploaded.get_future();
-     auto parameter = prepared->model().named_parameters(true)["class_embed.weight"];
-     const auto hook = parameter.register_hook([&](const torch::Tensor& gradient) { return gate.hold(gradient); });
      TrainingPreparationTestAccess::observe(lanes, [&](const PreparedTargets* targets, std::uintptr_t copy_stream, std::exception_ptr failure) {
       if (failure) {
        signal->fail(std::move(failure));
@@ -1552,12 +1624,16 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
        require(targets != nullptr, "successful preparation has no target view");
        const auto stream = tc::external_torch_cuda_stream(copy_stream, tc::checked_device_index(device));
        tc::TorchCudaStreamGuard guard(stream);
+       trace("future_upload_sync_begin", step);
        stream.synchronize();
+       trace("future_upload_sync_completed", step);
        require(!gate.armed.load() && !gate.complete.query(), "next targets did not finish uploading during held backward");
        auto identities = targets->all_image_ids.cpu();
        require(targets->microbatch_key == draws.schedule->microbatch_keys[3], "prepared target draw key differs");
        if (!signal->delivered.exchange(true)) signal->uploaded.set_value(std::move(identities));
+       trace("future_upload_published", step);
        signal->release_worker.acquire();
+       trace("future_worker_released", step);
       } catch (...) {
        signal->fail(std::current_exception());
        throw;
@@ -1569,7 +1645,8 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
       return prepared->attempt();
      });
      try {
-      const auto identities = uploaded.get();
+      const auto identities = mmltk::testsupport::await_test_future(uploaded, "prepared target upload during held backward", std::chrono::seconds{20});
+      trace("received_future_upload", step);
       for (std::size_t image = 0; image < slice.count; ++image)
        require(identities[image].item<std::int64_t>() == draws.schedule->image_indices[3 * request.batch_size + slice.begin + image] + 1,
         "prepared target identities differ from the exact future rank slice");
@@ -1579,50 +1656,58 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
        lanes.prepare_next(extra, draws.schedule, slice, request.seed, 0, distributed.rank, 4, false);
       } catch (const std::logic_error&) { duplicate_rejected = true; }
       require(duplicate_rejected, "training admitted a second future preparation");
+      trace("backward_release_begin", step);
       gate.release();
+      trace("backward_released", step);
       require(attempt.get() == request.batch_size, "held training update was lost");
+      trace("held_attempt_completed", step);
       // The worker is still holding only the completed future preparation.
       // Publication must freeze the admitted trajectory without waiting for it.
+      trace("held_publication_begin", step);
       const auto saved = save(*prepared, checkpoint);
+      trace("held_publication_completed", step);
       require(saved.data == admitted.data && saved.schedule == admitted.schedule, "speculative preparation entered saved donor or sampler state");
       signal->release_worker.release();
-      parameter.remove_hook(hook);
       TrainingPreparationTestAccess::observe(lanes, {});
       workers->wait_idle();
       signal.reset();
      } catch (...) {
+      trace("held_attempt_unwinding", step);
       gate.release();
       signal->release_worker.release();
       if (attempt.valid()) try {
         (void)attempt.get();
        } catch (...) {}
-      parameter.remove_hook(hook);
       TrainingPreparationTestAccess::observe(lanes, {});
       workers->wait_idle();
       signal.reset();
       throw;
      }
     } else {
+     trace("prepared_attempt_begin", step);
      require(prepared->attempt() == request.batch_size, "prepared training skipped a finite update");
+     trace("prepared_attempt_completed", step);
      if (step == 2) {
       const auto saved = save(*prepared, checkpoint);
       require(saved.data == admitted.data && saved.schedule == admitted.schedule, "empty rank preparation changed continuation");
      }
     }
     require(prepared->schedule() == clocks.at(step), "lookahead changed the optimizer clock");
-    require(prepared->progress(TrainingPhase::Train).step_loss == losses.at(step), "lookahead used a different parameter version");
+    const auto actual_loss = prepared->progress(TrainingPhase::Train).step_loss;
+    require(std::isfinite(actual_loss) && std::abs(actual_loss - losses.at(step)) <= kPreparationLossFloor + kPreparationRelativeRoundoff * std::abs(losses.at(step)),
+     "lookahead used a different parameter version");
    }
    require(!lanes.has_prepared(), "training prepared across an epoch boundary");
    require(prepared->attempt() == 0, "exhausted epoch admitted another draw");
    prepared->end_epoch();
-   equal_training_state(host_training_state(*prepared), expected, "lookahead");
+   equal_training_state(host_training_state(*prepared), expected, "lookahead", absolute_roundoff);
   }
   {
    auto resumed = construct(checkpoint);
    require(resumed->schedule() == admitted.schedule, "Resume restored speculative progress");
    while (!resumed->exhausted()) require(resumed->attempt() == request.batch_size, "resumed training skipped a finite update");
    resumed->end_epoch();
-   equal_training_state(host_training_state(*resumed), expected, "resume");
+   equal_training_state(host_training_state(*resumed), expected, "resume", absolute_roundoff);
   }
   require(failures == 0, "healthy preparation invoked the global failure path");
   if (!distributed.enabled) {

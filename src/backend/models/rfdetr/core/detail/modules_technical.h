@@ -2,6 +2,7 @@
 #include <torch/torch.h>
 #include "src/backend/models/rfdetr/core/detail/selective_compilation.h"
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 #include "src/backend/models/rfdetr/core/detection_types.h"
@@ -28,6 +29,7 @@ class MlpImpl : public torch::nn::Module {
 public:
  MlpImpl(int64_t input_dim, int64_t hidden_dim, int64_t output_dim, int64_t num_layers);
  torch::Tensor forward(torch::Tensor x);
+ static torch::Tensor grouped_forward(torch::Tensor x, std::span<const MlpImpl* const> groups);
 
 private:
  int64_t num_layers_ = 0;

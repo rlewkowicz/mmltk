@@ -1374,8 +1374,9 @@ TEST_CASE("Explore labels and inherited loading preferences survive durable upda
   const auto document = nlohmann::json::parse(file);
   CHECK(document.at("schema_version") == 9);
   const auto& explore = document.at("workflows").at("explore");
-  CHECK(explore.size() == 22U);
+  CHECK(explore.size() == 23U);
   CHECK(explore.at("show_labels") == labels);
+  CHECK(explore.at("show_keypoints") == true);
   CHECK(explore.at("h2d_dataloader") == false);
   CHECK(explore.at("numa_node") == 2);
   mmltk::controller::SettingsSystem reloaded;

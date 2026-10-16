@@ -111,7 +111,9 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root, 
  if (keypoints_) {
   const torch::NoGradGuard no_grad;
   auto parameters = model.named_parameters();
-  rfdetr::KeypointPredictionPacket::select<^^rfdetr::KeypointPrediction::x>(parameters["keypoint_embed.layers.2.bias"], 0).add_(2);
+  // Deltas scale by proposal width. Move joints within the source image so
+  // the restart proves both changed model outputs and visible native pixels.
+  rfdetr::KeypointPredictionPacket::select<^^rfdetr::KeypointPrediction::x>(parameters["keypoint_embed.layers.2.bias"], 0).add_(0.25);
   checkpoint.replace_entries(rfdetr::testsupport::clone_normalized_model_state(model));
   const auto alternate_weights = root / "alternate.pt";
   rfdetr::save_native_checkpoint(alternate_weights, checkpoint);

@@ -3760,13 +3760,13 @@ Examples:
 
 Grammar (quote the entire expression for the shell):
   expr      := expr OR expr | expr [AND] expr | NOT expr | '(' expr ')'
-  primary   := text | '*' | mmltk::tools::includes(field) | field operator value
+  primary   := text | '*' | has(field) | field operator value
   operator  := = != : ~ !~ > >= < <=
 AND binds tighter than OR; NOT binds tightest. Adjacent terms imply AND.
 Bare/quoted text and ':' are case-insensitive literal substring searches.
 '='/'!=' compare exact typed values; ordering compares numbers; '~'/'!~' use
 Python regex (case-sensitive; use (?i) for insensitive). Missing fields do
-not satisfy comparisons, including '!='; NOT includes them. mmltk::tools::includes() tests
+not satisfy comparisons, including '!='; NOT includes them. has() tests
 presence including null/zero. Quote strings containing spaces or punctuation.
 
 Fields:

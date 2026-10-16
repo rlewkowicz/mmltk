@@ -51,7 +51,7 @@ LiveMediaDataPlane::Impl::~Impl() { static_cast<void>(stop()); }
 LiveMediaDataPlane::Impl::PhysicalResources::PhysicalResources(Impl& owner_in, const LiveDataPlaneConfig& config)
     : owner(owner_in),
       commands(config.resource_worker),
-      cuda(commands.binding(), gpu::CudaDeviceOwner{.device = config.capture.cuda_device_index, .context = &owner, .record_failure = &Impl::RecordCudaFailure}),
+      cuda(commands.binding(), gpu::CudaDeviceOwner{.device = config.capture.cuda_device_index, .context = &owner, .record_failure = &Impl::RecordCudaFailure}, config.device_api),
       ingress(config.capture, config.ingress_slots, cuda),
       fanout(ingress, config.fanout_slots, config.capture.width, config.capture.height, cuda),
       analyzer(fanout, config.analysis_slots, config.analysis_regions, config.capture.width, config.capture.height, cuda),

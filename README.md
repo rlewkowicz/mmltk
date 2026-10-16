@@ -34,9 +34,9 @@ Third party contains aggressively modified upstreams. This project would not exi
 
 ## Build
 
-Use a Linux host with Docker/Buildx and NVIDIA GPU access configured for
-containers. Run commands from the repository root; the wrapper supplies the
-container toolchains. A fresh checkout first builds the native wrapper:
+Use Linux with Docker/Buildx, NVIDIA container GPU access, and Wayland for the
+GUI. Run from the repository root; the wrapper supplies container toolchains.
+Bootstrap a fresh checkout, then build and launch:
 
 ```bash
 ./tools/bootstrap/bootstrap_mmltk.sh --launch "$PWD" --build-tools
@@ -44,129 +44,94 @@ container toolchains. A fresh checkout first builds the native wrapper:
 ./mmltk --gui
 ```
 
-After tool-source changes, rebuild the wrapper with `./mmltk --build-tools`.
-The full build packages the native CLI, browser host, owned Firefox runtime,
-and Iced WebAssembly interface. The GUI requires an active Wayland session.
-
-See [build and cache details](docs/build.md) for prerequisites, toolchain
-policy, [standalone tool ownership](docs/build.md#standalone-tools-module-graph),
-generated bindings, and build timing.
+Rebuild changed tool sources with `./mmltk --build-tools`. The product build
+packages the CLI, browser host, Firefox runtime, and Iced WebAssembly interface.
+See [build and cache details](docs/build.md) for prerequisites, tool ownership,
+generated bindings, and reusable state.
 
 ## Training, validation, and prediction
 
-Train prepares the selected model and starts the run from its primary action.
-Its center shows a selectable chart dashboard with a separate live progress
-card. Train and validation inputs are required; the final-test split is optional.
-The weights card keeps Transfer/Resume preparation separate from Start.
-Train, Validate, Predict, and Export put Output at the top of the right column,
-with GPU selection immediately below it. The header's Status panel retains
-session warnings and errors with complete selectable text, Copy, and Dismiss.
-Each workflow remembers its compute GPU;
-Train supports multiple GPUs in rank order. Auto Output creates a fresh
-run beneath `output/<workflow>` at Start; Browse Output selects a manual
-destination and, for Train, loads saved charts. EMA is optional and off by default.
-Train supports Shared gradients, Independent models, and Periodic averaging,
-with global batch semantics, per-model recipes, and native final model selection.
-Independent/periodic modes and model soups are experimental. The dashboard
-selects model/weight sources separately for live and saved history.
-Validate shows twelve COCO summaries beside six sample tiles and uses Explore's
-viewer, including Upscale and Open in Annotation. Samples captured while detail
-is open remain available when you close it after validation completes.
-Groundtruth and Detections switch the two annotation layers independently.
-Advanced includes Display confidence for filtering preview detections. It also
-saves the selected samples
-as individual PNGs with the display choices captured at Start. Predict handles
-compiled data, an image, or a local video, with source-specific sample saving
-and Full annotated H.264/MKV output. Video has Pause/Resume/Stop and retains
-partial media after interruption. Export can save ONNX, TensorRT, or both.
-Local training failures show the reported cause and exit status. CUDA
-out-of-memory errors point to batch size and training lanes; restarting remains
-an explicit action.
+The RF-DETR catalog includes detection, segmentation, and keypoint models.
+Train, Validate, Predict, and Export share model preparation, output selection,
+and per-workflow GPU choices. Auto Output creates a new run at Start; a manual
+Train destination can also load saved charts. Status retains selectable warnings
+and errors with Copy and Dismiss.
 
-The [RF-DETR workflow guide](docs/rfdetr-workflows.md) covers class identity,
-metrics, output files, and continuation. The
-[merging and Resume reference](docs/model-merging.md) explains current formats,
-whole-session manifests, deployment artifacts, and the custom chooser's current
-manifest-selection limit. Older application checkpoints and output-directory
-history are unsupported. Upstream weights keep their own supported input
-routes. Compiled datasets use format 10; recompile older
-bins. Dataset compilation defaults to Stretch, with Letterbox available
-explicitly. Native RGB resizing remains the default; compilation and image-file
-prediction also offer explicit [PyTorch bilinear choices](docs/datasets.md#rgb-resampling-methods).
-Explore thumbnails preserve source proportions in padded cells.
-Every Upscale method prepares stretched compiled input at source aspect first.
-The shared viewer's Original option changes how retained pixels are displayed;
-it does not recover source resolution. See the
-[viewer guide](docs/gui-interaction.md#original-view-and-annotation-import).
+Train requires training and validation data; final-test data is optional.
+Transfer and Resume prepare weights or a complete session before Start. Training
+supports shared gradients, independent models, periodic averaging, per-model
+recipes, and final model selection. EMA is optional and off by default;
+independent/periodic modes and model soups are experimental.
 
-The [training reference](docs/rfdetr-training.md) explains the pinned stock
-mathematics, logical lanes, optimizer recipes and schedules, sparse data plans,
-optional Match-Free and denoising mask supervision, and native compilation.
-The [numerical results](docs/reviews/rfdetr-math/current-results.md) distinguish
-matched-state upstream checks from measured training-trajectory differences;
-they do not establish AP, convergence or throughput equivalence.
+Validate presents metrics and retained samples in the shared viewer. Predict
+accepts compiled data, an image, or local video; video supports Pause/Resume/Stop,
+sample saving, full annotated H.264/MKV output, and partial media after interruption.
+Export writes ONNX, TensorRT, or both. Local failures report their cause and exit
+status; restarting is explicit. See the [workflow guide](docs/rfdetr-workflows.md),
+[training reference](docs/rfdetr-training.md), and
+[merging and Resume reference](docs/model-merging.md) for controls, recipes,
+class/joint meaning, artifact admission, and continuation.
 
-The Dataset card's benchmark override offers Coco custom and Coconut.
-Coconut compiles the full COCONut training recipe with a choice of validation
-annotations and membership, reusing the persistent source cache. Its optional
-dropped-mask recovery is off by default; enable it before recompiling to recover
-eligible objects from original COCO annotations. Ready images and annotations
-compile independently. Bounded repair preserves healthy samples and reports
-omissions; both output splits still need usable data. See the
-[built-in dataset guide](docs/benchmark-datasets.md) for those choices and for
-reading the independent acquisition, labels/masks, and pixel progress.
+Compiled datasets use format 11 and retain format-10 reading. Native checkpoints
+use format 5 and retain supported format-4 reading. Dataset compilation defaults
+to Stretch; Letterbox and explicit
+[RGB resampling methods](docs/datasets.md#rgb-resampling-methods) are available.
+Explore thumbnails preserve source proportions. The viewer's Original option
+changes displayed geometry; it does not recover source resolution.
 
-Directory and benchmark compilation share available CPU capacity and reuse
-prepared, page-locked working buffers with task-sized allocations. Both compile
-and resize images on the CPU; perceptual GPU augmentation is a separate training
-option. Progress remains responsive while the window resizes, and Cancel settles
-native work before another run starts.
-The [compilation guide](docs/compile-execution.md) explains worker sharing,
-memory preparation, oversized inputs, and file settlement.
+For your data, start with the [Directory dataset format](docs/datasets.md).
+Built-in Coco custom and Coconut recipes share a persistent source cache;
+Coconut's optional dropped-mask recovery is off by default. Compilation reports
+acquisition, labels/masks, pixels, and bounded-repair omissions separately; both
+output splits require usable data. Directory and benchmark compilation share CPU
+capacity and reusable pinned storage. Perceptual GPU augmentation is a separate
+training option. See [benchmark datasets](docs/benchmark-datasets.md) and
+[compilation execution](docs/compile-execution.md).
 
 ## Quick reference
 
 ```bash
-./mmltk --help                              # Native CLI commands
-./mmltk --test list                         # Available test suites and options
+./mmltk --help
+./mmltk --test list
 ./mmltk --logs --family latest-wayland-test --triage
 ```
 
-Start with the [dataset format and compiler](docs/datasets.md) for your own
-data, or the [command reference](docs/commands.md) for CLI and GUI operations.
-[Validation](docs/validation.md) covers tidy, cleanup, focused tests, and
-hardware acceptance; [logging](docs/logging.md) explains captured evidence.
-`./mmltk --test all` runs the ordinary native suites, browser JavaScript/Rust
-tests, cleanup/declaration, log-query, and compositor fixtures. Packaged
-Wayland acceptance has its own command in the validation guide.
-CPU compilation/resampling profiles and full Coconut measurements are
-[explicit opt-in operations](docs/validation.md#data-compilation-and-resampling-profiles);
-ordinary tests do not launch a full benchmark-dataset download or compile.
+The [command reference](docs/commands.md) covers CLI and GUI operations.
+[Validation](docs/validation.md) covers focused checks, numerical gates, and
+hardware acceptance; [logging](docs/logging.md) covers diagnostics and transcripts.
+Matched-state numerical checks and measured independent trajectories do not
+establish AP, convergence, or throughput equivalence.
+
+`./mmltk --test all` runs ordinary native, browser JavaScript/Rust,
+cleanup/declaration, log-query, and compositor fixtures. Packaged Wayland
+acceptance runs separately. External upstream tensors and historical sessions
+require `--with-upstream` or an explicit evidence path; ordinary tests do not
+generate them. Dataset profiles and full Coconut measurements are also
+[opt-in](docs/validation.md#data-compilation-and-resampling-profiles).
 
 ## Codebase
 
-Independent C++ systems own application work; Rust/Iced owns the interface.
-`PresentationSystem` routes the foreground source and its graphics handoff.
-Firefox owns two reusable Vulkan display buffers, sampling resources, and
-display cadence. Completed images carry their own geometry and labels over
-the graphics channel; the browser can keep redrawing them while native work
-continues. See [GUI interaction and presentation](docs/gui-interaction.md).
+Independent C++ systems own application work; Rust/Iced owns presentation and
+interaction. Native rendering publishes completed images with their geometry
+and labels through a GPU graphics connection. Firefox owns reusable Vulkan
+display storage and Wayland presentation cadence; the interface can redraw the
+last completed image while native work continues.
 
 | Start here | Purpose |
 | --- | --- |
-| [Native driver](tools/mmltk.cpp) and [tools graph](tools/CMakeLists.txt) | Container orchestration and standalone tool modules |
+| [Native driver](tools/mmltk.cpp) and [tools graph](tools/CMakeLists.txt) | Container orchestration and standalone tools |
 | [Product graph](CMakeLists.txt) | Native application, browser, and packaged runtime |
 | [CLI entrypoint](src/entrypoints/cli/cli.cpp) | Dataset commands and RF-DETR dispatch |
-| [Desktop entrypoint](src/entrypoints/desktop/browser_runtime_entry.cpp) | Browser-host startup and configuration |
-| [Application shell](src/controller/shell/application_shell.h) | Native system construction and lifetime |
-| [Iced app](src/frontend/iced/src/app.rs) | UI composition and message routing |
+| [Desktop entrypoint](src/entrypoints/desktop/browser_runtime_entry.cpp) | Browser-host startup |
+| [Application shell](src/controller/shell/application_shell.h) | System construction and lifetime |
+| [Iced app](src/frontend/iced/src/app.rs) | UI composition and routing |
 
-The [technical wiki](docs/README.md) indexes the reference, architecture,
-data, and engineering guides. [CONTRACT.md](CONTRACT.md) is the architectural
-authority; [AGENTS.md](AGENTS.md) defines development workflows.
+The [technical wiki](docs/README.md) indexes the reference guides.
+[CONTRACT.md](CONTRACT.md) owns architecture; [AGENTS.md](AGENTS.md) owns
+engineering policy.
 
 ## License
 
 Copyright 2026 Ryan Michael Lewkowicz. Repository code is licensed under
-[Apache 2.0](LICENSE); see [NOTICE](NOTICE) for attribution. Vendored code and
-bundled assets retain their respective upstream licenses and notices.
+[Apache 2.0](LICENSE); see [NOTICE](NOTICE) for attribution. Vendored code,
+models, and bundled assets retain their upstream licenses and notices.

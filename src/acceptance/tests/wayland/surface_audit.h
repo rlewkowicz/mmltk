@@ -1,4 +1,5 @@
 #pragma once
+#include "audit_facts.h"
 #include <nlohmann/json.hpp>
 #include <cstddef>
 #include <cstdint>
@@ -172,6 +173,7 @@ struct SurfaceAudit final {
  };
  std::map<std::string, SurfaceState, std::less<>> surfaces;
  std::vector<Draw> draws;
+ std::size_t draw_limit = kAcceptanceRecordLimit;
  std::string failure;
  std::size_t browser_ordinal = 0U;
  std::size_t scenario_started = 0U;

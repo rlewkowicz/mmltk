@@ -7,6 +7,7 @@
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
+#include "src/frameworks/gpu/cuda/cuda_device_scope.h"
 #include "src/backend/media/live/live_types.h"
 #include "src/backend/media/live/manual_overlay_document.h"
 #include "src/backend/media/capture/capture_session.h"
@@ -17,6 +18,7 @@ namespace mmltk::backend::media::live {
 struct LiveDataPlaneConfig final {
  mmltk::backend::media::capture::CaptureConfig capture{};
  mmltk::frameworks::gpu::ResourceOwnerWorkerCapability resource_worker{};
+ mmltk::frameworks::gpu::CudaDeviceApi device_api = mmltk::frameworks::gpu::cuda_runtime_device_api();
  std::uint32_t ingress_slots = 3U;
  std::uint32_t fanout_slots = 3U;
  std::uint32_t analysis_slots = 2U;

@@ -99,6 +99,7 @@ struct BrowserAudit final {
  bool keypoint_pixel_invalid = false;
  std::map<std::pair<std::string, std::string>, nlohmann::json> keypoint_catalog;
  nlohmann::json keypoint_training_artifact;
+ nlohmann::json keypoint_training_output;
  bool keypoint_catalog_invalid = false;
  [[nodiscard]] bool keypoint_catalog_complete() const;
  [[nodiscard]] bool keypoint_pixels_complete() const;
