@@ -418,7 +418,24 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    // the canonical lineage after admission and receive all model values below.
    const auto& asset = *find_encoder_pretraining_asset(artifacts.config.backbone.kind);
    artifacts.encoder_pretraining = encoder_pretraining_provenance(asset);
-   if (main_process) artifacts.encoder_pretraining = initialize_encoder_pretraining(*common, options.encoder_weights_path).provenance;
+   std::exception_ptr import_failure;
+   if (main_process) try {
+     artifacts.encoder_pretraining = initialize_encoder_pretraining(*common, options.encoder_weights_path).provenance;
+    } catch (...) {
+     import_failure = std::current_exception();
+     report_failure(active_model, import_failure);
+    }
+   if (distributed.enabled) {
+    // Publish the admission outcome while rank zero still participates. Local
+    // communicator abort alone cannot retire a peer's next unpaired collective.
+    auto admitted = torch::tensor(import_failure ? 0 : 1, torch::TensorOptions().dtype(torch::kInt32).device(torch_cuda::cuda_device(options.device_id)));
+    distributed_all_reduce_tensor(distributed, admitted);
+    if (admitted.item<std::int32_t>() != distributed.world_size) {
+     if (import_failure) std::rethrow_exception(import_failure);
+     throw TrainingPeerCancelled{};
+    }
+   }
+   if (import_failure) std::rethrow_exception(import_failure);
    std::array<std::byte, mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<EncoderPretrainingProvenance>()> scratch;
    const auto provenance = mmltk::frameworks::serialization::reflected_json(*artifacts.encoder_pretraining, scratch, {.max_bytes = scratch.size(), .max_items = 32, .max_depth = 4}).dump();
    agree_training_text(distributed, "encoder-pretraining", provenance);

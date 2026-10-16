@@ -2431,6 +2431,9 @@ class Wrapper {
    "--env", "TRITON_CACHE_DIR=/tmp/triton", "--volume", weights + ":/weights:rw", "--volume", output + ":/evidence:rw", "--workdir", "/tmp", "--entrypoint", "/usr/bin/timeout"
   };
   if (env("MMLTK_RFDETR_ORACLE_TRACE") == "1") append(args, {"--env", "MMLTK_RFDETR_ORACLE_TRACE=1"});
+  // Pin the donor override as well as Torch's reported precision setting.
+  // Encoder CPU/CUDA FP32 controls require the requested IEEE arithmetic.
+  if (encoder_pretraining_only) append(args, {"--env", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0"});
   append(args, source_mounts);
   execution_policy(args);
   labels(args, mode);

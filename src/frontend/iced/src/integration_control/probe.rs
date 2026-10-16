@@ -518,6 +518,7 @@ impl Requests {
                                 | Message::NumberPasteRead { .. }
                                 | Message::GalleryMouseDelivered
                                 | Message::WorkflowPixels { .. }
+                                | Message::ScratchPixels { .. }
                                 | Message::PrimaryActionPixels { .. }
                                 | Message::PrimaryActionMeasure { .. }
                                 | Message::PrimaryActionMeasured { .. }

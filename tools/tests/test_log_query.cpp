@@ -3205,6 +3205,7 @@ void test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly() {
   const auto arguments = support::read_json(path).get<Strings>();
   if (std::find(arguments.begin(), arguments.end(), "--encoder-pretraining-only") == arguments.end()) continue;
   forwarded_encoder = true;
+  CHECK(std::find(arguments.begin(), arguments.end(), "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0") != arguments.end());
   CHECK(std::find(arguments.begin(), arguments.end(), "--inventory-only") == arguments.end());
   CHECK(std::find(arguments.begin(), arguments.end(), "[upstream_oracle]") == arguments.end());
   EQ(option_value(arguments, "--output"), "/evidence");

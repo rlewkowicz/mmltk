@@ -350,13 +350,18 @@ TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfd
    CHECK(torch::allclose(actual, expected, 1.0e-5, 1.0e-6));
    const auto position = torch::cat({torch::zeros({1, 1, 2}), input.permute({0, 2, 3, 1}).reshape({1, 63, 2})}, 1);
    const auto pixels = torch::zeros_like(expected);
-   auto [constant_graph, initializers] = trace_unary_graph_with_parameters(pixels, {{"position", position}}, [&](torch::jit::Module& module, const torch::Tensor& value) {
-    const auto grid = module.attr("position").toTensor().slice(1, 1).reshape({1, 7, 9, 2}).permute({0, 3, 1, 2}).to(torch::kFloat32);
-    return value + interpolate(grid);
-   });
-   assert_lowering_replaces_kinds(constant_graph, &initializers, {c10::Symbol::fromQualString("aten::_upsample_bicubic2d_aa")}, {kOnnxAdd});
-   CHECK_FALSE(block_contains_kind(constant_graph->block(), c10::Symbol::fromQualString("onnx::Resize")));
-   CHECK(torch::allclose(execute_unary_onnx(constant_graph, pixels), expected, 1.0e-5, 1.0e-6));
+   for (const bool narrow : {false, true}) {
+    CAPTURE(narrow);
+    auto [constant_graph, initializers] = trace_unary_graph_with_parameters(pixels, {{"position", position}}, [&](torch::jit::Module& module, const torch::Tensor& value) {
+     const auto positions = module.attr("position").toTensor();
+     const auto spatial = narrow ? positions.narrow(1, 1, positions.size(1) - 1) : positions.slice(1, 1);
+     const auto grid = spatial.reshape({1, 7, 9, 2}).permute({0, 3, 1, 2}).to(torch::kFloat32);
+     return value + interpolate(grid);
+    });
+    assert_lowering_replaces_kinds(constant_graph, &initializers, {c10::Symbol::fromQualString("aten::_upsample_bicubic2d_aa")}, {kOnnxAdd});
+    CHECK_FALSE(block_contains_kind(constant_graph->block(), c10::Symbol::fromQualString("onnx::Resize")));
+    CHECK(torch::allclose(execute_unary_onnx(constant_graph, pixels), expected, 1.0e-5, 1.0e-6));
+   }
   }
  }
 }
@@ -688,7 +693,7 @@ TEST_CASE("GroupPose attention lowering preserves class masks and fully excluded
 TEST_CASE("PE rotary pairs and GroupPose finite refinement survive ONNX lowering", "[model][rfdetr][onnx_lowering]") {
  const auto input = torch::arange(16, torch::kFloat).reshape({1, 2, 2, 4}) / 10;
  const auto operation = [](const torch::Tensor& value) {
-  auto angles = value.narrow(-1, 0, 2).repeat_interleave(2, -1);
+  auto angles = torch::reciprocal(torch::pow(10000.0, value.narrow(-1, 0, 2))).repeat_interleave(2, -1);
   auto pairs = torch::stack({-value.slice(-1, 1, 4, 2), value.slice(-1, 0, 4, 2)}, -1).reshape_as(value);
   auto rotary = value * angles.cos() + pairs * angles.sin();
   return rotary + value.narrow(-1, 0, 1).expand_as(value);

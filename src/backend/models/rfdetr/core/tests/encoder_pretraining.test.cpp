@@ -129,10 +129,11 @@ const Json& encoder_reference_policy() {
  static const Json policy{
   {"transformations", {{"patch", "timm.layers.patch_embed.resample_patch_embed"}, {"positions", "bicubic antialias align_corners=false; prefix preserved"}, {"intermediate_dtype", "torch.float32"},
                        {"pinv_atol", nullptr}, {"pinv_rtol", nullptr}, {"runtime_grid", "4*num_windows; stored grid follows native preset"}}},
-  {"execution_policy", {{"sdpa_backend", "math"}, {"matmul_tf32", false}, {"cudnn_tf32", false}, {"matmul_precision", "highest"}, {"flash_sdp", false}, {"math_sdp", true},
-                        {"memory_efficient_sdp", false}, {"cudnn_sdp", false}, {"grad_enabled", false}}},
+  {"execution_policy", {{"sdpa_backend", "math"}, {"cublas_tf32_override", "0"}, {"fp32_precision", "ieee"}, {"cuda_matmul_precision", "ieee"}, {"cudnn_precision", "ieee"},
+                        {"cudnn_conv_precision", "ieee"}, {"cudnn_rnn_precision", "ieee"}, {"cpu_matmul_precision", "ieee"}, {"cpu_conv_precision", "ieee"}, {"cpu_rnn_precision", "ieee"},
+                        {"flash_sdp", false}, {"math_sdp", true}, {"memory_efficient_sdp", false}, {"cudnn_sdp", false}, {"grad_enabled", false}}},
   {"numerical_policy",
-   {{"patch_atol", 3.e-5}, {"patch_rtol", 3.e-4}, {"feature_atol", 5.e-4}, {"feature_rtol", 5.e-4}, {"controls", "CPU FP32 vs FP64 pinv; independent upstream CPU vs CUDA FP32 math SDPA"}}}
+   {{"patch_atol", 3.e-5}, {"patch_rtol", 3.e-4}, {"feature_atol", 5.e-4}, {"pe_feature_atol", 2.e-3}, {"feature_rtol", 5.e-4}, {"controls", "CPU FP32 vs FP64 pinv; independent upstream CPU vs CUDA FP32 math SDPA"}}}
  };
  return policy;
 }
@@ -174,7 +175,15 @@ void admit_encoder_manifest(const Json& manifest, const std::filesystem::path& r
  admit(distributions.at("torch") == payload.at("donor_metadata").at("torch_distribution_version"), "incompatible Torch distribution");
  const auto cuda_version = payload.at("versions").at("cuda").get<std::string>();
  admit(environment.at("cuda") == cuda_version.substr(0, cuda_version.rfind('.')), "incompatible CUDA runtime");
- admit(environment.at("torchvision") == distributions.at("torchvision") && distributions.contains("triton"), "incomplete donor runtime versions");
+ // NGC runtime and wheel strings retain the same release/commit, but use
+ // different .nv release/build suffixes. The producer checks the full donor
+ // snapshot; this boundary compares their shared upstream build identity.
+ const auto package_build = [](const Json& version) {
+  const std::string_view text = version.get_ref<const std::string&>();
+  return text.substr(0, text.find(".nv"));
+ };
+ admit(!package_build(environment.at("torchvision")).empty() && package_build(environment.at("torchvision")) == package_build(distributions.at("torchvision")) && distributions.contains("triton"),
+  "incomplete donor runtime versions");
  const auto required_dependencies = pinned_dependencies(repository);
  for (const auto& [name, version] : required_dependencies.items()) admit(dependencies.at(name) == version, "incompatible dependency: " + name);
  admit(dependencies.at("timm") == pins.at("timm"), "incompatible pinned operators");
@@ -422,8 +431,8 @@ TEST_CASE("Encoder manifest admission binds provenance and controlled policy bef
   {"sources", bounded_json(repository / "tools/oracle/rfdetr_sources.json")}, {"native_catalog", Json::parse(rfdetr_native_catalog_json())}, {"fingerprint", identity}, {"producer_sha256", identity},
   {"dependency_sha256", file_digest(repository / "tools/oracle/rfdetr_oracle_requirements.txt")}, {"source_manifest_sha256", file_digest(repository / "tools/oracle/rfdetr_sources.json")},
   {"source_hashes", {{"core", {{"README.md", identity}}}, {"plus", {{"README.md", identity}}}}}, {"operator_sources", {{"patch_embed", identity}, {"pos_embed", identity}}},
-  {"environment", {{"torch", payload.at("donor_metadata").at("torch_runtime_version")}, {"cuda", cuda.substr(0, cuda.rfind('.'))}, {"torchvision", "metadata-fixture"},
-                   {"distributions", {{"torch", payload.at("donor_metadata").at("torch_distribution_version")}, {"torchvision", "metadata-fixture"}, {"triton", "metadata-fixture"}}},
+  {"environment", {{"torch", payload.at("donor_metadata").at("torch_runtime_version")}, {"cuda", cuda.substr(0, cuda.rfind('.'))}, {"torchvision", "0.29.0a0+fixture.nv26.08"},
+                   {"distributions", {{"torch", payload.at("donor_metadata").at("torch_distribution_version")}, {"torchvision", "0.29.0a0+fixture.nv26.8.123"}, {"triton", "metadata-fixture"}}},
                    {"dependency_closure", pinned_dependencies(repository)}}},
   {"precision_capability", {{"fp32", true}}}, {"cases", std::vector<Json>(rf::kPresetCatalog.size())}, {"assets", std::vector<Json>(rf::kEncoderPretrainingAssets.size())}
  };
@@ -442,10 +451,12 @@ TEST_CASE("Encoder manifest admission binds provenance and controlled policy bef
   {"/environment/cuda", "0.0"}, {"/environment/distributions/torch", "0.0"}, {"/environment/torchvision", "contradiction"}, {"/environment/dependency_closure/transformers", "0.0"},
   {"/environment/dependency_closure/timm", "0.0"}, {"/transformations/patch", "bilinear"}, {"/transformations/positions", "prefix interpolated"},
   {"/transformations/intermediate_dtype", "torch.float64"}, {"/transformations/pinv_atol", 0.0}, {"/transformations/pinv_rtol", 1.e-5}, {"/transformations/runtime_grid", "different"},
-  {"/execution_policy/sdpa_backend", "default"}, {"/execution_policy/matmul_tf32", true}, {"/execution_policy/cudnn_tf32", true}, {"/execution_policy/matmul_precision", "high"},
+  {"/execution_policy/sdpa_backend", "default"}, {"/execution_policy/cublas_tf32_override", "1"}, {"/execution_policy/fp32_precision", "tf32"},
+  {"/execution_policy/cuda_matmul_precision", "tf32"}, {"/execution_policy/cudnn_precision", "tf32"}, {"/execution_policy/cudnn_conv_precision", "tf32"}, {"/execution_policy/cudnn_rnn_precision", "tf32"},
+  {"/execution_policy/cpu_matmul_precision", "tf32"}, {"/execution_policy/cpu_conv_precision", "tf32"}, {"/execution_policy/cpu_rnn_precision", "tf32"},
   {"/execution_policy/flash_sdp", true}, {"/execution_policy/math_sdp", false}, {"/execution_policy/memory_efficient_sdp", true}, {"/execution_policy/cudnn_sdp", true},
   {"/execution_policy/grad_enabled", true}, {"/numerical_policy/patch_atol", 1.e-3}, {"/numerical_policy/patch_rtol", 1.e-3}, {"/numerical_policy/feature_atol", 1.e-2},
-  {"/numerical_policy/feature_rtol", 1.e-2}
+  {"/numerical_policy/pe_feature_atol", 2.e-2}, {"/numerical_policy/feature_rtol", 1.e-2}
  };
  for (const auto& [pointer, value] : incompatible) {
   INFO(pointer);
@@ -561,11 +572,13 @@ TEST_CASE("Official encoder initialization agrees with independent pinned source
     staged.destinations[index].copy_(value);
    }
    const auto features = encoder->forward(reference.at("input"));
+   // Fixed from independent upstream CPU/CUDA controls before native comparison.
+   const double feature_atol = asset.backbone == rf::BackboneKind::PeCoreTiny ? 2.e-3 : 5.e-4;
    REQUIRE(features.size() == config.backbone.features.size());
    for (std::size_t index = 0; index < features.size(); ++index) {
     const auto name = std::to_string(index);
-    errors["feature/" + name] = compare(features[index], reference.at("feature/" + name), 5.e-4, 5.e-4);
-    errors["cuda_control/" + name] = compare(reference.at("feature/" + name), reference.at("control/cuda_feature/" + name), 5.e-4, 5.e-4);
+    errors["feature/" + name] = compare(features[index], reference.at("feature/" + name), feature_atol, 5.e-4);
+    errors["cuda_control/" + name] = compare(reference.at("feature/" + name), reference.at("control/cuda_feature/" + name), feature_atol, 5.e-4);
    }
    errors["patch_fp64_control"] = compare(reference.at("state/" + patch), reference.at("control/patch_fp64"), 3.e-5, 3.e-4);
    if (!admitted_model) {

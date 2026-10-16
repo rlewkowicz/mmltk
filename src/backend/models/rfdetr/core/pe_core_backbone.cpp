@@ -14,7 +14,7 @@ namespace {
 torch::Tensor rotary_embedding(int64_t height, int64_t width, int64_t head_dim, torch::TensorOptions options) {
  // timm 1.0.27 uses reciprocal positive powers, xy indexing, grid_offset=1
  // and a 24x24 reference grid. Preserve those rounding boundaries.
- const auto bands = 1.0 / torch::pow(10000.0, torch::arange(head_dim / 4, options) / static_cast<double>(head_dim / 4));
+ const auto bands = torch::reciprocal(torch::pow(10000.0, torch::arange(head_dim / 4, options) / static_cast<double>(head_dim / 4)));
  const auto xs = (torch::arange(width, options) + 1.0) / static_cast<double>(width) * 24.0;
  const auto ys = (torch::arange(height, options) + 1.0) / static_cast<double>(height) * 24.0;
  const auto grid = torch::stack({xs.unsqueeze(0).expand({height, width}), ys.unsqueeze(1).expand({height, width})}, -1);

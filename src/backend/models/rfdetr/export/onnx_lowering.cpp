@@ -90,6 +90,7 @@ const c10::Symbol kAtenRelu = c10::Symbol::fromQualString("aten::relu");
 const c10::Symbol kAtenTanh = c10::Symbol::fromQualString("aten::tanh");
 const c10::Symbol kAtenSin = c10::Symbol::fromQualString("aten::sin");
 const c10::Symbol kAtenCos = c10::Symbol::fromQualString("aten::cos");
+const c10::Symbol kAtenReciprocal = c10::Symbol::fromQualString("aten::reciprocal");
 const c10::Symbol kAtenExp = c10::Symbol::fromQualString("aten::exp");
 const c10::Symbol kAtenLog = c10::Symbol::fromQualString("aten::log");
 const c10::Symbol kAtenAbs = c10::Symbol::fromQualString("aten::abs");
@@ -180,6 +181,7 @@ const c10::Symbol kOnnxRelu = c10::Symbol::fromQualString("onnx::Relu");
 const c10::Symbol kOnnxTanh = c10::Symbol::fromQualString("onnx::Tanh");
 const c10::Symbol kOnnxSin = c10::Symbol::fromQualString("onnx::Sin");
 const c10::Symbol kOnnxCos = c10::Symbol::fromQualString("onnx::Cos");
+const c10::Symbol kOnnxReciprocal = c10::Symbol::fromQualString("onnx::Reciprocal");
 const c10::Symbol kOnnxExp = c10::Symbol::fromQualString("onnx::Exp");
 const c10::Symbol kOnnxLog = c10::Symbol::fromQualString("onnx::Log");
 const c10::Symbol kOnnxAbs = c10::Symbol::fromQualString("onnx::Abs");
@@ -1993,6 +1995,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
  SYMBOL(kAtenNeg, lower_unary_node, c10::Symbol::fromQualString("onnx::Neg")) \
  SYMBOL(kAtenSin, lower_unary_node, kOnnxSin)                                 \
  SYMBOL(kAtenCos, lower_unary_node, kOnnxCos)                                 \
+ SYMBOL(kAtenReciprocal, lower_unary_node, kOnnxReciprocal)                   \
  SYMBOL(kAtenExp, lower_unary_node, kOnnxExp)                                 \
  SYMBOL(kAtenLog, lower_unary_node, kOnnxLog)                                 \
  SYMBOL(kAtenAbs, lower_unary_node, kOnnxAbs)                                 \
@@ -2250,7 +2253,8 @@ std::optional<at::Tensor> initializer_view(const torch::jit::Value* value, const
  const bool reshape = kind == kAtenView || kind == kAtenReshape;
  const bool cast = kind == kAtenTo || kind == kAtenTypeAs;
  const bool identity = kind == kAtenAlias || kind == kAtenDetach || kind == kAtenContiguous;
- if (!reshape && !cast && !identity && kind != kAtenPermute && kind != kAtenTranspose && kind != kAtenSlice && kind != kAtenSelect && kind != kAtenUnsqueeze && kind != kAtenSqueeze)
+ if (!reshape && !cast && !identity && kind != kAtenPermute && kind != kAtenTranspose && kind != kAtenSlice && kind != kAtenNarrow && kind != kAtenSelect && kind != kAtenUnsqueeze &&
+     kind != kAtenSqueeze)
   return std::nullopt;
  if (node->inputs().empty()) return std::nullopt;
  const auto input = initializer_view(node->input(0), context, cache, depth + 1U);
@@ -2269,6 +2273,9 @@ std::optional<at::Tensor> initializer_view(const torch::jit::Value* value, const
   const auto start = is_none_value(node->input(2)) ? std::optional<std::int64_t>{0} : constant_int_value(node->input(2));
   const auto end = is_none_value(node->input(3)) ? std::optional<std::int64_t>{std::numeric_limits<std::int64_t>::max()} : constant_int_value(node->input(3));
   if (dimension && start && end && step) result = input->slice(*dimension, *start, *end, *step);
+ } else if (kind == kAtenNarrow) {
+  const auto dimension = constant_int_value(node->input(1)), start = constant_int_value(node->input(2)), length = constant_int_value(node->input(3));
+  if (dimension && start && length) result = input->narrow(*dimension, *start, *length);
  } else if (kind == kAtenTranspose || kind == kAtenSelect) {
   const auto first = constant_int_value(node->input(1)), second = constant_int_value(node->input(2));
   if (first && second) result = kind == kAtenTranspose ? input->transpose(*first, *second) : input->select(*first, *second);

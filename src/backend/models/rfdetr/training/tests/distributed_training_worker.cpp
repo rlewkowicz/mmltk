@@ -12,9 +12,11 @@
 int main(int argc, char** argv) {
  using namespace mmltk::backend::models::rfdetr;
  DistributedContext group;
+ int rank = -1;
  try {
   if (argc != 5) throw std::invalid_argument("distributed training helper requires store, rank, selected device ordinal, case");
-  const int rank = std::stoi(argv[2]), device = std::stoi(argv[3]);
+  rank = std::stoi(argv[2]);
+  const int device = std::stoi(argv[3]);
   mmltk::backend::ml::cuda::TorchCudaDeviceGuard guard(mmltk::backend::ml::cuda::checked_device_index(device));
   if (std::string_view(argv[4]) == "scratch-run") {
    std::ifstream file(std::string(argv[1]) + ".request.json");
@@ -62,7 +64,7 @@ int main(int argc, char** argv) {
   distributed_shutdown(group);
   return 0;
  } catch (const std::exception& error) {
-  std::fprintf(stderr, "distributed training rank %d failed: %s\n", group.rank, error.what());
+  std::fprintf(stderr, "distributed training rank %d failed: %s\n", rank, error.what());
   distributed_abort(group);
   return 1;
  }

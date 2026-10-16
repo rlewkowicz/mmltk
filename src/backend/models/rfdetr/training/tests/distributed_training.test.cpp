@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <future>
 #include <string>
+#include <utility>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fstream>
@@ -112,13 +113,23 @@ TEST_CASE("distributed scratch workers share admitted initialization and retire 
    file << r::encode_train_request_json(request);
   }
   auto children = start_distributed_workers(store, devices, "scratch-run");
-  for (auto& child : children) {
-   const auto result = child.get();
-   INFO(result.output);
+  std::array<std::string, 2> output;
+  for (std::size_t rank = 0; rank < children.size(); ++rank) {
+   CAPTURE(rank);
+   process::CapturedChildProcessResult result;
+   try {
+    result = children[rank].get();
+   } catch (const std::exception& error) {
+    FAIL_CHECK(error.what());
+    continue;
+   }
+   output[rank] = std::move(result.output);
+   INFO(output[rank]);
    CHECK_FALSE(result.setup_failure);
-   REQUIRE(WIFEXITED(result.status));
-   CHECK((WEXITSTATUS(result.status) == 0) == success);
+   CHECK(WIFEXITED(result.status));
+   if (WIFEXITED(result.status)) CHECK((WEXITSTATUS(result.status) == 0) == success);
   }
+  return output;
  };
  run(true);
  const auto initial_path = request.output_dir / "session.json";
@@ -139,6 +150,8 @@ TEST_CASE("distributed scratch workers share admitted initialization and retire 
  request.encoder_weights_path = alias;
  request.output_dir = root.path() / "rejected";
  std::ofstream(alias) << "invalid original source";
- run(false);
+ const auto rejected = run(false);
+ CHECK(rejected[0].find("encoder pretraining: source byte count differs from catalog") != std::string::npos);
+ CHECK(rejected[1].find("training peer cancelled") != std::string::npos);
  CHECK_FALSE(std::filesystem::exists(request.output_dir / "session.json"));
 }

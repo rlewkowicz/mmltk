@@ -313,6 +313,7 @@ void WorkflowScratchInputs::Configure(contracts::GuiSettingsState& settings) {
  train.request.gpu_augmentation.enabled = false;
  train.request.compilation_mode = rfdetr::CompilationMode::kNone;
  train.output = {.automatic = false, .directory = (root_ / "training").string()};
+ std::filesystem::create_directories(train.output.directory);
 }
 void WorkflowScratchInputs::PrepareResume(const std::filesystem::path& encoder, const std::filesystem::path& checkpoint, const std::filesystem::path& output) {
  REQUIRE(encoder.lexically_normal() == source_.lexically_normal());

@@ -450,13 +450,19 @@ public:
   std::map<std::string, std::size_t> counts;
   bool active = true;
   bool backward = false;
+  bool observe_linear_operands = false;
+  std::vector<py::object> first_linear_operands;
  };
- explicit ForwardOperators(bool backward) : state_(std::make_shared<State>()) {
+ explicit ForwardOperators(bool backward, bool observe_linear_operands = false) : state_(std::make_shared<State>()) {
   state_->backward = backward;
+  state_->observe_linear_operands = observe_linear_operands;
   const auto functional = module("torch.nn.functional");
   for (const char* name : {"conv2d", "layer_norm", "linear", "gelu", "scaled_dot_product_attention"}) {
    const py::object original = functional.attr(name);
    auto callback = py::cpp_function([state = state_, name = std::string(name), original](py::args args, py::kwargs kwargs) {
+    if (state->observe_linear_operands && name == "linear" && state->first_linear_operands.empty()) {
+     for (py::handle value : args) state->first_linear_operands.push_back(value.is_none() ? py::none() : detached_clone(value));
+    }
     auto output = invoke(original, args, kwargs);
     if (state->active || state->backward) {
      if (state->outputs.size() >= 256) throw std::runtime_error("forward operator observation exceeds its bound");
@@ -1307,19 +1313,55 @@ Json encoder_tensor_record(py::handle tensor) {
 // Bounds are fixed before native comparison. The producer must independently
 // satisfy them for FP32 versus FP64 matrix arithmetic and CPU versus CUDA math
 // attention. The receipt remains specific to encoder initialization.
-constexpr double EncoderPatchAtol = 3.e-5, EncoderPatchRtol = 3.e-4, EncoderFeatureAtol = 5.e-4, EncoderFeatureRtol = 5.e-4;
-Json encoder_control(py::handle value, py::handle reference, const double atol, const double rtol) {
+// Independent CPU/CUDA controls across all 16 presets measured PE feature
+// max_abs <= 1.70e-3 and RMS <= 5.31e-5. Freeze its absolute floor before
+// comparing native output; DINO and patch/position bounds stay independent.
+constexpr double EncoderPatchAtol = 3.e-5, EncoderPatchRtol = 3.e-4, EncoderFeatureAtol = 5.e-4, EncoderPeFeatureAtol = 2.e-3, EncoderFeatureRtol = 5.e-4;
+class EncoderControlFailure final : public std::runtime_error {
+public:
+ explicit EncoderControlFailure(Json detail) : std::runtime_error("encoder independent numerical control exceeds the fixed FP32 bound: " + detail.dump()), detail_(std::move(detail)) {}
+ [[nodiscard]] const Json& detail() const noexcept { return detail_; }
+private:
+ Json detail_;
+};
+Json encoder_control(py::handle value, py::handle reference, const double atol, const double rtol, const std::string& context) {
  const auto actual = object(value).attr("detach")().attr("cpu")().attr("float")();
  const auto expected = object(reference).attr("detach")().attr("cpu")().attr("float")();
- if (!truth(module("torch").attr("allclose")(actual, expected, "atol"_a = atol, "rtol"_a = rtol))) throw std::runtime_error("encoder independent numerical control exceeds the fixed FP32 bound");
  const auto error = actual.attr("sub")(expected).attr("abs")();
- return {{"max_abs", py::cast<double>(error.attr("max")().attr("item")())}, {"rms", py::cast<double>(error.attr("square")().attr("mean")().attr("sqrt")().attr("item")())}};
+ Json result{{"max_abs", py::cast<double>(error.attr("max")().attr("item")())}, {"rms", py::cast<double>(error.attr("square")().attr("mean")().attr("sqrt")().attr("item")())}};
+ if (!truth(module("torch").attr("allclose")(actual, expected, "atol"_a = atol, "rtol"_a = rtol))) {
+  auto detail = result;
+  detail["control"] = context;
+  detail["shape"] = sequence_json(actual.attr("shape"));
+  detail["atol"] = atol;
+  detail["rtol"] = rtol;
+  detail["expected_max_abs"] = py::cast<double>(expected.attr("abs")().attr("max")().attr("item")());
+  detail["expected_rms"] = py::cast<double>(expected.attr("square")().attr("mean")().attr("sqrt")().attr("item")());
+  const auto allowed = expected.attr("abs")().attr("mul")(rtol).attr("add")(atol);
+  detail["outside_bound"] = integer(error.attr("gt")(allowed).attr("sum")().attr("item")());
+  detail["max_excess"] = py::cast<double>(error.attr("sub")(allowed).attr("max")().attr("item")());
+  throw EncoderControlFailure(std::move(detail));
+ }
+ return result;
 }
 void install_source_paths(const fs::path& core, const fs::path& plus) {
  module("sys").attr("path").attr("insert")(0, (plus / "src").string());
  module("sys").attr("path").attr("insert")(0, (core / "src").string());
 }
+Json encoder_execution_policy() {
+ const auto torch = module("torch");
+ const auto backends = torch.attr("backends"), cuda_matmul = backends.attr("cuda").attr("matmul"), cudnn = backends.attr("cudnn"), mkldnn = backends.attr("mkldnn");
+ return {{"sdpa_backend", "math"}, {"cublas_tf32_override", support::env("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE")}, {"fp32_precision", string(backends.attr("fp32_precision"))},
+         {"cuda_matmul_precision", string(cuda_matmul.attr("fp32_precision"))}, {"cudnn_precision", string(cudnn.attr("fp32_precision"))},
+         {"cudnn_conv_precision", string(cudnn.attr("conv").attr("fp32_precision"))}, {"cudnn_rnn_precision", string(cudnn.attr("rnn").attr("fp32_precision"))},
+         {"cpu_matmul_precision", string(mkldnn.attr("matmul").attr("fp32_precision"))}, {"cpu_conv_precision", string(mkldnn.attr("conv").attr("fp32_precision"))},
+         {"cpu_rnn_precision", string(mkldnn.attr("rnn").attr("fp32_precision"))},
+         {"flash_sdp", truth(torch.attr("backends").attr("cuda").attr("flash_sdp_enabled")())}, {"math_sdp", truth(torch.attr("backends").attr("cuda").attr("math_sdp_enabled")())},
+         {"memory_efficient_sdp", truth(torch.attr("backends").attr("cuda").attr("mem_efficient_sdp_enabled")())},
+         {"cudnn_sdp", truth(torch.attr("backends").attr("cuda").attr("cudnn_sdp_enabled")())}, {"grad_enabled", truth(torch.attr("is_grad_enabled")())}};
+}
 void generate_encoder_pretraining(const Arguments& args) {
+ if (support::env("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") != "0") throw std::runtime_error("encoder FP32 controls require TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0");
  const fs::path source = args.upstream, plus_source = args.plus_upstream, output = args.output;
  const auto core_hashes = verify_source(source), plus_hashes = verify_source(plus_source, "plus");
  const auto environment = check_environment();
@@ -1327,11 +1369,22 @@ void generate_encoder_pretraining(const Arguments& args) {
  if (string(module("importlib.metadata").attr("version")("timm")) != source_pins().at("timm").get<std::string>()) throw std::runtime_error("encoder timm pin differs");
  install_source_paths(source, plus_source);
  const auto torch = module("torch"), safe = module("safetensors.torch"), patch_ops = module("timm.layers.patch_embed"), position_ops = module("timm.layers.pos_embed");
+ // Import model owners before fixing arithmetic: rfdetr.detr sets matmul
+ // precision to high at import. Late imports must not invalidate the receipt.
+ const auto dino = module("rfdetr.models.backbone.dinov2"), pe_core = module("rfdetr_plus.models.pe_core");
  const auto attention = module("torch.nn.attention");
  if (!truth(torch.attr("cuda").attr("is_available")())) throw std::runtime_error("encoder FP32 CUDA control unavailable");
- torch.attr("backends").attr("cuda").attr("matmul").attr("allow_tf32") = false;
- torch.attr("backends").attr("cudnn").attr("allow_tf32") = false;
- torch.attr("set_float32_matmul_precision")("highest");
+ const auto backends = torch.attr("backends"), cuda_matmul = backends.attr("cuda").attr("matmul"), cudnn = backends.attr("cudnn"), mkldnn = backends.attr("mkldnn");
+ // The pinned donor has independent current per-backend precision controls.
+ // Do not mix them with legacy allow_tf32/set_float32_matmul_precision flags.
+ backends.attr("fp32_precision") = "ieee";
+ cuda_matmul.attr("fp32_precision") = "ieee";
+ for (const auto& backend : {cudnn, mkldnn}) {
+  backend.attr("fp32_precision") = "ieee";
+  for (const char* operation : {"matmul", "conv", "rnn"}) {
+   if (py::hasattr(backend, operation)) backend.attr(operation).attr("fp32_precision") = "ieee";
+  }
+ }
  PythonContext no_grad(torch.attr("no_grad")());
  PythonContext math(attention.attr("sdpa_kernel")(attention.attr("SDPBackend").attr("MATH")));
  fs::create_directories(output / "assets");
@@ -1342,17 +1395,14 @@ void generate_encoder_pretraining(const Arguments& args) {
   {"source_hashes", {{"core", core_hashes}, {"plus", plus_hashes}}}, {"environment", environment}, {"fingerprint", args.fingerprint}, {"producer_sha256", digest(support::executable_path())},
   {"dependency_sha256", digest(OracleRoot / "requirements.txt")}, {"source_manifest_sha256", digest(OracleRoot / "sources.json")},
   {"operator_sources", {{"patch_embed", digest(string(patch_ops.attr("__file__")))}, {"pos_embed", digest(string(position_ops.attr("__file__")))}}},
-  {"execution_policy", {{"sdpa_backend", "math"}, {"matmul_tf32", truth(torch.attr("backends").attr("cuda").attr("matmul").attr("allow_tf32"))},
-                        {"cudnn_tf32", truth(torch.attr("backends").attr("cudnn").attr("allow_tf32"))}, {"matmul_precision", string(torch.attr("get_float32_matmul_precision")())},
-                        {"flash_sdp", truth(torch.attr("backends").attr("cuda").attr("flash_sdp_enabled")())}, {"math_sdp", truth(torch.attr("backends").attr("cuda").attr("math_sdp_enabled")())},
-                        {"memory_efficient_sdp", truth(torch.attr("backends").attr("cuda").attr("mem_efficient_sdp_enabled")())},
-                        {"cudnn_sdp", truth(torch.attr("backends").attr("cuda").attr("cudnn_sdp_enabled")())}, {"grad_enabled", truth(torch.attr("is_grad_enabled")())}}},
+  {"execution_policy", encoder_execution_policy()},
   {"precision_capability", precision_capability()}, {"assets", Json::array()}, {"cases", Json::array()},
-  {"numerical_policy", {{"patch_atol", EncoderPatchAtol}, {"patch_rtol", EncoderPatchRtol}, {"feature_atol", EncoderFeatureAtol}, {"feature_rtol", EncoderFeatureRtol},
+  {"numerical_policy", {{"patch_atol", EncoderPatchAtol}, {"patch_rtol", EncoderPatchRtol}, {"feature_atol", EncoderFeatureAtol}, {"pe_feature_atol", EncoderPeFeatureAtol}, {"feature_rtol", EncoderFeatureRtol},
                         {"controls", "CPU FP32 vs FP64 pinv; independent upstream CPU vs CUDA FP32 math SDPA"}}},
   {"transformations", {{"patch", "timm.layers.patch_embed.resample_patch_embed"}, {"positions", "bicubic antialias align_corners=false; prefix preserved"}, {"intermediate_dtype", "torch.float32"},
                        {"pinv_atol", nullptr}, {"pinv_rtol", nullptr}, {"runtime_grid", "4*num_windows; stored grid follows native preset"}}}
  };
+ Json feature_control_failures = Json::array();
  for (const auto& asset : native.at("encoder_pretraining")) {
   const auto kind = asset.at("backbone").get<std::string>();
   const auto repository = asset.at("source_repository").get<std::string>(), revision = asset.at("source_revision").get<std::string>();
@@ -1366,12 +1416,12 @@ void generate_encoder_pretraining(const Arguments& args) {
   acquire_inventory_asset(evidence_asset, asset);
   const auto original = safe.attr("load_file")(evidence_asset.string(), "device"_a = "cpu").cast<py::dict>();
   const bool pe = kind == "PeCoreTiny";
-  const auto dino = module("rfdetr.models.backbone.dinov2");
+  const double feature_atol = pe ? EncoderPeFeatureAtol : EncoderFeatureAtol;
   // The complete original model is loaded strictly, including PE's discarded
   // classifier. This verifies source coverage independently of native mapping.
   py::object base;
   if (pe)
-   base = module("timm").attr("create_model")(module("rfdetr_plus.models.pe_core").attr("PE_CORE_T_TIMM_ARCH"), "pretrained"_a = false);
+   base = module("timm").attr("create_model")(pe_core.attr("PE_CORE_T_TIMM_ARCH"), "pretrained"_a = false);
   else {
    const auto configuration = dino.attr("get_config")(kind == "DinoV2Small" ? "small" : "base", false);
    const auto config = invoke(module("transformers").attr("Dinov2Config"), py::tuple(), configuration);
@@ -1393,8 +1443,7 @@ void generate_encoder_pretraining(const Arguments& args) {
    const int side = patch * windows * 4;
    py::object encoder;
    if (pe)
-    encoder = module("rfdetr_plus.models.pe_core")
-               .attr("PECoreEncoder")("out_feature_indexes"_a = config.at("backbone").at("features").get<std::vector<int>>(), "shape"_a = py::make_tuple(side, side), "patch_size"_a = patch,
+    encoder = pe_core.attr("PECoreEncoder")("out_feature_indexes"_a = config.at("backbone").at("features").get<std::vector<int>>(), "shape"_a = py::make_tuple(side, side), "patch_size"_a = patch,
                 "num_windows"_a = windows, "positional_encoding_size"_a = grid, "load_pretrained_weights"_a = false);
    else
     encoder = dino.attr("DinoV2")("shape"_a = py::make_tuple(side, side), "out_feature_indexes"_a = config.at("backbone").at("features").get<std::vector<int>>(),
@@ -1432,32 +1481,90 @@ void generate_encoder_pretraining(const Arguments& args) {
     const auto inverse = torch.attr("linalg").attr("pinv")(matrix.attr("double")());
     double_control = original_kernel.attr("flatten")(2).attr("double")().attr("matmul")(inverse).attr("reshape")(admitted[py::str(prefix + kernel)].attr("shape")).attr("float")();
    }
-   Json controls{{"patch_fp64", encoder_control(admitted[py::str(prefix + kernel)], double_control, EncoderPatchAtol, EncoderPatchRtol)}, {"features_cuda", Json::array()}};
+   Json controls{{"patch_fp64", encoder_control(admitted[py::str(prefix + kernel)], double_control, EncoderPatchAtol, EncoderPatchRtol, name + "/patch_fp64")}, {"features_cuda", Json::array()}};
    references["control/patch_fp64"] = double_control.attr("contiguous")();
    const auto input =
     torch.attr("arange")(3 * side * side, "dtype"_a = torch.attr("float32")).attr("remainder")(251).attr("div")(125.0).attr("sub")(1.0).attr("reshape")(py::make_tuple(1, 3, side, side));
    references["input"] = input;
+   if (encoder_execution_policy() != manifest.at("execution_policy")) throw std::runtime_error("encoder arithmetic policy changed before forward: " + encoder_execution_policy().dump());
+   const bool trace_encoder = support::env("MMLTK_RFDETR_ORACLE_TRACE") == "1";
+   std::unique_ptr<ForwardOperators> cpu_operators, cuda_operators;
+   if (trace_encoder) cpu_operators = std::make_unique<ForwardOperators>(false, true);
    const auto features = encoder(input);
+   if (cpu_operators) cpu_operators->close();
    encoder.attr("cuda")();
+   if (trace_encoder) cuda_operators = std::make_unique<ForwardOperators>(false);
    const auto cuda_features = encoder(input.attr("cuda")());
+   if (cuda_operators) {
+    cuda_operators->close();
+    Json observations{
+     {"execution_policy", manifest.at("execution_policy")}, {"NVIDIA_TF32_OVERRIDE", support::env("NVIDIA_TF32_OVERRIDE")},
+     {"TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", support::env("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE")}, {"operators", Json::array()}
+    };
+    const auto& cpu_outputs = cpu_operators->state()->outputs;
+    const auto& gpu_outputs = cuda_operators->state()->outputs;
+    if (cpu_outputs.size() != gpu_outputs.size()) throw std::runtime_error("encoder diagnostic operator inventory differs");
+    for (std::size_t index_value = 0; index_value < cpu_outputs.size(); ++index_value) {
+     const auto& [key, cpu] = cpu_outputs[index_value];
+     const auto& [gpu_key, gpu] = gpu_outputs[index_value];
+     if (key != gpu_key) throw std::runtime_error("encoder diagnostic operator order differs");
+     Json observation{{"operator", key}};
+     try {
+      observation["comparison"] = encoder_control(cpu, gpu, feature_atol, EncoderFeatureRtol, name + '/' + key);
+     } catch (const std::exception& failure) { observation["failure"] = failure.what(); }
+     observations["operators"].push_back(std::move(observation));
+    }
+    observations["torch_configuration"] = string(torch.attr("__config__").attr("show")());
+    observations["cpu_matmul_precision"] = string(torch.attr("backends").attr("mkldnn").attr("matmul").attr("fp32_precision"));
+    for (const auto* variable : {"DNNL_DEFAULT_FPMATH_MODE", "ONEDNN_DEFAULT_FPMATH_MODE", "MKL_CBWR", "ATEN_CPU_CAPABILITY"}) observations[variable] = support::env(variable);
+    const auto& operands = cpu_operators->state()->first_linear_operands;
+    if (operands.size() != 3) throw std::runtime_error("encoder diagnostic linear operand inventory differs");
+    py::tuple cpu_args(3), cuda_args(3), double_args(3);
+    for (std::size_t operand = 0; operand < operands.size(); ++operand) {
+     const auto& value = operands[operand];
+     cpu_args[operand] = value;
+     cuda_args[operand] = value.is_none() ? py::none() : value.attr("cuda")();
+     double_args[operand] = value.is_none() ? py::none() : value.attr("double")();
+    }
+    const auto linear = module("torch.nn.functional").attr("linear");
+    const auto cpu = invoke(linear, cpu_args, py::dict()), gpu = invoke(linear, cuda_args, py::dict()), fp64 = invoke(linear, double_args, py::dict());
+    for (const auto& [label, actual] : std::array{std::pair{"cpu_fp32_vs_fp64", cpu}, std::pair{"cuda_fp32_vs_fp64", gpu}}) {
+     try {
+      observations["isolated_linear"][label] = encoder_control(actual, fp64, feature_atol, EncoderFeatureRtol, name + '/' + label);
+     } catch (const std::exception& failure) { observations["isolated_linear"][label] = failure.what(); }
+    }
+    json_write(output / (name + "-encoder-operators.json"), observations);
+   }
+   if (encoder_execution_policy() != manifest.at("execution_policy")) throw std::runtime_error("encoder arithmetic policy changed during forward: " + encoder_execution_policy().dump());
    if (py::len(features) != py::len(cuda_features)) throw std::runtime_error("encoder feature inventory differs across independent controls");
-   for (py::ssize_t index_value = 0; index_value < py::len(features); ++index_value) {
+   const auto failures_before = feature_control_failures.size();
+   for (py::size_t index_value = 0; index_value < py::len(features); ++index_value) {
     const auto cpu = index(features, index_value).attr("contiguous")(), gpu = index(cuda_features, index_value).attr("cpu")().attr("contiguous")();
     references[py::str("feature/" + std::to_string(index_value))] = cpu;
     references[py::str("control/cuda_feature/" + std::to_string(index_value))] = gpu;
-    controls["features_cuda"].push_back(encoder_control(cpu, gpu, EncoderFeatureAtol, EncoderFeatureRtol));
+    try {
+     controls["features_cuda"].push_back(encoder_control(cpu, gpu, feature_atol, EncoderFeatureRtol, name + "/features_cuda/" + std::to_string(index_value)));
+    } catch (const EncoderControlFailure& failure) {
+     feature_control_failures.push_back(failure.detail());
+     controls["features_cuda"].push_back({{"failure", failure.detail()}});
+    }
    }
    const auto reference = output / "references" / (name + ".safetensors");
    publish_file(reference, [&](const auto& temporary) { safe.attr("save_file")(references, temporary.string()); });
    manifest["cases"].push_back(
     {{"preset", name}, {"backbone", kind}, {"source_sha256", asset.at("sha256")}, {"adaptation_revision", asset.at("adaptation_revision")}, {"configuration", config}, {"runtime_side", side},
      {"reference", file_record(reference)}, {"exact_state", exact}, {"transformed_state", transformed}, {"controls", controls}});
-   std::cout << "encoder pretraining " << name << ": complete source state and FP32 controls" << std::endl;
+   std::cout << "encoder pretraining " << name << ": complete source state; FP32 controls " << (feature_control_failures.size() == failures_before ? "passed" : "failed") << std::endl;
   }
-  if (digest(evidence_asset) != asset.at("sha256")) throw std::runtime_error("encoder asset changed during independent generation");
+  if (digest(evidence_asset) != asset.at("sha256").get_ref<const std::string&>()) throw std::runtime_error("encoder asset changed during independent generation");
  }
  if (manifest["cases"].size() != native.at("presets").size() || verify_source(source) != core_hashes || verify_source(plus_source, "plus") != plus_hashes)
   throw std::runtime_error("encoder evidence coverage or source identity changed");
+ Json control_cases = Json::array();
+ for (const auto& row : manifest.at("cases")) control_cases.push_back({{"preset", row.at("preset")}, {"backbone", row.at("backbone")}, {"controls", row.at("controls")}});
+ json_write(output / "encoder-control-calibration.json", {{"execution_policy", manifest.at("execution_policy")}, {"numerical_policy", manifest.at("numerical_policy")},
+                                                       {"cases", control_cases}, {"failures", feature_control_failures}});
+ if (!feature_control_failures.empty()) throw std::runtime_error("encoder independent feature controls failed; see encoder-control-calibration.json (" + std::to_string(feature_control_failures.size()) + " controls)");
  manifest["status"] = "encoder_references_complete_native_comparison_pending";
  json_write(output / "manifest.json", manifest);
 }

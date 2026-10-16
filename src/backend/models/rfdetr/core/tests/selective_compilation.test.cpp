@@ -347,6 +347,9 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
 }
 TEST_CASE("Ordinary and DN grouped SDPA match masked dense equations with retained AMP backwards", "[rfdetr][attention][compilation]") {
  const tensor_fixture::FullMatrixPrecision precision;
+ // Keep this numerical fixture independent of preceding model construction
+ // and its shared CPU/CUDA generator consumption.
+ torch::manual_seed(947);
  for (const auto& [device, dtype] : tensor_fixture::available_amp_precisions()) {
   for (bool dn : {false, true}) {
    CAPTURE(device.str(), dtype, dn);
