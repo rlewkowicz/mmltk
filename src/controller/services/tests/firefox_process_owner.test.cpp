@@ -9,6 +9,9 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <functional>
+#include <future>
+#include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <csignal>
 #include <string>
@@ -47,10 +50,14 @@ struct FirefoxObservations final {
  services::FirefoxProcessLifecycle terminal{};
  std::size_t terminal_count = 0U;
  bool accept_install = true;
+ std::size_t installations = 0U;
+ std::function<bool()> restart;
  static bool Install(void* context, pid_t process_group) noexcept {
   static_cast<FirefoxObservations*>(context)->process_group = process_group;
+  ++static_cast<FirefoxObservations*>(context)->installations;
   return process_group > 0 && static_cast<FirefoxObservations*>(context)->accept_install;
  }
+ static bool PrepareRestart(void* context) noexcept { return static_cast<FirefoxObservations*>(context)->restart(); }
  static void Publish(void* context, const services::FirefoxPhysicalObservation observation) noexcept {
   auto& observations = *static_cast<FirefoxObservations*>(context);
   observations.terminal = observation.process;
@@ -61,6 +68,7 @@ struct FirefoxObservations final {
    .context = this,
    .install_process_group = &Install,
    .submit_observation = &Publish,
+   .prepare_restart = restart ? &PrepareRestart : nullptr,
   };
  }
 };
@@ -130,6 +138,30 @@ TEST_CASE("Firefox process owner reaps a normal pidfd terminal") {
  CHECK(owner.lifecycle().status == 0);
  CHECK(owner.lifecycle().error_code == 0);
  diagnostics.check(observations, {"child.spawned"});
+}
+TEST_CASE("Firefox recovery honors a stop while browser replacement is preparing", "[gui][services][firefox][lifecycle]") {
+ REQUIRE(services::block_browser_runtime_signals());
+ FirefoxObservations observations;
+ std::promise<void> preparing, release;
+ auto prepared = preparing.get_future();
+ const auto released = release.get_future().share();
+ observations.restart = [&] {
+  preparing.set_value();
+  released.wait();
+  return true;
+ };
+ auto owner = make_firefox_owner(observations, "segfault");
+ mmltk::testsupport::ScopedTestCleanup unblock{[&] { mmltk::testsupport::release_test_promise(release); }};
+ REQUIRE(owner.start() == services::FirefoxProcessStartResult::ChildInstalled);
+ mmltk::testsupport::await_test_future(prepared, "Firefox restart preparation", std::chrono::seconds{2});
+ owner.request_stop();
+ mmltk::testsupport::release_test_promise(release);
+ owner.wait();
+ CHECK(observations.installations == 1U);
+ CHECK(observations.terminal_count == 1U);
+ CHECK(owner.lifecycle().terminal == services::FirefoxProcessTerminal::Signaled);
+ CHECK(owner.lifecycle().status == 128 + SIGSEGV);
+ CHECK(owner.lifecycle().stop_requested);
 }
 TEST_CASE("Firefox process owner stops and joins through its eventfd") {
  // CLEANUP-IGNORE: Signal admission, shared owner factory and diagnostics precede distinct eventfd and retained-PID settlement paths.

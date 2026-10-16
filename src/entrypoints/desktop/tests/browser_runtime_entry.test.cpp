@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/linux_process_test_utils.hpp"
 #include "src/common/io/file_memory.h"
@@ -236,6 +238,7 @@ TEST_CASE("desktop terminal reports preserve process status and quiet requested 
     check_fatal_output(output.directory(), entry.detail);
    CHECK_FALSE(std::filesystem::exists(output.directory() / "trace.jsonl"));
    CHECK_FALSE(std::filesystem::exists(output.directory() / ".mmltk-data" / "logs"));
+   CHECK_FALSE(std::filesystem::exists(output.directory() / ".mmltk-data" / "firefox-crash.jsonl"));
   }
  }
  TemporaryFirefoxLog output;
@@ -243,6 +246,43 @@ TEST_CASE("desktop terminal reports preserve process status and quiet requested 
  REQUIRE(result.exited());
  CHECK(result.exit_code() == 1);
  check_fatal_output(output.directory(), "invalid MMLTK log level");
+ for (const char* mode : {"segfault-once", "segfault-always"}) {
+  for (const bool refuse_record : {false, true}) {
+   CAPTURE(mode, refuse_record);
+   TemporaryFirefoxLog crash;
+   const auto record_path = crash.directory() / ".mmltk-data" / "firefox-crash.jsonl";
+   if (refuse_record) std::filesystem::create_directories(record_path);
+   const auto recovered = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, crash.path(), crash.directory(), MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, 0, false, mode, "off");
+   REQUIRE(recovered.exited());
+   const bool repeated = std::string_view{mode} == "segfault-always";
+   CHECK(recovered.exit_code() == (repeated ? 128 + SIGSEGV : 0));
+   const auto message = native_output(crash.directory());
+   CHECK(message.find("SIGSEGV") != std::string::npos);
+   CHECK(message.find("restarting UI once") != std::string::npos);
+   CHECK(std::ranges::count(message, '\n') == (repeated ? 2 : 1));
+   if (refuse_record) {
+    CHECK(message.find("crash record") != std::string::npos);
+    CHECK(message.find("failed") != std::string::npos);
+    CHECK(std::filesystem::is_directory(record_path));
+   } else {
+    const auto encoded = mmltk::testsupport::read_text_file(record_path);
+    CHECK(std::ranges::count(encoded, '\n') == 1);
+    const auto record = nlohmann::json::parse(encoded);
+    CHECK(record.at("event") == "firefox.crash");
+    CHECK(record.at("signal") == SIGSEGV);
+    CHECK(record.at("status") == 128 + SIGSEGV);
+    CHECK(record.at("process").get<pid_t>() > 0);
+    CHECK(record.at("process") == record.at("process_group"));
+    CHECK(record.at("parent_process").get<pid_t>() > 0);
+    CHECK(record.at("restart_selected") == !repeated);
+    CHECK(record.at("restart_attempt") == (repeated ? 1 : 0));
+    CHECK(std::filesystem::file_size(record_path) < 2048U);
+   }
+   CHECK_FALSE(std::filesystem::exists(record_path.string() + ".tmp"));
+   CHECK_FALSE(std::filesystem::exists(crash.directory() / "trace.jsonl"));
+   CHECK_FALSE(std::filesystem::exists(crash.directory() / ".mmltk-data" / "logs"));
+  }
+ }
 }
 TEST_CASE("desktop startup reports exact errno without changing its exit status", "[gui][browser-runtime][entry]") {
  for (const bool refused_log : {false, true}) {

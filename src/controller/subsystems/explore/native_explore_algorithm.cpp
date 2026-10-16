@@ -326,6 +326,7 @@ private:
    std::shared_ptr<const std::function<bool(ControlCommand)>> completion;
    std::uint64_t sequence = 0U;
    std::uint32_t artifact_mutation_index = 0U;
+   bool frontend_restart = false;
    auto frontend_kind = contracts::IntegrationControlKind::Advance;
    {
     std::scoped_lock lock(mutex_);
@@ -351,13 +352,18 @@ private:
     } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ && initial_released_generation_ == 0U && redraw_command_) {
      redraw_claimed_ = true;
      redraw = redraw_command_;
+    } else if (command == static_cast<std::uint8_t>(ControlCommand::ReportFrontendFailure) && frontend_command_) {
+     sequence = frontend_sequence_;
+     callback = frontend_command_;
+     frontend_kind = contracts::IntegrationControlKind::FailureContextRequested;
     } else if (command == static_cast<std::uint8_t>(ControlCommand::ArtifactMutationReady) && artifact_mutation_pending_ && frontend_command_) {
      artifact_mutation_pending_ = false;
      artifact_mutation_index = artifact_mutation_next_++;
      sequence = frontend_sequence_;
      callback = frontend_command_;
      frontend_kind = contracts::IntegrationControlKind::ArtifactMutationReady;
-    } else if (command == 8U && frontend_settled_ && waiters_ == 0U && !held_pending_ && frontend_command_ && frontend_sequence_ != std::numeric_limits<std::uint64_t>::max()) {
+    } else if ((command == static_cast<std::uint8_t>(ControlCommand::Advance) || command == static_cast<std::uint8_t>(ControlCommand::RestartFrontend)) && frontend_settled_ && waiters_ == 0U &&
+               !held_pending_ && frontend_command_ && frontend_sequence_ != std::numeric_limits<std::uint64_t>::max()) {
      release_all_ = false;
      release_one_ = false;
      release_held_ = false;
@@ -372,13 +378,19 @@ private:
      capacity_requested_ = false;
      artifact_mutation_pending_ = false;
      artifact_mutation_next_ = 0U;
-     sequence = ++frontend_sequence_;
-     callback = frontend_command_;
+     frontend_restart = command == static_cast<std::uint8_t>(ControlCommand::RestartFrontend);
+     sequence = frontend_restart ? frontend_sequence_ : ++frontend_sequence_;
+     if (!frontend_restart) callback = frontend_command_;
     } else {
      terminal_ = true;
     }
     changed_.notify_all();
     if (terminal_) return;
+   }
+   if (frontend_restart) {
+    if (SendControlObservation({.event = ControlEvent::FrontendRestartPrepared, .generation = sequence})) continue;
+    Terminal();
+    return;
    }
    if (redraw || callback || completion) {
     try {

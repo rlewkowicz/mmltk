@@ -785,7 +785,7 @@ running the selected comma-separated Catch union. The current
 [scenario registrations](../src/acceptance/tests/wayland/scenarios.cpp) are below;
 standalone evidence-audit cases also live in this executable.
 
-| Entrypoint | Browser lifetimes / required behavior |
+| Entrypoint | Native host lifetimes / required behavior |
 | --- | --- |
 | `workspace_wayland_retained` | One H2D: Dataset disclosures/input, real Cancel/restart, capacity growth, integer typing/paste, cached/held-miss gallery/detail returns, Detail-open resize both orientations, augmentation retention, fractional/wrapped/partial rows, wide/tall layouts, native labels/semantics, light/dark copy, Annotate layout/long lists, FPS, rapid changes, SIGINT |
 | `workspace_wayland_sparse` | One H2D: physical compiled slot IDs across holes, exact range editing, gallery/detail selection |
@@ -793,13 +793,21 @@ standalone evidence-audit cases also live in this executable.
 | `workspace_wayland_dpi` | One H2D, scale 1.5: Dataset fixtures, theme/copy, rapid changes |
 | `workspace_wayland_terminal` | Two H2D: real window close and abrupt peer loss after Annotation edit, completed draw, independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D: startup-latched allocation/reset/begin/end probe failures, exact-content recovery, final pixels/semantics |
-| `workspace_wayland_quiet` | Two H2D: blocked reads and completed gesture with diagnostics/reporting/probes inactive |
+| `workspace_wayland_quiet` | Three H2D: blocked reads, completed gesture, and an injected Firefox SIGSEGV followed by rendered interaction in its replacement; diagnostics/reporting/probes inactive |
 | `workspace_wayland_gdr` | One optional GDR lifetime; absent hardware explicitly skips |
 
-Fourteen H2D lifetimes are required; GDR is independent. Compatible scenarios
+Fifteen H2D host lifetimes are required; GDR is independent. Compatible scenarios
 reuse browsers; startup-latched settings/destructive exits require isolation.
 Window-close uses lifecycle diagnostics without probes. Quiet scenarios retain
 real input pressure, typed control, settlement, and drawn readiness.
+Reopening waits for its submitted Open to settle and publish a new gallery frame
+before pointer selection.
+The recovery lifetime keeps one native host alive across two browser processes,
+verifies their distinct identities and the bounded crash record, then requires
+a healthy requested shutdown.
+After a quiet-workflow deadline expires, the harness requests one bounded
+frontend failure context through typed acceptance control; the scenario still
+fails. This collects no continuous trace and cannot extend a passing deadline.
 
 [WaylandSession](../src/acceptance/tests/wayland/session.h) owns process/fixtures,
 artifact cursors, deadlines, and lifetime custody. Advancement requires typed
@@ -955,7 +963,7 @@ sessions retain ordinary clipboard permissions.
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, independent prepared/released artifacts, and bounded fatal reporting with disabled/uninitialized/failed sinks and broken pipes |
 | `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | Reflected CLI names/aliases/negation, canonical member presence and width-only square compilation, GPU selection for bounded streaming and training-option exclusivity, scalar/item/fixed-capacity error precedence and unchanged rejected destinations; CLI/ONNX fatal stderr, logging overrides and named file identities, and command exit behavior |
 | `mmltk_common_concurrency_tests` | Borrowed cancellation, scoped stop-token bridging, pre-requested/concurrent cancellation, unwind, and source destruction policy |
-| `mmltk_entrypoints_desktop_tests` and `mmltk_controller_firefox_process_tests` | Desktop startup/child failure status, exact launch OS errors, unexpected signal reporting, and quiet requested shutdown |
+| `mmltk_entrypoints_desktop_tests` and `mmltk_controller_firefox_process_tests` | Desktop startup/child failure status, exact launch OS errors, bounded SIGSEGV recovery/crash records with logging off, and quiet requested shutdown including stop during recovery |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_annotation_tests` | Resolved-mask foreground support, tight bounds, empty masks, and HSV filtering against independent scalar expectations |
 | `mmltk_backend_imaging_upscale_tests` | Exact Basic sharpening bytes and guards, bitwise neural tile preparation, tile stitching, ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |

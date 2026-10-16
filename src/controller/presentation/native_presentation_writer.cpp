@@ -390,7 +390,7 @@ public:
  void SetExpectedBrowserProcessGroup(pid_t group) override { channel_.set_expected_process_group(group); }
  Retirement BrowserPeerLost() noexcept override {
   static_cast<void>(channel_.consume_peer_loss());
-  channel_.reset_peer();
+  channel_.close();
   for (auto& source : sources_)
    if (source->workspace) source->workspace->Withdraw();
   const auto settlement = SettlePhysicalWork(true);

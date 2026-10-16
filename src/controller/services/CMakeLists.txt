@@ -38,7 +38,6 @@ mmltk_register_ordinary_sources(
     file_dialog/file_dialog_system.cpp
     settings/settings_system.cpp
     file_dialog/file_dialog_client.cpp
-    firefox/firefox_process_owner.cpp
     diagnostics/runtime_diagnostics.cpp
     settings/settings_store.cpp
     training/train_command.cpp
@@ -48,6 +47,8 @@ mmltk_register_ordinary_sources(
     vast/vast_client.cpp
     vast/vast_provider_owner.cpp
     vast/vast_runtime.cpp)
+mmltk_register_retained_module_importers(mmltk_controller_direct_services
+    firefox/firefox_process_owner.cpp)
 target_include_directories(mmltk_controller_direct_services PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mmltk_controller_direct_services
     PUBLIC

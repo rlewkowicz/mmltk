@@ -7,6 +7,9 @@
 #include "src/pch_std.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/io/scoped_fd.h"
+#include "src/common/io/json_file.h"
+#include <nlohmann/json.hpp>
+import mmltk.common.logging.mmltk_logging;
 namespace mmltk::controller::services {
 namespace {
 using mmltk::common::io::ScopedFd;
@@ -81,6 +84,7 @@ constexpr std::uint32_t kInitialFirefoxWindowHeight = 1'125U;
 }
 struct ChildSettlement final {
  siginfo_t child{};
+ int process_group_error = 0;
 };
 class ChildCustody final {
 public:
@@ -101,7 +105,7 @@ public:
  [[nodiscard]] pid_t pid() const noexcept { return pid_; }
  [[nodiscard]] int poll_fd() const noexcept { return pidfd_.get(); }
  [[nodiscard]] bool installed() const noexcept { return pid_ > 0; }
- [[nodiscard]] bool Signal(const int signal) const noexcept { return signal_child(pidfd_.get(), pid_, signal); }
+ [[nodiscard]] bool Signal(const int signal) const noexcept { return !installed() || signal_child(pidfd_.get(), pid_, signal); }
  void PreferRetainedPidWaitForTest() noexcept { prefer_retained_pid_wait_ = true; }
  [[nodiscard]] ChildSettlement Settle(const RuntimeDiagnosticTarget diagnostics) noexcept {
   if (pid_ <= 0) std::terminate();
@@ -110,7 +114,17 @@ public:
    for (;;) {
     child = {};
     errno = 0;
-    if (::waitid(kind, identity, &child, WEXITED) == 0 && child.si_pid != 0) return Complete(child);
+    if (::waitid(kind, identity, &child, WEXITED | WNOWAIT) == 0 && child.si_pid != 0) {
+     // Retain the root zombie until its isolated group is stopped, so its
+     // numeric PID/PGID cannot be reused before the group signal.
+     int group_error = 0;
+     if (child.si_code != CLD_EXITED && child.si_status == SIGSEGV && ::kill(-pid_, SIGKILL) != 0 && errno != ESRCH) group_error = errno;
+     siginfo_t reaped{};
+     int result;
+     do { result = ::waitid(kind, identity, &reaped, WEXITED); } while (result != 0 && errno == EINTR);
+     if (result == 0 || errno == ECHILD) return Complete(child, group_error);
+     return std::nullopt;
+    }
     if (errno == EINTR) continue;
     if (errno == ECHILD) return Complete({});
     return std::nullopt;
@@ -132,7 +146,7 @@ public:
     child.si_code = CLD_KILLED;
     child.si_status = WIFSIGNALED(status) ? WTERMSIG(status) : SIGKILL;
    }
-   return Complete(child);
+   return Complete(child, child.si_code != CLD_EXITED && child.si_status == SIGSEGV ? ENOTSUP : 0);
   }
   if (waited < 0 && errno == ECHILD) return Complete({});
   if (diagnostics.valid())
@@ -148,10 +162,10 @@ public:
  }
 
 private:
- [[nodiscard]] ChildSettlement Complete(const siginfo_t child) noexcept {
+ [[nodiscard]] ChildSettlement Complete(const siginfo_t child, const int process_group_error = 0) noexcept {
   pid_ = -1;
   pidfd_.reset();
-  return {.child = child};
+  return {.child = child, .process_group_error = process_group_error};
  }
  pid_t pid_ = -1;
  ScopedFd pidfd_;
@@ -195,9 +209,11 @@ public:
        executable_(std::move(config.executable)),
        page_url_(std::move(config.page_url)),
        log_file_(std::move(config.log_file)),
+       crash_file_(std::move(config.crash_file)),
        observations_(observations),
        diagnostics_(diagnostics),
        stop_grace_(config.stop_grace),
+       restart_after_segfault_(config.restart_after_segfault),
        integration_(config.integration),
        integration_high_dpi_(config.integration_high_dpi) {}
  ~Implementation() noexcept {
@@ -211,6 +227,23 @@ public:
    if (lifecycle_.settled()) return FirefoxProcessStartResult::Terminal;
    if (custody_.installed()) return monitor_.joinable() ? FirefoxProcessStartResult::ChildInstalled : FirefoxProcessStartResult::Terminal;
   }
+  stop_fd_.reset(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
+  if (stop_fd_.get() < 0) return startup_failed("start.stop_event_refused", errno);
+  timer_fd_.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
+  if (timer_fd_.get() < 0) return startup_failed("start.stop_timer_refused", errno);
+  if (launch() == FirefoxProcessStartResult::Terminal) return FirefoxProcessStartResult::Terminal;
+  try {
+   monitor_ = std::jthread([this] { monitor(); });
+  } catch (const std::system_error& error) {
+   settle_failure("child.monitor_refused", EAGAIN, error.code().value());
+   return FirefoxProcessStartResult::Terminal;
+  } catch (...) {
+   settle_failure("child.monitor_refused", EAGAIN);
+   return FirefoxProcessStartResult::Terminal;
+  }
+  return FirefoxProcessStartResult::ChildInstalled;
+ }
+ [[nodiscard]] FirefoxProcessStartResult launch() noexcept {
   if (!valid_launch_inputs() || !prepare_profile()) return startup_failed("start.invalid");
   std::array<std::string, 10U> argument_storage;
   std::optional<mmltk::frameworks::process::ArgvBuffer> environment;
@@ -253,39 +286,25 @@ public:
    return FirefoxProcessStartResult::Terminal;
   }
   ScopedFd pidfd{static_cast<int>(::syscall(SYS_pidfd_open, child, 0U))};
-  int setup_error = pidfd.get() < 0 ? errno : 0;
-  ScopedFd stop_fd{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
-  if (stop_fd.get() < 0 && setup_error == 0) setup_error = errno;
-  ScopedFd timer_fd{::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)};
-  if (timer_fd.get() < 0 && setup_error == 0) setup_error = errno;
+  const int setup_error = pidfd.get() < 0 ? errno : 0;
   {
    std::scoped_lock lock{mutex_};
    custody_.InstallPidfd(std::move(pidfd));
-   stop_fd_ = std::move(stop_fd);
-   timer_fd_ = std::move(timer_fd);
   }
   if (custody_.poll_fd() < 0 || stop_fd_.get() < 0 || timer_fd_.get() < 0 || !observations_.install(child)) {
    settle_failure("child.integration_refused", errno, setup_error);
    return FirefoxProcessStartResult::Terminal;
   }
   trace("child.spawned");
-  try {
-   monitor_ = std::jthread([this] { monitor(); });
-  } catch (const std::system_error& error) {
-   settle_failure("child.monitor_refused", EAGAIN, error.code().value());
-   return FirefoxProcessStartResult::Terminal;
-  } catch (...) {
-   settle_failure("child.monitor_refused", EAGAIN);
-   return FirefoxProcessStartResult::Terminal;
-  }
   return FirefoxProcessStartResult::ChildInstalled;
  }
  void request_stop() noexcept {
   int error = 0;
   {
    std::scoped_lock lock{mutex_};
-   if (lifecycle_.settled() || !custody_.installed()) return;
+   if (lifecycle_.settled()) return;
    lifecycle_.stop_requested = true;
+   if (stop_fd_.get() < 0) return;
    const std::uint64_t value = 1U;
    ssize_t written = -1;
    do { written = ::write(stop_fd_.get(), &value, sizeof(value)); } while (written < 0 && errno == EINTR);
@@ -403,7 +422,7 @@ private:
    settlement = custody_.Settle(diagnostics_);
   }
   trace("stop.kill_selected", 0U, process);
-  publish_settlement(settlement.child);
+  static_cast<void>(publish_settlement(settlement));
   return false;
  }
  [[nodiscard]] bool reap() noexcept {
@@ -413,21 +432,71 @@ private:
    std::scoped_lock lock{mutex_};
    settlement = custody_.Settle(diagnostics_);
   }
-  publish_settlement(settlement.child);
-  return false;
+  return publish_settlement(settlement);
  }
- void publish_settlement(const siginfo_t child, const int infrastructure_error = 0) noexcept {
-  int failure = infrastructure_error;
+ [[nodiscard]] bool publish_settlement(const ChildSettlement settlement) noexcept {
+  const auto& child = settlement.child;
+  int failure = 0;
   {
    std::scoped_lock lock{mutex_};
    if (failure == 0 && infrastructure_error_) failure = *infrastructure_error_;
   }
   if (failure != 0) {
+   if (child.si_code != CLD_EXITED && child.si_status == SIGSEGV) record_crash(child, false);
    publish_infrastructure_failure(failure);
-   return;
+   return false;
   }
+  if (child.si_code != CLD_EXITED && child.si_status == SIGSEGV && restart_after_crash(child, settlement.process_group_error)) return true;
   publish_terminal(
    child.si_code == CLD_EXITED ? FirefoxProcessTerminal::Exited : FirefoxProcessTerminal::Signaled, child.si_code == CLD_EXITED ? child.si_status : 128 + child.si_status, child.si_pid);
+  return false;
+ }
+ [[nodiscard]] bool restart_after_crash(const siginfo_t child, const int process_group_error) noexcept {
+  bool restart = false;
+  {
+   std::scoped_lock lock{mutex_};
+   restart = process_group_error == 0 && restart_after_segfault_ && !restart_used_ && !lifecycle_.stop_requested && observations_.prepare_restart != nullptr;
+  }
+  record_crash(child, restart, process_group_error);
+  if (!restart) return false;
+  restart_used_ = true;
+  if (!observations_.prepare_restart(observations_.context)) return false;
+  {
+   std::scoped_lock lock{mutex_};
+   if (lifecycle_.stop_requested) return false;
+  }
+  cleanup_profile();
+  trace("child.restarting", 128U + SIGSEGV, child.si_pid);
+  return launch() == FirefoxProcessStartResult::ChildInstalled;
+ }
+ void record_crash(const siginfo_t child, const bool restart, const int process_group_error = 0) const noexcept {
+  trace("child.signaled", 128U + SIGSEGV, child.si_pid);
+  std::string detail;
+  try {
+   detail = "terminated by SIGSEGV; ";
+   detail += restart ? "restarting UI once" : "UI restart unavailable or already used";
+   if (!crash_file_.empty()) {
+    if (!crash_file_.parent_path().empty()) std::filesystem::create_directories(crash_file_.parent_path());
+    const nlohmann::json record{
+     {"event", "firefox.crash"}, {"signal", SIGSEGV}, {"signal_name", "SIGSEGV"}, {"status", 128 + SIGSEGV}, {"process", child.si_pid}, {"parent_process", ::getpid()}, {"process_group", child.si_pid},
+     {"core_dumped", child.si_code == CLD_DUMPED}, {"restart_selected", restart}, {"restart_attempt", restart_used_ ? 1 : 0}, {"executable", executable_.string()},
+     {"process_group_stop_errno", process_group_error}, {"unix_time_ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()}
+    };
+    // Retain only the latest compact crash, with atomic publication. No normal
+    // output, tensor payloads, tracing or crash dumps are collected.
+    if (const auto failure = mmltk::common::io::write_json_file_atomic(crash_file_, record, -1)) {
+     std::error_code ignored;
+     std::filesystem::remove(crash_file_.string() + ".tmp", ignored);
+     throw std::runtime_error("crash record " + std::string{mmltk::common::io::to_string(*failure)} + " failed");
+    }
+    detail += "; crash record=" + crash_file_.string();
+   }
+  } catch (const std::exception& error) {
+   try {
+    detail += "; crash record failed: " + std::string{error.what()};
+   } catch (...) {}
+  } catch (...) {}
+  mmltk::common::logging::report_fatal("Firefox", detail.empty() ? "terminated by SIGSEGV" : std::string_view{detail}, SIGSEGV);
  }
  void settle_failure(const std::string_view event, const int error, const int cause = 0) noexcept {
   trace(event, static_cast<std::uint64_t>(static_cast<std::uint32_t>(error)));
@@ -440,7 +509,7 @@ private:
    static_cast<void>(custody_.Signal(SIGKILL));
    settlement = custody_.Settle(diagnostics_);
   }
-  publish_settlement(settlement.child);
+  static_cast<void>(publish_settlement(settlement));
  }
  void publish_infrastructure_failure(const int error) noexcept {
   FirefoxProcessLifecycle published;
@@ -466,7 +535,8 @@ private:
    stop_fd_.reset();
    timer_fd_.reset();
   }
-  trace(terminal == FirefoxProcessTerminal::Exited ? "child.exited" : "child.signaled", static_cast<std::uint64_t>(static_cast<std::uint32_t>(status)), process);
+  if (terminal != FirefoxProcessTerminal::Signaled || status != 128 + SIGSEGV)
+   trace(terminal == FirefoxProcessTerminal::Exited ? "child.exited" : "child.signaled", static_cast<std::uint64_t>(static_cast<std::uint32_t>(status)), process);
   observations_.publish({.kind = FirefoxPhysicalObservationKind::ProcessTerminal, .process = published});
  }
  [[nodiscard]] bool valid_launch_inputs() const noexcept {
@@ -528,9 +598,11 @@ private:
  const std::filesystem::path executable_;
  const std::string page_url_;
  const std::filesystem::path log_file_;
+ const std::filesystem::path crash_file_;
  const FirefoxProcessObservationTarget observations_;
  const RuntimeDiagnosticTarget diagnostics_;
  const std::chrono::milliseconds stop_grace_;
+ const bool restart_after_segfault_;
  const bool integration_;
  const bool integration_high_dpi_;
  mutable std::mutex mutex_;
@@ -541,6 +613,7 @@ private:
  ScopedFd firefox_log_;
  std::jthread monitor_;
  std::optional<int> infrastructure_error_;
+ bool restart_used_ = false;
  FirefoxProcessLifecycle lifecycle_{};
 };
 bool block_browser_runtime_signals() noexcept {

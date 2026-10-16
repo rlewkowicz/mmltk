@@ -89,7 +89,10 @@ services::FirefoxProcessStartResult ApplicationShell::start_firefox(services::Fi
  if (firefox_process_ || shutdown_requested_.load(std::memory_order_acquire)) return services::FirefoxProcessStartResult::Terminal;
  firefox_process_.emplace(presentation_import_socket_path(), std::move(config),
   services::FirefoxProcessObservationTarget{
-   .context = this, .install_process_group = &ApplicationShell::InstallFirefoxProcessGroup, .submit_observation = &ApplicationShell::FirefoxPhysicalObservation
+   .context = this,
+   .install_process_group = &ApplicationShell::InstallFirefoxProcessGroup,
+   .submit_observation = &ApplicationShell::FirefoxPhysicalObservation,
+   .prepare_restart = &ApplicationShell::PrepareFirefoxRestart
   },
   runtime_diagnostics_.target());
  return firefox_process_->start();
@@ -101,6 +104,10 @@ const std::filesystem::path& ApplicationShell::presentation_import_socket_path()
 bool ApplicationShell::InstallFirefoxProcessGroup(void* context, const pid_t group) noexcept { return context && static_cast<ApplicationShell*>(context)->install_firefox_process_group(group); }
 void ApplicationShell::FirefoxPhysicalObservation(void* context, services::FirefoxPhysicalObservation observation) noexcept {
  if (context) static_cast<ApplicationShell*>(context)->on_firefox_observation(observation);
+}
+bool ApplicationShell::PrepareFirefoxRestart(void* context) noexcept {
+ auto* shell = static_cast<ApplicationShell*>(context);
+ return shell && !shell->shutdown_requested_.load(std::memory_order_acquire) && shell->systems_->presentation().RestartBrowser();
 }
 bool ApplicationShell::install_firefox_process_group(const pid_t group) noexcept {
  if (group <= 0 || shutdown_requested_.load(std::memory_order_acquire)) return false;

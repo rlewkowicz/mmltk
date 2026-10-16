@@ -12,6 +12,106 @@ use crate::integration_control::{
 use crate::view_model::{ApplicationModel, ConnectionState};
 use iced::Rectangle;
 #[test]
+fn quiet_gallery_input_waits_for_the_submitted_open_to_replace_retained_readiness() {
+    initialize_reporting(false, false);
+    let mut controller = Controller::new(
+        true,
+        false,
+        String::new(),
+        String::new(),
+        "512".into(),
+        "quiet".into(),
+    );
+    let (mut model, settings) = fps_settings();
+    let mut router = crate::view::router::Router::default();
+    router.explore_measure_gallery(
+        896.0,
+        896.0,
+        crate::generated::VisualExtent {
+            width: 1920,
+            height: 1080,
+        },
+        3,
+    );
+    let viewport = router.explore_measured_viewport(3, 0, 1).unwrap();
+    let snapshot = model.explore.snapshot.as_mut().unwrap();
+    snapshot.ready = true;
+    snapshot.busy = false;
+    snapshot.mode = crate::generated::ExploreMode::Gallery;
+    snapshot.frame = crate::view_model::test_support::visual_frame(
+        crate::generated::PresentationSourceKind::Explore,
+        5,
+    );
+    snapshot.dataset.classcatalogidentity = 1;
+    snapshot.order.matchingcount = 1;
+    snapshot.viewport = viewport;
+    let baseline = snapshot.frame.clone();
+    let driver = &mut controller;
+    driver.driver.phase = Phase::AwaitExploreReady;
+    let drive = |driver: &mut Controller, model: &ApplicationModel| {
+        drop(driver.advance(
+            model,
+            &settings,
+            1.0,
+            &router,
+            FeatureId::Explore,
+            None,
+            false,
+        ));
+    };
+    drive(driver, &model);
+    assert_eq!(driver.driver.phase, Phase::AwaitExploreReady);
+    driver.observe_explore_open(baseline);
+    drive(driver, &model);
+    assert_eq!(driver.driver.phase, Phase::AwaitExploreReady);
+    model.explore.snapshot.as_mut().unwrap().frame.revision += 1;
+    model.explore.desired_open = true;
+    drive(driver, &model);
+    assert_eq!(driver.driver.phase, Phase::AwaitExploreReady);
+    model.explore.desired_open = false;
+    let mut submitted = model.clone();
+    let submitted_viewport = submitted
+        .explore
+        .snapshot
+        .as_ref()
+        .unwrap()
+        .viewport
+        .clone();
+    submitted
+        .register_intent(
+            crate::generated::ApplicationIntentEndpoint::ExploreOpen,
+            |correlation| {
+                crate::generated::encode_explore_Open(
+                    correlation,
+                    crate::generated::ExploreOpen {
+                        viewport: submitted_viewport,
+                        compiledsource: "/tmp/compiled".into(),
+                    },
+                )
+            },
+        )
+        .unwrap();
+    drive(driver, &submitted);
+    assert_eq!(driver.driver.phase, Phase::AwaitExploreReady);
+    for (busy, rendering, mode) in [
+        (true, false, crate::generated::ExploreMode::Gallery),
+        (false, true, crate::generated::ExploreMode::Gallery),
+        (false, false, crate::generated::ExploreMode::Detail),
+    ] {
+        let snapshot = model.explore.snapshot.as_mut().unwrap();
+        snapshot.busy = busy;
+        snapshot.renderpending = rendering;
+        snapshot.mode = mode;
+        drive(driver, &model);
+        assert_eq!(driver.driver.phase, Phase::AwaitExploreReady);
+    }
+    model.explore.snapshot.as_mut().unwrap().mode = crate::generated::ExploreMode::Gallery;
+    drive(driver, &model);
+    assert_eq!(driver.driver.phase, Phase::ViewerSelect);
+    assert!(driver.widgets.location_pending());
+}
+
+#[test]
 fn sparse_numeric_controls_use_physical_extent_and_wait_for_persisted_high_ranges() {
     let mut fixture = ProbeFixture::new("sparse");
     let (mut model, settings) = fps_settings();

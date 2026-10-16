@@ -14,6 +14,8 @@
 #include <string_view>
 #include <system_error>
 #include "browser_runtime_fixture_args.hpp"
+#include <fcntl.h>
+#include <sys/resource.h>
 namespace {
 constexpr std::string_view kPagePrefix{"http://127.0.0.1:"};
 constexpr std::string_view kFixtureMarker{"mmltk browser runtime entry fixture"};
@@ -88,6 +90,16 @@ int main(const int argc, char* argv[]) {
  const std::string_view mode = mode_text != nullptr ? mode_text : "healthy";
  if (mode == "exit-failure") return 23;
  if (mode == "signal-failure") static_cast<void>(::kill(::getpid(), SIGKILL));
+ if (mode == "segfault-once" || mode == "segfault-always") {
+  const int marker = ::open("segfault-attempt", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (marker >= 0) static_cast<void>(::close(marker));
+  if (marker >= 0 || mode == "segfault-always") {
+   const rlimit core{.rlim_cur = 0U, .rlim_max = 0U};
+   static_cast<void>(::setrlimit(RLIMIT_CORE, &core));
+   static_cast<void>(::kill(::getpid(), SIGSEGV));
+   return 77;
+  }
+ }
  if (mode == "request-int" || mode == "request-term") {
   if (::kill(::getppid(), mode == "request-int" ? SIGINT : SIGTERM) != 0) return 76;
   for (;;) ::pause();

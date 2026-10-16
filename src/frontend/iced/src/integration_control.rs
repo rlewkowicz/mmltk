@@ -1527,6 +1527,12 @@ impl Controller {
         }
     }
 
+    pub(crate) fn observe_explore_open(&mut self, baseline: crate::generated::VisualFrame) {
+        if self.driver.phase == Phase::AwaitExploreReady {
+            self.retained.observe_open(baseline);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn annotation_open_for_test(
         &self,
@@ -2508,6 +2514,53 @@ impl Controller {
 }
 
 impl Controller {
+    pub(crate) fn report_failure_context(
+        &mut self,
+        receipt: &crate::generated::IntegrationControlReceipt,
+        model: &ApplicationModel,
+        connection: Option<&crate::transport_connection::Connection>,
+        surface: Option<crate::presentation_surface::Surface>,
+        settings_pending: bool,
+    ) -> Result<(), &'static str> {
+        if receipt.kind != crate::generated::IntegrationControlKind::FailureContextRequested
+            || !crate::generated::integration_receipt_valid(receipt)
+            || receipt.sequence != self.driver.control_sequence
+        {
+            return Err("invalid failure context request");
+        }
+        let detail = format!(
+            "acceptance deadline: phase={:?}; explore={:?}; requested={:?}/{:?}; foreground={:?}; mutable={}; settings_pending={}; presentation={:?}; surface={:?}; retained={:?}; detail={}; {}; {}; sampleable={:?}",
+            self.driver.phase,
+            model.explore.snapshot.as_ref().map(|value| (
+                value.ready,
+                value.busy,
+                value.renderpending,
+                value.mode,
+                value.selectedimage,
+                &value.frame,
+            )),
+            model.explore.requested_selection,
+            model.explore.desired_selection,
+            model.foreground_visual(),
+            model.explore_mutation_available(),
+            settings_pending,
+            model.presentation,
+            surface,
+            crate::presentation_surface::retained_surface(),
+            model.explore.snapshot.as_ref().is_some_and(|snapshot| {
+                pixel_checks::displayed_detail(surface, snapshot).is_some()
+            }),
+            self.annotation_scenario.failure_context(model),
+            connection.map_or_else(
+                || "no connection".into(),
+                |value| value.integration_failure_context()
+            ),
+            self.probes.annotation_observation().frame_ready
+        );
+        self.driver.fail(&detail);
+        self.finish_transition();
+        Ok(())
+    }
     pub(crate) fn receive_control(
         &mut self,
         receipt: crate::generated::IntegrationControlReceipt,

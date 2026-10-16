@@ -67,7 +67,20 @@ impl App {
             TransportEvent::SystemEvent(event) => self.reduce_event(event),
             TransportEvent::IntegrationControl(receipt) => {
                 if let Some(integration) = self.integration.as_mut() {
-                    if let Err(detail) = integration.receive_control(receipt) {
+                    let result = if receipt.kind
+                        == crate::generated::IntegrationControlKind::FailureContextRequested
+                    {
+                        integration.report_failure_context(
+                            &receipt,
+                            &self.model,
+                            self.connection.as_ref(),
+                            self.presentation.surface(),
+                            self.settings.has_local_edits(),
+                        )
+                    } else {
+                        integration.receive_control(receipt)
+                    };
+                    if let Err(detail) = result {
                         self.model.report_error(
                             crate::view_model::notices::Origin::Protocol,
                             UiError::protocol(detail),

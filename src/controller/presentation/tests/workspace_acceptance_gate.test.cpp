@@ -39,6 +39,7 @@ private:
 TEST_CASE("acceptance gate retains one reader across settled frontend workflows", "[explore][acceptance][control]") {
  using Kind = contracts::IntegrationControlKind;
  const int transport = GENERATE(SOCK_STREAM, SOCK_SEQPACKET);
+ const bool restart = GENERATE(false, true);
  std::promise<contracts::IntegrationControlReceipt> advanced;
  auto delivered = advanced.get_future();
  AcceptanceGateFixture fixture{transport};
@@ -61,14 +62,29 @@ TEST_CASE("acceptance gate retains one reader across settled frontend workflows"
  CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Advance, .sequence = 1U}));
  CHECK(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 1U}));
  CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 1U}));
- const std::uint8_t advance = 8U;
+ const std::uint8_t advance = static_cast<std::uint8_t>(restart ? ExploreAcceptanceGate::ControlCommand::RestartFrontend : ExploreAcceptanceGate::ControlCommand::Advance);
  REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
- CHECK((fixture.Await(delivered) == contracts::IntegrationControlReceipt{.kind = Kind::Advance, .sequence = 2U}));
+ if (restart) {
+  bool prepared = false;
+  for (unsigned count = 0U; count < 8U && !prepared; ++count) {
+   pollfd ready{.fd = commands.get(), .events = POLLIN, .revents = 0};
+   REQUIRE(::poll(&ready, 1U, 2000) == 1);
+   ExploreAcceptanceGate::ControlObservation record{};
+   REQUIRE(::recv(commands.get(), &record, sizeof(record), MSG_WAITALL) == sizeof(record));
+   prepared = record.event == ExploreAcceptanceGate::ControlEvent::FrontendRestartPrepared;
+   if (prepared) CHECK(record.generation == 1U);
+  }
+  REQUIRE(prepared);
+  CHECK(delivered.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+ } else {
+  CHECK((fixture.Await(delivered) == contracts::IntegrationControlReceipt{.kind = Kind::Advance, .sequence = 2U}));
+ }
+ const std::uint64_t sequence = restart ? 1U : 2U;
  CHECK(gate.ClaimHeldCompletion());
- CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 1U}));
- CHECK(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 2U, .progress = 1U}));
+ CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = sequence - 1U}));
+ CHECK(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = sequence, .progress = 1U}));
  gate.SetFrontendCommand({});
- CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 2U}));
+ CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = sequence}));
  gate.Stop();
  CHECK(gate.ClaimTerminalReport());
  CHECK_FALSE(gate.ClaimTerminalReport());

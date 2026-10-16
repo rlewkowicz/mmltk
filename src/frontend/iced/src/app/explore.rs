@@ -546,6 +546,12 @@ impl App {
             });
         }
         if submitted {
+            if let (Some(integration), Some(snapshot)) = (
+                self.integration.as_mut(),
+                self.model.explore.snapshot.as_ref(),
+            ) {
+                integration.observe_explore_open(snapshot.frame.clone());
+            }
             self.model.explore.desired_open = false;
         }
     }

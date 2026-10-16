@@ -250,6 +250,25 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn failure_context(&self, model: &ApplicationModel) -> String {
+        format!(
+            "annotation_baseline=({}, {}); annotation={:?}",
+            self.bounded_document_revision,
+            self.bounded_object_count,
+            model.annotation.snapshot.as_ref().map(|value| (
+                value.ready,
+                value.busy,
+                value.inputdocumentepoch,
+                value.ui.documentrevision,
+                value.ui.scenerevision,
+                value.ui.interactionrevision,
+                value.ui.scene.objects.len(),
+                value.ui.canundo,
+                value.ui.editor.tool,
+                value.frame.revision
+            ))
+        )
+    }
     pub(super) fn advance_annotation_checks(
         &mut self,
         widgets: &mut widget_ops::RevealState,

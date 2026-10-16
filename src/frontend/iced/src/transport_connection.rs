@@ -127,6 +127,16 @@ impl Connection {
             .is_some_and(|(_, _, entered)| entered)
             && retained.records.is_empty()
     }
+    pub(crate) fn integration_failure_context(&self) -> String {
+        let retained = self.retained.lock().expect("connection output");
+        format!(
+            "input_epoch={}; pressure={:?}; queued={}; closed={}",
+            retained.epoch,
+            retained.pressure_observation,
+            retained.records.len(),
+            retained.closed
+        )
+    }
     pub(crate) fn new(outbound: mpsc::Sender<OutboundRecord>) -> Self {
         Self {
             outbound,

@@ -30,6 +30,7 @@ enum class IntegrationControlKind : std::uint8_t {
  GalleryReadCompletionHeld[[= IntegrationCommandDirection{true, true, true}]],
  ArtifactMutationRequested[[= IntegrationCommandDirection{false, false, true}]],
  ArtifactMutationReady[[= IntegrationCommandDirection{true, false, true}]],
+ FailureContextRequested[[= IntegrationCommandDirection{true}]],
 };
 template <auto Kind>
  requires std::is_enum_v<decltype(Kind)>

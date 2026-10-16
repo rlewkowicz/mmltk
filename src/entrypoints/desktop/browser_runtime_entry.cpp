@@ -271,6 +271,7 @@ int main(int argc, char** argv) {
     {.executable = configured_root("MMLTK_FIREFOX_RUNTIME_ROOT_OVERRIDE", MMLTK_FIREFOX_RUNTIME_ROOT) / "firefox",
      .page_url = std::move(*page),
      .log_file = firefox_log_file(),
+     .crash_file = std::filesystem::current_path() / ".mmltk-data" / "firefox-crash.jsonl",
      .integration = integration,
      .integration_high_dpi = integration_high_dpi});
    if (process_start == mmltk::controller::services::FirefoxProcessStartResult::Terminal) {
@@ -284,9 +285,11 @@ int main(int argc, char** argv) {
    const int status = mmltk::controller::services::browser_runtime_exit_status(firefox, shell.healthy());
    if (status != 0) {
     using mmltk::controller::services::FirefoxProcessTerminal;
-    if (firefox.terminal == FirefoxProcessTerminal::Signaled)
-     mmltk::common::logging::report_fatal("Firefox", "terminated by signal", firefox.status - 128);
-    else if (firefox.terminal == FirefoxProcessTerminal::StartupFailed) {
+    if (firefox.terminal == FirefoxProcessTerminal::Signaled) {
+     // The process owner records SIGSEGV at observation time, including when
+     // it can recover. Other terminal signals are reported here once.
+     if (firefox.status != 128 + SIGSEGV) mmltk::common::logging::report_fatal("Firefox", "terminated by signal", firefox.status - 128);
+    } else if (firefox.terminal == FirefoxProcessTerminal::StartupFailed) {
      const auto detail = firefox_error_detail(firefox.error_code);
      mmltk::common::logging::report_fatal("Firefox process infrastructure failure", detail.data(), firefox.status);
     } else if (firefox.terminal == FirefoxProcessTerminal::Exited && firefox.status != 0)

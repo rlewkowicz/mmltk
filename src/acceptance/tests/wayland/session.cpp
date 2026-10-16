@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <algorithm>
 #include <array>
@@ -289,6 +290,25 @@ public:
   if (peer <= 0 || peer != peer_group_ || peer_pidfd_.get() < 0) return false;
   return ::syscall(SYS_pidfd_send_signal, peer_pidfd_.get(), SIGKILL, nullptr, 0U) == 0 || errno == ESRCH;
  }
+ [[nodiscard]] pid_t segfault_peer() {
+  const auto peer = browser_peer("before SIGSEGV");
+  retain_peer(peer);
+  const rlimit no_core{.rlim_cur = 0U, .rlim_max = 0U};
+  if (::prlimit(peer, RLIMIT_CORE, &no_core, nullptr) != 0) throw std::runtime_error("failed to disable core dumps for the injected Firefox crash");
+  if (::syscall(SYS_pidfd_send_signal, peer_pidfd_.get(), SIGSEGV, nullptr, 0U) != 0) throw std::runtime_error("failed to inject Firefox SIGSEGV");
+  std::cout << "workspace-wayland: injected Firefox SIGSEGV pid=" << peer << '\n' << std::flush;
+  return peer;
+ }
+ [[nodiscard]] pid_t retain_replacement_peer() {
+  pollfd old{.fd = peer_pidfd_.get(), .events = POLLIN, .revents = 0};
+  if (::poll(&old, 1U, 0) != 1 || (old.revents & POLLIN) == 0) throw std::runtime_error("replacement Firefox arrived before its predecessor exited");
+  const auto predecessor = std::exchange(peer_group_, -1);
+  peer_pidfd_.reset();
+  const auto peer = browser_peer("after recovery");
+  if (peer == predecessor) throw std::runtime_error("Firefox replacement reused the crashed process");
+  retain_peer(peer);
+  return peer;
+ }
  [[nodiscard]] int reap() noexcept {
   if (!active()) return status_;
   const auto terminal = reap_pidfd(pidfd_.get(), child_);
@@ -323,6 +343,27 @@ public:
  }
 
 private:
+ [[nodiscard]] pid_t browser_peer(const std::string_view stage) const {
+  std::string observed;
+  pid_t selected = -1;
+  // Replacement is spawned by the monitor thread. Linux exposes children per
+  // task, so inspecting only the host's main thread would miss that process.
+  for (const auto& task : std::filesystem::directory_iterator{"/proc/" + std::to_string(child_) + "/task"}) {
+   std::ifstream children{task.path() / "children"};
+   pid_t peer = -1;
+   for (unsigned count = 0U; count < 32U && children >> peer; ++count) {
+    const auto group = ::getpgid(peer);
+    observed += " pid=" + std::to_string(peer) + " pgid=" + std::to_string(group);
+    // Quiet acceptance launches no training/export subprocesses. Firefox is
+    // the sole isolated child group; executable links are security-restricted.
+    if (group != peer) continue;
+    if (selected > 0 && selected != peer) throw std::runtime_error("multiple isolated browser-host child groups " + observed);
+    selected = peer;
+   }
+  }
+  if (selected > 0) return selected;
+  throw std::runtime_error("packaged Firefox root is unavailable " + std::string{stage} + "; host=" + std::to_string(child_) + observed);
+ }
  void terminate_peer() noexcept {
   if (peer_group_ <= 0) return;
   const pid_t peer_group = std::exchange(peer_group_, -1);
@@ -553,7 +594,7 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
  settings_file.close();
  notifications_ = std::make_unique<ArtifactNotifications>(diagnostics, firefox_log);
  process_ = std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER, diagnostics, runtime_log, firefox_log, working.path(), termination, ordinary_fixture_, ordinary_compiled_,
-  profile_ == "blocked" ? "quiet" : profile_, logging, high_dpi, h2d, pixel_probes, probe_failure, &inputs_->square());
+  profile_ == "blocked" || profile_ == "recover" ? "quiet" : profile_, logging, high_dpi, h2d, pixel_probes, probe_failure, &inputs_->square());
  deadline.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
  if (deadline.get() < 0) throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
  native_cursor_ = std::make_unique<JsonLineCursor>(diagnostics, 0U);
@@ -824,10 +865,13 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  std::cout << "workspace-wayland: " << kWaylandStartupDeadline.count() << "-second browser startup deadline armed"
            << "\nnative JSONL: " << diagnostics << "\nnative runtime log: " << runtime_log << "\nFirefox log: " << firefox_log << '\n'
            << std::flush;
- if (profile_ == "blocked" || profile_ == "quiet") {
+ if (profile_ == "blocked" || profile_ == "quiet" || profile_ == "recover") {
   // The acceptance socket reports entry into the real I/O gate. This
   // shutdown case needs neither diagnostic records nor a startup delay.
   std::uint64_t progress = 0U;
+  pid_t crashed_peer = -1;
+  bool restart_preparing = false;
+  bool failure_context_requested = false;
   // CLEANUP-IGNORE: This wait combines acceptance commands, peer death and a phase deadline; production polls child custody, stop and
   // escalation.
   for (;;) {
@@ -840,12 +884,29 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    do { ready = ::poll(waits.data(), waits.size(), -1); } while (ready < 0 && errno == EINTR);
    REQUIRE(ready > 0);
    INFO("quiet profile " << profile_ << ", stage " << deadline_stage << ", progress " << progress << ", pressure entered " << pressure_entered_);
+   if ((waits[2].revents & POLLIN) != 0) {
+    if (!failure_context_requested) {
+     failure_context_requested = true;
+     REQUIRE(process.command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ReportFrontendFailure)));
+     arm_acceptance_deadline(kWaylandFailureSettlementDeadline, "quiet frontend failure context");
+     continue;
+    }
+    FAIL("quiet workflow deadline after progress " << progress << "; runtime output:\n" << read_tail(runtime_log));
+   }
    REQUIRE((waits[2].revents & POLLIN) == 0);
    REQUIRE((waits[1].revents & POLLIN) == 0);
    REQUIRE((waits[0].revents & POLLIN) != 0);
    const auto entered = process.receive_explore_event();
    REQUIRE(entered.has_value());
-   if (entered->event == ExploreAcceptanceGate::ControlEvent::InitialWait) {
+   if (entered->event == ExploreAcceptanceGate::ControlEvent::FrontendRestartPrepared) {
+    REQUIRE(restart_preparing);
+    REQUIRE(crashed_peer < 0);
+    crashed_peer = process.segfault_peer();
+    REQUIRE(crashed_peer > 0);
+    pressure_entered_ = false;
+    progress = 0U;
+    arm_acceptance_deadline(kWaylandStartupDeadline, "Firefox SIGSEGV recovery");
+   } else if (entered->event == ExploreAcceptanceGate::ControlEvent::InitialWait) {
     if (profile_ == "blocked") break;
     REQUIRE(process.command_explore(2U));
    } else if (entered->event == ExploreAcceptanceGate::ControlEvent::HeldWait) {
@@ -862,17 +923,36 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
      REQUIRE_FALSE(pressure_entered_);
      pressure_entered_ = true;
     } else if (kind == Kind::Settled) {
+     REQUIRE_FALSE(failure_context_requested);
      REQUIRE(pressure_entered_);
+     if (profile_ == "recover" && crashed_peer < 0) {
+      REQUIRE_FALSE(restart_preparing);
+      restart_preparing = true;
+      REQUIRE(process.command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::RestartFrontend)));
+      continue;
+     }
      frontend_settled_ = true;
      break;
     } else if (kind == Kind::Progress) {
      REQUIRE(entered->compiled_index > progress);
      progress = entered->compiled_index;
-     arm_acceptance_deadline((progress & 3U) == 2U ? kWaylandWorkDeadline : kWaylandInteractionDeadline, "quiet typed workflow progress");
+     if (!failure_context_requested) arm_acceptance_deadline((progress & 3U) == 2U ? kWaylandWorkDeadline : kWaylandInteractionDeadline, "quiet typed workflow progress");
     } else {
      FAIL("invalid quiet integration control direction");
     }
    }
+  }
+  if (profile_ == "recover") {
+   CHECK(process.retain_replacement_peer() != crashed_peer);
+   const auto record_path = working.path() / ".mmltk-data" / "firefox-crash.jsonl";
+   const auto record = nlohmann::json::parse(read_tail(record_path));
+   CHECK(record.at("signal") == SIGSEGV);
+   CHECK(record.at("process") == crashed_peer);
+   CHECK(std::filesystem::path{record.at("executable").get<std::string>()}.filename() == "firefox");
+   CHECK(record.at("restart_selected") == true);
+   CHECK(record.at("restart_attempt") == 0);
+   CHECK(record.at("process_group_stop_errno") == 0);
+   CHECK(std::filesystem::file_size(record_path) < 2048U);
   }
   process.interrupt();
   arm_acceptance_deadline(kWaylandShutdownDeadline, "shutdown");
@@ -884,7 +964,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    CHECK_FALSE(std::filesystem::exists(firefox_log));
    CHECK_FALSE(std::filesystem::exists(artifact_sibling(diagnostics, "-application.log")));
    INFO("quiet runtime output: " << read_tail(runtime_log));
-   CHECK(std::filesystem::file_size(runtime_log) == 0U);
+   if (profile_ == "recover")
+    CHECK(read_tail(runtime_log).find("SIGSEGV") != std::string::npos);
+   else
+    CHECK(std::filesystem::file_size(runtime_log) == 0U);
   }
   return;
  }

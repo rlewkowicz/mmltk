@@ -663,8 +663,15 @@ WorkspaceSurfaceImportChannel::WorkspaceSurfaceImportChannel(const std::filesyst
  std::string error;
  if (!bind_listener(impl_->listener.get(), socket_path, error)) { throw std::system_error(errno, std::generic_category(), error); }
 }
-WorkspaceSurfaceImportChannel::~WorkspaceSurfaceImportChannel() {
- if (impl_ != nullptr && !impl_->path.empty()) { ::unlink(impl_->path.c_str()); }
+WorkspaceSurfaceImportChannel::~WorkspaceSurfaceImportChannel() { close(); }
+void WorkspaceSurfaceImportChannel::close() noexcept {
+ if (!impl_) return;
+ reset_peer();
+ impl_->listener.reset();
+ if (!impl_->path.empty()) {
+  ::unlink(impl_->path.c_str());
+  impl_->path.clear();
+ }
 }
 const std::filesystem::path& WorkspaceSurfaceImportChannel::socket_path() const noexcept { return impl_->path; }
 int WorkspaceSurfaceImportChannel::poll_fd() const noexcept { return impl_->peer.get() >= 0 ? impl_->peer.get() : impl_->listener.get(); }

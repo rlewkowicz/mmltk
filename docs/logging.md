@@ -149,6 +149,31 @@ parent terminal to a particular child.
   --auto-correlate --format timeline --limit 40
 ```
 
+### Firefox SIGSEGV recovery
+
+An observed Firefox root `SIGSEGV` always reports on stderr, including with
+`MMLTK_LOG_LEVEL=off`. The desktop also atomically replaces
+`.mmltk-data/firefox-crash.jsonl` under its working directory with the latest
+crash: timestamp, executable, PID/PPID/PGID, signal/status, core-dump flag,
+process-group stop error, and recovery selection/attempt. Healthy runs do no
+crash collection or writes. The record contains no tensor payloads, routine
+browser output, or stack dump. A failed record write is included in stderr and
+does not prevent recovery.
+
+The surviving process owner stops the crashed browser's remaining process group,
+then asks Presentation to retire its graphics connection before launching one
+replacement browser. Native jobs and committed domain state continue; browser-local
+view state and unsubmitted drafts reset. Unproven GPU reads retain their
+resources in bounded terminal custody. Unsafe retirement refuses recovery; a
+second crash ends the invocation with status 139. Requested shutdown and other
+signals retain their existing exit policy. Reporting runs after child exit on
+an ordinary parent thread, with no new signal handler in the failing process.
+
+```bash
+./mmltk --logs .mmltk-data/firefox-crash.jsonl \
+  -q '@event=firefox.crash' --format jsonl --no-auto-correlate
+```
+
 ## Local training failures
 
 [TrainProcessClient](../src/controller/services/training/train_process_client.cpp)

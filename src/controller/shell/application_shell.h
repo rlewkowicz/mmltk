@@ -68,6 +68,7 @@ public:
 private:
  static bool InstallFirefoxProcessGroup(void*, pid_t) noexcept;
  static void FirefoxPhysicalObservation(void*, services::FirefoxPhysicalObservation) noexcept;
+ static bool PrepareFirefoxRestart(void*) noexcept;
  [[nodiscard]] bool install_firefox_process_group(pid_t) noexcept;
  void on_firefox_observation(services::FirefoxPhysicalObservation) noexcept;
  void emit_shutdown_event(std::string_view) noexcept;

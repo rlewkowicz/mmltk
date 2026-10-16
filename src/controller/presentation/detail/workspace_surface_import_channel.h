@@ -132,6 +132,7 @@ public:
  // process cannot claim the channel across a browser restart.
  void set_expected_process_group(pid_t process_group);
  void reset_peer() noexcept;
+ void close() noexcept;
  // Setup transfers duplicated native eventfd/frame/access descriptors. Firefox
  // replies with independently owned memory and timeline descriptors after
  // completing initial Vulkan ownership. Per-frame work uses the existing edge.

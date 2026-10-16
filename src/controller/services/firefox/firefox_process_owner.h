@@ -14,6 +14,8 @@ struct FirefoxProcessConfig final {
  std::filesystem::path executable;
  std::string page_url;
  std::filesystem::path log_file{};
+ std::filesystem::path crash_file{};
+ bool restart_after_segfault = true;
  bool integration = false;
  bool integration_high_dpi = false;
  std::chrono::milliseconds stop_grace{std::chrono::seconds{5}};
@@ -22,6 +24,7 @@ struct FirefoxProcessObservationTarget final {
  void* context = nullptr;
  bool (*install_process_group)(void*, pid_t) noexcept = nullptr;
  void (*submit_observation)(void*, FirefoxPhysicalObservation) noexcept = nullptr;
+ bool (*prepare_restart)(void*) noexcept = nullptr;
  [[nodiscard]] bool install(const pid_t process_group) const noexcept { return install_process_group != nullptr && install_process_group(context, process_group); }
  void publish(const FirefoxPhysicalObservation observation) const noexcept {
   if (submit_observation != nullptr) submit_observation(context, observation);

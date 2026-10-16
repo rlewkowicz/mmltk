@@ -35,6 +35,7 @@ use iced::{Rectangle, Task};
 
 /// Mutable observations owned by this scenario or mechanism.
 pub(super) struct State {
+    explore_open_baseline: Option<crate::generated::VisualFrame>,
     explore_paste_read: bool,
     sparse_range_checked: bool,
     original_roundtrip: u8,
@@ -79,6 +80,7 @@ pub(super) struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            explore_open_baseline: None,
             explore_paste_read: false,
             sparse_range_checked: false,
             original_roundtrip: 0,
@@ -124,6 +126,10 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn observe_open(&mut self, baseline: crate::generated::VisualFrame) {
+        self.explore_open_baseline = Some(baseline);
+    }
+
     pub(super) fn prepare_upscale_probe(
         &mut self,
         probes: &mut probe::Requests,
@@ -642,6 +648,21 @@ impl State {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
+                // Reopening retains the preceding ready product until commit.
+                // Quiet input must follow the actual submitted Open and its new
+                // frame, rather than selecting a gallery that Open will replace.
+                if driver.viewer_scenario == "quiet"
+                    && (self
+                        .explore_open_baseline
+                        .as_ref()
+                        .is_none_or(|old| old == &snapshot.frame)
+                        || model.has_explore_pending()
+                        || model.explore.desired_open
+                        || snapshot.renderpending
+                        || snapshot.mode != crate::generated::ExploreMode::Gallery)
+                {
+                    return Task::none();
+                }
                 if snapshot.ready
                     && !snapshot.busy
                     && snapshot.frame.revision != 0

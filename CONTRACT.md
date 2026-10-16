@@ -240,6 +240,10 @@ outcomes at the owning boundary, preserve useful causes and valid state, and
 retire failed resources safely. Recovery stays within the affected system while
 independent systems continue.
 
+Browser crash recovery replaces the UI while native jobs, committed documents,
+and retained products continue. Replacement preserves physical GPU custody;
+unsafe retirement and repeated crashes stop recovery instead of creating a loop.
+
 The shell initiates coordinated shutdown; each system settles its own work.
 
 ```text
@@ -259,8 +263,8 @@ retained capacity. Incremental rendering updates affected content; idle, hidden,
 and unchanged display work remains quiet. Resource growth and outstanding work
 stay bounded.
 
-Opt-in diagnostics provide system and failure context. Disabled diagnostics do
-no diagnostic work. Diagnostic identities observe behavior; product ordering,
+Opt-in diagnostics provide system and failure context. Disabled routine diagnostics
+do no diagnostic work. Diagnostic identities observe behavior; product ordering,
 validity, and resource lifetime remain independent of them. Crashes and fatal
 operation or process failures report a concise cause on stderr even when
 diagnostics are disabled. Healthy shutdown remains quiet.

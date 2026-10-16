@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <exception>
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -49,7 +50,7 @@ public:
  static constexpr std::size_t kMaximumSources = 8U;
  Impl(
   const VisualDeviceSettings settings, PresentationNativeWriterFactory factory, const std::span<const VisualSourceReader> sources, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
-     : settings_(settings), events_(std::move(events)), diagnostics_(diagnostics), writer_(CreateWriter(settings, factory)) {
+     : settings_(settings), events_(std::move(events)), diagnostics_(diagnostics), factory_(std::move(factory)), writer_(CreateWriter(settings, factory_)) {
   if (!settings_.valid() || sources.empty() || sources.size() > kMaximumSources) throw contracts::InvalidIntentError("Presentation configuration is invalid");
   for (const auto& source : sources) {
    if (!source.source.valid() || !source.observe || !source.borrow || std::ranges::count(sources, source.source, &VisualSourceReader::source) != 1)
@@ -124,12 +125,26 @@ public:
   std::scoped_lock lock(mutex_);
   browser_terminal_ = true;
  }
+ [[nodiscard]] bool RestartBrowser() noexcept {
+  std::unique_lock lock(mutex_);
+  if (stopping_ || restart_requested_ || restart_completed_) return false;
+  restart_requested_ = true;
+  lock.unlock();
+  if (!Wake()) {
+   Failed(std::make_exception_ptr(std::runtime_error("Presentation restart notification failed")));
+   return false;
+  }
+  lock.lock();
+  restart_settled_.wait(lock, [this] { return restart_completed_ || stopping_; });
+  return restart_completed_ && !stopping_;
+ }
  void CloseAdmission() noexcept {
   {
    std::scoped_lock lock(mutex_);
    stopping_ = true;
    pending_.reset();
   }
+  restart_settled_.notify_all();
   static_cast<void>(Wake());
  }
  PresentationSnapshot snapshot() const {
@@ -145,10 +160,11 @@ public:
    stopping_ = true;
    pending_.reset();
   }
+  restart_settled_.notify_all();
   worker_.request_stop();
   static_cast<void>(Wake());
   if (worker_.joinable()) worker_.join();
-  RetireWriter();
+  static_cast<void>(RetireWriter());
   {
    std::scoped_lock lock(mutex_);
    stopped_ = true;
@@ -176,6 +192,26 @@ private:
   return writer;
  }
  void RunCycle(const std::stop_token stop) {
+  bool restart = false;
+  {
+   std::scoped_lock lock(mutex_);
+   if (stopping_) return;
+   restart = restart_requested_ && !restart_completed_;
+  }
+  if (restart) {
+   // The process owner has reaped the root and stopped its process group.
+   // Retire on the writer's worker, keeping any unproven reads in quarantine.
+   if (!RetireWriter()) throw std::runtime_error("Presentation browser retirement failed");
+   writer_ = CreateWriter(settings_, factory_);
+   {
+    std::scoped_lock lock(mutex_);
+    restart_completed_ = true;
+    state_.capability = {};
+    AdvanceRevision();
+    if (state_.selected.valid() && !stopping_) pending_ = Pending{.source = state_.selected, .generation = selection_generation_};
+   }
+   restart_settled_.notify_all();
+  }
   std::optional<Pending> pending;
   const VisualSourceReader* reader = nullptr;
   std::optional<pid_t> expected_process_group;
@@ -385,10 +421,11 @@ private:
    failed_selection_generation = selection_generation_;
   }
   if (!publish) return;
+  restart_settled_.notify_all();
   report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Presentation, settings_.device, detail, failed_selection_generation);
   Publish(event_type{PresentationFailed{{failed.revision, failed.selected}, std::move(detail)}});
  }
- void RetireWriter() noexcept {
+ [[nodiscard]] bool RetireWriter() noexcept {
   std::shared_ptr<PresentationNativeWriter> retired;
   {
    std::scoped_lock lock(mutex_);
@@ -404,16 +441,18 @@ private:
    // Capacity and shared custody are reserved before the worker starts.
    // A terminal receiver retains its borrowed source and CUDA resources.
    auto* retained_writer = retired.get();
-   std::move(retirement_).Install(gpu::TerminalCudaCustody::Share(std::move(retired)), result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
+   std::move(retirements_[retirement_index_++]).Install(gpu::TerminalCudaCustody::Share(std::move(retired)), result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
    if (result == Retirement::RetainedBrowserRead) retained_writer->TerminalCustodyInstalled();
   }
   if (result == Retirement::UnsafeFailure || result == Retirement::ReleasedWithFailure) Failed({});
+  return result == Retirement::Released || result == Retirement::RetainedBrowserRead;
  }
  void Publish(event_type event) noexcept { publish_visual_event_noexcept(events_, std::move(event)); }
  VisualDeviceSettings settings_;
  std::span<const VisualSourceReader> sources_;
  SystemEventSink<event_type> events_;
  VisualDiagnosticSink diagnostics_{};
+ PresentationNativeWriterFactory factory_;
  mutable std::mutex mutex_;
  PresentationSnapshot state_;
  std::optional<Pending> pending_;
@@ -426,9 +465,15 @@ private:
  bool shutdown_started_ = false;
  bool stopped_ = false;
  bool failure_published_ = false;
+ bool restart_requested_ = false;
+ bool restart_completed_ = false;
+ std::condition_variable restart_settled_;
  std::optional<std::string> terminal_failure_;
- gpu::TerminalCudaRetirementOwner terminal_{1U};
- gpu::TerminalCudaRetirementLease retirement_{gpu::ReserveTerminalCudaLease(terminal_)};
+ // One original browser and at most one automatic replacement. Reserve both
+ // before execution; quarantine closes further reservations.
+ gpu::TerminalCudaRetirementOwner terminal_{2U};
+ std::array<gpu::TerminalCudaRetirementLease, 2U> retirements_{gpu::ReserveTerminalCudaLease(terminal_), gpu::ReserveTerminalCudaLease(terminal_)};
+ std::size_t retirement_index_ = 0U;
  std::shared_ptr<PresentationNativeWriter> writer_;
  mmltk::common::io::ScopedFd control_fd_;
  std::jthread worker_;
@@ -450,6 +495,7 @@ PresentationState PresentationSystem::selection() const {
 void PresentationSystem::SourceChanged(const PresentationSourceIdentity source) noexcept { impl_->SourceChanged(source); }
 void PresentationSystem::SetApplicationPeerConnected(const bool connected) noexcept { impl_->SetApplicationPeerConnected(connected); }
 void PresentationSystem::SetExpectedBrowserProcessGroup(const pid_t process_group) { impl_->SetExpectedBrowserProcessGroup(process_group); }
+bool PresentationSystem::RestartBrowser() noexcept { return impl_->RestartBrowser(); }
 void PresentationSystem::BrowserPeerLost() noexcept { impl_->BrowserPeerLost(); }
 void PresentationSystem::CloseAdmission() noexcept { impl_->CloseAdmission(); }
 PresentationShutdownResult PresentationSystem::Stop() noexcept { return impl_->Stop(); }

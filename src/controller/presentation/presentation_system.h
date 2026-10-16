@@ -174,6 +174,7 @@ public:
  void SourceChanged(PresentationSourceIdentity) noexcept;
  void SetApplicationPeerConnected(bool) noexcept;
  void SetExpectedBrowserProcessGroup(pid_t);
+ [[nodiscard]] bool RestartBrowser() noexcept;
  void BrowserPeerLost() noexcept;
  void CloseAdmission() noexcept;
  [[nodiscard]] PresentationShutdownResult Stop() noexcept;

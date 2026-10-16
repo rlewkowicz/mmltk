@@ -200,6 +200,12 @@ GPU OOM immediately offers manual reload while native work continues. Other devi
 failures allow one automatic reload/episode, then manual recovery; a healthy
 interval clears the session-storage counter, independently of notices.
 
+A Firefox process segfault permits one automatic browser replacement while
+native work and committed documents remain. The replacement reconnects to current
+native snapshots; browser-local view state and unsubmitted drafts reset.
+[Crash reporting](logging.md#firefox-sigsegv-recovery) remains active with logging
+disabled and explains the recovery limit and retained record.
+
 ## Shared form expansion and dividers
 
 [Transitions](../src/frontend/iced/src/view/shared/transition.rs) keep conditional

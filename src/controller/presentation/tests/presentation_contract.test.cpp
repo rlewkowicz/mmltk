@@ -1082,6 +1082,41 @@ TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one
   CHECK(fact.context.frame_revision == completed.completed.revision);
  }
 }
+TEST_CASE("Presentation replaces one terminal browser while retaining source products", "[presentation][browser-runtime]") {
+ const auto retirement = GENERATE(PresentationNativeWriter::Retirement::Released, PresentationNativeWriter::Retirement::RetainedBrowserRead, PresentationNativeWriter::Retirement::UnsafeFailure,
+  PresentationNativeWriter::Retirement::ReleasedWithFailure);
+ PresentationSourceFixture source;
+ EventGate events;
+ const auto first = std::make_shared<TestPresentationWriterState>();
+ const auto second = std::make_shared<TestPresentationWriterState>();
+ first->terminal_retirement = retirement;
+ std::atomic_uint constructions{0U};
+ PresentationSystem presentation{kDevice, [&, backend = source.backend()] {
+  return std::make_unique<TestPresentationWriter>(0, backend, constructions.fetch_add(1U) == 0U ? first : second);
+ }, source.sources(), [&](PresentationSystem::event_type) { events.Advance(); }};
+ PresentationScenario scenario{presentation, second};
+ publish_first_presentation(presentation, source, *first, events);
+ const auto prior = presentation.snapshot();
+ const bool recoverable = retirement == PresentationNativeWriter::Retirement::Released || retirement == PresentationNativeWriter::Retirement::RetainedBrowserRead;
+ REQUIRE(presentation.RestartBrowser() == recoverable);
+ CHECK_FALSE(presentation.RestartBrowser());
+ CHECK(presentation.snapshot().selected == prior.selected);
+ CHECK(first->browser_terminals.load() == 1U);
+ if (recoverable) {
+  REQUIRE(events.Wait([&] { return second->submissions.load() == 1U && presentation.snapshot().capability.valid(); }));
+  CHECK(constructions.load() == 2U);
+  CHECK(presentation.snapshot().completed == prior.completed);
+  source.Advance();
+  presentation.SourceChanged(source.identity());
+  REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 2U; }));
+ } else {
+  CHECK(constructions.load() == 1U);
+ }
+ CHECK(first->retirements.load() == (retirement == PresentationNativeWriter::Retirement::Released || retirement == PresentationNativeWriter::Retirement::ReleasedWithFailure ? 1U : 0U));
+ CHECK(first->terminal_custody_notifications.load() == (retirement == PresentationNativeWriter::Retirement::RetainedBrowserRead ? 1U : 0U));
+ CHECK(shutdown_presentation(presentation) == PresentationShutdownResult::Stopped);
+ CHECK_FALSE(presentation.RestartBrowser());
+}
 TEST_CASE("Presentation directly refreshes a selected private product") {
  PresentationSourceFixture source;
  EventGate events;

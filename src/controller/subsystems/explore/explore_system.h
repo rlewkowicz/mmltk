@@ -400,6 +400,7 @@ public:
   NativeCapacityAvailable = 0x86U,
   VisibleReadHeld = 0x87U,
   PendingSupersessionHeld = 0x88U,
+  FrontendRestartPrepared = 0x89U,
  };
  enum class ControlCommand : std::uint8_t {
   InitialRelease = 1U,
@@ -413,6 +414,8 @@ public:
   ReleaseNativeCompletion = 64U,
   ReleasePendingSupersession = 65U,
   ArtifactMutationReady = 66U,
+  RestartFrontend = 67U,
+  ReportFrontendFailure = 68U,
  };
  [[nodiscard]] std::uint64_t FrontendSequence() const noexcept;
  void SetCompletionCommand(std::function<bool(ControlCommand)>);

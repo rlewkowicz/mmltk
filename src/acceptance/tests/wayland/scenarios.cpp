@@ -47,11 +47,13 @@ void workspace_wayland_gdr() {
  session.RunScenario("wide", true);
 }
 void workspace_wayland_quiet() {
- const std::string profile = GENERATE("blocked", "quiet");
- const char* const diagnostics = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_QUIET_DIAGNOSTICS");
- const bool logging = diagnostics && std::string_view{diagnostics} == "1";
- WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, profile, logging, false, true, {}, false};
- session.RunScenario("quiet", true);
+ const std::string profile = GENERATE("blocked", "quiet", "recover");
+ DYNAMIC_SECTION(profile) {
+  const char* const diagnostics = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_QUIET_DIAGNOSTICS");
+  const bool logging = diagnostics && std::string_view{diagnostics} == "1";
+  WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, profile, logging, false, true, {}, false};
+  session.RunScenario("quiet", true);
+ }
 }
 TEST_CASE("workspace_wayland_retained", "[workspace_hardware][workspace_wayland_integration][retained]") { workspace_wayland_retained(); }
 TEST_CASE("workspace_wayland_sparse", "[workspace_hardware][workspace_wayland_integration][sparse]") {
