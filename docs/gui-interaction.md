@@ -145,6 +145,22 @@ native terminal settles it: Completed/Cancelled show supplied detail/path;
 failure/refusal posts Status and collapses terminal body. Reservation releases
 through the shared transition. Late progress cannot revive work or undo cancellation.
 
+## Live capture and analysis
+
+[Live](../src/frontend/iced/src/view/live.rs) defaults to capture-only operation.
+**Analyze captured frames** enables the shared Predict model and settings;
+the model card, Skeletons and Joint uncertainty controls edit that shared state.
+For analysis, prepare an ONNX or TensorRT artifact on the capture device before Start. Native
+weights and mismatched compute devices are refused. Start captures the current
+configuration; changing it for another run requires Stop and an explicit restart.
+
+Completed frames retain clean pixels and paired analysis, including a valid
+analyzed frame with zero detections. Upscale and Open in Annotation use the
+selected native product and preserve its named joint meaning. A provider-start
+failure whose cleanup settles preserves the last completed image and permits a
+later Start; Status retains the cause. Physical capture, model and receiver
+retirement remain with the [native owners](architecture.md#model-and-media-owners).
+
 ## Session Status
 
 [Status](../src/frontend/iced/src/view/status.rs) is the single operational

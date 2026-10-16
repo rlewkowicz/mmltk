@@ -779,22 +779,24 @@ replacement for the retained interop and application suites.
 ```
 
 Build the package with `./mmltk --build`. Visible runs mount host Wayland;
-headless runs add private NVIDIA Weston with identical assertions. The wrapper
-verifies all seven [registered hardware entrypoints](../src/acceptance/tests/wayland/scenarios.cpp)
-before the selected comma-separated Catch union. Standalone evidence-audit cases
-also live in this executable.
+headless runs add private NVIDIA Weston with identical assertions. The
+[wrapper](../tools/mmltk.cpp) checks required hardware entrypoint names before
+running the selected comma-separated Catch union. The current
+[scenario registrations](../src/acceptance/tests/wayland/scenarios.cpp) are below;
+standalone evidence-audit cases also live in this executable.
 
 | Entrypoint | Browser lifetimes / required behavior |
 | --- | --- |
 | `workspace_wayland_retained` | One H2D: Dataset disclosures/input, real Cancel/restart, capacity growth, integer typing/paste, cached/held-miss gallery/detail returns, Detail-open resize both orientations, augmentation retention, fractional/wrapped/partial rows, wide/tall layouts, native labels/semantics, light/dark copy, Annotate layout/long lists, FPS, rapid changes, SIGINT |
-| `workspace_wayland_workflows` | Two H2D: Train/Validate/Predict/Export GPU execution, real Train start/resize/live+hidden progress, retained charts, progressive Validation/detail/confidence/layout, direct Explore return, compiled/image/video Predict and Pause/Resume/EOF/Stop, export/cancellation, theme/minimum width. Second lifetime injects resized-canvas allocation failure and requires manual recovery plus completed training; both SIGINT |
+| `workspace_wayland_sparse` | One H2D: physical compiled slot IDs across holes, exact range editing, gallery/detail selection |
+| `workspace_wayland_workflows` | Three H2D: ordinary Train/Validate/Predict/Export (including video Pause/Resume/EOF/Stop and export cancellation), resized-canvas allocation failure with manual recovery and completed training, and keypoint/catalog/Live workflows described below; each ends with SIGINT |
 | `workspace_wayland_dpi` | One H2D, scale 1.5: Dataset fixtures, theme/copy, rapid changes |
 | `workspace_wayland_terminal` | Two H2D: real window close and abrupt peer loss after Annotation edit, completed draw, independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D: startup-latched allocation/reset/begin/end probe failures, exact-content recovery, final pixels/semantics |
 | `workspace_wayland_quiet` | Two H2D: blocked reads and completed gesture with diagnostics/reporting/probes inactive |
 | `workspace_wayland_gdr` | One optional GDR lifetime; absent hardware explicitly skips |
 
-Twelve H2D lifetimes are required; GDR is independent. Compatible scenarios
+Fourteen H2D lifetimes are required; GDR is independent. Compatible scenarios
 reuse browsers; startup-latched settings/destructive exits require isolation.
 Window-close uses lifecycle diagnostics without probes. Quiet scenarios retain
 real input pressure, typed control, settlement, and drawn readiness.
@@ -830,7 +832,7 @@ ordinary actions/viewers, sibling CLI, and product systems:
 
 | Behavior | Required independent observations |
 | --- | --- |
-| Train / GPU cards | Typed terminals plus curve/progress/theme/narrow pixels; bar capture paired to native image count, hidden-tab later metric sequences; [admitted generation ↔ actual device/rank](logging.md#workflow-gpu-evidence), including pre-progress cancellation and four Output/GPU light layouts plus dark/narrow Train |
+| Train / GPU cards | Real startup/resize, typed terminals, and curve/progress/theme/narrow pixels; bar capture paired to native image count, hidden-tab later metric sequences; [admitted generation ↔ actual device/rank](logging.md#workflow-gpu-evidence), including pre-progress cancellation and four Output/GPU light layouts plus dark/narrow Train |
 | Validation | Detail opens during capture and survives successful settlement; closing returns six same-generation samples without reevaluation; canvas may lag metrics. All saved PNGs verified |
 | Confidence / captions | Exact `0.437`, invalid/blank retention, inert arrows/wheel, settled `0→1→0`; [pixel oracle](logging.md#rendered-ui-acceptance-evidence) retains raw detections/clean identity/evaluation generation. Groundtruth/Detections below preview, 20 px spacing, narrow wrap, Advanced text. Seven atlas/detail caption cases cycle GT/Det; actual glyphs and Det-over-GT pixels required |
 | Workflow fixture | Real six-query detector calibrated against selected proposals to overlap captions; Validation FP32 matches calibration, Train still updates actual model. Native completion/caption cache alone proves no drawing |
@@ -843,6 +845,27 @@ ordinary actions/viewers, sibling CLI, and product systems:
 | Integers | Five Explore controls: min/max instances, seed, first/last compiled index. Spinner edges, wheel suppression, invalid unsigned text, native persistence/restoration; seed typing/paste uses exact value above `2^53`. Digits advance across render frames; rapid resize does not repeat audit |
 | Annotate | Wide/narrow shared layout, Timeline in Advanced, page/horizontal scroll reachability, 32 objects/classes and wrapped final entries. Remeasure after scroll with whole-pixel tolerance; gestures retain full-image/visible-region geometry |
 | Status | Real overlay, bounded fixture notices: add/update/dismiss/overflow, long wrapping/selection/exact Copy, hover/Escape/reentry, keyboard/touch, themes/narrow/modal, shortcut isolation, pulse/reduced motion, hidden quietness. [Records](logging.md#rendered-ui-acceptance-evidence) join identity; fixtures are not native failures. Rust covers reconnect/dedup/ack/stale delivery/clipboard |
+
+The [keypoint driver](../src/frontend/iced/src/integration_control/workflows/keypoints.rs)
+also exercises dataset compilation, named-joint Explore/Annotate edits and saved
+imports, training/validation OKS, ONNX export, Predict, and Upscale. Live covers
+capture-only and analyzed frames, valid zero detections, failed provider startup
+with retained output, model replacement/restart, incompatible-model refusal,
+clean imports, and derived products. Pixel checks require the current drawn
+frame, document epoch, and scene revision; model/settings admission settles
+before each dependent operation.
+
+Every row in the [model catalog](../src/backend/models/rfdetr/contract/preset_catalog.h)
+is prepared and operated: detection/segmentation models predict, and the keypoint
+model trains. The native/browser audits join model and operation generations,
+resolution, actual GPU execution, and completion. The final training audit
+resolves the selected output/checkpoint inside the fixture root, matches the
+persisted output directory and run ID, and checks `run.json`, canonical original
+weights, dataset/query admission, and the completed checkpoint's topology and
+class/joint layout. UI completion alone is insufficient; the
+[artifact verifier](../src/acceptance/tests/workflow_wayland_inputs.cpp) owns these
+checks. [Diagnostic records](logging.md#rendered-ui-acceptance-evidence) retain
+the corresponding paths and identities.
 
 The [physical ledger](logging.md#physical-presentation-evidence) requires inventories,
 exact transfers/acquisitions, mode-specific settlement, encoded/submitted draws,
@@ -1034,7 +1057,7 @@ coverage, not a record that the current checkout passed these cases:
 | [training/tests/distributed_training.test.cpp](../src/backend/models/rfdetr/training/tests/distributed_training.test.cpp) | Two selected physical GPUs: global objective/update equivalence, uneven/empty-rank contributions, early NCCL overlap, and cancellation/failure retirement |
 | [training/tests/distributed_placement.test.cpp](../src/backend/models/rfdetr/training/tests/distributed_placement.test.cpp) | Independent known/unknown GPU locality resolution and explicit rank placement |
 | [training/tests/model_merging.test.cpp](../src/backend/models/rfdetr/training/tests/model_merging.test.cpp) | Native averaging, cadence and zero intervals, final policies/ties/duplicates, finite mask metrics, immutable publication faults, whole-session leases and replaced/mixed artifact rejection |
-| [training/tests/training_continuation.test.cpp](../src/backend/models/rfdetr/training/tests/training_continuation.test.cpp) | Exact continuation inventory, SGD held values, schedules/offsets/donor support, named optimizer/EMA state, and applied epoch policies |
+| [training/tests/training_continuation.test.cpp](../src/backend/models/rfdetr/training/tests/training_continuation.test.cpp) | Exact restoration/inventory, SGD held values, schedules/offsets/donor support, named optimizer/EMA state, applied epoch policies, and independently recomputed family trajectories |
 | [core/tests/inference_lanes.test.cpp](../src/backend/models/rfdetr/core/tests/inference_lanes.test.cpp) | Bounded lanes, ordered delivery, source-copy release, backpressure, failure, and drain |
 
 Two-GPU cases require two eligible CUDA devices and report a skip when that
@@ -1075,6 +1098,17 @@ The one-query SDPA positional-gradient cancellation case permits the same
 exact next-batch/Resume trajectory fixture enables deterministic cuDNN and
 disables cuDNN benchmarking for its comparison, then restores both settings.
 That fixture policy does not change ordinary training defaults.
+
+The separate full-session family comparison runs independently resumed FP32
+trajectories for Femto, XLarge, and Keypoint Preview with Shared, Independent,
+and Periodic Averaging. It uses fixed `torch.testing.assert_close` FP32 defaults
+(`rtol=1.3e-6`, `atol=1e-5`) for recomputed FP32 tensors and requires finite values.
+Tensor definedness, dtype, shape, names, metadata, nonfloating state, and restored
+state remain exact. Its deterministic-cuDNN/no-benchmark setting is fixture-local.
+These bounds do not alter the separate preparation comparison or the
+[independent upstream gates](#numerical-gates-and-trajectory-observations).
+[Optional difference diagnostics](logging.md#training-session-comparison)
+report tensor-level error without changing admission.
 
 Graph capture, executor reuse, fuser availability, fused ATen operators, graph
 fusion, and throughput are separate claims. Inspect the actual optimized graph

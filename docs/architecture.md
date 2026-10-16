@@ -126,9 +126,11 @@ distinguishes model candidate defaults from evaluation limits. Immutable class
 and joint meaning comes from the [data catalog](../src/backend/data/catalog/class_catalog.h).
 
 [CaptureSession](../src/backend/media/capture/capture_session.h) depends on the
-GPU framework. [LiveSessionController](../src/backend/media/live/live_session_controller.h)
+GPU framework. [LiveMediaDataPlane](../src/backend/media/live/live_session_controller.h)
 connects capture, analysis, overlays, fanout and compositing through private
-`media/live/detail/` owners; raster composition remains private.
+`media/live/detail/` owners. `LiveSystem` captures Predict's prepared model and
+settings at Start; its native adapter supplies a model-neutral analysis factory
+on the media owner's stream. Raster composition remains private.
 
 ## Workflow output and media handoffs
 

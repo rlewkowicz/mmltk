@@ -387,7 +387,10 @@ GT is also excluded. Source order/duplicate annotations are retained; equal IoU
 chooses the last within an ignore group, and score ties keep prediction order.
 Prefix partial sorting and early settled-threshold exits preserve those rules.
 
-No eligible GT means unavailable metrics. Box+mask requires every GT to declare
+No eligible GT means unavailable metrics. Valid keypoint output with zero
+detections contributes zero AP when eligible GT exists; it needs no joint-data
+pointer. Task, stride and capacity checks still apply, and nonempty predictions
+must supply their class's active joints. Box+mask requires every GT to declare
 a mask; empty is valid. Compiled masks do not recover discarded source resolution,
 and exact AP retains detection-proportional matching records.
 

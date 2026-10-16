@@ -338,7 +338,7 @@ hardware's BF16, so evidence records actual precision. Default SDPA remains
 accelerated; [selective compilation](rfdetr-training.md#native-selective-compilation)
 owns explicit local math/replay guards.
 
-[InternalRuntimeBackendOptions](../src/backend/ml/runtime/backend_factory.h)
+[RuntimeBackendOptions](../src/backend/ml/runtime/backend_factory.h)
 defaults `allow_fp16=true`, `allow_tf32=true`. [ONNX CUDA](../src/backend/ml/runtime/backend_onnx.cpp)
 enables graph optimization and explicitly forwards TF32 permission as provider
 `use_tf32`. [TensorRT](../src/backend/ml/runtime/tensorrt_runtime.cpp) forwards
@@ -355,6 +355,15 @@ to allocate concurrently. Failed capture-end installation cleans unpublished raw
 executable graphs while retaining original cause. Replay remains enabled with
 independent domain ownership. [Build inputs](build.md#toolchain-and-image-inputs)
 own the pinned patch/fingerprint.
+
+The [runtime backend](../src/backend/ml/runtime/backend_onnx.cpp) retains the
+session's actual `CudaPinned` allocator. Close clears bindings and output values,
+destroys the session, then settles its canonical CUDA stream before releasing
+that allocator on the ordinary owner thread. Session destruction can enqueue
+deferred CPU frees; their callbacks must finish before final pinned-host release.
+Backend release failures propagate through `RuntimeBackend::Close` before lane
+closure. [Release diagnostics](logging.md#onnx-session-release) observe this
+sequence only when native trace logging is enabled.
 
 ShiftLUT storage persists across replay/fallback. Ordinary operators allocate no
 counter state; verification can supply a scoped counter outliving the operator.

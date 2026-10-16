@@ -7,6 +7,15 @@ The native compiler publishes `train.bin`, `val.bin`, and
 the shared [resize policy](datasets.md#resize-geometry), and the current
 [compiled format](datasets.md#compiled-binary-format).
 
+| Task | Reference |
+| --- | --- |
+| Choose training/validation data | [Recipes](#recipes-and-validation-membership) and [GUI controls](gui-interaction.md#dataset-compilation-controls) |
+| Restore eligible missing masks | [Dropped-mask recovery](#optional-dropped-mask-recovery) |
+| Reuse inputs or understand repair | [Persistent cache](#persistent-cache-and-publication) and [cache selection](commands.md#benchmark-cache-selection) |
+| Interpret current work and omissions | [Progress](#reading-compilation-progress) and [failure reports](#native-import-and-provenance) |
+| Change compiler internals | [Source owners](#native-import-and-provenance), [overlap](#overlapping-acquisition-labels-and-pixels), and [shared execution](compile-execution.md) |
+| Inspect formats or measure performance | [Cache formats](#cache-formats-and-capacity), [diagnostics](commands.md#benchmark-image-geometry), and [measurement scope](benchmark-performance.md) |
+
 ## Recipes and validation membership
 
 | Selection | Training | Validation |

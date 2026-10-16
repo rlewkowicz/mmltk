@@ -104,6 +104,14 @@ healthy SIGINT/SIGTERM is not failure.
 [implementation](../src/common/logging/mmltk_logging.cpp) own `report_fatal`.
 It serves ordinary terminal boundaries and **must not run in signal handlers**.
 
+Packaged Wayland diagnostics can additionally set
+`--env MMLTK_RUN_WORKSPACE_WAYLAND_TERMINATE_TRACE=1`. The
+[desktop entrypoint](../src/entrypoints/desktop/browser_runtime_entry.cpp) installs
+the ordinary `std::terminate` handler only with integration enabled and native
+logging at `trace`. It reports `native termination`, the active exception when
+available, and at most 40 stack frames to stderr before aborting. This opt-in
+handler is separate from signal reporting; frames alone establish no cause.
+
 ### Firefox fatal causes and process identity
 
 Unrecoverable Firefox WebGPU/dispatcher/queue/completion boundaries report the
@@ -212,6 +220,16 @@ Compare encoder freezing, DN, batch/GPU, loading, and augmentation before
 attributing throughput to rendering. `images_per_second` is an epoch average;
 different startup/work makes isolated values incomparable.
 
+### Training session comparison
+
+For the [full-session fixtures](validation.md#training-mathematics-and-compilation-evidence),
+`--env MMLTK_TEST_SESSION_CONTINUATION_TRACE=1` enables stderr JSONL with
+`event: "test.training_session_difference"` for differing compatible tensors.
+Records contain `tensor`, `maximum_difference`, `reference_maximum`,
+`l2_difference`, `reference_l2`, and `maximum_bound_ratio`. The last field divides
+elementwise error by the family comparison's FP32 bound. Collection is opt-in;
+the validation reference owns comparison policies.
+
 ## Capture one reproduction
 
 ```bash
@@ -266,6 +284,17 @@ performs no graph inspection/formatting. Capture/reuse, fuser availability,
 graph fusion, and fused ATen (e.g. SDPA) differ. None alone proves a training
 speedup over upstream Dynamo/Inductor; [validation](validation.md#training-mathematics-and-compilation-evidence)
 defines evidence boundaries.
+
+## ONNX session release
+
+Native `trace` logging enables `event=onnx.runtime.release` messages from the
+[ONNX backend](../src/backend/ml/runtime/backend_onnx.cpp), separately from GUI
+JSONL. `phase=before_session` precedes binding/session release;
+`phase=after_session` follows successful stream settlement and pinned-allocator
+release. Fields are `stream`, CUDA `status` from `cudaStreamQuery`, and
+`last_error` from `cudaPeekAtLastError`. Disabled trace performs neither query.
+These observations diagnose the [release order](gpu-execution.md#onnx-capture-and-verification-storage)
+and do not replace the returned close status.
 
 ## Upstream numerical comparisons
 
@@ -716,6 +745,9 @@ record UI interaction and pixels separately from physical resource custody:
 | `integration.workflow.completed` | Typed Train, dashboard interaction/aspect, Validate, compiled/image/video Predict, Stop, theme, and narrow-layout stage completion |
 | `integration.workflow.pixels` | Actual sampled/visible canvas pixel counts for charts, the live progress bar, validation atlas/detail, direct Validate-to-Explore return, and prediction stages; image captures retain the expected source/presentation revisions |
 | `integration.workflow.progress` | Native completed/total image counts and epoch facts at the live progress capture |
+| `integration.keypoint.catalog` | Preset in `control`, prepared/completed stage in `detail`; `a`/`b` are model/operation generations, `c` is resolution, `d` is catalog row |
+| `integration.keypoint.training-artifact`, `.training-output` | Checkpoint/output path in `control`, run ID in `detail`; paired `a`/`b` model/operation generations, `c` optimizer step, `d` OKS AP |
+| `integration.keypoint.display_policy` | Current sample stage, raw/visible detection counts, confidence threshold, and sampled joint count for paired Predict/Live skeletons |
 | `integration.validation_confidence_edit` | Nine settled decimal/invalid-input/arrow/wheel/endpoint stages, with the value, native settings revision, and unchanged evaluation generation |
 | `integration.validation_confidence_pixels` | Paired threshold, retained raw detection count/score range, clean identity, evaluation generation, settings revision, and canvas difference counts for `0 → 1 → 0` |
 | `integration.validation_layout`, `integration.validation_text` | Measured atlas and overlay-group bounds in ordinary/narrow layouts, plus Groundtruth/Detections and confidence-control text |

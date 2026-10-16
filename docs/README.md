@@ -18,7 +18,7 @@
 | [Source ownership](architecture.md) | Systems, components, dependencies, and source locations |
 | [Reflection](reflection.md) | Canonical declarations, schema authoring, and native projections |
 | [Application wire](application-wire.md) | Generated Rust, protocol records, validation, and transport |
-| [GUI interaction](gui-interaction.md) | Iced state, controls, viewer behavior, rendering, and graphics custody |
+| [GUI interaction](gui-interaction.md) | Iced state, controls, Live analysis, viewer behavior, rendering, and graphics custody |
 
 ## Data and backend systems
 
@@ -27,7 +27,7 @@
 | [RF-DETR training](rfdetr-training.md) | Objectives, recipes, lanes, precision, and native compilation |
 | [Datasets](datasets.md) | Directory inputs, compiled formats, keypoints, augmentation, and resampling |
 | [Compilation execution](compile-execution.md) | Scheduling, pinned storage, cancellation, and file settlement |
-| [Benchmark datasets](benchmark-datasets.md) | Recipes, acquisition, masks, caching, repair, and progress |
+| [Benchmark datasets](benchmark-datasets.md) | Recipe selection, mask recovery, progress, cache formats, repair, and compiler internals |
 | [Benchmark performance](benchmark-performance.md) | Current measurement methods and interpretation |
 | [GPU execution](gpu-execution.md) | Devices, transfers, inference lanes, readbacks, and Wayland/Vulkan/CUDA handoffs |
 
