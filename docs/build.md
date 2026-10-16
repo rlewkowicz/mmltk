@@ -277,9 +277,13 @@ prepares/checks this image without weights, references, or native comparisons.
 
 The image fingerprint binds upstream revision, donor/payload manifest, Dockerfile,
 requirements, selected native sources/rules, and actual tools-image identity.
-Runs additionally bind upstream tree and SDPA policy. Sources/Git metadata and
-weights mount read-only; only evidence is a writable host mount, with temporary
-storage inside the container. [Upstream validation](validation.md#independent-upstream-diagnostic)
+Runs additionally bind upstream tree, selected preparation mode and execution
+policy. Sources/Git metadata mount read-only; evidence and the shared model asset
+cache mount writable for publication/acquisition, with temporary storage inside
+the container. Completed reference payloads are made read-only. The selected
+[encoder mode](validation.md#encoder-pretraining-evidence) uses the same isolated
+producer and dependency closure, with a distinct evidence identity.
+[Upstream validation](validation.md#independent-upstream-diagnostic)
 owns explicit opt-in, storage/retention, admission, retries, and verdicts.
 
 ### Native Parquet dependency
@@ -328,6 +332,16 @@ Declaration-only projections consume owner usage requirements without linking
 implementation. Header-isolation dependencies compile generated one-include
 units with those requirements, no unity/PCH/forced includes; selected boundaries
 also check both include orders.
+
+The [Torch component](../src/backend/ml/torch/CMakeLists.txt) separately registers
+`mmltk_backend_ml_torch_archive_cbor` for the shared
+[archive/CBOR boundary](architecture.md#reflected-value-and-persistence-boundaries).
+It publishes its own Torch and serialization declaration requirements and header
+isolation; ordinary Torch consumers do not inherit serialization through a broad
+umbrella. Domain test-support targets likewise own their registered fixture
+headers and usage requirements; [fixture ownership](validation.md#shared-fixtures-and-evidence)
+locates the encoder-training support shared by training, inference, CLI and
+Wayland acceptance.
 
 Normal product PCH groups:
 
@@ -378,13 +392,14 @@ These are the default repository-local locations:
 | `.cache/buildkit` | Exported image-build caches |
 | `.cache/image-fingerprints`, `.cache/locks` | Verified identities and mutation locks |
 | `.cache/tests/rfdetr` | RF-DETR test assets and derived artifacts |
+| `.cache/mmltk/weights` | Shared canonical detector and original encoder assets; see [model asset cache](#model-asset-cache) |
 | `.cache/benchmark-dataset/v1` | Persistent benchmark source archives, JPEGs, indexes, and completion metadata; see [cache ownership](benchmark-datasets.md#persistent-cache-and-publication) |
 | `output/` | Repository-root product artifacts; automatic workflow roots and explicit destinations follow [workflow output policy](rfdetr-workflows.md#run-output-directories) |
 | `build/release`, `build/browser-app` | Staged package and canonical browser bundle |
 | `build/validation`, `build/logs` | Acceptance evidence and [build/test/tidy transcripts](logging.md#wrapper-build-test-and-tidy-transcripts) |
 | `build/diagnostics` | Wrapper-owned capability, standalone GPU, and native-link diagnostic artifacts |
 
-`MMLTK_CACHE_ROOT` may select a subtree of `.cache`; `MMLTK_RELEASE_STAGE_ROOT`
+`MMLTK_CACHE_ROOT` may select a build-cache subtree of `.cache`; `MMLTK_RELEASE_STAGE_ROOT`
 must remain below `build`. The wrapper rejects overlapping checkout/cache-root
 mutations. Retain caches for incremental builds.
 The root artifact ignore rule is `/output/`. Build products, dependency caches,
@@ -404,6 +419,38 @@ own options, admission, geometry ordering, and trace selection; `profile_pipelin
 and `profile_compaction.cpp` own those modes. CPU modes need no CUDA context;
 Loader does. [Profiles](validation.md#data-compilation-and-resampling-profiles)
 own scratch, retained inputs, and explicit complete Coconut runs.
+
+### Model asset cache
+
+[ArtifactStore](../src/controller/services/artifact_store.cpp) defaults to the
+repository root's `.cache/mmltk/weights`, shared by GUI, CLI and upstream evidence
+preparation. This product asset location is independent of a wrapper build-cache
+override. Canonical detector files retain their catalog filename and MD5 checks.
+Original encoder assets live under
+`encoders/<source-repository-with-slashes-replaced-by-dashes>-<source-revision>/model.safetensors`
+and require both the canonical SHA-256 and exact byte length. The
+[asset declaration](../src/backend/models/rfdetr/contract/encoder_pretraining.h)
+owns URLs, immutable pins, source geometry and adaptation revision.
+
+Both asset types use the same cancellable acquisition, progress, staging,
+integrity and atomic publication path. Cache reuse verifies integrity; a corrupt
+entry is removed before replacement. Failed or cancelled staging never becomes
+the canonical asset. Encoder selection is typed by backbone and cannot substitute
+for detector-weight selection. Multiple presets sharing a backbone reuse one
+original source file.
+
+The [CLI launch service](../src/controller/services/training/train_command.cpp)
+validates scratch admission before acquisition, verifies any supplied resolved
+path, and passes an absolute launch path to workers. Workers do not download;
+the backend importer owns tensor admission/adaptation independently of controller
+services. Saved weights/sessions remain [self-contained](model-merging.md#encoder-provenance).
+
+[NOTICE](../NOTICE) retains encoder source attribution alongside RF-DETR,
+RF-DETR+ and timm implementation notices; [LICENSE](../LICENSE) and NOTICE are
+packaged by the root build. Source encoder licensing does not replace the
+selected preset's implementation notices. The
+[validation reference](validation.md#encoder-pretraining-evidence) owns generated
+reference retention, separate from these reusable original assets.
 
 ### Benchmark diagnostic builds
 

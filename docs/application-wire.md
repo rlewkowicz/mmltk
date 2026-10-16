@@ -39,6 +39,17 @@ Byte buffers and byte arrays use distinct byte-string wrappers. Structs and
 variants get generated codecs, including inherited reflected members. Unsupported
 shapes and projected Rust symbol collisions fail generation.
 
+The canonical [model selection key](../src/controller/contracts/model_selection_types.h)
+contains workflow, source, input kind, preset, resolution, scratch mode and
+class-layout path. [Member relations](../src/controller/contracts/model_selection.h)
+cover every reflected key field exactly once. Train projects `from_scratch` from
+its request; the other workflows supply a typed constant false. Native projection,
+generated Rust selection, settings field identities and dialog derivation consume
+that same relation. Constants have no invented editable settings field. Artifact
+path and inspection device remain separate projected facts; a draft projection
+does not authorize a prepared model. Iced compares the complete generated identity
+when retaining preparation, continuation and pending actions.
+
 Schema validation checks endpoint signatures, projectable types, field
 constraints, defaults, catalog and settings relationships, visual projections,
 and identity collisions. An endpoint is an annotated public ordinary instance

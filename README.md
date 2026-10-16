@@ -58,10 +58,11 @@ Train destination can also load saved charts. Status retains selectable warnings
 and errors with Copy and Dismiss.
 
 Train requires training and validation data; final-test data is optional.
-Transfer and Resume prepare weights or a complete session before Start. Training
-supports shared gradients, independent models, periodic averaging, per-model
-recipes, and final model selection. EMA is optional and off by default;
-independent/periodic modes and model soups are experimental.
+**From scratch** uses a pretrained base encoder with new RF-DETR detector weights
+for any catalog preset. Transfer and Resume prepare detector weights or a complete
+session before Start. Training supports shared gradients, independent models,
+periodic averaging, per-model recipes, and final model selection. EMA is optional
+and off by default; independent/periodic modes and model soups are experimental.
 
 Validate presents metrics and retained samples in the shared viewer. Predict
 accepts compiled data, an image, or local video; video supports Pause/Resume/Stop,
@@ -105,8 +106,10 @@ establish AP, convergence, or throughput equivalence.
 `./mmltk --test all` runs ordinary native, browser JavaScript/Rust,
 cleanup/declaration, log-query, and compositor fixtures. Packaged Wayland
 acceptance runs separately. External upstream tensors and historical sessions
-require `--with-upstream` or an explicit evidence path; ordinary tests do not
-generate them. Dataset profiles and full Coconut measurements are also
+require explicit preparation or an existing evidence path; ordinary tests do not
+generate them. [Encoder initialization checks](docs/validation.md#encoder-pretraining-evidence)
+have their own `--with-upstream=encoder-pretraining` selection. Dataset profiles
+and full Coconut measurements are also
 [opt-in](docs/validation.md#data-compilation-and-resampling-profiles).
 
 ## Codebase

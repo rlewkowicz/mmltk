@@ -43,7 +43,7 @@ confirmation/preparation/cancellation, without manual backend-kind/Class layout.
 
 | Page | Controls/workspace |
 | --- | --- |
-| Train | Aspect-selected dashboard and separate live progress; Dataset inference/manual split fields with independent optional test; Transfer/Resume; saved Output history; Advanced EMA, augmentation/perceptual, lanes/recipes |
+| Train | Aspect-selected dashboard and separate live progress; Dataset inference/manual split fields with independent optional test; From scratch and Transfer/Resume; saved Output history; Advanced EMA, augmentation/perceptual, lanes/recipes |
 | Validate | Open Dataset override or inherited validation split; fixed metrics/preview workspace |
 | Predict | Compiled/image/video sources; image-only RGB resize; threshold/aspect; video Pause/Resume/Stop; batch one, no batch field; source-specific saving disclosures retain choices |
 | Export | Independent ONNX/TensorRT checkboxes; at least one required |
@@ -59,6 +59,27 @@ opening, sampling, initialization and optimizer setup before measurements exist.
 Validate/Predict retain saving options captured at Start through preparation;
 later viewer edits do not change them. Prediction inspection replies use the
 same revision-aware reduction as events and cannot overwrite newer source facts.
+
+### Scratch and continuation controls
+
+Train's **From scratch** checkbox defaults off. When checked, its description is
+**Pretrained base encoder; new RF-DETR detector weights.** Canonical presets stay
+available; Custom Weights and Transfer/Resume remain visible but disabled.
+The checkbox itself disables while settings or the primary action are busy.
+
+Toggling either way submits one settings edit: select canonical weights, preserve
+the preset, and clear detector, launch-only encoder, Resume and class-layout
+paths. It does not start work. The complete generated
+[selection identity](application-wire.md#canonical-declarations-and-generator-ownership)
+includes scratch mode, so changing it invalidates stale preparation, continuation
+inspection and queued starts. Other workflows retain their existing selection.
+
+Prepared encoder and admitted checkpoint details can show optional source
+provenance. For scratch-origin Resume, turn scratch off and select the saved
+session through Custom Weights; the ordinary inspection/Resume flow restores it.
+Native [initialization](rfdetr-workflows.md#training-initialization) and
+[continuation](model-merging.md#encoder-provenance) own semantics; Iced owns labels,
+checkbox/radio presentation, availability and interaction state.
 
 ### Lane and recipe controls
 

@@ -3,9 +3,11 @@
 [Wiki index](README.md) · [Quick start](../README.md#build) · [Build details](build.md) · [Validation](validation.md)
 
 Run from the repository root through native `./mmltk`; cold checkouts need
-[bootstrap](build.md#native-tools-and-checkout-bootstrap). Supported host paths
-map to container mounts: checkout → `/workspace`, other absolute paths →
-`/host/...`. Runtime containers are repository-labeled and stream app output.
+[bootstrap](build.md#native-tools-and-checkout-bootstrap). The checkout mounts at
+`/workspace`. Supported host path arguments are rewritten to
+`/host/<absolute-host-path>`, resolving relative paths from the invocation directory.
+Paths inside canonical JSON or explicit test `--env` values must already be
+container-visible. Runtime containers are repository-labeled and stream app output.
 
 ## Wrapper operations
 
@@ -29,6 +31,7 @@ map to container mounts: checkout → `/workspace`, other absolute paths →
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, log-query, and compositor fixtures |
 | `./mmltk --test rfdetr --with-upstream` | Explicitly prepare and run external upstream and historical-session validation; full reference tensors can exceed 1 TiB |
+| `./mmltk --test rfdetr --with-upstream=encoder-pretraining` | Prepare only original encoder/reference evidence and run the selected suite; no full detector or historical-session preparation |
 | `./mmltk --test data-profile -- --help` | Prepare the opt-in target and show CPU compile/pipeline/archive/compaction/resample, full Coconut, and CUDA loader options |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
@@ -38,6 +41,7 @@ map to container mounts: checkout → `/workspace`, other absolute paths →
 | `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
 | `./mmltk --diagnose-gpu-program [--torch] SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic, optionally linked to pinned PyTorch, using existing images |
 | `./mmltk --diagnose-rfdetr-upstream [--upstream PATH] [--plus-upstream PATH] [--output PATH] [--sdpa default\|math]` | Explicit pinned references plus core/training/inference/export comparisons; selected `--case ID` prepares one case without comparisons |
+| `./mmltk --diagnose-rfdetr-upstream --encoder-pretraining-only [--output PATH]` | Prepare three original encoder assets, bounded references for all 16 presets and independent controls; native comparisons run separately |
 | `./mmltk --diagnose-nvidia-payload donor\|development HEADER...` | Inspect public NVIDIA headers and payload selection |
 | `./mmltk --diagnose-native-symbols [OPTIONS] ARTIFACT...` | Inspect cached native `.a`/`.o` symbols or resolve `--address HEX` values in one ELF artifact with the existing development image |
 | `./mmltk --diagnose-native-link [OPTIONS] TARGET` | Repeat one generated Release link into separate diagnostic storage |
@@ -51,7 +55,7 @@ export, and diagnostics are separate operations. Standalone `--logs`,
 | Detail | Reference |
 | --- | --- |
 | Selectors, profiles, CUDA/Vulkan, native symbols/links | [Validation](validation.md) |
-| Upstream opt-in, single-case preparation, retention/verdicts | [Upstream validation](validation.md#independent-upstream-diagnostic) |
+| Upstream opt-in, single-case preparation, retention/verdicts | [Upstream validation](validation.md#independent-upstream-diagnostic), [encoder evidence](validation.md#encoder-pretraining-evidence) |
 | Cleanup/declaration/PCH tools | [Validation tooling](validation.md#deduplication-reports) |
 | Log queries and capture provenance | [Logging](logging.md) |
 
@@ -246,6 +250,24 @@ Fatal operation failures still produce a concise
 [stderr report](logging.md#fatal-stderr-reports) with diagnostics disabled.
 
 ### Training request selection
+
+Choose exactly one source: `--from-scratch --preset NAME`, `--weights PATH`, or
+`--resume PATH`. Scratch requires a known catalog preset and rejects detector
+weights, Resume and `--class-layout` in the same request. For example:
+
+```bash
+./mmltk rfdetr train --from-scratch --preset rf-detr-atto \
+  --train-compiled ./compiled/train.bin --val-compiled ./compiled/val.bin \
+  --output-dir ./output/train/scratch
+```
+
+This acquires the preset's verified base encoder and initializes new detector
+weights. The [workflow guide](rfdetr-workflows.md#training-initialization) owns
+mode semantics. There is no public scalar encoder-path flag: acquisition resolves
+`TrainRequest::encoder_weights_path` for launch, and the native JSON boundary
+can carry an already resolved path that must pass the same asset integrity checks.
+Invalid or conflicting source choices fail before acquisition. The internal
+path is not saved in reusable requests.
 
 `rfdetr train --batch-size` counts **global microbatch** images;
 `--grad-accum-steps` and logical `--lanes` determine effective batch.

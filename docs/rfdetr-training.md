@@ -13,8 +13,11 @@ upstream may repeat/pad data to fill accumulation windows, so matched equations
 do not imply matching epoch trajectories.
 
 The native [runtime](../src/backend/models/rfdetr/core/runtime.cpp) disables
-cuBLAS/cuDNN TF32; upstream selects float32 matmul precision `high`. Tensor
-dtype, autocast and internal matrix/convolution precision are distinct. The
+cuBLAS/cuDNN TF32; ordinary upstream imports select float32 matmul precision `high`.
+Controlled comparisons override that policy as recorded in their manifests;
+[encoder evidence](validation.md#encoder-pretraining-evidence) uses explicit IEEE
+FP32 controls. Tensor dtype, autocast and internal matrix/convolution precision
+are distinct. The
 [container payload](../docker/nvidia-payload.json) pins NGC/Torch;
 [validation](validation.md#training-mathematics-and-compilation-evidence) defines
 numerical gates, controlled inputs and evidence limits. Checkpoint equivalence
@@ -123,6 +126,62 @@ gathered pre-normalization rows. Algebraically equivalent slicing or bias/
 activation expansion can change finite-precision values and gradients.
 Installed-payload comparisons establish these choices; [numerical accuracy](https://docs.pytorch.org/docs/stable/notes/numerical_accuracy.html)
 explains the general batched-versus-sliced limitation.
+
+## Pretrained encoder initialization
+
+[From scratch](rfdetr-workflows.md#training-initialization) initializes the complete
+RF-DETR model under the requested seed, then replaces every encoder parameter and
+buffer with admitted pretrained state. Projectors, proposals, decoder, task heads
+and training-only supervision keep their seeded initialization. Dataset-owned
+class/joint layout and ordinary stock recipe/query admission still apply.
+
+The canonical [encoder assets](../src/backend/models/rfdetr/contract/encoder_pretraining.h)
+own immutable source revisions, SHA-256, exact byte lengths, geometry and adaptation
+revision. The [preset catalog](../src/backend/models/rfdetr/contract/preset_catalog.h)
+maps the [16 presets](rfdetr-workflows.md#model-input-and-detection-selection)
+to three original safetensors files:
+
+| Original source | Native family | Source geometry |
+| --- | --- | --- |
+| `facebook/dinov2-small` | DINOv2-Small | Width 384, 12 layers, 6 heads, patch 14, 37×37 positions |
+| `facebook/dinov2-base` | DINOv2-Base | Width 768, 12 layers, 12 heads, patch 14, 37×37 positions |
+| `timm/vit_pe_core_tiny_patch16_384.fb` | PE-Core-T | Width 192, 12 layers, 3 heads, patch 16, 24×24 positions |
+
+All sources have three input channels, one class-prefix token and no register
+tokens. DINOv2 also carries its mask token. Acquisition and notices belong to the
+[asset cache](build.md#model-asset-cache), independent of model execution.
+
+[Native import](../src/backend/models/rfdetr/core/encoder_pretraining.cpp) holds an
+opened, length- and digest-verified source through commit and checks it has not
+changed. The bounded safetensors decoder rejects malformed/duplicate names,
+unsupported or nonfinite tensor data, invalid shapes/offsets and incomplete
+payload coverage. Complete source and destination inventories must agree with the
+selected family. PE's exact classifier/attention-pool exclusions are checked by
+name and shape; an arbitrary extra tensor or missing encoder tensor is an error.
+No partial encoder load falls back to random weights.
+
+Patch adaptation applies the pinned timm antialiased bicubic resize matrix and
+its pseudoinverse, with default pseudoinverse tolerances, to the original FP32
+patch kernels; equal patch size is identity.
+Spatial positions use FP32 antialiased bicubic interpolation with
+`align_corners=false`, preserving the prefix token exactly. The
+[shared position operation](../src/backend/models/rfdetr/core/detail/position_embedding.h)
+also serves runtime DINOv2/PE interpolation. Adaptation targets the preset's patch
+and stored-position geometry without altering source width/layers/heads.
+
+All exact and adapted tensors are staged before a rollback-protected encoder
+commit. Import/adaptation currently runs once on CPU FP32 before moving the model
+to CUDA; CPU placement is an implementation choice, not a mathematical requirement.
+Distributed training imports only on rank zero, agrees source admission/provenance,
+then uses the ordinary complete-model broadcast. Forward, backward, optimizer,
+EMA and subsequent training remain on the existing CUDA execution path.
+
+The initialized-model identity covers the resulting full model. Optional source
+[provenance](model-merging.md#encoder-provenance) remains descriptive; saved
+continuation does not depend on rerunning import. Independent
+[encoder comparisons](validation.md#encoder-pretraining-evidence) check original
+source coverage, adaptation, nonencoder preservation and bounded features for
+every preset.
 
 ## Logical lanes and global batch
 

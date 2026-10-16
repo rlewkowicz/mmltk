@@ -83,6 +83,32 @@ Session/selection bounds are 4 MiB/64 KiB. Native artifacts carry class/joint
 layout; [pinned readbacks](gpu-execution.md#checkpoint-and-export-readbacks)
 serialize after drain, without racing optimizer writes.
 
+### Encoder provenance
+
+Native model metadata, checkpoint inspection and run history may carry
+`encoder_pretraining`: canonical asset ID, source revision, SHA-256 and adaptation
+revision from the [native declaration](../src/backend/models/rfdetr/contract/encoder_pretraining.h).
+It describes the initialization source; its absence remains valid for existing
+artifacts. Historical provenance is structurally validated without requiring
+the source to remain in the current catalog. It is not a compatibility or exact
+Resume identity, and does not change the formats above.
+
+Scratch-origin deployment weights are ordinary complete detector weights.
+Transfer uses their saved tensors; whole-session Resume restores saved working,
+optimizer, scheduler, scaler, EMA and stochastic state. Neither operation reads
+the original encoder or acquires it again. A saved reusable request may retain
+`from_scratch` as its original selection, but `encoder_weights_path` is launch-only
+and is cleared before persistence. Resume preparation clears scratch, encoder,
+detector-weight and class-layout selections and uses the admitted session.
+Older owned request records default missing scratch/path fields to false/empty.
+Only absent fields are supplied; existing malformed values still fail admission.
+
+Averaged deployment artifacts retain encoder provenance only when every input
+with a positive normalized coefficient has the same optional provenance.
+Zero-coefficient inputs do not participate; disagreement or any missing lineage
+clears it. This does not exclude otherwise compatible ingredients or change the
+tensor averaging policy.
+
 ## Whole-session Resume
 
 Resume requires `session.json`, including one-model sessions:

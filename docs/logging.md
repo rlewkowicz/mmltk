@@ -208,7 +208,8 @@ standalone runtime retains its reporting responsibility.
 Input/operation messages are bounded to 1024 UTF-8 bytes; UI retains full bounded
 terminal detail. Resolution errors identify file, actual geometry/channels,
 and requirements. Preparation covers GPU connection, dataset admission,
-checkpoint/model construction, GPU weight loading, synchronization, optimizer
+checkpoint/model construction, weight initialization (including CPU encoder
+import/adaptation for scratch), CUDA placement, synchronization, optimizer
 setup. [Dataset identity](model-merging.md#whole-session-resume) uses metadata,
 without payload scans or startup console parsing.
 
@@ -322,6 +323,13 @@ These observations diagnose the [release order](gpu-execution.md#onnx-capture-an
 and do not replace the returned close status.
 
 ## Upstream numerical comparisons
+
+Selected [encoder evidence](validation.md#encoder-pretraining-evidence) retains
+`encoder-control-calibration.json` from the upstream producer and
+`encoder-comparison.json` from native tests. Their recorded policies and terminal
+statuses distinguish independent-control preparation from completed native
+initialization comparison. These bounded JSON receipts have their own formats;
+the full detector oracle's JSONL fields and verdict below do not describe them.
 
 [Upstream validation](validation.md#independent-upstream-diagnostic) retains
 `wrapper.log`, native executable logs, `manifest.json`, authenticated archives,
@@ -770,6 +778,8 @@ record UI interaction and pixels separately from physical resource custody:
 | `integration.workflow.completed` | Typed Train, dashboard interaction/aspect, Validate, compiled/image/video Predict, Stop, theme, and narrow-layout stage completion |
 | `integration.workflow.pixels` | Actual sampled/visible canvas pixel counts for charts, the live progress bar, validation atlas/detail, direct Validate-to-Explore return, and prediction stages; image captures retain the expected source/presentation revisions |
 | `integration.workflow.progress` | Native completed/total image counts and epoch facts at the live progress capture |
+| `integration.scratch.prepared` | Prepared encoder path in `control`, source SHA-256 in `detail`, model generation in `a`, and zero detector class outputs in `c` |
+| `integration.scratch.fresh-session`, `.resumed-session` | Saved checkpoint in `control`, output directory in `detail`, operation generation in `a`; resumed `b` is the completed optimizer step. Native artifact admission separately verifies saved state and source independence |
 | `integration.keypoint.catalog` | Preset in `control`, prepared/completed stage in `detail`; `a`/`b` are model/operation generations, `c` is resolution, `d` is catalog row |
 | `integration.keypoint.training-artifact`, `.training-output` | Checkpoint/output path in `control`, run ID in `detail`; paired `a`/`b` model/operation generations, `c` optimizer step, `d` OKS AP |
 | `integration.keypoint.display_policy` | Current sample stage, raw/visible detection counts, confidence threshold, and sampled joint count for paired Predict/Live skeletons |

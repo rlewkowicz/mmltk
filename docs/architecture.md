@@ -39,6 +39,7 @@ stop and join; systems retain admission, state, failures and events.
 | [Settings](../src/controller/services/settings/settings_system.h) | Live settings and mutation admission; immutable shell-supplied CUDA inventory remains outside persisted preferences |
 | [Settings store](../src/controller/services/settings/settings_store.h) | Parsing, repair, revision admission and durable writes; `SettingsLocation` owns path bytes across worker calls |
 | [Dataset](../src/controller/subsystems/system/dataset_system.cpp) | Captured compile/inspect requests, cancellation and retained `ArtifactStore` runtime |
+| [Model](../src/controller/subsystems/system/model_system.cpp) | Complete selection identity, cancellable preparation, and admitted detector or training-only encoder facts |
 | [Training](../src/controller/subsystems/train/training_system.cpp) | Sibling CLI via `TrainProcessClient`; history/Resume via `TrainRunStore` |
 | [Validation](../src/controller/subsystems/validate/validation_system.cpp) | Evaluation, metrics, retained samples and captured saving |
 | [Prediction](../src/controller/subsystems/system/predict_system.cpp) | Incremental inference, playback, previews and source-specific output |
@@ -116,6 +117,17 @@ projects canonical descriptors. [Workflow source ownership](rfdetr-workflows.md#
 locates training lanes, metrics, snapshots, optimizer and checkpoints.
 [Training](rfdetr-training.md) owns equations/execution; [merging](model-merging.md)
 owns synchronization, selection and Resume.
+
+[Encoder asset declarations](../src/backend/models/rfdetr/contract/encoder_pretraining.h)
+own immutable source and provenance facts; the preset catalog selects the family.
+[ArtifactStore](../src/controller/services/artifact_store.cpp) owns shared
+[acquisition/cache publication](build.md#model-asset-cache), while the native
+[encoder importer](../src/backend/models/rfdetr/core/encoder_pretraining.cpp)
+owns complete tensor admission and staged adaptation into the model-owned encoder.
+Training owns initialization order and distributed agreement. These boundaries
+keep acquisition out of the backend and resource/execution policy out of reflected
+provenance. [Training initialization](rfdetr-training.md#pretrained-encoder-initialization)
+defines exact behavior.
 
 [GpuBatchPreprocessor](../src/backend/models/rfdetr/core/gpu_batch_preprocessor.h)
 owns reusable normalized inference input; [postprocess](../src/backend/models/rfdetr/core/postprocess.h)
@@ -210,6 +222,14 @@ order. [Application records](application-wire.md#record-shapes) distinguish
 positional transport from named persistence. Encoding measures before reserving,
 checks borrowed map keys as UTF-8, and preserves depth/item/error order. Browser
 records and Rust map keys move owned values rather than copying them.
+
+[Torch archive CBOR](../src/backend/ml/torch/archive_cbor.h) provides bounded
+reflected records inside byte-tensor archive entries. Its ordinary owner checks
+CPU byte type, rank and capacity, retains tensor storage through decoding, and
+normalizes contiguous storage unless the caller requires it. Model state,
+continuation and checkpoint owners retain entry names, domain limits, optionality,
+migrations and errors. The separate [build target](build.md#target-declarations-and-precompiled-headers)
+keeps this shared storage mechanism out of unrelated Torch dependencies.
 
 [Settings persistence](../src/controller/contracts/gui_settings.cpp) structurally
 projects same-name source/UI/training/loading fields and complete

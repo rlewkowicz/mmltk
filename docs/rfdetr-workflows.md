@@ -4,7 +4,7 @@
 
 Train, Validate, Predict and Export share model selection/preparation. An explicit
 [primary action](gui-interaction.md#training-validation-and-prediction) settles
-settings, prepares weights, inspects inputs and starts its owner. Preparation
+settings, prepares model inputs, inspects inputs and starts its owner. Preparation
 errors end that request in session Status. Model-card preparation and workflow
 execution progress remain separate. Each captures its [compute device](gpu-execution.md#workflow-device-selection);
 Train retains ordered multi-GPU and remote-provider execution.
@@ -97,10 +97,10 @@ all 16 presets, topology, resolution, assets, task coefficients and licenses:
 | Detection, PE-Core-T | Atto | 300 |
 | Detection, PE-Core-T | Femto, Pico | 200 |
 | Detection, DINOv2-Base | XLarge, 2XLarge | 300 |
-| Segmentation | Nano, Small | 100 |
-| Segmentation | Medium, Large | 200 |
-| Segmentation | XLarge, 2XLarge | 300 |
-| Keypoints, GroupPose | Keypoint Preview | 100 |
+| Segmentation, DINOv2-Small | Nano, Small | 100 |
+| Segmentation, DINOv2-Small | Medium, Large | 200 |
+| Segmentation, DINOv2-Small | XLarge, 2XLarge | 300 |
+| Keypoints, DINOv2-Small, GroupPose | Keypoint Preview | 100 |
 
 Canonical names use `rf-detr-*`; 2XLarge is `xxlarge`, with `2xlarge` aliases.
 Lookup is case-sensitive and also admits declared upstream class names. Plus
@@ -165,9 +165,40 @@ The [compatibility catalog](../src/controller/contracts/model_selection.h)
 classifies extensions; normal artifact/class admission still applies. These
 cards have no separate backend-kind/Class layout controls. A new custom
 selection clears an unrelated descriptor; CLI/native descriptor routes remain.
-Only Train exposes Transfer/Resume. Dialog confirmation, pending selection and
-preparation are shared behavior with independent workflow widget identities.
+Only Train exposes From scratch and Transfer/Resume. From scratch keeps canonical
+preset selection and disables Custom Weights and both continuation radios.
+Dialog confirmation, pending selection and preparation are shared behavior with
+independent workflow widget identities.
 Failures enter [session Status](gui-interaction.md#session-status).
+
+## Training initialization
+
+Train admits exactly one initialization source:
+
+| Selection | Required input and result |
+| --- | --- |
+| From scratch | Known catalog preset; verified original pretrained base encoder plus a newly seeded RF-DETR detector |
+| Transfer | Detector weights; starts a fresh training session and maps compatible class/joint state |
+| Resume | Complete `session.json`; restores the admitted model and training state exactly |
+
+From scratch is off by default. It supports all 16 presets, requires training and
+validation data, and rejects detector weights, Resume, or a class-layout override
+in the same request. The compiled data supplies class/joint meaning and admitted
+resolution; preset topology, stock task losses and ordinary query policy remain
+in force. A base encoder alone is not a Validate/Predict/Export model.
+
+Preparation acquires the preset's original encoder through the shared
+[model asset cache](build.md#model-asset-cache); Start imports it into the fresh
+model. The [training reference](rfdetr-training.md#pretrained-encoder-initialization)
+owns source mapping, complete-state admission and adaptation. The
+[CLI reference](commands.md#training-request-selection) gives `--from-scratch`
+usage; [Iced controls](gui-interaction.md#scratch-and-continuation-controls) own
+checkbox behavior and selection changes.
+
+Saved scratch-origin sessions Resume without the original encoder file, cache,
+or network. Their emitted detector weights support ordinary Transfer, Validate,
+Predict and Export. Optional [encoder provenance](model-merging.md#encoder-provenance)
+describes origin without changing continuation or model compatibility.
 
 ## Run output directories
 
@@ -278,9 +309,10 @@ trajectories and frozen final selection/test. These are not accuracy guarantees.
 [Whole-session Resume](model-merging.md#whole-session-resume) requires
 `session.json` and the complete immutable generation, even for one model.
 Individual archives/candidates/soups are Transfer/deployment inputs.
-Train's Transfer/Resume radios never start work. Catalog/weights-only inputs use
-Transfer; admitted resumable custom input defaults to Resume. Select and confirm
-`session.json` in Custom Weights; successful native inspection enables Resume.
+Train's Transfer/Resume radios never start work. With From scratch off,
+catalog/weights-only inputs use Transfer; admitted resumable custom input defaults
+to Resume. Select and confirm `session.json` in Custom Weights; successful native
+inspection enables Resume.
 Browse Output selects history only. Saved custom paths use the same inspection/
 Prepare Resume path; CLI accepts `--resume`.
 
@@ -316,7 +348,7 @@ distribution and selected-output metadata.
 
 | File | Contents |
 | --- | --- |
-| `run.json` | Run/attempt, configuration, execution/query facts, catalog/layout, evaluated weights and Resume provenance |
+| `run.json` | Run/attempt, configuration, execution/query facts, catalog/layout, evaluated weights, Resume and optional encoder provenance |
 | `metrics.jsonl` | Append-only typed records, sequence/attempt/role, gaps and progress |
 | `progress.json` | Latest record, retained sources and optional final result for process client |
 | `log.txt` | Epoch summary projections |

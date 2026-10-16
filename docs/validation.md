@@ -14,13 +14,19 @@ after the required final full build, both gate commands must pass in this order:
 ```
 
 Unfiltered `all` runs native, browser JavaScript/Rust, cleanup/declaration,
-log-query, and compositor fixtures. External RF-DETR upstream comparisons and
-historical-session acceptance are opt-in: ordinary `all` and `rfdetr` runs do
-not prepare their data and report those cases as skipped when no explicit
-evidence is supplied. `--with-upstream` explicitly enables preparation;
+log-query, and compositor fixtures. External RF-DETR upstream comparisons,
+encoder-pretraining comparisons and historical-session acceptance are opt-in:
+ordinary runs do not prepare their data and report those cases as skipped when
+no explicit evidence is supplied. `--with-upstream` prepares the full detector
+references and historical session; the separate
+`--with-upstream=encoder-pretraining` selects only encoder evidence preparation.
+Both options apply to `all` or `rfdetr` and are mutually exclusive.
 `--env MMLTK_RFDETR_UPSTREAM_ORACLE_DIR=PATH` and
 `--env MMLTK_RFDETR_BASELINE_SESSION=PATH` reuse existing evidence without
-generating either missing fixture. Full upstream references can exceed 1 TiB;
+generating either missing fixture. Explicit
+`MMLTK_RFDETR_ENCODER_PRETRAINING_DIR` selects existing
+[encoder evidence](#encoder-pretraining-evidence), including its optional Wayland
+lifecycle. Full upstream references can exceed 1 TiB;
 they are tensor snapshots, separate from diagnostic logs. New-model numerical
 acceptance still requires the explicitly selected comparisons to pass.
 Resume failed tests and tidy checks with
@@ -605,6 +611,7 @@ exposes both under `--errors`.
 | `--config release` or `--config dev` | Select the supported native graph |
 | `--env NAME` or `--env NAME=VALUE` | Forward a native-test environment variable; repeatable |
 | `--with-upstream` | With `all` or `rfdetr`, explicitly prepare upstream references and the historical session; full references can exceed 1 TiB |
+| `--with-upstream=encoder-pretraining` | With `all` or `rfdetr`, prepare only encoder evidence unless its explicit directory is already supplied; mutually exclusive with bare `--with-upstream` |
 | `--gdb` | Run one selected native executable in containerized GDB |
 | `--gdb-command COMMAND` | Add an ordered debugger command; also enables GDB |
 | `--headless-compositor` | Use private NVIDIA Weston with `workspace-wayland` |
@@ -643,7 +650,9 @@ phase selection live in
 Compositor startup and process-group teardown have their own bounded waits in
 [headless Wayland](headless-wayland.md).
 
-`workspace-wayland` requires the packaged Release graph and rejects GDB.
+`workspace-wayland` requires the packaged Release graph; GDB additionally requires
+`--headless-compositor`. The debugger wraps the acceptance executable inside the
+private compositor session and returns its child result.
 `browser-app` accepts Cargo test arguments after `--` but does not support
 native executable, environment, or debugger options. Optional prefix selectors
 must precede ordinary Cargo arguments:
@@ -789,14 +798,15 @@ standalone evidence-audit cases also live in this executable.
 | --- | --- |
 | `workspace_wayland_retained` | One H2D: Dataset disclosures/input, real Cancel/restart, capacity growth, integer typing/paste, cached/held-miss gallery/detail returns, Detail-open resize both orientations, augmentation retention, fractional/wrapped/partial rows, wide/tall layouts, native labels/semantics, light/dark copy, Annotate layout/long lists, FPS, rapid changes, SIGINT |
 | `workspace_wayland_sparse` | One H2D: physical compiled slot IDs across holes, exact range editing, gallery/detail selection |
-| `workspace_wayland_workflows` | Three H2D: ordinary Train/Validate/Predict/Export (including video Pause/Resume/EOF/Stop and export cancellation), resized-canvas allocation failure with manual recovery and completed training, and keypoint/catalog/Live workflows described below; each ends with SIGINT |
+| `workspace_wayland_workflows` | Three ordinary H2D: Train/Validate/Predict/Export (including video Pause/Resume/EOF/Stop and export cancellation), resized-canvas allocation failure with manual recovery and completed training, and keypoint/catalog/Live. One additional scratch/Resume lifetime when explicit encoder evidence is supplied; each ends with SIGINT |
 | `workspace_wayland_dpi` | One H2D, scale 1.5: Dataset fixtures, theme/copy, rapid changes |
 | `workspace_wayland_terminal` | Two H2D: real window close and abrupt peer loss after Annotation edit, completed draw, independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D: startup-latched allocation/reset/begin/end probe failures, exact-content recovery, final pixels/semantics |
 | `workspace_wayland_quiet` | Three H2D: blocked reads, completed gesture, and an injected Firefox SIGSEGV followed by rendered interaction in its replacement; diagnostics/reporting/probes inactive |
 | `workspace_wayland_gdr` | One optional GDR lifetime; absent hardware explicitly skips |
 
-Fifteen H2D host lifetimes are required; GDR is independent. Compatible scenarios
+Fifteen H2D host lifetimes run ordinarily; explicit encoder evidence adds one
+scratch/Resume lifetime. GDR is independent. Compatible scenarios
 reuse browsers; startup-latched settings/destructive exits require isolation.
 Window-close uses lifecycle diagnostics without probes. Quiet scenarios retain
 real input pressure, typed control, settlement, and drawn readiness.
@@ -841,6 +851,7 @@ ordinary actions/viewers, sibling CLI, and product systems:
 | Behavior | Required independent observations |
 | --- | --- |
 | Train / GPU cards | Real startup/resize, typed terminals, and curve/progress/theme/narrow pixels; bar capture paired to native image count, hidden-tab later metric sequences; [admitted generation ↔ actual device/rank](logging.md#workflow-gpu-evidence), including pre-progress cancellation and four Output/GPU light layouts plus dark/narrow Train |
+| Scratch / Resume | With explicit encoder evidence: rendered checkbox and Custom/Resume availability before/after toggles, canonical encoder preparation/provenance, fresh native training and bounded Stop, original source removal, saved-session inspection and successful source-independent Resume |
 | Validation | Detail opens during capture and survives successful settlement; closing returns six same-generation samples without reevaluation; canvas may lag metrics. All saved PNGs verified |
 | Confidence / captions | Exact `0.437`, invalid/blank retention, inert arrows/wheel, settled `0→1→0`; [pixel oracle](logging.md#rendered-ui-acceptance-evidence) retains raw detections/clean identity/evaluation generation. Groundtruth/Detections below preview, 20 px spacing, narrow wrap, Advanced text. Seven atlas/detail caption cases cycle GT/Det; actual glyphs and Det-over-GT pixels required |
 | Workflow fixture | Real six-query detector calibrated against selected proposals to overlap captions; Validation FP32 matches calibration, Train still updates actual model. Native completion/caption cache alone proves no drawing |
@@ -874,6 +885,14 @@ class/joint layout. UI completion alone is insufficient; the
 [artifact verifier](../src/acceptance/tests/workflow_wayland_inputs.cpp) owns these
 checks. [Diagnostic records](logging.md#rendered-ui-acceptance-evidence) retain
 the corresponding paths and identities.
+
+The optional [scratch driver](../src/frontend/iced/src/integration_control/workflows/scratch.rs)
+uses the same ordinary controls. Native verification checks saved configuration,
+class layout, initialization, provenance and cleared launch paths independently
+of frontend completion. The [encoder fixture](#shared-fixtures-and-evidence)
+admits all original assets before running; missing environment alone skips,
+while an explicitly empty, missing or invalid path fails. No Wayland route
+generates references or downloads an evidence fixture.
 
 The [physical ledger](logging.md#physical-presentation-evidence) requires inventories,
 exact transfers/acquisitions, mode-specific settlement, encoded/submitted draws,
@@ -1050,6 +1069,7 @@ coverage, not a record that the current checkout passed these cases:
 | Source | Required evidence |
 | --- | --- |
 | [layers/tests/ms_deform_attn.test.cpp](../src/backend/ml/layers/tests/ms_deform_attn.test.cpp) | Custom CUDA attention, exact support boundaries, nonfinite propagation, chunk tails, dispatcher capture and mixed-precision replay/VJPs |
+| [core/tests/encoder_pretraining.test.cpp](../src/backend/models/rfdetr/core/tests/encoder_pretraining.test.cpp) | Bounded safetensors/integrity admission, exact source coverage, transactional initialization and nonencoder preservation, patch/position identity and adaptation; explicit independent references for all 16 presets |
 | [core/tests/upstream_model_parity.test.cpp](../src/backend/models/rfdetr/core/tests/upstream_model_parity.test.cpp) | Actual pinned upstream model/resize artifacts, complete fixed-cotangent VJPs, discrete identities, and numerical-policy admission |
 | [training/tests/upstream_optimizer_parity.test.cpp](../src/backend/models/rfdetr/training/tests/upstream_optimizer_parity.test.cpp) | Actual upstream criterion at matched weights, complete gradients/clipping, identical-gradient production AdamW state/updates, and separately measured independent trajectories |
 | [core/tests/upstream_training_parity.test.cpp](../src/backend/models/rfdetr/core/tests/upstream_training_parity.test.cpp) | Independent geometry/epsilon/promotion equations and VJPs; categorical half-pixel sampling; representation-specific empty masks; learned encoder projection; grouped classification/box and dense/sparse mask objectives; full-domain nonfinite matcher sanitization; depthwise AMP derivatives and updates; direct DN mask equations |
@@ -1058,14 +1078,14 @@ coverage, not a record that the current checkout passed these cases:
 | [core/tests/selective_compilation.test.cpp](../src/backend/models/rfdetr/core/tests/selective_compilation.test.cpp) | First recording and retained live weights, signature/tail fallback, transactional replacement, dynamic query extents, direct grouped/DN SDPA and independent decoder-tail derivatives with outstanding backwards |
 | [core/tests/full_compilation.test.cpp](../src/backend/models/rfdetr/core/tests/full_compilation.test.cpp) | First-real-forward full tracing with custom CUDA/depthwise operators, replay/VJPs, signature/mode/owner changes, output inventory and explicit supervision restrictions |
 | [training/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/training/tests/training_supervision.test.cpp) | Production Hungarian/Match-Free and optional DN, FP32/FP16/BF16, empty images, accumulated updates, eager/selective values/RNG/live state; target-ring reuse and delayed backward protection, partial DMA failure, selected donor uploads, next-batch preparation with exact continuation and parameter versions |
-| [inference/tests/prediction_session.test.cpp](../src/backend/models/rfdetr/inference/tests/prediction_session.test.cpp) | Native weights compilation-request propagation, file-image resampling, incremental inference, and export snapshot isolation including failed publication |
+| [inference/tests/prediction_session.test.cpp](../src/backend/models/rfdetr/inference/tests/prediction_session.test.cpp) | Native weights compilation-request propagation, file-image resampling, incremental inference, export snapshot isolation including failed publication, and scratch-origin prediction/validation after encoder-source removal |
 | [training/tests/execution_policy.test.cpp](../src/backend/models/rfdetr/training/tests/execution_policy.test.cpp) | Literal SGD warmup exit/round-even behavior, native schedule reference clocks, final-epoch latches, sparse membership/repeats, semantic samples, and donor identity |
 | [training/tests/training_gradient_reducer.test.cpp](../src/backend/models/rfdetr/training/tests/training_gradient_reducer.test.cpp) | Logical objective across physical capacities, early-bucket overlap, direct exclusive-gradient storage and alias isolation, exact count-wave/attempt admission, cross-stream count/metric completion, cancellation, partial failure and physical collective custody |
 | [augmentation/tests/gpu_augment.test.cpp](../src/backend/models/rfdetr/augmentation/tests/gpu_augment.test.cpp) | Deterministic prepared identities/donors, RGB/output-domain paths, high-water reuse, host staging retirement before delayed pixels, exact visible support and erasure geometry, continuous boxes with empty raster masks, failure custody |
-| [training/tests/distributed_training.test.cpp](../src/backend/models/rfdetr/training/tests/distributed_training.test.cpp) | Two selected physical GPUs: global objective/update equivalence, uneven/empty-rank contributions, early NCCL overlap, and cancellation/failure retirement |
+| [training/tests/distributed_training.test.cpp](../src/backend/models/rfdetr/training/tests/distributed_training.test.cpp) | Two selected physical GPUs: global objective/update equivalence, uneven/empty-rank contributions, early NCCL overlap, cancellation/failure retirement, shared scratch initialization/source-independent Resume and peer retirement after rank-zero import failure |
 | [training/tests/distributed_placement.test.cpp](../src/backend/models/rfdetr/training/tests/distributed_placement.test.cpp) | Independent known/unknown GPU locality resolution and explicit rank placement |
-| [training/tests/model_merging.test.cpp](../src/backend/models/rfdetr/training/tests/model_merging.test.cpp) | Native averaging, cadence and zero intervals, final policies/ties/duplicates, finite mask metrics, immutable publication faults, whole-session leases and replaced/mixed artifact rejection |
-| [training/tests/training_continuation.test.cpp](../src/backend/models/rfdetr/training/tests/training_continuation.test.cpp) | Exact restoration/inventory, SGD held values, schedules/offsets/donor support, named optimizer/EMA state, applied epoch policies, and independently recomputed family trajectories |
+| [training/tests/model_merging.test.cpp](../src/backend/models/rfdetr/training/tests/model_merging.test.cpp) | Native averaging, cadence and zero intervals, final policies/ties/duplicates, finite mask metrics, unanimous contributing encoder provenance, immutable publication faults, whole-session leases and replaced/mixed artifact rejection |
+| [training/tests/training_continuation.test.cpp](../src/backend/models/rfdetr/training/tests/training_continuation.test.cpp) | Exact restoration/inventory, SGD held values, schedules/offsets/donor support, named optimizer/EMA state, applied epoch policies, independently recomputed family trajectories, legacy launch-field migration and scratch-origin Resume/Transfer without the source encoder |
 | [core/tests/inference_lanes.test.cpp](../src/backend/models/rfdetr/core/tests/inference_lanes.test.cpp) | Bounded lanes, ordered delivery, source-copy release, backpressure, failure, and drain |
 
 Two-GPU cases require two eligible CUDA devices and report a skip when that
@@ -1074,6 +1094,11 @@ or cross-rank cancellation. Controller/contract and frontend fixtures also
 cover recipe projection, source-specific live/saved metrics, selected-output
 metadata, and whole-session capability admission. These cases remain inside
 the existing `all` gate; they add no plan-specific acceptance command.
+CLI [runtime cases](../src/entrypoints/cli/tests/cli_runtime.test.cpp) reject
+ambiguous scratch sources before acquisition and exercise verified source reuse
+plus source-independent Resume. Original-asset cases require the explicit
+encoder directory below; synthetic decoder, request, persistence and selection
+cases run without it.
 
 The data suite's [roundtrip cases](../src/backend/data/tests/roundtrip.test.cpp)
 exercise reordered/repeated source reads with preserved destinations, an upload
@@ -1157,12 +1182,14 @@ evidence fails admission.
 | `--case ID --backward-operators` | Bounded intermediate gradient diagnostics; disabled by default |
 | `--case ID --export-reference` | Prepared CPU/CUDA controls and an actual pinned upstream ONNX artifact for one controlled FP32 batch-one case; disabled by default |
 | `--inventory-only` | Verify/download official assets; topology/class/joint/tensor metadata, no product build/forward/training/comparisons |
+| `--encoder-pretraining-only` | Original encoder acquisition, bounded references for all presets and independent CPU/CUDA controls; [separate native comparison](#encoder-pretraining-evidence) |
 | `--build-only` | Prepare isolated image/environment only, no weights/source checkout/numerical execution |
 
 Admission requires clean core/Plus sources (including untracked files) at
 [`rfdetr_sources.json`](../tools/oracle/rfdetr_sources.json) revisions/trees.
 Omitted paths use managed pins; omitted output uses capability-addressed cache.
-Inventory verifies all sixteen official assets in cache `mmltk/weights`.
+Inventory verifies all sixteen official detector assets in the
+[shared model cache](build.md#model-asset-cache).
 Command-local Git trust/read-only metadata supports linked/differently owned
 checkouts without global changes. Numerical work binds source/weight identities,
 uses the [pinned donor image](build.md#upstream-reference-image), and has a
@@ -1234,6 +1261,96 @@ directories; use a fresh destination for missing cases.
 reference for upstream-to-upstream observation; normal diagnostics do not need
 it. [Comparison logging](logging.md#upstream-numerical-comparisons) owns fields,
 retries, and queries.
+
+### Encoder pretraining evidence
+
+Prepare this selected mode independently of the full detector/training oracle:
+
+```bash
+./mmltk --diagnose-rfdetr-upstream --encoder-pretraining-only \
+  --output build/validation/encoder-pretraining
+./mmltk --test rfdetr --executable mmltk_backend_models_rfdetr_core_tests \
+  --env MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=/workspace/build/validation/encoder-pretraining \
+  -- '[encoder_pretraining_oracle]'
+```
+
+Alternatively, `./mmltk --test rfdetr --with-upstream=encoder-pretraining`
+prepares encoder evidence and runs the selected suite. It uses an explicit
+encoder directory when supplied, without regenerating missing content.
+Bare `--with-upstream` retains its full upstream-reference and historical-session
+meaning; the two preparation selections cannot be combined. Encoder-only mode
+rejects `--inventory-only`, `--case`, `--backward-operators` and
+`--export-reference` combinations. Like the full producer, it admits clean pinned
+core/Plus sources and the [isolated donor environment](build.md#upstream-reference-image);
+it requires FP32 CUDA controls, without requiring FP16/BF16 support.
+
+An explicitly exported host directory is forwarded into ordinary `all`, `rfdetr`
+and `workspace-wayland`, translated to its host mount in the container. This
+enables the required complete gates without changing their commands:
+
+```bash
+export MMLTK_RFDETR_ENCODER_PRETRAINING_DIR="$PWD/build/validation/encoder-pretraining"
+./mmltk --test all
+./mmltk --test workspace-wayland --headless-compositor
+```
+
+Explicit `--env MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=PATH` instead expects a
+container-visible path and can override the ambient selection. Absence skips
+external encoder cases. Native comparison rejects an explicitly empty, missing,
+corrupt or incompatible directory; lifecycle fixtures require manifest presence
+and exact integrity of all three original assets. Environment forwarding never
+schedules generation.
+
+The [producer](../tools/oracle/generate_rfdetr_upstream_oracle.cpp) consumes the
+compiled [native catalog projection](../tools/oracle/native_catalog.cpp), loads
+each complete original source strictly through its upstream Transformers/timm
+model, and adapts it through pinned upstream operators. It produces these files:
+
+| Evidence | Ownership and format |
+| --- | --- |
+| `assets/<BackboneKind>.safetensors` | Three verified original source files copied from the shared asset cache |
+| `references/<preset>.safetensors` | Sixteen deterministic input/adapted-state/feature payloads, including independent controls |
+| `manifest.json` | `mmltk.rfdetr.encoder-pretraining.v1`, mode `encoder-pretraining`, status `encoder_references_complete_native_comparison_pending` |
+| `encoder-control-calibration.json` | Producer's execution/numerical policy, per-preset independent controls and failures; written before the completed manifest |
+| `encoder-comparison.json` | Native `mmltk.rfdetr.encoder-pretraining-comparison.v1` receipt, atomically replaced from `incomplete` to `passed_encoder_initialization` only after all checks |
+
+The manifest binds source revisions/hashes, asset/tensor inventories, native
+catalog/configuration, dependency and producer identities, resize-operator
+sources, execution/precision policy and all reference hashes. Failed independent
+controls prevent completed-manifest publication. Producer completion alone is
+not native comparison success; this mode does not emit the full oracle verdict.
+
+Import upstream model modules before setting precision: those imports can change
+matmul policy. This mode sets the pinned donor's current `fp32_precision="ieee"`
+controls globally and for CUDA matmul, cuDNN and CPU MKLDNN operations, with
+`TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0`, no gradients and math-only SDPA. It records
+and rechecks these controls without mixing legacy `allow_tf32` or
+`set_float32_matmul_precision` APIs. Independent controls compare CPU FP32 patch
+adaptation with FP64 pseudoinverse results and upstream CPU with CUDA FP32 features.
+
+Native [comparison cases](../src/backend/models/rfdetr/core/tests/encoder_pretraining.test.cpp)
+require exact hashes/shapes for unchanged encoder tensors, exact prefix tokens,
+complete source coverage, staged adaptation and unchanged detector state. Adapted
+state uses `atol=3e-5, rtol=3e-4`; feature controls/comparisons use `rtol=5e-4`
+with `atol=5e-4` for DINOv2 and `2e-3` for PE. Bounds are fixed by independent
+controls before native comparison. The native feature check runs CPU math;
+upstream CPU/CUDA controls separately establish its numerical reference.
+
+All 16 presets retain their actual patch and stored-position geometry, with
+bounded batch-one runtime side `4 × patch_size × num_windows`. This evidence
+covers encoder initialization and bounded features, not full detector training,
+stock-resolution performance, default accelerator trajectories or convergence.
+Actual CUDA training, saved-state Resume/Transfer, CLI, inference and rendered
+Wayland lifecycle are covered by their existing optional original-asset cases.
+
+Retain reference tensors until every selected numerical consumer finishes, then
+remove generated payloads while preserving manifests, calibration/comparison
+receipts and retention metadata. Keep original `assets/` through all training,
+CLI, inference and Wayland consumers; the shared asset cache is separately
+reusable. A directory with retired reference tensors can support original-asset
+lifecycle cases, but cannot rerun the complete encoder comparison. Missing
+payloads are never regenerated implicitly; preparation rejects a
+`retention.json`-marked directory, so use a fresh destination for fresh references.
 
 ### Numerical gates and trajectory observations
 
@@ -1435,6 +1552,7 @@ their owning components and publish their own declaration dependencies.
 | [Dataset fixture](../src/backend/data/tests/test_fixture.h) | Synthetic inputs, one canonical compiler configuration, and compilation of existing deliberately modified inputs |
 | [NUMA topology support](../src/common/system/tests/numa_topology_test_support.h) | Value-only selection from a caller-captured topology; each scenario retains its own snapshot and worker budget |
 | [ClassArtifactFixture](../src/backend/models/rfdetr/core/tests/class_artifact_fixture.h) | RF-DETR artifact/descriptor seeding and independent SHA-256 preservation checks, including absence of staged directories |
+| [Encoder training fixture](../src/backend/models/rfdetr/training/tests/encoder_training_fixture.h) | Optional evidence admission with exact integrity of all three originals, bounded compiled datasets, scratch requests and source aliases; shared by training, inference, CLI and Wayland, with no acquisition or controller dependency |
 | [Application data support](../src/controller/subsystems/system/tests/application_data_test_support.h) | Data/compute inspection fixtures and their domain facts |
 
 Torch-backed test consumers use

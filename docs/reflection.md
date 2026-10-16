@@ -56,6 +56,16 @@ Keep the type, initializer, equality and registration explicit. Register the
 header with its CMake owner; consumers inherit that owner's compile requirements.
 Header isolation checks independence from PCHs and preceding includes.
 
+For a genuine structural relation, use
+[StaticMemberRelation](../src/frameworks/reflection/include/mmltk/frameworks/reflection/member_relation.h)
+with typed member paths. Derive the expected destination count from its reflected
+declaration and validate complete destination coverage in the owning materialization.
+`ConstantMemberRelationEntry` can supply a typed constant without inventing a source
+member or editable field identity. Visitors distinguish constants from source
+relations; consumers share that projection instead of maintaining another field
+list. [Model selection](application-wire.md#canonical-declarations-and-generator-ownership)
+uses this for workflow-specific settings and constant facts.
+
 ## Short annotation syntax
 
 [declaration_annotations.h](../src/frameworks/reflection/declaration_annotations.h)

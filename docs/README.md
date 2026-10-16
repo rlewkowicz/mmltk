@@ -6,10 +6,10 @@
 
 | Guide | Use it for |
 | --- | --- |
-| [Build](build.md) | Bootstrap, toolchains, packaging, generated files, and caches |
+| [Build](build.md) | Bootstrap, toolchains, packaging, generated files, and build/model caches |
 | [Commands](commands.md) | Wrapper, application CLI, process inspection, and model tooling |
-| [RF-DETR workflows](rfdetr-workflows.md) | Models, inputs, outputs, training artifacts, validation, prediction, and export |
-| [Merging and continuation](model-merging.md) | Session formats, Resume, Transfer, averaging, and final selection |
+| [RF-DETR workflows](rfdetr-workflows.md) | Model selection, scratch/Transfer/Resume, inputs, outputs, validation, prediction, and export |
+| [Merging and continuation](model-merging.md) | Session formats, provenance, Resume, Transfer, averaging, and final selection |
 
 ## Architecture and frameworks
 
@@ -24,7 +24,7 @@
 
 | Guide | Use it for |
 | --- | --- |
-| [RF-DETR training](rfdetr-training.md) | Objectives, recipes, lanes, precision, and native compilation |
+| [RF-DETR training](rfdetr-training.md) | Encoder initialization, objectives, recipes, lanes, precision, and native compilation |
 | [Datasets](datasets.md) | Directory inputs, compiled formats, keypoints, augmentation, and resampling |
 | [Compilation execution](compile-execution.md) | Scheduling, pinned storage, cancellation, and file settlement |
 | [Benchmark datasets](benchmark-datasets.md) | Recipe selection, mask recovery, progress, cache formats, repair, and compiler internals |
@@ -35,7 +35,7 @@
 
 | Guide | Use it for |
 | --- | --- |
-| [Validation](validation.md) | Focused tests, tidy, deduplication, numerical gates, profiles, and acceptance |
+| [Validation](validation.md) | Focused tests, tidy, deduplication, upstream/encoder evidence, numerical gates, profiles, and acceptance |
 | [Headless Wayland](headless-wayland.md) | Private NVIDIA Weston setup, input, readiness, deadlines, and shutdown |
 | [Logging](logging.md) | Transcripts, opt-in diagnostics, fatal reports, log queries, and artifact custody |
 
