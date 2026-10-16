@@ -152,6 +152,9 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  MMLTK_MAX_PATH_BYTES std::filesystem::path weights_path;
  MMLTK_MAX_PATH_BYTES std::filesystem::path class_layout_path;
  MMLTK_MAX_PATH_BYTES std::filesystem::path resume_path;
+ // Launch-only base encoder input, resolved by acquisition before training.
+ MMLTK_MAX_PATH_BYTES std::filesystem::path encoder_weights_path;
+ bool from_scratch = false;
  MMLTK_MAX_PATH_BYTES MMLTK_RUNTIME_DESTINATION std::filesystem::path output_dir;
  MMLTK_MAX_NAME_BYTES MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Preset)
   // CLEANUP-IGNORE: Preset metadata is deliberately repeated on the Train field consumed by reflection.

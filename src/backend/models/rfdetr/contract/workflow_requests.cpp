@@ -73,12 +73,16 @@ void validate_train_request(const TrainRequest& request) {
  if (request.train_compiled_path.empty() || request.val_compiled_path.empty() || request.output_dir.empty()) {
   throw std::runtime_error("RF-DETR train requires --train-compiled, --val-compiled, and --output-dir");
  }
- const std::size_t input_count = static_cast<std::size_t>(!request.weights_path.empty()) + static_cast<std::size_t>(!request.resume_path.empty());
+ if (request.from_scratch && (find_preset_catalog_entry(request.preset_name) == nullptr || !request.class_layout_path.empty())) {
+  throw std::runtime_error("rfdetr train --from-scratch requires a known --preset and no --class-layout");
+ }
+ if (!request.from_scratch && !request.encoder_weights_path.empty()) throw std::runtime_error("encoder weights are valid only for --from-scratch training");
+ const std::size_t input_count = static_cast<std::size_t>(!request.weights_path.empty()) + static_cast<std::size_t>(!request.resume_path.empty()) + static_cast<std::size_t>(request.from_scratch);
  const bool distributed = request.distributed_worker ? request.distributed_rank >= 0 && request.distributed_world_size > 1 && !request.distributed_store_path.empty()
                                                      : request.distributed_rank == 0 && request.distributed_world_size == 1 && request.distributed_store_path.empty();
  if (input_count != 1U || !gpu_augmentation_config_valid(request.gpu_augmentation) || !mmltk::frameworks::reflection::unique_nonnegative_identifiers(request.device_ids) ||
      !mmltk::frameworks::reflection::enum_contains(request.recipe.lr_scheduler) || !distributed) {
-  throw std::runtime_error("rfdetr train requires train/validation data, output, and one checkpoint input");
+  throw std::runtime_error("rfdetr train requires train/validation data, output, and exactly one of --weights, --from-scratch, or --resume");
  }
 }
 std::string encode_train_request_json(const TrainRequest& request) {

@@ -128,7 +128,9 @@ Model weights → native average → every model on every GPU
                 Optimizers and other training state stay per model
 ```
 
-Models share a verified initialization while retaining independent trajectories.
+Fresh task models may initialize from a pretrained base encoder with new detector
+weights. Models share a verified initialization while retaining independent
+trajectories.
 Logical batches and training semantics survive changes in physical concurrency.
 Periodic averaging weights models by images in successful updates. Validation
 and final selection use a common evaluation context independently of merge
@@ -147,9 +149,9 @@ Retained model candidates → native selection / weight averaging
                                              └─ Transfer
 ```
 
-Resume restores the complete session; Transfer maps deployment weights by class
-meaning. Final test consumes the frozen selection. Metrics and persistence
-progress independently of browser rendering.
+Resume restores the complete session independently of its initialization source;
+Transfer maps deployment weights by class meaning. Final test consumes the frozen
+selection. Metrics and persistence progress independently of browser rendering.
 
 Inference workflows own bounded parallel lanes with ordered delivery. Immutable
 weights may be shared; each lane retains its mutable execution and storage.

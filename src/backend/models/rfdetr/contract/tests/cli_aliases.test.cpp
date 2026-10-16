@@ -339,3 +339,26 @@ TEST_CASE("Validation CLI lane limits share native request admission", "[rfdetr]
   CHECK(invalid.output_text.find("unknown option") == std::string::npos);
  }
 }
+TEST_CASE("scratch CLI exposes the choice and keeps encoder launch paths internal", "[rfdetr][cli][encoder_pretraining]") {
+ namespace cli = mmltk::entrypoints::cli::rfdetr_options;
+ namespace reflection = mmltk::frameworks::reflection;
+ const auto parsed = reflection::parse<cli::TrainCliRequest>(std::array<std::string_view, 3>{"--from-scratch", "--preset", "rf-detr-nano"}, cli::kTrainOptions);
+ REQUIRE(parsed);
+ CHECK(parsed->request.request.from_scratch);
+ CHECK(parsed->request.request.preset_name == "rf-detr-nano");
+ CHECK(parsed->request.request.encoder_weights_path.empty());
+ const auto disabled = reflection::parse<cli::TrainCliRequest>(std::array<std::string_view, 1>{"--from-scratch=false"}, cli::kTrainOptions);
+ REQUIRE(disabled);
+ CHECK_FALSE(disabled->request.request.from_scratch);
+ const auto hidden = reflection::parse<cli::TrainCliRequest>(std::array<std::string_view, 2>{"--encoder-weights-path", "/encoder"}, cli::kTrainOptions);
+ CHECK_FALSE(hidden);
+ const auto help = run_train_options({"--help"});
+ CHECK(help.exit_code == 0);
+ CHECK(help.output_text.find("--from-scratch") != std::string::npos);
+ CHECK(help.output_text.find("Pretrained base encoder") != std::string::npos);
+ CHECK(help.output_text.find("--encoder-weights-path") == std::string::npos);
+ require_missing_training_input(run_train_options({"--from-scratch", "--preset", "rf-detr-nano"}));
+ const auto exclusive = run_train_options({"--request-json", "{}", "--from-scratch"});
+ CHECK(exclusive.exit_code == 1);
+ CHECK(exclusive.output_text.find("mutually exclusive") != std::string::npos);
+}

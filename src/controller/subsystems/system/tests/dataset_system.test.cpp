@@ -43,6 +43,7 @@ services::RuntimeDiagnosticTarget detached_diagnostic_target(services::Diagnosti
 class UnusedWeightOperations final : public services::ArtifactWeightOperations {
 public:
  [[nodiscard]] std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { return std::nullopt; }
+ [[nodiscard]] std::optional<services::ArtifactWeightAsset> find(mmltk::backend::models::rfdetr::BackboneKind) const override { return std::nullopt; }
  void download(std::string_view, const std::filesystem::path&, const services::ArtifactCancellationToken&, services::ArtifactWeightProgressObserver) const override {}
 };
 class DiagnosticCompiler final : public services::ArtifactCompilerOperations {

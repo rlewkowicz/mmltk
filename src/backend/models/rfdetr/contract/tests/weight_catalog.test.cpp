@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -11,6 +12,7 @@
 #include "src/backend/models/rfdetr/contract/cli.h"
 #include "src/backend/models/rfdetr/contract/contract.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/encoder_pretraining.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 namespace {
@@ -217,4 +219,90 @@ TEST_CASE("RF-DETR supervision capabilities do not admit malformed topology", "[
  SECTION("keypoint head for detection") { config.keypoint_head = KeypointHeadKind::GroupPose; }
  CHECK(training_supervision_model_config_valid(config));
  CHECK_FALSE(native_model_config_valid(config));
+}
+TEST_CASE("base encoder assets cover every backbone without becoming detector weights", "[backend][models][rfdetr][contract][encoder_pretraining]") {
+ using namespace mmltk::backend::models::rfdetr;
+ REQUIRE(kEncoderPretrainingAssets.size() == 3U);
+ CHECK(encoder_pretraining_catalog_is_valid());
+ for (const auto& preset : kPresetCatalog) {
+  INFO(preset.preset_name);
+  const auto* asset = find_encoder_pretraining_asset(preset.backbone.kind);
+  REQUIRE(asset != nullptr);
+  CHECK(asset->geometry.dimension == preset.backbone.dimension);
+  CHECK(asset->geometry.feedforward_dimension == preset.backbone.feedforward_dimension);
+  CHECK(asset->geometry.heads == preset.backbone.heads);
+  CHECK(asset->geometry.layers == preset.backbone.layers);
+  CHECK(asset->geometry.register_tokens == 0U);
+  CHECK(find_weight_asset(asset->filename) == nullptr);
+  CHECK(asset->download_url != preset.canonical_weight_url);
+  const bool pe = preset.backbone.kind == BackboneKind::PeCoreTiny;
+  CHECK(asset->geometry.patch_size == (pe ? 16U : 14U));
+  CHECK(asset->geometry.position_grid == (pe ? 24U : 37U));
+  CHECK(asset->geometry.mask_token == !pe);
+  CHECK(encoder_pretraining_provenance_valid(encoder_pretraining_provenance(*asset)));
+ }
+ for (std::size_t index = 0; index < kEncoderPretrainingAssets.size(); ++index) {
+  const auto& asset = kEncoderPretrainingAssets[index];
+  CHECK(asset.filename == "model.safetensors");
+  for (std::size_t sibling = index + 1U; sibling < kEncoderPretrainingAssets.size(); ++sibling) {
+   CHECK(asset.source_repository != kEncoderPretrainingAssets[sibling].source_repository);
+   CHECK(asset.sha256 != kEncoderPretrainingAssets[sibling].sha256);
+  }
+ }
+ CHECK(find_encoder_pretraining_asset(static_cast<BackboneKind>(255U)) == nullptr);
+ auto historical = encoder_pretraining_provenance(kEncoderPretrainingAssets.front());
+ historical.asset_id = "publisher/retired-source";
+ historical.source_revision.assign(40U, '0');
+ CHECK(encoder_pretraining_provenance_valid(historical));
+ historical.sha256[0] = 'g';
+ CHECK_FALSE(encoder_pretraining_provenance_valid(historical));
+}
+TEST_CASE("training source admission distinguishes Transfer scratch and Resume", "[backend][models][rfdetr][contract][encoder_pretraining]") {
+ using namespace mmltk::backend::models::rfdetr;
+ TrainRequest request;
+ CHECK_FALSE(request.from_scratch);
+ CHECK(request.encoder_weights_path.empty());
+ request.train_compiled_path = "/train.bin";
+ request.val_compiled_path = "/val.bin";
+ request.output_dir = "/output";
+ for (const bool scratch : {false, true}) for (const bool weights : {false, true}) for (const bool resume : {false, true})
+  for (const bool layout : {false, true}) for (const bool encoder : {false, true}) for (const std::string_view preset : {"", "unknown", "rf-detr-nano"}) {
+   request.from_scratch = scratch;
+   request.weights_path = weights ? "/detector.pt" : "";
+   request.resume_path = resume ? "/session" : "";
+   request.class_layout_path = layout ? "/layout.json" : "";
+   request.encoder_weights_path = encoder ? "/encoder.safetensors" : "";
+   request.preset_name = preset;
+   INFO("scratch=" << scratch << " weights=" << weights << " resume=" << resume << " layout=" << layout << " encoder=" << encoder << " preset=" << preset);
+   const bool accepted = (static_cast<int>(scratch) + static_cast<int>(weights) + static_cast<int>(resume) == 1) && (!scratch || (preset == "rf-detr-nano" && !layout)) && (scratch || !encoder);
+   if (accepted) CHECK_NOTHROW(validate_train_request(request));
+   else CHECK_THROWS(validate_train_request(request));
+  }
+ request.weights_path.clear();
+ request.resume_path.clear();
+ request.class_layout_path.clear();
+ request.from_scratch = true;
+ for (const auto& preset : kPresetCatalog) {
+  request.preset_name = preset.preset_name;
+  CHECK_NOTHROW(validate_train_request(request));
+ }
+ const auto encoded = encode_train_request_json(request);
+ CHECK(decode_train_request_json(encoded) == request);
+ auto document = nlohmann::json::parse(encoded);
+ CHECK(document.at("from_scratch") == true);
+ CHECK(document.at("encoder_weights_path") == "/encoder.safetensors");
+ document["from_scratch"] = "true";
+ CHECK_THROWS(decode_train_request_json(document.dump()));
+ document["from_scratch"] = true;
+ document["encoder_weights_path"] = 7;
+ CHECK_THROWS(decode_train_request_json(document.dump()));
+ document["encoder_weights_path"] = std::string(4097U, 'x');
+ CHECK_THROWS(decode_train_request_json(document.dump()));
+ request.from_scratch = false;
+ request.encoder_weights_path.clear();
+ request.weights_path = "/detector.pt";
+ const auto transfer = decode_train_request_json(encode_train_request_json(request));
+ CHECK_FALSE(transfer.from_scratch);
+ CHECK(transfer.encoder_weights_path.empty());
+ CHECK(transfer == request);
 }

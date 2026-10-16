@@ -229,6 +229,7 @@ inline constexpr std::array kTrainOptions{
  MMLTK_CLI_NAMED(Train, val_compiled_path, "--val-compiled", "Compiled validation split", "Dataset"), MMLTK_CLI_NAMED(Train, test_compiled_path, "--test-compiled", "Compiled test split", "Dataset"),
  MMLTK_CLI_OPTION(Train, resolution, "Square model input resolution", "Dataset"), MMLTK_CLI_OPTION(Train, output_dir, "Output directory", "Checkpoint"),
  MMLTK_CLI_NAMED(Train, weights_path, "--weights", "Source checkpoint", "Checkpoint"), MMLTK_CLI_NAMED(Train, resume_path, "--resume", "Native checkpoint to resume", "Checkpoint"),
+ MMLTK_CLI_OPTION(Train, from_scratch, "Pretrained base encoder with new RF-DETR detector weights (requires --preset)", "Checkpoint"),
  MMLTK_CLI_NAMED(Train, preset_name, "--preset", "Declared preset", "Checkpoint"), MMLTK_CLI_OPTION(Train, num_queries, "Native query count", "Checkpoint"),
  MMLTK_CLI_OPTION(Train, batch_size, "Global microbatch image count", "Optimization"), MMLTK_CLI_OPTION(Train, val_batch_size, "Validation batch size", "Optimization"),
  MMLTK_CLI_OPTION(Train, epochs, "Epoch count", "Optimization"), MMLTK_CLI_OPTION(Train, grad_accum_steps, "Gradient accumulation", "Optimization"),
@@ -317,6 +318,7 @@ static_assert((reflection::audit_descriptors(kEvaluateOptions), true));
 static_assert((reflection::audit_descriptors(kPredictOptions, kPredictUnexposed), true));
 static_assert((reflection::audit_descriptors(kValidateOptions), true));
 inline constexpr std::array kTrainUnexposed{
+ reflection::unexposed<TrainCliRequest, Train::path<&TrainRequest::encoder_weights_path>>("acquisition resolves the internal encoder path; request JSON carries it to workers"),
  reflection::unexposed<TrainCliRequest, Train::path<&TrainRequest::lane_configuration, &TrainLaneConfiguration::models>>("--request-json owns the complete model recipes and identities"),
  reflection::unexposed<TrainCliRequest, Train::path<&TrainRequest::lane_configuration, &TrainLaneConfiguration::next_model_id>>("--request-json owns the model identity frontier"),
  reflection::unexposed<TrainCliRequest, Train::path<&TrainRequest::lane_configuration, &TrainLaneConfiguration::merge_rounds>>("--request-json owns the complete merge policy"),

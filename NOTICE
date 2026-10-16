@@ -185,3 +185,25 @@ EVA and EVA02 model contributions retain Copyright (c) 2022 and 2023
 BAAI-Vision; the timm modifications retain Copyright 2023 Ross Wightman.
 Source: https://github.com/huggingface/pytorch-image-models/tree/v1.0.27
 The packaged Apache-2.0 license is retained in LICENSE.
+
+Pretrained base encoder assets
+-------------------------------
+
+DINOv2 Small and Base weights: Copyright (c) Meta Platforms, Inc. and
+affiliates. Released under the Apache License, Version 2.0.
+Sources: https://huggingface.co/facebook/dinov2-small
+         https://huggingface.co/facebook/dinov2-base
+         https://github.com/facebookresearch/dinov2
+
+PE-Core-T vision weights: Copyright (c) Meta Platforms, Inc. and affiliates.
+The Perception Encoder checkpoints are released under the Apache License,
+Version 2.0. The acquired vision-only safetensors conversion is published by
+timm (Ross Wightman and contributors), also marked Apache-2.0.
+Sources: https://huggingface.co/timm/vit_pe_core_tiny_patch16_384.fb
+         https://huggingface.co/facebook/PE-Core-T16-384
+         https://github.com/facebookresearch/perception_models/tree/main/apps/pe
+
+The canonical immutable source identities and integrity pins are maintained in
+src/backend/models/rfdetr/contract/encoder_pretraining.h. The Apache-2.0 license
+is retained in LICENSE. Base encoder attribution does not replace the RF-DETR,
+RF-DETR+, or timm implementation notices above.

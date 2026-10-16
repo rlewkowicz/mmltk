@@ -9,6 +9,7 @@
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/backend/models/rfdetr/contract/encoder_pretraining.h"
 #include "src/common/io/path_publication.h"
 #include "src/common/io/staging_directory.h"
 #include "src/common/system/cpu_affinity.h"
@@ -219,17 +220,25 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
  if (!value.starts_with(kHttps) || value.size() <= kHttps.size() || value.size() > contracts::kArtifactPathCapacity) return false;
  return std::ranges::all_of(value, [](const unsigned char byte) { return !std::iscntrl(byte) && !std::isspace(byte); });
 }
-[[nodiscard]] bool valid_weight_md5(const std::string_view value) noexcept {
- return value.size() == 32U && std::ranges::all_of(value, [](const unsigned char byte) { return std::isxdigit(byte); });
+[[nodiscard]] bool valid_weight_digest(const ArtifactWeightAsset& asset) noexcept {
+ const std::size_t size = asset.digest_kind == ArtifactWeightDigest::Md5 ? 32U : asset.digest_kind == ArtifactWeightDigest::Sha256 ? 64U : 0U;
+ return size != 0U && asset.digest.size() == size && std::ranges::all_of(asset.digest, [](const unsigned char byte) { return std::isxdigit(byte); });
+}
+[[nodiscard]] bool valid_weight_filename(const std::string_view text) {
+ const std::filesystem::path path(text);
+ return !text.empty() && text.size() <= contracts::kArtifactPathCapacity && !path.is_absolute() && !path.has_parent_path() && text != "." && text != ".." &&
+        !text.contains('/') && !text.contains('\\') && !text.contains('\0');
 }
 [[nodiscard]] std::optional<std::filesystem::path> validated_weight_destination(const ArtifactWeightAsset& asset, const std::filesystem::path& cache_root) {
- const std::filesystem::path filename(asset.filename);
- if (asset.filename.empty() || asset.filename.size() > contracts::kArtifactPathCapacity || filename.is_absolute() || filename.has_parent_path() || filename == std::filesystem::path{"."} ||
-     filename == std::filesystem::path{".."} || asset.filename.contains('/') || asset.filename.contains('\\') || !valid_weight_url(asset.url) || !valid_weight_md5(asset.md5)) {
-  return std::nullopt;
- }
- const std::filesystem::path root = cache_root.lexically_normal();
- const std::filesystem::path destination = (root / filename).lexically_normal();
+ if (!valid_weight_filename(asset.filename) || !valid_weight_url(asset.url) || !valid_weight_digest(asset)) return std::nullopt;
+ std::filesystem::path root = cache_root.lexically_normal();
+ if (asset.encoder) {
+  if (!mmltk::frameworks::reflection::enum_contains(*asset.encoder) || asset.digest_kind != ArtifactWeightDigest::Sha256 || asset.file_bytes == 0U ||
+      !valid_weight_filename(asset.cache_identity)) return std::nullopt;
+  root /= "encoders";
+  root /= asset.cache_identity;
+ } else if (asset.digest_kind != ArtifactWeightDigest::Md5 || asset.file_bytes != 0U || !asset.cache_identity.empty()) return std::nullopt;
+ const std::filesystem::path destination = (root / asset.filename).lexically_normal();
  if (destination.parent_path() != root) return std::nullopt;
  return destination;
 }
@@ -247,7 +256,17 @@ public:
  std::optional<ArtifactWeightAsset> find(const std::string_view preset) const override {
   const auto* entry = mmltk::backend::models::rfdetr::find_preset_catalog_entry(preset);
   if (entry == nullptr) return std::nullopt;
-  return ArtifactWeightAsset{.filename = std::string(entry->canonical_weight_filename), .url = std::string(entry->canonical_weight_url), .md5 = std::string(entry->canonical_weight_md5)};
+  return ArtifactWeightAsset{.filename = std::string(entry->canonical_weight_filename), .url = std::string(entry->canonical_weight_url), .digest = std::string(entry->canonical_weight_md5)};
+ }
+ std::optional<ArtifactWeightAsset> find(const mmltk::backend::models::rfdetr::BackboneKind encoder) const override {
+  const auto* asset = mmltk::backend::models::rfdetr::find_encoder_pretraining_asset(encoder);
+  if (asset == nullptr) return std::nullopt;
+  std::string identity(asset->source_repository);
+  std::ranges::replace(identity, '/', '-');
+  identity += '-';
+  identity += asset->source_revision;
+  return ArtifactWeightAsset{.filename = std::string(asset->filename), .url = std::string(asset->download_url), .digest_kind = ArtifactWeightDigest::Sha256,
+   .digest = std::string(asset->sha256), .file_bytes = asset->file_bytes, .cache_identity = std::move(identity), .encoder = encoder};
  }
  void download(const std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver) const override;
 };
@@ -283,7 +302,7 @@ int weight_progress(void* opaque, const curl_off_t total, const curl_off_t compl
 void RuntimeArtifactWeightOperations::download(
  const std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, const ArtifactWeightProgressObserver progress) const {
  WeightTransfer transfer{.output = std::ofstream(output, std::ios::binary | std::ios::trunc), .cancellation = &cancellation, .progress = progress};
- if (!transfer.output) throw std::runtime_error("cannot create staged canonical RF-DETR weights");
+ if (!transfer.output) throw std::runtime_error("cannot create staged canonical model weights");
  CURL* curl = curl_easy_init();
  if (!curl) throw std::runtime_error("cannot initialize canonical weight download");
  const auto curl_cleanup = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>{curl, curl_easy_cleanup};
@@ -300,10 +319,17 @@ void RuntimeArtifactWeightOperations::download(
  transfer.output.close();
  if (result != CURLE_OK) throw std::runtime_error(cancellation.cancelled() ? "canonical weight acquisition cancelled" : std::string("canonical weight download failed: ") + curl_easy_strerror(result));
 }
-std::string md5_file(const std::filesystem::path& path, const ArtifactCancellationToken& cancellation) {
- const auto digests = mmltk::common::io::try_file_digests(path, true, [&] { return cancellation.cancelled(); });
+bool weight_integrity_matches(const std::filesystem::path& path, const ArtifactWeightAsset& asset, const ArtifactCancellationToken& cancellation) {
+ const bool md5 = asset.digest_kind == ArtifactWeightDigest::Md5;
+ if (!md5 && mmltk::common::io::FileSnapshot::Read(path).bytes != asset.file_bytes) return false;
+ const auto digests = mmltk::common::io::try_file_digests(path, md5, [&] { return cancellation.cancelled(); });
  if (!digests) throw std::runtime_error("canonical weight acquisition cancelled");
- return digests->md5;
+ if (!md5 && digests->snapshot.bytes != asset.file_bytes) return false;
+ const auto actual = md5 ? digests->md5 : mmltk::common::io::sha256_hex(digests->sha256);
+ return actual == asset.digest;
+}
+void require_weight_acquisition_active(const ArtifactCancellationToken& cancellation) {
+ if (cancellation.cancelled()) throw std::runtime_error("canonical weight acquisition cancelled");
 }
 }  // namespace
 bool ArtifactCompileRequest::valid() const noexcept {
@@ -397,22 +423,33 @@ std::filesystem::path ArtifactStore::canonical_weight_path(const std::string_vie
  return canonical_weight_path(preset, pair.second);
 }
 std::filesystem::path ArtifactStore::canonical_weight_path(const std::string_view preset, const ArtifactCancellationToken& cancellation, const ArtifactWeightProgressObserver progress) const {
- const auto require_not_cancelled = [&cancellation] {
-  if (cancellation.cancelled()) throw std::runtime_error("canonical weight acquisition cancelled");
- };
- require_not_cancelled();
+ require_weight_acquisition_active(cancellation);
  if (const auto invalid = invalid_artifact_input(preset)) throw std::invalid_argument(std::string(*invalid));
  const auto asset = weight_operations_->find(preset);
- require_not_cancelled();
+ require_weight_acquisition_active(cancellation);
  if (!asset) throw std::invalid_argument("unknown RF-DETR preset");
- const auto destination = validated_weight_destination(*asset, cache_root_);
- if (!destination) throw std::invalid_argument("invalid canonical RF-DETR weight metadata");
+ if (asset->encoder) throw std::invalid_argument("detector selection returned a base encoder asset");
+ return acquire_weight(*asset, cancellation, progress);
+}
+std::filesystem::path ArtifactStore::canonical_encoder_weight_path(const mmltk::backend::models::rfdetr::BackboneKind encoder, const ArtifactCancellationToken& cancellation,
+ const ArtifactWeightProgressObserver progress) const {
+ require_weight_acquisition_active(cancellation);
+ if (!mmltk::frameworks::reflection::enum_contains(encoder)) throw std::invalid_argument("unknown base encoder kind");
+ const auto asset = weight_operations_->find(encoder);
+ require_weight_acquisition_active(cancellation);
+ if (!asset || asset->encoder != encoder) throw std::invalid_argument("base encoder selection did not resolve the requested encoder asset");
+ return acquire_weight(*asset, cancellation, progress);
+}
+std::filesystem::path ArtifactStore::acquire_weight(const ArtifactWeightAsset& asset, const ArtifactCancellationToken& cancellation, const ArtifactWeightProgressObserver progress) const {
+ const auto require_not_cancelled = [&cancellation] { require_weight_acquisition_active(cancellation); };
+ const auto destination = validated_weight_destination(asset, cache_root_);
+ if (!destination) throw std::invalid_argument("invalid canonical model weight metadata");
  require_not_cancelled();
  if (progress.report != nullptr) progress({.stage = contracts::ModelProgressStage::InspectingCache, .activity = "Inspecting model cache"});
  if (std::filesystem::is_regular_file(*destination)) {
   require_not_cancelled();
   if (progress.report != nullptr) progress({.stage = contracts::ModelProgressStage::Verifying, .activity = "Verifying cached model weights"});
-  if (md5_file(*destination, cancellation) == asset->md5) {
+  if (weight_integrity_matches(*destination, asset, cancellation)) {
    require_not_cancelled();
    return *destination;
   }
@@ -420,13 +457,13 @@ std::filesystem::path ArtifactStore::canonical_weight_path(const std::string_vie
   std::filesystem::remove(*destination);
  }
  require_not_cancelled();
- mmltk::common::io::StagingDirectory staging{*destination, ".", ".weights.XXXXXX", "failed to stage canonical RF-DETR weights"};
- const auto staged = staging.path() / asset->filename;
+ mmltk::common::io::StagingDirectory staging{*destination, ".", ".weights.XXXXXX", "failed to stage canonical model weights"};
+ const auto staged = staging.path() / asset.filename;
  require_not_cancelled();
- weight_operations_->download(asset->url, staged, cancellation, progress);
+ weight_operations_->download(asset.url, staged, cancellation, progress);
  require_not_cancelled();
  if (progress.report != nullptr) progress({.stage = contracts::ModelProgressStage::Verifying, .activity = "Verifying downloaded model weights"});
- if (md5_file(staged, cancellation) != asset->md5) throw std::runtime_error("canonical RF-DETR weight checksum mismatch");
+ if (!weight_integrity_matches(staged, asset, cancellation)) throw std::runtime_error("canonical model weight size or checksum mismatch");
  require_not_cancelled();
  mmltk::common::io::publish_staged_path_atomically(staged, *destination, true);
  return *destination;

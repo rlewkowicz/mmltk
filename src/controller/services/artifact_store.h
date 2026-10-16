@@ -2,6 +2,7 @@
 #include "src/backend/data/compile_trace_selection.h"
 #include "src/backend/data/benchmark/benchmark_dataset_options.h"
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <expected>
 #include <memory>
@@ -13,6 +14,7 @@
 #include "src/common/types/cancellation_observation.h"
 #include "src/controller/contracts/artifact.h"
 #include "src/backend/data/catalog/class_catalog.h"
+#include "src/backend/models/rfdetr/contract/model_topology.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/controller/contracts/gui_settings_states.h"
 #include "src/controller/contracts/model.h"
@@ -87,10 +89,16 @@ struct ArtifactCompileResult final {
  bool cancelled = false;
  mmltk::controller::contracts::ArtifactInspection inspection{};
 };
+enum class ArtifactWeightDigest : std::uint8_t { Md5, Sha256 };
 struct ArtifactWeightAsset final {
  std::string filename;
  std::string url;
- std::string md5;
+ ArtifactWeightDigest digest_kind = ArtifactWeightDigest::Md5;
+ std::string digest;
+ std::uint64_t file_bytes = 0U;
+ // Encoder files use an immutable source identity below the encoder cache root.
+ std::string cache_identity;
+ std::optional<mmltk::backend::models::rfdetr::BackboneKind> encoder;
 };
 struct ArtifactWeightProgressObserver final {
  void* context = nullptr;
@@ -99,16 +107,17 @@ struct ArtifactWeightProgressObserver final {
   if (report != nullptr) report(context, value);
  }
 };
-// The sole acquisition seam. Production resolves the RF-DETR catalog and
+// The sole acquisition seam. Production resolves the detector/encoder catalogs and
 // performs libcurl transfer; ArtifactStore owns cache policy and integrity.
 class ArtifactWeightOperations {
 public:
  virtual ~ArtifactWeightOperations() = default;
  [[nodiscard]] virtual std::optional<ArtifactWeightAsset> find(std::string_view preset) const = 0;
+ [[nodiscard]] virtual std::optional<ArtifactWeightAsset> find(mmltk::backend::models::rfdetr::BackboneKind encoder) const = 0;
  virtual void download(std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver) const = 0;
 };
 // The sole owner of filesystem artifact inspection, compilation, and canonical
-// RF-DETR weight acquisition. Its values are ordinary work results.
+// detector and base encoder acquisition. Its values are ordinary work results.
 class ArtifactStore final {
 public:
  ArtifactStore();
@@ -122,8 +131,11 @@ public:
   const ArtifactCompileRequest& request, const ArtifactCancellationToken& cancellation, ArtifactProgressObserver progress = {}, ArtifactDiagnosticObserver diagnostics = {}) const;
  [[nodiscard]] std::filesystem::path canonical_weight_path(std::string_view preset) const;
  [[nodiscard]] std::filesystem::path canonical_weight_path(std::string_view preset, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver progress = {}) const;
+ [[nodiscard]] std::filesystem::path canonical_encoder_weight_path(mmltk::backend::models::rfdetr::BackboneKind encoder, const ArtifactCancellationToken& cancellation,
+  ArtifactWeightProgressObserver progress = {}) const;
 
 private:
+ [[nodiscard]] std::filesystem::path acquire_weight(const ArtifactWeightAsset&, const ArtifactCancellationToken&, ArtifactWeightProgressObserver) const;
  std::filesystem::path cache_root_;
  const ArtifactWeightOperations* weight_operations_ = nullptr;
  const ArtifactCompilerOperations* compiler_operations_;

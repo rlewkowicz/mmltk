@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -36,6 +37,7 @@
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/controller/services/artifact_store.h"
 #include "src/controller/services/training/train_process_client.h"
 #include "src/common/types/utf8.h"
@@ -113,10 +115,17 @@ class ArtifactTestOperations final : public ArtifactWeightOperations {
 public:
  std::optional<ArtifactWeightAsset> find(std::string_view preset) const override {
   ++finds;
-  return preset == "fixture" ? std::optional<ArtifactWeightAsset>{{.filename = filename, .url = url, .md5 = md5}} : std::nullopt;
+  return preset == "fixture" ? std::optional<ArtifactWeightAsset>{{.filename = filename, .url = url, .digest = md5}} : std::nullopt;
  }
- void download(std::string_view, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver progress) const override {
+ std::optional<ArtifactWeightAsset> find(const rfdetr::BackboneKind encoder) const override {
+  encoder_finds.push_back(encoder);
+  if (detector_for_encoder) return find("fixture");
+  return ArtifactWeightAsset{.filename = "model.safetensors", .url = encoder_url, .digest_kind = encoder_digest_kind, .digest = sha256, .file_bytes = encoder_bytes,
+   .cache_identity = std::string(mmltk::frameworks::reflection::enum_name(encoder)) + "-" + encoder_identity, .encoder = encoder};
+ }
+ void download(std::string_view selected_url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver progress) const override {
   ++downloads;
+  downloaded_urls.emplace_back(selected_url);
   progress({.stage = domain::ModelProgressStage::Downloading, .activity = "fixture download", .completed = payload.size(), .total = payload.size(), .total_known = true});
   if (cancel_on_download && cancellation_trigger != nullptr) {
    if (&cancellation_trigger->token != &cancellation) { throw std::runtime_error("artifact fixture cancellation identity mismatch"); }
@@ -128,12 +137,20 @@ public:
  }
  mutable std::size_t finds = 0U;
  mutable std::size_t downloads = 0U;
+ mutable std::vector<rfdetr::BackboneKind> encoder_finds;
+ mutable std::vector<std::string> downloaded_urls;
  bool cancel_on_download = false;
  ArtifactCancellationFixture* cancellation_trigger = nullptr;
  std::string filename = "fixture.bin";
  std::string url = "https://fixture.invalid/weight";
  std::string payload = "abc";
  std::string md5 = "900150983cd24fb0d6963f7d28e17f72";
+ std::string encoder_url = "https://fixture.invalid/encoder";
+ std::string encoder_identity = "source-revision";
+ std::string sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+ std::uint64_t encoder_bytes = 3U;
+ ArtifactWeightDigest encoder_digest_kind = ArtifactWeightDigest::Sha256;
+ bool detector_for_encoder = false;
 };
 [[nodiscard]] TrainProcessRunResult finish_train_client(TrainProcessClient& client) {
  auto [source, token] = TrainProcessStopSource::Mint();
@@ -551,6 +568,102 @@ TEST_CASE("artifact service refuses hostile weight metadata before transfer or c
  CHECK_THROWS(store.canonical_weight_path("fixture"));
  CHECK(operations.downloads == 0U);
  CHECK_FALSE(std::filesystem::exists(root));
+}
+TEST_CASE("encoder acquisition shares verified files across presets without requesting detector assets", "[gui][services][encoder_pretraining]") {
+ mmltk::testsupport::ScopedTempDir temporary("mmltk-encoder-cache");
+ ArtifactTestOperations operations;
+ ArtifactStore store(temporary.path(), operations);
+ ArtifactCancellationFixture active;
+ std::array<std::filesystem::path, 3U> paths{};
+ for (const auto& preset : rfdetr::kPresetCatalog) {
+  const auto path = store.canonical_encoder_weight_path(preset.backbone.kind, active.token);
+  const auto kind = static_cast<std::size_t>(preset.backbone.kind);
+  REQUIRE(kind < paths.size());
+  if (paths[kind].empty()) paths[kind] = path;
+  CHECK(path == paths[kind]);
+  CHECK(path.filename() == "model.safetensors");
+  CHECK(path.parent_path().parent_path() == temporary.path() / "encoders");
+  CHECK(std::filesystem::file_size(path) == operations.encoder_bytes);
+ }
+ CHECK(operations.finds == 0U);
+ CHECK(operations.downloads == 3U);
+ CHECK(operations.encoder_finds.size() == rfdetr::kPresetCatalog.size());
+ CHECK(std::ranges::all_of(operations.downloaded_urls, [&](const auto& url) { return url == operations.encoder_url; }));
+ CHECK(paths[0] != paths[1]);
+ CHECK(paths[0] != paths[2]);
+ const auto original = paths[0];
+ operations.encoder_identity = "new-source-revision";
+ CHECK(store.canonical_encoder_weight_path(rfdetr::BackboneKind::DinoV2Small, active.token) != original);
+ CHECK(std::filesystem::is_regular_file(original));
+ CHECK(operations.downloads == 4U);
+}
+TEST_CASE("encoder acquisition rejects corrupt state and keeps cancelled work unpublished", "[gui][services][encoder_pretraining]") {
+ mmltk::testsupport::ScopedTempDir temporary("mmltk-encoder-integrity");
+ const auto root = temporary.path() / "weights";
+ ArtifactTestOperations operations;
+ ArtifactStore store(root, operations);
+ ArtifactCancellationFixture active;
+ constexpr auto encoder = rfdetr::BackboneKind::DinoV2Small;
+ ArtifactCancellationFixture pre_cancelled;
+ pre_cancelled.cancel();
+ CHECK_THROWS(store.canonical_encoder_weight_path(encoder, pre_cancelled.token));
+ CHECK(operations.encoder_finds.empty());
+ CHECK_FALSE(std::filesystem::exists(root));
+ CHECK_THROWS(store.canonical_encoder_weight_path(static_cast<rfdetr::BackboneKind>(255U), active.token));
+ CHECK(operations.encoder_finds.empty());
+ const auto path = store.canonical_encoder_weight_path(encoder, active.token);
+ REQUIRE(operations.downloads == 1U);
+ std::ofstream(path, std::ios::binary | std::ios::trunc) << "corrupt";
+ CHECK(store.canonical_encoder_weight_path(encoder, active.token) == path);
+ REQUIRE(operations.downloads == 2U);
+ SECTION("same-size corrupted download") { operations.payload = "bad"; }
+ SECTION("wrong declared byte count") { ++operations.encoder_bytes; }
+ SECTION("wrong declared digest") { operations.sha256.assign(64U, '0'); }
+ SECTION("transfer cancellation") {
+  operations.cancel_on_download = true;
+  operations.cancellation_trigger = &active;
+ }
+ std::filesystem::remove(path);
+ CHECK_THROWS(store.canonical_encoder_weight_path(encoder, active.token));
+ CHECK_FALSE(std::filesystem::exists(path));
+ CHECK(operations.finds == 0U);
+ for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+  CHECK(entry.path().filename().string().find(".weights.") == std::string::npos);
+ }
+}
+TEST_CASE("encoder metadata admission rejects detector assets and malformed identities before transfer", "[gui][services][encoder_pretraining]") {
+ mmltk::testsupport::ScopedTempDir temporary("mmltk-encoder-metadata");
+ const auto root = temporary.path() / "weights";
+ ArtifactTestOperations operations;
+ ArtifactStore store(root, operations);
+ ArtifactCancellationFixture active;
+ SECTION("detector selection") { operations.detector_for_encoder = true; }
+ SECTION("MD5 for an encoder") { operations.encoder_digest_kind = ArtifactWeightDigest::Md5; operations.sha256 = operations.md5; }
+ SECTION("invalid digest") { operations.sha256 = "not-sha256"; }
+ SECTION("missing size") { operations.encoder_bytes = 0U; }
+ SECTION("unsafe source identity") { operations.encoder_identity = "../../escape"; }
+ CHECK_THROWS(store.canonical_encoder_weight_path(rfdetr::BackboneKind::DinoV2Small, active.token));
+ CHECK(operations.downloads == 0U);
+ CHECK_FALSE(std::filesystem::exists(root));
+}
+TEST_CASE("encoder verification cancellation preserves cache and removes staged downloads", "[gui][services][encoder_pretraining]") {
+ mmltk::testsupport::ScopedTempDir temporary("mmltk-encoder-verification-cancel");
+ ArtifactTestOperations operations;
+ ArtifactStore store(temporary.path(), operations);
+ ArtifactCancellationFixture active;
+ std::filesystem::path cached;
+ SECTION("cached source") { cached = store.canonical_encoder_weight_path(rfdetr::BackboneKind::DinoV2Small, active.token); }
+ SECTION("new download") {}
+ const ArtifactWeightProgressObserver observer{.context = &active, .report = [](void* context, const domain::ModelProgress& progress) noexcept {
+  if (progress.stage == domain::ModelProgressStage::Verifying) static_cast<ArtifactCancellationFixture*>(context)->cancel();
+ }};
+ CHECK_THROWS(store.canonical_encoder_weight_path(rfdetr::BackboneKind::DinoV2Small, active.token, observer));
+ CHECK(operations.downloads == 1U);
+ if (!cached.empty()) CHECK(std::filesystem::is_regular_file(cached));
+ for (const auto& entry : std::filesystem::recursive_directory_iterator(temporary.path())) {
+  CHECK(entry.path().filename().string().find(".weights.") == std::string::npos);
+  if (entry.is_regular_file()) CHECK(entry.path() == cached);
+ }
 }
 TEST_CASE("compute service domain values retain ordered terminal-safe progress", "[gui][services]") {
  const domain::ComputeProgress initial{.sequence = 1U, .completed = 0U, .total = 8U, .status = "training"};

@@ -22,6 +22,7 @@ mmltk_register_public_headers(
         contract.h
         model_config.h
         model_topology.h
+        encoder_pretraining.h
         preset_catalog.h
         prediction_limits.h
         execution_plan.h
