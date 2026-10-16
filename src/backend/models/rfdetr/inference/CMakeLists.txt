@@ -83,6 +83,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         mmltk_backend_models_rfdetr_inference_tests PRIVATE
         mmltk_backend_ml_torch_test_support
         mmltk_backend_models_rfdetr_class_artifact_test_support
+        mmltk_backend_models_rfdetr_encoder_training_test_support
         mmltk_frameworks_gpu_test_support
         mmltk::backend::models::rfdetr::training
         mmltk_entrypoints_cli_test_support

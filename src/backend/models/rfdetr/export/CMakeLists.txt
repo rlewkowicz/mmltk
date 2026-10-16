@@ -150,6 +150,7 @@ function(mmltk_add_backend_models_rfdetr_export_tests)
     target_link_libraries(mmltk_backend_models_rfdetr_export_tests PRIVATE
         mmltk_backend_ml_torch_test_support
         mmltk_backend_data_test_support
+        mmltk_backend_models_rfdetr_encoder_training_test_support
         mmltk::backend::models::rfdetr::training
         mmltk::backend::models::rfdetr::export
         mmltk::vendor::onnxruntime

@@ -44,6 +44,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_contract
         mmltk::backend::models::contract
         mmltk::backend::data::catalog
         mmltk::frameworks::reflection
+        nlohmann_json
     PRIVATE
         mmltk::frameworks::serialization
         mmltk::common::types

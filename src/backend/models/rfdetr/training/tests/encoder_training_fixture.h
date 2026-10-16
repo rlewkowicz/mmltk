@@ -10,6 +10,7 @@
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/common/io/file_digest.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
 // Optional absence alone skips. Explicit evidence always admits every original
 // asset before any CLI/product path is invoked; this helper never acquires files.

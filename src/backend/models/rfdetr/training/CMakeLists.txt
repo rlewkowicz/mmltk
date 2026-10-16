@@ -112,6 +112,23 @@ mmltk_enable_torch(mmltk_backend_models_rfdetr_training PRIVATE)
 
 mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_training std linux torch)
 
+function(mmltk_add_backend_models_rfdetr_encoder_training_test_support)
+    add_library(mmltk_backend_models_rfdetr_encoder_training_test_support INTERFACE)
+    mmltk_register_public_headers(
+        mmltk_backend_models_rfdetr_encoder_training_test_support
+        BASE_DIRS ${CMAKE_SOURCE_DIR}
+        FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/encoder_training_fixture.h)
+    target_link_libraries(
+        mmltk_backend_models_rfdetr_encoder_training_test_support INTERFACE
+        mmltk::backend::models::rfdetr::contract
+        mmltk_backend_data_test_support
+        mmltk::common::io
+        mmltk::frameworks::reflection
+        Catch2::Catch2)
+    mmltk_register_header_isolation(
+        mmltk_backend_models_rfdetr_encoder_training_test_support)
+endfunction()
+
 function(mmltk_add_backend_models_rfdetr_training_tests)
     set(sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/stock_training_parity.test.cpp
@@ -132,7 +149,6 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk_backend_models_rfdetr_training_tests PRIVATE_DECLARATIONS)
     mmltk_register_private_headers(
         mmltk_backend_models_rfdetr_training_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/encoder_training_fixture.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_state_fixture.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation_fixture.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_gradient_fixture.h)
@@ -162,6 +178,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         mmltk_backend_models_rfdetr_augmentation_test_support
         mmltk_backend_models_rfdetr_class_artifact_test_support
+        mmltk_backend_models_rfdetr_encoder_training_test_support
         mmltk_backend_models_rfdetr_training_fixture
         mmltk::backend::models::rfdetr::export
         mmltk_backend_ml_torch_test_support
