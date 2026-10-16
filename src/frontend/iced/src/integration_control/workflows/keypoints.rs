@@ -2,7 +2,7 @@
 //! the immutable native metadata paired with completed canvas presentations.
 #[cfg(target_arch = "wasm32")]
 use super::Picture;
-use super::{Step, completed};
+use super::{Step, completed, control};
 use crate::generated::*;
 use crate::integration_control::pixel_checks::ProbeOutcome;
 use crate::integration_control::{Driver, Phase, probe, widget_ops};
@@ -168,21 +168,6 @@ fn annotation_current(metadata: &AnnotationImageMetadata, snapshot: &AnnotationS
 }
 fn phase(driver: &mut Driver, stage: Stage) -> Task<RootMessage> {
     driver.advance_to(Phase::Workflows(Step::Keypoints(stage)))
-}
-fn control(
-    widgets: &mut widget_ops::RevealState,
-    driver: &mut Driver,
-    id: impl Into<String>,
-) -> Task<RootMessage> {
-    if !widgets.begin_location() {
-        return Task::none();
-    }
-    let id = id.into();
-    if id.starts_with("navigation.") || id.starts_with("explore.") {
-        widget_ops::locate(id, driver.generation)
-    } else {
-        widget_ops::reveal_control(id, driver.generation, widget_ops::AnnotationReveal::Control)
-    }
 }
 fn same_scene(left: &AnnotationSceneContent, right: &AnnotationSceneContent) -> bool {
     let mut expected = right.clone();

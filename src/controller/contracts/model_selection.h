@@ -91,7 +91,7 @@ struct ModelSelectionResolutionTransform final {
 };
 using mmltk::frameworks::reflection::member_path;
 using mmltk::frameworks::reflection::MemberRelationEntry;
-template <FeatureId Workflow, auto Source, auto Input, auto Preset, auto Resolution, auto Artifact, auto Layout>
+template <FeatureId Workflow, auto Source, auto Input, auto Preset, auto Resolution, auto Artifact, auto Layout, auto Scratch = false>
 struct ModelSelectionRelationRow {
  static constexpr FeatureId workflow = Workflow;
  static constexpr auto source = Source;
@@ -106,11 +106,14 @@ struct ModelSelectionRelationRow {
   mmltk::frameworks::reflection::visit_materialized_members<ModelSelectionKey>([&]<class>(const auto&) { ++count; });
   return count;
  }();
+ using scratch_entry = std::conditional_t<std::same_as<decltype(Scratch), bool>,
+  mmltk::frameworks::reflection::ConstantMemberRelationEntry<Scratch, member_path<&ModelSelectionKey::from_scratch>>,
+  MemberRelationEntry<Scratch, member_path<&ModelSelectionKey::from_scratch>>>;
  using key_relation =
   mmltk::frameworks::reflection::StaticMemberRelation<GuiSettingsState, ModelSelectionKey, key_field_count - 1U, MemberRelationEntry<Source, member_path<&ModelSelectionKey::source>>,
    MemberRelationEntry<Input, member_path<&ModelSelectionKey::input>>, MemberRelationEntry<Preset, member_path<&ModelSelectionKey::preset>, ModelSelectionTextTransform>,
    MemberRelationEntry<Resolution, member_path<&ModelSelectionKey::resolution>, ModelSelectionResolutionTransform>,
-   MemberRelationEntry<Layout, member_path<&ModelSelectionKey::class_layout_path>, ModelSelectionTextTransform>>;
+   MemberRelationEntry<Layout, member_path<&ModelSelectionKey::class_layout_path>, ModelSelectionTextTransform>, scratch_entry>;
  using artifact_relation = mmltk::frameworks::reflection::StaticMemberRelation<GuiSettingsState, ModelSettingsProjection, 1U,
   MemberRelationEntry<Artifact, member_path<&ModelSettingsProjection::artifact>, ModelSelectionTextTransform>>;
  inline static constexpr auto artifact_field_path = mmltk::frameworks::reflection::reflected_member_path<GuiSettingsState, Artifact>();
@@ -136,7 +139,8 @@ struct TrainWeightsModelSelection final
        member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::preset_name>,
        member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::resolution>,
        member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::weights_path>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::class_layout_path>> {
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::class_layout_path>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::from_scratch>> {
  inline static constexpr ModelArtifactInputKind input_kind = ModelArtifactInputKind::Weights;
  inline static constexpr ModelSelectionCompatibility compatibility = [] {
   auto result = custom_model_compatibility("train.weights", workflow, input_kind, true, artifact_field_path.view());

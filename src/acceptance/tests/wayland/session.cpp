@@ -178,6 +178,7 @@ public:
   const std::string mozilla_text = artifact_sibling(diagnostics, "-mozilla%PID.log").string();
   const std::string dataset_source = mmltk::backend::data::testsupport::dataset_dir(fixture);
   const std::string compiled_text = compiled_directory.string();
+  const std::string scratch_path = (working_directory / "fixture-bin").string() + ":" + (std::getenv("PATH") ? std::getenv("PATH") : "/usr/bin:/bin");
   const std::string resolution = std::to_string(viewer_scenario == "square" ? 384 : kCompiledResolution);
   const std::string square_source = square_fixture ? mmltk::backend::data::testsupport::dataset_dir(*square_fixture) : "";
   const std::string square_compiled = square_fixture ? mmltk::backend::data::testsupport::compiled_dir(*square_fixture) : "";
@@ -195,6 +196,7 @@ public:
    const bool configured =
     runtime_output.get() >= 0 && ::dup2(runtime_output.get(), STDOUT_FILENO) >= 0 && ::dup2(runtime_output.get(), STDERR_FILENO) >= 0 && ::fcntl(control_read.get(), F_SETFD, 0) == 0 &&
     ::chdir(working_directory.c_str()) == 0 &&
+    (viewer_scenario != "scratch" || (::setenv("MMLTK_REPO_ROOT", working_directory.c_str(), 1) == 0 && ::setenv("PATH", scratch_path.c_str(), 1) == 0)) &&
     (logging ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", application_log_text.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_text.c_str(), 1) == 0 && ::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_text.c_str(), 1) == 0 &&
                 ::setenv("MOZ_LOG",
@@ -586,6 +588,10 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
  initial_settings.workflows.explore.h2d_dataloader = h2d;
  initial_settings.workflows.train.request.h2d_dataloader = h2d;
  if (profile_ == "workflows" || profile_ == "workflows-oom" || profile_ == "keypoints") inputs_->workflows(profile_ == "keypoints").Configure(initial_settings, working.path());
+ if (profile_ == "scratch") {
+  scratch_ = std::make_unique<mmltk::testsupport::WorkflowScratchInputs>(working.path());
+  scratch_->Configure(initial_settings);
+ }
  if (profile_ == "keypoints") REQUIRE_FALSE(initial_settings.workflows.train.overwrite_compiled_dataset);
  std::filesystem::create_directories(working.path() / ".mmltk-data");
  std::ofstream settings_file{working.path() / ".mmltk-data" / "gui.json"};
@@ -698,7 +704,14 @@ void WaylandSession::RunWorkflows() {
    REQUIRE(event->generation == scenario_sequence_);
    using Kind = mmltk::controller::contracts::IntegrationControlKind;
    const auto kind = static_cast<Kind>(event->slot);
-   if (kind == Kind::ArtifactMutationRequested) {
+   if (kind == Kind::ArtifactMutationRequested && scratch_) {
+    REQUIRE(event->compiled_index == 0);
+    ConsumeRecords();
+    const auto& fresh = browser.scratch_records.at("integration.scratch.fresh-session");
+    scratch_->PrepareResume(browser.scratch_records.at("integration.scratch.prepared").at("control").get<std::string>(),
+     fresh.at("control").get<std::string>(), fresh.at("detail").get<std::string>());
+    REQUIRE(process.command_explore(static_cast<std::uint8_t>(Command::ArtifactMutationReady)));
+   } else if (kind == Kind::ArtifactMutationRequested) {
     REQUIRE(artifacts);
     const auto index = static_cast<std::uint32_t>(event->compiled_index);
     if (index == 0) REQUIRE(native.ArmLiveArtifactFailure(artifacts->artifact().string()));
@@ -741,6 +754,12 @@ void WaylandSession::RunWorkflows() {
   REQUIRE(canvas_allocation_failed_);
   REQUIRE(graphics_recovery_visible_);
   REQUIRE(workflow_steps_.contains("train-after-graphics-failure"));
+ } else if (profile_ == "scratch") {
+  REQUIRE(scratch_);
+  REQUIRE(browser.scratch_complete());
+  REQUIRE((workflow_steps_ == std::set<std::string>{"scratch-prepared", "scratch-stopped", "scratch-resumed"}));
+  const auto& resumed = browser.scratch_records.at("integration.scratch.resumed-session");
+  scratch_->VerifyResume(resumed.at("control").get<std::string>(), resumed.at("detail").get<std::string>());
  } else if (profile_ == "keypoints") {
   CHECK(
    (workflow_steps_ == std::set<std::string>{
@@ -844,7 +863,7 @@ void WaylandSession::RunWorkflows() {
  CHECK_FALSE(browser_failed_);
 }
 void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool last, const bool dark, const bool pending_reconstruction) {
- if (viewer_scenario == "workflows" || viewer_scenario == "keypoints") {
+ if (viewer_scenario == "workflows" || viewer_scenario == "keypoints" || viewer_scenario == "scratch") {
   RunWorkflows();
   return;
  }

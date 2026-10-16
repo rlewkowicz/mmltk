@@ -719,6 +719,47 @@ function workflowCaptionPixels(owner, canvas, snapshot, control, stage, caseInde
   }
 }
 
+// Scratch acceptance samples the real Iced checkbox, custom-source button and
+// Resume radio separately after reveal. Native state never substitutes for ink.
+export function mmltkIntegrationScratchPixels(control, cssBounds, stage, index, completed) {
+  completed = integrationCompletion(completed);
+  const owner = integrationState;
+  cssBounds = Array.from(cssBounds);
+  if (!owner || !integrationDriver) { completed('failed'); return; }
+  integrationFrame(() => integrationFrame(() => {
+    if (integrationState !== owner) { completed('invalidated'); return; }
+    try {
+      const expected = ['train.model.from_scratch', 'train.model.custom_weights', 'train.model.resume'];
+      if (stage < 0 || stage > 3 || control !== expected[index]) throw new Error('scratch pixel identity');
+      const canvas = document.querySelector('canvas');
+      const [x,y,w,h] = canvasPixelBounds(canvas, cssBounds, control);
+      const left = Math.ceil(x), top = Math.ceil(y), height = Math.floor(h);
+      const width = Math.floor(index === 0 ? Math.min(w, h) : w);
+      if (left < 0 || top < 0 || width < 8 || height < 8 || left+width > canvas.width || top+height > canvas.height) throw new Error('scratch control clipped');
+      const pixels = canvasSnapshot(canvas).getImageData(left,top,width,height).data;
+      let blue=0, dark=0, disabledInk=0, minimum=255, maximum=0;
+      for (let i=0;i<pixels.length;i+=4) {
+        const [r,g,b] = [pixels[i],pixels[i+1],pixels[i+2]];
+        minimum=Math.min(minimum,r,g,b); maximum=Math.max(maximum,r,g,b);
+        if (b > r+24 && b > g+8) ++blue;
+        if (Math.max(r,g,b) < 160) ++dark;
+        if (Math.max(r,g,b)-Math.min(r,g,b) < 6 && g >= 180 && g <= 232) ++disabledInk;
+      }
+      const checked = stage === 1;
+      const disabled = index === 1 ? checked : index === 2 && stage !== 3;
+      const colored = index === 0 ? checked : !disabled;
+      const matched = maximum-minimum > 8 && (colored ? blue >= 8 : blue === 0)
+        && (!disabled || (disabledInk >= 8 && dark === 0));
+      report({event:'integration.scratch.pixels',control,stage,index,checked: index === 0 && checked,
+        disabled,blue,dark,disabled_ink:disabledInk,sampled:width*height,matched});
+      completed(matched ? 'observed' : 'failed',width*height,Math.max(blue,disabledInk,maximum-minimum));
+    } catch (error) {
+      report({event:'integration.failure',control,detail:String(error)});
+      completed('failed');
+    }
+  }));
+}
+
 export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progress, source, presentation,
   captionStage, captionCase, captionPatches, completed, galleryTile, confidence, restoredAtlas = false) {
   completed = integrationCompletion(completed);

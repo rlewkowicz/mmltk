@@ -50,6 +50,31 @@ private:
  std::shared_ptr<mmltk::testsupport::StopGate> gate_;
  bool fail_ = false;
 };
+TEST_CASE("scratch Train choice persists with legacy off and ordinary Resume restoration", "[controller][settings][encoder_pretraining]") {
+ const auto root = mmltk::testsupport::make_temp_root("scratch-settings");
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root)).applied());
+ CHECK_FALSE(settings.snapshot().settings_state.workflows.train.request.from_scratch);
+ contracts::SettingsUpdateRequest edit;
+ edit.updates.push_back({.path = "workflows.train.request.from_scratch", .value = mmltk::frameworks::serialization::wire::FlatValue{true}});
+ static_cast<void>(settings.Update(std::move(edit)));
+ LoadedSettingsFixture restored{services::SettingsLocation{(root / "settings.json").string()}};
+ auto request = restored.settings.snapshot().settings_state.workflows.train.request;
+ CHECK(request.from_scratch);
+ request.encoder_weights_path = "/missing/source.safetensors";
+ restored.settings.RestoreTrainingCheckpoint(request, "/saved/session.json");
+ const auto resume = restored.settings.snapshot().settings_state.workflows.train;
+ CHECK_FALSE(resume.request.from_scratch);
+ CHECK(resume.request.encoder_weights_path.empty());
+ CHECK(resume.request.resume_path == "/saved/session.json");
+ CHECK(resume.request.weights_path == "/saved/session.json");
+ CHECK(resume.model_source == contracts::ModelSelectionSource::Custom);
+ auto document = contracts::snapshot_gui_settings(restored.settings.snapshot().settings_state);
+ document["workflows"]["train"]["training"].erase("from_scratch");
+ auto legacy = contracts::default_gui_settings_state();
+ contracts::apply_gui_settings(document, legacy);
+ CHECK_FALSE(legacy.workflows.train.request.from_scratch);
+}
 TEST_CASE("prediction source saving choices persist independently", "[controller][systems][settings][prediction]") {
  const auto root = mmltk::testsupport::make_temp_root("prediction-saving-settings");
  SettingsSystem settings;
@@ -430,7 +455,8 @@ TEST_CASE("Admitted training rejects queued execution changes but preserves inde
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
  for (const auto& update : std::array{
        contracts::SettingsValueUpdate{"workflows.train.compiled_dataset_dir", *Value::text("/next/dataset", mmltk::frameworks::reflection::kMaximumPathBytes)},
-       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{0}}}
+       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{0}}},
+       contracts::SettingsValueUpdate{"workflows.train.request.from_scratch", Value{true}}
       }) {
   contracts::SettingsUpdateRequest locked;
   locked.updates.push_back(update);

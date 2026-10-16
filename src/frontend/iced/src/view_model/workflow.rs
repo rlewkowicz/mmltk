@@ -37,7 +37,8 @@ pub enum CheckpointCapability {
 #[derive(Debug, Clone)]
 pub struct Continuation {
     pub mode: ContinuationMode,
-    pub selection: Option<(crate::generated::ModelSelectionSource, String, String)>,
+    pub selection: Option<crate::generated::ModelSelectionKey>,
+    pub artifact: Option<String>,
     pub capability: CheckpointCapability,
     pub mode_chosen: bool,
     pub cancel_needed: bool,
@@ -49,6 +50,7 @@ impl Default for Continuation {
         Self {
             mode: ContinuationMode::Transfer,
             selection: None,
+            artifact: None,
             capability: Default::default(),
             mode_chosen: false,
             cancel_needed: false,
@@ -59,24 +61,17 @@ impl Default for Continuation {
 }
 impl Continuation {
     pub fn matches(&self, train: &crate::generated::TrainViewState) -> bool {
-        !self.refresh_requested
-            && self
-                .selection
-                .as_ref()
-                .is_some_and(|(source, path, preset)| {
-                    *source == train.modelsource
-                        && *path == train.request.weightspath
-                        && *preset == train.request.presetname
-                })
+        !self.refresh_requested && self.selection_matches(train)
+    }
+    pub(crate) fn selection_matches(&self, train: &crate::generated::TrainViewState) -> bool {
+        self.selection.as_ref() == Some(&crate::generated::project_train_model_key(train))
+            && self.artifact.as_deref() == Some(train.request.weightspath.as_str())
     }
     pub fn select(&mut self, train: &crate::generated::TrainViewState) {
         self.refresh_requested = false;
         self.cancel_needed |= matches!(self.capability, CheckpointCapability::Pending { .. });
-        self.selection = Some((
-            train.modelsource,
-            train.request.weightspath.clone(),
-            train.request.presetname.clone(),
-        ));
+        self.selection = Some(crate::generated::project_train_model_key(train));
+        self.artifact = Some(train.request.weightspath.clone());
         self.capability = CheckpointCapability::Idle;
         self.mode = ContinuationMode::Transfer;
         self.mode_chosen = false;
@@ -131,9 +126,9 @@ impl Continuation {
     }
     pub fn observe(&mut self, value: crate::generated::TrainingCheckpointInspection) {
         if self
-            .selection
+            .artifact
             .as_ref()
-            .is_none_or(|(_, path, _)| *path != value.path)
+            .is_none_or(|path| *path != value.path)
         {
             return;
         }
@@ -430,10 +425,11 @@ impl StartPreparation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelSelectionReceipt {
     pub workflow: FeatureId,
     pub settings_revision: u64,
+    pub selection: crate::generated::ModelSettingsProjection,
 }
 
 impl Default for WorkflowModel {
@@ -520,10 +516,11 @@ impl WorkflowModel {
         self.settings_revision = Some(snapshot.revision);
     }
 
-    pub fn model_selection_receipt(&self, workflow: FeatureId) -> Option<ModelSelectionReceipt> {
+    pub fn model_selection_receipt(&self, workflow: FeatureId, settings: &crate::generated::GuiSettingsState) -> Option<ModelSelectionReceipt> {
         Some(ModelSelectionReceipt {
             workflow,
             settings_revision: self.settings_revision?,
+            selection: crate::generated::project_model_settings(settings, workflow)?,
         })
     }
 
@@ -1049,7 +1046,7 @@ mod tests {
             })
             .unwrap();
         model.install_settings(&settings);
-        let receipt = model.model_selection_receipt(FeatureId::Predict).unwrap();
+        let receipt = model.model_selection_receipt(FeatureId::Predict, &settings.settingsstate).unwrap();
         assert_eq!(receipt.workflow, FeatureId::Predict);
         assert_eq!(receipt.settings_revision, settings.revision);
     }

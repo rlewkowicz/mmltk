@@ -23,6 +23,13 @@ struct MemberRelationEntry final {
  static constexpr auto destination = Destination;
  using transform = Transform;
 };
+// Constants participate in destination completeness without inventing a source
+// member or an editable settings identity.
+template <auto Value, auto Destination>
+struct ConstantMemberRelationEntry final {
+ static constexpr auto value = Value;
+ static constexpr auto destination = Destination;
+};
 template <class Source, class Destination, std::size_t ExpectedCount, class... Entries>
 struct StaticMemberRelation {
  using source_type = Source;
@@ -39,7 +46,12 @@ struct StaticMemberRelation {
   std::size_t index = 0U;
   bool compatible = true;
   VisitMembers([&]<class Entry>() {
-   if constexpr (accessor_is_applicable<Source, Entry::source>() && accessor_is_applicable<Destination, Entry::destination>()) {
+   if constexpr (requires { Entry::value; }) {
+    if constexpr (accessor_is_applicable<Destination, Entry::destination>()) {
+     destinations[index] = accessor_member_identity<Destination, Entry::destination>();
+     compatible = compatible && ExactMemberTransform::template accepts<decltype(Entry::value), accessor_value_t<Destination, Entry::destination>>() && destinations[index].valid();
+    } else compatible = false;
+   } else if constexpr (accessor_is_applicable<Source, Entry::source>() && accessor_is_applicable<Destination, Entry::destination>()) {
     using SourceValue = accessor_value_t<Source, Entry::source>;
     using DestinationValue = accessor_value_t<Destination, Entry::destination>;
     sources[index] = accessor_member_identity<Source, Entry::source>();
@@ -53,14 +65,17 @@ struct StaticMemberRelation {
   if (!compatible) return false;
   for (std::size_t left = 0U; left < sources.size(); ++left) {
    for (std::size_t right = left + 1U; right < sources.size(); ++right) {
-    if (sources[left] == sources[right] || destinations[left] == destinations[right]) return false;
+    if ((sources[left].valid() && sources[left] == sources[right]) || destinations[left] == destinations[right]) return false;
    }
   }
   return true;
  }
  template <class SourceValue, class DestinationValue>
  static constexpr void Project(const SourceValue& source, DestinationValue& destination) {
-  VisitMembers([&]<class Entry>() { Entry::transform::apply(access<DestinationValue, Entry::destination>(destination), access<const SourceValue, Entry::source>(source)); });
+  VisitMembers([&]<class Entry>() {
+   if constexpr (requires { Entry::value; }) access<DestinationValue, Entry::destination>(destination) = Entry::value;
+   else Entry::transform::apply(access<DestinationValue, Entry::destination>(destination), access<const SourceValue, Entry::source>(source));
+  });
  }
 };
 template <class Provider>

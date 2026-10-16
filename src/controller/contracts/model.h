@@ -12,6 +12,7 @@
 #include "src/controller/contracts/model_selection_types.h"
 #include "src/backend/models/rfdetr/contract/class_layout.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/encoder_pretraining.h"
 #include "src/controller/contracts/terminal_presentation.h"
 #include "src/controller/contracts/workflows.h"
 #include "src/frameworks/serialization/serialization.h"
@@ -46,6 +47,7 @@ struct ModelSelection final {
  mmltk::backend::models::rfdetr::ModelTask task = mmltk::backend::models::rfdetr::ModelTask::Detection;
  std::optional<mmltk::backend::models::rfdetr::NativeRfDetrConfig> training_config{};
  mmltk::backend::models::rfdetr::PresetTrainingCapabilities training_capabilities{};
+ std::optional<mmltk::backend::models::rfdetr::EncoderPretrainingProvenance> encoder_pretraining{};
  [[nodiscard]] bool valid() const noexcept {
   return key.valid() && !artifact.empty() && artifact.size() <= kModelArtifactCapacity && mmltk::frameworks::reflection::enum_contains(task) && (!training_config || training_config->task == task);
  }

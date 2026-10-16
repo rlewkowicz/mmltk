@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <cstdint>
 #include <string_view>
+#include <string>
 #include "src/backend/data/tests/test_fixture.h"
 namespace mmltk::controller::contracts {
 struct GuiSettingsState;
@@ -24,6 +25,20 @@ private:
  std::filesystem::path video_;
  std::filesystem::path alternate_;
  bool keypoints_ = false;
+};
+// Owns the source alias consumed by the real launcher, independently of the
+// immutable externally verified evidence. Resume deliberately removes this alias.
+class WorkflowScratchInputs final {
+public:
+ explicit WorkflowScratchInputs(const std::filesystem::path& root);
+ void Configure(mmltk::controller::contracts::GuiSettingsState&);
+ void PrepareResume(const std::filesystem::path& encoder, const std::filesystem::path& checkpoint, const std::filesystem::path& output);
+ void VerifyResume(const std::filesystem::path& checkpoint, const std::filesystem::path& output) const;
+private:
+ std::filesystem::path root_, source_, checkpoint_;
+ mmltk::backend::data::testsupport::FixtureSpec fixture_;
+ std::string initialization_, source_attempt_, session_id_;
+ std::uint64_t optimizer_steps_ = 0;
 };
 // Only the freshly exported session artifact is mutable. Restore it before the
 // surrounding retained fixture root is released, including exceptional exits.

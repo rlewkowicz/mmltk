@@ -9,6 +9,7 @@
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
@@ -16,6 +17,9 @@ namespace mmltk::controller {
 ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& key, const std::filesystem::path& custom, const int inspection_device, const std::stop_token stop,
  const std::function<void(const contracts::ModelProgress&)>& progress) {
  if (!key.valid()) throw std::invalid_argument("model selection key is invalid");
+ namespace rfdetr = mmltk::backend::models::rfdetr;
+ const auto* preset = key.from_scratch ? rfdetr::find_preset_catalog_entry(key.preset) : nullptr;
+ if (key.from_scratch && !preset) throw std::invalid_argument("unknown RF-DETR preset");
  std::filesystem::path artifact;
  if (key.source == contracts::ModelSelectionSource::Custom) {
   if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
@@ -35,15 +39,27 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
    } catch (...) {}
   }
   };
-  artifact = store_.canonical_weight_path(key.preset, cancellation.token(), observer);
+  artifact = key.from_scratch ? store_.canonical_encoder_weight_path(preset->backbone.kind, cancellation.token(), observer)
+                              : store_.canonical_weight_path(key.preset, cancellation.token(), observer);
  }
  if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
- namespace rfdetr = mmltk::backend::models::rfdetr;
+ if (key.from_scratch) {
+  auto config = rfdetr::native_config_from_preset(*preset);
+  config.resolution = static_cast<int>(key.resolution);
+  // Dataset admission establishes output meaning and query sizing at launch.
+  config.num_classes = 0;
+  config.keypoints_per_class.clear();
+  return {.artifact = artifact.string(), .task = preset->task, .training_config = std::move(config),
+          .training_capabilities = preset->training_capabilities,
+          .encoder_pretraining = rfdetr::encoder_pretraining_provenance(*rfdetr::find_encoder_pretraining_asset(preset->backbone.kind))};
+ }
  rfdetr::ModelClassLayout layout;
  rfdetr::ModelTask task = rfdetr::ModelTask::Detection;
  std::optional<rfdetr::NativeRfDetrConfig> training_config;
+ std::optional<rfdetr::EncoderPretrainingProvenance> encoder_pretraining;
  if (key.input == contracts::ModelArtifactInputKind::Weights) {
   auto resolved = rfdetr::resolve_model_state(artifact, key.preset, key.resolution, key.class_layout_path, {}, stop);
+  encoder_pretraining = resolved.artifacts.encoder_pretraining;
   layout = std::move(resolved.artifacts.class_layout);
   training_config = std::move(resolved.artifacts.config);
   task = training_config->task;
@@ -68,7 +84,8 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
   .class_layout = rfdetr::ResolvedClassLayout(std::move(layout)).summary(),
   .task = task,
   .training_config = std::move(training_config),
-  .training_capabilities = capabilities
+  .training_capabilities = capabilities,
+  .encoder_pretraining = std::move(encoder_pretraining)
  };
 }
 ModelSystem::ModelSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events) : settings_(settings), factory_(std::move(factory)), events_(std::move(events)) {
@@ -128,7 +145,8 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
      .class_layout = std::move(artifact.class_layout),
      .task = artifact.task,
      .training_config = std::move(artifact.training_config),
-     .training_capabilities = artifact.training_capabilities
+     .training_capabilities = artifact.training_capabilities,
+     .encoder_pretraining = std::move(artifact.encoder_pretraining)
     };
     if (!selection.valid()) throw std::runtime_error("model runtime returned an invalid selection");
     terminal.outcome = contracts::ModelSelectionOutcome::Accepted;

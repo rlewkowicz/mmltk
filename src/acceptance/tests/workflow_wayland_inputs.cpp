@@ -19,6 +19,11 @@
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/training/tests/model_state_fixture.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
+#include "src/backend/models/rfdetr/training/tests/encoder_training_fixture.h"
+#include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
+#include "src/backend/models/rfdetr/training/detail/training_snapshot.h"
+#include "src/backend/models/rfdetr/training/detail/training_artifact.h"
+#include "src/backend/models/rfdetr/core/encoder_pretraining.h"
 #include "src/controller/contracts/gui_settings.h"
 #include "src/backend/models/rfdetr/core/keypoint_prediction.h"
 #include "src/backend/models/rfdetr/core/keypoint_layout.h"
@@ -29,6 +34,15 @@ namespace data = mmltk::backend::data;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace contracts = mmltk::controller::contracts;
 namespace {
+rfdetr::TrainingRun read_workflow_run(const std::filesystem::path& directory) {
+ const auto manifest = directory / "run.json";
+ const auto bytes = std::filesystem::file_size(manifest);
+ if (bytes > rfdetr::kTrainingManifestBytes) throw std::runtime_error("workflow training manifest exceeds its native budget");
+ std::ifstream stream(manifest, std::ios::binary);
+ std::string text(static_cast<std::size_t>(bytes), '\0');
+ if (!stream.read(text.data(), static_cast<std::streamsize>(text.size()))) throw std::runtime_error("workflow training manifest read failed");
+ return rfdetr::decode_training_run_json(text);
+}
 void prepare_caption_model(rfdetr::NativeRfDetrModel& model, const data::catalog::ClassCatalog& catalog) {
  // Keep the real native detector and its six queries. Its fixture checkpoint
  // must put Det captions over the synthetic GT boxes, not depend on randomly
@@ -215,13 +229,7 @@ void WorkflowWaylandInputs::VerifyCatalogTraining(
   return *absolute;
  };
  const auto directory = inside(output), artifact = inside(checkpoint);
- const auto manifest = directory / "run.json";
- const auto bytes = std::filesystem::file_size(manifest);
- if (bytes > rfdetr::kTrainingManifestBytes) throw std::runtime_error("catalog training manifest exceeds its native budget");
- std::ifstream stream(manifest, std::ios::binary);
- std::string text(static_cast<std::size_t>(bytes), '\0');
- if (!stream.read(text.data(), static_cast<std::streamsize>(text.size()))) throw std::runtime_error("catalog training manifest read failed");
- const auto run = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingRun>(text, {.max_bytes = rfdetr::kTrainingManifestBytes, .max_items = 65536, .max_depth = 32});
+ const auto run = read_workflow_run(directory);
  const auto* preset = rfdetr::find_preset_catalog_entry(preset_name);
  if (!preset || preset->task != rfdetr::ModelTask::Keypoints || run.run_id != run_id || run.configuration.preset_name != preset_name ||
      run.configuration.resolution != static_cast<int>(preset->resolution) || run.configuration.epochs != 1 || !run.configuration.resume_path.empty() ||
@@ -260,6 +268,132 @@ void WorkflowWaylandInputs::VerifyCatalogTraining(
  rfdetr::require_checkpoint_model_topology(expected, trained.metadata);
  if (config.resolution != expected.resolution || config.preset_name != preset_name || config.task != preset->task || config.num_queries != queries.as_int || config.num_select != queries.as_int)
   throw std::runtime_error("completed checkpoint lost catalog model or admitted query identity");
+}
+WorkflowScratchInputs::WorkflowScratchInputs(const std::filesystem::path& root)
+ : root_(std::filesystem::absolute(root)), fixture_{.root_dir = (root_ / "scratch-data").string(), .width = 40, .height = 40, .num_images = 64, .background_images = 0} {
+ const auto evidence = rfdetr::testsupport::encoder_training_evidence();
+ if (!evidence) throw std::runtime_error("scratch workflow requires explicit encoder evidence");
+ data::testsupport::create_compiled_fixture(fixture_, false);
+ const auto& asset = *rfdetr::find_encoder_pretraining_asset(rfdetr::find_preset_catalog_entry("rf-detr-atto")->backbone.kind);
+ std::string identity(asset.source_repository);
+ std::ranges::replace(identity, '/', '-');
+ identity += '-' + std::string(asset.source_revision);
+ source_ = root_ / ".cache/mmltk/weights/encoders" / identity / asset.filename;
+ std::filesystem::create_directories(source_.parent_path());
+ std::filesystem::create_symlink(*evidence / "assets" / (std::string(mmltk::frameworks::reflection::enum_name(asset.backbone)) + ".safetensors"), source_);
+ // The real file-dialog transport still owns selection and confirmation. Its
+ // executable seam returns only the session admitted below by the parent.
+ std::filesystem::create_directories(root_ / "fixture-bin");
+ std::ofstream chooser(root_ / "fixture-bin/zenity");
+ chooser << "#!/bin/sh\nexec cat ./resume-source\n";
+ chooser.close();
+ std::filesystem::permissions(root_ / "fixture-bin/zenity", std::filesystem::perms::owner_all);
+}
+void WorkflowScratchInputs::Configure(contracts::GuiSettingsState& settings) {
+ auto& train = settings.workflows.train;
+ train.model_source = contracts::ModelSelectionSource::Canonical;
+ train.model_input = contracts::ModelArtifactInputKind::Weights;
+ train.use_compiled_directory_defaults = false;
+ train.request.preset_name = "rf-detr-atto";
+ train.request.resolution = fixture_.width;
+ train.request.train_compiled_path = train.request.val_compiled_path = data::testsupport::compiled_bin_path(fixture_);
+ train.request.test_compiled_path.clear();
+ train.request.weights_path.clear();
+ train.request.encoder_weights_path.clear();
+ train.request.from_scratch = false;
+ train.request.num_queries = 8;
+ train.request.batch_size = train.request.val_batch_size = 2;
+ train.request.epochs = 3;
+ train.request.workers = 4;
+ train.request.lanes = 2;
+ train.request.freeze_encoder = true;
+ train.request.amp = train.request.fused_optimizer = train.request.progress_bar = false;
+ train.request.gpu_augmentation.enabled = false;
+ train.request.compilation_mode = rfdetr::CompilationMode::kNone;
+ train.output = {.automatic = false, .directory = (root_ / "training").string()};
+}
+void WorkflowScratchInputs::PrepareResume(const std::filesystem::path& encoder, const std::filesystem::path& checkpoint, const std::filesystem::path& output) {
+ REQUIRE(encoder.lexically_normal() == source_.lexically_normal());
+ const auto checked_checkpoint = canonical_fixture_path(root_, checkpoint);
+ const auto checked_output = canonical_fixture_path(root_, output);
+ REQUIRE(checked_checkpoint);
+ REQUIRE(checked_output);
+ checkpoint_ = *checked_checkpoint;
+ rfdetr::TrainingSessionAdmission session(checkpoint_);
+ const auto& manifest = session.manifest();
+ const auto run = read_workflow_run(*checked_output);
+ REQUIRE(run.configuration.from_scratch);
+ REQUIRE(run.original_weights.empty());
+ REQUIRE(run.configuration.weights_path.empty());
+ REQUIRE(run.configuration.encoder_weights_path.empty());
+ REQUIRE(run.configuration.resume_path.empty());
+ REQUIRE(manifest.epoch > 0);
+ REQUIRE(manifest.epoch < manifest.request.epochs);
+ REQUIRE(manifest.request.from_scratch);
+ REQUIRE(manifest.request.encoder_weights_path.empty());
+ const auto& metadata = session.model(0).metadata;
+ const auto config = rfdetr::checkpoint_configuration(metadata);
+ const auto provenance = rfdetr::encoder_pretraining_provenance(*rfdetr::find_encoder_pretraining_asset(config.backbone.kind));
+ REQUIRE(metadata.encoder_pretraining == provenance);
+ REQUIRE(run.encoder_pretraining == provenance);
+ REQUIRE(metadata.source_path.empty());
+ const auto source = mmltk::common::io::try_file_digests(source_, false);
+ REQUIRE(source);
+ REQUIRE(mmltk::common::io::sha256_hex(source->sha256) == provenance.sha256);
+ torch::manual_seed(static_cast<std::uint64_t>(manifest.request.seed));
+ rfdetr::NativeRfDetrModel initial(config, metadata.class_layout);
+ initial.initialize_training_supervision(static_cast<std::uint64_t>(manifest.request.seed));
+ const auto fresh_head = initial.named_parameters(true)["class_embed.weight"].detach().clone();
+ const auto loaded = rfdetr::initialize_encoder_pretraining(initial, source_);
+ REQUIRE(torch::equal(initial.named_parameters(true)["class_embed.weight"], fresh_head));
+ REQUIRE(loaded.provenance == provenance);
+ initialization_ = rfdetr::native_state_fingerprint(rfdetr::collect_module_state(initial));
+ REQUIRE(manifest.initialization == initialization_);
+ source->snapshot.RequireUnchanged(source_);
+ source_attempt_ = manifest.attempt_id;
+ session_id_ = manifest.session_id;
+ optimizer_steps_ = session.continuation(0).values.schedule.consumed_attempts;
+ REQUIRE(optimizer_steps_ > 0);
+ contracts::GuiSettingsState persisted;
+ REQUIRE(contracts::load_gui_settings_file((root_ / ".mmltk-data/gui.json").string(), persisted));
+ REQUIRE(persisted.workflows.train.request.from_scratch);
+ REQUIRE(persisted.workflows.train.request.weights_path.empty());
+ REQUIRE(persisted.workflows.train.request.resume_path.empty());
+ REQUIRE(std::filesystem::remove(source_));
+ REQUIRE_FALSE(std::filesystem::exists(source_));
+ std::ofstream(root_ / "resume-source") << checkpoint_.string() << '\n';
+}
+void WorkflowScratchInputs::VerifyResume(const std::filesystem::path& checkpoint, const std::filesystem::path& output) const {
+ REQUIRE_FALSE(std::filesystem::exists(source_));
+ const auto checked = canonical_fixture_path(root_, checkpoint);
+ const auto directory = canonical_fixture_path(root_, output);
+ REQUIRE(checked);
+ REQUIRE(directory);
+ rfdetr::TrainingSessionAdmission session(*checked);
+ const auto& manifest = session.manifest();
+ const auto run = read_workflow_run(*directory);
+ REQUIRE(manifest.initialization == initialization_);
+ REQUIRE(manifest.session_id == session_id_);
+ REQUIRE(manifest.attempt_id != source_attempt_);
+ REQUIRE(manifest.request.from_scratch);
+ REQUIRE(manifest.request.encoder_weights_path.empty());
+ REQUIRE(manifest.epoch == manifest.request.epochs);
+ REQUIRE(session.continuation(0).values.schedule.consumed_attempts > optimizer_steps_);
+ REQUIRE(run.source_checkpoint_attempt_id == source_attempt_);
+ REQUIRE(run.resume_optimizer_step == optimizer_steps_);
+ // Saved run configuration retains initialization lineage; the GUI launch
+ // request below is the normalized, source-independent Resume invocation.
+ REQUIRE(run.configuration.from_scratch);
+ REQUIRE(run.configuration.resume_path.empty());
+ REQUIRE(run.configuration.weights_path.empty());
+ REQUIRE(run.original_weights.empty());
+ REQUIRE(run.encoder_pretraining == session.model(0).metadata.encoder_pretraining);
+ REQUIRE(run.encoder_pretraining);
+ contracts::GuiSettingsState persisted;
+ REQUIRE(contracts::load_gui_settings_file((root_ / ".mmltk-data/gui.json").string(), persisted));
+ REQUIRE_FALSE(persisted.workflows.train.request.from_scratch);
+ REQUIRE(persisted.workflows.train.request.encoder_weights_path.empty());
+ REQUIRE(persisted.workflows.train.request.resume_path == checkpoint_);
 }
 WorkflowArtifactMutation::WorkflowArtifactMutation(const std::filesystem::path& root, std::filesystem::path alternate)
     : artifact_(std::filesystem::absolute(root / "export" / "model.onnx").lexically_normal()), backup_(artifact_.string() + ".acceptance-retained"), alternate_(std::move(alternate)) {}

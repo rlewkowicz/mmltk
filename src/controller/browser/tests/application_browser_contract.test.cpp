@@ -1259,6 +1259,7 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
   STATIC_REQUIRE(Relation::valid());
   std::size_t projected_fields = 0U;
   Relation::key_relation::VisitMembers([&]<class Entry>() {
+   if constexpr (requires { Entry::source; }) {
    constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Entry::source>();
    constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<contracts::ModelSelectionKey, Entry::destination>();
    std::size_t matches = 0U;
@@ -1270,6 +1271,10 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
    });
    CHECK(matches == 1U);
    CHECK_FALSE(destination.view().empty());
+   } else {
+    STATIC_REQUIRE(Entry::value == false);
+    STATIC_REQUIRE(Relation::workflow != contracts::FeatureId::Train);
+   }
    ++projected_fields;
   });
   CHECK(projected_fields + 1U == Relation::key_field_count);

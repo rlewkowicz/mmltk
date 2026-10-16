@@ -95,6 +95,10 @@ struct BrowserAudit final {
  bool workflow_gpu_invalid = false;
  void consume_native_gpu(const nlohmann::json& record);
  [[nodiscard]] bool workflow_gpus_complete() const;
+ std::map<std::string, nlohmann::json> scratch_records;
+ std::map<std::pair<unsigned, unsigned>, nlohmann::json> scratch_pixels;
+ bool scratch_invalid = false;
+ [[nodiscard]] bool scratch_complete() const;
  std::map<std::string, nlohmann::json> keypoint_pixels;
  bool keypoint_pixel_invalid = false;
  std::map<std::pair<std::string, std::string>, nlohmann::json> keypoint_catalog;

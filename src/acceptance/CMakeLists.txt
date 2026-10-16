@@ -167,6 +167,7 @@ if(BUILD_RFDETR_NATIVE)
         target_compile_definitions(mmltk_workspace_wayland_integration PRIVATE
         MMLTK_TEST_MMLTK_GUI_LAUNCHER="/opt/mmltk/bin/mmltk-browser-host")
     target_link_libraries(mmltk_workspace_wayland_integration PRIVATE
+        mmltk_backend_models_rfdetr_encoder_training_test_support
         PkgConfig::MMLTK_FFMPEG
         stb
         mmltk::backend::imaging::primitives

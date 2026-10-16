@@ -800,27 +800,60 @@ private:
   emit_rust_field_access(output, path.view(), false);
   return std::move(output).str();
  }
+ template <auto Destination>
+ static consteval bool ModelFieldHasConstant() {
+  bool constant = false;
+  constexpr auto identity = reflect::accessor_member_identity<mmltk::controller::contracts::ModelSelectionKey, Destination>();
+  mmltk::controller::contracts::ModelSelectionRelation::VisitRows([&]<class Row>(const auto&) {
+   Row::key_relation::VisitMembers([&]<class Entry>() {
+    if constexpr (requires { Entry::value; }) constant = constant || identity == reflect::accessor_member_identity<mmltk::controller::contracts::ModelSelectionKey, Entry::destination>();
+   });
+  });
+  return constant;
+ }
  template <class Relation>
  void EmitModelKeyFields(const bool declaration) {
   Relation::key_relation::VisitMembers([&]<class Entry>() {
    const auto member = RustMemberPath<mmltk::controller::contracts::ModelSelectionKey, Entry::destination>();
+   constexpr bool optional = ModelFieldHasConstant<Entry::destination>();
    if (declaration) {
     symbols_.Reserve("struct ModelSelectionFields", member, "model selection destination " + member);
-    output_ << "pub " << member << ": u64,\n";
+    output_ << "pub " << member << (optional ? ": Option<u64>,\n" : ": u64,\n");
+   } else if constexpr (requires { Entry::value; }) {
+    output_ << member << ": None,\n";
    } else {
     constexpr auto path = reflect::reflected_member_path<Settings, Entry::source>();
-    output_ << member << ": " << mmltk::controller::browser::application_settings_field_stable_id(path.view()) << ",\n";
+    output_ << member << ": " << (optional ? "Some(" : "") << mmltk::controller::browser::application_settings_field_stable_id(path.view()) << (optional ? ")" : "") << ",\n";
    }
   });
+ }
+ template <class Entry>
+ void EmitModelKeyValue(const std::string_view root, const std::string_view prefix = {}) {
+  if constexpr (requires { Entry::value; }) {
+   emit_catalog_value(output_, Entry::value);
+  } else {
+   const auto path = RustMemberPath<Settings, Entry::source>();
+   if (!path.starts_with(prefix)) throw std::logic_error("model selection field is outside its owning settings");
+   output_ << root << std::string_view(path).substr(prefix.size());
+   if constexpr (std::same_as<typename Entry::transform, mmltk::controller::contracts::ModelSelectionResolutionTransform>) {
+    output_ << " as u32";
+   } else {
+    static_assert(std::same_as<typename Entry::transform, mmltk::controller::contracts::ModelSelectionTextTransform> || std::same_as<typename Entry::transform, reflect::ExactMemberTransform>);
+    output_ << ".clone()";
+   }
+  }
  }
  void EmitModelSelection() {
   using namespace mmltk::controller::contracts;
   symbols_.Reserve("module", "ModelSelectionFields", "canonical model key settings identities");
   output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct ModelSelectionFields {\n";
   EmitModelKeyFields<TrainWeightsModelSelection>(true);
-  output_ << "}\nimpl ModelSelectionFields { pub fn all(&self) -> [u64; " << TrainWeightsModelSelection::key_relation::member_count << "] { [";
-  TrainWeightsModelSelection::key_relation::VisitMembers([&]<class Entry>() { output_ << "self." << RustMemberPath<ModelSelectionKey, Entry::destination>() << ','; });
-  output_ << "] } }\n";
+  output_ << "}\nimpl ModelSelectionFields { pub fn all(&self) -> impl Iterator<Item = u64> + '_ { [";
+  TrainWeightsModelSelection::key_relation::VisitMembers([&]<class Entry>() {
+   constexpr bool optional = ModelFieldHasConstant<Entry::destination>();
+   output_ << (optional ? "" : "Some(") << "self." << RustMemberPath<ModelSelectionKey, Entry::destination>() << (optional ? "" : ")") << ',';
+  });
+  output_ << "].into_iter().flatten() } }\n";
   ReserveGeneratedStruct("ModelArtifactDialogFact", "canonical model artifact dialogs", {"target", "stable_field_id", "key_fields", "field_path", "dialog"});
   symbols_.Reserve("module", "MODEL_ARTIFACT_DIALOGS", "canonical model artifact dialogs");
   output_ << "#[derive(Debug, Clone, PartialEq)]\n"
@@ -847,13 +880,8 @@ private:
    output_ << " {\nif result.is_none() { result = Some(ModelSettingsProjection { key: ModelSelectionKey {\n";
    output_ << RustMemberPath<ModelSelectionKey, Relation::workflow_destination>() << ": FeatureId::" << rust_identifier(reflect::enum_name(Relation::workflow), true) << ",\n";
    Relation::key_relation::VisitMembers([&]<class Entry>() {
-    output_ << RustMemberPath<ModelSelectionKey, Entry::destination>() << ": settings." << RustMemberPath<Settings, Entry::source>();
-    if constexpr (std::same_as<typename Entry::transform, ModelSelectionResolutionTransform>)
-     output_ << " as u32";
-    else {
-     static_assert(std::same_as<typename Entry::transform, ModelSelectionTextTransform> || std::same_as<typename Entry::transform, reflect::ExactMemberTransform>);
-     output_ << ".clone()";
-    }
+    output_ << RustMemberPath<ModelSelectionKey, Entry::destination>() << ": ";
+    EmitModelKeyValue<Entry>("settings.");
     output_ << ",\n";
    });
    output_ << "}, inspectiondevice: None, artifact: String::new(), compatible: false";
@@ -866,6 +894,15 @@ private:
            << (row.custom_allowed ? "true" : "false") << " };\n} }\n";
   });
   output_ << "result }\n";
+  symbols_.Reserve("module", "project_train_model_key", "canonical Train continuation selection identity");
+  output_ << "pub fn project_train_model_key(train: &TrainViewState) -> ModelSelectionKey { ModelSelectionKey { workflow: FeatureId::Train,\n";
+  const auto train_prefix = RustMemberPath<Settings, reflect::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train>>() + ".";
+  TrainWeightsModelSelection::key_relation::VisitMembers([&]<class Entry>() {
+   output_ << RustMemberPath<ModelSelectionKey, Entry::destination>() << ": ";
+   EmitModelKeyValue<Entry>("train.", train_prefix);
+   output_ << ",\n";
+  });
+  output_ << "} }\n";
  }
  void EmitIdentitiesAndApplicationEnums() {
   BindingOuterRoutingWriter writer(output_, symbols_);

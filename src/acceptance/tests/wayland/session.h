@@ -89,6 +89,7 @@ private:
  std::filesystem::path acceptance_log;
  std::unique_ptr<ArtifactNotifications> notifications_;
  std::unique_ptr<BrowserHostProcess> process_;
+ std::unique_ptr<mmltk::testsupport::WorkflowScratchInputs> scratch_;
  ScopedFd deadline;
  NativeAudit native;
  BrowserAudit browser;

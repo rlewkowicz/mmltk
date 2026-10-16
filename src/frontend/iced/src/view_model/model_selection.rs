@@ -49,7 +49,7 @@ impl ModelSettingsProjection {
                 || !self.selection.artifact.is_empty())
     }
 
-    pub(super) fn matches(&self, selection: &ModelSelection) -> bool {
+    pub(crate) fn matches(&self, selection: &ModelSelection) -> bool {
         selection.key == self.selection.key
             && selection.inspectiondevice == self.selection.inspectiondevice
             && (self.selection.key.source == ModelSelectionSource::Canonical
@@ -139,7 +139,9 @@ impl crate::generated::ModelApplicationProjection<UiError> for ApplicationModel 
                             != Some(receipt.settings_revision)
                             || (outcome == ModelSelectionOutcome::Accepted
                                 && self.model_snapshot.as_ref().is_some_and(|value| {
-                                    value.selection.key.workflow != receipt.workflow
+                                    value.selection.key != receipt.selection.key
+                                        || value.selection.inspectiondevice != receipt.selection.inspectiondevice
+                                        || (receipt.selection.key.source == ModelSelectionSource::Custom && value.selection.artifact != receipt.selection.artifact)
                                 }))
                         {
                             self.report_admission_error(
@@ -179,6 +181,31 @@ mod tests {
 
     fn write_field(settings: &mut GuiSettingsState, stable_id: u64, value: SettingsFieldValue) {
         crate::generated::apply_settings_field(settings, stable_id, value).unwrap();
+    }
+
+    #[test]
+    fn scratch_preparation_and_receipts_retain_the_generated_mode_identity() {
+        let mut model = bootstrapped();
+        let mut settings = model.settings_snapshot.as_ref().unwrap().settingsstate.clone();
+        settings.workflows.train.modelsource = ModelSelectionSource::Canonical;
+        let pretrained = accepted_model_for(&model, &settings, FeatureId::Train);
+        model.model_snapshot = Some(pretrained.clone());
+        let inputs = crate::view_model::StartInputs::capture(&settings, FeatureId::Train).unwrap();
+        let receipt = model.workflow.model_selection_receipt(FeatureId::Train, &settings).unwrap();
+        settings.workflows.train.request.fromscratch = true;
+        assert!(!inputs.matches(&settings));
+        assert!(!model.model_selection_matches(&settings, FeatureId::Train));
+        let scratch = accepted_model_for(&model, &settings, FeatureId::Train);
+        assert_ne!(receipt.selection.key, scratch.selection.key);
+        model.model_snapshot = Some(scratch);
+        assert!(model.model_selection_matches(&settings, FeatureId::Train));
+        settings.workflows.train.request.fromscratch = false;
+        assert!(!model.model_selection_matches(&settings, FeatureId::Train));
+        model.model_snapshot = Some(pretrained);
+        assert!(model.model_selection_matches(&settings, FeatureId::Train));
+        for dialog in crate::generated::MODEL_ARTIFACT_DIALOGS {
+            assert_eq!(dialog.key_fields.fromscratch.is_some(), dialog.target.workflow == FeatureId::Train);
+        }
     }
 
     #[test]
@@ -392,7 +419,7 @@ mod tests {
             .clone();
         let receipt = model
             .workflow
-            .model_selection_receipt(FeatureId::Train)
+            .model_selection_receipt(FeatureId::Train, &settings)
             .unwrap();
         let correlation = model.begin_model_select_intent(receipt).unwrap();
         let accepted = accepted_model_for(&model, &settings, FeatureId::Train);

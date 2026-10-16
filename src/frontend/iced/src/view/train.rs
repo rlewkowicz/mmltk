@@ -13,6 +13,10 @@ mod progress;
 
 use crate::view_model::ContinuationMode;
 
+pub const FROM_SCRATCH_ID: &str = "train.model.from_scratch";
+pub const CONTINUATION_ID: &str = "train.model.continuation";
+pub const RESUME_ID: &str = "train.model.resume";
+
 pub const DATASET_CARD_ID: &str = "train.card.dataset";
 pub const COMPILE_DATASET_ID: &str = "train.compile_dataset";
 pub const DATASET_SOURCE_ID: &str = "train.dataset.source";
@@ -33,6 +37,7 @@ pub const MATCH_FREE_ASSIGNMENT_ID: &str = "train.advanced.assignment.match_free
 #[derive(Debug, Clone)]
 pub enum Message {
     Gpu(crate::view::workflow::gpu::Message),
+    FromScratch(bool),
     Continuation(ContinuationMode),
     AspectSelected(crate::generated::WorkspaceAspectRatio),
     StartRequested,
@@ -105,6 +110,15 @@ fn continuation_controls<'a>(
     train: Option<&crate::generated::TrainViewState>,
     enabled: bool,
 ) -> Element<'a, Message> {
+    let scratch = train.is_some_and(|train| train.request.fromscratch);
+    let checkbox = container(iced::widget::checkbox(scratch).label("From scratch")
+        .on_toggle_maybe(enabled.then_some(Message::FromScratch)))
+        .id(FROM_SCRATCH_ID);
+    let mut initialization = column![checkbox].spacing(crate::view::workflow::FIELD_SPACING);
+    if scratch {
+        initialization = initialization.push(text("Pretrained base encoder; new RF-DETR detector weights.").size(12));
+    }
+    let enabled = enabled && !scratch;
     let current = train.is_some_and(|train| model.workflow.train_continuation.matches(train));
     let selected = if current {
         model.workflow.train_continuation.mode
@@ -124,7 +138,7 @@ fn continuation_controls<'a>(
     };
     let mut controls = column![
         radio("Transfer", ContinuationMode::Transfer, enabled),
-        radio(
+        container(radio(
             "Resume",
             ContinuationMode::Resume,
             enabled
@@ -134,7 +148,7 @@ fn continuation_controls<'a>(
                     .train_continuation
                     .checkpoint()
                     .is_some_and(|checkpoint| checkpoint.resumable)
-        ),
+        )).id(RESUME_ID),
     ]
     .spacing(crate::view::workflow::FIELD_SPACING);
     if current {
@@ -153,7 +167,12 @@ fn continuation_controls<'a>(
             _ => {}
         }
     }
-    controls.into()
+    if current && let Some(provenance) = model.workflow.train_continuation.checkpoint()
+        .and_then(|checkpoint| checkpoint.encoderpretraining.as_ref()) {
+        controls = controls.push(crate::view::workflow::model_card::encoder_lineage(provenance));
+    }
+    initialization = initialization.push(container(controls).id(CONTINUATION_ID));
+    initialization.into()
 }
 
 pub(crate) fn offer_identity(offer: &crate::generated::ProviderOffer) -> ProviderOfferIdentity {
@@ -175,6 +194,19 @@ impl Component {
                 model,
                 message,
             )?),
+            Message::FromScratch(value) => {
+                use crate::generated::{SettingsFieldValue as Value, ModelSelectionSource, ModelArtifactInputKind};
+                let schedule = model.edit_fields(crate::view::settings::EditCadence::Immediate, [
+                    (crate::generated::constraint_workflowstrainrequestfromscratch().stable_field_id, Value::Bool(value)),
+                    (crate::generated::constraint_workflowstrainmodelsource().stable_field_id, Value::ModelSelectionSource(ModelSelectionSource::Canonical)),
+                    (crate::generated::constraint_workflowstrainmodelinput().stable_field_id, Value::ModelArtifactInputKind(ModelArtifactInputKind::Weights)),
+                    (crate::generated::constraint_workflowstrainrequestweightspath().stable_field_id, Value::String(String::new())),
+                    (crate::generated::constraint_workflowstrainrequestencoderweightspath().stable_field_id, Value::String(String::new())),
+                    (crate::generated::constraint_workflowstrainrequestresumepath().stable_field_id, Value::String(String::new())),
+                    (crate::generated::constraint_workflowstrainrequestclasslayoutpath().stable_field_id, Value::String(String::new())),
+                ])?;
+                Outcome::SettingsEdited(schedule)
+            }
             Message::Continuation(mode) => Outcome::Continuation(mode),
             Message::AspectSelected(aspect) => {
                 Outcome::SettingsEdited(crate::view::workspace::edit_aspect(model, aspect)?)
@@ -408,6 +440,40 @@ impl Component {
 mod tests {
     use super::*;
     use crate::view::settings::installed_settings_model;
+
+    #[test]
+    fn scratch_choice_atomically_clears_detector_resume_and_layout_inputs() {
+        let mut settings = installed_settings_model();
+        let train = &mut settings.draft.as_mut().unwrap().workflows.train;
+        assert!(!train.request.fromscratch);
+        train.modelsource = crate::generated::ModelSelectionSource::Custom;
+        train.request.weightspath = "/saved/session.json".into();
+        train.request.resumepath = train.request.weightspath.clone();
+        train.request.classlayoutpath = "/saved/classes.json".into();
+        train.request.encoderweightspath = "/stale/base.safetensors".into();
+        let preset = train.request.presetname.clone();
+        let mut component = Component::default();
+        for checked in [true, false] {
+            assert!(matches!(component.update(&mut settings, None, Message::FromScratch(checked)),
+                Ok(Some(Outcome::SettingsEdited(EditSchedule::FlushNow)))));
+            let train = &settings.draft.as_ref().unwrap().workflows.train;
+            assert_eq!(train.request.fromscratch, checked);
+            assert_eq!(train.modelsource, crate::generated::ModelSelectionSource::Canonical);
+            assert_eq!(train.request.presetname, preset);
+            assert!(train.request.weightspath.is_empty() && train.request.resumepath.is_empty()
+                && train.request.classlayoutpath.is_empty() && train.request.encoderweightspath.is_empty());
+        }
+    }
+
+    #[test]
+    fn admitted_training_locks_scratch_choice_atomically() {
+        let mut settings = installed_settings_model();
+        settings.execution_edit_locked[0] = true;
+        let before = settings.draft.clone();
+        assert!(Component::default().update(&mut settings, None, Message::FromScratch(true)).is_err());
+        assert_eq!(settings.draft, before);
+        assert_eq!(settings.queued_len(), 0);
+    }
 
     #[test]
     fn only_train_installs_continuation_controls_inside_the_weights_card() {

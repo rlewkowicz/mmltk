@@ -287,6 +287,8 @@ fn validate_generated_surfaces() -> io::Result<()> {
         "model-artifact identities are duplicated",
     )?;
     for dialog in schema::MODEL_ARTIFACT_DIALOGS {
+        require(dialog.key_fields.fromscratch.is_some() == (dialog.target.workflow == schema::FeatureId::Train),
+            "constant model selection fields must not identify editable settings")?;
         require(
             dialog.target.stableid == dialog.stable_field_id
                 && !dialog.dialog.title.is_empty()

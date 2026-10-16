@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/contract/encoder_pretraining.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
@@ -806,6 +807,11 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     ++phase_progress_revision;
    }
   }
+ } else if (event == "integration.scratch.pixels") {
+  const auto key = std::pair{record.value("stage", 99U), record.value("index", 99U)};
+  if (key.first > 3 || key.second > 2 || !scratch_pixels.emplace(key, record).second) scratch_invalid = true;
+ } else if (event == "integration.scratch.prepared" || event == "integration.scratch.fresh-session" || event == "integration.scratch.resumed-session") {
+  if (!scratch_records.emplace(event, record).second) scratch_invalid = true;
  } else if (event == "integration.keypoint.catalog") {
   const auto key = std::pair{record.value("control", ""), record.value("detail", "")};
   if (keypoint_catalog.size() >= 2 * mmltk::backend::models::rfdetr::kPresetCatalog.size() || !keypoint_catalog.emplace(key, record).second) keypoint_catalog_invalid = true;
@@ -2472,6 +2478,27 @@ bool BrowserAudit::keypoint_pixels_complete() const {
  const auto& failed_pixels = keypoint_pixels.at("live-failure-retained");
  const auto& retained = keypoint_pixels.at("live-zero-detections");
  return scalar(failed_pixels, "a") == scalar(retained, "a");
+}
+bool BrowserAudit::scratch_complete() const {
+ if (scratch_invalid || scratch_pixels.size() != 12 || scratch_records.size() != 3) return false;
+ constexpr std::array controls{"train.model.from_scratch", "train.model.custom_weights", "train.model.resume"};
+ for (unsigned stage = 0; stage < 4; ++stage) for (unsigned index = 0; index < controls.size(); ++index) {
+  const auto found = scratch_pixels.find({stage, index});
+  if (found == scratch_pixels.end()) return false;
+  const auto& value = found->second;
+  const bool disabled = index == 1 ? stage == 1 : index == 2 && stage != 3;
+  const bool colored = index == 0 ? stage == 1 : !disabled;
+  if (value.value("control", "") != controls[index] || !value.value("matched", false) || value.value("sampled", 0U) < 64 ||
+      value.value("checked", false) != (index == 0 && stage == 1) || value.value("disabled", false) != disabled ||
+      (colored ? value.value("blue", 0U) < 8 : value.value("blue", 1U) != 0) ||
+      (disabled && (value.value("disabled_ink", 0U) < 8 || value.value("dark", 1U) != 0))) return false;
+ }
+ const auto prepared = scratch_records.find("integration.scratch.prepared");
+ const auto fresh = scratch_records.find("integration.scratch.fresh-session"), resumed = scratch_records.find("integration.scratch.resumed-session");
+ if (prepared == scratch_records.end() || fresh == scratch_records.end() || resumed == scratch_records.end()) return false;
+ const auto& encoder = *mmltk::backend::models::rfdetr::find_encoder_pretraining_asset(mmltk::backend::models::rfdetr::BackboneKind::PeCoreTiny);
+ return prepared->second.value("detail", "") == encoder.sha256 && scalar(prepared->second, "a") > 0 && scalar(prepared->second, "b") == 1 && scalar(prepared->second, "c") == 0 &&
+        scalar(resumed->second, "a") > scalar(fresh->second, "a") && scalar(resumed->second, "b") > 0;
 }
 bool BrowserAudit::keypoint_catalog_complete() const {
  namespace rfdetr = mmltk::backend::models::rfdetr;

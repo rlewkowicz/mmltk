@@ -20,6 +20,7 @@ struct ModelSelectionKey final {
  ModelArtifactInputKind input = ModelArtifactInputKind::None;
  MMLTK_MAX_NAME_BYTES std::string preset;
  std::uint32_t resolution = 0U;
+ bool from_scratch = false;
  MMLTK_MAX_BYTES(kModelArtifactCapacity) std::string class_layout_path {};
  [[nodiscard]] bool valid() const noexcept;
  bool operator==(const ModelSelectionKey&) const = default;

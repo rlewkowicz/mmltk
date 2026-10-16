@@ -38,6 +38,98 @@ namespace {
  REQUIRE(input);
  return {.key = input->key, .inspection_device = input->inspection_device, .artifact = input->custom_artifact};
 }
+TEST_CASE("scratch preparation admits only the matching encoder and provisional catalog facts", "[controller][model][encoder_pretraining]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ class Assets final : public services::ArtifactWeightOperations {
+ public:
+  mutable std::size_t detectors = 0, encoders = 0;
+  mutable r::BackboneKind selected{};
+  std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { ++detectors; throw std::runtime_error("detector acquisition is forbidden"); }
+  std::optional<services::ArtifactWeightAsset> find(r::BackboneKind kind) const override {
+   ++encoders;
+   selected = kind;
+   return services::ArtifactWeightAsset{.filename = "model.safetensors", .url = "https://fixture.invalid/encoder",
+    .digest_kind = services::ArtifactWeightDigest::Sha256, .digest = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    .file_bytes = 1, .cache_identity = "fixture", .encoder = kind};
+  }
+  void download(std::string_view, const std::filesystem::path& path, const services::ArtifactCancellationToken&, services::ArtifactWeightProgressObserver) const override {
+   std::ofstream(path).put('a');
+  }
+ } assets;
+ const mmltk::testsupport::ScopedTempDir root("scratch-model-selection");
+ ArtifactModelRuntime runtime(services::ArtifactStore(root.path(), assets));
+ for (const auto& preset : r::kPresetCatalog) {
+  contracts::ModelSelectionKey key{.workflow = contracts::FeatureId::Train, .source = contracts::ModelSelectionSource::Canonical,
+   .input = contracts::ModelArtifactInputKind::Weights, .preset = std::string(preset.preset_name), .resolution = preset.resolution, .from_scratch = true};
+  const auto admitted = runtime.Acquire(key, {}, 0, {}, [](const auto&) {});
+  CHECK(admitted.task == preset.task);
+  REQUIRE(admitted.training_config);
+  CHECK(admitted.training_config->num_classes == 0);
+  CHECK(admitted.training_config->keypoints_per_class.empty());
+  CHECK(admitted.training_capabilities == preset.training_capabilities);
+  CHECK(admitted.class_layout.output_count == 0);
+  CHECK(admitted.encoder_pretraining == r::encoder_pretraining_provenance(*r::find_encoder_pretraining_asset(preset.backbone.kind)));
+  CHECK(assets.selected == preset.backbone.kind);
+  CHECK(assets.detectors == 0);
+  auto invalid = key;
+  invalid.source = contracts::ModelSelectionSource::Custom;
+  CHECK_FALSE(invalid.valid());
+  invalid = key;
+  invalid.workflow = contracts::FeatureId::Predict;
+  CHECK_FALSE(invalid.valid());
+  invalid = key;
+  invalid.class_layout_path = "/detector.classes.json";
+  CHECK_FALSE(invalid.valid());
+  std::stop_source cancelled;
+  cancelled.request_stop();
+  const auto acquisitions = assets.encoders;
+  CHECK_THROWS(runtime.Acquire(key, {}, 0, cancelled.get_token(), [](const auto&) {}));
+  CHECK(assets.encoders == acquisitions);
+ }
+ contracts::ModelSelectionKey unknown{.input = contracts::ModelArtifactInputKind::Weights, .preset = "missing", .resolution = 64, .from_scratch = true};
+ CHECK_THROWS_WITH(runtime.Acquire(unknown, {}, 0, {}, [](const auto&) {}), "unknown RF-DETR preset");
+}
+TEST_CASE("fresh scratch materialization keeps encoder and detector identities disjoint", "[controller][model][encoder_pretraining]") {
+ using Materializer = subsystems::system::ComputeIntentMaterializer;
+ auto settings = contracts::default_gui_settings_state();
+ auto& train = settings.workflows.train;
+ train.request.from_scratch = true;
+ train.request.train_compiled_path = "/tmp/train.bin";
+ train.request.val_compiled_path = "/tmp/val.bin";
+ train.request.test_compiled_path.clear();
+ train.model_source = contracts::ModelSelectionSource::Canonical;
+ train.model_input = contracts::ModelArtifactInputKind::Weights;
+ const auto key = Materializer::ModelInputFor(settings, contracts::FeatureId::Train);
+ REQUIRE(key);
+ CHECK(key->key.from_scratch);
+ for (const auto workflow : {contracts::FeatureId::Validate, contracts::FeatureId::Predict, contracts::FeatureId::Export}) {
+  const auto projection = contracts::model_settings_projection(settings, workflow);
+  REQUIRE(projection);
+  CHECK_FALSE(projection->key.from_scratch);
+ }
+ contracts::ModelSelection prepared{.key = key->key, .artifact = "/tmp/base.safetensors"};
+ const contracts::ArtifactInspection data{.compatible = true, .splits = {split("/tmp/train.bin"), split("/tmp/val.bin")}};
+ const auto request = Materializer::LocalTrain(settings, data, prepared);
+ REQUIRE(request);
+ CHECK(request->from_scratch);
+ CHECK(request->weights_path.empty());
+ CHECK(request->encoder_weights_path == prepared.artifact);
+ CHECK(request->resume_path.empty());
+ for (auto* conflict : {&train.request.weights_path, &train.request.resume_path, &train.request.class_layout_path}) {
+  *conflict = "/tmp/conflicting-detector";
+  CHECK_FALSE(Materializer::LocalTrain(settings, data, prepared));
+  conflict->clear();
+ }
+ train.request.from_scratch = false;
+ CHECK_FALSE(Materializer::LocalTrain(settings, data, prepared));
+ auto pretrained = prepared;
+ pretrained.key.from_scratch = false;
+ CHECK(Materializer::LocalTrain(settings, data, pretrained));
+ train.request.from_scratch = true;
+ CHECK_FALSE(Materializer::LocalTrain(settings, data, pretrained));
+ train.request.preset_name = "rf-detr-small";
+ CHECK_FALSE(Materializer::LocalTrain(settings, data, prepared));
+}
 TEST_CASE("Prepared model facts publish complete admitted custom names and task configuration", "[controller][model][boundary]") {
  namespace rfdetr = mmltk::backend::models::rfdetr;
  rfdetr::test_support::with_configuration_envelope([&](const rfdetr::NativeRfDetrConfig& config) {

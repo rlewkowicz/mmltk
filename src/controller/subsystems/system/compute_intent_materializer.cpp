@@ -90,6 +90,8 @@ std::expected<ComputeIntentMaterializer::ModelInput, ComputeIntentMaterializer::
 std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMaterializer::Refusal> ComputeIntentMaterializer::LocalTrain(
  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  auto request = settings.workflows.train.request;
+ if (request.from_scratch && (!request.weights_path.empty() || !request.resume_path.empty() || !request.class_layout_path.empty()))
+  return std::unexpected(refused("scratch training cannot use detector, Resume or class-layout inputs"));
  request.output_dir = mmltk::controller::contracts::workflow_output_root(settings.workflows.train.output, mmltk::controller::contracts::FeatureId::Train);
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Train, model);
  if (!selected) return std::unexpected(selected.error());
@@ -106,7 +108,8 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
  if ((*training)->class_names != (*validation)->class_names) return std::unexpected(refused("training and validation class order differs"));
  request.train_compiled_path = (*training)->path;
  if (request.resume_path.empty()) {
-  request.weights_path = model.artifact;
+  request.weights_path = request.from_scratch ? std::filesystem::path{} : std::filesystem::path{model.artifact};
+  request.encoder_weights_path = request.from_scratch ? std::filesystem::path{model.artifact} : std::filesystem::path{};
  } else {
   if (request.resume_path != model.artifact) return std::unexpected(refused("prepared training model does not match the selected resume checkpoint"));
   mmltk::backend::models::rfdetr::normalize_train_resume_request(request, request.resume_path);

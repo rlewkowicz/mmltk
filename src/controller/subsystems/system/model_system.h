@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <utility>
@@ -30,6 +31,7 @@ struct ModelArtifactAdmission final {
  mmltk::backend::models::rfdetr::ModelTask task = mmltk::backend::models::rfdetr::ModelTask::Detection;
  std::optional<mmltk::backend::models::rfdetr::NativeRfDetrConfig> training_config{};
  mmltk::backend::models::rfdetr::PresetTrainingCapabilities training_capabilities{};
+ std::optional<mmltk::backend::models::rfdetr::EncoderPretrainingProvenance> encoder_pretraining{};
 };
 class ModelRuntime {
 public:

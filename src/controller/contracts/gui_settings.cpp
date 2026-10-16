@@ -338,6 +338,7 @@ constexpr auto train_training_fields = [](auto& state, const auto& visit) {
  visit("unfreeze_encoder_last_epochs", request.unfreeze_encoder_last_epochs);
  visit("disable_augmentation_last_epochs", request.disable_augmentation_last_epochs);
  visit("resume_path", request.resume_path);
+ visit("from_scratch", request.from_scratch);
  visit("batch_size", request.batch_size);
  visit("val_batch_size", request.val_batch_size);
  visit("epochs", request.epochs);

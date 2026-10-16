@@ -1,5 +1,6 @@
 //! Real model workflows driven through the packaged Iced interface.
 pub(super) mod keypoints;
+pub(super) mod scratch;
 use super::annotation_checks::annotation_layout_scale;
 use crate::generated::FeatureId;
 use crate::generated::{ComputeOperationOutcome, SourceKind};
@@ -99,6 +100,7 @@ impl Retention {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Step {
     Keypoints(keypoints::Stage),
+    Scratch(scratch::Stage),
     GpuSelect(FeatureId, i32),
     GpuReady(FeatureId),
     Train,
@@ -230,6 +232,7 @@ pub(super) enum Step {
 #[derive(Default)]
 pub(super) struct State {
     keypoints: keypoints::State,
+    pub(super) scratch: scratch::State,
     source_fixture: Option<TrainingFixture>,
     gpu_completed: [bool; 4],
     gpu_admitted: [u64; 4],
@@ -983,6 +986,21 @@ fn source(index: u8) -> SourceKind {
         0 => SourceKind::CompiledDataset,
         1 => SourceKind::SingleImage,
         _ => SourceKind::VideoFile,
+    }
+}
+fn control(
+    widgets: &mut widget_ops::RevealState,
+    driver: &mut Driver,
+    id: impl Into<String>,
+) -> Task<RootMessage> {
+    if !widgets.begin_location() {
+        return Task::none();
+    }
+    let id = id.into();
+    if id.starts_with("navigation.") || id.starts_with("explore.") {
+        widget_ops::locate(id, driver.generation)
+    } else {
+        widget_ops::reveal_control(id, driver.generation, widget_ops::AnnotationReveal::Control)
     }
 }
 fn primary(feature: FeatureId) -> &'static str {
@@ -2176,6 +2194,10 @@ impl State {
         let Phase::Workflows(step) = driver.phase else {
             return;
         };
+        if let Step::Scratch(stage) = step {
+            self.scratch.located(driver, stage, control, bounds);
+            return;
+        }
         if let Step::Keypoints(stage) = step {
             self.keypoints.located(driver, stage, control, bounds);
             return;
@@ -2586,6 +2608,9 @@ impl State {
         surface: Option<crate::presentation_surface::Surface>,
         router: &crate::view::router::Router,
     ) -> Task<RootMessage> {
+        if let Step::Scratch(stage) = step {
+            return self.scratch.advance(widgets, driver, stage, model, settings, active);
+        }
         if let Step::Keypoints(stage) = step {
             return self
                 .keypoints
