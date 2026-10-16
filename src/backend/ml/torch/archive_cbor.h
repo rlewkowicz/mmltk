@@ -6,7 +6,6 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "src/frameworks/serialization/reflected_cbor.h"
-
 namespace mmltk::backend::ml::serialization {
 struct CborArchiveBudget final {
  std::size_t max_items;

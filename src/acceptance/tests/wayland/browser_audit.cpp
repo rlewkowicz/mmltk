@@ -2459,9 +2459,7 @@ bool BrowserAudit::keypoint_pixels_complete() const {
   const std::string_view name(stage);
   const bool empty = name == "live-capture-only" || name == "live-zero-detections" || name == "live-failure-retained";
   const bool clean = name == "live-import-clean", catalog = name == "catalog-pe-image";
-  const auto control = name == "keypoint-explore"    ? "explore.detail.workspace"
-                       : name == "keypoint-validate" ? "validate.samples.atlas"
-                                                     : "workflow.visual.workspace";
+  const auto control = name == "keypoint-explore" ? "explore.detail.workspace" : name == "keypoint-validate" ? "validate.samples.atlas" : "workflow.visual.workspace";
   const auto sampled = scalar(record, "c"), matched = scalar(record, "d"), joints = scalar(record, "native_joints");
   if (record.value("control", "") != control || scalar(record, "a") == 0 || scalar(record, "b") == 0 || !record.value("matched", false) || record.value("analyzed_empty", !empty) != empty ||
       sampled == 0 || matched > sampled || !record.value("current_receipt", false) || scalar(record, "drawn_source") != scalar(record, "a") ||
@@ -2481,18 +2479,19 @@ bool BrowserAudit::keypoint_pixels_complete() const {
 }
 bool BrowserAudit::scratch_complete() const {
  if (scratch_invalid || scratch_pixels.size() != 12 || scratch_records.size() != 3) return false;
- constexpr std::array controls{"train.model.from_scratch", "train.model.custom_weights", "train.model.resume"};
- for (unsigned stage = 0; stage < 4; ++stage) for (unsigned index = 0; index < controls.size(); ++index) {
-  const auto found = scratch_pixels.find({stage, index});
-  if (found == scratch_pixels.end()) return false;
-  const auto& value = found->second;
-  const bool disabled = index == 1 ? stage == 1 : index == 2 && stage != 3;
-  const bool colored = index == 0 ? stage == 1 : !disabled;
-  if (value.value("control", "") != controls[index] || !value.value("matched", false) || value.value("sampled", 0U) < 64 ||
-      value.value("checked", false) != (index == 0 && stage == 1) || value.value("disabled", false) != disabled ||
-      (colored ? value.value("blue", 0U) < 8 : value.value("blue", 1U) != 0) ||
-      (disabled && (value.value("disabled_ink", 0U) < 8 || value.value("dark", 1U) != 0))) return false;
- }
+ constexpr std::array control_names{"train.model.from_scratch", "train.model.custom_weights", "train.model.resume"};
+ for (unsigned stage = 0; stage < 4; ++stage)
+  for (unsigned index = 0; index < control_names.size(); ++index) {
+   const auto found = scratch_pixels.find({stage, index});
+   if (found == scratch_pixels.end()) return false;
+   const auto& value = found->second;
+   const bool disabled = index == 1 ? stage == 1 : index == 2 && stage != 3;
+   const bool colored = index == 0 ? stage == 1 : !disabled;
+   if (value.value("control", "") != control_names[index] || !value.value("matched", false) || value.value("sampled", 0U) < 64 || value.value("checked", false) != (index == 0 && stage == 1) ||
+       value.value("disabled", false) != disabled || (colored ? value.value("blue", 0U) < 8 : value.value("blue", 1U) != 0) ||
+       (disabled && (value.value("disabled_ink", 0U) < 8 || value.value("dark", 1U) != 0)))
+    return false;
+  }
  const auto prepared = scratch_records.find("integration.scratch.prepared");
  const auto fresh = scratch_records.find("integration.scratch.fresh-session"), resumed = scratch_records.find("integration.scratch.resumed-session");
  if (prepared == scratch_records.end() || fresh == scratch_records.end() || resumed == scratch_records.end()) return false;

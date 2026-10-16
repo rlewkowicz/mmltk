@@ -43,9 +43,7 @@ void write_scalar(torch::serialize::OutputArchive& archive, const char* key, con
   mmltk::backend::ml::serialization::write_int(archive, key, static_cast<int64_t>(value));
  else if constexpr (std::is_floating_point_v<T>)
   mmltk::backend::ml::serialization::write_double(archive, key, static_cast<double>(value));
- else {
-  archive_serialization::write_cbor_record(archive, key, value, kContinuationCborBudget, "invalid continuation structure");
- }
+ else { archive_serialization::write_cbor_record(archive, key, value, kContinuationCborBudget, "invalid continuation structure"); }
 }
 template <class T>
 auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
@@ -55,8 +53,8 @@ auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
   if (!value) throw std::runtime_error(std::string("full training checkpoint is missing ") + key);
   return *value;
  } else {
-  return archive_serialization::read_cbor_record<T>(archive_serialization::require_tensor(archive, key), kContinuationCborBudget,
-   "invalid continuation structure", "invalid continuation values", {.require_contiguous = true, .allow_empty = true});
+  return archive_serialization::read_cbor_record<T>(
+   archive_serialization::require_tensor(archive, key), kContinuationCborBudget, "invalid continuation structure", "invalid continuation values", {.require_contiguous = true, .allow_empty = true});
  }
 }
 void validate_values(const TrainingContinuationValues& values, const TrainRequest& request, bool present_ema) {
@@ -113,8 +111,7 @@ TrainRequest read_training_configuration(torch::serialize::InputArchive& archive
  if (!archive.try_read("training_configuration_cbor", configuration)) throw std::runtime_error("full checkpoint is missing current saved training configuration");
  constexpr auto limits = archive_serialization::cbor_archive_limits<TrainRequest>(kTrainingConfigurationCborBudget);
  configuration = archive_serialization::admit_cbor_tensor<TrainRequest>(std::move(configuration), "invalid checkpoint training configuration");
- auto document = serialization::json_from_cbor(
-  {std::span(reinterpret_cast<const std::byte*>(configuration.const_data_ptr()), static_cast<std::size_t>(configuration.numel())), {}}, limits);
+ auto document = serialization::json_from_cbor({std::span(reinterpret_cast<const std::byte*>(configuration.const_data_ptr()), static_cast<std::size_t>(configuration.numel())), {}}, limits);
  migrate_train_request_record(document);
  auto migration_limits = limits;
  migration_limits.max_bytes *= 6U;

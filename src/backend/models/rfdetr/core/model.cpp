@@ -631,8 +631,7 @@ public:
    torch::Tensor topk_refs;
    if (groups > 1) {
     const auto expanded_memory = output_memory.unsqueeze(0).expand({groups, -1, -1, -1});
-    auto all_memory = detail::grouped_linear_forward(expanded_memory, groups,
-     [&](std::size_t group) -> const torch::nn::LinearImpl& { return enc_output->at<torch::nn::LinearImpl>(group); });
+    auto all_memory = detail::grouped_linear_forward(expanded_memory, groups, [&](std::size_t group) -> const torch::nn::LinearImpl& { return enc_output->at<torch::nn::LinearImpl>(group); });
     std::vector<torch::Tensor> norm_weights, norm_biases;
     std::vector<const RfDetrMlpImpl*> box_heads;
     norm_weights.reserve(groups);
@@ -646,8 +645,8 @@ public:
     }
     const auto normalized = F::layer_norm(all_memory, F::LayerNormFuncOptions({config_.hidden_dim}).eps(enc_output_norm->at<torch::nn::LayerNormImpl>(0).options.eps()));
     all_memory = normalized * torch::stack(norm_weights).view({groups, 1, 1, config_.hidden_dim}) + torch::stack(norm_biases).view({groups, 1, 1, config_.hidden_dim});
-    const auto all_logits = detail::grouped_linear_forward(all_memory, groups,
-     [&](std::size_t group) -> const torch::nn::LinearImpl& { return enc_out_class_embed->at<torch::nn::LinearImpl>(group); });
+    const auto all_logits =
+     detail::grouped_linear_forward(all_memory, groups, [&](std::size_t group) -> const torch::nn::LinearImpl& { return enc_out_class_embed->at<torch::nn::LinearImpl>(group); });
     const int64_t topk = std::min<int64_t>(config_.num_queries, output_memory.size(1));
     const auto topk_indices = std::get<1>(std::get<0>(all_logits.max(-1)).topk(topk, -1));
     if (encoder_indices) *encoder_indices = topk_indices.unbind(0);

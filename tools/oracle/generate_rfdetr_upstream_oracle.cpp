@@ -339,7 +339,8 @@ void verify_archive(const fs::path& directory, const Json& reference) {
   for (const auto& [name, spec] : shard.at("tensors").items())
    if (!names.insert(name).second || names.size() > MaxTensors) throw std::runtime_error("duplicate completed tensor");
   const auto [path, bytes] = admitted_file_record(directory, shard);
-  if (!files.insert(path.filename().string()).second || !bytes || bytes > MaxArchive || bytes > MaxStepStorage - total || fs::file_size(path) != bytes || digest(path) != shard.at("sha256").get<std::string>())
+  if (!files.insert(path.filename().string()).second || !bytes || bytes > MaxArchive || bytes > MaxStepStorage - total || fs::file_size(path) != bytes ||
+      digest(path) != shard.at("sha256").get<std::string>())
    throw std::runtime_error("completed tensor shard changed");
   total += bytes;
  }
@@ -809,8 +810,8 @@ Json save_export_reference(Archive& archive, py::object model, py::object config
  PythonContext no_grad(torch.attr("no_grad")());
  const auto snapshot = module("copy").attr("deepcopy")(model);
  const auto shape = py::make_tuple(configuration.attr("resolution"), configuration.attr("resolution"));
- const auto graph = module("rfdetr.export.prepare").attr("prepare_export_graph")(
-  snapshot, configuration, "shape"_a = shape, "device"_a = input.attr("device"), "batch_size"_a = integer(input.attr("size")(0)));
+ const auto graph =
+  module("rfdetr.export.prepare").attr("prepare_export_graph")(snapshot, configuration, "shape"_a = shape, "device"_a = input.attr("device"), "batch_size"_a = integer(input.attr("size")(0)));
  const auto export_model = graph.attr("model");
  module("rfdetr.export._backend").attr("_switch_to_export_mode")(export_model);
  const bool masks = truth(configuration.attr("segmentation_head")), joints = truth(configuration.attr("use_grouppose_keypoints"));
@@ -1291,9 +1292,7 @@ void acquire_inventory_asset(const fs::path& path, const std::string& url, const
  if (!fs::is_regular_file(path) || fs::file_size(path) > maximum_bytes || (exact_bytes && fs::file_size(path) != *exact_bytes) || hash(path) != expected_digest)
   throw std::runtime_error("cached official checkpoint digest mismatch: " + path.string());
 }
-void acquire_inventory_asset(const fs::path& path, py::handle asset) {
- acquire_inventory_asset(path, string(object(asset).attr("url")), "md5", string(object(asset).attr("md5_hash")), MaxArchive);
-}
+void acquire_inventory_asset(const fs::path& path, py::handle asset) { acquire_inventory_asset(path, string(object(asset).attr("url")), "md5", string(object(asset).attr("md5_hash")), MaxArchive); }
 void acquire_inventory_asset(const fs::path& path, const Json& asset) {
  const auto bytes = asset.at("file_bytes").get<std::uint64_t>();
  acquire_inventory_asset(path, asset.at("download_url"), "sha256", asset.at("sha256"), bytes, bytes);
@@ -1335,21 +1334,22 @@ void generate_encoder_pretraining(const Arguments& args) {
  fs::create_directories(output / "assets");
  fs::create_directories(output / "references");
  if (fs::exists(output / "manifest.json")) throw std::runtime_error("refusing to overwrite published encoder evidence");
- Json manifest{{"format", "mmltk.rfdetr.encoder-pretraining.v1"}, {"mode", "encoder-pretraining"}, {"sources", source_pins()}, {"native_catalog", native},
-  {"source_hashes", {{"core", core_hashes}, {"plus", plus_hashes}}}, {"environment", environment}, {"fingerprint", args.fingerprint},
-  {"producer_sha256", digest(support::executable_path())}, {"dependency_sha256", digest(OracleRoot / "requirements.txt")},
-  {"source_manifest_sha256", digest(OracleRoot / "sources.json")},
+ Json manifest{
+  {"format", "mmltk.rfdetr.encoder-pretraining.v1"}, {"mode", "encoder-pretraining"}, {"sources", source_pins()}, {"native_catalog", native},
+  {"source_hashes", {{"core", core_hashes}, {"plus", plus_hashes}}}, {"environment", environment}, {"fingerprint", args.fingerprint}, {"producer_sha256", digest(support::executable_path())},
+  {"dependency_sha256", digest(OracleRoot / "requirements.txt")}, {"source_manifest_sha256", digest(OracleRoot / "sources.json")},
   {"operator_sources", {{"patch_embed", digest(string(patch_ops.attr("__file__")))}, {"pos_embed", digest(string(position_ops.attr("__file__")))}}},
   {"execution_policy", {{"sdpa_backend", "math"}, {"matmul_tf32", truth(torch.attr("backends").attr("cuda").attr("matmul").attr("allow_tf32"))},
-   {"cudnn_tf32", truth(torch.attr("backends").attr("cudnn").attr("allow_tf32"))}, {"matmul_precision", string(torch.attr("get_float32_matmul_precision")())},
-   {"flash_sdp", truth(torch.attr("backends").attr("cuda").attr("flash_sdp_enabled")())}, {"math_sdp", truth(torch.attr("backends").attr("cuda").attr("math_sdp_enabled")())},
-   {"memory_efficient_sdp", truth(torch.attr("backends").attr("cuda").attr("mem_efficient_sdp_enabled")())},
-   {"cudnn_sdp", truth(torch.attr("backends").attr("cuda").attr("cudnn_sdp_enabled")())}, {"grad_enabled", truth(torch.attr("is_grad_enabled")())}}},
+                        {"cudnn_tf32", truth(torch.attr("backends").attr("cudnn").attr("allow_tf32"))}, {"matmul_precision", string(torch.attr("get_float32_matmul_precision")())},
+                        {"flash_sdp", truth(torch.attr("backends").attr("cuda").attr("flash_sdp_enabled")())}, {"math_sdp", truth(torch.attr("backends").attr("cuda").attr("math_sdp_enabled")())},
+                        {"memory_efficient_sdp", truth(torch.attr("backends").attr("cuda").attr("mem_efficient_sdp_enabled")())},
+                        {"cudnn_sdp", truth(torch.attr("backends").attr("cuda").attr("cudnn_sdp_enabled")())}, {"grad_enabled", truth(torch.attr("is_grad_enabled")())}}},
   {"precision_capability", precision_capability()}, {"assets", Json::array()}, {"cases", Json::array()},
   {"numerical_policy", {{"patch_atol", EncoderPatchAtol}, {"patch_rtol", EncoderPatchRtol}, {"feature_atol", EncoderFeatureAtol}, {"feature_rtol", EncoderFeatureRtol},
-   {"controls", "CPU FP32 vs FP64 pinv; independent upstream CPU vs CUDA FP32 math SDPA"}}},
-  {"transformations", {{"patch", "timm.layers.patch_embed.resample_patch_embed"}, {"positions", "bicubic antialias align_corners=false; prefix preserved"},
-   {"intermediate_dtype", "torch.float32"}, {"pinv_atol", nullptr}, {"pinv_rtol", nullptr}, {"runtime_grid", "4*num_windows; stored grid follows native preset"}}}};
+                        {"controls", "CPU FP32 vs FP64 pinv; independent upstream CPU vs CUDA FP32 math SDPA"}}},
+  {"transformations", {{"patch", "timm.layers.patch_embed.resample_patch_embed"}, {"positions", "bicubic antialias align_corners=false; prefix preserved"}, {"intermediate_dtype", "torch.float32"},
+                       {"pinv_atol", nullptr}, {"pinv_rtol", nullptr}, {"runtime_grid", "4*num_windows; stored grid follows native preset"}}}
+ };
  for (const auto& asset : native.at("encoder_pretraining")) {
   const auto kind = asset.at("backbone").get<std::string>();
   const auto repository = asset.at("source_repository").get<std::string>(), revision = asset.at("source_revision").get<std::string>();
@@ -1367,7 +1367,8 @@ void generate_encoder_pretraining(const Arguments& args) {
   // The complete original model is loaded strictly, including PE's discarded
   // classifier. This verifies source coverage independently of native mapping.
   py::object base;
-  if (pe) base = module("timm").attr("create_model")(module("rfdetr_plus.models.pe_core").attr("PE_CORE_T_TIMM_ARCH"), "pretrained"_a = false);
+  if (pe)
+   base = module("timm").attr("create_model")(module("rfdetr_plus.models.pe_core").attr("PE_CORE_T_TIMM_ARCH"), "pretrained"_a = false);
   else {
    const auto configuration = dino.attr("get_config")(kind == "DinoV2Small" ? "small" : "base", false);
    const auto config = invoke(module("transformers").attr("Dinov2Config"), py::tuple(), configuration);
@@ -1388,14 +1389,17 @@ void generate_encoder_pretraining(const Arguments& args) {
    const auto patch = config.at("patch_size").get<int>(), grid = config.at("positional_encoding_size").get<int>(), windows = config.at("num_windows").get<int>();
    const int side = patch * windows * 4;
    py::object encoder;
-   if (pe) encoder = module("rfdetr_plus.models.pe_core").attr("PECoreEncoder")("out_feature_indexes"_a = config.at("backbone").at("features").get<std::vector<int>>(),
-    "shape"_a = py::make_tuple(side, side), "patch_size"_a = patch, "num_windows"_a = windows, "positional_encoding_size"_a = grid, "load_pretrained_weights"_a = false);
-   else encoder = dino.attr("DinoV2")("shape"_a = py::make_tuple(side, side), "out_feature_indexes"_a = config.at("backbone").at("features").get<std::vector<int>>(),
-    "size"_a = (kind == "DinoV2Small" ? "small" : "base"), "use_registers"_a = false, "load_dinov2_weights"_a = false, "patch_size"_a = patch,
-    "num_windows"_a = windows, "positional_encoding_size"_a = grid);
+   if (pe)
+    encoder = module("rfdetr_plus.models.pe_core")
+               .attr("PECoreEncoder")("out_feature_indexes"_a = config.at("backbone").at("features").get<std::vector<int>>(), "shape"_a = py::make_tuple(side, side), "patch_size"_a = patch,
+                "num_windows"_a = windows, "positional_encoding_size"_a = grid, "load_pretrained_weights"_a = false);
+   else
+    encoder = dino.attr("DinoV2")("shape"_a = py::make_tuple(side, side), "out_feature_indexes"_a = config.at("backbone").at("features").get<std::vector<int>>(),
+     "size"_a = (kind == "DinoV2Small" ? "small" : "base"), "use_registers"_a = false, "load_dinov2_weights"_a = false, "patch_size"_a = patch, "num_windows"_a = windows,
+     "positional_encoding_size"_a = grid);
    encoder.attr("eval")();
    const std::string prefix = pe ? "model." : "encoder.", kernel = pe ? "patch_embed.proj.weight" : "embeddings.patch_embeddings.projection.weight",
-    positions = pe ? "pos_embed" : "embeddings.position_embeddings";
+                     positions = pe ? "pos_embed" : "embeddings.position_embeddings";
    py::dict admitted, references;
    Json exact = Json::object(), transformed = Json::array();
    for (const auto& target : encoder.attr("state_dict")().cast<py::dict>()) {
@@ -1407,19 +1411,19 @@ void generate_encoder_pretraining(const Arguments& args) {
     if (key == kernel) value = patch_ops.attr("resample_patch_embed")(value, py::make_tuple(patch, patch));
     if (key == positions) value = position_ops.attr("resample_abs_pos_embed")(value, py::make_tuple(grid, grid), "num_prefix_tokens"_a = 1, "interpolation"_a = "bicubic", "antialias"_a = true);
     admitted[target.first] = value;
-    if (key == kernel || key == positions) {
-     references[py::str("state/" + destination)] = value.attr("contiguous")().attr("clone")();
-    }
-    const bool changed = (key == kernel && patch != asset.at("geometry").at("patch_size").get<int>()) ||
-     (key == positions && grid != asset.at("geometry").at("position_grid").get<int>());
-    if (changed) transformed.push_back(destination);
-    else exact[destination] = encoder_tensor_record(value);
+    if (key == kernel || key == positions) { references[py::str("state/" + destination)] = value.attr("contiguous")().attr("clone")(); }
+    const bool changed = (key == kernel && patch != asset.at("geometry").at("patch_size").get<int>()) || (key == positions && grid != asset.at("geometry").at("position_grid").get<int>());
+    if (changed)
+     transformed.push_back(destination);
+    else
+     exact[destination] = encoder_tensor_record(value);
    }
    encoder.attr("load_state_dict")(admitted, "strict"_a = true);
    const auto original_kernel = object(original[py::str(kernel)]);
    const auto old = asset.at("geometry").at("patch_size").get<int>();
    py::object double_control;
-   if (old == patch) double_control = original_kernel.attr("clone")();
+   if (old == patch)
+    double_control = original_kernel.attr("clone")();
    else {
     const auto matrix = patch_ops.attr("_compute_resize_matrix")(py::make_tuple(old, old), py::make_tuple(patch, patch), "bicubic", true, torch.attr("device")("cpu"), torch.attr("float32"));
     const auto inverse = torch.attr("linalg").attr("pinv")(matrix.attr("double")());
@@ -1427,7 +1431,8 @@ void generate_encoder_pretraining(const Arguments& args) {
    }
    Json controls{{"patch_fp64", encoder_control(admitted[py::str(prefix + kernel)], double_control, EncoderPatchAtol, EncoderPatchRtol)}, {"features_cuda", Json::array()}};
    references["control/patch_fp64"] = double_control.attr("contiguous")();
-   const auto input = torch.attr("arange")(3 * side * side, "dtype"_a = torch.attr("float32")).attr("remainder")(251).attr("div")(125.0).attr("sub")(1.0).attr("reshape")(py::make_tuple(1, 3, side, side));
+   const auto input =
+    torch.attr("arange")(3 * side * side, "dtype"_a = torch.attr("float32")).attr("remainder")(251).attr("div")(125.0).attr("sub")(1.0).attr("reshape")(py::make_tuple(1, 3, side, side));
    references["input"] = input;
    const auto features = encoder(input);
    encoder.attr("cuda")();
@@ -1441,8 +1446,9 @@ void generate_encoder_pretraining(const Arguments& args) {
    }
    const auto reference = output / "references" / (name + ".safetensors");
    publish_file(reference, [&](const auto& temporary) { safe.attr("save_file")(references, temporary.string()); });
-   manifest["cases"].push_back({{"preset", name}, {"backbone", kind}, {"source_sha256", asset.at("sha256")}, {"adaptation_revision", asset.at("adaptation_revision")},
-    {"configuration", config}, {"runtime_side", side}, {"reference", file_record(reference)}, {"exact_state", exact}, {"transformed_state", transformed}, {"controls", controls}});
+   manifest["cases"].push_back(
+    {{"preset", name}, {"backbone", kind}, {"source_sha256", asset.at("sha256")}, {"adaptation_revision", asset.at("adaptation_revision")}, {"configuration", config}, {"runtime_side", side},
+     {"reference", file_record(reference)}, {"exact_state", exact}, {"transformed_state", transformed}, {"controls", controls}});
    std::cout << "encoder pretraining " << name << ": complete source state and FP32 controls" << std::endl;
   }
   if (digest(evidence_asset) != asset.at("sha256")) throw std::runtime_error("encoder asset changed during independent generation");
@@ -1727,7 +1733,8 @@ void generate(const Arguments& args) {
   {"inventory_sha256", digest(fs::path(inventory_args.output) / "manifest.json")},
   {"preprocessing", "RGB unit float32 -> upstream RFDETR.means/stds; deterministic source pixels and exact normalized input retained"},
   {"tensor_families",
-   Json::array({"backbone", "grouppose", "forward-operator", "output", "vjp", "assignment", "loss", "gradient", "clipped", "updated", "optimizer", "held", "schema", "selection", "oks", "export-math"})},
+   Json::array(
+    {"backbone", "grouppose", "forward-operator", "output", "vjp", "assignment", "loss", "gradient", "clipped", "updated", "optimizer", "held", "schema", "selection", "oks", "export-math"})},
   {"export_policy", {{"device", "cuda"}, {"sdpa_backend", "math"}, {"prefix", "export-math/"}}}
  };
  trace("precision.inspect");
@@ -1921,7 +1928,8 @@ Arguments parse_arguments(int argc, char** argv) {
  Arguments result;
  const std::array<std::string_view, 16> options{
   "--capabilities", "--payload-snapshot", "--check-environment", "--upstream", "--plus-upstream", "--inventory-only", "--output", "--weights", "--fingerprint", "--sdpa", "--case",
-  "--backward-operators", "--export-reference", "--encoder-pretraining-only", "--help", "-h"};
+  "--backward-operators", "--export-reference", "--encoder-pretraining-only", "--help", "-h"
+ };
  for (int i = 1; i < argc; ++i) {
   const std::string argument = argv[i];
   const auto equals = argument.find('=');
@@ -1945,14 +1953,15 @@ Arguments parse_arguments(int argc, char** argv) {
    result.help = true;
    return result;
   }
-  if (option == "--check-environment" || option == "--inventory-only" || option == "--encoder-pretraining-only" || option == "--capabilities" || option == "--backward-operators" || option == "--export-reference") {
+  if (option == "--check-environment" || option == "--inventory-only" || option == "--encoder-pretraining-only" || option == "--capabilities" || option == "--backward-operators" ||
+      option == "--export-reference") {
    if (equals != std::string::npos) throw support::ToolError("argument " + option + ": ignored explicit argument", 2);
-   (option == "--inventory-only" ? result.inventory_only
+   (option == "--inventory-only"             ? result.inventory_only
     : option == "--encoder-pretraining-only" ? result.encoder_pretraining_only
-    : option == "--capabilities" ? result.capabilities
-    : option == "--backward-operators" ? result.backward_operators
-    : option == "--export-reference" ? result.export_reference
-                                    : result.check_environment) = true;
+     : option == "--capabilities"            ? result.capabilities
+      : option == "--backward-operators"     ? result.backward_operators
+       : option == "--export-reference"      ? result.export_reference
+                                             : result.check_environment) = true;
    continue;
   }
   std::string value;
@@ -1984,8 +1993,8 @@ Arguments parse_arguments(int argc, char** argv) {
  if (result.payload_snapshot.empty() && !result.check_environment && !result.capabilities &&
      (result.upstream.empty() || result.plus_upstream.empty() || result.output.empty() || result.weights.empty() || result.fingerprint.empty()))
   throw support::ToolError("generation requires --upstream, --plus-upstream, --output, --weights and --fingerprint", 2);
- if (result.export_reference && (result.inventory_only || !result.selected_case.contains("-controlled-group2-fp32-b1-") ||
-                               !(result.selected_case.ends_with("-train") || result.selected_case.ends_with("-eval"))))
+ if (result.export_reference &&
+     (result.inventory_only || !result.selected_case.contains("-controlled-group2-fp32-b1-") || !(result.selected_case.ends_with("-train") || result.selected_case.ends_with("-eval"))))
   throw support::ToolError("--export-reference requires one controlled FP32 batch-one --case", 2);
  if (result.encoder_pretraining_only && (result.inventory_only || !result.selected_case.empty() || result.backward_operators || result.export_reference))
   throw support::ToolError("--encoder-pretraining-only excludes inventory-only, case, backward-operators and export-reference", 2);

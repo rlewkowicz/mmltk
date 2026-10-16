@@ -70,9 +70,12 @@ Json bounded_json(const std::filesystem::path& path) {
  std::vector<std::set<std::string>> keys;
  return Json::parse(mapped.data(), mapped.data() + mapped.size(), [&](int depth, Json::parse_event_t event, Json& value) {
   admit(depth <= 16, "manifest exceeds depth bound");
-  if (event == Json::parse_event_t::object_start) keys.emplace_back();
-  else if (event == Json::parse_event_t::key) admit(keys.back().insert(value.get<std::string>()).second, "duplicate manifest key");
-  else if (event == Json::parse_event_t::object_end) keys.pop_back();
+  if (event == Json::parse_event_t::object_start)
+   keys.emplace_back();
+  else if (event == Json::parse_event_t::key)
+   admit(keys.back().insert(value.get<std::string>()).second, "duplicate manifest key");
+  else if (event == Json::parse_event_t::object_end)
+   keys.pop_back();
   return true;
  });
 }
@@ -124,18 +127,19 @@ Json pinned_dependencies(const std::filesystem::path& repository) {
 }
 const Json& encoder_reference_policy() {
  static const Json policy{
-  {"transformations", {{"patch", "timm.layers.patch_embed.resample_patch_embed"}, {"positions", "bicubic antialias align_corners=false; prefix preserved"},
-   {"intermediate_dtype", "torch.float32"}, {"pinv_atol", nullptr}, {"pinv_rtol", nullptr}, {"runtime_grid", "4*num_windows; stored grid follows native preset"}}},
-  {"execution_policy", {{"sdpa_backend", "math"}, {"matmul_tf32", false}, {"cudnn_tf32", false}, {"matmul_precision", "highest"},
-   {"flash_sdp", false}, {"math_sdp", true}, {"memory_efficient_sdp", false}, {"cudnn_sdp", false}, {"grad_enabled", false}}},
-  {"numerical_policy", {{"patch_atol", 3.e-5}, {"patch_rtol", 3.e-4}, {"feature_atol", 5.e-4}, {"feature_rtol", 5.e-4},
-   {"controls", "CPU FP32 vs FP64 pinv; independent upstream CPU vs CUDA FP32 math SDPA"}}}
+  {"transformations", {{"patch", "timm.layers.patch_embed.resample_patch_embed"}, {"positions", "bicubic antialias align_corners=false; prefix preserved"}, {"intermediate_dtype", "torch.float32"},
+                       {"pinv_atol", nullptr}, {"pinv_rtol", nullptr}, {"runtime_grid", "4*num_windows; stored grid follows native preset"}}},
+  {"execution_policy", {{"sdpa_backend", "math"}, {"matmul_tf32", false}, {"cudnn_tf32", false}, {"matmul_precision", "highest"}, {"flash_sdp", false}, {"math_sdp", true},
+                        {"memory_efficient_sdp", false}, {"cudnn_sdp", false}, {"grad_enabled", false}}},
+  {"numerical_policy",
+   {{"patch_atol", 3.e-5}, {"patch_rtol", 3.e-4}, {"feature_atol", 5.e-4}, {"feature_rtol", 5.e-4}, {"controls", "CPU FP32 vs FP64 pinv; independent upstream CPU vs CUDA FP32 math SDPA"}}}
  };
  return policy;
 }
 void admit_encoder_manifest(const Json& manifest, const std::filesystem::path& repository) {
- admit(manifest.at("format") == "mmltk.rfdetr.encoder-pretraining.v1" && manifest.at("mode") == "encoder-pretraining" &&
-  manifest.at("status") == "encoder_references_complete_native_comparison_pending", "incompatible format, mode or completion status");
+ admit(
+  manifest.at("format") == "mmltk.rfdetr.encoder-pretraining.v1" && manifest.at("mode") == "encoder-pretraining" && manifest.at("status") == "encoder_references_complete_native_comparison_pending",
+  "incompatible format, mode or completion status");
  const auto sources = repository / "tools/oracle/rfdetr_sources.json", requirements = repository / "tools/oracle/rfdetr_oracle_requirements.txt";
  const auto pins = bounded_json(sources), payload = bounded_json(repository / "docker/nvidia-payload.json");
  admit(manifest.at("sources") == pins, "source pins differ");
@@ -152,8 +156,8 @@ void admit_encoder_manifest(const Json& manifest, const std::filesystem::path& r
   admit(package.is_object() && !package.empty() && package.size() <= 5000, "missing or unbounded source hash map");
   for (const auto& [name, hash] : package.items()) {
    const std::filesystem::path path(name);
-   admit(!name.empty() && name.size() <= 1024 && name.find('\0') == std::string::npos && !path.is_absolute() &&
-    std::ranges::none_of(path, [](const auto& part) { return part == ".."; }), "invalid source hash path");
+   admit(!name.empty() && name.size() <= 1024 && name.find('\0') == std::string::npos && !path.is_absolute() && std::ranges::none_of(path, [](const auto& part) { return part == ".."; }),
+    "invalid source hash path");
    admit_digest(hash);
   }
  }
@@ -166,7 +170,7 @@ void admit_encoder_manifest(const Json& manifest, const std::filesystem::path& r
  admit_version_map(distributions);
  admit_version_map(dependencies);
  const auto torch_version = environment.at("torch").get<std::string>();
- admit(torch_version == payload.at("donor_metadata").at("torch_runtime_version") && torch_version.starts_with(TORCH_VERSION), "incompatible Torch runtime");
+ admit(torch_version == payload.at("donor_metadata").at("torch_runtime_version").get_ref<const std::string&>() && torch_version.starts_with(TORCH_VERSION), "incompatible Torch runtime");
  admit(distributions.at("torch") == payload.at("donor_metadata").at("torch_distribution_version"), "incompatible Torch distribution");
  const auto cuda_version = payload.at("versions").at("cuda").get<std::string>();
  admit(environment.at("cuda") == cuda_version.substr(0, cuda_version.rfind('.')), "incompatible CUDA runtime");
@@ -200,20 +204,13 @@ TEST_CASE("Encoder safetensors decoder bounds metadata and covers every payload 
  const auto decoded = decode(safe_bytes(valid));
  REQUIRE(decoded.size() == 1);
  CHECK(torch::equal(decoded[0].tensor, torch::tensor({1.F, 2.F})));
- for (const auto* invalid : {
-  R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}})",
-  R"({"a":{"dtype":"F32","dtype":"F32","shape":[2],"data_offsets":[0,8]}})",
-  R"({"a":{"dtype":"F16","shape":[2],"data_offsets":[0,8]}})",
-  R"({"a":{"dtype":"F32","shape":[1,1,1,1,2],"data_offsets":[0,8]}})",
-  R"({"a":{"dtype":"F32","shape":[18446744073709551615,2],"data_offsets":[0,8]}})",
-  R"({"a":{"dtype":"F32","shape":[-2],"data_offsets":[0,8]}})",
-  R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}})",
-  R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
-  R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
-  R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,12]}})",
-  R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8],"extra":0}})",
-  R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"__metadata__":{"bad":2}})",
-  R"({"model":{"a":2}})"}) {
+ for (const auto* invalid :
+  {R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}})", R"({"a":{"dtype":"F32","dtype":"F32","shape":[2],"data_offsets":[0,8]}})",
+   R"({"a":{"dtype":"F16","shape":[2],"data_offsets":[0,8]}})", R"({"a":{"dtype":"F32","shape":[1,1,1,1,2],"data_offsets":[0,8]}})",
+   R"({"a":{"dtype":"F32","shape":[18446744073709551615,2],"data_offsets":[0,8]}})", R"({"a":{"dtype":"F32","shape":[-2],"data_offsets":[0,8]}})",
+   R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}})", R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
+   R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})", R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,12]}})",
+   R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8],"extra":0}})", R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"__metadata__":{"bad":2}})", R"({"model":{"a":2}})"}) {
   INFO(invalid);
   CHECK_THROWS(decode(safe_bytes(invalid)));
  }
@@ -238,13 +235,34 @@ TEST_CASE("Encoder staging is exact and leaves fresh detector state intact", "[r
  torch::manual_seed(2381);
  rf::NativeRfDetrModel model(config);
  const auto before = state_digests(model);
- SECTION("missing state") { source.pop_back(); CHECK_THROWS(model.stage_encoder_pretraining(source)); }
- SECTION("duplicate state") { source.push_back(source.front()); CHECK_THROWS(model.stage_encoder_pretraining(source)); }
- SECTION("detector state") { source.push_back({"class_embed.weight", torch::zeros({1})}); CHECK_THROWS(model.stage_encoder_pretraining(source)); }
- SECTION("register tokens") { source.push_back({"embeddings.register_tokens", torch::zeros({1, 4, 384})}); CHECK_THROWS(model.stage_encoder_pretraining(source)); }
- SECTION("wrong dtype") { source.front().tensor = source.front().tensor.to(torch::kFloat64); CHECK_THROWS(model.stage_encoder_pretraining(source)); }
- SECTION("wrong shape") { source.front().tensor = torch::zeros({1}); CHECK_THROWS(model.stage_encoder_pretraining(source)); }
- SECTION("nonfinite state") { source.front().tensor.fill_(std::numeric_limits<float>::quiet_NaN()); CHECK_THROWS(model.stage_encoder_pretraining(source)); }
+ SECTION("missing state") {
+  source.pop_back();
+  CHECK_THROWS(model.stage_encoder_pretraining(source));
+ }
+ SECTION("duplicate state") {
+  source.push_back(source.front());
+  CHECK_THROWS(model.stage_encoder_pretraining(source));
+ }
+ SECTION("detector state") {
+  source.push_back({"class_embed.weight", torch::zeros({1})});
+  CHECK_THROWS(model.stage_encoder_pretraining(source));
+ }
+ SECTION("register tokens") {
+  source.push_back({"embeddings.register_tokens", torch::zeros({1, 4, 384})});
+  CHECK_THROWS(model.stage_encoder_pretraining(source));
+ }
+ SECTION("wrong dtype") {
+  source.front().tensor = source.front().tensor.to(torch::kFloat64);
+  CHECK_THROWS(model.stage_encoder_pretraining(source));
+ }
+ SECTION("wrong shape") {
+  source.front().tensor = torch::zeros({1});
+  CHECK_THROWS(model.stage_encoder_pretraining(source));
+ }
+ SECTION("nonfinite state") {
+  source.front().tensor.fill_(std::numeric_limits<float>::quiet_NaN());
+  CHECK_THROWS(model.stage_encoder_pretraining(source));
+ }
  SECTION("family topology mismatch") {
   auto wrong_config = config;
   wrong_config.backbone.kind = rf::BackboneKind::DinoV2Base;
@@ -254,7 +272,9 @@ TEST_CASE("Encoder staging is exact and leaves fresh detector state intact", "[r
  SECTION("source custody failure rolls back copied state") {
   auto candidate = model.stage_encoder_pretraining(source);
   int checks = 0;
-  candidate.validate_source = [&] { if (++checks == 2) throw std::runtime_error("source changed"); };
+  candidate.validate_source = [&] {
+   if (++checks == 2) throw std::runtime_error("source changed");
+  };
   CHECK_THROWS(model.commit_normalized_state(std::move(candidate)));
   CHECK(checks == 2);
  }
@@ -266,8 +286,10 @@ TEST_CASE("Encoder staging is exact and leaves fresh detector state intact", "[r
   const auto after = state_digests(model);
   std::size_t changed = 0;
   for (const auto& [name, digest] : before) {
-   if (!name.starts_with("backbone.0.encoder.")) CHECK(after.at(name) == digest);
-   else changed += after.at(name) != digest;
+   if (!name.starts_with("backbone.0.encoder."))
+    CHECK(after.at(name) == digest);
+   else
+    changed += after.at(name) != digest;
   }
   CHECK(changed > 0);
   return;
@@ -319,7 +341,8 @@ TEST_CASE("PE encoder staging admits exactly the standalone classifier exclusion
   auto candidate = model.stage_encoder_pretraining(source);
   REQUIRE(candidate.summary.loaded_names.size() == 151);
   model.commit_normalized_state(std::move(candidate));
-  for (const auto& [name, digest] : state_digests(model)) if (!name.starts_with("backbone.0.encoder.")) CHECK(before.at(name) == digest);
+  for (const auto& [name, digest] : state_digests(model))
+   if (!name.starts_with("backbone.0.encoder.")) CHECK(before.at(name) == digest);
   return;
  }
  SECTION("missing excluded tensor") { source.pop_back(); }
@@ -337,11 +360,13 @@ TEST_CASE("Encoder initialization excludes both projector owners", "[rfdetr][enc
  const auto source = synthetic_source(config);
  rf::detail::NativeBackboneImpl backbone(config);
  std::map<std::string, std::string> before;
- for (const auto& parameter : backbone.named_parameters(true)) if (!parameter.key().starts_with("encoder.")) before.emplace(parameter.key(), tensor_digest(parameter.value()));
+ for (const auto& parameter : backbone.named_parameters(true))
+  if (!parameter.key().starts_with("encoder.")) before.emplace(parameter.key(), tensor_digest(parameter.value()));
  REQUIRE(std::ranges::any_of(before, [](const auto& entry) { return entry.first.starts_with("cross_attn_projector."); }));
  auto candidate = backbone.stage_encoder_pretraining(config, source);
  for (std::size_t index = 0; index < candidate.tensors.size(); ++index) candidate.destinations[index].copy_(candidate.tensors[index]);
- for (const auto& parameter : backbone.named_parameters(true)) if (!parameter.key().starts_with("encoder.")) CHECK(before.at(parameter.key()) == tensor_digest(parameter.value()));
+ for (const auto& parameter : backbone.named_parameters(true))
+  if (!parameter.key().starts_with("encoder.")) CHECK(before.at(parameter.key()) == tensor_digest(parameter.value()));
 }
 TEST_CASE("Encoder resampling preserves identity and prefix with a pseudoinverse patch policy", "[rfdetr][encoder_pretraining]") {
  const auto kernel = torch::arange(3 * 14 * 14, torch::kFloat32).reshape({1, 3, 14, 14}) / 100.F;
@@ -352,13 +377,15 @@ TEST_CASE("Encoder resampling preserves identity and prefix with a pseudoinverse
   const auto result = rf::detail::resample_encoder_patch(kernel, size);
   REQUIRE(result.sizes().vec() == std::vector<std::int64_t>{1, 3, size, size});
   CHECK(torch::isfinite(result).all().item<bool>());
-  const auto interpolated = torch::nn::functional::interpolate(kernel, torch::nn::functional::InterpolateFuncOptions().size(std::vector<std::int64_t>{size, size}).mode(torch::kBicubic).align_corners(false).antialias(true));
+  const auto interpolated =
+   torch::nn::functional::interpolate(kernel, torch::nn::functional::InterpolateFuncOptions().size(std::vector<std::int64_t>{size, size}).mode(torch::kBicubic).align_corners(false).antialias(true));
   CHECK_FALSE(torch::allclose(result, interpolated));
   if (size > 14) {
    // The defining resampling invariant: a resized image patch keeps its
    // original convolution response under the inverse-resized kernel.
    const auto pixels = torch::sin(torch::arange(3 * 14 * 14, torch::kFloat32)).reshape({1, 3, 14, 14});
-   const auto resized = torch::nn::functional::interpolate(pixels, torch::nn::functional::InterpolateFuncOptions().size(std::vector<std::int64_t>{size, size}).mode(torch::kBicubic).align_corners(false).antialias(true));
+   const auto resized =
+    torch::nn::functional::interpolate(pixels, torch::nn::functional::InterpolateFuncOptions().size(std::vector<std::int64_t>{size, size}).mode(torch::kBicubic).align_corners(false).antialias(true));
    CHECK(torch::allclose((result * resized).sum(), (kernel * pixels).sum(), 1.e-4, 1.e-3));
   }
   CHECK(torch::equal(rf::detail::resample_encoder_positions(positions, size).narrow(1, 0, 1), positions.narrow(1, 0, 1)));
@@ -392,14 +419,12 @@ TEST_CASE("Encoder manifest admission binds provenance and controlled policy bef
  // certify numerical agreement. It exercises only the real metadata boundary.
  Json complete{
   {"format", "mmltk.rfdetr.encoder-pretraining.v1"}, {"mode", "encoder-pretraining"}, {"status", "encoder_references_complete_native_comparison_pending"},
-  {"sources", bounded_json(repository / "tools/oracle/rfdetr_sources.json")}, {"native_catalog", Json::parse(rfdetr_native_catalog_json())},
-  {"fingerprint", identity}, {"producer_sha256", identity}, {"dependency_sha256", file_digest(repository / "tools/oracle/rfdetr_oracle_requirements.txt")},
-  {"source_manifest_sha256", file_digest(repository / "tools/oracle/rfdetr_sources.json")},
-  {"source_hashes", {{"core", {{"README.md", identity}}}, {"plus", {{"README.md", identity}}}}},
-  {"operator_sources", {{"patch_embed", identity}, {"pos_embed", identity}}},
+  {"sources", bounded_json(repository / "tools/oracle/rfdetr_sources.json")}, {"native_catalog", Json::parse(rfdetr_native_catalog_json())}, {"fingerprint", identity}, {"producer_sha256", identity},
+  {"dependency_sha256", file_digest(repository / "tools/oracle/rfdetr_oracle_requirements.txt")}, {"source_manifest_sha256", file_digest(repository / "tools/oracle/rfdetr_sources.json")},
+  {"source_hashes", {{"core", {{"README.md", identity}}}, {"plus", {{"README.md", identity}}}}}, {"operator_sources", {{"patch_embed", identity}, {"pos_embed", identity}}},
   {"environment", {{"torch", payload.at("donor_metadata").at("torch_runtime_version")}, {"cuda", cuda.substr(0, cuda.rfind('.'))}, {"torchvision", "metadata-fixture"},
-   {"distributions", {{"torch", payload.at("donor_metadata").at("torch_distribution_version")}, {"torchvision", "metadata-fixture"}, {"triton", "metadata-fixture"}}},
-   {"dependency_closure", pinned_dependencies(repository)}}},
+                   {"distributions", {{"torch", payload.at("donor_metadata").at("torch_distribution_version")}, {"torchvision", "metadata-fixture"}, {"triton", "metadata-fixture"}}},
+                   {"dependency_closure", pinned_dependencies(repository)}}},
   {"precision_capability", {{"fp32", true}}}, {"cases", std::vector<Json>(rf::kPresetCatalog.size())}, {"assets", std::vector<Json>(rf::kEncoderPretrainingAssets.size())}
  };
  complete.update(encoder_reference_policy());
@@ -411,18 +436,16 @@ TEST_CASE("Encoder manifest admission binds provenance and controlled policy bef
   CHECK_THROWS(admit_encoder_manifest(stripped, repository));
  }
  const std::vector<std::pair<std::string, Json>> incompatible{
-  {"/fingerprint", std::string(63, 'a')}, {"/producer_sha256", std::string(64, 'A')}, {"/producer_sha256", std::string(64, 'g')}, {"/fingerprint", 1},
-  {"/dependency_sha256", identity}, {"/source_manifest_sha256", identity},
-  {"/source_hashes/core", Json::object()}, {"/source_hashes/plus", Json::array()}, {"/source_hashes/core/README.md", "invalid"},
-  {"/source_hashes/plus/..~1escape", identity}, {"/operator_sources/patch_embed", "invalid"}, {"/operator_sources/pos_embed", nullptr},
-  {"/environment/torch", "0.0-incompatible"}, {"/environment/cuda", "0.0"}, {"/environment/distributions/torch", "0.0"},
-  {"/environment/torchvision", "contradiction"}, {"/environment/dependency_closure/transformers", "0.0"}, {"/environment/dependency_closure/timm", "0.0"},
-  {"/transformations/patch", "bilinear"}, {"/transformations/positions", "prefix interpolated"}, {"/transformations/intermediate_dtype", "torch.float64"},
-  {"/transformations/pinv_atol", 0.0}, {"/transformations/pinv_rtol", 1.e-5}, {"/transformations/runtime_grid", "different"},
-  {"/execution_policy/sdpa_backend", "default"}, {"/execution_policy/matmul_tf32", true}, {"/execution_policy/cudnn_tf32", true},
-  {"/execution_policy/matmul_precision", "high"}, {"/execution_policy/flash_sdp", true}, {"/execution_policy/math_sdp", false},
-  {"/execution_policy/memory_efficient_sdp", true}, {"/execution_policy/cudnn_sdp", true}, {"/execution_policy/grad_enabled", true},
-  {"/numerical_policy/patch_atol", 1.e-3}, {"/numerical_policy/patch_rtol", 1.e-3}, {"/numerical_policy/feature_atol", 1.e-2}, {"/numerical_policy/feature_rtol", 1.e-2}
+  {"/fingerprint", std::string(63, 'a')}, {"/producer_sha256", std::string(64, 'A')}, {"/producer_sha256", std::string(64, 'g')}, {"/fingerprint", 1}, {"/dependency_sha256", identity},
+  {"/source_manifest_sha256", identity}, {"/source_hashes/core", Json::object()}, {"/source_hashes/plus", Json::array()}, {"/source_hashes/core/README.md", "invalid"},
+  {"/source_hashes/plus/..~1escape", identity}, {"/operator_sources/patch_embed", "invalid"}, {"/operator_sources/pos_embed", nullptr}, {"/environment/torch", "0.0-incompatible"},
+  {"/environment/cuda", "0.0"}, {"/environment/distributions/torch", "0.0"}, {"/environment/torchvision", "contradiction"}, {"/environment/dependency_closure/transformers", "0.0"},
+  {"/environment/dependency_closure/timm", "0.0"}, {"/transformations/patch", "bilinear"}, {"/transformations/positions", "prefix interpolated"},
+  {"/transformations/intermediate_dtype", "torch.float64"}, {"/transformations/pinv_atol", 0.0}, {"/transformations/pinv_rtol", 1.e-5}, {"/transformations/runtime_grid", "different"},
+  {"/execution_policy/sdpa_backend", "default"}, {"/execution_policy/matmul_tf32", true}, {"/execution_policy/cudnn_tf32", true}, {"/execution_policy/matmul_precision", "high"},
+  {"/execution_policy/flash_sdp", true}, {"/execution_policy/math_sdp", false}, {"/execution_policy/memory_efficient_sdp", true}, {"/execution_policy/cudnn_sdp", true},
+  {"/execution_policy/grad_enabled", true}, {"/numerical_policy/patch_atol", 1.e-3}, {"/numerical_policy/patch_rtol", 1.e-3}, {"/numerical_policy/feature_atol", 1.e-2},
+  {"/numerical_policy/feature_rtol", 1.e-2}
  };
  for (const auto& [pointer, value] : incompatible) {
   INFO(pointer);
@@ -444,9 +467,14 @@ TEST_CASE("Official encoder initialization agrees with independent pinned source
  const auto manifest = bounded_json(root / "manifest.json");
  admit_encoder_manifest(manifest, evidence_repository());
  const auto native_catalog = Json::parse(rfdetr_native_catalog_json());
- Json receipt{{"format", "mmltk.rfdetr.encoder-pretraining-comparison.v1"}, {"status", "incomplete"}, {"scope", "encoder initialization only"},
-  {"manifest_sha256", io::sha256_hex(io::sha256_file(root / "manifest.json"))}, {"cases", Json::array()}, {"assets", Json::array()}};
- const auto write_receipt = [&] { fixtures::write_text_file(root / "encoder-comparison.json.partial", receipt.dump(2)); std::filesystem::rename(root / "encoder-comparison.json.partial", root / "encoder-comparison.json"); };
+ Json receipt{
+  {"format", "mmltk.rfdetr.encoder-pretraining-comparison.v1"}, {"status", "incomplete"}, {"scope", "encoder initialization only"},
+  {"manifest_sha256", io::sha256_hex(io::sha256_file(root / "manifest.json"))}, {"cases", Json::array()}, {"assets", Json::array()}
+ };
+ const auto write_receipt = [&] {
+  fixtures::write_text_file(root / "encoder-comparison.json.partial", receipt.dump(2));
+  std::filesystem::rename(root / "encoder-comparison.json.partial", root / "encoder-comparison.json");
+ };
  write_receipt();
  torch::NoGradGuard guard;
  std::set<std::string> covered;
@@ -486,7 +514,7 @@ TEST_CASE("Official encoder initialization agrees with independent pinned source
    REQUIRE(case_record->at("adaptation_revision") == asset.adaptation_revision);
    const auto reference_path = evidence_file(root, "references/" + case_record->at("reference").at("file").template get<std::string>());
    REQUIRE(std::filesystem::file_size(reference_path) == case_record->at("reference").at("bytes"));
-   REQUIRE(io::sha256_hex(io::sha256_file(reference_path)) == case_record->at("reference").at("sha256"));
+   REQUIRE(io::sha256_hex(io::sha256_file(reference_path)) == case_record->at("reference").at("sha256").get_ref<const std::string&>());
    const auto reference_map = io::MappedFile::open_readonly(reference_path.string());
    const auto tensors = rf::detail::decode_encoder_safetensors({reference_map.data(), reference_map.size()}, 64U * 1024U * 1024U);
    std::map<std::string, torch::Tensor> reference;
@@ -528,7 +556,8 @@ TEST_CASE("Official encoder initialization agrees with independent pinned source
     if (case_record->at("exact_state").contains(name)) {
      REQUIRE(case_record->at("exact_state").at(name).at("sha256") == tensor_digest(value));
      REQUIRE(case_record->at("exact_state").at(name).at("shape") == value.sizes().vec());
-    } else errors[name] = compare(value, reference.at("state/" + name), 3.e-5, 3.e-4);
+    } else
+     errors[name] = compare(value, reference.at("state/" + name), 3.e-5, 3.e-4);
     staged.destinations[index].copy_(value);
    }
    const auto features = encoder->forward(reference.at("input"));
@@ -547,7 +576,8 @@ TEST_CASE("Official encoder initialization agrees with independent pinned source
     REQUIRE(result.summary.loaded_names.size() == staged.summary.loaded_names.size());
     const auto parameters = encoder->named_parameters(true), buffers = encoder->named_buffers(true);
     for (const auto& [name, digest] : state_digests(model)) {
-     if (!name.starts_with("backbone.0.encoder.")) REQUIRE(before.at(name) == digest);
+     if (!name.starts_with("backbone.0.encoder."))
+      REQUIRE(before.at(name) == digest);
      else {
       const auto relative = name.substr(std::string_view("backbone.0.encoder.").size());
       const auto* value = parameters.find(relative);

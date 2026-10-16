@@ -238,18 +238,14 @@ TEST_CASE("Live provider admission failure requires joined clean media resources
  provider.fail_cleanup = fail_cleanup;
  provider.cancelled = cancelled;
  auto config = owner.Configuration();
- config.device_api = {
-  &provider,
-  [](void*, int* device) noexcept { return cudaGetDevice(device); },
-  [](void* context, int device) noexcept {
-   auto& state = *static_cast<Provider*>(context);
-   if (state.fail_restore.exchange(false)) {
-    ++state.restore_failures;
-    return cudaErrorInvalidValue;
-   }
-   return cudaSetDevice(device);
+ config.device_api = {&provider, [](void*, int* device) noexcept { return cudaGetDevice(device); }, [](void* context, int device) noexcept {
+  auto& state = *static_cast<Provider*>(context);
+  if (state.fail_restore.exchange(false)) {
+   ++state.restore_failures;
+   return cudaErrorInvalidValue;
   }
- };
+  return cudaSetDevice(device);
+ }};
  LiveMediaDataPlane plane(config);
  CHECK_FALSE(plane.no_custody_start_settlement().ok());
  auto startup = std::async(std::launch::async, [&] {

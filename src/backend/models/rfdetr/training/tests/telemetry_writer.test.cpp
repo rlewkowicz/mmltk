@@ -639,7 +639,6 @@ TEST_CASE("Retained selectable sources reject foreign duplicate inconsistent and
  document.record.progress.val->bbox.ap50 = .75;
  CHECK_THROWS(r::validate_training_progress_document(document, sources.catalog));
 }
-
 TEST_CASE("scratch history retains original choice and lineage without a launch path", "[rfdetr][training][telemetry][encoder_pretraining]") {
  const mmltk::testsupport::ScopedTempDir root("scratch-history");
  r::TrainingRun run;

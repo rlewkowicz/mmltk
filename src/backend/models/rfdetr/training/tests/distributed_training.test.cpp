@@ -95,7 +95,6 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
  }
  std::filesystem::remove(store);
 }
-
 TEST_CASE("distributed scratch workers share admitted initialization and retire a rank zero import failure", "[rfdetr][training][distributed][encoder_pretraining][nccl]") {
  namespace r = mmltk::backend::models::rfdetr;
  const auto evidence = r::testsupport::encoder_training_evidence();
@@ -108,7 +107,10 @@ TEST_CASE("distributed scratch workers share admitted initialization and retire 
  const auto store = root.path() / "rendezvous";
  const auto run = [&](bool success) {
   std::filesystem::remove(store);
-  { std::ofstream file(store.string() + ".request.json"); file << r::encode_train_request_json(request); }
+  {
+   std::ofstream file(store.string() + ".request.json");
+   file << r::encode_train_request_json(request);
+  }
   auto children = start_distributed_workers(store, devices, "scratch-run");
   for (auto& child : children) {
    const auto result = child.get();

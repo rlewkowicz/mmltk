@@ -229,7 +229,12 @@ impl App {
             self.model.workflow.cancel_start();
         }
         if let Some(train) = self.settings.draft().map(|draft| &draft.workflows.train)
-            && !self.model.workflow.train_continuation.selection_matches(train) {
+            && !self
+                .model
+                .workflow
+                .train_continuation
+                .selection_matches(train)
+        {
             self.model.workflow.train_continuation.select(train);
         }
         match schedule {

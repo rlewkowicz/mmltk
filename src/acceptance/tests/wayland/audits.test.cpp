@@ -3018,8 +3018,7 @@ TEST_CASE("Catalog workflow evidence joins canonical prepared models to actual n
  }
  audit.consume(
   {{"event", "integration.keypoint.training-artifact"}, {"control", "/session/training/catalog-keypoint/model.pt"}, {"detail", "actual-run"}, {"a", pose_model}, {"b", 2U}, {"c", 4U}, {"d", .5}});
- audit.consume(
-  {{"event", "integration.keypoint.training-output"}, {"control", "/session/training/catalog-keypoint"}, {"detail", "actual-run"}, {"a", pose_model}, {"b", 2U}, {"c", 4U}, {"d", .5}});
+ audit.consume({{"event", "integration.keypoint.training-output"}, {"control", "/session/training/catalog-keypoint"}, {"detail", "actual-run"}, {"a", pose_model}, {"b", 2U}, {"c", 4U}, {"d", .5}});
  REQUIRE(audit.keypoint_catalog_complete());
  SECTION("selection only") { audit.keypoint_catalog.erase({pe, "completed"}); }
  SECTION("custom compact model") { audit.keypoint_catalog.at({pose, "prepared"})["control"] = "rf-detr-nano"; }

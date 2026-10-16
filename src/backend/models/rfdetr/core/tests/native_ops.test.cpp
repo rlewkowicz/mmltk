@@ -1397,8 +1397,7 @@ TEST_CASE("PE-Core positions and RoPE admit dynamic geometry without learned-sta
    if (sealed) model.freeze_inference_weights();
    auto clone = model.make_inference_clone(1, r::CompilationMode::kNone);
    const auto copied = clone->named_parameters();
-   for (const auto& entry : model.named_parameters())
-    CHECK((copied[entry.key()].data_ptr() == entry.value().data_ptr()) == sealed);
+   for (const auto& entry : model.named_parameters()) CHECK((copied[entry.key()].data_ptr() == entry.value().data_ptr()) == sealed);
    const auto actual = clone->forward({input, {}}, false);
    CHECK(torch::allclose(actual.main.pred_logits, expected.main.pred_logits, 2e-4, 2e-4));
    CHECK(torch::allclose(actual.main.pred_boxes, expected.main.pred_boxes, 2e-4, 2e-4));

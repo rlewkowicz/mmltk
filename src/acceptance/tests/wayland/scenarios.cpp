@@ -19,8 +19,7 @@ void workspace_wayland_retained() {
 void workspace_wayland_workflows() {
  const std::string profile = GENERATE("workflows", "workflows-oom", "keypoints", "scratch");
  DYNAMIC_SECTION(profile) {
-  if (profile == "scratch" && !std::getenv("MMLTK_RFDETR_ENCODER_PRETRAINING_DIR"))
-   SKIP("scratch rendered lifecycle requires explicit MMLTK_RFDETR_ENCODER_PRETRAINING_DIR");
+  if (profile == "scratch" && !std::getenv("MMLTK_RFDETR_ENCODER_PRETRAINING_DIR")) SKIP("scratch rendered lifecycle requires explicit MMLTK_RFDETR_ENCODER_PRETRAINING_DIR");
   // Scratch inputs admit every supplied source through encoder_training_evidence
   // before WaylandSession launches its browser. Only absent opt-in skips.
   WaylandSession session{wayland_inputs(false), TerminationMode::SignalInterrupt, profile, true, false, true, {}, false};

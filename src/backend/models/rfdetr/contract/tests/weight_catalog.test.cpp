@@ -265,19 +265,25 @@ TEST_CASE("training source admission distinguishes Transfer scratch and Resume",
  request.train_compiled_path = "/train.bin";
  request.val_compiled_path = "/val.bin";
  request.output_dir = "/output";
- for (const bool scratch : {false, true}) for (const bool weights : {false, true}) for (const bool resume : {false, true})
-  for (const bool layout : {false, true}) for (const bool encoder : {false, true}) for (const std::string_view preset : {"", "unknown", "rf-detr-nano"}) {
-   request.from_scratch = scratch;
-   request.weights_path = weights ? "/detector.pt" : "";
-   request.resume_path = resume ? "/session" : "";
-   request.class_layout_path = layout ? "/layout.json" : "";
-   request.encoder_weights_path = encoder ? "/encoder.safetensors" : "";
-   request.preset_name = preset;
-   INFO("scratch=" << scratch << " weights=" << weights << " resume=" << resume << " layout=" << layout << " encoder=" << encoder << " preset=" << preset);
-   const bool accepted = (static_cast<int>(scratch) + static_cast<int>(weights) + static_cast<int>(resume) == 1) && (!scratch || (preset == "rf-detr-nano" && !layout)) && (scratch || !encoder);
-   if (accepted) CHECK_NOTHROW(validate_train_request(request));
-   else CHECK_THROWS(validate_train_request(request));
-  }
+ for (const bool scratch : {false, true})
+  for (const bool weights : {false, true})
+   for (const bool resume : {false, true})
+    for (const bool layout : {false, true})
+     for (const bool encoder : {false, true})
+      for (const std::string_view preset : {"", "unknown", "rf-detr-nano"}) {
+       request.from_scratch = scratch;
+       request.weights_path = weights ? "/detector.pt" : "";
+       request.resume_path = resume ? "/session" : "";
+       request.class_layout_path = layout ? "/layout.json" : "";
+       request.encoder_weights_path = encoder ? "/encoder.safetensors" : "";
+       request.preset_name = preset;
+       INFO("scratch=" << scratch << " weights=" << weights << " resume=" << resume << " layout=" << layout << " encoder=" << encoder << " preset=" << preset);
+       const bool accepted = (static_cast<int>(scratch) + static_cast<int>(weights) + static_cast<int>(resume) == 1) && (!scratch || (preset == "rf-detr-nano" && !layout)) && (scratch || !encoder);
+       if (accepted)
+        CHECK_NOTHROW(validate_train_request(request));
+       else
+        CHECK_THROWS(validate_train_request(request));
+      }
  request.weights_path.clear();
  request.resume_path.clear();
  request.class_layout_path.clear();

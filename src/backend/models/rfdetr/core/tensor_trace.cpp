@@ -180,7 +180,8 @@ TensorTrace::Result TensorTrace::invoke(bool training, std::span<const torch::Te
     count(count, graph->block());
    }
    logger.debug(
-    "rfdetr compilation region={} owner={} reason={} training={} signature={} grad={} amp={} amp_cache={} amp_dtype={} torch={} executor_optimize={} fuse_cpu={} fuse_gpu={} tf32_matmul={} tf32_cudnn={} "
+    "rfdetr compilation region={} owner={} reason={} training={} signature={} grad={} amp={} amp_cache={} amp_dtype={} torch={} executor_optimize={} fuse_cpu={} fuse_gpu={} tf32_matmul={} "
+    "tf32_cudnn={} "
     "graph_available={} operators={} fusion_groups={} tensor_expr_groups={}",
     name_, static_cast<const void*>(this), reason, training, metadata.str(), signature.grad, signature.amp, signature.amp_cache, static_cast<int>(signature.amp_dtype), TORCH_VERSION,
     torch::jit::getGraphExecutorOptimize(), torch::jit::canFuseOnCPU(), torch::jit::canFuseOnGPU(), at::globalContext().allowTF32CuBLAS(), at::globalContext().allowTF32CuDNN(),

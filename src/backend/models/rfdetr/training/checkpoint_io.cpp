@@ -72,8 +72,7 @@ void write_native_checkpoint_metadata(torch::serialize::OutputArchive& archive, 
  mmltk::backend::ml::serialization::write_int(archive, "num_select", metadata.num_select);
  if (metadata.encoder_pretraining) {
   if (!encoder_pretraining_provenance_valid(*metadata.encoder_pretraining)) throw std::invalid_argument("invalid encoder pretraining provenance");
-  archive_serialization::write_cbor_record(
-   archive, "encoder_pretraining_cbor", *metadata.encoder_pretraining, {.max_items = 32, .max_depth = 4}, "cannot encode encoder pretraining provenance");
+  archive_serialization::write_cbor_record(archive, "encoder_pretraining_cbor", *metadata.encoder_pretraining, {.max_items = 32, .max_depth = 4}, "cannot encode encoder pretraining provenance");
  }
  metadata.for_each_optional_field([&]<class Optional>(const char* key, const Optional& value) {
   if constexpr (std::is_same_v<typename Optional::value_type, bool>)

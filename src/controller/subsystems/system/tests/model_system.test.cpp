@@ -44,13 +44,22 @@ TEST_CASE("scratch preparation admits only the matching encoder and provisional 
  public:
   mutable std::size_t detectors = 0, encoders = 0;
   mutable r::BackboneKind selected{};
-  std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { ++detectors; throw std::runtime_error("detector acquisition is forbidden"); }
+  std::optional<services::ArtifactWeightAsset> find(std::string_view) const override {
+   ++detectors;
+   throw std::runtime_error("detector acquisition is forbidden");
+  }
   std::optional<services::ArtifactWeightAsset> find(r::BackboneKind kind) const override {
    ++encoders;
    selected = kind;
-   return services::ArtifactWeightAsset{.filename = "model.safetensors", .url = "https://fixture.invalid/encoder",
-    .digest_kind = services::ArtifactWeightDigest::Sha256, .digest = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
-    .file_bytes = 1, .cache_identity = "fixture", .encoder = kind};
+   return services::ArtifactWeightAsset{
+    .filename = "model.safetensors",
+    .url = "https://fixture.invalid/encoder",
+    .digest_kind = services::ArtifactWeightDigest::Sha256,
+    .digest = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    .file_bytes = 1,
+    .cache_identity = "fixture",
+    .encoder = kind
+   };
   }
   void download(std::string_view, const std::filesystem::path& path, const services::ArtifactCancellationToken&, services::ArtifactWeightProgressObserver) const override {
    std::ofstream(path).put('a');
@@ -59,8 +68,14 @@ TEST_CASE("scratch preparation admits only the matching encoder and provisional 
  const mmltk::testsupport::ScopedTempDir root("scratch-model-selection");
  ArtifactModelRuntime runtime(services::ArtifactStore(root.path(), assets));
  for (const auto& preset : r::kPresetCatalog) {
-  contracts::ModelSelectionKey key{.workflow = contracts::FeatureId::Train, .source = contracts::ModelSelectionSource::Canonical,
-   .input = contracts::ModelArtifactInputKind::Weights, .preset = std::string(preset.preset_name), .resolution = preset.resolution, .from_scratch = true};
+  contracts::ModelSelectionKey key{
+   .workflow = contracts::FeatureId::Train,
+   .source = contracts::ModelSelectionSource::Canonical,
+   .input = contracts::ModelArtifactInputKind::Weights,
+   .preset = std::string(preset.preset_name),
+   .resolution = preset.resolution,
+   .from_scratch = true
+  };
   const auto admitted = runtime.Acquire(key, {}, 0, {}, [](const auto&) {});
   CHECK(admitted.task == preset.task);
   REQUIRE(admitted.training_config);
@@ -108,7 +123,7 @@ TEST_CASE("fresh scratch materialization keeps encoder and detector identities d
   CHECK_FALSE(projection->key.from_scratch);
  }
  contracts::ModelSelection prepared{.key = key->key, .artifact = "/tmp/base.safetensors"};
- const contracts::ArtifactInspection data{.compatible = true, .splits = {split("/tmp/train.bin"), split("/tmp/val.bin")}};
+ const contracts::ArtifactInspection data{.compatible = true, .splits = {split("/tmp/train.bin"), split("/tmp/val.bin")}, .detail = {}};
  const auto request = Materializer::LocalTrain(settings, data, prepared);
  REQUIRE(request);
  CHECK(request->from_scratch);

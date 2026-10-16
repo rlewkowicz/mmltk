@@ -111,12 +111,16 @@ fn continuation_controls<'a>(
     enabled: bool,
 ) -> Element<'a, Message> {
     let scratch = train.is_some_and(|train| train.request.fromscratch);
-    let checkbox = container(iced::widget::checkbox(scratch).label("From scratch")
-        .on_toggle_maybe(enabled.then_some(Message::FromScratch)))
-        .id(FROM_SCRATCH_ID);
+    let checkbox = container(
+        iced::widget::checkbox(scratch)
+            .label("From scratch")
+            .on_toggle_maybe(enabled.then_some(Message::FromScratch)),
+    )
+    .id(FROM_SCRATCH_ID);
     let mut initialization = column![checkbox].spacing(crate::view::workflow::FIELD_SPACING);
     if scratch {
-        initialization = initialization.push(text("Pretrained base encoder; new RF-DETR detector weights.").size(12));
+        initialization = initialization
+            .push(text("Pretrained base encoder; new RF-DETR detector weights.").size(12));
     }
     let enabled = enabled && !scratch;
     let current = train.is_some_and(|train| model.workflow.train_continuation.matches(train));
@@ -148,7 +152,8 @@ fn continuation_controls<'a>(
                     .train_continuation
                     .checkpoint()
                     .is_some_and(|checkpoint| checkpoint.resumable)
-        )).id(RESUME_ID),
+        ))
+        .id(RESUME_ID),
     ]
     .spacing(crate::view::workflow::FIELD_SPACING);
     if current {
@@ -167,9 +172,16 @@ fn continuation_controls<'a>(
             _ => {}
         }
     }
-    if current && let Some(provenance) = model.workflow.train_continuation.checkpoint()
-        .and_then(|checkpoint| checkpoint.encoderpretraining.as_ref()) {
-        controls = controls.push(crate::view::workflow::model_card::encoder_lineage(provenance));
+    if current
+        && let Some(provenance) = model
+            .workflow
+            .train_continuation
+            .checkpoint()
+            .and_then(|checkpoint| checkpoint.encoderpretraining.as_ref())
+    {
+        controls = controls.push(crate::view::workflow::model_card::encoder_lineage(
+            provenance,
+        ));
     }
     initialization = initialization.push(container(controls).id(CONTINUATION_ID));
     initialization.into()
@@ -195,16 +207,48 @@ impl Component {
                 message,
             )?),
             Message::FromScratch(value) => {
-                use crate::generated::{SettingsFieldValue as Value, ModelSelectionSource, ModelArtifactInputKind};
-                let schedule = model.edit_fields(crate::view::settings::EditCadence::Immediate, [
-                    (crate::generated::constraint_workflowstrainrequestfromscratch().stable_field_id, Value::Bool(value)),
-                    (crate::generated::constraint_workflowstrainmodelsource().stable_field_id, Value::ModelSelectionSource(ModelSelectionSource::Canonical)),
-                    (crate::generated::constraint_workflowstrainmodelinput().stable_field_id, Value::ModelArtifactInputKind(ModelArtifactInputKind::Weights)),
-                    (crate::generated::constraint_workflowstrainrequestweightspath().stable_field_id, Value::String(String::new())),
-                    (crate::generated::constraint_workflowstrainrequestencoderweightspath().stable_field_id, Value::String(String::new())),
-                    (crate::generated::constraint_workflowstrainrequestresumepath().stable_field_id, Value::String(String::new())),
-                    (crate::generated::constraint_workflowstrainrequestclasslayoutpath().stable_field_id, Value::String(String::new())),
-                ])?;
+                use crate::generated::{
+                    ModelArtifactInputKind, ModelSelectionSource, SettingsFieldValue as Value,
+                };
+                let schedule = model.edit_fields(
+                    crate::view::settings::EditCadence::Immediate,
+                    [
+                        (
+                            crate::generated::constraint_workflowstrainrequestfromscratch()
+                                .stable_field_id,
+                            Value::Bool(value),
+                        ),
+                        (
+                            crate::generated::constraint_workflowstrainmodelsource()
+                                .stable_field_id,
+                            Value::ModelSelectionSource(ModelSelectionSource::Canonical),
+                        ),
+                        (
+                            crate::generated::constraint_workflowstrainmodelinput().stable_field_id,
+                            Value::ModelArtifactInputKind(ModelArtifactInputKind::Weights),
+                        ),
+                        (
+                            crate::generated::constraint_workflowstrainrequestweightspath()
+                                .stable_field_id,
+                            Value::String(String::new()),
+                        ),
+                        (
+                            crate::generated::constraint_workflowstrainrequestencoderweightspath()
+                                .stable_field_id,
+                            Value::String(String::new()),
+                        ),
+                        (
+                            crate::generated::constraint_workflowstrainrequestresumepath()
+                                .stable_field_id,
+                            Value::String(String::new()),
+                        ),
+                        (
+                            crate::generated::constraint_workflowstrainrequestclasslayoutpath()
+                                .stable_field_id,
+                            Value::String(String::new()),
+                        ),
+                    ],
+                )?;
                 Outcome::SettingsEdited(schedule)
             }
             Message::Continuation(mode) => Outcome::Continuation(mode),
@@ -454,14 +498,23 @@ mod tests {
         let preset = train.request.presetname.clone();
         let mut component = Component::default();
         for checked in [true, false] {
-            assert!(matches!(component.update(&mut settings, None, Message::FromScratch(checked)),
-                Ok(Some(Outcome::SettingsEdited(EditSchedule::FlushNow)))));
+            assert!(matches!(
+                component.update(&mut settings, None, Message::FromScratch(checked)),
+                Ok(Some(Outcome::SettingsEdited(EditSchedule::FlushNow)))
+            ));
             let train = &settings.draft.as_ref().unwrap().workflows.train;
             assert_eq!(train.request.fromscratch, checked);
-            assert_eq!(train.modelsource, crate::generated::ModelSelectionSource::Canonical);
+            assert_eq!(
+                train.modelsource,
+                crate::generated::ModelSelectionSource::Canonical
+            );
             assert_eq!(train.request.presetname, preset);
-            assert!(train.request.weightspath.is_empty() && train.request.resumepath.is_empty()
-                && train.request.classlayoutpath.is_empty() && train.request.encoderweightspath.is_empty());
+            assert!(
+                train.request.weightspath.is_empty()
+                    && train.request.resumepath.is_empty()
+                    && train.request.classlayoutpath.is_empty()
+                    && train.request.encoderweightspath.is_empty()
+            );
         }
     }
 
@@ -470,7 +523,11 @@ mod tests {
         let mut settings = installed_settings_model();
         settings.execution_edit_locked[0] = true;
         let before = settings.draft.clone();
-        assert!(Component::default().update(&mut settings, None, Message::FromScratch(true)).is_err());
+        assert!(
+            Component::default()
+                .update(&mut settings, None, Message::FromScratch(true))
+                .is_err()
+        );
         assert_eq!(settings.draft, before);
         assert_eq!(settings.queued_len(), 0);
     }

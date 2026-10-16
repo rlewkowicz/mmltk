@@ -1428,8 +1428,10 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
  const bool tracing = diagnostic && std::string_view(diagnostic) == "1";
  const auto trace = [&](std::string_view phase, std::size_t step = 0) {
   if (!tracing) return;
-  const nlohmann::json record{{"event", "test.training_preparation"}, {"phase", phase}, {"preset", preset.empty() ? "default" : preset}, {"rank", distributed.rank}, {"device", device}, {"step", step},
-   {"steady_ns", std::chrono::steady_clock::now().time_since_epoch().count()}};
+  const nlohmann::json record{
+   {"event", "test.training_preparation"}, {"phase", phase}, {"preset", preset.empty() ? "default" : preset}, {"rank", distributed.rank}, {"device", device}, {"step", step},
+   {"steady_ns", std::chrono::steady_clock::now().time_since_epoch().count()}
+  };
   std::fprintf(stderr, "%s\n", record.dump().c_str());
  };
  trace("begin");
@@ -1579,8 +1581,10 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   }
   const double absolute_roundoff = kPreparationRelativeRoundoff * update_path_bound;
   if (tracing) {
-   const nlohmann::json record{{"event", "test.training_preparation_roundoff"}, {"preset", preset.empty() ? "default" : preset}, {"rank", distributed.rank},
-    {"relative", kPreparationRelativeRoundoff}, {"absolute", absolute_roundoff}, {"clipped_sgd_path_bound", update_path_bound}, {"updates", clocks.size()}};
+   const nlohmann::json record{
+    {"event", "test.training_preparation_roundoff"}, {"preset", preset.empty() ? "default" : preset}, {"rank", distributed.rank}, {"relative", kPreparationRelativeRoundoff},
+    {"absolute", absolute_roundoff}, {"clipped_sgd_path_bound", update_path_bound}, {"updates", clocks.size()}
+   };
    std::fprintf(stderr, "%s\n", record.dump().c_str());
   }
   if (tracing && config.has_keypoints()) {
@@ -1595,8 +1599,10 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
    const auto state = host_training_state(*repeated);
    for (std::size_t index = 0; index < state.size(); ++index) {
     if (torch::equal(state[index].tensor, expected[index].tensor)) continue;
-    const nlohmann::json record{{"event", "test.training_preparation_control"}, {"preset", preset}, {"parameter", state[index].name},
-     {"maximum_difference", (state[index].tensor.to(torch::kFloat64) - expected[index].tensor.to(torch::kFloat64)).abs().max().item<double>()}};
+    const nlohmann::json record{
+     {"event", "test.training_preparation_control"}, {"preset", preset}, {"parameter", state[index].name},
+     {"maximum_difference", (state[index].tensor.to(torch::kFloat64) - expected[index].tensor.to(torch::kFloat64)).abs().max().item<double>()}
+    };
     std::fprintf(stderr, "%s\n", record.dump().c_str());
    }
   }

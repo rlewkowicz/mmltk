@@ -195,8 +195,7 @@ public:
    ScopedFd runtime_output{::open(runtime_log_text.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC)};
    const bool configured =
     runtime_output.get() >= 0 && ::dup2(runtime_output.get(), STDOUT_FILENO) >= 0 && ::dup2(runtime_output.get(), STDERR_FILENO) >= 0 && ::fcntl(control_read.get(), F_SETFD, 0) == 0 &&
-    ::chdir(working_directory.c_str()) == 0 &&
-    (viewer_scenario != "scratch" || (::setenv("MMLTK_REPO_ROOT", working_directory.c_str(), 1) == 0 && ::setenv("PATH", scratch_path.c_str(), 1) == 0)) &&
+    ::chdir(working_directory.c_str()) == 0 && (viewer_scenario != "scratch" || (::setenv("MMLTK_REPO_ROOT", working_directory.c_str(), 1) == 0 && ::setenv("PATH", scratch_path.c_str(), 1) == 0)) &&
     (logging ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", application_log_text.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_text.c_str(), 1) == 0 && ::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_text.c_str(), 1) == 0 &&
                 ::setenv("MOZ_LOG",
@@ -708,8 +707,7 @@ void WaylandSession::RunWorkflows() {
     REQUIRE(event->compiled_index == 0);
     ConsumeRecords();
     const auto& fresh = browser.scratch_records.at("integration.scratch.fresh-session");
-    scratch_->PrepareResume(browser.scratch_records.at("integration.scratch.prepared").at("control").get<std::string>(),
-     fresh.at("control").get<std::string>(), fresh.at("detail").get<std::string>());
+    scratch_->PrepareResume(browser.scratch_records.at("integration.scratch.prepared").at("control").get<std::string>(), fresh.at("control").get<std::string>(), fresh.at("detail").get<std::string>());
     REQUIRE(process.command_explore(static_cast<std::uint8_t>(Command::ArtifactMutationReady)));
    } else if (kind == Kind::ArtifactMutationRequested) {
     REQUIRE(artifacts);

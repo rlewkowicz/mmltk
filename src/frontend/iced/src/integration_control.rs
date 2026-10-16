@@ -198,7 +198,11 @@ pub enum Message {
     },
     #[cfg(any(target_arch = "wasm32", test))]
     ConfidenceInputDelivered(u8, bool),
-    ScratchPixels { stage: u8, index: u8, outcome: ProbeOutcome },
+    ScratchPixels {
+        stage: u8,
+        index: u8,
+        outcome: ProbeOutcome,
+    },
     WorkflowPixels {
         picture: workflows::Picture,
         index: u8,
@@ -424,7 +428,13 @@ extern "C" {
         completed: &wasm_bindgen::JsValue,
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationScratchPixels)]
-    fn scratch_pixels_js(control: &str, bounds: &[f64], stage: u8, index: u8, completed: &wasm_bindgen::JsValue);
+    fn scratch_pixels_js(
+        control: &str,
+        bounds: &[f64],
+        stage: u8,
+        index: u8,
+        completed: &wasm_bindgen::JsValue,
+    );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationWorkflowPixels)]
     fn workflow_pixels_js(
         control: &str,
@@ -1441,8 +1451,15 @@ impl Controller {
                 return Err("invalid capacity control identity");
             }
             if receipt.kind == Kind::ArtifactMutationReady {
-                if self.driver.phase == Phase::Workflows(workflows::Step::Scratch(workflows::scratch::Stage::AwaitMutation)) && receipt.compiledindex == 0 {
-                    self.driver.phase = Phase::Workflows(workflows::Step::Scratch(workflows::scratch::Stage::SourceRemoved));
+                if self.driver.phase
+                    == Phase::Workflows(workflows::Step::Scratch(
+                        workflows::scratch::Stage::AwaitMutation,
+                    ))
+                    && receipt.compiledindex == 0
+                {
+                    self.driver.phase = Phase::Workflows(workflows::Step::Scratch(
+                        workflows::scratch::Stage::SourceRemoved,
+                    ));
                     return Ok(());
                 }
                 if self.driver.phase
@@ -1565,7 +1582,9 @@ impl Controller {
         use crate::generated::IntegrationControlKind as Kind;
         let kind = match self.driver.phase {
             Phase::Disabled => return,
-            Phase::Workflows(workflows::Step::Scratch(workflows::scratch::Stage::AwaitMutation)) => Kind::ArtifactMutationRequested,
+            Phase::Workflows(workflows::Step::Scratch(
+                workflows::scratch::Stage::AwaitMutation,
+            )) => Kind::ArtifactMutationRequested,
             Phase::Workflows(workflows::Step::Keypoints(
                 workflows::keypoints::Stage::AwaitMutation(_),
             )) => Kind::ArtifactMutationRequested,
@@ -1925,8 +1944,14 @@ impl Controller {
                 self.workflows.fixture_update(message);
                 return None;
             }
-            Message::ScratchPixels { stage, index, outcome } => {
-                self.workflows.scratch.pixels(&mut self.driver, stage, index, outcome);
+            Message::ScratchPixels {
+                stage,
+                index,
+                outcome,
+            } => {
+                self.workflows
+                    .scratch
+                    .pixels(&mut self.driver, stage, index, outcome);
                 return None;
             }
             Message::WorkflowPixels {
@@ -2495,7 +2520,9 @@ impl Driver {
                 self.reporting
                     .observe(|reporting| reporting.bootstrap(model, settings));
                 if self.viewer_scenario == "scratch" {
-                    return self.advance_to(Phase::Workflows(workflows::Step::Scratch(workflows::scratch::Stage::Page)));
+                    return self.advance_to(Phase::Workflows(workflows::Step::Scratch(
+                        workflows::scratch::Stage::Page,
+                    )));
                 }
                 if self.viewer_scenario == "keypoints" {
                     return self.advance_to(Phase::Workflows(workflows::Step::Keypoints(

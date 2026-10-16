@@ -516,7 +516,11 @@ impl WorkflowModel {
         self.settings_revision = Some(snapshot.revision);
     }
 
-    pub fn model_selection_receipt(&self, workflow: FeatureId, settings: &crate::generated::GuiSettingsState) -> Option<ModelSelectionReceipt> {
+    pub fn model_selection_receipt(
+        &self,
+        workflow: FeatureId,
+        settings: &crate::generated::GuiSettingsState,
+    ) -> Option<ModelSelectionReceipt> {
         Some(ModelSelectionReceipt {
             workflow,
             settings_revision: self.settings_revision?,
@@ -1046,7 +1050,9 @@ mod tests {
             })
             .unwrap();
         model.install_settings(&settings);
-        let receipt = model.model_selection_receipt(FeatureId::Predict, &settings.settingsstate).unwrap();
+        let receipt = model
+            .model_selection_receipt(FeatureId::Predict, &settings.settingsstate)
+            .unwrap();
         assert_eq!(receipt.workflow, FeatureId::Predict);
         assert_eq!(receipt.settings_revision, settings.revision);
     }

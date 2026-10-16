@@ -268,7 +268,6 @@ TEST_CASE("saved training output admits complete selected provenance and rejects
  std::filesystem::remove(temp.path() / "selected.json");
  CHECK_FALSE(store.Open(temp.path()).selected);
 }
-
 TEST_CASE("legacy history reopens and appends with owned request migration", "[gui][train_run_store][encoder_pretraining]") {
  namespace r = mmltk::backend::models::rfdetr;
  const mmltk::testsupport::ScopedTempDir root("legacy-run-history");

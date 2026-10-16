@@ -770,8 +770,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
       session.models.push_back({models[i]->id(), {}, {}, successful_images[i], best ? std::optional{best->artifact} : std::nullopt});
       if (best) candidate_admissions.push_back(best->admission);
      }
-     checkpoint->publish(session, immutable_plan,
-      [&](const std::filesystem::path& destination, std::size_t index) { models[index]->save_resume(destination, metadata, session.attempt_id, original_descriptor, session.request); }, candidate_admissions);
+     checkpoint->publish(session, immutable_plan, [&](const std::filesystem::path& destination, std::size_t index) {
+      models[index]->save_resume(destination, metadata, session.attempt_id, original_descriptor, session.request);
+     }, candidate_admissions);
      for (auto& publication : publications) publication.finish();
      last_checkpoint_path = checkpoint->path();
      latest = {};

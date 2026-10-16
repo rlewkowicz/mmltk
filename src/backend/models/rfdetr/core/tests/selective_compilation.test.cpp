@@ -108,7 +108,8 @@ TEST_CASE("Tensor recording preserves shared parameter AMP accumulation", "[rfde
       (void)at::autocast::cached_cast(dtype, actual->weight, at::kCUDA);
       (void)at::autocast::cached_cast(dtype, expected->weight, at::kCUDA);
      }
-     output = region.invoke(true, {first, second}, {actual.get()}, [&](const auto& inputs) {
+     output = region
+               .invoke(true, {first, second}, {actual.get()}, [&](const auto& inputs) {
       ++forwards;
       return Region::Tensors{run(actual, inputs[0], inputs[1])};
      }).front();
@@ -255,8 +256,8 @@ TEST_CASE("Query tensor regions reuse varying extents and independent promoted i
  }
 }
 // An independent dense matrix equation: no MultiheadAttention or SDPA call.
-torch::Tensor dense_attention(torch::nn::MultiheadAttention& module, const torch::Tensor& target, const torch::Tensor& position, const torch::Tensor& admitted = {},
- bool sequence_first_projection = true) {
+torch::Tensor dense_attention(
+ torch::nn::MultiheadAttention& module, const torch::Tensor& target, const torch::Tensor& position, const torch::Tensor& admitted = {}, bool sequence_first_projection = true) {
  const auto width = target.size(-1);
  const auto heads = module->options.num_heads();
  const auto project = [&](const torch::Tensor& x, int64_t offset) {
@@ -383,7 +384,7 @@ TEST_CASE("Ordinary and DN grouped SDPA match masked dense equations with retain
     {
      mmltk::backend::ml::cuda::TorchAutocastScope amp(device.is_cuda() && dtype != torch::kFloat32, dtype);
      output = rf::isolated_group_self_attention(actual, target, position, layout);
-    expected = dense_attention(oracle, clean_target, clean_position, admitted, !dn);
+     expected = dense_attention(oracle, clean_target, clean_position, admitted, !dn);
     }
     REQUIRE(torch::allclose(output, expected, 1e-2, 3e-3));
     actual_losses.push_back(output.square().sum());

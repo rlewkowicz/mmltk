@@ -318,8 +318,7 @@ public:
    auto input = subsystems::system::ComputeIntentMaterializer::ModelInputFor(facts.settings, contracts::FeatureId::Train);
    if (!input) throw contracts::InvalidIntentError(input.error().detail);
    if (input->key.from_scratch) throw contracts::InvalidIntentError("Resume requires the restored session selection");
-   selection = {.key = std::move(input->key), .inspection_device = input->inspection_device, .artifact = resume.string(),
-                .encoder_pretraining = admission->checkpoint().encoder_pretraining};
+   selection = {.key = std::move(input->key), .inspection_device = input->inspection_device, .artifact = resume.string(), .encoder_pretraining = admission->checkpoint().encoder_pretraining};
    if (admission->checkpoint().class_layout) selection.class_layout = mmltk::backend::models::rfdetr::ResolvedClassLayout(*admission->checkpoint().class_layout).summary();
   } else {
    selection = model_.selection();

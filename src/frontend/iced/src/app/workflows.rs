@@ -340,7 +340,7 @@ impl App {
         }
         if !restoring
             && !train.request.fromscratch
-                && train.modelsource == crate::generated::ModelSelectionSource::Custom
+            && train.modelsource == crate::generated::ModelSelectionSource::Custom
             && !train.request.weightspath.is_empty()
             && matches!(
                 self.model.workflow.train_continuation.capability,
@@ -489,8 +489,10 @@ impl App {
             pending.preparation = StartPreparation::Waiting;
             // Restored canonical input identity is deliberate; ordinary edits still cancel.
             let train = &self.settings.draft().unwrap().workflows.train;
-            self.model.workflow.train_continuation.selection = Some(crate::generated::project_train_model_key(train));
-            self.model.workflow.train_continuation.artifact = Some(train.request.weightspath.clone());
+            self.model.workflow.train_continuation.selection =
+                Some(crate::generated::project_train_model_key(train));
+            self.model.workflow.train_continuation.artifact =
+                Some(train.request.weightspath.clone());
         }
         let pending = self.model.workflow.pending_start.as_ref().unwrap();
         let Some(draft) = self.settings.draft() else {
@@ -771,7 +773,11 @@ impl App {
             return;
         }
         let workflow = page;
-        let Some(receipt) = self.model.workflow.model_selection_receipt(workflow, self.settings.draft().unwrap()) else {
+        let Some(receipt) = self
+            .model
+            .workflow
+            .model_selection_receipt(workflow, self.settings.draft().unwrap())
+        else {
             self.model.report_admission_error(
                 ApplicationIntentEndpoint::ModelSelect,
                 UiError::invalid("Settings are not installed yet."),
@@ -880,8 +886,14 @@ impl App {
             }
             crate::view::train::Outcome::Continuation(mode) => {
                 if !self.model.settings_edit_available()
-                    || self.model.current_native_operation(FeatureId::Train).is_some()
-                    || self.settings.draft().is_none_or(|draft| draft.workflows.train.request.fromscratch)
+                    || self
+                        .model
+                        .current_native_operation(FeatureId::Train)
+                        .is_some()
+                    || self
+                        .settings
+                        .draft()
+                        .is_none_or(|draft| draft.workflows.train.request.fromscratch)
                     || (mode == crate::view_model::ContinuationMode::Resume
                         && (!self.settings.draft().is_some_and(|draft| {
                             self.model
@@ -2121,18 +2133,21 @@ mod tests {
 
     #[test]
     fn explicit_resume_waits_for_restore_reply_and_settings_before_launch() {
-        for (event_first, scratch_origin) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (event_first, scratch_origin) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let (mut app, mut capture) = start_app();
             let mut checkpoint = select_resumable(&mut app);
             if scratch_origin {
                 // Deliberately synthetic historical lineage: Resume must retain
                 // the native record without consulting today's source catalog.
-                checkpoint.encoderpretraining = Some(crate::generated::EncoderPretrainingProvenance {
-                    assetid: "fixture/base-encoder".into(),
-                    sourcerevision: "1".repeat(40),
-                    sha256: "2".repeat(64),
-                    adaptationrevision: 1,
-                });
+                checkpoint.encoderpretraining =
+                    Some(crate::generated::EncoderPretrainingProvenance {
+                        assetid: "fixture/base-encoder".into(),
+                        sourcerevision: "1".repeat(40),
+                        sha256: "2".repeat(64),
+                        adaptationrevision: 1,
+                    });
                 app.model.workflow.train_continuation.capability =
                     crate::view_model::CheckpointCapability::Ready(checkpoint.clone());
             }
@@ -2173,9 +2188,28 @@ mod tests {
             }
             app.advance_start();
             next_intent(&mut capture, ApplicationIntentEndpoint::TrainingResume);
-            assert!(!app.settings.draft().unwrap().workflows.train.request.fromscratch);
-            assert_eq!(app.model.workflow.train_continuation.checkpoint().unwrap().encoderpretraining, lineage);
-            assert_eq!(app.model.workflow.train_continuation.mode, crate::view_model::ContinuationMode::Resume);
+            assert!(
+                !app.settings
+                    .draft()
+                    .unwrap()
+                    .workflows
+                    .train
+                    .request
+                    .fromscratch
+            );
+            assert_eq!(
+                app.model
+                    .workflow
+                    .train_continuation
+                    .checkpoint()
+                    .unwrap()
+                    .encoderpretraining,
+                lineage
+            );
+            assert_eq!(
+                app.model.workflow.train_continuation.mode,
+                crate::view_model::ContinuationMode::Resume
+            );
             assert!(app.model.workflow.pending_start.is_none());
             assert!(capture.try_recv().is_err());
         }
@@ -2612,17 +2646,25 @@ mod tests {
         let mut snapshot = app.model.settings_snapshot.clone().unwrap();
         snapshot.revision += 1;
         snapshot.settingsstate.workflows.train.request.fromscratch = true;
-        app.model.project_settings_snapshot(snapshot.clone()).unwrap();
+        app.model
+            .project_settings_snapshot(snapshot.clone())
+            .unwrap();
         app.settings.install(&snapshot);
         app.request_start(FeatureId::Train);
         let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
         let pending = app.model.workflow.pending_start.as_ref().unwrap();
-        assert!(matches!(&pending.inputs, crate::view_model::StartInputs::Train(train) if train.request.fromscratch));
+        assert!(
+            matches!(&pending.inputs, crate::view_model::StartInputs::Train(train) if train.request.fromscratch)
+        );
         assert!(pending.resume_checkpoint.is_none());
         assert!(capture.try_recv().is_err());
-        let prepared = accepted_model_for(&app.model, app.settings.draft().unwrap(), FeatureId::Train);
+        let prepared =
+            accepted_model_for(&app.model, app.settings.draft().unwrap(), FeatureId::Train);
         assert!(prepared.selection.key.fromscratch);
-        app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(prepared)));
+        app.model.reduce_reply(
+            select.correlation,
+            Ok(crate::generated::ApplicationReply::ModelSelect(prepared)),
+        );
         app.advance_start();
         next_intent(&mut capture, ApplicationIntentEndpoint::TrainingStart);
         assert!(app.model.workflow.pending_start.is_none());
@@ -2635,17 +2677,47 @@ mod tests {
         app.request_start(FeatureId::Train);
         let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
         let active = active_preparation(&app, FeatureId::Train);
-        let accepted = accepted_model_for(&app.model, app.settings.draft().unwrap(), FeatureId::Train);
-        app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(active)));
+        let accepted =
+            accepted_model_for(&app.model, app.settings.draft().unwrap(), FeatureId::Train);
+        app.model.reduce_reply(
+            select.correlation,
+            Ok(crate::generated::ApplicationReply::ModelSelect(active)),
+        );
         let mut component = crate::view::train::Component::default();
-        let outcome = component.update(app.settings.state_mut(), None, crate::view::train::Message::FromScratch(true)).unwrap().unwrap();
+        let outcome = component
+            .update(
+                app.settings.state_mut(),
+                None,
+                crate::view::train::Message::FromScratch(true),
+            )
+            .unwrap()
+            .unwrap();
         drop(app.on_train(outcome));
-        assert!(app.model.workflow.pending_start.as_ref().unwrap().preparation.cancelled());
-        assert_eq!(app.model.workflow.train_continuation.mode, crate::view_model::ContinuationMode::Transfer);
+        assert!(
+            app.model
+                .workflow
+                .pending_start
+                .as_ref()
+                .unwrap()
+                .preparation
+                .cancelled()
+        );
+        assert_eq!(
+            app.model.workflow.train_continuation.mode,
+            crate::view_model::ContinuationMode::Transfer
+        );
         model_event(&mut app, accepted);
-        assert!(!app.model.model_selection_matches(app.settings.draft().unwrap(), FeatureId::Train));
-        while let Ok(intent) = capture.try_recv() {
-            assert_ne!(intent.endpoint_id, crate::generated::encode_training_Start(1, crate::generated::Train {}).record.endpoint_id);
+        assert!(
+            !app.model
+                .model_selection_matches(app.settings.draft().unwrap(), FeatureId::Train)
+        );
+        while let Ok(record) = capture.try_recv() {
+            if let CapturedRecord::Intent(intent) = record {
+                assert_ne!(
+                    crate::generated::decode_application_intent_endpoint(intent.endpoint_id),
+                    Some(ApplicationIntentEndpoint::TrainingStart)
+                );
+            }
         }
     }
 
@@ -2656,16 +2728,41 @@ mod tests {
         app.model.workflow.train_continuation.begin(81);
         let mut component = crate::view::train::Component::default();
         for checked in [true, false] {
-            let outcome = component.update(app.settings.state_mut(), None, crate::view::train::Message::FromScratch(checked)).unwrap().unwrap();
+            let outcome = component
+                .update(
+                    app.settings.state_mut(),
+                    None,
+                    crate::view::train::Message::FromScratch(checked),
+                )
+                .unwrap()
+                .unwrap();
             drop(app.on_train(outcome));
-            assert_eq!(app.model.workflow.train_continuation.mode, crate::view_model::ContinuationMode::Transfer);
+            assert_eq!(
+                app.model.workflow.train_continuation.mode,
+                crate::view_model::ContinuationMode::Transfer
+            );
             assert!(app.model.workflow.train_continuation.checkpoint().is_none());
-            assert!(app.settings.draft().unwrap().workflows.train.request.resumepath.is_empty());
+            assert!(
+                app.settings
+                    .draft()
+                    .unwrap()
+                    .workflows
+                    .train
+                    .request
+                    .resumepath
+                    .is_empty()
+            );
         }
-        app.model.workflow.train_continuation.reply(81, crate::generated::TrainingCheckpointInspection {
-            generation: 1, path: checkpoint.path.clone(), status: crate::generated::TrainingInspectionStatus::Ready,
-            checkpoint: Some(checkpoint), error: String::new(),
-        });
+        app.model.workflow.train_continuation.reply(
+            81,
+            crate::generated::TrainingCheckpointInspection {
+                generation: 1,
+                path: checkpoint.path.clone(),
+                status: crate::generated::TrainingInspectionStatus::Ready,
+                checkpoint: Some(checkpoint),
+                error: String::new(),
+            },
+        );
         assert!(app.model.workflow.train_continuation.checkpoint().is_none());
     }
 

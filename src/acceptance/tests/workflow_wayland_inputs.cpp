@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "workflow_wayland_inputs.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/frameworks/serialization/reflected_json.h"
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <c10/cuda/CUDAGuard.h>
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
@@ -270,7 +272,7 @@ void WorkflowWaylandInputs::VerifyCatalogTraining(
   throw std::runtime_error("completed checkpoint lost catalog model or admitted query identity");
 }
 WorkflowScratchInputs::WorkflowScratchInputs(const std::filesystem::path& root)
- : root_(std::filesystem::absolute(root)), fixture_{.root_dir = (root_ / "scratch-data").string(), .width = 40, .height = 40, .num_images = 64, .background_images = 0} {
+    : root_(std::filesystem::absolute(root)), fixture_{.root_dir = (root_ / "scratch-data").string(), .width = 40, .height = 40, .num_images = 64, .background_images = 0} {
  const auto evidence = rfdetr::testsupport::encoder_training_evidence();
  if (!evidence) throw std::runtime_error("scratch workflow requires explicit encoder evidence");
  data::testsupport::create_compiled_fixture(fixture_, false);
@@ -328,7 +330,7 @@ void WorkflowScratchInputs::PrepareResume(const std::filesystem::path& encoder, 
  REQUIRE(run.configuration.encoder_weights_path.empty());
  REQUIRE(run.configuration.resume_path.empty());
  REQUIRE(manifest.epoch > 0);
- REQUIRE(manifest.epoch < manifest.request.epochs);
+ REQUIRE(std::cmp_less(manifest.epoch, manifest.request.epochs));
  REQUIRE(manifest.request.from_scratch);
  REQUIRE(manifest.request.encoder_weights_path.empty());
  const auto& metadata = session.model(0).metadata;
@@ -377,7 +379,7 @@ void WorkflowScratchInputs::VerifyResume(const std::filesystem::path& checkpoint
  REQUIRE(manifest.attempt_id != source_attempt_);
  REQUIRE(manifest.request.from_scratch);
  REQUIRE(manifest.request.encoder_weights_path.empty());
- REQUIRE(manifest.epoch == manifest.request.epochs);
+ REQUIRE(std::cmp_equal(manifest.epoch, manifest.request.epochs));
  REQUIRE(session.continuation(0).values.schedule.consumed_attempts > optimizer_steps_);
  REQUIRE(run.source_checkpoint_attempt_id == source_attempt_);
  REQUIRE(run.resume_optimizer_step == optimizer_steps_);

@@ -120,8 +120,15 @@ public:
  std::optional<ArtifactWeightAsset> find(const rfdetr::BackboneKind encoder) const override {
   encoder_finds.push_back(encoder);
   if (detector_for_encoder) return find("fixture");
-  return ArtifactWeightAsset{.filename = "model.safetensors", .url = encoder_url, .digest_kind = encoder_digest_kind, .digest = sha256, .file_bytes = encoder_bytes,
-   .cache_identity = std::string(mmltk::frameworks::reflection::enum_name(encoder)) + "-" + encoder_identity, .encoder = encoder};
+  return ArtifactWeightAsset{
+   .filename = "model.safetensors",
+   .url = encoder_url,
+   .digest_kind = encoder_digest_kind,
+   .digest = sha256,
+   .file_bytes = encoder_bytes,
+   .cache_identity = std::string(mmltk::frameworks::reflection::enum_name(encoder)) + "-" + encoder_identity,
+   .encoder = encoder
+  };
  }
  void download(std::string_view selected_url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver progress) const override {
   ++downloads;
@@ -627,9 +634,7 @@ TEST_CASE("encoder acquisition rejects corrupt state and keeps cancelled work un
  CHECK_THROWS(store.canonical_encoder_weight_path(encoder, active.token));
  CHECK_FALSE(std::filesystem::exists(path));
  CHECK(operations.finds == 0U);
- for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
-  CHECK(entry.path().filename().string().find(".weights.") == std::string::npos);
- }
+ for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) { CHECK(entry.path().filename().string().find(".weights.") == std::string::npos); }
 }
 TEST_CASE("encoder metadata admission rejects detector assets and malformed identities before transfer", "[gui][services][encoder_pretraining]") {
  mmltk::testsupport::ScopedTempDir temporary("mmltk-encoder-metadata");
@@ -638,7 +643,10 @@ TEST_CASE("encoder metadata admission rejects detector assets and malformed iden
  ArtifactStore store(root, operations);
  ArtifactCancellationFixture active;
  SECTION("detector selection") { operations.detector_for_encoder = true; }
- SECTION("MD5 for an encoder") { operations.encoder_digest_kind = ArtifactWeightDigest::Md5; operations.sha256 = operations.md5; }
+ SECTION("MD5 for an encoder") {
+  operations.encoder_digest_kind = ArtifactWeightDigest::Md5;
+  operations.sha256 = operations.md5;
+ }
  SECTION("invalid digest") { operations.sha256 = "not-sha256"; }
  SECTION("missing size") { operations.encoder_bytes = 0U; }
  SECTION("unsafe source identity") { operations.encoder_identity = "../../escape"; }

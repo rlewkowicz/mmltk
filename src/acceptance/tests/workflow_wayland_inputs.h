@@ -34,6 +34,7 @@ public:
  void Configure(mmltk::controller::contracts::GuiSettingsState&);
  void PrepareResume(const std::filesystem::path& encoder, const std::filesystem::path& checkpoint, const std::filesystem::path& output);
  void VerifyResume(const std::filesystem::path& checkpoint, const std::filesystem::path& output) const;
+
 private:
  std::filesystem::path root_, source_, checkpoint_;
  mmltk::backend::data::testsupport::FixtureSpec fixture_;

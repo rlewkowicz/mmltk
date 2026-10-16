@@ -87,9 +87,14 @@ TEST_CASE("Predict publishes full custom schemas and refuses aggregate excess be
  }, [&](PredictSystem::event_type event) {
   if (trace) {
    std::visit([](const auto& value) {
-    if constexpr (requires { value.snapshot.frame; value.snapshot.labels; }) {
-     nlohmann::json record{{"event", "test.prediction_publication"}, {"generation", value.snapshot.operation.generation_frontier},
-      {"active", value.snapshot.operation.active}, {"frame_valid", value.snapshot.frame.valid()}, {"labels", value.snapshot.labels.size()}};
+    if constexpr (requires {
+                   value.snapshot.frame;
+                   value.snapshot.labels;
+                  }) {
+     nlohmann::json record{
+      {"event", "test.prediction_publication"}, {"generation", value.snapshot.operation.generation_frontier}, {"active", value.snapshot.operation.active},
+      {"frame_valid", value.snapshot.frame.valid()}, {"labels", value.snapshot.labels.size()}
+     };
      if constexpr (requires { value.detail; }) record["detail"] = value.detail;
      std::fprintf(stderr, "%s\n", record.dump().c_str());
     }

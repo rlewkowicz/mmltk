@@ -1244,8 +1244,10 @@ TEST_CASE("Explicit empty class schemas reject placement and retain reversible r
  document::AnnotationDocument editor;
  const auto apply = [&](auto edit) { REQUIRE(editor.Edit({std::move(edit)}).outcome == document::DocumentOutcome::Applied); };
  auto geometric = scene;
- geometric.objects = {{.name = contracts::AnnotationText::From("box"), .shape = contracts::AnnotationShape::Box, .box = {{1, 1}, {4, 4}}, .category = 1},
-  {.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {4, 4}}, .category = 1}};
+ geometric.objects = {
+  {.name = contracts::AnnotationText::From("box"), .shape = contracts::AnnotationShape::Box, .box = {{1, 1}, {4, 4}}, .category = 1},
+  {.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {4, 4}}, .category = 1}
+ };
  REQUIRE(editor.Open(geometric).outcome == document::DocumentOutcome::Applied);
  REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
  apply(AnnotationObjectEdit{0});

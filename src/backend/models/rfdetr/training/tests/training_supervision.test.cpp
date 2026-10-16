@@ -2889,8 +2889,9 @@ TEST_CASE("Target slots prime independent uploads and protect delayed backward i
 }
 TEST_CASE("Shared training prepares the next draw with exact continuation and live parameter versions", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; shared training preparation unexecuted");
- for (const std::string_view preset : {"", "rf-detr-femto", "rf-detr-xlarge", "rf-detr-keypoint-preview"})
-  DYNAMIC_SECTION((preset.empty() ? "default" : preset)) { rfdetr::testsupport::exercise_prepared_training({}, 0, preset); }
+ for (const std::string_view preset : {"", "rf-detr-femto", "rf-detr-xlarge", "rf-detr-keypoint-preview"}) DYNAMIC_SECTION((preset.empty() ? "default" : preset)) {
+   rfdetr::testsupport::exercise_prepared_training({}, 0, preset);
+  }
 }
 TEST_CASE("Partial target DMA failure retains staging and permits bounded recovery", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; partial target upload unexecuted");

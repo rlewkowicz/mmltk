@@ -262,9 +262,16 @@ impl<'a> State<'a> {
             .and_then(|value| value.artifact_field)
             .or_else(|| custom_row.and_then(|row| dialog_for_row(row).ok()))
             .map_or(0, |dialog| dialog.stable_field_id);
-        let model = model.filter(|model| model.active || model.terminal.outcome != crate::generated::ModelSelectionOutcome::Accepted
-            || projection.as_ref().is_some_and(|projection| projection.matches(&model.selection)));
-        let from_scratch = projection.as_ref().is_some_and(|value| value.selection.key.fromscratch);
+        let model = model.filter(|model| {
+            model.active
+                || model.terminal.outcome != crate::generated::ModelSelectionOutcome::Accepted
+                || projection
+                    .as_ref()
+                    .is_some_and(|projection| projection.matches(&model.selection))
+        });
+        let from_scratch = projection
+            .as_ref()
+            .is_some_and(|value| value.selection.key.fromscratch);
         let artifact = projection.map_or_else(String::new, |value| value.selection.artifact);
         Self {
             workflow,
@@ -470,7 +477,9 @@ pub(crate) fn status_presentation(state: Option<&ModelUiState>) -> StatusPresent
     };
     StatusPresentation {
         label: label.to_owned(),
-        detail: if state.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted && !state.selection.key.fromscratch {
+        detail: if state.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted
+            && !state.selection.key.fromscratch
+        {
             let layout = &state.selection.classlayout;
             let meaning = match layout.domain {
                 crate::generated::ClassReferenceDomain::Foreground => {
@@ -504,11 +513,20 @@ pub(crate) const fn card_title(workflow: FeatureId) -> &'static str {
     }
 }
 
-pub(crate) fn encoder_lineage<'a, M: Clone + 'a>(provenance: &crate::generated::EncoderPretrainingProvenance) -> Element<'a, M> {
-    column![text(format!("Base encoder: {}", provenance.assetid)).size(12),
+pub(crate) fn encoder_lineage<'a, M: Clone + 'a>(
+    provenance: &crate::generated::EncoderPretrainingProvenance,
+) -> Element<'a, M> {
+    column![
+        text(format!("Base encoder: {}", provenance.assetid)).size(12),
         status_text(format!("SHA-256 {}", provenance.sha256)).size(12),
-        status_text(format!("Revision {} · adaptation {}", provenance.sourcerevision, provenance.adaptationrevision)).size(12)]
-        .spacing(4).into()
+        status_text(format!(
+            "Revision {} · adaptation {}",
+            provenance.sourcerevision, provenance.adaptationrevision
+        ))
+        .size(12)
+    ]
+    .spacing(4)
+    .into()
 }
 
 fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, Message> {
@@ -531,7 +549,10 @@ fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, 
         .spacing(4)
     };
     if let Some(provenance) = state
-        .filter(|value| !value.active && value.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted)
+        .filter(|value| {
+            !value.active
+                && value.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted
+        })
         .and_then(|value| value.selection.encoderpretraining.as_ref())
     {
         content = content.push(encoder_lineage(provenance));
@@ -580,7 +601,9 @@ fn pending_artifact_confirmation<'a>(
     state: &State<'a>,
     dismissed_dialog_generation: u64,
 ) -> Option<(&'a str, u64)> {
-    if state.from_scratch { return None; }
+    if state.from_scratch {
+        return None;
+    }
     let target = crate::generated::MODEL_ARTIFACT_DIALOGS
         .iter()
         .find(|dialog| {
@@ -772,7 +795,14 @@ fn view_with<'a, M: Clone + 'a>(
                         container(button("Confirm").on_press(Message::ConfirmArtifact {
                             path: path.to_owned(),
                             generation
-                        })).id(selector_id(state.workflow, "train.model.confirm", "validate.model.confirm", "predict.model.confirm", "export.model.confirm")),
+                        }))
+                        .id(selector_id(
+                            state.workflow,
+                            "train.model.confirm",
+                            "validate.model.confirm",
+                            "predict.model.confirm",
+                            "export.model.confirm"
+                        )),
                     ]
                     .spacing(8),
                     text("The selected artifact will be verified when you prepare the model."),
@@ -783,7 +813,11 @@ fn view_with<'a, M: Clone + 'a>(
     );
     let title = card_title(state.workflow);
     let body = if supported_workflow(state.workflow) {
-        let weights_selector = shared_selector(state.workflow, presets, state.settings_enabled && !state.from_scratch);
+        let weights_selector = shared_selector(
+            state.workflow,
+            presets,
+            state.settings_enabled && !state.from_scratch,
+        );
         column![
             weights_selector,
             status_text(

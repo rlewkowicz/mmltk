@@ -39,8 +39,7 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
    } catch (...) {}
   }
   };
-  artifact = key.from_scratch ? store_.canonical_encoder_weight_path(preset->backbone.kind, cancellation.token(), observer)
-                              : store_.canonical_weight_path(key.preset, cancellation.token(), observer);
+  artifact = key.from_scratch ? store_.canonical_encoder_weight_path(preset->backbone.kind, cancellation.token(), observer) : store_.canonical_weight_path(key.preset, cancellation.token(), observer);
  }
  if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
  if (key.from_scratch) {
@@ -49,9 +48,13 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
   // Dataset admission establishes output meaning and query sizing at launch.
   config.num_classes = 0;
   config.keypoints_per_class.clear();
-  return {.artifact = artifact.string(), .task = preset->task, .training_config = std::move(config),
-          .training_capabilities = preset->training_capabilities,
-          .encoder_pretraining = rfdetr::encoder_pretraining_provenance(*rfdetr::find_encoder_pretraining_asset(preset->backbone.kind))};
+  return {
+   .artifact = artifact.string(),
+   .task = preset->task,
+   .training_config = std::move(config),
+   .training_capabilities = preset->training_capabilities,
+   .encoder_pretraining = rfdetr::encoder_pretraining_provenance(*rfdetr::find_encoder_pretraining_asset(preset->backbone.kind))
+  };
  }
  rfdetr::ModelClassLayout layout;
  rfdetr::ModelTask task = rfdetr::ModelTask::Detection;

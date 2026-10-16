@@ -384,8 +384,10 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   OracleCase entry;
   if (item.contains("upstream_export") && !item.at("upstream_export").is_null()) {
    const auto& artifact = item.at("upstream_export");
-   OracleExportArtifact value{child(case_directory, artifact.at("file").get<std::string>()), artifact.at("sha256").get<std::string>(), artifact.at("bytes").get<std::uint64_t>(),
-    artifact.at("outputs").get<std::map<std::string, std::string>>()};
+   OracleExportArtifact value{
+    child(case_directory, artifact.at("file").get<std::string>()), artifact.at("sha256").get<std::string>(), artifact.at("bytes").get<std::uint64_t>(),
+    artifact.at("outputs").get<std::map<std::string, std::string>>()
+   };
    if (!value.bytes || value.bytes > kArchiveLimit || value.sha256.size() != 64 || value.outputs.size() < 2 || value.outputs.size() > 3 ||
        artifact.at("exporter") != "rfdetr.export._onnx.exporter.OnnxExporter" || artifact.at("onnx_version").get<std::string>().empty())
     invalid("invalid upstream export declaration");
@@ -403,8 +405,7 @@ UpstreamOracle::UpstreamOracle(const std::filesystem::path& root) {
   entry.training = item.at("training").get<bool>();
   entry.math_sdpa = sdpa == "math";
   entry.batch = item.at("batch").get<int>();
-  if (entry.id != entry.preset + "-" + entry.protocol + "-" + entry.precision + "-b" + std::to_string(entry.batch) + (entry.training ? "-train" : "-eval") ||
-      (selected && entry.id != selected_case))
+  if (entry.id != entry.preset + "-" + entry.protocol + "-" + entry.precision + "-b" + std::to_string(entry.batch) + (entry.training ? "-train" : "-eval") || (selected && entry.id != selected_case))
    invalid("selected case identity differs");
   entry.resolution = item.at("resolution").get<int>();
   entry.groups = item.at("groups").get<int>();

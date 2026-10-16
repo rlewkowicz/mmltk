@@ -18,8 +18,10 @@ Value ReadFacts(const std::filesystem::path& path, const std::size_t limit) {
  input.read(text.data(), static_cast<std::streamsize>(text.size()));
  text.resize(static_cast<std::size_t>(input.gcount()));
  auto value = [&] {
-  if constexpr (std::is_same_v<Value, r::TrainingRun>) return r::decode_training_run_json(text);
-  else return serial::decode_reflected_json<Value>(text, {.max_bytes = limit, .max_items = 65536, .max_depth = 32});
+  if constexpr (std::is_same_v<Value, r::TrainingRun>)
+   return r::decode_training_run_json(text);
+  else
+   return serial::decode_reflected_json<Value>(text, {.max_bytes = limit, .max_items = 65536, .max_depth = 32});
  }();
  identity.RequireUnchanged(path);
  return value;

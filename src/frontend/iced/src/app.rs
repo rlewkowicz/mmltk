@@ -875,7 +875,10 @@ mod tests {
         let receipt = app
             .model
             .workflow
-            .model_selection_receipt(crate::generated::FeatureId::Train, app.settings.draft().unwrap())
+            .model_selection_receipt(
+                crate::generated::FeatureId::Train,
+                app.settings.draft().unwrap(),
+            )
             .unwrap();
         let correlation = app.model.begin_model_select_intent(receipt).unwrap();
         app.model.reduce_reply(
@@ -1461,7 +1464,10 @@ mod tests {
         let receipt = app
             .model
             .workflow
-            .model_selection_receipt(crate::generated::FeatureId::Export, app.settings.draft().unwrap())
+            .model_selection_receipt(
+                crate::generated::FeatureId::Export,
+                app.settings.draft().unwrap(),
+            )
             .unwrap();
         let selection = app.model.begin_model_select_intent(receipt).unwrap();
         drop(app.on_workspace(crate::view::router::Message::Export(

@@ -2257,8 +2257,7 @@ std::optional<at::Tensor> initializer_view(const torch::jit::Value* value, const
  if (!input) return std::nullopt;
  std::optional<at::Tensor> result;
  if (reshape || kind == kAtenPermute) {
-  if (const auto dimensions = constant_int_list_value(node->input(1)))
-   result = reshape ? input->reshape(*dimensions) : input->permute(*dimensions);
+  if (const auto dimensions = constant_int_list_value(node->input(1))) result = reshape ? input->reshape(*dimensions) : input->permute(*dimensions);
  } else if (cast) {
   // Staging already owns CPU values. A traced device transfer changes no
   // initializer data; retain only its admitted output dtype here.

@@ -17,7 +17,8 @@ bool AnnotationDocumentBudget::AddSchema(const mmltk::backend::data::catalog::Cl
 }
 bool AnnotationDocumentBudget::AddObject(const AnnotationObject& object) noexcept {
  if (!Add(object.mask.runs.size(), runs_, kAnnotationMaskRunCapacity) || !Add(object.skeleton_nodes.size(), joints_, kAnnotationDocumentJointCapacity) ||
-     !Add(object.skeleton_edges.size(), edges_, kAnnotationDocumentEdgeCapacity)) return false;
+     !Add(object.skeleton_edges.size(), edges_, kAnnotationDocumentEdgeCapacity))
+  return false;
  for (const auto& node : object.skeleton_nodes)
   if (!Add(node.key.size(), names_, kAnnotationDocumentJointNameBytes)) return false;
  try {

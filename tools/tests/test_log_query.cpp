@@ -2832,8 +2832,7 @@ int package_docker(const Strings& args) {
  } else if (args[0] == "run") {
   const auto name = option_value(args, "--name");
   support::write_json(root / "containers" / (name + ".json"), args);
-  if (std::ranges::find(args, "--list-tests") != args.end() &&
-      std::ranges::any_of(args, [](const auto& argument) { return argument.ends_with("/mmltk_workspace_wayland_integration"); }))
+  if (std::find(args.begin(), args.end(), "--list-tests") != args.end() && std::ranges::any_of(args, [](const auto& argument) { return argument.ends_with("/mmltk_workspace_wayland_integration"); }))
    std::cout << "workspace_wayland_retained\nworkspace_wayland_workflows\nworkspace_wayland_dpi\nworkspace_wayland_terminal\n"
                 "workspace_wayland_probe_recovery\nworkspace_wayland_gdr\nworkspace_wayland_quiet\n";
   if (name.ends_with("-build-package")) {
@@ -2845,14 +2844,17 @@ int package_docker(const Strings& args) {
   }
   if (name.ends_with("-upstream-capability")) std::cout << R"({"fp32":true,"fp16":true,"bf16":true})" << '\n';
   if (name.ends_with("-upstream")) {
-   if (support::env("TEST_ENCODER_ORACLE_SUCCESS") == "1" && std::ranges::find(args, "--encoder-pretraining-only") != args.end()) {
+   if (support::env("TEST_ENCODER_ORACLE_SUCCESS") == "1" && std::find(args.begin(), args.end(), "--encoder-pretraining-only") != args.end()) {
     std::string output;
-    for (const auto& argument : args) if (argument.ends_with(":/evidence:rw")) output = argument.substr(0, argument.size() - std::string_view(":/evidence:rw").size());
+    for (const auto& argument : args)
+     if (argument.ends_with(":/evidence:rw")) output = argument.substr(0, argument.size() - std::string_view(":/evidence:rw").size());
     CHECK(!output.empty());
-    support::write_json(fs::path(output) / "manifest.json", {{"format", "mmltk.rfdetr.encoder-pretraining.v1"}, {"mode", "encoder-pretraining"},
-     {"status", "encoder_references_complete_native_comparison_pending"}, {"sources", support::read_json(root / "tools/oracle/rfdetr_sources.json")},
-     {"fingerprint", option_value(args, "--fingerprint")}, {"precision_capability", {{"fp32", true}, {"fp16", true}, {"bf16", true}}}});
-   } else return 41;  // Stop before native numerical comparisons.
+    support::write_json(
+     fs::path(output) / "manifest.json", {{"format", "mmltk.rfdetr.encoder-pretraining.v1"}, {"mode", "encoder-pretraining"}, {"status", "encoder_references_complete_native_comparison_pending"},
+                                          {"sources", support::read_json(root / "tools/oracle/rfdetr_sources.json")}, {"fingerprint", option_value(args, "--fingerprint")},
+                                          {"precision_capability", {{"fp32", true}, {"fp16", true}, {"bf16", true}}}});
+   } else
+    return 41;  // Stop before native numerical comparisons.
   }
  } else if (args[0] != "version" && args[0] != "rm" && args[0] != "ps" && args[0] != "tag" && args[0] != "buildx")
   throw Failure("unexpected package Docker operation: " + args[0]);
@@ -3154,7 +3156,8 @@ void test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly() {
  const auto tidy = f.invoke({"--tidy-tools"});
  if (tidy.exit_code) throw Failure(tidy.err);
  prepare_oracle_sources(f);
- const auto oracle = f.invoke({"--diagnose-rfdetr-upstream", "--upstream", (f.root / "upstream").string(), "--plus-upstream", (f.root / "plus-upstream").string(), "--output", (f.root / "evidence").string()});
+ const auto oracle =
+  f.invoke({"--diagnose-rfdetr-upstream", "--upstream", (f.root / "upstream").string(), "--plus-upstream", (f.root / "plus-upstream").string(), "--output", (f.root / "evidence").string()});
  if (oracle.exit_code != 41) throw Failure(oracle.err);
  EQ(oracle.exit_code, 41);
  std::set<std::string> checked;
@@ -3185,8 +3188,10 @@ void test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly() {
  }
  EQ(checked, (std::set<std::string>{"oracle", "tidy"}));
  f.options.env["TEST_ENCODER_ORACLE_SUCCESS"] = "1";
- const Strings selected{"--diagnose-rfdetr-upstream", "--encoder-pretraining-only", "--upstream", (f.root / "upstream").string(), "--plus-upstream", (f.root / "plus-upstream").string(),
-  "--output", (f.root / "encoder-evidence").string()};
+ const Strings selected{
+  "--diagnose-rfdetr-upstream", "--encoder-pretraining-only", "--upstream", (f.root / "upstream").string(), "--plus-upstream", (f.root / "plus-upstream").string(), "--output",
+  (f.root / "encoder-evidence").string()
+ };
  const auto encoder = f.invoke(selected);
  if (encoder.exit_code) throw Failure(encoder.err);
  HAS(encoder.err, "encoder pretraining references ready");
@@ -3195,10 +3200,10 @@ void test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly() {
  bool forwarded_encoder = false;
  for (const auto& path : matching_files(f.root / "containers", "", ".json")) {
   const auto arguments = support::read_json(path).get<Strings>();
-  if (std::ranges::find(arguments, "--encoder-pretraining-only") == arguments.end()) continue;
+  if (std::find(arguments.begin(), arguments.end(), "--encoder-pretraining-only") == arguments.end()) continue;
   forwarded_encoder = true;
-  CHECK(std::ranges::find(arguments, "--inventory-only") == arguments.end());
-  CHECK(std::ranges::find(arguments, "[upstream_oracle]") == arguments.end());
+  CHECK(std::find(arguments.begin(), arguments.end(), "--inventory-only") == arguments.end());
+  CHECK(std::find(arguments.begin(), arguments.end(), "[upstream_oracle]") == arguments.end());
   EQ(option_value(arguments, "--output"), "/evidence");
  }
  CHECK(forwarded_encoder);
@@ -3220,8 +3225,10 @@ void test_encoder_preparation_and_explicit_evidence_routing() {
   const bool workspace = suite == "workspace-wayland";
   const std::string executable = workspace ? "mmltk_workspace_wayland_integration" : "mmltk_backend_models_rfdetr_core_tests";
   Strings selection{"--test", suite};
-  if (workspace) selection.push_back("--headless-compositor");
-  else selection.insert(selection.end(), {"--executable", executable});
+  if (workspace)
+   selection.push_back("--headless-compositor");
+  else
+   selection.insert(selection.end(), {"--executable", executable});
   const auto run = [&](const Strings& extra, std::optional<std::string> expected, bool prepare = false) {
    fs::remove_all(f.root / "containers");
    fs::create_directory(f.root / "containers");
@@ -3242,7 +3249,7 @@ void test_encoder_preparation_and_explicit_evidence_routing() {
     }
     if (path.stem().string().ends_with("-upstream")) {
      ++producers;
-     CHECK(std::ranges::find(arguments, "--encoder-pretraining-only") != arguments.end());
+     CHECK(std::find(arguments.begin(), arguments.end(), "--encoder-pretraining-only") != arguments.end());
      for (const auto& argument : arguments)
       if (argument.ends_with(":/evidence:rw")) produced = argument.substr(0, argument.size() - std::string_view(":/evidence:rw").size());
      CHECK(!produced.empty());
@@ -3261,8 +3268,7 @@ void test_encoder_preparation_and_explicit_evidence_routing() {
    if (prepare) expected = "/host" + produced;
    EQ(forwarded, expected);
    FALSE(fs::exists(f.root / ".cache/tests/rfdetr/baseline"));
-   for (const auto& entry : fs::recursive_directory_iterator(f.root / ".cache/tests/rfdetr"))
-    CHECK(entry.path().filename() != "comparisons" && entry.path().filename() != "inventory");
+   for (const auto& entry : fs::recursive_directory_iterator(f.root / ".cache/tests/rfdetr")) CHECK(entry.path().filename() != "comparisons" && entry.path().filename() != "inventory");
    return produced;
   };
   const auto explicit_path = "/host" + (f.root / "explicit-encoder-evidence").string();

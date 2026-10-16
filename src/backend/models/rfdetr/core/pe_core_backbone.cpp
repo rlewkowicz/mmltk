@@ -114,9 +114,7 @@ public:
   const int64_t batch = pixels.size(0), h = pixels.size(2) / config_.patch_size, w = pixels.size(3) / config_.patch_size;
   if (pixels.size(2) % (config_.patch_size * windows) || pixels.size(3) % (config_.patch_size * windows)) throw std::invalid_argument("PE-Core-T input is not divisible by patch_size * num_windows");
   auto positions = pos_embed_;
-  if (h != config_.positional_encoding_size || w != config_.positional_encoding_size) {
-   positions = interpolate_position_embedding(positions, config_.positional_encoding_size, h, w);
-  }
+  if (h != config_.positional_encoding_size || w != config_.positional_encoding_size) { positions = interpolate_position_embedding(positions, config_.positional_encoding_size, h, w); }
   auto tokens = projection_->forward(pixels).flatten(2).transpose(1, 2);
   tokens = norm_pre_->forward(torch::cat({cls_token_.expand({batch, -1, -1}), tokens}, 1) + positions);
   const auto options = pixels.options().dtype(torch::kFloat32);

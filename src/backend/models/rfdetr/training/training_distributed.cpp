@@ -243,8 +243,7 @@ void TrainingCollectiveWork::settle() {
   // backend observe peer failure/timeout before waiting on its CUDA fence.
   for (std::size_t index = 0; index < state.used; ++index) {
    const auto& slot = state.slots[index];
-   if (slot.work && !slot.work->wait(slot.group.transport_->timeout.value_or(std::chrono::milliseconds::max())))
-    throw std::runtime_error("training collective completion wait returned false");
+   if (slot.work && !slot.work->wait(slot.group.transport_->timeout.value_or(std::chrono::milliseconds::max()))) throw std::runtime_error("training collective completion wait returned false");
   }
   state.completed.synchronize();
  } catch (...) {

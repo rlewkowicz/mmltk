@@ -1260,17 +1260,17 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
   std::size_t projected_fields = 0U;
   Relation::key_relation::VisitMembers([&]<class Entry>() {
    if constexpr (requires { Entry::source; }) {
-   constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Entry::source>();
-   constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<contracts::ModelSelectionKey, Entry::destination>();
-   std::size_t matches = 0U;
-   VisitSettingsLeaves<contracts::GuiSettingsState>([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
-    if (field.path == source.view()) {
-     ++matches;
-     CHECK(field.stable_id == application_settings_field_stable_id(source.view()));
-    }
-   });
-   CHECK(matches == 1U);
-   CHECK_FALSE(destination.view().empty());
+    constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Entry::source>();
+    constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<contracts::ModelSelectionKey, Entry::destination>();
+    std::size_t matches = 0U;
+    VisitSettingsLeaves<contracts::GuiSettingsState>([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+     if (field.path == source.view()) {
+      ++matches;
+      CHECK(field.stable_id == application_settings_field_stable_id(source.view()));
+     }
+    });
+    CHECK(matches == 1U);
+    CHECK_FALSE(destination.view().empty());
    } else {
     STATIC_REQUIRE(Entry::value == false);
     STATIC_REQUIRE(Relation::workflow != contracts::FeatureId::Train);

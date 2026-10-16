@@ -82,7 +82,11 @@ void compare_assignments(support::OracleComparison& comparison, const support::O
    torch::NoGradGuard no_grad;
    const auto& output_layer = *output_layers[index];
    REQUIRE(output_layer.sparse_pred_masks.has_value());
-   const auto output_key = prefix + "output/" + (index == 0 ? std::string("main") : index + 1 == output_layers.size() && outputs.enc_outputs ? std::string("enc") : "aux." + std::to_string(index - 1)) + "/pred_masks/";
+   const auto output_key = prefix + "output/" +
+                           (index == 0                                                 ? std::string("main")
+                            : index + 1 == output_layers.size() && outputs.enc_outputs ? std::string("enc")
+                                                                                       : "aux." + std::to_string(index - 1)) +
+                           "/pred_masks/";
    const std::array names{output_key + "spatial_features", output_key + "query_features", output_key + "bias"};
    const auto source = archive.read_tensors(names);
    const auto device = masks.device();
@@ -98,7 +102,8 @@ void compare_assignments(support::OracleComparison& comparison, const support::O
     return torch::cat(projected);
    };
    comparison.observe_values([&] {
-    for (const auto& [variant, value] : {std::pair{"native-einsum", project(*output_layer.sparse_pred_masks, true)}, std::pair{"source-matmul", project(reference, false)}, std::pair{"source-einsum", project(reference, true)}}) {
+    for (const auto& [variant, value] :
+     {std::pair{"native-einsum", project(*output_layer.sparse_pred_masks, true)}, std::pair{"source-matmul", project(reference, false)}, std::pair{"source-einsum", project(reference, true)}}) {
      const auto control = rf::sample_direct_masks(value, targets, target_indices, config.mask_point_sample_ratio, samples[index]);
      comparison.compare(key + variant + "/point_coords", control.coordinates, expected.at(key + "point_coords"), ComparisonPolicy::Exact);
      comparison.compare(key + variant + "/point_logits", control.logits, expected.at(key + "point_logits"), ComparisonPolicy::Value);
@@ -121,9 +126,10 @@ void compare_assignments(support::OracleComparison& comparison, const support::O
    for (int64_t point = 0; point < std::min<int64_t>(changed.size(0), 16); ++point) {
     const auto row = changed[point][0].item<int64_t>(), column = changed[point][1].item<int64_t>();
     const auto actual_id = actual_ids[row][column].item<int64_t>(), expected_id = expected_ids[row][column].item<int64_t>();
-    points.push_back({{"row", row}, {"column", column}, {"actual_id", actual_id}, {"expected_id", expected_id},
-                      {"native_actual_uncertainty", uncertainty[row][actual_id].item<double>()}, {"native_expected_uncertainty", uncertainty[row][expected_id].item<double>()},
-                      {"source_actual_uncertainty", source_uncertainty[row][actual_id].item<double>()}, {"source_expected_uncertainty", source_uncertainty[row][expected_id].item<double>()}});
+    points.push_back(
+     {{"row", row}, {"column", column}, {"actual_id", actual_id}, {"expected_id", expected_id}, {"native_actual_uncertainty", uncertainty[row][actual_id].item<double>()},
+      {"native_expected_uncertainty", uncertainty[row][expected_id].item<double>()}, {"source_actual_uncertainty", source_uncertainty[row][actual_id].item<double>()},
+      {"source_expected_uncertainty", source_uncertainty[row][expected_id].item<double>()}});
    }
    comparison.fact(key + "selection-difference", {{"changed_positions", changed.size(0)}, {"points", points}});
   }

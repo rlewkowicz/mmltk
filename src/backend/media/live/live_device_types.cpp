@@ -16,7 +16,8 @@ LiveCudaCommandScope::LiveCudaCommandScope(const LivePhysicalCudaContext& contex
       device_(command_ && !(detail::active_live_cuda_context.worker == context.command_.worker_identity() && detail::active_live_cuda_context.owner == context.device_.context &&
                             detail::active_live_cuda_context.device == context.device_.device)
                ? context.device_
-               : gpu::CudaDeviceOwner{}, context.api_),
+               : gpu::CudaDeviceOwner{},
+       context.api_),
       nested_(command_ && detail::active_live_cuda_context.worker == context.command_.worker_identity() && detail::active_live_cuda_context.owner == context.device_.context &&
               detail::active_live_cuda_context.device == context.device_.device) {
  if (!command_ || (!nested_ && !device_)) {

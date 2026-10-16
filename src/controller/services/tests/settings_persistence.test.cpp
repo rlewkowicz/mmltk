@@ -3,6 +3,7 @@
 #include "src/controller/services/file_dialog/file_dialog_system.h"
 #include "src/controller/services/settings/settings_system.h"
 #include "src/controller/contracts/model_selection.h"
+#include "src/controller/contracts/gui_settings.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include <catch2/catch_test_macros.hpp>
@@ -455,8 +456,7 @@ TEST_CASE("Admitted training rejects queued execution changes but preserves inde
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
  for (const auto& update : std::array{
        contracts::SettingsValueUpdate{"workflows.train.compiled_dataset_dir", *Value::text("/next/dataset", mmltk::frameworks::reflection::kMaximumPathBytes)},
-       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{0}}},
-       contracts::SettingsValueUpdate{"workflows.train.request.from_scratch", Value{true}}
+       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{0}}}, contracts::SettingsValueUpdate{"workflows.train.request.from_scratch", Value{true}}
       }) {
   contracts::SettingsUpdateRequest locked;
   locked.updates.push_back(update);

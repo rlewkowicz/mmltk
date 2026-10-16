@@ -7,9 +7,8 @@ export {
  using tools::command::Command;
  // The packaged acceptance child has two process roles: enumeration enters the
  // executable directly; execution may enter the owned private compositor.
- inline std::vector<std::string> workspace_test_command(
-  bool headless, const std::string& executable, const std::vector<std::string>& arguments, const std::string& runtime_image, const std::string& validation_image,
-  const std::vector<std::string>& prefix = {}) {
+ inline std::vector<std::string> workspace_test_command(bool headless, const std::string& executable, const std::vector<std::string>& arguments, const std::string& runtime_image,
+  const std::string& validation_image, const std::vector<std::string>& prefix = {}) {
   std::vector<std::string> result;
   auto program = prefix;
   program.push_back(executable);

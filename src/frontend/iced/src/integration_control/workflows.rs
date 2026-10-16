@@ -1862,31 +1862,51 @@ mod tests {
 
     #[test]
     fn workflow_completion_requires_current_nonempty_canvas_evidence() {
-        let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
-        let controller = &mut fixture.controller;
-        controller.driver.phase = Phase::Workflows(Step::AwaitPixels(Picture::Narrow, 0));
-        let capture = |generation, outcome| Message::Scoped {
-            generation,
-            receipt: None,
-            message: Box::new(Message::WorkflowPixels {
-                picture: Picture::Narrow,
-                index: 0,
-                outcome,
-            }),
-        };
-        let _ = controller.update(capture(
-            controller.driver.generation.wrapping_sub(1),
-            ProbeOutcome::Observed(256, 256),
-        ));
-        assert_eq!(
-            controller.driver.phase,
-            Phase::Workflows(Step::AwaitPixels(Picture::Narrow, 0))
-        );
-        let _ = controller.update(capture(
-            controller.driver.generation,
-            ProbeOutcome::Observed(256, 0),
-        ));
-        assert_eq!(controller.driver.phase, Phase::Failed);
+        for scratch in [false, true] {
+            let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+            let controller = &mut fixture.controller;
+            let awaiting = Phase::Workflows(if scratch {
+                Step::Scratch(super::scratch::Stage::AwaitPixels(0, 0))
+            } else {
+                Step::AwaitPixels(Picture::Narrow, 0)
+            });
+            controller.driver.phase = awaiting.clone();
+            let capture = |generation, index, outcome| Message::Scoped {
+                generation,
+                receipt: None,
+                message: Box::new(if scratch {
+                    Message::ScratchPixels {
+                        stage: 0,
+                        index,
+                        outcome,
+                    }
+                } else {
+                    Message::WorkflowPixels {
+                        picture: Picture::Narrow,
+                        index,
+                        outcome,
+                    }
+                }),
+            };
+            let _ = controller.update(capture(
+                controller.driver.generation.wrapping_sub(1),
+                0,
+                ProbeOutcome::Observed(256, 256),
+            ));
+            assert_eq!(controller.driver.phase, awaiting);
+            let _ = controller.update(capture(
+                controller.driver.generation,
+                1,
+                ProbeOutcome::Observed(256, 256),
+            ));
+            assert_eq!(controller.driver.phase, awaiting);
+            let _ = controller.update(capture(
+                controller.driver.generation,
+                0,
+                ProbeOutcome::Observed(256, 0),
+            ));
+            assert_eq!(controller.driver.phase, Phase::Failed);
+        }
     }
 
     #[test]
@@ -2609,7 +2629,9 @@ impl State {
         router: &crate::view::router::Router,
     ) -> Task<RootMessage> {
         if let Step::Scratch(stage) = step {
-            return self.scratch.advance(widgets, driver, stage, model, settings, active);
+            return self
+                .scratch
+                .advance(widgets, driver, stage, model, settings, active);
         }
         if let Step::Keypoints(stage) = step {
             return self

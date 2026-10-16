@@ -292,7 +292,7 @@ TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation a
  const auto capability = training.PrepareResume({path});
  CHECK(capability.path == path);
  CHECK(capability.resumable);
- CHECK(capability.encoder_pretraining == checkpoint.encoder_pretraining);
+ CHECK_FALSE(capability.encoder_pretraining);
  CHECK(inspections == 1);
  const auto change = [&] {
   switch (mutation) {

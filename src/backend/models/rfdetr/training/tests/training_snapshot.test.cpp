@@ -590,8 +590,7 @@ TEST_CASE("ordinary publication excludes stale EMA after released storage is reu
  metadata.encoder_pretraining = r::EncoderPretrainingProvenance{"publication.fixture", std::string(40, 'a'), std::string(64, 'b'), 2};
  const auto destination = directory.path() / "ordinary-resume.pt";
  REQUIRE_THROWS(fixture.snapshot.save_resume(destination, metadata, fixture.built.optimizer, fixture.scaler, saved_request, 0, 0, "attempt", original_descriptor, destination, fixture.values));
- fixture.snapshot.save_resume(
-  destination, metadata, fixture.built.optimizer, fixture.scaler, saved_request, 0, 0, "attempt", original_descriptor, active.class_layout_path, fixture.values);
+ fixture.snapshot.save_resume(destination, metadata, fixture.built.optimizer, fixture.scaler, saved_request, 0, 0, "attempt", original_descriptor, active.class_layout_path, fixture.values);
  publication.finish();
  auto saved = r::decode_native_model_state(destination);
  REQUIRE(saved.metadata.encoder_pretraining == metadata.encoder_pretraining);

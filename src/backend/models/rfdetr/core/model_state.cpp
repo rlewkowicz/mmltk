@@ -354,10 +354,9 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  c10::IValue provenance;
  if (archive.try_read("encoder_pretraining_cbor", provenance)) {
   if (!provenance.isTensor()) throw std::runtime_error("invalid encoder pretraining CBOR metadata");
-  auto decoded = mmltk::backend::ml::serialization::read_cbor_record<EncoderPretrainingProvenance>(
+  metadata.encoder_pretraining = mmltk::backend::ml::serialization::read_cbor_record<EncoderPretrainingProvenance>(
    provenance.toTensor(), {.max_items = 32, .max_depth = 4}, "invalid encoder pretraining CBOR extent", "invalid encoder pretraining provenance");
-  if (!encoder_pretraining_provenance_valid(decoded)) throw std::runtime_error("invalid encoder pretraining provenance");
-  metadata.encoder_pretraining = std::move(decoded);
+  if (!encoder_pretraining_provenance_valid(*metadata.encoder_pretraining)) throw std::runtime_error("invalid encoder pretraining provenance");
  }
  metadata.num_classes = mmltk::backend::ml::serialization::read_optional_value<int64_t>(archive, "num_classes").value_or(0);
  metadata.num_queries = mmltk::backend::ml::serialization::require_int(archive, "num_queries");

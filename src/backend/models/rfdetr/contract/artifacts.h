@@ -17,7 +17,7 @@ struct ResolvedModelArtifacts {
  std::filesystem::path tensorrt_path{};
  NativeRfDetrConfig config{};
  ModelClassLayout class_layout{};
- std::optional<EncoderPretrainingProvenance> encoder_pretraining;
+ std::optional<EncoderPretrainingProvenance> encoder_pretraining{};
  std::string artifact_sha256{};
  int automatic_num_queries_cap = 0;
  int source_num_queries = 0;

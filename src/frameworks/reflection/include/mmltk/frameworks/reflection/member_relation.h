@@ -50,7 +50,8 @@ struct StaticMemberRelation {
     if constexpr (accessor_is_applicable<Destination, Entry::destination>()) {
      destinations[index] = accessor_member_identity<Destination, Entry::destination>();
      compatible = compatible && ExactMemberTransform::template accepts<decltype(Entry::value), accessor_value_t<Destination, Entry::destination>>() && destinations[index].valid();
-    } else compatible = false;
+    } else
+     compatible = false;
    } else if constexpr (accessor_is_applicable<Source, Entry::source>() && accessor_is_applicable<Destination, Entry::destination>()) {
     using SourceValue = accessor_value_t<Source, Entry::source>;
     using DestinationValue = accessor_value_t<Destination, Entry::destination>;
@@ -73,8 +74,10 @@ struct StaticMemberRelation {
  template <class SourceValue, class DestinationValue>
  static constexpr void Project(const SourceValue& source, DestinationValue& destination) {
   VisitMembers([&]<class Entry>() {
-   if constexpr (requires { Entry::value; }) access<DestinationValue, Entry::destination>(destination) = Entry::value;
-   else Entry::transform::apply(access<DestinationValue, Entry::destination>(destination), access<const SourceValue, Entry::source>(source));
+   if constexpr (requires { Entry::value; })
+    access<DestinationValue, Entry::destination>(destination) = Entry::value;
+   else
+    Entry::transform::apply(access<DestinationValue, Entry::destination>(destination), access<const SourceValue, Entry::source>(source));
   });
  }
 };

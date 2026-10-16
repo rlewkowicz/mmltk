@@ -1103,11 +1103,12 @@ TEST_CASE("scoped required options accept environment defaults and enforce prese
  CHECK(rejected.error().code == reflection::ParseErrorCode::InvalidValue);
  CHECK(std::string_view(rejected.error().what()) == "command descriptor capacity exceeded");
 }
-
 #if defined(MMLTK_TEST_TORCH_RGB_RESIZE)
 TEST_CASE("CLI rejects ambiguous scratch sources before acquisition", "[core][cli][rfdetr][encoder_pretraining]") {
- for (const auto& extra : std::vector<std::vector<std::string>>{{"--preset", "unknown"}, {"--preset", "rf-detr-atto", "--weights", "/missing/detector.pt"},
-       {"--preset", "rf-detr-atto", "--resume", "/missing/session.json"}, {"--preset", "rf-detr-atto", "--class-layout", "/missing/classes.json"}}) {
+ for (const auto& extra : std::vector<std::vector<std::string>>{
+       {"--preset", "unknown"}, {"--preset", "rf-detr-atto", "--weights", "/missing/detector.pt"}, {"--preset", "rf-detr-atto", "--resume", "/missing/session.json"},
+       {"--preset", "rf-detr-atto", "--class-layout", "/missing/classes.json"}
+      }) {
   std::vector<std::string> arguments{mmltk_cli_path(), "rfdetr", "train", "--from-scratch", "--train-compiled", "train.bin", "--val-compiled", "val.bin", "--output-dir", "output"};
   arguments.insert(arguments.end(), extra.begin(), extra.end());
   const auto result = run_subprocess_capture_output(arguments);

@@ -106,8 +106,7 @@ struct ModelSelectionRelationRow {
   mmltk::frameworks::reflection::visit_materialized_members<ModelSelectionKey>([&]<class>(const auto&) { ++count; });
   return count;
  }();
- using scratch_entry = std::conditional_t<std::same_as<decltype(Scratch), bool>,
-  mmltk::frameworks::reflection::ConstantMemberRelationEntry<Scratch, member_path<&ModelSelectionKey::from_scratch>>,
+ using scratch_entry = std::conditional_t<std::same_as<decltype(Scratch), bool>, mmltk::frameworks::reflection::ConstantMemberRelationEntry<Scratch, member_path<&ModelSelectionKey::from_scratch>>,
   MemberRelationEntry<Scratch, member_path<&ModelSelectionKey::from_scratch>>>;
  using key_relation =
   mmltk::frameworks::reflection::StaticMemberRelation<GuiSettingsState, ModelSelectionKey, key_field_count - 1U, MemberRelationEntry<Source, member_path<&ModelSelectionKey::source>>,

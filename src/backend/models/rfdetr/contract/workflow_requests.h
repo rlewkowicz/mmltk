@@ -1,5 +1,5 @@
 #pragma once
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 #include "src/frameworks/reflection/reflected_declarations.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"

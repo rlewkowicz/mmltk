@@ -35,8 +35,9 @@ namespace mmltk::backend::models::rfdetr::testsupport {
  const auto* preset = find_preset_catalog_entry(preset_name);
  REQUIRE(preset);
  const auto config = native_config_from_preset(*preset);
- mmltk::backend::data::testsupport::FixtureSpec spec{.root_dir = root.string(), .width = config.patch_size * config.num_windows * 2,
-  .height = config.patch_size * config.num_windows * 2, .num_images = 4, .background_images = 0};
+ mmltk::backend::data::testsupport::FixtureSpec spec{
+  .root_dir = root.string(), .width = config.patch_size * config.num_windows * 2, .height = config.patch_size * config.num_windows * 2, .num_images = 4, .background_images = 0
+ };
  mmltk::backend::data::testsupport::create_compiled_fixture(spec, config.has_keypoints());
  TrainRequest request;
  request.preset_name = preset_name;

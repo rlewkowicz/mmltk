@@ -97,8 +97,8 @@ struct ArtifactWeightAsset final {
  std::string digest;
  std::uint64_t file_bytes = 0U;
  // Encoder files use an immutable source identity below the encoder cache root.
- std::string cache_identity;
- std::optional<mmltk::backend::models::rfdetr::BackboneKind> encoder;
+ std::string cache_identity{};
+ std::optional<mmltk::backend::models::rfdetr::BackboneKind> encoder{};
 };
 struct ArtifactWeightProgressObserver final {
  void* context = nullptr;
@@ -131,8 +131,8 @@ public:
   const ArtifactCompileRequest& request, const ArtifactCancellationToken& cancellation, ArtifactProgressObserver progress = {}, ArtifactDiagnosticObserver diagnostics = {}) const;
  [[nodiscard]] std::filesystem::path canonical_weight_path(std::string_view preset) const;
  [[nodiscard]] std::filesystem::path canonical_weight_path(std::string_view preset, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver progress = {}) const;
- [[nodiscard]] std::filesystem::path canonical_encoder_weight_path(mmltk::backend::models::rfdetr::BackboneKind encoder, const ArtifactCancellationToken& cancellation,
-  ArtifactWeightProgressObserver progress = {}) const;
+ [[nodiscard]] std::filesystem::path canonical_encoder_weight_path(
+  mmltk::backend::models::rfdetr::BackboneKind encoder, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver progress = {}) const;
 
 private:
  [[nodiscard]] std::filesystem::path acquire_weight(const ArtifactWeightAsset&, const ArtifactCancellationToken&, ArtifactWeightProgressObserver) const;

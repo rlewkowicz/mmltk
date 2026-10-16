@@ -805,8 +805,10 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
         const auto [expected_sorted, expected_order] = expected.sort(-1);
         comparison.compare(std::string(prefix) + "encoder/0", actual, expected, support::OracleComparisonPolicy::Exact);
         comparison.compare(std::string(prefix) + "encoder identities", actual_sorted, expected_sorted, support::OracleComparisonPolicy::Exact);
-        if (torch::equal(actual_sorted, expected_sorted)) export_permutations[prefix] = expected_order.gather(-1, actual_order.argsort(false, -1, false));
-        else export_permutations.erase(prefix);
+        if (torch::equal(actual_sorted, expected_sorted))
+         export_permutations[prefix] = expected_order.gather(-1, actual_order.argsort(false, -1, false));
+        else
+         export_permutations.erase(prefix);
        }
       }
       rf::RfdetrOutputSchema::visit([&]<rf::RfdetrOutputRole>(rf::RfdetrOutputPolicy facts) {
@@ -827,8 +829,7 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
     };
     const auto admitted = model.forward_observed({input, mask}, model.config().has_masks(), admitted_indices);
     report({}, admitted, admitted_indices);
-    for (const auto& [name, math, deformable] : {
-          std::tuple{"math", true, false}, std::tuple{"deformable", false, true}, std::tuple{"export-policy", true, true}}) {
+    for (const auto& [name, math, deformable] : {std::tuple{"math", true, false}, std::tuple{"deformable", false, true}, std::tuple{"export-policy", true, true}}) {
      auto snapshot = model.make_inference_clone(entry.batch, rf::CompilationMode::kNone);
      snapshot->set_force_math_attention(math);
      snapshot->set_force_pytorch_deformable_attn(deformable);
@@ -927,14 +928,13 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
        }
        for (std::size_t index = 0; index < info.output_count; ++index) {
         comparison.compare("output/" + info.outputs[index].name, values[index], reference.tensor(expected_prefix + info.outputs[index].name), support::OracleComparisonPolicy::Value);
-        if (portable_reference) comparison.observe_values([&] {
-         compare_export_reference(comparison, info.outputs[index].name, values[index]);
-        });
-        if (source_backend) comparison.observe_values([&] {
-         const auto& role = info.outputs[index].name;
-         comparison.compare("source-runtime/output/" + role, values[index], source_values.at(role), support::OracleComparisonPolicy::Value);
-         comparison.compare("source-runtime/math-reference/" + role, source_values.at(role), reference.tensor(expected_prefix + role), support::OracleComparisonPolicy::Value);
-        });
+        if (portable_reference) comparison.observe_values([&] { compare_export_reference(comparison, info.outputs[index].name, values[index]); });
+        if (source_backend)
+         comparison.observe_values([&] {
+          const auto& role = info.outputs[index].name;
+          comparison.compare("source-runtime/output/" + role, values[index], source_values.at(role), support::OracleComparisonPolicy::Value);
+          comparison.compare("source-runtime/math-reference/" + role, source_values.at(role), reference.tensor(expected_prefix + role), support::OracleComparisonPolicy::Value);
+         });
        }
       }
      });
@@ -957,7 +957,6 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
  }
 }
 #endif
-
 TEST_CASE("scratch task outputs export to executable ONNX and TensorRT without base sources", "[model][rfdetr][export][encoder_pretraining][cuda]") {
  namespace rf = mmltk::backend::models::rfdetr;
  namespace runtime = mmltk::backend::ml::runtime;
@@ -965,60 +964,60 @@ TEST_CASE("scratch task outputs export to executable ONNX and TensorRT without b
  if (!evidence) SKIP("real scratch export requires explicit MMLTK_RFDETR_ENCODER_PRETRAINING_DIR");
  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
  for (const auto* preset : {"rf-detr-atto", "rf-detr-seg-nano", "rf-detr-keypoint-preview"}) DYNAMIC_SECTION(preset) {
-  const mmltk::testsupport::ScopedTempDir root("scratch-export");
-  const auto training = rf::testsupport::encoder_training_request(root.path(), *evidence, preset);
-  const auto trained = rf::run_training(training);
-  REQUIRE(trained.selected);
-  std::filesystem::remove(training.encoder_weights_path);
-  REQUIRE_FALSE(std::filesystem::exists(training.encoder_weights_path));
-  rf::ExportOnnxRequest request;
-  request.weights_path = trained.selected->artifact.path;
-  request.preset_name = preset;
-  request.resolution = trained.artifacts.config.resolution;
-  request.output_path = root.path() / "model.onnx";
-  rf::export_onnx(request);
-  const auto metadata = rf::load_onnx_model_info(request.output_path);
-  REQUIRE(metadata.output_contract);
-  CHECK(metadata.output_contract->task == trained.artifacts.config.task);
-  CHECK(metadata.output_contract->keypoints_per_class == trained.artifacts.config.keypoints_per_class);
-  CHECK(metadata.class_layout == trained.artifacts.class_layout);
-  const auto engine_path = root.path() / "model.engine";
-  {
-   runtime::TensorRtEngineOptions options{};
-   options.allow_fp16 = options.allow_tf32 = false;
-   runtime::TensorRtEngine engine(request.output_path, options);
-   REQUIRE_FALSE(engine.cancelled());
-   engine.Save(engine_path);
-  }
-  const mmltk::testsupport::ScopedTestStream stream;
-  c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream.get(), 0));
-  const runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
-  const auto input = torch::zeros({1, 3, request.resolution, request.resolution}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
-  for (const auto kind : {runtime::RuntimeBackendKind::Onnx, runtime::RuntimeBackendKind::TensorRt}) {
-   runtime::RuntimeBackendOptions options{};
-   options.kind = kind;
-   options.model_path = kind == runtime::RuntimeBackendKind::Onnx ? request.output_path : engine_path;
-   options.device = 0;
-   options.command_stream = command;
-   options.allow_fp16 = options.allow_tf32 = false;
-   auto backend = runtime::make_runtime_backend(options);
-   const auto& info = backend->model_info();
-   REQUIRE(info.output_count == rf::RfdetrOutputSchema::count(trained.artifacts.config.task));
-   std::vector<torch::Tensor> values;
-   std::vector<runtime::RuntimeTensorBuffer> outputs;
-   for (std::size_t index = 0; index < info.output_count; ++index) {
-    const auto& descriptor = info.outputs[index];
-    REQUIRE(descriptor.element_type == runtime::RuntimeElementType::Float32);
-    std::vector<int64_t> shape(descriptor.shape.extents.begin(), descriptor.shape.extents.begin() + descriptor.shape.rank);
-    REQUIRE(std::ranges::all_of(shape, [](auto dimension) { return dimension > 0; }));
-    values.push_back(torch::empty(shape, input.options()));
-    outputs.push_back(runtime_buffer(values.back()));
+   const mmltk::testsupport::ScopedTempDir root("scratch-export");
+   const auto training = rf::testsupport::encoder_training_request(root.path(), *evidence, preset);
+   const auto trained = rf::run_training(training);
+   REQUIRE(trained.selected);
+   std::filesystem::remove(training.encoder_weights_path);
+   REQUIRE_FALSE(std::filesystem::exists(training.encoder_weights_path));
+   rf::ExportOnnxRequest request;
+   request.weights_path = trained.selected->artifact.path;
+   request.preset_name = preset;
+   request.resolution = trained.artifacts.config.resolution;
+   request.output_path = root.path() / "model.onnx";
+   rf::export_onnx(request);
+   const auto metadata = rf::load_onnx_model_info(request.output_path);
+   REQUIRE(metadata.output_contract);
+   CHECK(metadata.output_contract->task == trained.artifacts.config.task);
+   CHECK(metadata.output_contract->keypoints_per_class == trained.artifacts.config.keypoints_per_class);
+   CHECK(metadata.class_layout == trained.artifacts.class_layout);
+   const auto engine_path = root.path() / "model.engine";
+   {
+    runtime::TensorRtEngineOptions options{};
+    options.allow_fp16 = options.allow_tf32 = false;
+    runtime::TensorRtEngine engine(request.output_path, options);
+    REQUIRE_FALSE(engine.cancelled());
+    engine.Save(engine_path);
    }
-   auto receipt = backend->Run(runtime_buffer(input), outputs, {}, {}, {});
-   backend->ReleaseAfterCompletion(std::move(receipt));
-   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
-   for (const auto& output : values) CHECK(torch::isfinite(output).all().item<bool>());
-   CHECK(backend->Close() == runtime::kRuntimeSuccess);
+   const mmltk::testsupport::ScopedTestStream stream;
+   c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream.get(), 0));
+   const runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
+   const auto input = torch::zeros({1, 3, request.resolution, request.resolution}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+   for (const auto kind : {runtime::RuntimeBackendKind::Onnx, runtime::RuntimeBackendKind::TensorRt}) {
+    runtime::RuntimeBackendOptions options{};
+    options.kind = kind;
+    options.model_path = kind == runtime::RuntimeBackendKind::Onnx ? request.output_path : engine_path;
+    options.device = 0;
+    options.command_stream = command;
+    options.allow_fp16 = options.allow_tf32 = false;
+    auto backend = runtime::make_runtime_backend(options);
+    const auto& info = backend->model_info();
+    REQUIRE(info.output_count == rf::RfdetrOutputSchema::count(trained.artifacts.config.task));
+    std::vector<torch::Tensor> values;
+    std::vector<runtime::RuntimeTensorBuffer> outputs;
+    for (std::size_t index = 0; index < info.output_count; ++index) {
+     const auto& descriptor = info.outputs[index];
+     REQUIRE(descriptor.element_type == runtime::RuntimeElementType::Float32);
+     std::vector<int64_t> shape(descriptor.shape.extents.begin(), descriptor.shape.extents.begin() + descriptor.shape.rank);
+     REQUIRE(std::ranges::all_of(shape, [](auto dimension) { return dimension > 0; }));
+     values.push_back(torch::empty(shape, input.options()));
+     outputs.push_back(runtime_buffer(values.back()));
+    }
+    auto receipt = backend->Run(runtime_buffer(input), outputs, {}, {}, {});
+    backend->ReleaseAfterCompletion(std::move(receipt));
+    REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+    for (const auto& output : values) CHECK(torch::isfinite(output).all().item<bool>());
+    CHECK(backend->Close() == runtime::kRuntimeSuccess);
+   }
   }
- }
 }

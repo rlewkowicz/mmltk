@@ -29,7 +29,8 @@ r::EvalSummary evaluation(double metric, bool masks = false) {
  }
  return value;
 }
-r::TrainingSelectionCandidate ingredient(const std::filesystem::path& directory, std::uint64_t id, double value, double metric, bool masks = false, std::optional<r::EncoderPretrainingProvenance> lineage = {}) {
+r::TrainingSelectionCandidate ingredient(
+ const std::filesystem::path& directory, std::uint64_t id, double value, double metric, bool masks = false, std::optional<r::EncoderPretrainingProvenance> lineage = {}) {
  r::DecodedNativeModelState state;
  state.metadata = r::testsupport::synthetic_training_metadata();
  state.metadata.encoder_pretraining = std::move(lineage);
@@ -631,12 +632,11 @@ TEST_CASE("Selection requires the task metric and exact joint topology before av
  CHECK_FALSE(r::same_native_model_semantics(a, b));
  REQUIRE_THROWS(r::require_checkpoint_model_topology(config, a));
 }
-
 TEST_CASE("selection keeps only unanimous lineage among actual averaging contributors", "[model][rfdetr][training][merge][encoder_pretraining]") {
  const r::EncoderPretrainingProvenance lineage{"merge.fixture", std::string(40, 'a'), std::string(64, 'b'), 3};
  auto other = lineage;
  other.adaptation_revision = 4;
- for (const auto second : {std::optional{lineage}, std::optional{other}, std::optional<r::EncoderPretrainingProvenance>{}}) {
+ for (const auto& second : {std::optional{lineage}, std::optional{other}, std::optional<r::EncoderPretrainingProvenance>{}}) {
   const mmltk::testsupport::ScopedTempDir root("merge-lineage");
   std::array candidates{ingredient(root.path(), 1, 1, .8, false, lineage), ingredient(root.path(), 2, 5, .7, false, second)};
   const auto evaluate = [](const auto&) { return evaluation(.6); };
@@ -650,7 +650,6 @@ TEST_CASE("selection keeps only unanimous lineage among actual averaging contrib
   CHECK(r::decode_native_model_state(sole.artifact.path).metadata.encoder_pretraining == second);
  }
 }
-
 TEST_CASE("session manifests migrate absent launch fields without weakening admission", "[model][rfdetr][training][session][encoder_pretraining]") {
  const mmltk::testsupport::ScopedTempDir root("legacy-session-request");
  SessionFixture fixture(root.path());

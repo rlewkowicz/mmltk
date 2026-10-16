@@ -62,6 +62,7 @@ public:
  }
  [[nodiscard]] std::span<const std::uint8_t> bytes() const { return {static_cast<const std::uint8_t*>(mapping_.address()), mapping_.mapped_bytes()}; }
  void unchanged() const { require(io::FileSnapshot::Read(file_.get()) == snapshot_, "opened source changed during admission"); }
+
 private:
  io::FileHandle file_;
  io::FileSnapshot snapshot_;
@@ -71,10 +72,10 @@ private:
 // would hide new or wrongly shaped source state, so every name/shape is explicit.
 const std::unordered_map<std::string, std::vector<std::int64_t>>& pe_exclusions() {
  static const std::unordered_map<std::string, std::vector<std::int64_t>> shapes{
-  {"attn_pool.kv.bias", {384}}, {"attn_pool.kv.weight", {384, 192}}, {"attn_pool.latent", {1, 1, 192}},
-  {"attn_pool.mlp.fc1.bias", {768}}, {"attn_pool.mlp.fc1.weight", {768, 192}}, {"attn_pool.mlp.fc2.bias", {192}}, {"attn_pool.mlp.fc2.weight", {192, 768}},
-  {"attn_pool.norm.bias", {192}}, {"attn_pool.norm.weight", {192}}, {"attn_pool.proj.bias", {192}}, {"attn_pool.proj.weight", {192, 192}},
-  {"attn_pool.q.bias", {192}}, {"attn_pool.q.weight", {192, 192}}, {"head.bias", {512}}, {"head.weight", {512, 192}}};
+  {"attn_pool.kv.bias", {384}}, {"attn_pool.kv.weight", {384, 192}}, {"attn_pool.latent", {1, 1, 192}}, {"attn_pool.mlp.fc1.bias", {768}}, {"attn_pool.mlp.fc1.weight", {768, 192}},
+  {"attn_pool.mlp.fc2.bias", {192}}, {"attn_pool.mlp.fc2.weight", {192, 768}}, {"attn_pool.norm.bias", {192}}, {"attn_pool.norm.weight", {192}}, {"attn_pool.proj.bias", {192}},
+  {"attn_pool.proj.weight", {192, 192}}, {"attn_pool.q.bias", {192}}, {"attn_pool.q.weight", {192, 192}}, {"head.bias", {512}}, {"head.weight", {512, 192}}
+ };
  return shapes;
 }
 }  // namespace
@@ -89,14 +90,21 @@ std::vector<NormalizedModelStateEntry> decode_encoder_safetensors(const std::spa
  std::vector<std::set<std::string>> keys;
  const auto header = Json::parse(bytes.begin() + 8, bytes.begin() + 8 + static_cast<std::ptrdiff_t>(header_bytes), [&](int depth, Json::parse_event_t event, Json& value) {
   require(depth <= 6, "safetensors metadata nesting exceeds bound");
-  if (event == Json::parse_event_t::object_start) keys.emplace_back();
-  else if (event == Json::parse_event_t::key) require(keys.back().insert(value.get<std::string>()).second, "duplicate safetensors key");
-  else if (event == Json::parse_event_t::object_end) keys.pop_back();
+  if (event == Json::parse_event_t::object_start)
+   keys.emplace_back();
+  else if (event == Json::parse_event_t::key)
+   require(keys.back().insert(value.get<std::string>()).second, "duplicate safetensors key");
+  else if (event == Json::parse_event_t::object_end)
+   keys.pop_back();
   return true;
  });
  require(header.is_object() && !header.empty() && header.size() <= kTensorLimit + 1U, "invalid safetensors tensor count");
  const std::size_t payload = 8U + static_cast<std::size_t>(header_bytes), payload_bytes = bytes.size() - payload;
- struct TensorRange { std::string name; std::vector<std::int64_t> shape; std::size_t begin, end; };
+ struct TensorRange {
+  std::string name;
+  std::vector<std::int64_t> shape;
+  std::size_t begin, end;
+ };
  std::vector<TensorRange> ranges;
  ranges.reserve(std::min(header.size(), kTensorLimit));
  for (const auto& [name, record] : header.items()) {
@@ -170,7 +178,8 @@ NormalizedModelStateCandidate stage_encoder_pretraining(BackboneEncoder& encoder
  require(asset != nullptr, "unsupported encoder family");
  const auto& geometry = asset->geometry;
  require(config.backbone.dimension == geometry.dimension && config.backbone.feedforward_dimension == geometry.feedforward_dimension && config.backbone.heads == geometry.heads &&
-  config.backbone.layers == geometry.layers, "encoder topology differs from source family");
+          config.backbone.layers == geometry.layers,
+  "encoder topology differs from source family");
  require(state.size() <= kTensorLimit, "source tensor count exceeds bound");
  const bool pe = config.backbone.kind == BackboneKind::PeCoreTiny;
  const std::string prefix = pe ? "model." : "encoder.";
@@ -189,8 +198,10 @@ NormalizedModelStateCandidate stage_encoder_pretraining(BackboneEncoder& encoder
   if (!destination) destination = buffers.find(name);
   if (!destination) {
    const auto excluded = pe_exclusions().find(entry.name);
-   if (pe && excluded != pe_exclusions().end()) require(entry.tensor.sizes().vec() == excluded->second, "excluded PE tensor shape differs: " + entry.name);
-   else candidate.summary.unexpected_names.push_back(entry.name);
+   if (pe && excluded != pe_exclusions().end())
+    require(entry.tensor.sizes().vec() == excluded->second, "excluded PE tensor shape differs: " + entry.name);
+   else
+    candidate.summary.unexpected_names.push_back(entry.name);
    continue;
   }
   require(destination->device().is_cpu() && destination->scalar_type() == torch::kFloat32, "initialization requires a fresh CPU FP32 encoder");
@@ -201,8 +212,9 @@ NormalizedModelStateCandidate stage_encoder_pretraining(BackboneEncoder& encoder
    candidate.summary.incompatible_names.push_back(name);
    continue;
   }
-  auto tensor = entry.name == patch ? resample_encoder_patch(entry.tensor, config.patch_size)
-   : entry.name == positions ? resample_encoder_positions(entry.tensor, config.positional_encoding_size) : entry.tensor;
+  auto tensor = entry.name == patch       ? resample_encoder_patch(entry.tensor, config.patch_size)
+                : entry.name == positions ? resample_encoder_positions(entry.tensor, config.positional_encoding_size)
+                                          : entry.tensor;
   require_fp32(tensor, name);
   (void)stage_model_state_tensor(candidate, name, tensor, *destination);
  }
@@ -214,7 +226,9 @@ NormalizedModelStateCandidate stage_encoder_pretraining(BackboneEncoder& encoder
  };
  missing(parameters);
  missing(buffers);
- if (pe) for (const auto& [name, shape] : pe_exclusions()) if (!supplied.contains(name)) candidate.summary.missing_names.push_back(name);
+ if (pe)
+  for (const auto& [name, shape] : pe_exclusions())
+   if (!supplied.contains(name)) candidate.summary.missing_names.push_back(name);
  if (!candidate.summary.missing_names.empty() || !candidate.summary.unexpected_names.empty() || !candidate.summary.incompatible_names.empty())
   throw ModelStateAdmissionError("encoder pretraining state does not exactly cover the source and native encoder", std::move(candidate.summary));
  return candidate;

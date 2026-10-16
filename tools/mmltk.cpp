@@ -2241,14 +2241,14 @@ class Wrapper {
   const auto input = fingerprint({revision, donor, tools_id},
               {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp",
                "tools/oracle/native_catalog.cpp", "tools/oracle/native_catalog.h", "tools/oracle/rfdetr_sources.json", "src/backend/models/rfdetr/contract/preset_catalog.h",
-               "src/backend/models/rfdetr/contract/model_topology.h", "src/backend/models/rfdetr/contract/encoder_pretraining.h", "src/backend/models/rfdetr/contract/training_supervision.h", "src/backend/models/rfdetr/contract/weight_catalog.h",
-               "src/backend/models/rfdetr/contract/class_layout.h", "src/backend/models/rfdetr/contract/output_roles.h", "src/backend/models/rfdetr/contract/model_config.cpp",
-               "src/backend/models/rfdetr/contract/model_config.h", "src/backend/models/rfdetr/contract/weight_catalog.cpp", "src/backend/models/rfdetr/contract/contract.h",
-               "src/backend/models/contract/capabilities.h", "src/common/types/string_utils.h", "src/backend/data/catalog/keypoint_visibility.h", "src/backend/data/catalog/class_catalog.h",
-               "src/backend/data/catalog/keypoint_schema.h", "src/frameworks/reflection/include/mmltk/frameworks/reflection/materializer.h", "src/frameworks/reflection/reflection_metadata.h",
-               "src/frameworks/reflection/reflected_field_policy.h", "src/frameworks/reflection/field_policy.h", "src/frameworks/reflection/declaration_annotations.h",
-               "src/frameworks/reflection/reflected_declarations.h", "tools/support/cpp_support.cpp", "tools/support/cpp_text.cpp", "tools/support/cpp_digest.cpp", "tools/CMakeLists.txt",
-               "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake", "tools/cmake/StdModules.cmake"}),
+               "src/backend/models/rfdetr/contract/model_topology.h", "src/backend/models/rfdetr/contract/encoder_pretraining.h", "src/backend/models/rfdetr/contract/training_supervision.h",
+               "src/backend/models/rfdetr/contract/weight_catalog.h", "src/backend/models/rfdetr/contract/class_layout.h", "src/backend/models/rfdetr/contract/output_roles.h",
+               "src/backend/models/rfdetr/contract/model_config.cpp", "src/backend/models/rfdetr/contract/model_config.h", "src/backend/models/rfdetr/contract/weight_catalog.cpp",
+               "src/backend/models/rfdetr/contract/contract.h", "src/backend/models/contract/capabilities.h", "src/common/types/string_utils.h", "src/backend/data/catalog/keypoint_visibility.h",
+               "src/backend/data/catalog/class_catalog.h", "src/backend/data/catalog/keypoint_schema.h", "src/frameworks/reflection/include/mmltk/frameworks/reflection/materializer.h",
+               "src/frameworks/reflection/reflection_metadata.h", "src/frameworks/reflection/reflected_field_policy.h", "src/frameworks/reflection/field_policy.h",
+               "src/frameworks/reflection/declaration_annotations.h", "src/frameworks/reflection/reflected_declarations.h", "tools/support/cpp_support.cpp", "tools/support/cpp_text.cpp",
+               "tools/support/cpp_digest.cpp", "tools/CMakeLists.txt", "tools/cmake/Toolchain.cmake", "tools/cmake/RuntimeClosure.cmake", "tools/cmake/StdModules.cmake"}),
              image = image_name + "-rfdetr-oracle";
   task([&] {
    cached_image("default", "-", image, repo + "/docker/Dockerfile.rfdetr-oracle", "rfdetr-oracle", input, repo,
@@ -2450,10 +2450,14 @@ class Wrapper {
    require(retained.value("backward_operators", false) == backward_operators, "cached upstream diagnostic selection differs");
    require(retained.value("export_reference", false) == export_reference, "cached upstream export reference selection differs");
    require(retained.value("mode", std::string("detector")) == (encoder_pretraining_only ? "encoder-pretraining" : "detector"), "cached upstream evidence mode differs");
-   require(retained.at("status") == (encoder_pretraining_only ? "encoder_references_complete_native_comparison_pending" : inventory_only ? "verified_inventory_complete" : selected_case.empty() ? "references_complete_native_comparison_pending" : "selected_reference_native_comparison_pending"),
+   require(retained.at("status") == (encoder_pretraining_only ? "encoder_references_complete_native_comparison_pending"
+                                     : inventory_only         ? "verified_inventory_complete"
+                                      : selected_case.empty() ? "references_complete_native_comparison_pending"
+                                                              : "selected_reference_native_comparison_pending"),
     "cached upstream evidence is incomplete");
    if (!inventory_only)
-    require(retained.at("format") == (encoder_pretraining_only ? "mmltk.rfdetr.encoder-pretraining.v1" : "mmltk.rfdetr.upstream-oracle.v2") && retained.at("precision_capability") == capability, "cached reference precision capability differs from current hardware");
+    require(retained.at("format") == (encoder_pretraining_only ? "mmltk.rfdetr.encoder-pretraining.v1" : "mmltk.rfdetr.upstream-oracle.v2") && retained.at("precision_capability") == capability,
+     "cached reference precision capability differs from current hardware");
   } else
    status = owned_docker(name, args).status;
   if (status) {
@@ -2463,13 +2467,16 @@ class Wrapper {
   }
   for (const auto& entry : fs::recursive_directory_iterator(output)) {
    const auto relative = entry.path().lexically_relative(output).generic_string();
-   if (entry.is_regular_file() && (relative == "manifest.json" || relative.starts_with("references/") || relative.starts_with("inventory/") || ((inventory_only || encoder_pretraining_only) && relative.starts_with("assets/"))))
+   if (entry.is_regular_file() &&
+       (relative == "manifest.json" || relative.starts_with("references/") || relative.starts_with("inventory/") || ((inventory_only || encoder_pretraining_only) && relative.starts_with("assets/"))))
     fs::permissions(entry.path(), fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write, fs::perm_options::remove);
   }
   release_mutation();
   if (encoder_pretraining_only) {
-   if (prepare_only) test_environment.push_back("MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=" + host_path(output));
-   else log("encoder pretraining references ready: " + output + "/manifest.json; run [encoder_pretraining_oracle] with --env MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=PATH");
+   if (prepare_only)
+    test_environment.push_back("MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=" + host_path(output));
+   else
+    log("encoder pretraining references ready: " + output + "/manifest.json; run [encoder_pretraining_oracle] with --env MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=PATH");
    return 0;
   }
   if (inventory_only) {
@@ -2530,8 +2537,8 @@ class Wrapper {
   ensure_build_image();
   must({"bash", repo + "/tools/bootstrap/bootstrap_mmltk.sh", "--image", repo}, {.environment = {{"MMLTK_BOOTSTRAP_CAPTURED", "1"}}});
   const auto historical_tools_image = image_id(tools_image);
-  const auto identity = fingerprint({std::string(revision), std::string(tree), image_id(build_image), historical_tools_image},
-   {"tools/oracle/rfdetr_baseline_session.cpp", "tools/oracle/rfdetr_baseline_session.cmake"});
+  const auto identity =
+   fingerprint({std::string(revision), std::string(tree), image_id(build_image), historical_tools_image}, {"tools/oracle/rfdetr_baseline_session.cpp", "tools/oracle/rfdetr_baseline_session.cmake"});
   const auto base = cache + "/tests/rfdetr/baseline/" + identity;
   const auto source = base + "/source", evidence = base + "/evidence";
   const auto container_base = "/workspace" + base.substr(repo.size());
@@ -2565,22 +2572,22 @@ class Wrapper {
    const auto tools_build = container_base + "/tools-build";
    const auto old_tools = container_base + "/tools";
    const auto quoted_source = shell_quote(container_source);
-   const std::string tools_command =
-    "set -euo pipefail\n{\ncmake -S " + quoted_source + "/tools -B " + shell_quote(tools_build) + " -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=" + shell_quote(old_tools) +
-    "\ncmake --build " + shell_quote(tools_build) + " --parallel " + std::to_string(jobs) + " --target mmltk mmltk_tool_tests\ncmake --install " + shell_quote(tools_build) +
-    " --component Runtime\n} 2>&1 | tee " + shell_quote(container_evidence + "/build.log");
+   const std::string tools_command = "set -euo pipefail\n{\ncmake -S " + quoted_source + "/tools -B " + shell_quote(tools_build) +
+                                     " -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=" + shell_quote(old_tools) + "\ncmake --build " + shell_quote(tools_build) + " --parallel " +
+                                     std::to_string(jobs) + " --target mmltk mmltk_tool_tests\ncmake --install " + shell_quote(tools_build) + " --component Runtime\n} 2>&1 | tee " +
+                                     shell_quote(container_evidence + "/build.log");
    const auto tools_container = test_build_container + "-historical-tools";
    Args tools_args{
-    "run", "--rm", "--init", "--pull", "never", "--name", tools_container, "--security-opt", "seccomp=unconfined", "--cpuset-cpus", cpu_list, "--user", user(), "--volume",
-    repo + ":/workspace:rw", "--workdir", "/workspace", "--env", "HOME=/tmp", "--entrypoint", "/bin/bash"
+    "run", "--rm", "--init", "--pull", "never", "--name", tools_container, "--security-opt", "seccomp=unconfined", "--cpuset-cpus", cpu_list, "--user", user(), "--volume", repo + ":/workspace:rw",
+    "--workdir", "/workspace", "--env", "HOME=/tmp", "--entrypoint", "/bin/bash"
    };
    labels(tools_args, mode);
    append(tools_args, {historical_tools_image, "-lc", tools_command});
    owned_docker_must(tools_container, std::move(tools_args));
    const std::string build_command =
     "set -euo pipefail\nexport CCACHE_DIR=" + shell_quote(container_base + "/ccache") + "\nexport CCACHE_TEMPDIR=" + shell_quote(container_base + "/ccache/tmp") +
-    "\nexport MMLTK_CONTAINER_CACHE_ROOT=" + shell_quote(container_base + "/build-cache") + "\nmkdir -p \"$CCACHE_TEMPDIR\"\n{\ncd " + quoted_source + "\ncmake --preset release -B " + shell_quote(build) +
-    " -DBUILD_MMLTK_BROWSER_APP=OFF -DBUILD_MMLTK_BROWSER_HOST=OFF -DBUILD_MMLTK_FIREFOX_RUNTIME=OFF -DMMLTK_NATIVE_TOOLS_EXECUTABLE=" + shell_quote(old_tools + "/mmltk") +
+    "\nexport MMLTK_CONTAINER_CACHE_ROOT=" + shell_quote(container_base + "/build-cache") + "\nmkdir -p \"$CCACHE_TEMPDIR\"\n{\ncd " + quoted_source + "\ncmake --preset release -B " +
+    shell_quote(build) + " -DBUILD_MMLTK_BROWSER_APP=OFF -DBUILD_MMLTK_BROWSER_HOST=OFF -DBUILD_MMLTK_FIREFOX_RUNTIME=OFF -DMMLTK_NATIVE_TOOLS_EXECUTABLE=" + shell_quote(old_tools + "/mmltk") +
     " -DMMLTK_FIREFOX_CACHE_ROOT=" + shell_quote(container_base + "/firefox") + " -DCMAKE_PROJECT_INCLUDE=" + shell_quote(container_evidence + "/rfdetr_baseline_session.cmake") + "\ncmake --build " +
     shell_quote(build) + " --parallel " + std::to_string(jobs) + " --target mmltk_rfdetr_baseline_session\n} 2>&1 | tee -a " + shell_quote(container_evidence + "/build.log") + "\ncp " +
     shell_quote(build + "/mmltk_rfdetr_baseline_session") + " " + shell_quote(container_evidence + "/producer") + "\ncp " + shell_quote(build + "/historical_identity_wrap.h") + " " +

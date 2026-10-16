@@ -2623,7 +2623,6 @@ TEST_CASE("Caller-owned joint planes preserve source coordinates covariance coun
  output.keypoint_capacity = 1;
  CHECK_THROWS(rfdetr::write_analysis_keypoints(selected, output));
 }
-
 TEST_CASE("scratch training products predict and validate without their encoder source", "[model][rfdetr][prediction][validation][encoder_pretraining][gpu]") {
  const auto evidence = rfdetr::testsupport::encoder_training_evidence();
  if (!evidence) SKIP("real scratch inference requires explicit MMLTK_RFDETR_ENCODER_PRETRAINING_DIR");

@@ -143,7 +143,6 @@ TEST_CASE("Native configuration preserves admitted long custom names within its 
   CHECK(rfdetr::encode_checkpoint_configuration(resolved.config) == encoded);
  });
 }
-
 TEST_CASE("native encoder lineage survives archive normalization and ordinary artifact inspection", "[model][rfdetr][checkpoint_resolution][encoder_pretraining]") {
  namespace r = rfdetr;
  const mmltk::testsupport::ScopedTempDir root("encoder-lineage");
@@ -212,8 +211,9 @@ TEST_CASE("native encoder lineage survives archive normalization and ordinary ar
   if (kind == 5) output.write("encoder_pretraining_cbor", torch::zeros({1}, torch::kInt64));
   const auto path = root.path() / ("malformed-" + std::to_string(kind) + ".pt");
   output.save_to(path.string());
-  REQUIRE_THROWS_WITH(r::decode_native_model_state(path),
-   kind == 0 ? "invalid encoder pretraining CBOR metadata" : kind == 3 ? "invalid encoder pretraining provenance" : "invalid encoder pretraining CBOR extent");
+  REQUIRE_THROWS_WITH(r::decode_native_model_state(path), kind == 0   ? "invalid encoder pretraining CBOR metadata"
+                                                          : kind == 3 ? "invalid encoder pretraining provenance"
+                                                                      : "invalid encoder pretraining CBOR extent");
  }
  state.metadata.encoder_pretraining.reset();
  r::save_native_checkpoint(root.path() / "legacy.pt", state);

@@ -226,18 +226,19 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
 }
 [[nodiscard]] bool valid_weight_filename(const std::string_view text) {
  const std::filesystem::path path(text);
- return !text.empty() && text.size() <= contracts::kArtifactPathCapacity && !path.is_absolute() && !path.has_parent_path() && text != "." && text != ".." &&
-        !text.contains('/') && !text.contains('\\') && !text.contains('\0');
+ return !text.empty() && text.size() <= contracts::kArtifactPathCapacity && !path.is_absolute() && !path.has_parent_path() && text != "." && text != ".." && !text.contains('/') &&
+        !text.contains('\\') && !text.contains('\0');
 }
 [[nodiscard]] std::optional<std::filesystem::path> validated_weight_destination(const ArtifactWeightAsset& asset, const std::filesystem::path& cache_root) {
  if (!valid_weight_filename(asset.filename) || !valid_weight_url(asset.url) || !valid_weight_digest(asset)) return std::nullopt;
  std::filesystem::path root = cache_root.lexically_normal();
  if (asset.encoder) {
-  if (!mmltk::frameworks::reflection::enum_contains(*asset.encoder) || asset.digest_kind != ArtifactWeightDigest::Sha256 || asset.file_bytes == 0U ||
-      !valid_weight_filename(asset.cache_identity)) return std::nullopt;
+  if (!mmltk::frameworks::reflection::enum_contains(*asset.encoder) || asset.digest_kind != ArtifactWeightDigest::Sha256 || asset.file_bytes == 0U || !valid_weight_filename(asset.cache_identity))
+   return std::nullopt;
   root /= "encoders";
   root /= asset.cache_identity;
- } else if (asset.digest_kind != ArtifactWeightDigest::Md5 || asset.file_bytes != 0U || !asset.cache_identity.empty()) return std::nullopt;
+ } else if (asset.digest_kind != ArtifactWeightDigest::Md5 || asset.file_bytes != 0U || !asset.cache_identity.empty())
+  return std::nullopt;
  const std::filesystem::path destination = (root / asset.filename).lexically_normal();
  if (destination.parent_path() != root) return std::nullopt;
  return destination;
@@ -265,8 +266,15 @@ public:
   std::ranges::replace(identity, '/', '-');
   identity += '-';
   identity += asset->source_revision;
-  return ArtifactWeightAsset{.filename = std::string(asset->filename), .url = std::string(asset->download_url), .digest_kind = ArtifactWeightDigest::Sha256,
-   .digest = std::string(asset->sha256), .file_bytes = asset->file_bytes, .cache_identity = std::move(identity), .encoder = encoder};
+  return ArtifactWeightAsset{
+   .filename = std::string(asset->filename),
+   .url = std::string(asset->download_url),
+   .digest_kind = ArtifactWeightDigest::Sha256,
+   .digest = std::string(asset->sha256),
+   .file_bytes = asset->file_bytes,
+   .cache_identity = std::move(identity),
+   .encoder = encoder
+  };
  }
  void download(const std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver) const override;
 };
@@ -431,8 +439,8 @@ std::filesystem::path ArtifactStore::canonical_weight_path(const std::string_vie
  if (asset->encoder) throw std::invalid_argument("detector selection returned a base encoder asset");
  return acquire_weight(*asset, cancellation, progress);
 }
-std::filesystem::path ArtifactStore::canonical_encoder_weight_path(const mmltk::backend::models::rfdetr::BackboneKind encoder, const ArtifactCancellationToken& cancellation,
- const ArtifactWeightProgressObserver progress) const {
+std::filesystem::path ArtifactStore::canonical_encoder_weight_path(
+ const mmltk::backend::models::rfdetr::BackboneKind encoder, const ArtifactCancellationToken& cancellation, const ArtifactWeightProgressObserver progress) const {
  require_weight_acquisition_active(cancellation);
  if (!mmltk::frameworks::reflection::enum_contains(encoder)) throw std::invalid_argument("unknown base encoder kind");
  const auto asset = weight_operations_->find(encoder);

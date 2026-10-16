@@ -250,7 +250,6 @@ TEST_CASE("Execution admission checks global products bounded stable models and 
   }
  });
 }
-
 TEST_CASE("scratch launch handoff and legacy request migration retain strict source admission", "[gui][train_command][encoder_pretraining]") {
  namespace serial = mmltk::frameworks::serialization;
  auto value = request();
@@ -301,13 +300,18 @@ TEST_CASE("scratch launch handoff and legacy request migration retain strict sou
  nested_duplicate.insert(recipe + std::string_view("\"recipe\":{").size(), "\"lr\":0,");
  CHECK_THROWS(r::decode_train_request_json(nested_duplicate));
 }
-
 TEST_CASE("source independent Resume and worker handoff invoke no acquisition operation", "[gui][train_command][encoder_pretraining]") {
  namespace services = mmltk::controller::services;
  struct NoAcquisition final : services::ArtifactWeightOperations {
   mutable unsigned calls = 0;
-  std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { ++calls; throw std::logic_error("unexpected detector acquisition"); }
-  std::optional<services::ArtifactWeightAsset> find(r::BackboneKind) const override { ++calls; throw std::logic_error("unexpected encoder acquisition"); }
+  std::optional<services::ArtifactWeightAsset> find(std::string_view) const override {
+   ++calls;
+   throw std::logic_error("unexpected detector acquisition");
+  }
+  std::optional<services::ArtifactWeightAsset> find(r::BackboneKind) const override {
+   ++calls;
+   throw std::logic_error("unexpected encoder acquisition");
+  }
   void download(std::string_view, const std::filesystem::path&, const services::ArtifactCancellationToken&, services::ArtifactWeightProgressObserver) const override {
    ++calls;
    throw std::logic_error("unexpected download");

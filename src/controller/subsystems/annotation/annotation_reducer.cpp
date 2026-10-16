@@ -134,7 +134,8 @@ struct DocumentState final {
  return {.first = {.x = std::min(first.x, second.x), .y = std::min(first.y, second.y)}, .second = {.x = std::max(first.x, second.x), .y = std::max(first.y, second.y)}};
 }
 [[nodiscard]] bool object_valid_for(const domain::AnnotationObject& object, const std::size_t categories, const AnnotationSceneContent& scene) {
- if (!object.valid() || !object.schema_matches(scene.keypoint_schemas) || object.category >= categories || !point_in_frame(scene, object.point) || !point_in_frame(scene, object.box.first) || !point_in_frame(scene, object.box.second)) {
+ if (!object.valid() || !object.schema_matches(scene.keypoint_schemas) || object.category >= categories || !point_in_frame(scene, object.point) || !point_in_frame(scene, object.box.first) ||
+     !point_in_frame(scene, object.box.second)) {
   return false;
  }
  return std::ranges::all_of(object.mask_points, [&scene](const auto& point) { return point_in_frame(scene, point); }) && std::ranges::all_of(object.spline_knots, [&scene](const auto& knot) {
@@ -414,8 +415,7 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
 [[nodiscard]] DocumentOutcome change_editor_facts(DocumentState& state, const std::function_ref<void(AnnotationEditorFacts&)> mutate) {
  auto after = state.ui.editor;
  mutate(after);
- if (const auto outcome = facts_admission(state.ui.scene, after); outcome != DocumentOutcome::Applied)
-  return outcome == DocumentOutcome::Capacity ? capacity(state) : refused(state);
+ if (const auto outcome = facts_admission(state.ui.scene, after); outcome != DocumentOutcome::Applied) return outcome == DocumentOutcome::Capacity ? capacity(state) : refused(state);
  if (after == state.ui.editor) return DocumentOutcome::Applied;
  state.pointer = {};
  state.ui.editor = after;
@@ -435,8 +435,7 @@ enum class JournalDirection : std::uint8_t {
  if (destination.size() == kHistoryCapacity) destination.pop_front();
  if (!next_revision_available(state)) return refused(state);
  const JournalView applied{source.back(), direction == JournalDirection::Undo, state.ui.editor};
- if (const auto outcome = entry_admission(state, applied); outcome != DocumentOutcome::Applied)
-  return outcome == DocumentOutcome::Capacity ? capacity(state) : refused(state);
+ if (const auto outcome = entry_admission(state, applied); outcome != DocumentOutcome::Applied) return outcome == DocumentOutcome::Capacity ? capacity(state) : refused(state);
  std::vector<domain::AnnotationColor> palette;
  auto prepared = prepare_application(state, applied, palette);
  // Allocate the deque node while the source still owns the complete history.

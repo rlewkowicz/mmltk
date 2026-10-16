@@ -54,7 +54,8 @@ torch::Tensor linear_relu_forward(const torch::nn::LinearImpl& layer, const torc
  const auto device = input.device().type();
  const bool autocast = at::autocast::is_autocast_enabled(device);
  if (!input.is_cuda() || !layer.bias.defined() ||
-     (autocast ? input.scalar_type() != torch::kFloat32 || layer.weight.scalar_type() != torch::kFloat32 || layer.bias.scalar_type() != torch::kFloat32 : input.scalar_type() != layer.weight.scalar_type()))
+     (autocast ? input.scalar_type() != torch::kFloat32 || layer.weight.scalar_type() != torch::kFloat32 || layer.bias.scalar_type() != torch::kFloat32
+               : input.scalar_type() != layer.weight.scalar_type()))
   return at::relu(linear_forward(layer, input));
  const auto dtype = autocast ? at::autocast::get_autocast_dtype(device) : input.scalar_type();
  const auto x = input.to(dtype), weight = layer.weight.to(dtype), bias = layer.bias.to(dtype);
