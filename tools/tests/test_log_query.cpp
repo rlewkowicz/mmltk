@@ -2444,17 +2444,16 @@ void test_help_documents_grammar_and_native_wrapper_is_executable() {
  const auto retired = wrapper.invoke({"--diagnose-rfdetr-upstream", "--case", "rf-detr-nano-controlled-group2-fp32-b1-eval", "--output", (wrapper.root / "retired").string()});
  EQ(retired.exit_code, 1);
  HAS(retired.err, "reference payloads were retired");
- const auto invalid = wrapper.invoke({"--test", "core", "--with-upstream"});
- EQ(invalid.exit_code, 1);
- HAS(invalid.err, "--with-upstream is only valid with --test rfdetr or all");
+ for (const char* mode : {"--with-upstream", "--with-upstream=encoder-pretraining"}) {
+  const auto invalid = wrapper.invoke({"--test", "core", mode});
+  EQ(invalid.exit_code, 1);
+  HAS(invalid.err, "--with-upstream is only valid with --test rfdetr or all");
+ }
  for (const auto& suffix : std::vector<Strings>{{"--inventory-only"}, {"--case", "rf-detr-nano-controlled-group2-fp32-b1-eval"}, {"--backward-operators"}, {"--export-reference"}}) {
   const auto rejected = wrapper.invoke(plus({"--diagnose-rfdetr-upstream", "--encoder-pretraining-only"}, suffix));
   EQ(rejected.exit_code, 1);
   HAS(rejected.err, "--encoder-pretraining-only excludes");
  }
- const auto selected_invalid = wrapper.invoke({"--test", "core", "--with-upstream=encoder-pretraining"});
- EQ(selected_invalid.exit_code, 1);
- HAS(selected_invalid.err, "--with-upstream is only valid with --test rfdetr or all");
  for (const auto& options : std::vector<Strings>{{"--with-upstream=unknown"}, {"--with-upstream", "--with-upstream=encoder-pretraining"}, {"--with-upstream=encoder-pretraining", "--with-upstream"}})
   NE(wrapper.invoke(plus({"--test", "rfdetr"}, options)).exit_code, 0);
 }
@@ -2559,6 +2558,13 @@ void send_ready(std::string_view stage, std::string_view owner) {
 std::string option_value(const Strings& args, std::string_view name) {
  const auto it = std::find(args.begin(), args.end(), name);
  return it == args.end() || std::next(it) == args.end() ? std::string{} : *std::next(it);
+}
+std::string required_evidence_output(const Strings& args) {
+ std::string output;
+ for (const auto& argument : args)
+  if (argument.ends_with(":/evidence:rw")) output = argument.substr(0, argument.size() - std::string_view(":/evidence:rw").size());
+ CHECK(!output.empty());
+ return output;
 }
 int runtime_docker(const Strings& args) {
  CHECK(!args.empty());
@@ -2845,10 +2851,7 @@ int package_docker(const Strings& args) {
   if (name.ends_with("-upstream-capability")) std::cout << R"({"fp32":true,"fp16":true,"bf16":true})" << '\n';
   if (name.ends_with("-upstream")) {
    if (support::env("TEST_ENCODER_ORACLE_SUCCESS") == "1" && std::find(args.begin(), args.end(), "--encoder-pretraining-only") != args.end()) {
-    std::string output;
-    for (const auto& argument : args)
-     if (argument.ends_with(":/evidence:rw")) output = argument.substr(0, argument.size() - std::string_view(":/evidence:rw").size());
-    CHECK(!output.empty());
+    const auto output = required_evidence_output(args);
     support::write_json(
      fs::path(output) / "manifest.json", {{"format", "mmltk.rfdetr.encoder-pretraining.v1"}, {"mode", "encoder-pretraining"}, {"status", "encoder_references_complete_native_comparison_pending"},
                                           {"sources", support::read_json(root / "tools/oracle/rfdetr_sources.json")}, {"fingerprint", option_value(args, "--fingerprint")},
@@ -3250,9 +3253,7 @@ void test_encoder_preparation_and_explicit_evidence_routing() {
     if (path.stem().string().ends_with("-upstream")) {
      ++producers;
      CHECK(std::find(arguments.begin(), arguments.end(), "--encoder-pretraining-only") != arguments.end());
-     for (const auto& argument : arguments)
-      if (argument.ends_with(":/evidence:rw")) produced = argument.substr(0, argument.size() - std::string_view(":/evidence:rw").size());
-     CHECK(!produced.empty());
+     produced = required_evidence_output(arguments);
      CHECK(fs::is_regular_file(fs::path(produced) / "manifest.json"));
      FALSE(fs::exists(fs::path(produced) / "inventory"));
      FALSE(fs::exists(fs::path(produced) / "comparisons"));

@@ -1110,8 +1110,10 @@ TEST_CASE("CLI rejects ambiguous scratch sources before acquisition", "[core][cl
        {"--preset", "rf-detr-atto", "--class-layout", "/missing/classes.json"}
       }) {
   std::vector<std::string> arguments{mmltk_cli_path(), "rfdetr", "train", "--from-scratch", "--train-compiled", "train.bin", "--val-compiled", "val.bin", "--output-dir", "output"};
+  // CLEANUP-OFF: Existing vector and subprocess APIs serve independent CLI admission and fatal-reporting cases.
   arguments.insert(arguments.end(), extra.begin(), extra.end());
   const auto result = run_subprocess_capture_output(arguments);
+  // CLEANUP-ON
   CHECK(result.exit_code != 0);
   CHECK(result.stderr_text.find("fatal:") != std::string::npos);
   CHECK(result.stderr_text.find("from-scratch") != std::string::npos);

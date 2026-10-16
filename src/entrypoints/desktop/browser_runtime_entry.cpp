@@ -11,6 +11,7 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 #include "src/common/io/scoped_fd.h"
+#include "src/common/types/exception_message.h"
 #include <cstdlib>
 #include <array>
 #include <cerrno>
@@ -38,12 +39,7 @@ namespace {
 // Ordinary std::terminate diagnostics only; this is not a signal handler.
 [[noreturn]] void integration_terminate_trace() noexcept {
  const auto failure = std::current_exception();
- std::string_view detail = "terminated without an active exception";
- try {
-  if (failure) std::rethrow_exception(failure);
- } catch (const std::exception& error) { detail = error.what(); } catch (...) {
-  detail = "uncaught nonstandard exception";
- }
+ const auto detail = mmltk::common::types::exception_message(failure, "terminated without an active exception", "uncaught nonstandard exception");
  mmltk::common::logging::report_fatal("native termination", detail);
  std::array<void*, 40U> frames{};
  const int count = ::backtrace(frames.data(), static_cast<int>(frames.size()));

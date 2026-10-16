@@ -183,8 +183,10 @@ TEST_CASE("Native checkpoint format round-trip matches for all registered fixtur
 }
 TEST_CASE("All official and controlled assets retain strict topology and checkpoint normalization", "[model][rfdetr][checkpoint_parity][upstream_oracle]") {
  namespace rf = mmltk::backend::models::rfdetr;
+ // CLEANUP-OFF: Calls instantiate the existing shared oracle; checkpoint and model parity retain independent cases.
  const auto requested = rf::testsupport::UpstreamOracle::requested();
  const rf::testsupport::UpstreamOracle oracle(requested);
+ // CLEANUP-ON
  const auto require_query_rows = [](const auto& entries, const auto& config) {
   for (const auto name : {rf::detail::kQueryFeatureWeight, rf::detail::kReferencePointWeight}) {
    const auto query = std::ranges::find(entries, name, &rf::NormalizedModelStateEntry::name);

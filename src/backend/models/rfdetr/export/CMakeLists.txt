@@ -158,6 +158,7 @@ function(mmltk_add_backend_models_rfdetr_export_tests)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
         target_link_libraries(mmltk_backend_models_rfdetr_export_tests PRIVATE
             mmltk_backend_models_rfdetr_checkpoint_test_support
+            mmltk_backend_models_rfdetr_optimizer_test_support
             mmltk_backend_models_rfdetr_training_fixture)
     endif()
     target_compile_definitions(mmltk_backend_models_rfdetr_export_tests PRIVATE

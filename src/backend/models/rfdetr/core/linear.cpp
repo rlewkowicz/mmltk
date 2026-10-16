@@ -31,10 +31,12 @@ public:
  }
  static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx, torch::autograd::variable_list gradients) {
   if (!gradients[0].defined()) return {{}, {}, {}};
+  // CLEANUP-OFF: Saved-tensor aliases and the existing autocast owner serve different autograd-node contracts and derivatives.
   const auto saved = ctx->get_saved_variables();
   const auto& input = saved[0];
   const auto& weight = saved[1];
   mmltk::backend::ml::cuda::TorchAutocastScope precision(false, weight.scalar_type());
+  // CLEANUP-ON
   const auto incoming = gradients[0].reshape({-1, weight.size(0)});
   const auto preactivation = at::threshold_backward(incoming, saved[2].reshape_as(incoming), 0);
   return {

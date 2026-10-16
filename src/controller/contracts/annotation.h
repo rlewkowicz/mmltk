@@ -209,6 +209,8 @@ public:
  [[nodiscard]] bool AddObject(const AnnotationObject& object) noexcept;
 
 private:
+ template <class Record>
+ bool AddEncoded(const Record& record) noexcept;
  // Reflected transport measurement allocates no second scene or payload.
  // The reserve covers category/palette arrays, resource identity, editor facts
  // and the publication wrapper independently of per-object contents.

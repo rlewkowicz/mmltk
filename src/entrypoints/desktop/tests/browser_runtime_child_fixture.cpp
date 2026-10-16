@@ -1,5 +1,4 @@
 #include <unistd.h>
-#include <sys/resource.h>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
@@ -57,12 +56,7 @@ int main(const int argc, char* argv[]) {
  const std::string_view argument{argv[9]};
  if (argument == "normal-exit") return 0;
  if (argument == "failure-exit") return 75;
- if (argument == "segfault") {
-  const rlimit no_core{.rlim_cur = 0U, .rlim_max = 0U};
-  static_cast<void>(::setrlimit(RLIMIT_CORE, &no_core));
-  static_cast<void>(::kill(::getpid(), SIGSEGV));
-  return 77;
- }
+ if (argument == "segfault") { return crash_browser_runtime_fixture(); }
  if (argument == "term-ack") return wait_for_term(-1);
  if (argument == "term-refuse") return refuse_term_until_kill(-1);
  std::string_view mode;

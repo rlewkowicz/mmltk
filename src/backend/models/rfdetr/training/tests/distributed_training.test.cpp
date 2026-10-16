@@ -124,8 +124,7 @@ TEST_CASE("distributed scratch workers share admitted initialization and retire 
  const auto initial_path = request.output_dir / "session.json";
  const r::TrainingSessionAdmission initial(initial_path);
  REQUIRE(initial.model(0).metadata.encoder_pretraining);
- CHECK(initial.manifest().request.from_scratch);
- CHECK(initial.manifest().request.encoder_weights_path.empty());
+ r::testsupport::require_reusable_encoder_request(initial.manifest().request);
  const auto alias = request.encoder_weights_path;
  std::filesystem::remove(alias);
  r::normalize_train_resume_request(request, initial_path);

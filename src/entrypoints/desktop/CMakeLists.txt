@@ -42,6 +42,7 @@ if(BUILD_MMLTK_BROWSER_HOST OR BUILD_TESTS)
     target_link_libraries(mmltk_entrypoints_desktop_host PRIVATE
         mmltk::common::system
         mmltk::common::logging
+        mmltk::common::types
         mmltk::controller::direct_services
         mmltk::controller::shell
     )

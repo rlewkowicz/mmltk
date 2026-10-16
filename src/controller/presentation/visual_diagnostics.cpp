@@ -1,5 +1,6 @@
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/common/types/utf8.h"
+#include "src/common/types/exception_message.h"
 #include "src/frameworks/gpu/image/image_workspace.h"
 #include <array>
 #include <cstddef>
@@ -47,11 +48,7 @@ services::RuntimeDiagnosticFact visual_runtime_diagnostic(const VisualDiagnostic
  };
 }
 std::string visual_failure_detail(const std::exception_ptr failure, const std::string_view fallback) {
- std::string_view detail = fallback;
- try {
-  if (failure) std::rethrow_exception(failure);
- } catch (const std::exception& error) { detail = error.what(); } catch (...) {
- }
+ auto detail = mmltk::common::types::exception_message(failure, fallback, fallback);
  // Dependency exception text is not necessarily UTF-8. Preserve complete
  // valid code points and replace each malformed byte before applying the
  // byte limit, so the bounded runtime JSON encoder never loses this failure.

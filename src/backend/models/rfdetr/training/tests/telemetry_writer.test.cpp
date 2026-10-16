@@ -14,6 +14,18 @@
 #include <unistd.h>
 namespace {
 namespace r = mmltk::backend::models::rfdetr;
+void check_scratch_lineage(const r::TrainingRun& saved, const r::TrainingRun& source) {
+ CHECK(saved.configuration.from_scratch);
+ CHECK(saved.configuration.encoder_weights_path.empty());
+ CHECK(saved.encoder_pretraining == source.encoder_pretraining);
+}
+r::TrainingRun finish_and_read_run(r::TrainingTelemetryWriter& writer, const std::filesystem::path& directory) {
+ writer.Finish({}, {});
+ writer.Close();
+ REQUIRE_FALSE(writer.persistence().degraded);
+ std::ifstream file(directory / "run.json");
+ return r::decode_training_run_json(std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()});
+}
 void test_telemetry_persistence_failure_is_nonfatal() {
  mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-failure"};
  r::TrainingRun run;
@@ -648,25 +660,12 @@ TEST_CASE("scratch history retains original choice and lineage without a launch 
  run.configuration.encoder_weights_path = "/removed/launch-source.safetensors";
  run.encoder_pretraining = r::EncoderPretrainingProvenance{"history.fixture", std::string(40, 'a'), std::string(64, 'b'), 2};
  r::TrainingTelemetryWriter writer(run);
- writer.Finish({}, {});
- writer.Close();
- REQUIRE_FALSE(writer.persistence().degraded);
- std::ifstream file(root.path() / "run.json");
- const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
- const auto saved = r::decode_training_run_json(text);
- CHECK(saved.configuration.from_scratch);
- CHECK(saved.configuration.encoder_weights_path.empty());
- CHECK(saved.encoder_pretraining == run.encoder_pretraining);
+ const auto saved = finish_and_read_run(writer, root.path());
+ check_scratch_lineage(saved, run);
  CHECK(saved.original_weights.empty());
  auto resumed = saved;
  resumed.source_checkpoint_attempt_id = saved.attempt_id;
  r::TrainingTelemetryWriter continuation(resumed, root.path() / "session.json");
- continuation.Finish({}, {});
- continuation.Close();
- REQUIRE_FALSE(continuation.persistence().degraded);
- std::ifstream again(root.path() / "run.json");
- const auto restored = r::decode_training_run_json(std::string{std::istreambuf_iterator<char>(again), std::istreambuf_iterator<char>()});
- CHECK(restored.configuration.from_scratch);
- CHECK(restored.configuration.encoder_weights_path.empty());
- CHECK(restored.encoder_pretraining == run.encoder_pretraining);
+ const auto restored = finish_and_read_run(continuation, root.path());
+ check_scratch_lineage(restored, run);
 }

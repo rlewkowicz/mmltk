@@ -129,6 +129,19 @@ function(mmltk_add_backend_models_rfdetr_encoder_training_test_support)
         mmltk_backend_models_rfdetr_encoder_training_test_support)
 endfunction()
 
+function(mmltk_add_backend_models_rfdetr_optimizer_test_support)
+    add_library(mmltk_backend_models_rfdetr_optimizer_test_support INTERFACE)
+    mmltk_register_public_headers(
+        mmltk_backend_models_rfdetr_optimizer_test_support
+        BASE_DIRS ${CMAKE_SOURCE_DIR}
+        FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/optimizer_fixture.h)
+    target_link_libraries(mmltk_backend_models_rfdetr_optimizer_test_support INTERFACE
+        mmltk::backend::models::rfdetr::training
+        mmltk::backend::models::rfdetr::core
+        mmltk::backend::ml::cuda)
+    mmltk_register_header_isolation(mmltk_backend_models_rfdetr_optimizer_test_support)
+endfunction()
+
 function(mmltk_add_backend_models_rfdetr_training_tests)
     set(sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/stock_training_parity.test.cpp
@@ -194,7 +207,8 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
         target_link_libraries(
             mmltk_backend_models_rfdetr_training_tests PRIVATE
-            mmltk_backend_models_rfdetr_checkpoint_test_support)
+            mmltk_backend_models_rfdetr_checkpoint_test_support
+            mmltk_backend_models_rfdetr_optimizer_test_support)
     endif()
     target_compile_definitions(
         mmltk_backend_models_rfdetr_training_tests PRIVATE

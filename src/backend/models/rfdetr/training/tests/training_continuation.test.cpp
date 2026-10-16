@@ -1041,8 +1041,7 @@ TEST_CASE("verified scratch sessions preserve fresh task state lineage and sourc
    CHECK(loaded.provenance == provenance);
    r::TrainingSessionAdmission session(result.checkpoint_path);
    CHECK(session.manifest().initialization == r::native_state_fingerprint(r::collect_module_state(initial)));
-   CHECK(session.manifest().request.from_scratch);
-   CHECK(session.manifest().request.encoder_weights_path.empty());
+   r::testsupport::require_reusable_encoder_request(session.manifest().request);
    const auto parameters = initial.named_parameters(true);
    const auto buffers = initial.named_buffers(true);
    for (std::size_t model = 0; model < session.model_count(); ++model) {

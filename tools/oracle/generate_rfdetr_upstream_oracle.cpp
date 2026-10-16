@@ -1315,14 +1315,17 @@ Json encoder_control(py::handle value, py::handle reference, const double atol, 
  const auto error = actual.attr("sub")(expected).attr("abs")();
  return {{"max_abs", py::cast<double>(error.attr("max")().attr("item")())}, {"rms", py::cast<double>(error.attr("square")().attr("mean")().attr("sqrt")().attr("item")())}};
 }
+void install_source_paths(const fs::path& core, const fs::path& plus) {
+ module("sys").attr("path").attr("insert")(0, (plus / "src").string());
+ module("sys").attr("path").attr("insert")(0, (core / "src").string());
+}
 void generate_encoder_pretraining(const Arguments& args) {
  const fs::path source = args.upstream, plus_source = args.plus_upstream, output = args.output;
  const auto core_hashes = verify_source(source), plus_hashes = verify_source(plus_source, "plus");
  const auto environment = check_environment();
  const auto native = Json::parse(rfdetr_native_catalog_json());
  if (string(module("importlib.metadata").attr("version")("timm")) != source_pins().at("timm").get<std::string>()) throw std::runtime_error("encoder timm pin differs");
- module("sys").attr("path").attr("insert")(0, (plus_source / "src").string());
- module("sys").attr("path").attr("insert")(0, (source / "src").string());
+ install_source_paths(source, plus_source);
  const auto torch = module("torch"), safe = module("safetensors.torch"), patch_ops = module("timm.layers.patch_embed"), position_ops = module("timm.layers.pos_embed");
  const auto attention = module("torch.nn.attention");
  if (!truth(torch.attr("cuda").attr("is_available")())) throw std::runtime_error("encoder FP32 CUDA control unavailable");
@@ -1487,8 +1490,7 @@ void inventory(const Arguments& args) {
  const auto plus_hashes = verify_source(plus_source, "plus");
  const auto environment = check_environment();
  if (string(module("importlib.metadata").attr("version")("timm")) != source_pins().at("timm").get<std::string>()) throw std::runtime_error("timm source pin disagrees with installed dependency");
- module("sys").attr("path").attr("insert")(0, (plus_source / "src").string());
- module("sys").attr("path").attr("insert")(0, (source / "src").string());
+ install_source_paths(source, plus_source);
  const auto core = module("rfdetr"), plus = module("rfdetr_plus"), torch = module("torch");
  const auto core_assets = module("rfdetr.assets.model_weights").attr("ModelWeights");
  const auto plus_assets = module("rfdetr_plus.assets.model_weights").attr("ModelWeights");
@@ -1676,8 +1678,7 @@ void generate(const Arguments& args) {
  const fs::path plus_source = args.plus_upstream;
  const auto plus_hashes = verify_source(plus_source, "plus");
  const auto environment = check_environment();
- module("sys").attr("path").attr("insert")(0, (plus_source / "src").string());
- module("sys").attr("path").attr("insert")(0, (source / "src").string());
+ install_source_paths(source, plus_source);
  const auto core = module("rfdetr"), plus = module("rfdetr_plus");
  const auto defaults_type = module("rfdetr.models._defaults").attr("ModelDefaults");
  const py::object get_param_dict = module("rfdetr.training.param_groups").attr("get_param_dict");

@@ -57,12 +57,23 @@
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "src/backend/models/rfdetr/training/detail/native_optimizer_private.h"
+#include "src/backend/models/rfdetr/training/tests/optimizer_fixture.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/training/tests/model_state_fixture.h"
 #endif
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.model_export.onnx_lowering;
 namespace {
+class BackendTestStream final {
+public:
+ BackendTestStream() : guard_(c10::cuda::getStreamFromExternal(stream_.get(), 0)) {}
+ [[nodiscard]] cudaStream_t get() const noexcept { return stream_.get(); }
+ [[nodiscard]] mmltk::backend::ml::runtime::BorrowedCommandStream command() const noexcept { return {reinterpret_cast<std::uintptr_t>(stream_.get()), true}; }
+
+private:
+ mmltk::testsupport::ScopedTestStream stream_;
+ c10::cuda::CUDAStreamGuard guard_;
+};
 mmltk::backend::ml::runtime::RuntimeTensorBuffer runtime_buffer(const torch::Tensor& tensor) {
  mmltk::backend::ml::runtime::RuntimeTensorBuffer result;
  result.device_data = tensor.data_ptr();
@@ -711,9 +722,8 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
  const mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  support::MatcherExecutionFixture matcher;
  rf::ScopedRuntimeContext runtime_context(nullptr, 0, &matcher.workspace);
- const mmltk::testsupport::ScopedTestStream stream;
- c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream.get(), 0));
- const runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
+ const BackendTestStream stream;
+ const auto command = stream.command();
  for (const auto& entry : oracle.cases()) {
   if (entry.protocol != "controlled-group2" || entry.precision != "fp32" || entry.batch != 1) continue;
   DYNAMIC_SECTION(entry.preset << (entry.training ? " trained" : " official")) {
@@ -741,10 +751,7 @@ TEST_CASE("Every official model and trained task artifact round trips through ON
    const std::string expected_prefix = "export-math/output/main/";
    std::string native_prefix = "output/main/", input_key = "input";
    if (entry.training) {
-    rf::TrainRequest training;
-    static_cast<rf::TrainRecipeValues&>(training.recipe) = entry.recipe;
-    training.fused_optimizer = false;
-    auto optimizer = rf::build_optimizer(model.named_optimizer_parameters(), training, model.config().backbone);
+    auto optimizer = support::unfused_recipe_optimizer(model, entry.recipe);
     const auto targets = support::oracle_targets(reference, entry, torch::kCUDA);
     const auto output = model.forward({reference.tensor("input", torch::kCUDA), reference.tensor("input_mask", torch::kCUDA)}, model.config().has_masks());
     const auto criterion = support::oracle_detection(model.config());
@@ -989,9 +996,8 @@ TEST_CASE("scratch task outputs export to executable ONNX and TensorRT without b
     REQUIRE_FALSE(engine.cancelled());
     engine.Save(engine_path);
    }
-   const mmltk::testsupport::ScopedTestStream stream;
-   c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream.get(), 0));
-   const runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
+   const BackendTestStream stream;
+   const auto command = stream.command();
    const auto input = torch::zeros({1, 3, request.resolution, request.resolution}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
    for (const auto kind : {runtime::RuntimeBackendKind::Onnx, runtime::RuntimeBackendKind::TensorRt}) {
     runtime::RuntimeBackendOptions options{};
@@ -1000,8 +1006,10 @@ TEST_CASE("scratch task outputs export to executable ONNX and TensorRT without b
     options.device = 0;
     options.command_stream = command;
     options.allow_fp16 = options.allow_tf32 = false;
+    // CLEANUP-OFF: Existing backend factory and borrowed descriptor APIs serve distinct output-verification cases.
     auto backend = runtime::make_runtime_backend(options);
     const auto& info = backend->model_info();
+    // CLEANUP-ON
     REQUIRE(info.output_count == rf::RfdetrOutputSchema::count(trained.artifacts.config.task));
     std::vector<torch::Tensor> values;
     std::vector<runtime::RuntimeTensorBuffer> outputs;

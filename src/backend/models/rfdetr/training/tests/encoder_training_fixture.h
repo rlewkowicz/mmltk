@@ -12,6 +12,10 @@
 #include "src/common/io/file_digest.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
+inline void require_reusable_encoder_request(const TrainRequest& request) {
+ CHECK(request.from_scratch);
+ CHECK(request.encoder_weights_path.empty());
+}
 // Optional absence alone skips. Explicit evidence always admits every original
 // asset before any CLI/product path is invoked; this helper never acquires files.
 [[nodiscard]] inline std::optional<std::filesystem::path> encoder_training_evidence() {

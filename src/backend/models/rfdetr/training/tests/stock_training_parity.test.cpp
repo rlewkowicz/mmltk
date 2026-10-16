@@ -49,6 +49,21 @@ namespace {
 using mmltk::backend::ml::testsupport::independent_leaf;
 namespace rf = mmltk::backend::models::rfdetr;
 namespace tensor_fixture = mmltk::backend::ml::testsupport;
+class StockTrainingContext final {
+public:
+ StockTrainingContext() : device_(checked_device()), runtime_(nullptr, 0, &matcher_.workspace) {}
+ [[nodiscard]] const torch::Device& device() const noexcept { return device_; }
+
+private:
+ static torch::Device checked_device() {
+  REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+  return {torch::kCUDA, 0};
+ }
+ torch::Device device_;
+ tensor_fixture::FullMatrixPrecision precision_;
+ rf::testsupport::MatcherExecutionFixture matcher_;
+ rf::ScopedRuntimeContext runtime_;
+};
 rf::TrainRequest optimizer_test_request(rf::TrainOptimizerKind kind) {
  rf::TrainRequest request;
  request.recipe.optimizer = kind;
@@ -783,11 +798,8 @@ TEST_CASE("PE optimizer groups use actual depth token and decay policy for every
   }
 }
 TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", "[rfdetr][training][stock-suite][gpu]") {
- REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
- const tensor_fixture::FullMatrixPrecision precision;
- rf::testsupport::MatcherExecutionFixture matcher;
- rf::ScopedRuntimeContext runtime(nullptr, 0, &matcher.workspace);
- const torch::Device device(torch::kCUDA, 0);
+ const StockTrainingContext context;
+ const auto& device = context.device();
  for (const auto& preset : rf::model_presets()) {
   CAPTURE(preset.preset_name);
   auto config = rf::native_config_from_preset(preset);
@@ -839,11 +851,8 @@ TEST_CASE("Every stock catalog model takes real task loss and optimizer steps", 
  }
 }
 TEST_CASE("Stock joint losses train through compilation AMP accumulation and every optimizer", "[rfdetr][training][keypoints][compilation][amp][gpu]") {
- REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
- const tensor_fixture::FullMatrixPrecision precision;
- rf::testsupport::MatcherExecutionFixture matcher;
- rf::ScopedRuntimeContext runtime(nullptr, 0, &matcher.workspace);
- const torch::Device device(torch::kCUDA, 0);
+ const StockTrainingContext context;
+ const auto& device = context.device();
  for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16})
   for (const auto mode : {rf::CompilationMode::kNone, rf::CompilationMode::kSelective, rf::CompilationMode::kFullTrace}) {
    CAPTURE(dtype, mode);

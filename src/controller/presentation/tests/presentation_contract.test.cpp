@@ -158,6 +158,10 @@ public:
   PublishUnobserved();
   UpdateObservation();
  }
+ void Advance(PresentationSystem& presentation) {
+  Advance();
+  presentation.SourceChanged(identity_);
+ }
  [[nodiscard]] auto Completed() const { return source_->Completed(); }
  void SelectCompleted(const mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput& product) {
   source_->SelectOutput(product);
@@ -1106,8 +1110,7 @@ TEST_CASE("Presentation replaces one terminal browser while retaining source pro
   REQUIRE(events.Wait([&] { return second->submissions.load() == 1U && presentation.snapshot().capability.valid(); }));
   CHECK(constructions.load() == 2U);
   CHECK(presentation.snapshot().completed == prior.completed);
-  source.Advance();
-  presentation.SourceChanged(source.identity());
+  source.Advance(presentation);
   REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 2U; }));
  } else {
   CHECK(constructions.load() == 1U);
@@ -1139,8 +1142,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  publish_first_presentation(presentation, source, *writer_state, events);
  REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 1U; }));
  const auto advance_source = [&] {
-  source.Advance();
-  presentation.SourceChanged(source.identity());
+  source.Advance(presentation);
   writer_state->SignalReadiness();
  };
  advance_source();
@@ -1171,8 +1173,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == 5U);
  CHECK(writer_state->timeline.load(std::memory_order_acquire) == 4U);
  writer_state->allow_publication.store(false, std::memory_order_release);
- source.Advance();
- presentation.SourceChanged(source.identity());
+ source.Advance(presentation);
  REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
  presentation.SetApplicationPeerConnected(false);
  writer_state->AllowPublication();
@@ -1192,8 +1193,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == 7U);
  CHECK(writer_state->timeline.load(std::memory_order_acquire) == 5U);
  CHECK(presentation.snapshot().completed.revision == 6U);
- source.Advance();
- presentation.SourceChanged(source.identity());
+ source.Advance(presentation);
  REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 8U; }));
  CHECK(writer_state->submissions.load(std::memory_order_acquire) == 8U);
  CHECK(writer_state->timeline.load(std::memory_order_acquire) == 6U);
@@ -1201,8 +1201,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  // immediately even before its separate source notification is delivered.
  // CLEANUP-IGNORE: This later admission tests an already-available newer source observation, not disconnected-peer recovery.
  writer_state->allow_publication.store(false, std::memory_order_release);
- source.Advance();
- presentation.SourceChanged(source.identity());
+ source.Advance(presentation);
  REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
  source.Advance();
  writer_state->AllowPublication();

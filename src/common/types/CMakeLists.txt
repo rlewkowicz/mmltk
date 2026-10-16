@@ -11,6 +11,7 @@ mmltk_register_public_headers(mmltk_common_types
         byte_encoding.h
         cancellation_observation.h
         container_utils.h
+        exception_message.h
         generation.h
         stable_identity.h
         string_utils.h

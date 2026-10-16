@@ -1,6 +1,8 @@
 #pragma once
+#include "src/common/types/exception_message.h"
 #include <exception>
 #include <stdexcept>
+#include <string>
 #include <utility>
 namespace mmltk::frameworks::gpu {
 // Failures form an ordered tree: the initiating failure is primary, and
@@ -9,20 +11,12 @@ namespace mmltk::frameworks::gpu {
 class ImageFailure : public std::runtime_error {
 public:
  ImageFailure(std::exception_ptr primary, std::exception_ptr secondary = {})
-     : std::runtime_error(Message(primary ? primary : secondary)), primary_(std::move(primary)), secondary_(std::move(secondary)) {}
+     : std::runtime_error(std::string(mmltk::common::types::exception_message(primary ? primary : secondary, kFallback, kFallback))), primary_(std::move(primary)), secondary_(std::move(secondary)) {}
  [[nodiscard]] const std::exception_ptr& primary() const noexcept { return primary_; }
  [[nodiscard]] const std::exception_ptr& secondary() const noexcept { return secondary_; }
 
 private:
- static const char* Message(const std::exception_ptr& failure) noexcept {
-  constexpr auto fallback = "image stream completion boundary was not established";
-  try {
-   if (failure) std::rethrow_exception(failure);
-  } catch (const std::exception& error) { return error.what(); } catch (...) {
-   return fallback;
-  }
-  return fallback;
- }
+ static constexpr auto kFallback = "image stream completion boundary was not established";
  std::exception_ptr primary_;
  std::exception_ptr secondary_;
 };

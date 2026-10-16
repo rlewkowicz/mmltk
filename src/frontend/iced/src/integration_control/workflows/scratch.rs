@@ -47,6 +47,7 @@ fn pixel_control(index: u8) -> &'static str {
     }
 }
 impl State {
+    // CLEANUP-OFF: Only method-signature boilerplate matches; the independent workflow state machines have distinct parameters and behavior.
     pub(super) fn advance(
         &mut self,
         widgets: &mut widget_ops::RevealState,
@@ -56,6 +57,7 @@ impl State {
         settings: &SettingsModel,
         active: FeatureId,
     ) -> Task<RootMessage> {
+        // CLEANUP-ON
         let Some(draft) = settings.draft.as_ref() else {
             return Task::none();
         };

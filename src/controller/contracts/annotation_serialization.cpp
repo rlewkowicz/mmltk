@@ -7,13 +7,17 @@ namespace mmltk::controller::contracts {
 namespace {
 constexpr mmltk::frameworks::serialization::wire::Limits kAnnotationLimits{.max_bytes = kAnnotationUiStateByteBudget, .max_items = kAnnotationUiStateByteBudget};
 }
+template <class Record>
+bool AnnotationDocumentBudget::AddEncoded(const Record& record) noexcept {
+ try {
+  const auto bytes = mmltk::frameworks::serialization::measure_transport(record, kAnnotationLimits);
+  return bytes && Bytes(*bytes);
+ } catch (...) { return false; }
+}
 bool AnnotationDocumentBudget::AddSchema(const mmltk::backend::data::catalog::ClassKeypointSchema& schema) noexcept {
  for (const auto& name : schema.names)
   if (!Add(name.size(), names_, kAnnotationDocumentJointNameBytes)) return false;
- try {
-  const auto bytes = mmltk::frameworks::serialization::measure_transport(schema, kAnnotationLimits);
-  return bytes && Bytes(*bytes);
- } catch (...) { return false; }
+ return AddEncoded(schema);
 }
 bool AnnotationDocumentBudget::AddObject(const AnnotationObject& object) noexcept {
  if (!Add(object.mask.runs.size(), runs_, kAnnotationMaskRunCapacity) || !Add(object.skeleton_nodes.size(), joints_, kAnnotationDocumentJointCapacity) ||
@@ -21,10 +25,7 @@ bool AnnotationDocumentBudget::AddObject(const AnnotationObject& object) noexcep
   return false;
  for (const auto& node : object.skeleton_nodes)
   if (!Add(node.key.size(), names_, kAnnotationDocumentJointNameBytes)) return false;
- try {
-  const auto bytes = mmltk::frameworks::serialization::measure_transport(object, kAnnotationLimits);
-  return bytes && Bytes(*bytes);
- } catch (...) { return false; }
+ return AddEncoded(object);
 }
 bool encode_annotation_persistence(const AnnotationUiState& state, std::vector<std::byte>& destination) noexcept {
  return mmltk::frameworks::serialization::encode(state, destination, kAnnotationLimits).has_value();

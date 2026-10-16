@@ -148,6 +148,10 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
  }
 }
 [[nodiscard]] std::string native_output(const std::filesystem::path& directory) { return mmltk::testsupport::read_text_file(directory / "native-output.txt"); }
+void check_no_routine_logs(const std::filesystem::path& directory) {
+ CHECK_FALSE(std::filesystem::exists(directory / "trace.jsonl"));
+ CHECK_FALSE(std::filesystem::exists(directory / ".mmltk-data" / "logs"));
+}
 void check_fatal_output(const std::filesystem::path& directory, const std::string_view expected) {
  const auto text = native_output(directory);
  CHECK(text.starts_with("fatal: "));
@@ -236,8 +240,7 @@ TEST_CASE("desktop terminal reports preserve process status and quiet requested 
     CHECK(native_output(output.directory()).empty());
    else
     check_fatal_output(output.directory(), entry.detail);
-   CHECK_FALSE(std::filesystem::exists(output.directory() / "trace.jsonl"));
-   CHECK_FALSE(std::filesystem::exists(output.directory() / ".mmltk-data" / "logs"));
+   check_no_routine_logs(output.directory());
    CHECK_FALSE(std::filesystem::exists(output.directory() / ".mmltk-data" / "firefox-crash.jsonl"));
   }
  }
@@ -279,8 +282,7 @@ TEST_CASE("desktop terminal reports preserve process status and quiet requested 
     CHECK(std::filesystem::file_size(record_path) < 2048U);
    }
    CHECK_FALSE(std::filesystem::exists(record_path.string() + ".tmp"));
-   CHECK_FALSE(std::filesystem::exists(crash.directory() / "trace.jsonl"));
-   CHECK_FALSE(std::filesystem::exists(crash.directory() / ".mmltk-data" / "logs"));
+   check_no_routine_logs(crash.directory());
   }
  }
 }

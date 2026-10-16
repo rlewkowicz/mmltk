@@ -8,6 +8,7 @@
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "src/backend/models/rfdetr/training/detail/training_step.h"
 #include "src/backend/models/rfdetr/training/detail/native_optimizer_private.h"
+#include "optimizer_fixture.h"
 #include "training_continuation_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <c10/cuda/CUDAGuard.h>
@@ -299,10 +300,7 @@ TEST_CASE("Actual upstream matched-state criterion AdamW and measured independen
      auto model = oracle.model(entry);
      if (mode != rf::CompilationMode::kNone) model.optimize_for_inference(entry.batch, true, mode);
      const auto config = support::oracle_detection(model.config());
-     rf::TrainRequest request;
-     static_cast<rf::TrainRecipeValues&>(request.recipe) = entry.recipe;
-     request.fused_optimizer = false;
-     auto built = rf::build_optimizer(model.named_optimizer_parameters(), request, model.config().backbone);
+     auto built = support::unfused_recipe_optimizer(model, entry.recipe);
      const rf::TrainingStep step(1, 1., entry.dtype() != torch::kFloat32, entry.dtype());
      support::OracleComparison comparison(requested, (matched_state ? "training-" : "trajectory-") + entry.id + "-mode" + std::to_string(static_cast<int>(mode)), entry.dtype());
      comparison.fact("SDPA comparison backend", entry.math_sdpa ? "math" : "default");
