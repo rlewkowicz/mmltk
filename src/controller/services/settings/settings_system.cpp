@@ -13,7 +13,7 @@ void SettingsSystem::RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::T
   if (training_locked_) throw contracts::BusyError("training configuration is locked during an admitted run");
   auto candidate = mutation_candidate();
   request.output_dir.clear();
-  request.resume_path = checkpoint;
+  mmltk::backend::models::rfdetr::normalize_train_resume_request(request, checkpoint);
   // Worker launch coordinates are process state, not a reusable GUI run.
   request.distributed_worker = false;
   request.distributed_rank = 0;

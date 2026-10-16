@@ -19,6 +19,7 @@
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/core/encoder_pretraining.h"
 #include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
@@ -199,6 +200,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  TrainRunResult result;
  std::uint64_t active_model = 0;
  try {
+  if (options.from_scratch && options.encoder_weights_path.empty()) throw std::invalid_argument("scratch training requires a resolved encoder path");
   agree_training_topology(distributed, options.device_id);
   agree_training_request(distributed, options);
   // The launcher selects local GPUs and shares these exact files. Agree the
@@ -211,10 +213,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   };
   std::vector<AdmittedFile> admitted_files;
   {
-   admitted_files.reserve(5);
+   admitted_files.reserve(6);
    for (const auto& [role, path] : std::array{
          std::pair{"train", options.train_compiled_path}, std::pair{"validation", options.val_compiled_path}, std::pair{"test", options.test_compiled_path},
-         std::pair{"class-layout", options.class_layout_path}, std::pair{"initial-state", options.resume_path.empty() ? options.weights_path : options.resume_path}
+         std::pair{"class-layout", options.resume_path.empty() ? options.class_layout_path : std::filesystem::path{}},
+         std::pair{"initial-state", options.resume_path.empty() ? options.weights_path : options.resume_path},
+         std::pair{"encoder", options.from_scratch ? options.encoder_weights_path : std::filesystem::path{}}
         }) {
     if (!path.empty()) {
      const auto snapshot = mmltk::common::io::FileSnapshot::Read(path);
@@ -307,9 +311,24 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   const auto source_checkpoint = resumed ? std::filesystem::canonical(options.resume_path).parent_path() / resumed->manifest().models.front().path : options.weights_path;
   if (train_loader.image_width() != train_loader.image_height()) throw std::runtime_error("train compiled RF-DETR input must be square");
   std::optional<ResolvedModelState> transferred;
-  if (!resumed) transferred = resolve_model_state(source_checkpoint, options.preset_name, static_cast<int>(train_loader.image_width()), options.class_layout_path);
-  auto artifacts = resumed ? resolve_admitted_model_artifacts(resumed->model(0), source_checkpoint, options.preset_name, static_cast<int>(train_loader.image_width()), options.class_layout_path)
-                           : transferred->artifacts;
+  ResolvedModelArtifacts artifacts;
+  if (resumed) {
+   artifacts = resolve_admitted_model_artifacts(resumed->model(0), source_checkpoint, options.preset_name, static_cast<int>(train_loader.image_width()));
+  } else if (options.from_scratch) {
+   const auto* preset = find_preset_catalog_entry(options.preset_name);
+   if (!preset) throw std::invalid_argument("scratch training requires a known preset");
+   artifacts.preset_name = std::string(preset->preset_name);
+   artifacts.model_id = artifacts.preset_name;
+   artifacts.input_kind = "encoder-pretraining";
+   artifacts.config = native_config_from_preset(*preset);
+   artifacts.config.resolution = static_cast<int>(train_loader.image_width());
+   artifacts.automatic_num_queries_cap = artifacts.config.num_queries;
+   artifacts.source_num_queries = artifacts.config.num_queries;
+   artifacts.source_num_select = artifacts.config.num_select;
+  } else {
+   transferred = resolve_model_state(source_checkpoint, options.preset_name, static_cast<int>(train_loader.image_width()), options.class_layout_path);
+   artifacts = transferred->artifacts;
+  }
   auto original_descriptor = resumed ? std::filesystem::path(resumed->continuation(0).values.training_original_descriptor) : options.class_layout_path;
   if (!resumed) apply_stock_training_coefficients(artifacts.config);
   artifacts.config.training_supervision = options.training_supervision;
@@ -394,8 +413,18 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   common->initialize_training_supervision(static_cast<std::uint64_t>(options.seed));
   agree_model_inventory(distributed, *common, "initialized-cpu-inventory");
   preparation.Stage(TrainingPreparationStage::Weights);
+  if (options.from_scratch) {
+   // Only rank zero decodes and adapts the agreed immutable source. Peers agree
+   // the canonical lineage after admission and receive all model values below.
+   const auto& asset = *find_encoder_pretraining_asset(artifacts.config.backbone.kind);
+   artifacts.encoder_pretraining = encoder_pretraining_provenance(asset);
+   if (main_process) artifacts.encoder_pretraining = initialize_encoder_pretraining(*common, options.encoder_weights_path).provenance;
+   std::array<std::byte, mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<EncoderPretrainingProvenance>()> scratch;
+   const auto provenance = mmltk::frameworks::serialization::reflected_json(*artifacts.encoder_pretraining, scratch, {.max_bytes = scratch.size(), .max_items = 32, .max_depth = 4}).dump();
+   agree_training_text(distributed, "encoder-pretraining", provenance);
+  }
   common->to(mmltk::backend::ml::cuda::cuda_device(options.device_id));
-  if (!resumed) {
+  if (transferred) {
    const auto loaded = load_training_model_weights(*common, transferred->model_state, supervision_route(options.training_supervision));
    if (main_process) {
     mmltk::common::logging::info([&](auto& logger) {
@@ -455,7 +484,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    session.validation = validation_fingerprint;
    session.precision = precision_kind;
   }
-  session.request = options;
+  session.request = reusable_train_request(options, resumed ? &resumed->manifest().request : nullptr);
   if (resumed) {
    const bool historical = session.identity_schema == 1;
    const auto admitted_configuration = historical ? share_identity(source_fingerprint(&train_loader, true), 64) : configuration_fingerprint;
@@ -538,7 +567,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
      artifacts.config.num_select, "val", dataset_limits.automatic);
     TrainingRun run;
     run.run_id = session.session_id;
-    run.configuration = options;
+    run.configuration = session.request;
+    run.encoder_pretraining = metadata.encoder_pretraining;
     run.original_weights = metadata.source_path;
     run.original_class_descriptor = original_descriptor;
     run.execution.training = execution_facts;
@@ -549,7 +579,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     run.source_checkpoint_attempt_id = resume_attempt;
     run.resume_epoch = start_epoch - 1;
     run.resume_optimizer_step = models.front()->schedule().consumed_attempts;
-    writer = std::make_unique<TrainingTelemetryWriter>(std::move(run));
+    writer = std::make_unique<TrainingTelemetryWriter>(std::move(run), options.resume_path);
     session.attempt_id = writer->attempt_id();
     latest.epoch = start_epoch;
     latest.total_epochs = options.epochs;
@@ -741,7 +771,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
       if (best) candidate_admissions.push_back(best->admission);
      }
      checkpoint->publish(session, immutable_plan,
-      [&](const std::filesystem::path& destination, std::size_t index) { models[index]->save_resume(destination, metadata, session.attempt_id, original_descriptor); }, candidate_admissions);
+      [&](const std::filesystem::path& destination, std::size_t index) { models[index]->save_resume(destination, metadata, session.attempt_id, original_descriptor, session.request); }, candidate_admissions);
      for (auto& publication : publications) publication.finish();
      last_checkpoint_path = checkpoint->path();
      latest = {};
@@ -842,7 +872,7 @@ TrainRunResult TrainingRuntimeOwner::run() { return impl_->run(); }
 TrainRunResult run_training(const TrainRequest& options) { return TrainingRuntimeOwner(options).run(); }
 void print_training_summary(const TrainRequest& options, const TrainRunResult& result) {
  if (options.distributed_worker && options.distributed_rank != 0) { return; }
- const char* source_label = options.resume_path.empty() ? "weights" : "resume";
+ const char* source_label = options.from_scratch ? "from-scratch" : options.resume_path.empty() ? "weights" : "resume";
  const auto best_path = result.selected ? result.selected->artifact.path.string() : "";
  const auto checkpoint_path = result.checkpoint_path.string();
  std::string summary = std::format("rfdetr train[{}]: preset={} optimizer={} epochs={} selected={} checkpoint={}", source_label, result.artifacts.config.preset_name,

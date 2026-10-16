@@ -29,9 +29,10 @@ r::EvalSummary evaluation(double metric, bool masks = false) {
  }
  return value;
 }
-r::TrainingSelectionCandidate ingredient(const std::filesystem::path& directory, std::uint64_t id, double value, double metric, bool masks = false) {
+r::TrainingSelectionCandidate ingredient(const std::filesystem::path& directory, std::uint64_t id, double value, double metric, bool masks = false, std::optional<r::EncoderPretrainingProvenance> lineage = {}) {
  r::DecodedNativeModelState state;
  state.metadata = r::testsupport::synthetic_training_metadata();
+ state.metadata.encoder_pretraining = std::move(lineage);
  state.replace_entries({{"value", torch::tensor({value})}, {"counter", torch::tensor({3}, torch::kInt64)}});
  r::TrainingSelectionCandidate candidate;
  auto& artifact = candidate.artifact;
@@ -629,4 +630,54 @@ TEST_CASE("Selection requires the task metric and exact joint topology before av
  b.native_configuration = r::encode_checkpoint_configuration(config);
  CHECK_FALSE(r::same_native_model_semantics(a, b));
  REQUIRE_THROWS(r::require_checkpoint_model_topology(config, a));
+}
+
+TEST_CASE("selection keeps only unanimous lineage among actual averaging contributors", "[model][rfdetr][training][merge][encoder_pretraining]") {
+ const r::EncoderPretrainingProvenance lineage{"merge.fixture", std::string(40, 'a'), std::string(64, 'b'), 3};
+ auto other = lineage;
+ other.adaptation_revision = 4;
+ for (const auto second : {std::optional{lineage}, std::optional{other}, std::optional<r::EncoderPretrainingProvenance>{}}) {
+  const mmltk::testsupport::ScopedTempDir root("merge-lineage");
+  std::array candidates{ingredient(root.path(), 1, 1, .8, false, lineage), ingredient(root.path(), 2, 5, .7, false, second)};
+  const auto evaluate = [](const auto&) { return evaluation(.6); };
+  const auto individual = r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, r::ModelTask::Detection, root.path(), evaluate);
+  CHECK(r::decode_native_model_state(individual.artifact.path).metadata.encoder_pretraining == lineage);
+  const auto average = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, r::ModelTask::Detection, root.path(), evaluate);
+  CHECK(r::decode_native_model_state(average.artifact.path).metadata.encoder_pretraining == (second == lineage ? second : std::nullopt));
+  candidates[0].coefficient = 0;
+  candidates[1].coefficient = 1;
+  const auto sole = r::select_training_artifact(candidates, r::TrainFinalPolicy::Explicit, r::ModelTask::Detection, root.path(), evaluate);
+  CHECK(r::decode_native_model_state(sole.artifact.path).metadata.encoder_pretraining == second);
+ }
+}
+
+TEST_CASE("session manifests migrate absent launch fields without weakening admission", "[model][rfdetr][training][session][encoder_pretraining]") {
+ const mmltk::testsupport::ScopedTempDir root("legacy-session-request");
+ SessionFixture fixture(root.path());
+ fixture.publish();
+ const auto path = root.path() / "session.json";
+ std::ifstream input(path);
+ auto document = nlohmann::json::parse(input);
+ input.close();
+ document["request"].erase("from_scratch");
+ document["request"].erase("encoder_weights_path");
+ const auto write = [&](const auto& value) { std::ofstream(path, std::ios::trunc) << value.dump(); };
+ write(document);
+ const auto legacy = r::read_training_manifest(path);
+ CHECK_FALSE(legacy.request.from_scratch);
+ CHECK(legacy.request.encoder_weights_path.empty());
+ REQUIRE_NOTHROW(r::TrainingSessionAdmission(path));
+ for (const auto* field : {"from_scratch", "encoder_weights_path"}) {
+  auto invalid = document;
+  invalid["request"][field] = nullptr;
+  write(invalid);
+  REQUIRE_THROWS(r::read_training_manifest(path));
+ }
+ auto missing = document;
+ missing["request"].erase("epochs");
+ write(missing);
+ REQUIRE_THROWS(r::read_training_manifest(path));
+ document["request"]["unknown"] = true;
+ write(document);
+ REQUIRE_THROWS(r::read_training_manifest(path));
 }

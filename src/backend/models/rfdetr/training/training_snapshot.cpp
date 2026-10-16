@@ -71,7 +71,8 @@ void save_snapshot_checkpoint(const std::filesystem::path& path, const NativeChe
 }
 void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer, const GradScaler& grad_scaler,
  const TrainRequest& options, int epoch, int64_t ema_completed_updates, const std::vector<NormalizedModelStateEntry>& model_state, const std::vector<NormalizedModelStateEntry>& ema_state,
- std::string_view attempt_id, const std::filesystem::path& original_descriptor, torch_cuda::TensorReadbackBuffers& readback, detail::TrainingContinuationValues& continuation) {
+ std::string_view attempt_id, const std::filesystem::path& original_descriptor, const std::filesystem::path& publication_descriptor, torch_cuda::TensorReadbackBuffers& readback,
+ detail::TrainingContinuationValues& continuation) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_total{"rfdetr.train.save.resume.total"};
  std::filesystem::create_directories(checkpoint_path.parent_path());
  torch::serialize::OutputArchive archive;
@@ -102,7 +103,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_archive_save_to{"rfdetr.train.save.resume.archive_save_to"};
   readback.Complete();
-  detail::publish_native_checkpoint_archive(archive, checkpoint_path, options.class_layout_path);
+  detail::publish_native_checkpoint_archive(archive, checkpoint_path, publication_descriptor);
  }
 }
 ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& admitted, const detail::TrainingContinuation& continuation,
@@ -174,7 +175,8 @@ void TrainingSnapshot::save_weights(const std::filesystem::path& path, const Nat
  save_snapshot_checkpoint(path, metadata, ordinary_, selected ? ema_ : no_ema, readback_, descriptor);
 }
 void TrainingSnapshot::save_resume(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer, const GradScaler& scaler, const TrainRequest& options,
- int epoch, int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor, detail::TrainingContinuationValues& continuation) {
+ int epoch, int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& original_descriptor, const std::filesystem::path& publication_descriptor,
+ detail::TrainingContinuationValues& continuation) {
  require_active();
  if (options.use_ema != !ema_.empty()) throw std::logic_error("Resume EMA differs from its frozen publication");
  if (optimizer_ && optimizer_ != &optimizer) throw std::logic_error("training snapshot optimizer changed during publication");
@@ -183,7 +185,7 @@ void TrainingSnapshot::save_resume(const std::filesystem::path& path, const Nati
   readback_.Freeze();
   optimizer_ = &optimizer;
  }
- save_resume_checkpoint(path, metadata, optimizer, scaler, options, epoch, ema_completed_updates, ordinary_, ema_, attempt_id, descriptor, readback_, continuation);
+ save_resume_checkpoint(path, metadata, optimizer, scaler, options, epoch, ema_completed_updates, ordinary_, ema_, attempt_id, original_descriptor, publication_descriptor, readback_, continuation);
 }
 void TrainingSnapshot::release() {
  readback_.Release();

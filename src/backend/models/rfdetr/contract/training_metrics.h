@@ -1,10 +1,12 @@
 #pragma once
+#include "encoder_pretraining.h"
 #include "src/frameworks/reflection/reflected_declarations.h"
 #include "src/frameworks/gpu/cuda/device_telemetry.h"
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "evaluation_metrics.h"
 #include "class_layout.h"
@@ -195,6 +197,7 @@ struct TrainingRun final {
  TrainingSourceCatalog sources;
  TrainingExecutionFacts execution;
  MMLTK_MAX_PATH_BYTES std::string original_weights;
+ std::optional<EncoderPretrainingProvenance> encoder_pretraining;
  MMLTK_MAX_PATH_BYTES std::filesystem::path original_class_descriptor;
  EvaluatedWeights evaluated_weights = EvaluatedWeights::Ordinary;
  ModelClassLayout class_layout{};
@@ -202,6 +205,8 @@ struct TrainingRun final {
  std::uint64_t resume_optimizer_step = 0;
 };
 MMLTK_REFLECT_FIELDS(TrainingRun)
+[[nodiscard]] TrainingRun decode_training_run_json(std::string_view);
+[[nodiscard]] TrainingRecord decode_training_record_json(std::string_view);
 struct TrainingOpenedRun final {
  std::uint64_t generation = 0;
  MMLTK_MAX_PATH_BYTES std::filesystem::path directory;
@@ -222,6 +227,7 @@ struct TrainingCheckpoint final {
  MMLTK_MAX_BYTES(64) std::string attempt_id;
  MMLTK_MAX_BYTES(64) std::string session_id;
  MMLTK_MAX_PATH_BYTES std::string original_weights;
+ std::optional<EncoderPretrainingProvenance> encoder_pretraining;
  MMLTK_MAX_PATH_BYTES std::filesystem::path original_class_descriptor;
  bool resumable = false;
  int epoch = -1;
@@ -231,6 +237,7 @@ struct TrainingCheckpoint final {
 };
 MMLTK_REFLECT_FIELDS(TrainingCheckpoint)
 struct TrainingCheckpointCapability final {
+ std::optional<EncoderPretrainingProvenance> encoder_pretraining;
  bool operator==(const TrainingCheckpointCapability&) const = default;
  MMLTK_MAX_PATH_BYTES std::filesystem::path path;
  bool resumable = false;

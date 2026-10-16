@@ -6,6 +6,7 @@
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <fstream>
+#include "training_continuation_fixture.h"
 #include <string_view>
 #include <type_traits>
 #include <filesystem>
@@ -138,4 +139,45 @@ TEST_CASE("Native configuration preserves admitted long custom names within its 
   CHECK(resolved.config.preset_name == config.preset_name);
   CHECK(rfdetr::encode_checkpoint_configuration(resolved.config) == encoded);
  });
+}
+
+TEST_CASE("native encoder lineage survives archive normalization and ordinary artifact inspection", "[model][rfdetr][checkpoint_resolution][encoder_pretraining]") {
+ namespace r = rfdetr;
+ const mmltk::testsupport::ScopedTempDir root("encoder-lineage");
+ r::DecodedNativeModelState state;
+ state.metadata = r::testsupport::synthetic_training_metadata();
+ // Serialization fixture identity deliberately claims no official source asset.
+ state.metadata.encoder_pretraining = r::EncoderPretrainingProvenance{"serialization.fixture", std::string(40, 'a'), std::string(64, 'b'), 7};
+ state.replace_entries({{"value", torch::ones({2})}});
+ const auto source = root.path() / "source.pt";
+ r::save_native_checkpoint(source, state);
+ const auto decoded = r::decode_native_model_state(source);
+ CHECK(decoded.metadata.encoder_pretraining == state.metadata.encoder_pretraining);
+ const auto artifacts = r::resolve_model_artifacts(source, {}, 0);
+ CHECK(artifacts.encoder_pretraining == state.metadata.encoder_pretraining);
+ CHECK(r::make_native_checkpoint_metadata(artifacts, 2).encoder_pretraining == state.metadata.encoder_pretraining);
+ const auto inspected = r::inspect_training_checkpoint(source).checkpoint();
+ CHECK(inspected.encoder_pretraining == state.metadata.encoder_pretraining);
+ CHECK_FALSE(inspected.resumable);
+ const auto normalized = r::normalize_checkpoint_to_native(source, root.path() / "normalized.pt", {});
+ CHECK(normalized.metadata.encoder_pretraining == state.metadata.encoder_pretraining);
+ auto invalid = state.metadata.encoder_pretraining;
+ invalid->sha256 = std::string(64, 'Z');
+ state.metadata.encoder_pretraining = invalid;
+ REQUIRE_THROWS(r::save_native_checkpoint(root.path() / "invalid.pt", state));
+ // Present malformed data cannot become a missing optional record.
+ for (int kind = 0; kind < 4; ++kind) {
+  torch::serialize::OutputArchive output;
+  r::testsupport::copy_checkpoint_archive(*decoded.admitted_archive(), output, "encoder_pretraining_cbor");
+  if (kind == 0) output.write("encoder_pretraining_cbor", c10::IValue("bad"));
+  if (kind == 1) output.write("encoder_pretraining_cbor", torch::zeros({2, 2}, torch::kUInt8));
+  if (kind == 2) output.write("encoder_pretraining_cbor", torch::zeros({65536}, torch::kUInt8));
+  if (kind == 3) output.write("encoder_pretraining_cbor", torch::zeros({4}, torch::kUInt8));
+  const auto path = root.path() / ("malformed-" + std::to_string(kind) + ".pt");
+  output.save_to(path.string());
+  REQUIRE_THROWS(r::decode_native_model_state(path));
+ }
+ state.metadata.encoder_pretraining.reset();
+ r::save_native_checkpoint(root.path() / "legacy.pt", state);
+ CHECK_FALSE(r::decode_native_model_state(root.path() / "legacy.pt").metadata.encoder_pretraining);
 }

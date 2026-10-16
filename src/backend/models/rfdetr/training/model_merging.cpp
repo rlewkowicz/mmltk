@@ -231,7 +231,12 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
   }
   average.prepare(inputs, weights);
   DecodedNativeModelState state;
+  const auto first_contributor = static_cast<std::size_t>(std::ranges::find_if(weights, [](double value) { return value > 0; }) - weights.begin());
   state.metadata = admitted.front()->metadata();
+  state.metadata.encoder_pretraining = proofs[indices[first_contributor]]->metadata().encoder_pretraining;
+  for (std::size_t slot = 0; slot < indices.size(); ++slot) {
+   if (weights[slot] > 0 && state.metadata.encoder_pretraining != proofs[indices[slot]]->metadata().encoder_pretraining) state.metadata.encoder_pretraining.reset();
+  }
   std::vector<NormalizedModelStateEntry> values = average.values();
   const auto& source = decoded(0).entries();
   for (std::size_t index = 0; index < values.size(); ++index) values[index].tensor = values[index].tensor.to(source[index].tensor.scalar_type());

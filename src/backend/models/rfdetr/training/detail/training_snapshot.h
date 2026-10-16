@@ -54,7 +54,7 @@ public:
  void require_inactive() const;
  void save_weights(const std::filesystem::path&, const NativeCheckpointMetadata&, bool selected, const std::filesystem::path&);
  void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch, int64_t ema_completed_updates,
-  std::string_view attempt_id, const std::filesystem::path& descriptor, detail::TrainingContinuationValues& continuation);
+  std::string_view attempt_id, const std::filesystem::path& original_descriptor, const std::filesystem::path& publication_descriptor, detail::TrainingContinuationValues& continuation);
 
 private:
  friend class TrainingSnapshotPublication;

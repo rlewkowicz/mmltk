@@ -36,6 +36,7 @@ TrainingCheckpointAdmission inspect_training_checkpoint(const std::filesystem::p
   result.configuration = admission->manifest().request;
   result.class_layout = admission->model(0).metadata.class_layout;
   result.original_weights = admission->model(0).metadata.source_path;
+  result.encoder_pretraining = admission->model(0).metadata.encoder_pretraining;
   result.original_class_descriptor = admission->continuation(0).values.training_original_descriptor;
   result.epoch = mmltk::common::math::checked_cast<int>(admission->continuation(0).values.epoch, "checkpoint epoch exceeds request range");
   result.evaluated_weights = result.configuration->use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;

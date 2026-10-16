@@ -427,6 +427,7 @@ pub(crate) fn saved_training_run(
         generation: 3,
         directory: "saved-output".into(),
         run: Some(TrainingRun {
+            encoderpretraining: None,
             formatversion: 3,
             runid: "saved".into(),
             attemptid: "saved-attempt".into(),

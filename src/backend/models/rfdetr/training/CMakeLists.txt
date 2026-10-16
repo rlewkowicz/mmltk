@@ -131,6 +131,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk_backend_models_rfdetr_training_tests PRIVATE_DECLARATIONS)
     mmltk_register_private_headers(
         mmltk_backend_models_rfdetr_training_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/encoder_training_fixture.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_state_fixture.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation_fixture.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_gradient_fixture.h)

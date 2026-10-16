@@ -2021,6 +2021,7 @@ mod tests {
             71,
             crate::generated::ApplicationReply::TrainingPrepareResume(
                 crate::generated::TrainingCheckpointCapability {
+                    encoderpretraining: None,
                     path: "/saved/full.pt".into(),
                     resumable: true,
                 },
@@ -2038,6 +2039,7 @@ mod tests {
         train.modelsource = crate::generated::ModelSelectionSource::Custom;
         train.request.weightspath = "/saved/session.json".into();
         let checkpoint = crate::generated::TrainingCheckpointCapability {
+            encoderpretraining: None,
             path: train.request.weightspath.clone(),
             resumable: true,
         };

@@ -9,7 +9,6 @@ namespace {
 constexpr std::size_t manifest_bytes = r::kTrainingManifestBytes;
 constexpr std::size_t line_bytes = r::kTrainingRecordBytes;
 constexpr std::size_t page_bytes = 2U * r::kTrainingRecordBytes;
-constexpr serial::wire::Limits record_limits{.max_bytes = line_bytes, .max_items = 8192, .max_depth = 32};
 template <class Value>
 Value ReadFacts(const std::filesystem::path& path, const std::size_t limit) {
  const auto identity = mmltk::common::io::FileSnapshot::Read(path);
@@ -18,7 +17,10 @@ Value ReadFacts(const std::filesystem::path& path, const std::size_t limit) {
  std::string text(limit + 1, '\0');
  input.read(text.data(), static_cast<std::streamsize>(text.size()));
  text.resize(static_cast<std::size_t>(input.gcount()));
- auto value = serial::decode_reflected_json<Value>(text, {.max_bytes = limit, .max_items = 65536, .max_depth = 32});
+ auto value = [&] {
+  if constexpr (std::is_same_v<Value, r::TrainingRun>) return r::decode_training_run_json(text);
+  else return serial::decode_reflected_json<Value>(text, {.max_bytes = limit, .max_items = 65536, .max_depth = 32});
+ }();
  identity.RequireUnchanged(path);
  return value;
 }
@@ -96,7 +98,7 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
   }
   if (!complete) break;  // A partial append is retried from its initial byte.
   if (consumed > page_bytes) break;
-  auto record = serial::decode_reflected_json<r::TrainingRecord>(line_, record_limits);
+  auto record = r::decode_training_record_json(line_);
   if (record.format_version != r::kTrainingRunFormat || record.run_id != run_->run_id || record.attempt_id.empty()) throw std::runtime_error("training history record belongs to an incompatible run");
   page.next_cursor += line_.size() + 1;
   page.records.push_back(std::move(record));

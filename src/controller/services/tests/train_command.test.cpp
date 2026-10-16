@@ -1,6 +1,7 @@
 #include "src/controller/services/training/train_command.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
+#include "src/frameworks/serialization/reflected_json.h"
 #include <cstddef>
 #include <span>
 #include <vector>
@@ -248,4 +249,93 @@ TEST_CASE("Execution admission checks global products bounded stable models and 
    CHECK_FALSE(r::train_recipe_valid(candidate));
   }
  });
+}
+
+TEST_CASE("scratch launch handoff and legacy request migration retain strict source admission", "[gui][train_command][encoder_pretraining]") {
+ namespace serial = mmltk::frameworks::serialization;
+ auto value = request();
+ value.weights_path.clear();
+ value.from_scratch = true;
+ value.preset_name = "rf-detr-atto";
+ value.encoder_weights_path = "/admitted/encoder.safetensors";
+ value.distributed_worker = true;
+ value.distributed_rank = 1;
+ value.distributed_world_size = 2;
+ value.distributed_store_path = "/shared/store";
+ CHECK(child_request(value) == value);
+ const auto saved = r::reusable_train_request(value);
+ CHECK(saved.from_scratch);
+ CHECK(saved.encoder_weights_path.empty());
+ CHECK(value.encoder_weights_path == "/admitted/encoder.safetensors");
+ auto resumed = saved;
+ r::normalize_train_resume_request(resumed, "/session/session.json");
+ CHECK_FALSE(resumed.from_scratch);
+ CHECK(resumed.encoder_weights_path.empty());
+ CHECK(resumed.weights_path.empty());
+ CHECK(resumed.class_layout_path.empty());
+ CHECK(child_request(resumed) == resumed);
+ const auto published = r::reusable_train_request(resumed, &saved);
+ CHECK(published.from_scratch);
+ CHECK(published.resume_path.empty());
+ auto legacy = nlohmann::json::parse(r::encode_train_request_json(request()));
+ legacy.erase("from_scratch");
+ legacy.erase("encoder_weights_path");
+ CHECK(r::decode_train_request_json(legacy.dump()) == request());
+ CHECK_THROWS(serial::decode_reflected_json<r::TrainRequest>(legacy.dump(), {.max_bytes = r::kMaximumTrainRequestJsonBytes, .max_items = 4096, .max_depth = 32}));
+ for (const auto* field : {"from_scratch", "encoder_weights_path"}) {
+  auto malformed = legacy;
+  malformed[field] = nullptr;
+  CHECK_THROWS(r::decode_train_request_json(malformed.dump()));
+ }
+ auto missing_required = legacy;
+ missing_required.erase("epochs");
+ CHECK_THROWS(r::decode_train_request_json(missing_required.dump()));
+ legacy["unknown_initialization"] = false;
+ CHECK_THROWS(r::decode_train_request_json(legacy.dump()));
+ const auto current = r::encode_train_request_json(request());
+ CHECK_THROWS(r::decode_train_request_json("{\"from_scratch\":false," + current.substr(1)));
+ CHECK_THROWS(r::decode_train_request_json("{\"recipe\":{}," + current.substr(1)));
+ auto nested_duplicate = current;
+ const auto recipe = nested_duplicate.find("\"recipe\":{");
+ REQUIRE(recipe != std::string::npos);
+ nested_duplicate.insert(recipe + std::string_view("\"recipe\":{").size(), "\"lr\":0,");
+ CHECK_THROWS(r::decode_train_request_json(nested_duplicate));
+}
+
+TEST_CASE("source independent Resume and worker handoff invoke no acquisition operation", "[gui][train_command][encoder_pretraining]") {
+ namespace services = mmltk::controller::services;
+ struct NoAcquisition final : services::ArtifactWeightOperations {
+  mutable unsigned calls = 0;
+  std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { ++calls; throw std::logic_error("unexpected detector acquisition"); }
+  std::optional<services::ArtifactWeightAsset> find(r::BackboneKind) const override { ++calls; throw std::logic_error("unexpected encoder acquisition"); }
+  void download(std::string_view, const std::filesystem::path&, const services::ArtifactCancellationToken&, services::ArtifactWeightProgressObserver) const override {
+   ++calls;
+   throw std::logic_error("unexpected download");
+  }
+ } operations;
+ const services::ArtifactStore store("/unused/cache", operations);
+ auto cancellation = services::ArtifactCancellationSource::Mint();
+ auto value = request();
+ CHECK_NOTHROW(services::prepare_train_encoder(value, store, cancellation.second));
+ r::normalize_train_resume_request(value, "/immutable/session.json");
+ CHECK_NOTHROW(services::prepare_train_encoder(value, store, cancellation.second));
+ value.resume_path.clear();
+ value.from_scratch = true;
+ value.preset_name = "rf-detr-atto";
+ value.distributed_worker = true;
+ value.distributed_rank = 1;
+ value.distributed_world_size = 2;
+ value.distributed_store_path = "/shared/store";
+ CHECK_THROWS(services::prepare_train_encoder(value, store, cancellation.second));
+ value.encoder_weights_path = "/admitted/source.safetensors";
+ CHECK_NOTHROW(services::prepare_train_encoder(value, store, cancellation.second));
+ value.distributed_worker = false;
+ value.distributed_rank = 0;
+ value.distributed_world_size = 1;
+ value.distributed_store_path.clear();
+ CHECK_THROWS(services::prepare_train_encoder(value, store, cancellation.second));
+ value.encoder_weights_path.clear();
+ CHECK(cancellation.first.RequestCancel());
+ CHECK_THROWS(services::prepare_train_encoder(value, store, cancellation.second));
+ CHECK(operations.calls == 0);
 }

@@ -92,9 +92,34 @@ std::string encode_train_request_json(const TrainRequest& request) {
  if (text.size() > kMaximumTrainRequestJsonBytes) throw std::invalid_argument("training request JSON exceeds 64 KiB");
  return text;
 }
+void migrate_train_request_record(nlohmann::json& record) {
+ if (!record.is_object()) throw std::invalid_argument("training request must be an object");
+ if (!record.contains("from_scratch")) record["from_scratch"] = false;
+ if (!record.contains("encoder_weights_path")) record["encoder_weights_path"] = "";
+}
+TrainRequest reusable_train_request(TrainRequest request, const TrainRequest* original) {
+ if (original) {
+  request.from_scratch = original->from_scratch;
+  request.weights_path = original->weights_path;
+  request.class_layout_path = original->class_layout_path;
+  request.resume_path = original->resume_path;
+ }
+ request.encoder_weights_path.clear();
+ return request;
+}
+void normalize_train_resume_request(TrainRequest& request, const std::filesystem::path& checkpoint) {
+ request.from_scratch = false;
+ request.encoder_weights_path.clear();
+ request.weights_path.clear();
+ request.class_layout_path.clear();
+ request.resume_path = checkpoint;
+}
 TrainRequest decode_train_request_json(const std::string_view text) {
  if (text.empty() || text.size() > kMaximumTrainRequestJsonBytes) throw std::invalid_argument("training request JSON must fit 64 KiB");
- auto request = mmltk::frameworks::serialization::decode_reflected_json<TrainRequest>(text, {.max_bytes = kMaximumTrainRequestJsonBytes, .max_items = 4096, .max_depth = 32});
+ constexpr mmltk::frameworks::serialization::wire::Limits limits{.max_bytes = kMaximumTrainRequestJsonBytes, .max_items = 4096, .max_depth = 32};
+ auto document = mmltk::frameworks::serialization::parse_bounded_json(text, limits);
+ migrate_train_request_record(document);
+ auto request = mmltk::frameworks::serialization::decode_reflected_json<TrainRequest>(document.dump(), limits);
  validate_train_request(request);
  return request;
 }

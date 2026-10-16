@@ -1,5 +1,6 @@
 
 #include "detail/training_continuation.h"
+#include "src/frameworks/serialization/reflected_json.h"
 #include "src/pch_std.h"
 #include "src/backend/ml/torch/archive.h"
 #include "detail/checkpoint_private.h"
@@ -117,7 +118,7 @@ bool has_continuation_fields(torch::serialize::InputArchive& archive) {
 void write_training_configuration(torch::serialize::OutputArchive& archive, const TrainRequest& request) {
  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
  serialization::wire::ByteBuffer bytes;
- const auto encoded = serialization::encode(request, bytes, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
+ const auto encoded = serialization::encode(reusable_train_request(request), bytes, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
  if (!encoded) throw std::runtime_error("training configuration violates its checkpoint schema");
  write_bytes(archive, "training_configuration_cbor", bytes);
 }
@@ -129,8 +130,11 @@ TrainRequest read_training_configuration(torch::serialize::InputArchive& archive
      static_cast<std::size_t>(configuration.numel()) > capacity)
   throw std::runtime_error("invalid checkpoint training configuration");
  configuration = configuration.contiguous();
- const auto request = serialization::decode<TrainRequest>(
+ auto document = serialization::json_from_cbor(
   {std::span(reinterpret_cast<const std::byte*>(configuration.const_data_ptr()), static_cast<std::size_t>(configuration.numel())), {}}, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
+ migrate_train_request_record(document);
+ const auto bytes = serialization::json_to_cbor(document.dump(), {.max_bytes = 6U * capacity, .max_items = 4096, .max_depth = 32});
+ auto request = serialization::decode<TrainRequest>({bytes, {}}, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
  if (!request) throw std::runtime_error("invalid checkpoint training configuration values");
  validate_train_request(*request);
  return *request;

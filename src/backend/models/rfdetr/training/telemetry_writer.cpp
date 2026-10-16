@@ -79,7 +79,8 @@ void TrainingPreparationWriter::Publish() noexcept {
  }
 }
 struct TrainingTelemetryWriter::Impl final {
- explicit Impl(TrainingRun value) : run(std::move(value)) {
+ explicit Impl(TrainingRun value, std::filesystem::path resume) : run(std::move(value)), resume_path(resume.empty() ? run.configuration.resume_path : std::move(resume)) {
+  run.configuration = reusable_train_request(std::move(run.configuration));
   run.attempt_id = identity();
   run.sources = training_source_catalog(run.configuration);
   document.sources.catalog = run.sources;
@@ -90,6 +91,7 @@ struct TrainingTelemetryWriter::Impl final {
   worker = std::jthread([this] { Work(); });
  }
  TrainingRun run;
+ std::filesystem::path resume_path;
  TrainingProgressDocument document;
  std::mutex mutex;
  std::atomic<std::uint64_t> wake_generation{0};
@@ -167,10 +169,10 @@ struct TrainingTelemetryWriter::Impl final {
  void Initialize() {
   const auto directory = run.configuration.output_dir;
   const auto manifest = directory / "run.json";
-  if (!run.configuration.resume_path.empty() && std::filesystem::exists(manifest)) {
-   if (!std::filesystem::exists(directory / "metrics.jsonl") || !std::filesystem::equivalent(std::filesystem::absolute(run.configuration.resume_path).parent_path(), directory))
+  if (!resume_path.empty() && std::filesystem::exists(manifest)) {
+   if (!std::filesystem::exists(directory / "metrics.jsonl") || !std::filesystem::equivalent(std::filesystem::absolute(resume_path).parent_path(), directory))
     throw std::runtime_error("selected output history is not associated with the resume checkpoint");
-   auto previous = serial::decode_reflected_json<TrainingRun>(read_manifest(manifest), manifest_limits);
+   auto previous = decode_training_run_json(read_manifest(manifest));
    if (previous.format_version != kTrainingRunFormat || previous.run_id.empty() || (!run.run_id.empty() && previous.run_id != run.run_id) || previous.attempt_id.empty() ||
        previous.evaluated_weights != run.evaluated_weights || previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() ||
        (previous.checkpoint_attempt_id != run.source_checkpoint_attempt_id && previous.attempt_id != run.source_checkpoint_attempt_id))
@@ -183,7 +185,7 @@ struct TrainingTelemetryWriter::Impl final {
    if (!metrics) throw std::runtime_error("cannot create training metric history");
    // This directory now describes a fresh session. Exact continuation above
    // retains the last published selection until its replacement succeeds.
-   if (run.configuration.resume_path.empty()) std::filesystem::remove(directory / "selected.json");
+   if (resume_path.empty()) std::filesystem::remove(directory / "selected.json");
   }
   write_file(manifest, serial::reflected_json(run, manifest_scratch, manifest_limits));
  }
@@ -271,7 +273,7 @@ struct TrainingTelemetryWriter::Impl final {
   }
  }
 };
-TrainingTelemetryWriter::TrainingTelemetryWriter(TrainingRun run) : impl_(std::make_unique<Impl>(std::move(run))) {}
+TrainingTelemetryWriter::TrainingTelemetryWriter(TrainingRun run, std::filesystem::path resume_path) : impl_(std::make_unique<Impl>(std::move(run), std::move(resume_path))) {}
 TrainingTelemetryWriter::~TrainingTelemetryWriter() noexcept {
  if (!impl_->finished && std::uncaught_exceptions() > impl_->uncaught) {
   auto progress = std::move(impl_->last_progress);

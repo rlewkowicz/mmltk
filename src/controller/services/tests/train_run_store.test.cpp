@@ -268,3 +268,90 @@ TEST_CASE("saved training output admits complete selected provenance and rejects
  std::filesystem::remove(temp.path() / "selected.json");
  CHECK_FALSE(store.Open(temp.path()).selected);
 }
+
+TEST_CASE("legacy history reopens and appends with owned request migration", "[gui][train_run_store][encoder_pretraining]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ const mmltk::testsupport::ScopedTempDir root("legacy-run-history");
+ r::TrainingRun run;
+ run.configuration.train_compiled_path = "train.bin";
+ run.configuration.val_compiled_path = "val.bin";
+ run.configuration.weights_path = "removed-seed.pt";
+ run.configuration.output_dir = root.path();
+ {
+  r::TrainingTelemetryWriter writer(run);
+  r::TrainingMetricProgress starting;
+  starting.phase = r::TrainingPhase::Starting;
+  writer.Submit(starting, r::TrainingRecordRole::Boundary);
+  writer.Finish({}, {});
+  writer.Close();
+  REQUIRE_FALSE(writer.persistence().degraded);
+ }
+ nlohmann::json legacy;
+ {
+  std::ifstream input(root.path() / "run.json");
+  legacy = nlohmann::json::parse(input);
+ }
+ legacy.erase("encoder_pretraining");
+ legacy["configuration"].erase("from_scratch");
+ legacy["configuration"].erase("encoder_weights_path");
+ const auto write = [&](const auto& document) { std::ofstream(root.path() / "run.json", std::ios::trunc) << document.dump(); };
+ write(legacy);
+ std::vector<nlohmann::json> records;
+ {
+  std::ifstream history(root.path() / "metrics.jsonl");
+  std::string line;
+  while (std::getline(history, line)) {
+   auto record = nlohmann::json::parse(line);
+   if (record.contains("attempt_configuration") && !record["attempt_configuration"].is_null()) {
+    record["attempt_configuration"].erase("from_scratch");
+    record["attempt_configuration"].erase("encoder_weights_path");
+   }
+   records.push_back(std::move(record));
+  }
+ }
+ {
+  std::ofstream history(root.path() / "metrics.jsonl", std::ios::trunc);
+  for (const auto& record : records) history << record.dump() << '\n';
+ }
+ TrainRunStore store;
+ const auto opened = store.Open(root.path());
+ REQUIRE(opened.run);
+ CHECK_FALSE(opened.run->configuration.from_scratch);
+ CHECK(opened.run->configuration.encoder_weights_path.empty());
+ CHECK_FALSE(opened.run->encoder_pretraining);
+ const auto page = store.Read({store.generation(), 0, 32});
+ REQUIRE(page.records.size() == records.size());
+ REQUIRE(page.records.front().attempt_configuration);
+ CHECK_FALSE(page.records.front().attempt_configuration->from_scratch);
+ for (const auto* name : {"from_scratch", "encoder_weights_path"}) {
+  auto malformed = legacy;
+  malformed["configuration"][name] = nullptr;
+  write(malformed);
+  CHECK_THROWS(store.Open(root.path()));
+ }
+ auto malformed = legacy;
+ malformed["configuration"].erase("epochs");
+ write(malformed);
+ CHECK_THROWS(store.Open(root.path()));
+ malformed = legacy;
+ malformed["encoder_pretraining"] = {{"asset_id", "invalid"}};
+ write(malformed);
+ CHECK_THROWS(store.Open(root.path()));
+ write(legacy);
+ auto resumed = *opened.run;
+ resumed.source_checkpoint_attempt_id = resumed.attempt_id;
+ resumed.configuration.resume_path = root.path() / "session.json";
+ resumed.configuration.weights_path.clear();
+ {
+  r::TrainingTelemetryWriter writer(resumed);
+  writer.Finish({}, {});
+  writer.Close();
+  INFO(writer.persistence().error);
+  REQUIRE_FALSE(writer.persistence().degraded);
+ }
+ const auto appended = store.Open(root.path());
+ REQUIRE(appended.run);
+ CHECK(appended.run->run_id == opened.run->run_id);
+ CHECK(appended.run->attempt_id != opened.run->attempt_id);
+ CHECK(store.Read({store.generation(), 0, 32}).records.size() == records.size() + 1);
+}

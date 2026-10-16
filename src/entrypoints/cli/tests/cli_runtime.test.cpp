@@ -29,6 +29,9 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
+#if defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+#include "src/backend/models/rfdetr/training/tests/encoder_training_fixture.h"
+#endif
 namespace {
 thread_local bool g_count_cli_allocations = false;
 thread_local std::size_t g_cli_allocation_count = 0U;
@@ -1100,3 +1103,39 @@ TEST_CASE("scoped required options accept environment defaults and enforce prese
  CHECK(rejected.error().code == reflection::ParseErrorCode::InvalidValue);
  CHECK(std::string_view(rejected.error().what()) == "command descriptor capacity exceeded");
 }
+
+#if defined(MMLTK_TEST_TORCH_RGB_RESIZE)
+TEST_CASE("CLI rejects ambiguous scratch sources before acquisition", "[core][cli][rfdetr][encoder_pretraining]") {
+ for (const auto& extra : std::vector<std::vector<std::string>>{{"--preset", "unknown"}, {"--preset", "rf-detr-atto", "--weights", "/missing/detector.pt"},
+       {"--preset", "rf-detr-atto", "--resume", "/missing/session.json"}, {"--preset", "rf-detr-atto", "--class-layout", "/missing/classes.json"}}) {
+  std::vector<std::string> arguments{mmltk_cli_path(), "rfdetr", "train", "--from-scratch", "--train-compiled", "train.bin", "--val-compiled", "val.bin", "--output-dir", "output"};
+  arguments.insert(arguments.end(), extra.begin(), extra.end());
+  const auto result = run_subprocess_capture_output(arguments);
+  CHECK(result.exit_code != 0);
+  CHECK(result.stderr_text.find("fatal:") != std::string::npos);
+  CHECK(result.stderr_text.find("from-scratch") != std::string::npos);
+  CHECK(result.stderr_text.find("checksum") == std::string::npos);
+ }
+}
+TEST_CASE("CLI reuses admitted encoder bytes and resumes their emitted session after source removal", "[core][cli][rfdetr][encoder_pretraining][gpu]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ const auto evidence = r::testsupport::encoder_training_evidence();
+ if (!evidence) SKIP("real scratch CLI requires explicit MMLTK_RFDETR_ENCODER_PRETRAINING_DIR");
+ const ScopedTempDir root("cli-scratch");
+ auto request = r::testsupport::encoder_training_request(root.path(), *evidence);
+ const auto invoke = [&] { return run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", "train", "--request-json", r::encode_train_request_json(request)}); };
+ const auto fresh = invoke();
+ INFO(fresh.output_text);
+ REQUIRE(fresh.exit_code == 0);
+ const auto session = request.output_dir / "session.json";
+ REQUIRE(fs::is_regular_file(session));
+ fs::remove(request.encoder_weights_path);
+ r::normalize_train_resume_request(request, session);
+ request.output_dir = root.path() / "resumed";
+ request.epochs = 2;
+ const auto resumed = invoke();
+ INFO(resumed.output_text);
+ REQUIRE(resumed.exit_code == 0);
+ REQUIRE(fs::is_regular_file(request.output_dir / "session.json"));
+}
+#endif

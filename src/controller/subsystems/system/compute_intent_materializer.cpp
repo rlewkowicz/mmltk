@@ -109,7 +109,7 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
   request.weights_path = model.artifact;
  } else {
   if (request.resume_path != model.artifact) return std::unexpected(refused("prepared training model does not match the selected resume checkpoint"));
-  request.weights_path.clear();
+  mmltk::backend::models::rfdetr::normalize_train_resume_request(request, request.resume_path);
  }
  request.val_compiled_path = (*validation)->path;
  if (request.test_compiled_path.empty()) {

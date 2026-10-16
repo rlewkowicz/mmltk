@@ -1,7 +1,24 @@
 #include "training_metrics.h"
 #include <algorithm>
 #include <stdexcept>
+#include "src/frameworks/serialization/reflected_json.h"
 namespace mmltk::backend::models::rfdetr {
+TrainingRun decode_training_run_json(std::string_view text) {
+ namespace serial = mmltk::frameworks::serialization;
+ constexpr serial::wire::Limits limits{.max_bytes = kTrainingManifestBytes, .max_items = 65536, .max_depth = 32};
+ auto document = serial::parse_bounded_json(text, limits);
+ migrate_train_request_record(document.at("configuration"));
+ auto result = serial::decode_reflected_json<TrainingRun>(document.dump(), limits);
+ if (result.encoder_pretraining && !encoder_pretraining_provenance_valid(*result.encoder_pretraining)) throw std::invalid_argument("invalid training run encoder provenance");
+ return result;
+}
+TrainingRecord decode_training_record_json(std::string_view text) {
+ namespace serial = mmltk::frameworks::serialization;
+ constexpr serial::wire::Limits limits{.max_bytes = kTrainingRecordBytes, .max_items = 8192, .max_depth = 32};
+ auto document = serial::parse_bounded_json(text, limits);
+ if (document.contains("attempt_configuration") && !document.at("attempt_configuration").is_null()) migrate_train_request_record(document.at("attempt_configuration"));
+ return serial::decode_reflected_json<TrainingRecord>(document.dump(), limits);
+}
 TrainingSourceCatalog training_source_catalog(const TrainRequest& request) {
  TrainingSourceCatalog result;
  const auto weights = request.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;

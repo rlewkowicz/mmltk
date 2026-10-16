@@ -20,6 +20,10 @@ template <class T>
 inline constexpr bool is_optional = false;
 template <class T>
 inline constexpr bool is_optional<std::optional<T>> = true;
+template <class T>
+inline constexpr bool is_scalar_optional = false;
+template <class T>
+inline constexpr bool is_scalar_optional<std::optional<T>> = std::is_same_v<T, bool> || std::is_same_v<T, int64_t> || std::is_same_v<T, double>;
 template <class Left, class Right, class Visitor>
 void visit_matching_members(Left& left, const Right& right, Visitor&& visit) {
  template for (constexpr auto left_member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Left, std::meta::access_context::current()))) {
@@ -37,6 +41,7 @@ struct NativeCheckpointMetadata {
  std::string preset_name;
  std::string source_kind;
  std::string source_path;
+ std::optional<EncoderPretrainingProvenance> encoder_pretraining;
  // Complete canonical configuration for format 5; external args are evidence only.
  std::string native_configuration;
  std::string external_topology;
@@ -84,7 +89,7 @@ private:
  void for_each_field(this Self&& self, Visitor&& visitor) {
   template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
    using Field = std::remove_cvref_t<decltype(self.[:member:])>;
-   if constexpr (model_state_detail::is_optional<Field> && (IncludeTopology || !std::meta::identifier_of(member).starts_with("topology_"))) {
+   if constexpr (model_state_detail::is_scalar_optional<Field> && (IncludeTopology || !std::meta::identifier_of(member).starts_with("topology_"))) {
     constexpr auto name = std::define_static_string(std::meta::identifier_of(member));
     visitor(name, self.[:member:]);
    }

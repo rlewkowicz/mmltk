@@ -74,6 +74,15 @@ void write_native_checkpoint_metadata(torch::serialize::OutputArchive& archive, 
  mmltk::backend::ml::serialization::write_int(archive, "num_classes", metadata.num_classes);
  mmltk::backend::ml::serialization::write_int(archive, "num_queries", metadata.num_queries);
  mmltk::backend::ml::serialization::write_int(archive, "num_select", metadata.num_select);
+ if (metadata.encoder_pretraining) {
+  if (!encoder_pretraining_provenance_valid(*metadata.encoder_pretraining)) throw std::invalid_argument("invalid encoder pretraining provenance");
+  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<EncoderPretrainingProvenance>();
+  serialization::wire::ByteBuffer bytes;
+  if (!serialization::encode(*metadata.encoder_pretraining, bytes, {.max_bytes = capacity, .max_items = 32, .max_depth = 4})) throw std::runtime_error("cannot encode encoder pretraining provenance");
+  auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+  std::memcpy(tensor.data_ptr<std::uint8_t>(), bytes.data(), bytes.size());
+  archive.write("encoder_pretraining_cbor", tensor);
+ }
  metadata.for_each_optional_field([&]<class Optional>(const char* key, const Optional& value) {
   if constexpr (std::is_same_v<typename Optional::value_type, bool>)
    mmltk::backend::ml::serialization::write_optional_bool(archive, key, value);
@@ -154,6 +163,7 @@ TrainingCheckpoint detail::inspect_training_model_checkpoint(const DecodedNative
  decoded.class_artifact->file()->snapshot.RequireUnchanged(result.path);
  result.class_layout = decoded.metadata.class_layout;
  result.original_weights = decoded.metadata.source_path;
+ result.encoder_pretraining = decoded.metadata.encoder_pretraining;
  const auto continuation = detail::read_training_continuation(archive);
  if (!continuation) {
   decoded.class_artifact->RequireUnchanged(stop);

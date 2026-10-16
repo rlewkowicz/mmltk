@@ -92,14 +92,14 @@ void validate_queries(const NativeCheckpointMetadata& metadata, const std::strin
 }
 void apply_checkpoint_detection_overrides(NativeRfDetrConfig& config, const NativeCheckpointMetadata& metadata) {
  model_state_detail::visit_matching_members(config, metadata, []<class Target, class Source>(Target& target, const Source& source) {
-  if constexpr (model_state_detail::is_optional<std::remove_cvref_t<Source>>) {
+  if constexpr (model_state_detail::is_scalar_optional<std::remove_cvref_t<Source>>) {
    if (source) target = *source;
   }
  });
 }
 void capture_checkpoint_detection_metadata(NativeCheckpointMetadata& metadata, const NativeRfDetrConfig& config) {
  model_state_detail::visit_matching_members(metadata, config, []<class Target, class Source>(Target& target, const Source& source) {
-  if constexpr (model_state_detail::is_optional<std::remove_cvref_t<Target>>) target = source;
+  if constexpr (model_state_detail::is_scalar_optional<std::remove_cvref_t<Target>>) target = source;
  });
 }
 template <class Config, class Metadata>
@@ -121,7 +121,7 @@ consteval bool configuration_policy_field(std::meta::info member) {
  return []<class Metadata>(std::string_view field_name) consteval {
   template for (constexpr auto evidence : std::define_static_array(std::meta::nonstatic_data_members_of(^^Metadata, std::meta::access_context::current()))) {
    using Value = std::remove_cvref_t<decltype(std::declval<Metadata>().[:evidence:])>;
-   if constexpr (model_state_detail::is_optional<Value>)
+   if constexpr (model_state_detail::is_scalar_optional<Value>)
     if (std::meta::identifier_of(evidence) == field_name) return true;
   }
   return false;
@@ -246,6 +246,7 @@ bool same_native_model_semantics(const NativeCheckpointMetadata& left, const Nat
  return a == b;
 }
 void validate_decoded_model_state(const DecodedNativeModelState& state) {
+ if (state.metadata.encoder_pretraining && !encoder_pretraining_provenance_valid(*state.metadata.encoder_pretraining)) throw std::invalid_argument("invalid encoder pretraining provenance");
  const ResolvedClassLayout layout(state.metadata.class_layout);
  if (state.metadata.num_classes <= 0 || layout.output_width() != static_cast<std::size_t>(state.metadata.num_classes))
   throw std::invalid_argument("checkpoint output width disagrees with its class layout");
@@ -349,6 +350,20 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  metadata.preset_name = mmltk::backend::ml::serialization::read_optional_value<std::string>(archive, "preset_name").value_or("");
  metadata.source_kind = mmltk::backend::ml::serialization::read_optional_value<std::string>(archive, "source_kind").value_or("native");
  metadata.source_path = mmltk::backend::ml::serialization::read_optional_value<std::string>(archive, "source_path").value_or(path);
+ c10::IValue provenance;
+ if (archive.try_read("encoder_pretraining_cbor", provenance)) {
+  if (!provenance.isTensor()) throw std::runtime_error("invalid encoder pretraining CBOR metadata");
+  auto tensor = provenance.toTensor();
+  namespace serial = mmltk::frameworks::serialization;
+  constexpr auto capacity = serial::reflected_maximum_cbor_bytes<EncoderPretrainingProvenance>();
+  if (!tensor.defined() || !tensor.is_cpu() || tensor.scalar_type() != torch::kUInt8 || tensor.dim() != 1 || tensor.numel() <= 0 || static_cast<std::uint64_t>(tensor.numel()) > capacity)
+   throw std::runtime_error("invalid encoder pretraining CBOR extent");
+  tensor = tensor.contiguous();
+  const auto bytes = std::span(reinterpret_cast<const std::byte*>(tensor.const_data_ptr()), static_cast<std::size_t>(tensor.numel()));
+  auto decoded = serial::decode<EncoderPretrainingProvenance>({bytes, {}}, {.max_bytes = capacity, .max_items = 32, .max_depth = 4});
+  if (!decoded || !encoder_pretraining_provenance_valid(*decoded)) throw std::runtime_error("invalid encoder pretraining provenance");
+  metadata.encoder_pretraining = std::move(*decoded);
+ }
  metadata.num_classes = mmltk::backend::ml::serialization::read_optional_value<int64_t>(archive, "num_classes").value_or(0);
  metadata.num_queries = mmltk::backend::ml::serialization::require_int(archive, "num_queries");
  metadata.num_select = mmltk::backend::ml::serialization::require_int(archive, "num_select");
@@ -598,6 +613,7 @@ ResolvedModelArtifacts resolve_admitted_model_artifacts(
  if (preset == nullptr && state.metadata.native_configuration.empty()) { throw std::runtime_error("unable to resolve RF-DETR weights preset"); }
  ResolvedModelArtifacts result;
  result.input_kind = state.metadata.source_kind == "upstream-python" ? "upstream-python" : "native-pt";
+ result.encoder_pretraining = state.metadata.encoder_pretraining;
  result.input_path = canonical;
  result.weights_path = canonical;
  result.artifact_root = canonical.parent_path();
@@ -635,6 +651,7 @@ ResolvedModelArtifacts resolve_admitted_model_artifacts(
 NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArtifacts& artifacts, const int64_t num_classes) {
  NativeCheckpointMetadata metadata;
  metadata.class_layout = artifacts.class_layout;
+ metadata.encoder_pretraining = artifacts.encoder_pretraining;
  metadata.preset_name = artifacts.config.preset_name;
  metadata.source_kind = artifacts.input_kind;
  metadata.source_path = artifacts.input_path.string();

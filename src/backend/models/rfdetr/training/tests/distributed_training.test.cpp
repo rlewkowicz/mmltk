@@ -10,9 +10,13 @@
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
-TEST_CASE("Two selected GPUs retain the global training objective and early NCCL overlap", "[rfdetr][training][distributed][nccl]") {
- const auto count = mmltk::testsupport::checked_cuda_device_count();
- if (count < 2) SKIP("Two CUDA devices unavailable; NCCL training coverage unverified");
+#include <fstream>
+#include "encoder_training_fixture.h"
+#include "detail/training_session_checkpoint.h"
+#include "src/test_support/filesystem_test_utils.hpp"
+namespace {
+namespace process = mmltk::frameworks::process;
+std::array<int, 2> selected_devices(int count) {
  std::array<int, 2> devices{0, 1};
  if (const auto* selected = std::getenv("MMLTK_TRAINING_TEST_DEVICE_IDS")) {
   const std::string text(selected);
@@ -25,6 +29,26 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
  REQUIRE(devices[0] < count);
  REQUIRE(devices[1] < count);
  REQUIRE(devices[0] != devices[1]);
+ return devices;
+}
+auto start_distributed_workers(const std::filesystem::path& store, const std::array<int, 2>& devices, const std::string& scenario) {
+ std::array<std::future<process::CapturedChildProcessResult>, 2> children;
+ for (std::size_t rank = 0; rank < children.size(); ++rank)
+  children[rank] = std::async(std::launch::async, [store, devices, scenario, rank] {
+   process::ArgvBuffer arguments({MMLTK_DISTRIBUTED_TRAINING_WORKER, store.string(), std::to_string(rank), std::to_string(devices[rank]), scenario});
+   return process::run_captured_child_process("training-nccl", "distributed training helper", [&](int output, int errors) {
+    process::prepare_captured_output_child(output, errors);
+    ::execv(arguments.program(), arguments.data());
+    process::fail_child_setup(errors, process::ChildSetupStage::Exec);
+   }, {}, std::chrono::seconds(600));
+  });
+ return children;
+}
+}  // namespace
+TEST_CASE("Two selected GPUs retain the global training objective and early NCCL overlap", "[rfdetr][training][distributed][nccl]") {
+ const auto count = mmltk::testsupport::checked_cuda_device_count();
+ if (count < 2) SKIP("Two CUDA devices unavailable; NCCL training coverage unverified");
+ const auto devices = selected_devices(count);
  const auto store = std::filesystem::temp_directory_path() / ("mmltk-training-nccl-" + std::to_string(::getpid()));
  std::filesystem::remove(store);
  namespace process = mmltk::frameworks::process;
@@ -39,16 +63,7 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
  SECTION("cancellation retains a real in-flight metric collective") { scenario = "cancel-metric"; }
  SECTION("cancellation retains real in-flight coalesced broadcasts") { scenario = "cancel-broadcast"; }
  CAPTURE(scenario);
- std::array<std::future<process::CapturedChildProcessResult>, 2> children;
- for (std::size_t rank = 0; rank < children.size(); ++rank)
-  children[rank] = std::async(std::launch::async, [&, rank] {
-   process::ArgvBuffer arguments({MMLTK_DISTRIBUTED_TRAINING_WORKER, store.string(), std::to_string(rank), std::to_string(devices[rank]), scenario});
-   return process::run_captured_child_process("training-nccl", "distributed training helper", [&](int output, int errors) {
-    process::prepare_captured_output_child(output, errors);
-    ::execv(arguments.program(), arguments.data());
-    process::fail_child_setup(errors, process::ChildSetupStage::Exec);
-   }, {}, std::chrono::seconds(600));
-  });
+ auto children = start_distributed_workers(store, devices, scenario);
  for (std::size_t rank = 0; rank < children.size(); ++rank) {
   CAPTURE(rank);
   process::CapturedChildProcessResult result;
@@ -79,4 +94,50 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
   }
  }
  std::filesystem::remove(store);
+}
+
+TEST_CASE("distributed scratch workers share admitted initialization and retire a rank zero import failure", "[rfdetr][training][distributed][encoder_pretraining][nccl]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ const auto evidence = r::testsupport::encoder_training_evidence();
+ if (!evidence) SKIP("real distributed scratch requires explicit MMLTK_RFDETR_ENCODER_PRETRAINING_DIR");
+ const auto count = mmltk::testsupport::checked_cuda_device_count();
+ if (count < 2) SKIP("two CUDA devices are required for distributed scratch");
+ const auto devices = selected_devices(count);
+ const mmltk::testsupport::ScopedTempDir root("distributed-scratch");
+ auto request = r::testsupport::encoder_training_request(root.path(), *evidence);
+ const auto store = root.path() / "rendezvous";
+ const auto run = [&](bool success) {
+  std::filesystem::remove(store);
+  { std::ofstream file(store.string() + ".request.json"); file << r::encode_train_request_json(request); }
+  auto children = start_distributed_workers(store, devices, "scratch-run");
+  for (auto& child : children) {
+   const auto result = child.get();
+   INFO(result.output);
+   CHECK_FALSE(result.setup_failure);
+   REQUIRE(WIFEXITED(result.status));
+   CHECK((WEXITSTATUS(result.status) == 0) == success);
+  }
+ };
+ run(true);
+ const auto initial_path = request.output_dir / "session.json";
+ const r::TrainingSessionAdmission initial(initial_path);
+ REQUIRE(initial.model(0).metadata.encoder_pretraining);
+ CHECK(initial.manifest().request.from_scratch);
+ CHECK(initial.manifest().request.encoder_weights_path.empty());
+ const auto alias = request.encoder_weights_path;
+ std::filesystem::remove(alias);
+ r::normalize_train_resume_request(request, initial_path);
+ request.output_dir = root.path() / "resumed";
+ request.epochs = 2;
+ run(true);
+ const r::TrainingSessionAdmission resumed(request.output_dir / "session.json");
+ CHECK(resumed.manifest().initialization == initial.manifest().initialization);
+ CHECK(resumed.model(0).metadata.encoder_pretraining == initial.model(0).metadata.encoder_pretraining);
+ request.resume_path.clear();
+ request.from_scratch = true;
+ request.encoder_weights_path = alias;
+ request.output_dir = root.path() / "rejected";
+ std::ofstream(alias) << "invalid original source";
+ run(false);
+ CHECK_FALSE(std::filesystem::exists(request.output_dir / "session.json"));
 }

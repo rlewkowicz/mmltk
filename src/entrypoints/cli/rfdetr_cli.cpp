@@ -42,6 +42,7 @@
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/controller/services/training/train_command.h"
+#include "src/controller/services/artifact_store.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.analysis_provider;
@@ -90,55 +91,56 @@ void finalize_compile_request(CompileCliRequest& request) {
    "--compile-benchmark-dataset");
  }
 }
-std::atomic<int> benchmark_cancel_descriptor{-1};
-std::atomic<unsigned> benchmark_signal_users{0};
+std::atomic<int> cli_cancel_descriptor{-1};
+std::atomic<unsigned> cli_signal_users{0};
 static_assert(std::atomic<int>::is_always_lock_free && std::atomic<unsigned>::is_always_lock_free);
-void request_benchmark_cancel(int) noexcept {
+void request_cli_cancel(int) noexcept {
  const int saved_errno = errno;
- benchmark_signal_users.fetch_add(1, std::memory_order_seq_cst);
- const int descriptor = benchmark_cancel_descriptor.load(std::memory_order_seq_cst);
+ cli_signal_users.fetch_add(1, std::memory_order_seq_cst);
+ const int descriptor = cli_cancel_descriptor.load(std::memory_order_seq_cst);
  if (descriptor >= 0) {
   const std::uint64_t requested = 1;
   while (::write(descriptor, &requested, sizeof(requested)) < 0 && errno == EINTR) {}
  }
- benchmark_signal_users.fetch_sub(1, std::memory_order_seq_cst);
+ cli_signal_users.fetch_sub(1, std::memory_order_seq_cst);
  errno = saved_errno;
 }
-class BenchmarkSignalScope final {
+class CliSignalScope final {
 public:
- BenchmarkSignalScope() : descriptor_(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {
-  if (descriptor_.get() < 0) throw std::system_error(errno, std::generic_category(), "cannot create benchmark signal event");
+ explicit CliSignalScope(int cancellation = -1)
+     : descriptor_(cancellation < 0 ? ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) : mmltk::common::concurrency::detail::duplicate_cancellation_descriptor(cancellation, "CLI acquisition")) {
+  if (descriptor_.get() < 0) throw std::system_error(errno, std::generic_category(), "cannot create CLI operation signal event");
   int unused = -1;
-  if (!benchmark_cancel_descriptor.compare_exchange_strong(unused, descriptor_.get())) throw std::logic_error("benchmark signal owner already exists");
+  if (!cli_cancel_descriptor.compare_exchange_strong(unused, descriptor_.get())) throw std::logic_error("CLI operation signal owner already exists");
   struct sigaction action{};
-  action.sa_handler = &request_benchmark_cancel;
+  action.sa_handler = &request_cli_cancel;
   ::sigemptyset(&action.sa_mask);
   if (::sigaction(SIGINT, &action, &previous_interrupt_) != 0) {
    const int failure = errno;
    retire_descriptor();
-   throw std::system_error(failure, std::generic_category(), "cannot install benchmark signal handler");
+   throw std::system_error(failure, std::generic_category(), "cannot install CLI operation signal handler");
   }
   if (::sigaction(SIGTERM, &action, &previous_terminate_) != 0) {
    const int failure = errno;
    (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
    retire_descriptor();
-   throw std::system_error(failure, std::generic_category(), "cannot install benchmark signal handler");
+   throw std::system_error(failure, std::generic_category(), "cannot install CLI operation signal handler");
   }
  }
- ~BenchmarkSignalScope() {
+ ~CliSignalScope() {
   (void)::sigaction(SIGTERM, &previous_terminate_, nullptr);
   (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
   retire_descriptor();
  }
  [[nodiscard]] bool cancelled() const noexcept { return mmltk::common::concurrency::detail::cancellation_descriptor_requested(descriptor_.get()); }
  [[nodiscard]] int descriptor() const noexcept { return descriptor_.get(); }
- BenchmarkSignalScope(const BenchmarkSignalScope&) = delete;
- BenchmarkSignalScope& operator=(const BenchmarkSignalScope&) = delete;
+ CliSignalScope(const CliSignalScope&) = delete;
+ CliSignalScope& operator=(const CliSignalScope&) = delete;
 
 private:
  void retire_descriptor() noexcept {
-  benchmark_cancel_descriptor.store(-1, std::memory_order_seq_cst);
-  while (benchmark_signal_users.load(std::memory_order_seq_cst)) std::this_thread::yield();
+  cli_cancel_descriptor.store(-1, std::memory_order_seq_cst);
+  while (cli_signal_users.load(std::memory_order_seq_cst)) std::this_thread::yield();
  }
  mmltk::common::io::ScopedFd descriptor_;
  struct sigaction previous_interrupt_{};
@@ -146,7 +148,7 @@ private:
 };
 void run_compile(const CompileCliRequest& request) {
  if (request.benchmark_resolution != 0) {
-  BenchmarkSignalScope signal_scope;
+  CliSignalScope signal_scope;
   data::BenchmarkCompilerConfig config;
   config.output_dir = request.output_dir;
   config.cache_dir = request.cache_dir;
@@ -423,6 +425,11 @@ int dispatch_command(const rfdetr::RfdetrCommandDescriptor& descriptor, const st
    }
    auto state = parse_train_request(arguments);
    auto request = rfdetr::finalize_train_request(std::move(state.request));
+   if (request.from_scratch) {
+    auto cancellation = services::ArtifactCancellationSource::Mint();
+    CliSignalScope signals(cancellation.second.descriptor());
+    services::prepare_train_encoder(request, services::ArtifactStore{}, cancellation.second);
+   }
    if (!request.distributed_worker && request.device_ids.size() > 1U) { return DistributedTrainingProcess::Run(request, logging_options); }
    const auto result = rfdetr::run_training(request);
    rfdetr::print_training_summary(request, result);

@@ -112,9 +112,14 @@ TrainingSelection read_training_selection(const std::filesystem::path& path) {
  identity.RequireUnchanged(path);
  return selected;
 }
-void write_training_manifest(const std::filesystem::path& path, const TrainingSessionManifest& value) { write_json(path, value, manifest_limits); }
+void write_training_manifest(const std::filesystem::path& path, const TrainingSessionManifest& value) {
+ auto saved = value;
+ saved.request = reusable_train_request(saved.request);
+ write_json(path, saved, manifest_limits);
+}
 TrainingSessionManifest read_training_manifest(const std::filesystem::path& path) {
- auto document = nlohmann::json::parse(read_file(path, kTrainingManifestBytes));
+ auto document = serial::parse_bounded_json(read_file(path, kTrainingManifestBytes), manifest_limits);
+ migrate_train_request_record(document.at("request"));
  if (!document.contains("identity_schema")) document["identity_schema"] = 1;
  auto value = serial::decode_reflected_json<TrainingSessionManifest>(document.dump(), manifest_limits);
  validate_training_session_manifest(value);

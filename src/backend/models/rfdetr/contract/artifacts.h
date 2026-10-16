@@ -1,6 +1,8 @@
 #pragma once
 #include <filesystem>
 #include <string>
+#include <optional>
+#include "encoder_pretraining.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/class_layout.h"
 namespace mmltk::backend::models::rfdetr {
@@ -15,6 +17,7 @@ struct ResolvedModelArtifacts {
  std::filesystem::path tensorrt_path{};
  NativeRfDetrConfig config{};
  ModelClassLayout class_layout{};
+ std::optional<EncoderPretrainingProvenance> encoder_pretraining;
  std::string artifact_sha256{};
  int automatic_num_queries_cap = 0;
  int source_num_queries = 0;

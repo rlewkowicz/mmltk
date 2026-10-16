@@ -1363,6 +1363,7 @@ mod training_history_tests {
             status: TrainingInspectionStatus::Ready,
             error: String::new(),
             checkpoint: Some(crate::generated::TrainingCheckpointCapability {
+                encoderpretraining: None,
                 path: path.into(),
                 resumable,
             }),

@@ -1545,7 +1545,7 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   const auto save = [&](TrainingModel& owner, const std::filesystem::path& path) {
    auto metadata = model_checkpoint_metadata(owner.model(), "native-fixture", "seeded-native-fixture.pt");
    auto publication = owner.begin_publication();
-   owner.save_resume(path, metadata, "prepared-training", "original.json");
+   owner.save_resume(path, metadata, "prepared-training", "original.json", request);
    publication.finish();
    auto state = decode_model_state(path);
    return detail::read_training_continuation(*state.admitted_archive())->values;

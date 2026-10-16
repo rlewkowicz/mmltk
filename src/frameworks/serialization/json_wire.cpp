@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 namespace mmltk::frameworks::serialization {
@@ -61,17 +63,24 @@ nlohmann::json json_from_cbor(wire::ByteSegments bytes, wire::Limits limits) {
  if (!value) throw std::runtime_error("invalid CBOR JSON projection");
  return project_json(std::move(*value));
 }
-wire::ByteBuffer json_to_cbor(std::string_view text, wire::Limits limits) {
+nlohmann::json parse_bounded_json(std::string_view text, wire::Limits limits) {
  if (text.size() > limits.max_bytes) throw std::runtime_error("JSON record exceeds its byte bound");
  std::size_t items = 0U;
- auto parsed = Json::parse(text, [&](int depth, Json::parse_event_t event, Json&) {
+ std::vector<std::unordered_set<std::string>> keys;
+ auto parsed = Json::parse(text, [&](int depth, Json::parse_event_t event, Json& value) {
+  if (event == Json::parse_event_t::object_end) keys.pop_back();
   if (event == Json::parse_event_t::object_end || event == Json::parse_event_t::array_end) return true;
   if (static_cast<std::size_t>(depth) > std::min(limits.max_depth, wire::kMaximumNestingDepth)) throw std::runtime_error("JSON record exceeds its depth bound");
   if (items == limits.max_items) throw std::runtime_error("JSON record exceeds its item bound");
   ++items;
+  if (event == Json::parse_event_t::object_start) keys.emplace_back();
+  if (event == Json::parse_event_t::key && !keys.back().insert(value.get<std::string>()).second) throw std::runtime_error("JSON record contains a duplicate key");
   return true;
  });
- auto value = project_wire(std::move(parsed));
+ return parsed;
+}
+wire::ByteBuffer json_to_cbor(std::string_view text, wire::Limits limits) {
+ auto value = project_wire(parse_bounded_json(text, limits));
  wire::ByteBuffer bytes;
  bytes.reserve(text.size());
  if (!wire::encode(value, bytes, limits)) throw std::runtime_error("JSON record violates native wire constraints");

@@ -425,6 +425,7 @@ impl TrainingFixture {
             directory: "fixture-saved-output".into(),
             selected: None,
             run: Some(TrainingRun {
+                encoderpretraining: None,
                 formatversion: template.formatversion,
                 runid: "fixture-saved".into(),
                 attemptid: "fixture-saved-attempt".into(),

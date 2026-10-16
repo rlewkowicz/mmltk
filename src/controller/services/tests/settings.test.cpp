@@ -1436,10 +1436,17 @@ TEST_CASE("checkpoint restore preserves output policy and installs explicit inhe
    request.train_compiled_path = "/restored/train.bin";
    request.val_compiled_path = "/restored/val.bin";
    request.output_dir = "/saved/old-output";
+   request.from_scratch = true;
+   request.encoder_weights_path = "/removed/base.safetensors";
    settings.RestoreTrainingCheckpoint(request, "/saved/checkpoint.pt");
    const auto verify = [&](const auto& snapshot) {
     const auto& train = snapshot.settings_state.workflows.train;
     CHECK_FALSE(train.use_compiled_directory_defaults);
+    CHECK_FALSE(train.request.from_scratch);
+    CHECK(train.request.encoder_weights_path.empty());
+    CHECK(train.request.class_layout_path.empty());
+    CHECK(train.request.resume_path == "/saved/checkpoint.pt");
+    CHECK(train.request.weights_path == "/saved/checkpoint.pt");
     CHECK(train.request.train_compiled_path == request.train_compiled_path);
     CHECK(train.request.val_compiled_path == request.val_compiled_path);
     CHECK(train.output.automatic == automatic);

@@ -214,7 +214,7 @@ TEST_CASE("checkpoint inspection replaces bounded worker work and guards cached 
  training.Shutdown();
  mmltk::testsupport::await_test_promise(cancelled, "shutdown joined inspection");
 }
-TEST_CASE("checkpoint capability projects only native path and resumability", "[controller][systems][training][reflection]") {
+TEST_CASE("checkpoint capability projects native path resumability and initialization lineage", "[controller][systems][training][reflection]") {
  namespace r = mmltk::backend::models::rfdetr;
  namespace reflection = mmltk::frameworks::reflection;
  r::TrainingCheckpoint checkpoint;
@@ -222,17 +222,19 @@ TEST_CASE("checkpoint capability projects only native path and resumability", "[
  checkpoint.resumable = true;
  checkpoint.configuration.emplace();
  checkpoint.attempt_id = "native-only-attempt";
+ checkpoint.encoder_pretraining = r::EncoderPretrainingProvenance{"capability.fixture", std::string(40, 'a'), std::string(64, 'b'), 2};
  checkpoint.class_layout = r::unresolved_class_layout(2);
  const auto capability = reflection::project_record<r::TrainingCheckpointCapability>(checkpoint);
  CHECK(capability.path == checkpoint.path);
  CHECK(capability.resumable);
+ CHECK(capability.encoder_pretraining == checkpoint.encoder_pretraining);
  std::size_t fields = 0;
  reflection::visit_materialized_members<r::TrainingCheckpointCapability>([&]<class Field>(const auto&) {
   constexpr auto name = reflection::materialized_member_name<Field::pointer>();
-  STATIC_REQUIRE((name == "path" || name == "resumable"));
+  STATIC_REQUIRE((name == "path" || name == "resumable" || name == "encoder_pretraining"));
   ++fields;
  });
- CHECK(fields == 2);
+ CHECK(fields == 3);
 }
 TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation and launch", "[controller][systems][training][local]") {
  namespace r = mmltk::backend::models::rfdetr;
@@ -290,6 +292,7 @@ TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation a
  const auto capability = training.PrepareResume({path});
  CHECK(capability.path == path);
  CHECK(capability.resumable);
+ CHECK(capability.encoder_pretraining == checkpoint.encoder_pretraining);
  CHECK(inspections == 1);
  const auto change = [&] {
   switch (mutation) {

@@ -6,6 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <fstream>
+#include <iterator>
+#include "src/backend/models/rfdetr/training/train.h"
 int main(int argc, char** argv) {
  using namespace mmltk::backend::models::rfdetr;
  DistributedContext group;
@@ -13,6 +16,19 @@ int main(int argc, char** argv) {
   if (argc != 5) throw std::invalid_argument("distributed training helper requires store, rank, selected device ordinal, case");
   const int rank = std::stoi(argv[2]), device = std::stoi(argv[3]);
   mmltk::backend::ml::cuda::TorchCudaDeviceGuard guard(mmltk::backend::ml::cuda::checked_device_index(device));
+  if (std::string_view(argv[4]) == "scratch-run") {
+   std::ifstream file(std::string(argv[1]) + ".request.json");
+   const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+   auto request = decode_train_request_json(text);
+   request.device_id = device;
+   request.device_ids.clear();
+   request.distributed_worker = true;
+   request.distributed_rank = rank;
+   request.distributed_world_size = 2;
+   request.distributed_store_path = argv[1];
+   (void)run_training(request);
+   return 0;
+  }
   group = make_distributed_context(argv[1], rank, 2, device, std::chrono::seconds(45));
   agree_training_topology(group, device);
   const auto precision = agree_training_precision(group, device, true, true);

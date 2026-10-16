@@ -639,3 +639,35 @@ TEST_CASE("Retained selectable sources reject foreign duplicate inconsistent and
  document.record.progress.val->bbox.ap50 = .75;
  CHECK_THROWS(r::validate_training_progress_document(document, sources.catalog));
 }
+
+TEST_CASE("scratch history retains original choice and lineage without a launch path", "[rfdetr][training][telemetry][encoder_pretraining]") {
+ const mmltk::testsupport::ScopedTempDir root("scratch-history");
+ r::TrainingRun run;
+ run.configuration.output_dir = root.path();
+ run.configuration.from_scratch = true;
+ run.configuration.preset_name = "rf-detr-atto";
+ run.configuration.encoder_weights_path = "/removed/launch-source.safetensors";
+ run.encoder_pretraining = r::EncoderPretrainingProvenance{"history.fixture", std::string(40, 'a'), std::string(64, 'b'), 2};
+ r::TrainingTelemetryWriter writer(run);
+ writer.Finish({}, {});
+ writer.Close();
+ REQUIRE_FALSE(writer.persistence().degraded);
+ std::ifstream file(root.path() / "run.json");
+ const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+ const auto saved = r::decode_training_run_json(text);
+ CHECK(saved.configuration.from_scratch);
+ CHECK(saved.configuration.encoder_weights_path.empty());
+ CHECK(saved.encoder_pretraining == run.encoder_pretraining);
+ CHECK(saved.original_weights.empty());
+ auto resumed = saved;
+ resumed.source_checkpoint_attempt_id = saved.attempt_id;
+ r::TrainingTelemetryWriter continuation(resumed, root.path() / "session.json");
+ continuation.Finish({}, {});
+ continuation.Close();
+ REQUIRE_FALSE(continuation.persistence().degraded);
+ std::ifstream again(root.path() / "run.json");
+ const auto restored = r::decode_training_run_json(std::string{std::istreambuf_iterator<char>(again), std::istreambuf_iterator<char>()});
+ CHECK(restored.configuration.from_scratch);
+ CHECK(restored.configuration.encoder_weights_path.empty());
+ CHECK(restored.encoder_pretraining == run.encoder_pretraining);
+}

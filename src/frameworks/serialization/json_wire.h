@@ -3,6 +3,7 @@
 #include <string_view>
 #include "cbor_wire.h"
 namespace mmltk::frameworks::serialization {
+[[nodiscard]] nlohmann::json parse_bounded_json(std::string_view text, wire::Limits limits);
 // JSON is an external representation of the canonical native wire vocabulary.
 // These conversions contain no reflected record or field inventory.
 [[nodiscard]] nlohmann::json json_from_cbor(wire::ByteSegments bytes, wire::Limits limits);

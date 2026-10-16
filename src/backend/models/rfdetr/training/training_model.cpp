@@ -492,10 +492,11 @@ void TrainingModel::save_ordinary_epoch(const NativeCheckpointMetadata& metadata
   directory / ("model-" + std::to_string(id()) + "-epoch-" + std::to_string(p.epoch) + "-ordinary-" + training_artifact_identity() + ".pt"), metadata, false, p.options.class_layout_path);
 }
 const std::optional<TrainingArtifactCandidate>& TrainingModel::best() const { return impl_->best; }
-void TrainingModel::save_resume(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, std::string_view attempt, const std::filesystem::path& original_descriptor) {
+void TrainingModel::save_resume(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, std::string_view attempt, const std::filesystem::path& original_descriptor, const TrainRequest& original_request) {
  mmltk::common::logging::ScopedProfile profile_resume{"rfdetr.train.save.resume"};
  auto& p = *impl_;
- p.snapshot.save_resume(path, metadata, p.optimizer_build.optimizer, p.scaler, p.options, p.epoch, p.ema ? p.ema->completed_updates() : 0, attempt, original_descriptor, p.continuation);
+ p.snapshot.save_resume(path, metadata, p.optimizer_build.optimizer, p.scaler, reusable_train_request(p.options, &original_request), p.epoch, p.ema ? p.ema->completed_updates() : 0, attempt,
+  original_descriptor, p.options.class_layout_path, p.continuation);
 }
 NativeRfDetrModel& TrainingModel::model() {
  impl_->snapshot.require_inactive();

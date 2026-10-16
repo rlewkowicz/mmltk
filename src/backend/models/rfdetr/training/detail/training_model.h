@@ -64,7 +64,7 @@ public:
  void remember_candidate(TrainingArtifactCandidate);
  void save_ordinary_epoch(const NativeCheckpointMetadata&, const std::filesystem::path&);
  [[nodiscard]] const std::optional<TrainingArtifactCandidate>& best() const;
- void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, std::string_view attempt, const std::filesystem::path& original_descriptor);
+ void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, std::string_view attempt, const std::filesystem::path& original_descriptor, const TrainRequest& original_request);
  [[nodiscard]] NativeRfDetrModel& model();
  [[nodiscard]] const std::vector<NormalizedModelStateEntry>& ordinary() const;
  [[nodiscard]] std::uint64_t id() const;

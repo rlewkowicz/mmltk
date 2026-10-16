@@ -26,6 +26,8 @@
 #include "src/backend/models/rfdetr/core/detail/modules_technical.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
+#include "src/backend/models/rfdetr/training/tests/encoder_training_fixture.h"
+#include "src/backend/models/rfdetr/training/train.h"
 #include "src/backend/models/rfdetr/training/detail/model_merging.h"
 #include "src/backend/models/rfdetr/training/detail/training_snapshot.h"
 #include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
@@ -2620,4 +2622,45 @@ TEST_CASE("Caller-owned joint planes preserve source coordinates covariance coun
  output.keypoints.capacity_bytes = product.nbytes();
  output.keypoint_capacity = 1;
  CHECK_THROWS(rfdetr::write_analysis_keypoints(selected, output));
+}
+
+TEST_CASE("scratch training products predict and validate without their encoder source", "[model][rfdetr][prediction][validation][encoder_pretraining][gpu]") {
+ const auto evidence = rfdetr::testsupport::encoder_training_evidence();
+ if (!evidence) SKIP("real scratch inference requires explicit MMLTK_RFDETR_ENCODER_PRETRAINING_DIR");
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+ const mmltk::testsupport::ScopedTempDir root("scratch-inference");
+ const auto training = rfdetr::testsupport::encoder_training_request(root.path(), *evidence);
+ const auto trained = rfdetr::run_training(training);
+ REQUIRE(trained.selected);
+ std::filesystem::remove(training.encoder_weights_path);
+ REQUIRE_FALSE(std::filesystem::exists(training.encoder_weights_path));
+ const mmltk::testsupport::ScopedTestStream stream;
+ const mmltk::backend::ml::runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
+ rfdetr::PredictRequest predict;
+ predict.weights_path = trained.selected->artifact.path;
+ predict.preset_name = training.preset_name;
+ predict.resolution = trained.artifacts.config.resolution;
+ predict.compiled_path = training.train_compiled_path;
+ predict.source_kind = rfdetr::PredictSourceKind::CompiledDataset;
+ predict.backend = "weights";
+ predict.allow_fp16 = false;
+ predict.compilation_mode = rfdetr::CompilationMode::kNone;
+ predict.progress_bar = false;
+ rfdetr::PredictionSession prediction;
+ CHECK(prediction.Run(predict, command).processed_images == 4);
+ rfdetr::ValidateRequest validate;
+ validate.weights_path = predict.weights_path;
+ validate.preset_name = predict.preset_name;
+ validate.resolution = predict.resolution;
+ validate.compiled_path = predict.compiled_path;
+ validate.eval_order = "weights";
+ validate.allow_fp16 = false;
+ validate.compilation_mode = rfdetr::CompilationMode::kNone;
+ validate.write_report_json = false;
+ validate.log_mode = rfdetr::ValidationLogMode::Quiet;
+ rfdetr::ValidationSession validation;
+ const auto result = validation.Run(validate, command);
+ CHECK(result.processed_images == 4);
+ CHECK(result.backends.at("weights").artifacts.encoder_pretraining == trained.artifacts.encoder_pretraining);
+ CHECK(result.backends.at("weights").artifacts.class_layout == trained.artifacts.class_layout);
 }

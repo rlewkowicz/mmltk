@@ -393,7 +393,7 @@ struct SnapshotFixture final {
  }
  [[nodiscard]] r::TrainingSnapshotPublication begin() { return snapshot.begin(ordinary, built.optimizer.eligible_parameter_names(), &ema); }
  void resume(const std::filesystem::path& path) {
-  snapshot.save_resume(path, r::testsupport::synthetic_training_metadata(), built.optimizer, scaler, request, 0, ema.completed_updates(), "attempt", {}, values);
+  snapshot.save_resume(path, r::testsupport::synthetic_training_metadata(), built.optimizer, scaler, request, 0, ema.completed_updates(), "attempt", {}, request.class_layout_path, values);
  }
  r::TrainRequest request;
  torch::OrderedDict<std::string, torch::Tensor> parameters;
@@ -453,8 +453,12 @@ TEST_CASE("one publication reuses ordinary EMA and Resume values and appends onl
  REQUIRE(accounting.copies.bytes == (cuda ? 32U : 0U));
  REQUIRE_THROWS(fixture.begin());
  const auto ordinary_path = directory.path() / "ordinary.pt", ema_path = directory.path() / "ema.pt";
- fixture.snapshot.save_weights(ordinary_path, r::testsupport::synthetic_training_metadata(), false, {});
- fixture.snapshot.save_weights(ema_path, r::testsupport::synthetic_training_metadata(), true, {});
+ auto metadata = r::testsupport::synthetic_training_metadata();
+ metadata.encoder_pretraining = r::EncoderPretrainingProvenance{"snapshot.fixture", std::string(40, 'a'), std::string(64, 'b'), 2};
+ fixture.snapshot.save_weights(ordinary_path, metadata, false, {});
+ fixture.snapshot.save_weights(ema_path, metadata, true, {});
+ CHECK(r::decode_native_model_state(ordinary_path).metadata.encoder_pretraining == metadata.encoder_pretraining);
+ CHECK(r::decode_native_model_state(ema_path).metadata.encoder_pretraining == metadata.encoder_pretraining);
  fixture.snapshot.save_weights(directory.path() / "ordinary-again.pt", r::testsupport::synthetic_training_metadata(), false, {});
  REQUIRE(accounting.copies.count() == (cuda ? 5U : 0U));
  fixture.resume(directory.path() / "resume.pt");
@@ -574,15 +578,30 @@ TEST_CASE("ordinary publication excludes stale EMA after released storage is reu
  fixture.request.use_ema = false;
  auto publication = fixture.snapshot.begin(fixture.ordinary, {}, nullptr);
  REQUIRE_THROWS(fixture.snapshot.save_weights(directory.path() / "unadmitted-ema.pt", r::testsupport::synthetic_training_metadata(), true, {}));
+ const auto original_descriptor = directory.path() / "historical.classes.json";
+ std::filesystem::create_symlink(original_descriptor.filename(), original_descriptor);
+ REQUIRE_THROWS(std::filesystem::weakly_canonical(original_descriptor));
+ auto original = fixture.request;
+ original.class_layout_path = original_descriptor;
+ auto active = original;
+ r::normalize_train_resume_request(active, directory.path() / "session.json");
+ const auto saved_request = r::reusable_train_request(active, &original);
+ auto metadata = r::testsupport::synthetic_training_metadata();
+ metadata.encoder_pretraining = r::EncoderPretrainingProvenance{"publication.fixture", std::string(40, 'a'), std::string(64, 'b'), 2};
+ const auto destination = directory.path() / "ordinary-resume.pt";
+ REQUIRE_THROWS(fixture.snapshot.save_resume(destination, metadata, fixture.built.optimizer, fixture.scaler, saved_request, 0, 0, "attempt", original_descriptor, destination, fixture.values));
  fixture.snapshot.save_resume(
-  directory.path() / "ordinary-resume.pt", r::testsupport::synthetic_training_metadata(), fixture.built.optimizer, fixture.scaler, fixture.request, 0, 0, "attempt", {}, fixture.values);
+  destination, metadata, fixture.built.optimizer, fixture.scaler, saved_request, 0, 0, "attempt", original_descriptor, active.class_layout_path, fixture.values);
  publication.finish();
- auto saved = r::decode_native_model_state(directory.path() / "ordinary-resume.pt");
+ auto saved = r::decode_native_model_state(destination);
+ REQUIRE(saved.metadata.encoder_pretraining == metadata.encoder_pretraining);
  torch::serialize::InputArchive unwanted;
  REQUIRE_FALSE(saved.admitted_archive()->try_read("ema_state", unwanted));
  const auto continuation = r::detail::read_training_continuation(*saved.admitted_archive());
  REQUIRE(continuation);
  REQUIRE(continuation->values.ema_completed_updates == 0);
+ REQUIRE(continuation->configuration == saved_request);
+ REQUIRE(continuation->values.training_original_descriptor == original_descriptor.string());
 }
 TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][training][ema][snapshot]") {
  r::NativeRfDetrConfig config;

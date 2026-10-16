@@ -18,7 +18,7 @@ private:
 // Publication copies bounded CPU facts and never waits for queue or disk space.
 class TrainingTelemetryWriter final {
 public:
- explicit TrainingTelemetryWriter(TrainingRun);
+ explicit TrainingTelemetryWriter(TrainingRun, std::filesystem::path resume_path = {});
  ~TrainingTelemetryWriter() noexcept;
  TrainingTelemetryWriter(const TrainingTelemetryWriter&) = delete;
  TrainingTelemetryWriter& operator=(const TrainingTelemetryWriter&) = delete;

@@ -1,4 +1,5 @@
 #pragma once
+#include <nlohmann/json_fwd.hpp>
 #include "src/frameworks/reflection/reflected_declarations.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
@@ -208,6 +209,10 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
 };
 [[nodiscard]] std::string encode_train_request_json(const TrainRequest&);
 [[nodiscard]] TrainRequest decode_train_request_json(std::string_view);
+// Only the two additive initialization fields migrate at owned persistence boundaries.
+void migrate_train_request_record(nlohmann::json&);
+[[nodiscard]] TrainRequest reusable_train_request(TrainRequest, const TrainRequest* original = nullptr);
+void normalize_train_resume_request(TrainRequest&, const std::filesystem::path&);
 MMLTK_REFLECT_FIELDS(TrainRequest)
 }  // namespace mmltk::backend::models::rfdetr
 namespace mmltk::backend::models::rfdetr {

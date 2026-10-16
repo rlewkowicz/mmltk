@@ -37,6 +37,9 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "training_continuation_fixture.h"
+#include "encoder_training_fixture.h"
+#include "src/backend/models/rfdetr/core/encoder_pretraining.h"
+#include "src/frameworks/serialization/reflected_json.h"
 #include "model_state_fixture.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -863,5 +866,145 @@ TEST_CASE("PE Base and keypoint sessions retain shared independent and averaged 
     CHECK(r::checkpoint_configuration(left.model(0).metadata).keypoints_per_class == config.keypoints_per_class);
    }
   }
+ }
+}
+
+TEST_CASE("legacy checkpoint requests migrate only absent encoder launch fields", "[rfdetr][training][continuation][encoder_pretraining]") {
+ namespace serial = mmltk::frameworks::serialization;
+ auto request = saved_request();
+ auto legacy = nlohmann::json::parse(r::encode_train_request_json(request));
+ legacy.erase("from_scratch");
+ legacy.erase("encoder_weights_path");
+ const auto read = [&](const nlohmann::json& document) {
+  const auto bytes = serial::json_to_cbor(document.dump(), {.max_bytes = r::kMaximumTrainRequestJsonBytes, .max_items = 4096, .max_depth = 32});
+  auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
+  std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
+  torch::serialize::OutputArchive output;
+  output.write("training_configuration_cbor", tensor);
+  auto input = r::testsupport::checkpoint_input(output);
+  return r::detail::read_training_configuration(input);
+ };
+ CHECK(read(legacy) == request);
+ for (const auto* name : {"from_scratch", "encoder_weights_path"}) {
+  auto invalid = legacy;
+  invalid[name] = nullptr;
+  REQUIRE_THROWS(read(invalid));
+ }
+ auto invalid = legacy;
+ invalid.erase("epochs");
+ REQUIRE_THROWS(read(invalid));
+ invalid = legacy;
+ invalid["new_source"] = true;
+ REQUIRE_THROWS(read(invalid));
+ request.weights_path.clear();
+ request.from_scratch = true;
+ request.preset_name = "rf-detr-atto";
+ request.encoder_weights_path = "/launch-only/base.safetensors";
+ auto source = continuation_fixture(request);
+ const auto restored = r::detail::read_training_continuation(source);
+ REQUIRE(restored);
+ CHECK(restored->configuration.from_scratch);
+ CHECK(restored->configuration.encoder_weights_path.empty());
+ auto active = restored->configuration;
+ r::normalize_train_resume_request(active, "/immutable/session.json");
+ CHECK_NOTHROW(r::detail::require_active_training_continuation(*restored, active));
+}
+
+TEST_CASE("verified scratch sessions preserve fresh task state lineage and source independent Resume", "[rfdetr][training][continuation][encoder_pretraining][gpu]") {
+ const auto evidence = r::testsupport::encoder_training_evidence();
+ if (!evidence) SKIP("real encoder lifecycle requires explicit MMLTK_RFDETR_ENCODER_PRETRAINING_DIR");
+ REQUIRE(mmltk::testsupport::checked_cuda_device_count() > 0);
+ for (const auto preset : {"rf-detr-atto", "rf-detr-seg-nano", "rf-detr-keypoint-preview", "rf-detr-xlarge"}) DYNAMIC_SECTION(preset) {
+  const mmltk::testsupport::ScopedTempDir root("scratch-session");
+  auto request = r::testsupport::encoder_training_request(root.path(), *evidence, preset);
+  if (std::string_view(preset) == "rf-detr-atto") {
+   request.num_queries = 0;
+   request.lane_configuration.mode = r::TrainLaneMode::Independent;
+   r::resize_training_models(request.lane_configuration, 2, request.recipe, request.seed);
+   request.lane_configuration.final_policy = r::TrainFinalPolicy::Uniform;
+  }
+  request.freeze_encoder = std::string_view(preset) != "rf-detr-seg-nano";
+  const auto result = r::run_training(request);
+  REQUIRE(result.selected);
+  REQUIRE(result.test_summary);
+  const auto& artifacts = result.artifacts;
+  const auto& provenance = artifacts.encoder_pretraining;
+  REQUIRE(provenance);
+  CHECK(*provenance == r::encoder_pretraining_provenance(*r::find_encoder_pretraining_asset(artifacts.config.backbone.kind)));
+  CHECK(artifacts.input_path.empty());
+  const auto source = mmltk::backend::data::CompiledDataset::open(request.train_compiled_path);
+  CHECK(artifacts.class_layout == r::native_training_class_layout(*source.class_catalog()));
+  CHECK(artifacts.config.num_classes == static_cast<int>(source.class_catalog()->size()) + 1);
+  CHECK(artifacts.source_num_queries == r::native_config_from_preset(*r::find_preset_catalog_entry(preset)).num_queries);
+  CHECK(artifacts.automatic_num_queries_cap == artifacts.source_num_queries);
+  if (request.num_queries == 0) CHECK(artifacts.config.num_queries == std::min<std::uint32_t>(source.header().max_instances_per_image * 2U + 1U, artifacts.automatic_num_queries_cap));
+  if (artifacts.config.has_keypoints()) CHECK(artifacts.config.keypoints_per_class == r::native_training_keypoint_counts(*source.class_catalog()));
+  if (std::string_view(preset) == "rf-detr-atto") CHECK(artifacts.config.dec_layers == 0);
+  // Reconstruct the seeded common model before any update. Its complete hash,
+  // encoder state and fresh task heads are the session's original identity.
+  torch::manual_seed(static_cast<std::uint64_t>(request.seed));
+  r::NativeRfDetrModel initial(artifacts.config, artifacts.class_layout);
+  initial.initialize_training_supervision(static_cast<std::uint64_t>(request.seed));
+  const auto fresh_heads = initial.named_parameters(true)["class_embed.weight"].detach().clone();
+  const auto loaded = r::initialize_encoder_pretraining(initial, request.encoder_weights_path);
+  CHECK(torch::equal(initial.named_parameters(true)["class_embed.weight"], fresh_heads));
+  CHECK(loaded.provenance == provenance);
+  r::TrainingSessionAdmission session(result.checkpoint_path);
+  CHECK(session.manifest().initialization == r::native_state_fingerprint(r::collect_module_state(initial)));
+  CHECK(session.manifest().request.from_scratch);
+  CHECK(session.manifest().request.encoder_weights_path.empty());
+  const auto parameters = initial.named_parameters(true);
+  const auto buffers = initial.named_buffers(true);
+  for (std::size_t model = 0; model < session.model_count(); ++model) {
+   const auto& state = session.model(model);
+   CHECK(state.metadata.encoder_pretraining == provenance);
+   CHECK(state.metadata.source_path.empty());
+   CHECK(session.continuation(model).configuration.from_scratch);
+   CHECK(session.continuation(model).configuration.encoder_weights_path.empty());
+   CHECK(session.continuation(model).values.schedule.consumed_attempts > 0);
+   std::size_t changed_encoder_tensors = 0;
+   for (const auto& value : state.entries()) if (value.name.starts_with("backbone.0.encoder.")) {
+    const auto* expected = parameters.find(value.name);
+    if (!expected) expected = buffers.find(value.name);
+    REQUIRE(expected);
+    const bool equal = torch::equal(value.tensor, *expected);
+    if (request.freeze_encoder) CHECK(equal);
+    changed_encoder_tensors += !equal;
+   }
+   if (!request.freeze_encoder) CHECK(changed_encoder_tensors > 0);
+  }
+  if (session.model_count() > 1) {
+   CHECK(session.plan().shards[0].seed != session.plan().shards[1].seed);
+   CHECK(r::native_state_fingerprint(session.model(0).entries()) != r::native_state_fingerprint(session.model(1).entries()));
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(request.output_dir)) if (entry.path().extension() == ".pt")
+   CHECK(r::decode_native_model_state(entry.path()).metadata.encoder_pretraining == provenance);
+  CHECK(r::decode_native_model_state(result.selected->artifact.path).metadata.encoder_pretraining == provenance);
+  const auto inspection = r::inspect_training_checkpoint(result.checkpoint_path).checkpoint();
+  CHECK(inspection.encoder_pretraining == provenance);
+  const auto initialization = session.manifest().initialization;
+  std::filesystem::remove(request.encoder_weights_path);
+  REQUIRE_FALSE(std::filesystem::exists(request.encoder_weights_path));
+  r::normalize_train_resume_request(request, result.checkpoint_path);
+  request.epochs = 2;
+  request.output_dir = root.path() / "resumed";
+  const auto continued = r::run_training(request);
+  REQUIRE(continued.selected);
+  r::TrainingSessionAdmission resumed(continued.checkpoint_path);
+  CHECK(resumed.manifest().initialization == initialization);
+  CHECK(resumed.manifest().request.from_scratch);
+  CHECK(resumed.manifest().request.encoder_weights_path.empty());
+  CHECK(resumed.model(0).metadata.encoder_pretraining == provenance);
+  CHECK(resumed.continuation(0).values.schedule.consumed_attempts > session.continuation(0).values.schedule.consumed_attempts);
+  // Ordinary Transfer records the emitted detector as input while retaining lineage.
+  request.resume_path.clear();
+  request.weights_path = continued.selected->artifact.path;
+  request.epochs = 1;
+  request.output_dir = root.path() / "transfer";
+  const auto transferred = r::run_training(request);
+  CHECK(transferred.artifacts.encoder_pretraining == provenance);
+  r::TrainingSessionAdmission transfer(transferred.checkpoint_path);
+  CHECK(transfer.model(0).metadata.source_path == std::filesystem::canonical(request.weights_path).string());
+  CHECK_FALSE(transfer.manifest().request.from_scratch);
  }
 }
