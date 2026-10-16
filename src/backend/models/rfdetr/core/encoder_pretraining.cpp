@@ -3,6 +3,7 @@
 #include "encoder_pretraining.h"
 #include "model.h"
 #include "detail/backbone.h"
+#include "detail/position_embedding.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
 #include <torch/torch.h>
@@ -162,9 +163,7 @@ torch::Tensor resample_encoder_positions(const torch::Tensor& source, const std:
  const auto old = static_cast<std::int64_t>(std::llround(std::sqrt(static_cast<double>(source.size(1) - 1))));
  require(old * old + 1 == source.size(1), "source position grid is not square");
  if (old == grid) return source;
- const auto spatial = source.narrow(1, 1, old * old).reshape({1, old, old, source.size(2)}).permute({0, 3, 1, 2});
- const auto resized = F::interpolate(spatial, F::InterpolateFuncOptions().size(std::vector<std::int64_t>{grid, grid}).mode(torch::kBicubic).align_corners(false).antialias(true));
- return torch::cat({source.narrow(1, 0, 1), resized.permute({0, 2, 3, 1}).reshape({1, grid * grid, source.size(2)})}, 1);
+ return interpolate_position_embedding(source, old, grid, grid);
 }
 NormalizedModelStateCandidate stage_encoder_pretraining(BackboneEncoder& encoder, const NativeRfDetrConfig& config, const std::vector<NormalizedModelStateEntry>& state) {
  const auto* asset = find_encoder_pretraining_asset(config.backbone.kind);

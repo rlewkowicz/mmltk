@@ -4,16 +4,13 @@
 #include "detail/backbone.h"
 #include "detail/decoder_attention.h"
 #include "detail/linear.h"
+#include "detail/position_embedding.h"
 #include <torch/torch.h>
-#include <torch/nn/functional.h>
-#include <ATen/TensorIndexing.h>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 namespace mmltk::backend::models::rfdetr::detail {
 namespace {
-namespace F = torch::nn::functional;
-using namespace torch::indexing;
 torch::Tensor rotary_embedding(int64_t height, int64_t width, int64_t head_dim, torch::TensorOptions options) {
  // timm 1.0.27 uses reciprocal positive powers, xy indexing, grid_offset=1
  // and a 24x24 reference grid. Preserve those rounding boundaries.
@@ -118,9 +115,7 @@ public:
   if (pixels.size(2) % (config_.patch_size * windows) || pixels.size(3) % (config_.patch_size * windows)) throw std::invalid_argument("PE-Core-T input is not divisible by patch_size * num_windows");
   auto positions = pos_embed_;
   if (h != config_.positional_encoding_size || w != config_.positional_encoding_size) {
-   auto grid = positions.narrow(1, 1, positions.size(1) - 1).reshape({1, config_.positional_encoding_size, config_.positional_encoding_size, dim}).permute({0, 3, 1, 2});
-   grid = F::interpolate(grid.to(torch::kFloat32), F::InterpolateFuncOptions().size(std::vector<int64_t>{h, w}).mode(torch::kBicubic).align_corners(false).antialias(true));
-   positions = torch::cat({positions.narrow(1, 0, 1), grid.permute({0, 2, 3, 1}).reshape({1, h * w, dim}).to(positions.scalar_type())}, 1);
+   positions = interpolate_position_embedding(positions, config_.positional_encoding_size, h, w);
   }
   auto tokens = projection_->forward(pixels).flatten(2).transpose(1, 2);
   tokens = norm_pre_->forward(torch::cat({cls_token_.expand({batch, -1, -1}), tokens}, 1) + positions);

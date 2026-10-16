@@ -95,6 +95,7 @@ mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
     dino_backbone.cpp
     pe_core_backbone.cpp
+    position_embedding.cpp
     keypoint_head.cpp
     keypoint_layout.cpp
     keypoint_ops.cpp
@@ -115,6 +116,7 @@ mmltk_register_private_headers(
     detail/selective_compilation.h
     detail/tensor_trace.h
     detail/backbone.h
+    detail/position_embedding.h
     detail/keypoint_head.h
     detail/keypoint_ops.h
     detail/decoder_attention.h
@@ -289,6 +291,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
     mmltk_register_ordinary_sources(mmltk_backend_models_rfdetr_core_tests
         ${CMAKE_SOURCE_DIR}/tools/oracle/native_catalog.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/encoder_pretraining.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/position_embedding.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/inference_lanes.test.cpp)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_core_tests ${sources})

@@ -2,15 +2,14 @@
 #include "detail/modules_technical.h"
 #include "detail/decoder_attention.h"
 #include "detail/linear.h"
+#include "detail/position_embedding.h"
 #include <torch/nn/functional.h>
-#include <ATen/TensorIndexing.h>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 namespace F = torch::nn::functional;
 namespace mmltk::backend::models::rfdetr {
 namespace {
-using namespace torch::indexing;
 class LayerNorm2dImpl : public torch::nn::Module {
 public:
  explicit LayerNorm2dImpl(int64_t normalized_shape, double eps = 1.0e-6)
@@ -119,18 +118,10 @@ public:
   const int64_t num_patches = embeddings.size(1) - 1;
   const int64_t num_positions = position_embeddings.size(1) - 1;
   if (num_patches == num_positions && height == width) { return position_embeddings; }
-  auto class_pos_embed = position_embeddings.index({Slice(), 0});
-  auto patch_pos_embed = position_embeddings.index({Slice(), Slice(1, None)});
-  const int64_t dim = embeddings.size(-1);
   const int64_t patch_height = height / patch_size_;
   const int64_t patch_width = width / patch_size_;
   const auto sqrt_num_positions = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(num_positions))));
-  patch_pos_embed = patch_pos_embed.view({1, sqrt_num_positions, sqrt_num_positions, dim}).permute({0, 3, 1, 2});
-  patch_pos_embed =
-   F::interpolate(patch_pos_embed.to(torch::kFloat32), F::InterpolateFuncOptions().size(std::vector<int64_t>{patch_height, patch_width}).mode(torch::kBicubic).align_corners(false).antialias(true))
-    .to(position_embeddings.dtype());
-  patch_pos_embed = patch_pos_embed.permute({0, 2, 3, 1}).reshape({1, -1, dim});
-  return torch::cat({class_pos_embed.unsqueeze(0), patch_pos_embed}, 1);
+  return detail::interpolate_position_embedding(position_embeddings, sqrt_num_positions, patch_height, patch_width);
  }
  torch::Tensor forward(const torch::Tensor& pixel_values) {
   const int64_t batch_size = pixel_values.size(0);
