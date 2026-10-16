@@ -299,7 +299,7 @@ class Wrapper {
  bool gui = false, build = false, build_gui = false, protocol = false, bindings = false, export_shiftlut = false, update_gui = false, update_firefox = false;
  bool build_tools = false, tidy_tools = false;
  bool tidy = false, third_party = false, prepare_gui = false, test = false, declaration = false, cleanup_report = false, diagnose_io = false, diagnose_nvidia = false, diagnose_gpu = false;
- bool test_config_explicit = false, debugger = false, headless = false, upstream_tests = false;
+ bool test_config_explicit = false, debugger = false, headless = false, upstream_tests = false, encoder_pretraining_tests = false;
  std::string shiftlut_source, shiftlut_operation, declaration_operation, cleanup_profile, io_path, gpu_image = "runtime", suite, test_config = "release", test_executable;
  Args original, passthrough, rewritten, test_args, test_environment, debugger_commands, declaration_args, nvidia_args, nvidia_configuration;
  Args mounts, groups, execution_args, container_command, active_container_names;
@@ -2241,7 +2241,7 @@ class Wrapper {
   const auto input = fingerprint({revision, donor, tools_id},
               {"docker/Dockerfile.rfdetr-oracle", "docker/nvidia-payload.json", "tools/oracle/rfdetr_oracle_requirements.txt", "tools/oracle/generate_rfdetr_upstream_oracle.cpp",
                "tools/oracle/native_catalog.cpp", "tools/oracle/native_catalog.h", "tools/oracle/rfdetr_sources.json", "src/backend/models/rfdetr/contract/preset_catalog.h",
-               "src/backend/models/rfdetr/contract/model_topology.h", "src/backend/models/rfdetr/contract/training_supervision.h", "src/backend/models/rfdetr/contract/weight_catalog.h",
+               "src/backend/models/rfdetr/contract/model_topology.h", "src/backend/models/rfdetr/contract/encoder_pretraining.h", "src/backend/models/rfdetr/contract/training_supervision.h", "src/backend/models/rfdetr/contract/weight_catalog.h",
                "src/backend/models/rfdetr/contract/class_layout.h", "src/backend/models/rfdetr/contract/output_roles.h", "src/backend/models/rfdetr/contract/model_config.cpp",
                "src/backend/models/rfdetr/contract/model_config.h", "src/backend/models/rfdetr/contract/weight_catalog.cpp", "src/backend/models/rfdetr/contract/contract.h",
                "src/backend/models/contract/capabilities.h", "src/common/types/string_utils.h", "src/backend/data/catalog/keypoint_visibility.h", "src/backend/data/catalog/class_catalog.h",
@@ -2323,11 +2323,13 @@ class Wrapper {
    return 0;
   }
   std::string upstream, plus_upstream, output, sdpa = "default", selected_case;
-  bool inventory_only = false, backward_operators = false, export_reference = false;
+  bool inventory_only = false, backward_operators = false, export_reference = false, encoder_pretraining_only = false;
   for (std::size_t i = 0; i < arguments.size(); ++i) {
    const auto& option = arguments[i];
    if (option == "--inventory-only") {
     inventory_only = true;
+   } else if (option == "--encoder-pretraining-only") {
+    encoder_pretraining_only = true;
    } else if (option == "--backward-operators") {
     backward_operators = true;
    } else if (option == "--export-reference") {
@@ -2341,6 +2343,8 @@ class Wrapper {
    } else
     die("unknown RF-DETR oracle option '" + option + "'");
   }
+  require(!encoder_pretraining_only || (!inventory_only && selected_case.empty() && !backward_operators && !export_reference),
+   "--encoder-pretraining-only excludes inventory-only, case, backward-operators and export-reference");
   require(selected_case.empty() || (!inventory_only && !prepare_only && matches(selected_case, "rf-detr-[a-z0-9-]+-(controlled-group2|stock)-(fp32|fp16|bf16)-b[12]-(train|eval)")),
    "--case requires one exact numerical case identity and cannot be combined with inventory-only");
   require(!backward_operators || !selected_case.empty(), "--backward-operators requires --case ID");
@@ -2409,11 +2413,11 @@ class Wrapper {
    const auto observed = owned_docker(name + "-capability", probe, {.capture = true});
    require(!observed.status, "required oracle CUDA precision inspection failed");
    capability = support::json::parse(observed.out);
-   require(capability.at("fp32") == true && capability.at("fp16") == true && capability.at("bf16").is_boolean(), "required oracle precision capability unavailable");
+   require(capability.at("fp32") == true && (encoder_pretraining_only || (capability.at("fp16") == true && capability.at("bf16").is_boolean())), "required oracle precision capability unavailable");
   }
   const auto generation_input = image_input + "\n" + source_trees + "\n" + sdpa + "\n" + capability.dump();
   const auto input = sha(generation_input + (selected_case.empty() ? "" : "\ncase=" + selected_case) + (backward_operators ? "\nbackward_operators=true" : "") +
-                         (export_reference ? "\nexport_reference=true" : ""));
+                         (export_reference ? "\nexport_reference=true" : "") + (encoder_pretraining_only ? "\nmode=encoder-pretraining" : "\nmode=detector"));
   if (output.empty()) {
    output = cache + "/tests/rfdetr/upstream/" + input + (inventory_only ? "-inventory" : "");
    if (!prepare_only) prepare_logging(output + "/wrapper.log");
@@ -2434,6 +2438,7 @@ class Wrapper {
   append(args, {image, "--signal=TERM", "--kill-after=15s", "172800s", "/opt/rfdetr-oracle/mmltk-rfdetr-upstream-oracle", "--upstream", "/upstream", "--plus-upstream", "/plus-upstream", "--output",
                 "/evidence", "--weights", "/weights", "--fingerprint", input, "--sdpa", sdpa});
   if (inventory_only) args.emplace_back("--inventory-only");
+  if (encoder_pretraining_only) args.emplace_back("--encoder-pretraining-only");
   if (!selected_case.empty()) append(args, {"--case", selected_case});
   if (backward_operators) args.emplace_back("--backward-operators");
   if (export_reference) args.emplace_back("--export-reference");
@@ -2444,10 +2449,11 @@ class Wrapper {
    require(retained.value("selected_case", std::string{}) == selected_case, "cached upstream evidence selection differs");
    require(retained.value("backward_operators", false) == backward_operators, "cached upstream diagnostic selection differs");
    require(retained.value("export_reference", false) == export_reference, "cached upstream export reference selection differs");
-   require(retained.at("status") == (inventory_only ? "verified_inventory_complete" : selected_case.empty() ? "references_complete_native_comparison_pending" : "selected_reference_native_comparison_pending"),
+   require(retained.value("mode", std::string("detector")) == (encoder_pretraining_only ? "encoder-pretraining" : "detector"), "cached upstream evidence mode differs");
+   require(retained.at("status") == (encoder_pretraining_only ? "encoder_references_complete_native_comparison_pending" : inventory_only ? "verified_inventory_complete" : selected_case.empty() ? "references_complete_native_comparison_pending" : "selected_reference_native_comparison_pending"),
     "cached upstream evidence is incomplete");
    if (!inventory_only)
-    require(retained.at("format") == "mmltk.rfdetr.upstream-oracle.v2" && retained.at("precision_capability") == capability, "cached reference precision capability differs from current hardware");
+    require(retained.at("format") == (encoder_pretraining_only ? "mmltk.rfdetr.encoder-pretraining.v1" : "mmltk.rfdetr.upstream-oracle.v2") && retained.at("precision_capability") == capability, "cached reference precision capability differs from current hardware");
   } else
    status = owned_docker(name, args).status;
   if (status) {
@@ -2457,10 +2463,15 @@ class Wrapper {
   }
   for (const auto& entry : fs::recursive_directory_iterator(output)) {
    const auto relative = entry.path().lexically_relative(output).generic_string();
-   if (entry.is_regular_file() && (relative == "manifest.json" || relative.starts_with("references/") || relative.starts_with("inventory/") || (inventory_only && relative.starts_with("assets/"))))
+   if (entry.is_regular_file() && (relative == "manifest.json" || relative.starts_with("references/") || relative.starts_with("inventory/") || ((inventory_only || encoder_pretraining_only) && relative.starts_with("assets/"))))
     fs::permissions(entry.path(), fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write, fs::perm_options::remove);
   }
   release_mutation();
+  if (encoder_pretraining_only) {
+   if (prepare_only) test_environment.push_back("MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=" + host_path(output));
+   else log("encoder pretraining references ready: " + output + "/manifest.json; run [encoder_pretraining_oracle] with --env MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=PATH");
+   return 0;
+  }
   if (inventory_only) {
    log("hash-bound RF-DETR catalog inventory complete: " + output + "/manifest.json");
    return 0;
@@ -2901,7 +2912,7 @@ cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" --parallel "${MMLTK_JOBS
  }
  int run_tests(const std::string& selected, Args arguments) {
   require(!headless || selected == "workspace-wayland", "--headless-compositor is only valid with --test workspace-wayland");
-  require(!upstream_tests || selected == "rfdetr" || selected == "all", "--with-upstream is only valid with --test rfdetr or all");
+  require(!(upstream_tests || encoder_pretraining_tests) || selected == "rfdetr" || selected == "all", "--with-upstream is only valid with --test rfdetr or all");
   if (selected == "list" || selected == "help" || selected == "-h" || selected == "--help") {
    require(arguments.empty(), "--test " + selected + " does not accept additional arguments");
    std::cout << commands::test_help;
@@ -2976,6 +2987,10 @@ cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" --parallel "${MMLTK_JOBS
   }
   require(!debugger || executables.size() == 1, "--gdb requires a suite with one executable or an explicit --executable");
   begin_test(selected);
+  if (encoder_pretraining_tests && !test_environment_value("MMLTK_RFDETR_ENCODER_PRETRAINING_DIR")) {
+   const auto preparation = oracle({"--encoder-pretraining-only"}, true);
+   if (preparation) return preparation;
+  }
   if (upstream_tests) {
    if (!test_environment_value("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR")) {
     const auto preparation = oracle({}, true);
@@ -3113,6 +3128,11 @@ cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" --parallel "${MMLTK_JOBS
  }
  void parse_tests(Args arguments) {
   test_args.clear();
+  // An explicitly exported evidence directory must also reach the required
+  // plain all/Wayland invocations. This never schedules reference generation.
+  if (suite == "all" || suite == "rfdetr" || suite == "workspace-wayland")
+   if (const char* supplied = std::getenv("MMLTK_RFDETR_ENCODER_PRETRAINING_DIR"))
+    test_environment.push_back("MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=" + (*supplied ? host_path(supplied) : std::string{}));
   for (std::size_t i = 0; i < arguments.size(); ++i) {
    const auto& argument = arguments[i];
    if (argument == "--") {
@@ -3128,7 +3148,14 @@ cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" --parallel "${MMLTK_JOBS
     continue;
    }
    if (argument == "--with-upstream") {
+    require(!encoder_pretraining_tests, "choose one --with-upstream preparation mode");
     upstream_tests = true;
+    continue;
+   }
+   if (argument.starts_with("--with-upstream=")) {
+    require(argument == "--with-upstream=encoder-pretraining", "unknown --with-upstream preparation mode");
+    require(!upstream_tests, "choose one --with-upstream preparation mode");
+    encoder_pretraining_tests = true;
     continue;
    }
    if (argument == "--config" || argument == "--executable" || argument == "--env" || argument == "--gdb-command") {

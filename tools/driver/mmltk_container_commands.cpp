@@ -243,6 +243,7 @@ For headless-compositor, arguments after -- run a command in the private composi
 For cuda-vulkan, arguments after -- are width height allocation-pairs transfers validation context-mode memory-owner process-mode; use -- --help.
 Test options:
   --with-upstream             Opt in to RF-DETR upstream references and historical-session preparation (may exceed 1 TiB)
+  --with-upstream=encoder-pretraining  Prepare only base encoder initialization evidence; no detector inventory or historical session
   --executable <target>       Build and run one executable owned by the suite
   --config <release|dev>      Select the containerized CMake graph
   --env <NAME[=VALUE]>        Forward an additional environment variable
@@ -253,9 +254,13 @@ Ordinary all/rfdetr runs never generate upstream references or historical sessio
 Their external-evidence cases skip unless --with-upstream or an explicit --env evidence path is supplied.
 )MMLTK";
  inline const std::string oracle_help = R"MMLTK(Usage: ./mmltk --diagnose-rfdetr-upstream [--upstream PATH] [--plus-upstream PATH] [--output PATH] [--inventory-only] [--sdpa default|math]
+       ./mmltk --diagnose-rfdetr-upstream --encoder-pretraining-only [--output PATH]
        ./mmltk --diagnose-rfdetr-upstream --case ID [--output PATH] [--sdpa default|math]
        ./mmltk --diagnose-rfdetr-upstream --build-only
 --build-only builds the isolated native oracle image without weights, upstream checkout, or numerical execution.
+--encoder-pretraining-only verifies the three canonical base encoder assets and produces FP32 initialization references only.
+It excludes --inventory-only, --case, --backward-operators and --export-reference; it never acquires detector weights or prepares historical sessions.
+Compare explicitly with --env MMLTK_RFDETR_ENCODER_PRETRAINING_DIR=PATH and [encoder_pretraining_oracle].
 Requires clean core and Plus source pins from tools/oracle/rfdetr_sources.json.
 Omitted source paths use managed pinned checkouts; omitted output uses the capability-addressed evidence cache.
 --inventory-only verifies/downloads the catalog's official assets through the pinned upstream registries,

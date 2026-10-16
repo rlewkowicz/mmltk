@@ -3,6 +3,7 @@
 #include <type_traits>
 #include <stdexcept>
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
+#include "src/backend/models/rfdetr/contract/encoder_pretraining.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/class_layout.h"
 #include "src/backend/data/catalog/class_catalog.h"
@@ -32,6 +33,7 @@ std::string rfdetr_native_catalog_json() {
  using namespace mmltk::backend::models::rfdetr;
  auto result = nlohmann::json::object();
  result["presets"] = project(kPresetCatalog);
+ result["encoder_pretraining"] = project(kEncoderPretrainingAssets);
  result["foreground_capacity"] = mmltk::backend::data::catalog::kClassCatalogCapacity;
  result["output_slot_capacity"] = kMaximumClassOutputSlots;
  return result.dump();

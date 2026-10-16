@@ -51,6 +51,7 @@ mmltk_register_public_headers(
         model_state.h
         model.h
         model_state_load.h
+        encoder_pretraining.h
         runtime.h
         criterion_terms.h
         detection_types.h
@@ -76,6 +77,7 @@ mmltk_register_ordinary_sources(
     inference_lanes.cpp
     python_checkpoint_bridge.cpp
     model_state.cpp
+    encoder_pretraining.cpp
     training_mask_loss.cpp)
 mmltk_register_retained_module_importers(
     mmltk_backend_models_rfdetr_core
@@ -285,6 +287,8 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
     mmltk_configure_component(
         mmltk_backend_models_rfdetr_core_tests PRIVATE_DECLARATIONS)
     mmltk_register_ordinary_sources(mmltk_backend_models_rfdetr_core_tests
+        ${CMAKE_SOURCE_DIR}/tools/oracle/native_catalog.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/encoder_pretraining.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/inference_lanes.test.cpp)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_core_tests ${sources})

@@ -66,6 +66,7 @@ public:
  [[nodiscard]] detail::NormalizedModelStateCandidate stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission,
   const ResolvedClassLayout* source_layout = nullptr, std::optional<FreshTransferQueryRetention> query_retention = std::nullopt);
  void commit_normalized_state(detail::NormalizedModelStateCandidate candidate);
+ [[nodiscard]] detail::NormalizedModelStateCandidate stage_encoder_pretraining(const std::vector<NormalizedModelStateEntry>& source);
  void set_force_pytorch_deformable_attn(bool value);
  void set_force_math_attention(bool value);
  void train(bool enabled = true);

@@ -2432,10 +2432,10 @@ void test_help_documents_grammar_and_native_wrapper_is_executable() {
  WrapperFixture wrapper("#!/bin/sh\nexit 99\n");
  const auto test_help = wrapper.invoke({"--test", "help"});
  EQ(test_help.exit_code, 0);
- includes(test_help.out, {"--with-upstream", "Ordinary all/rfdetr runs never generate upstream references"});
+ includes(test_help.out, {"--with-upstream", "--with-upstream=encoder-pretraining", "Ordinary all/rfdetr runs never generate upstream references"});
  const auto oracle_help = wrapper.invoke({"--diagnose-rfdetr-upstream", "--help"});
  EQ(oracle_help.exit_code, 0);
- includes(oracle_help.out, {"--case ID", "selected references never certify the full matrix"});
+ includes(oracle_help.out, {"--case ID", "selected references never certify the full matrix", "--encoder-pretraining-only", "MMLTK_RFDETR_ENCODER_PRETRAINING_DIR"});
  wrapper.write("tools/oracle/rfdetr_sources.json", support::read_text(repository() / "tools/oracle/rfdetr_sources.json"));
  const auto invalid_case = wrapper.invoke({"--diagnose-rfdetr-upstream", "--case", "invalid"});
  EQ(invalid_case.exit_code, 1);
@@ -2447,6 +2447,16 @@ void test_help_documents_grammar_and_native_wrapper_is_executable() {
  const auto invalid = wrapper.invoke({"--test", "core", "--with-upstream"});
  EQ(invalid.exit_code, 1);
  HAS(invalid.err, "--with-upstream is only valid with --test rfdetr or all");
+ for (const auto& suffix : std::vector<Strings>{{"--inventory-only"}, {"--case", "rf-detr-nano-controlled-group2-fp32-b1-eval"}, {"--backward-operators"}, {"--export-reference"}}) {
+  const auto rejected = wrapper.invoke(plus({"--diagnose-rfdetr-upstream", "--encoder-pretraining-only"}, suffix));
+  EQ(rejected.exit_code, 1);
+  HAS(rejected.err, "--encoder-pretraining-only excludes");
+ }
+ const auto selected_invalid = wrapper.invoke({"--test", "core", "--with-upstream=encoder-pretraining"});
+ EQ(selected_invalid.exit_code, 1);
+ HAS(selected_invalid.err, "--with-upstream is only valid with --test rfdetr or all");
+ for (const auto& options : std::vector<Strings>{{"--with-upstream=unknown"}, {"--with-upstream", "--with-upstream=encoder-pretraining"}, {"--with-upstream=encoder-pretraining", "--with-upstream"}})
+  NE(wrapper.invoke(plus({"--test", "rfdetr"}, options)).exit_code, 0);
 }
 void test_wrapper_retains_both_streams_and_queryable_terminal_status() {
  WrapperFixture f(R"SH(#!/usr/bin/env bash
@@ -2822,6 +2832,10 @@ int package_docker(const Strings& args) {
  } else if (args[0] == "run") {
   const auto name = option_value(args, "--name");
   support::write_json(root / "containers" / (name + ".json"), args);
+  if (std::ranges::find(args, "--list-tests") != args.end() &&
+      std::ranges::any_of(args, [](const auto& argument) { return argument.ends_with("/mmltk_workspace_wayland_integration"); }))
+   std::cout << "workspace_wayland_retained\nworkspace_wayland_workflows\nworkspace_wayland_dpi\nworkspace_wayland_terminal\n"
+                "workspace_wayland_probe_recovery\nworkspace_wayland_gdr\nworkspace_wayland_quiet\n";
   if (name.ends_with("-build-package")) {
    const auto stage = root / "build/release.next";
    fs::remove_all(stage);
@@ -2830,7 +2844,16 @@ int package_docker(const Strings& args) {
     if (argument.starts_with("MMLTK_PACKAGE_FINGERPRINT=")) support::write_text(stage / ".mmltk-package-fingerprint", argument.substr(26) + '\n');
   }
   if (name.ends_with("-upstream-capability")) std::cout << R"({"fp32":true,"fp16":true,"bf16":true})" << '\n';
-  if (name.ends_with("-upstream")) return 41;  // Stop before native numerical comparisons.
+  if (name.ends_with("-upstream")) {
+   if (support::env("TEST_ENCODER_ORACLE_SUCCESS") == "1" && std::ranges::find(args, "--encoder-pretraining-only") != args.end()) {
+    std::string output;
+    for (const auto& argument : args) if (argument.ends_with(":/evidence:rw")) output = argument.substr(0, argument.size() - std::string_view(":/evidence:rw").size());
+    CHECK(!output.empty());
+    support::write_json(fs::path(output) / "manifest.json", {{"format", "mmltk.rfdetr.encoder-pretraining.v1"}, {"mode", "encoder-pretraining"},
+     {"status", "encoder_references_complete_native_comparison_pending"}, {"sources", support::read_json(root / "tools/oracle/rfdetr_sources.json")},
+     {"fingerprint", option_value(args, "--fingerprint")}, {"precision_capability", {{"fp32", true}, {"fp16", true}, {"bf16", true}}}});
+   } else return 41;  // Stop before native numerical comparisons.
+  }
  } else if (args[0] != "version" && args[0] != "rm" && args[0] != "ps" && args[0] != "tag" && args[0] != "buildx")
   throw Failure("unexpected package Docker operation: " + args[0]);
  return 0;
@@ -2898,6 +2921,39 @@ esac
   FALSE(fs::exists(root / "images/mmltk.json"));
  }
 };
+void prepare_oracle_sources(PackageFixture& f) {
+ for (const auto* directory : {"backend", "common", "frameworks"}) {
+  fs::remove_all(f.root / "src" / directory);
+  fs::create_directory_symlink(repository() / "src" / directory, f.root / "src" / directory);
+ }
+ const auto pins = support::read_json(repository() / "tools/oracle/rfdetr_sources.json");
+ const auto cached_sources = f.root / ".cache/tests/rfdetr/sources";
+ fs::create_directories(cached_sources);
+ for (const auto* kind : {"core", "plus"}) {
+  const auto& pin = pins.at(kind);
+  const std::string source = std::string(kind) == "core" ? "upstream" : "plus-upstream";
+  fs::create_directories(f.root / source / ".git");
+  f.write(source + "/src/" + pin.at("package").get<std::string>() + "/__init__.py", "fixture\n");
+  fs::create_directory_symlink(f.root / source, cached_sources / pin.at("revision").get<std::string>());
+  f.options.env[std::string("TEST_ORACLE_") + kind + "_REVISION"] = pin.at("revision").get<std::string>();
+  f.options.env[std::string("TEST_ORACLE_") + kind + "_TREE"] = pin.at("tree").get<std::string>();
+ }
+ f.write("bin/git", R"SH(#!/bin/sh
+while [ "$#" -gt 0 ]; do
+ if [ "$1" = -C ]; then shift; source=$1; break; fi
+ shift
+done
+case "$source" in
+ */plus-upstream) revision=$TEST_ORACLE_plus_REVISION; tree=$TEST_ORACLE_plus_TREE;;
+ *) revision=$TEST_ORACLE_core_REVISION; tree=$TEST_ORACLE_core_TREE;;
+esac
+case "$*" in
+ *--absolute-git-dir*|*--git-common-dir*) printf '%s/.git\n' "$source";;
+ *'rev-parse HEAD') printf '%s\n' "$revision";;
+ *'rev-parse HEAD^{tree}') printf '%s\n' "$tree";;
+esac
+)SH");
+}
 int package_child(const Strings& args) {
  CHECK(!args.empty());
  const auto parent = ::getppid();
@@ -3097,34 +3153,7 @@ void test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly() {
  PackageFixture f;
  const auto tidy = f.invoke({"--tidy-tools"});
  if (tidy.exit_code) throw Failure(tidy.err);
- for (const auto* directory : {"backend", "common", "frameworks"}) {
-  fs::remove_all(f.root / "src" / directory);
-  fs::create_directory_symlink(repository() / "src" / directory, f.root / "src" / directory);
- }
- const auto pins = support::read_json(repository() / "tools/oracle/rfdetr_sources.json");
- for (const auto* kind : {"core", "plus"}) {
-  const auto& pin = pins.at(kind);
-  const std::string source = std::string(kind) == "core" ? "upstream" : "plus-upstream";
-  fs::create_directories(f.root / source / ".git");
-  f.write(source + "/src/" + pin.at("package").get<std::string>() + "/__init__.py", "fixture\n");
-  f.options.env[std::string("TEST_ORACLE_") + kind + "_REVISION"] = pin.at("revision").get<std::string>();
-  f.options.env[std::string("TEST_ORACLE_") + kind + "_TREE"] = pin.at("tree").get<std::string>();
- }
- f.write("bin/git", R"SH(#!/bin/sh
-while [ "$#" -gt 0 ]; do
- if [ "$1" = -C ]; then shift; source=$1; break; fi
- shift
-done
-case "$source" in
- */plus-upstream) revision=$TEST_ORACLE_plus_REVISION; tree=$TEST_ORACLE_plus_TREE;;
- *) revision=$TEST_ORACLE_core_REVISION; tree=$TEST_ORACLE_core_TREE;;
-esac
-case "$*" in
- *--absolute-git-dir*|*--git-common-dir*) printf '%s/.git\n' "$source";;
- *'rev-parse HEAD') printf '%s\n' "$revision";;
- *'rev-parse HEAD^{tree}') printf '%s\n' "$tree";;
-esac
-)SH");
+ prepare_oracle_sources(f);
  const auto oracle = f.invoke({"--diagnose-rfdetr-upstream", "--upstream", (f.root / "upstream").string(), "--plus-upstream", (f.root / "plus-upstream").string(), "--output", (f.root / "evidence").string()});
  if (oracle.exit_code != 41) throw Failure(oracle.err);
  EQ(oracle.exit_code, 41);
@@ -3155,6 +3184,107 @@ esac
   }
  }
  EQ(checked, (std::set<std::string>{"oracle", "tidy"}));
+ f.options.env["TEST_ENCODER_ORACLE_SUCCESS"] = "1";
+ const Strings selected{"--diagnose-rfdetr-upstream", "--encoder-pretraining-only", "--upstream", (f.root / "upstream").string(), "--plus-upstream", (f.root / "plus-upstream").string(),
+  "--output", (f.root / "encoder-evidence").string()};
+ const auto encoder = f.invoke(selected);
+ if (encoder.exit_code) throw Failure(encoder.err);
+ HAS(encoder.err, "encoder pretraining references ready");
+ FALSE(fs::exists(f.root / "encoder-evidence/comparisons"));
+ FALSE(fs::exists(f.root / ".cache/tests/rfdetr/baseline"));
+ bool forwarded_encoder = false;
+ for (const auto& path : matching_files(f.root / "containers", "", ".json")) {
+  const auto arguments = support::read_json(path).get<Strings>();
+  if (std::ranges::find(arguments, "--encoder-pretraining-only") == arguments.end()) continue;
+  forwarded_encoder = true;
+  CHECK(std::ranges::find(arguments, "--inventory-only") == arguments.end());
+  CHECK(std::ranges::find(arguments, "[upstream_oracle]") == arguments.end());
+  EQ(option_value(arguments, "--output"), "/evidence");
+ }
+ CHECK(forwarded_encoder);
+ EQ(f.invoke(selected).exit_code, 0);  // Compatible mode reuses its own evidence.
+ auto wrong_mode = support::read_json(f.root / "encoder-evidence/manifest.json");
+ wrong_mode["mode"] = "detector";
+ fs::permissions(f.root / "encoder-evidence/manifest.json", fs::perms::owner_write, fs::perm_options::add);
+ support::write_json(f.root / "encoder-evidence/manifest.json", wrong_mode);
+ const auto reuse = f.invoke(selected);
+ NE(reuse.exit_code, 0);
+ HAS(reuse.err, "cached upstream evidence mode differs");
+}
+void test_encoder_preparation_and_explicit_evidence_routing() {
+ const std::string variable = "MMLTK_RFDETR_ENCODER_PRETRAINING_DIR";
+ for (const std::string suite : {"all", "rfdetr", "workspace-wayland"}) {
+  PackageFixture f;
+  prepare_oracle_sources(f);
+  f.options.env["TEST_ENCODER_ORACLE_SUCCESS"] = "1";
+  const bool workspace = suite == "workspace-wayland";
+  const std::string executable = workspace ? "mmltk_workspace_wayland_integration" : "mmltk_backend_models_rfdetr_core_tests";
+  Strings selection{"--test", suite};
+  if (workspace) selection.push_back("--headless-compositor");
+  else selection.insert(selection.end(), {"--executable", executable});
+  const auto run = [&](const Strings& extra, std::optional<std::string> expected, bool prepare = false) {
+   fs::remove_all(f.root / "containers");
+   fs::create_directory(f.root / "containers");
+   const auto result = f.invoke(plus(selection, extra));
+   if (result.exit_code) throw Failure(suite + ": " + result.err);
+   std::size_t producers = 0, capability_calls = 0, native_calls = 0;
+   std::string produced;
+   std::optional<std::string> forwarded;
+   for (const auto& path : matching_files(f.root / "containers", "", ".json")) {
+    const auto arguments = support::read_json(path).get<Strings>();
+    FALSE(contains(path.filename().string(), "historical"));
+    if (path.stem().string().ends_with("-upstream-capability")) ++capability_calls;
+    for (const auto& argument : arguments) {
+     CHECK(argument != "--inventory-only" && argument != "[upstream_oracle]");
+     FALSE(argument.starts_with("MMLTK_RFDETR_UPSTREAM_ORACLE_DIR="));
+     FALSE(argument.starts_with("MMLTK_RFDETR_ORACLE_ATTEMPT="));
+     FALSE(argument.starts_with("MMLTK_RFDETR_BASELINE_SESSION="));
+    }
+    if (path.stem().string().ends_with("-upstream")) {
+     ++producers;
+     CHECK(std::ranges::find(arguments, "--encoder-pretraining-only") != arguments.end());
+     for (const auto& argument : arguments)
+      if (argument.ends_with(":/evidence:rw")) produced = argument.substr(0, argument.size() - std::string_view(":/evidence:rw").size());
+     CHECK(!produced.empty());
+     CHECK(fs::is_regular_file(fs::path(produced) / "manifest.json"));
+     FALSE(fs::exists(fs::path(produced) / "inventory"));
+     FALSE(fs::exists(fs::path(produced) / "comparisons"));
+    }
+    if (!std::ranges::any_of(arguments, [&](const auto& argument) { return argument.ends_with('/' + executable); })) continue;
+    ++native_calls;
+    for (std::size_t index = 0; index + 1 < arguments.size(); ++index)
+     if (arguments[index] == "--env" && arguments[index + 1].starts_with(variable + '=')) forwarded = arguments[index + 1].substr(variable.size() + 1);
+   }
+   EQ(producers, prepare ? 1U : 0U);
+   EQ(capability_calls, prepare ? 1U : 0U);
+   EQ(native_calls, 1U);
+   if (prepare) expected = "/host" + produced;
+   EQ(forwarded, expected);
+   FALSE(fs::exists(f.root / ".cache/tests/rfdetr/baseline"));
+   for (const auto& entry : fs::recursive_directory_iterator(f.root / ".cache/tests/rfdetr"))
+    CHECK(entry.path().filename() != "comparisons" && entry.path().filename() != "inventory");
+   return produced;
+  };
+  const auto explicit_path = "/host" + (f.root / "explicit-encoder-evidence").string();
+  if (!workspace) {
+   const auto prepared = run({"--with-upstream=encoder-pretraining"}, std::nullopt, true);
+   run({"--with-upstream=encoder-pretraining", "--env", variable + "=/host" + prepared}, "/host" + prepared);
+   // Empty explicit values remain supplied: the native admission case rejects
+   // them; wrapper preparation must not silently replace them with references.
+   run({"--with-upstream=encoder-pretraining", "--env", variable + '='}, std::string{});
+  }
+  run({}, std::nullopt);
+  run({"--env", variable + '=' + explicit_path}, explicit_path);
+  run({"--env", variable + '='}, std::string{});
+  const auto ambient_path = (f.root / "ambient-encoder-evidence").string();
+  f.options.env[variable] = ambient_path;
+  run({}, "/host" + ambient_path);
+  run({"--env", variable + '=' + explicit_path}, explicit_path);
+  run({"--env", variable + '='}, std::string{});
+  f.options.env[variable] = "";
+  run({}, std::string{});
+  if (!workspace) run({"--with-upstream=encoder-pretraining"}, std::string{});
+ }
 }
 void test_tools_tidy_grouped_selection_and_module_resume() {
  FileFixture f;
@@ -4545,6 +4675,7 @@ constexpr Case cases[]{
  {"NativeToolTests.test_package_callers_cancel_and_reap_archive_and_hash_descendants", test_package_callers_cancel_and_reap_archive_and_hash_descendants},
  {"NativeToolTests.test_native_process_selection_artifact_bounds_and_actions", test_native_process_selection_artifact_bounds_and_actions},
  {"NativeToolTests.test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly", test_tools_tidy_and_oracle_mount_diagnostic_runtime_readonly},
+ {"NativeToolTests.test_encoder_preparation_and_explicit_evidence_routing", test_encoder_preparation_and_explicit_evidence_routing},
  {"NativeToolTests.test_native_compiler_launcher_preserves_arguments_cache_and_status", test_native_compiler_launcher_preserves_arguments_cache_and_status},
  {"ParserTests.test_boolean_precedence_implicit_and_and_quoted_terms", test_boolean_precedence_implicit_and_and_quoted_terms},
  {"ParserTests.test_exact_numeric_values_preserve_uint64_and_boolean_type", test_exact_numeric_values_preserve_uint64_and_boolean_type},

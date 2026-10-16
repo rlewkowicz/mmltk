@@ -1254,14 +1254,9 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
     }
    }
   }
-  if (!source.defined() || source.sizes() != destination->sizes()) {
+  if (!detail::stage_model_state_tensor(candidate, entry.name, source, *destination)) {
    if (partial && axis_by_name.contains(entry.name)) throw std::invalid_argument("class-dependent tensor disagrees with model topology: " + entry.name);
-   candidate.summary.incompatible_names.push_back(entry.name);
-   continue;
   }
-  candidate.destinations.push_back(*destination);
-  candidate.tensors.push_back(source.to(destination->device(), destination->scalar_type()));
-  candidate.summary.loaded_names.push_back(entry.name);
  }
  for (const auto& parameter : parameters) {
   if (!supplied.contains(parameter.key())) { candidate.summary.missing_names.push_back(parameter.key()); }
@@ -1295,12 +1290,14 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
 void NativeRfDetrModel::Impl::commit_normalized_state(detail::NormalizedModelStateCandidate candidate) {
  require_mutable();
  torch::NoGradGuard no_grad;
+ if (candidate.validate_source) candidate.validate_source();
  std::vector<torch::Tensor> rollback;
  rollback.reserve(candidate.destinations.size());
  for (const auto& destination : candidate.destinations) { rollback.push_back(destination.detach().clone()); }
  std::size_t committed = 0;
  try {
   for (; committed < candidate.destinations.size(); ++committed) { candidate.destinations[committed].copy_(candidate.tensors[committed]); }
+  if (candidate.validate_source) candidate.validate_source();
  } catch (...) {
   const std::size_t restore_count = std::min(committed + 1, candidate.destinations.size());
   for (std::size_t index = 0; index < restore_count; ++index) { candidate.destinations[index].copy_(rollback[index]); }
@@ -1483,6 +1480,10 @@ void NativeRfDetrModel::configure_supervision_timing(const SupervisionTimingSetu
  return impl_->stage_normalized_state(state, admission, source_layout, query_retention);
 }
 void NativeRfDetrModel::commit_normalized_state(detail::NormalizedModelStateCandidate candidate) { impl_->commit_normalized_state(std::move(candidate)); }
+detail::NormalizedModelStateCandidate NativeRfDetrModel::stage_encoder_pretraining(const std::vector<NormalizedModelStateEntry>& source) {
+ impl_->require_mutable();
+ return impl_->backbone_->at<detail::NativeBackboneImpl>(0).stage_encoder_pretraining(config(), source);
+}
 void NativeRfDetrModel::set_force_pytorch_deformable_attn(bool value) {
  if (impl_->force_pytorch_deformable_attn_ == value) return;
  invalidate_compilation();

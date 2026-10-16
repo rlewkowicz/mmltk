@@ -401,8 +401,11 @@ void initialize_backbone_weight(torch::Tensor tensor) {
  // truncation bounds. The normal-CDF endpoints round to zero and one.
  tensor.uniform_(-1.0, 1.0).erfinv_().mul_(0.02 * std::sqrt(2.0)).clamp_(-2.0, 2.0);
 }
+std::shared_ptr<BackboneEncoder> make_backbone_encoder(const NativeRfDetrConfig& config) {
+ return config.backbone.kind == BackboneKind::PeCoreTiny ? make_pe_core_encoder(config) : std::make_shared<DinoV2WrapperImpl>(config);
+}
 NativeBackboneImpl::NativeBackboneImpl(const NativeRfDetrConfig& config) {
- encoder_ = register_module("encoder", config.backbone.kind == BackboneKind::PeCoreTiny ? make_pe_core_encoder(config) : std::make_shared<DinoV2WrapperImpl>(config));
+ encoder_ = register_module("encoder", make_backbone_encoder(config));
  projector_ = register_module("projector", std::make_shared<NativeBackboneProjectorImpl>(config));
  if (config.projector == ProjectorKind::DualKeypointOnly) cross_projector_ = register_module("cross_attn_projector", std::make_shared<NativeBackboneProjectorImpl>(config));
 }
@@ -413,5 +416,8 @@ std::inplace_vector<torch::Tensor, 2> NativeBackboneImpl::forward_features(const
  return result;
 }
 void NativeBackboneImpl::set_force_math_attention(bool value) { encoder_->set_force_math_attention(value); }
+NormalizedModelStateCandidate NativeBackboneImpl::stage_encoder_pretraining(const NativeRfDetrConfig& config, const std::vector<NormalizedModelStateEntry>& source) {
+ return detail::stage_encoder_pretraining(*encoder_, config, source);
+}
 }  // namespace detail
 }  // namespace mmltk::backend::models::rfdetr

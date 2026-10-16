@@ -4,6 +4,7 @@
 #include <string_view>
 #include <stdexcept>
 #include <utility>
+#include <functional>
 #include <vector>
 namespace mmltk::backend::models::rfdetr {
 struct NormalizedModelStateEntry {
@@ -31,7 +32,20 @@ struct NormalizedModelStateCandidate {
  ModelStateLoadSummary summary;
  std::vector<torch::Tensor> destinations;
  std::vector<torch::Tensor> tensors;
+ // Optional source custody check, invoked before mutation and inside rollback
+ // protection after all copies. Its closure retains any admitted source owner.
+ std::function<void()> validate_source;
 };
+inline bool stage_model_state_tensor(NormalizedModelStateCandidate& candidate, const std::string& name, const torch::Tensor& source, const torch::Tensor& destination) {
+ if (!source.defined() || source.sizes() != destination.sizes()) {
+  candidate.summary.incompatible_names.push_back(name);
+  return false;
+ }
+ candidate.destinations.push_back(destination);
+ candidate.tensors.push_back(source.to(destination.device(), destination.scalar_type()));
+ candidate.summary.loaded_names.push_back(name);
+ return true;
+}
 enum class NormalizedModelStateAdmission {
  Exact,
  // Complete inference state; native supervision is optional and not deployed.
