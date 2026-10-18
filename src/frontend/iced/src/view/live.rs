@@ -101,7 +101,7 @@ impl Component {
                 )
             ),
             self.model_card.view(crate::view::workflow::model_card::State::from_settings(
-                crate::generated::FeatureId::Predict, settings.draft.as_ref(), model.model_snapshot.as_ref(), model.file_dialog.as_ref(), settings_edit_available,
+                crate::generated::FeatureId::Predict, settings.draft.as_ref(), model.model_snapshot.as_ref(), settings_edit_available,
                 !settings.has_local_edits() && settings.draft.as_ref().is_some_and(|draft| model.model_selection_available(draft, crate::generated::FeatureId::Predict)), model.model_stop_available()
             )).map(Message::Model),
             crate::view::workflow::primary_action(

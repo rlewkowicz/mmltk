@@ -39,7 +39,8 @@ Viewer/editor identities survive ordinary layout and native updates.
 Train/Validate/Predict/Export place **Output** then **GPU** at right, setup/primary
 action at left. [Workflow reference](rfdetr-workflows.md) owns weights, inputs,
 reservations, metrics, artifacts and continuation. Shared weights controls provide
-confirmation/preparation/cancellation, without manual backend-kind/Class layout.
+direct custom-file selection, preparation and cancellation, without manual
+backend-kind/Class layout.
 
 | Page | Controls/workspace |
 | --- | --- |
@@ -102,7 +103,9 @@ formulas. Independent/periodic modes display their experimental limitation.
 
 Recipe scope chooses globals/stable model ID. New models copy settled globals;
 existing models retain overrides through mode changes. Model scope adds seed and
-soup coefficient. AdamW/Muon/SGD use generated defaults; switching optimizer
+soup coefficient. Selecting a preset or custom weights populates Train
+controls from [catalog training defaults](rfdetr-training.md#recipes-and-schedules).
+AdamW/Muon/SGD use generated defaults; switching optimizer
 preserves explicit overrides. **Use optimizer defaults** clears only that scope,
 preserving optimizer. Native policy determines Step/Cosine/Ultralytics linear
 availability; [recipe reference](rfdetr-training.md#recipes-and-schedules) owns
@@ -199,7 +202,7 @@ width is bounded by 60% of page/viewport with 12 px margins, rows scroll. Comple
 selectable read-only title/detail text wraps; Copy emits title, two newlines,
 detail exactly. Rows support Dismiss, without clear-all.
 
-Status remains available over model/file dialogs while navigation is disabled.
+Status remains available over file dialogs while navigation is disabled.
 It captures pointer/scroll/keyboard so underlying pages/modals/viewers/shortcuts
 cannot act. Focus traverses eligible panel controls; restoration checks ownership,
 including delayed annotation replies. Clipboard completion is checked by notice,

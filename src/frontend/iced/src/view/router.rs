@@ -348,7 +348,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routed_model_confirmations_share_component_admission_and_reset() {
+    fn routed_model_selections_share_component_admission_and_reset() {
         use crate::view::workflow::model_card;
         use crate::view_model::test_support::{
             bootstrapped, inadmissible_model_dialogs, selected_model_dialog,
@@ -384,10 +384,10 @@ mod tests {
                 );
                 // The combined chooser opens on the current input, independently of the selected extension.
                 let dialog = selected_model_dialog(settings.draft().unwrap(), workflow, &path, 7);
-                let confirm = || {
+                let select = || {
                     route(
                         workflow,
-                        model_card::Message::ConfirmArtifact {
+                        model_card::Message::ArtifactSelected {
                             path: path.clone(),
                             generation: 7,
                         },
@@ -398,7 +398,7 @@ mod tests {
                 for (case, invalid) in inadmissible_model_dialogs(&dialog) {
                     model.file_dialog = invalid;
                     assert!(
-                        router.update(&mut model, &mut settings, confirm()).is_err(),
+                        router.update(&mut model, &mut settings, select()).is_err(),
                         "{workflow:?}: {case}"
                     );
                     assert_eq!(settings.draft(), before.as_ref(), "{case}");
@@ -409,17 +409,17 @@ mod tests {
                     );
                 }
                 model.file_dialog = Some(dialog.clone());
-                let outcome = router.update(&mut model, &mut settings, confirm()).unwrap();
+                let outcome = router.update(&mut model, &mut settings, select()).unwrap();
                 assert!(matches!(
                     outcome,
                     Some(Outcome::Train(train::Outcome::Model(
-                        model_card::Outcome::ArtifactConfirmed(_)
+                        model_card::Outcome::ArtifactSelected(_)
                     ))) | Some(Outcome::Validate(validate::Outcome::Model(
-                        model_card::Outcome::ArtifactConfirmed(_)
+                        model_card::Outcome::ArtifactSelected(_)
                     ))) | Some(Outcome::Predict(predict::Outcome::Model(
-                        model_card::Outcome::ArtifactConfirmed(_)
+                        model_card::Outcome::ArtifactSelected(_)
                     ))) | Some(Outcome::Export(export::Outcome::Model(
-                        model_card::Outcome::ArtifactConfirmed(_)
+                        model_card::Outcome::ArtifactSelected(_)
                     )))
                 ));
                 let projection = crate::view_model::model_settings_projection(
@@ -429,20 +429,13 @@ mod tests {
                 .unwrap();
                 assert_eq!(projection.selection.key.input, row.input);
                 assert_eq!(projection.selection.artifact, path);
-                let confirmed = settings.draft().cloned();
+                let selected = settings.draft().cloned();
                 let edits = settings.state().clone().take_request([true; 3]);
-                router
-                    .update(
-                        &mut model,
-                        &mut settings,
-                        route(workflow, model_card::Message::CancelArtifact(3)),
-                    )
-                    .unwrap();
                 router.rebase(workflow, &mut model);
                 router.select(FeatureId::Explore);
                 router.select(workflow);
-                assert!(router.update(&mut model, &mut settings, confirm()).is_err());
-                assert_eq!(settings.draft(), confirmed.as_ref());
+                assert!(router.update(&mut model, &mut settings, select()).is_err());
+                assert_eq!(settings.draft(), selected.as_ref());
                 assert_eq!(settings.state().clone().take_request([true; 3]), edits);
                 for generation in [8, 1] {
                     if generation == 1 {
@@ -462,7 +455,7 @@ mod tests {
                                 &mut settings,
                                 route(
                                     workflow,
-                                    model_card::Message::ConfirmArtifact {
+                                    model_card::Message::ArtifactSelected {
                                         path: path.clone(),
                                         generation,
                                     }

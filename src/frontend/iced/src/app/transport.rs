@@ -40,6 +40,16 @@ impl App {
         {
             return Task::none();
         }
+        let receives_dialog_result = matches!(
+            &event,
+            TransportEvent::IntentReply(_) | TransportEvent::SystemEvent(_)
+        );
+        let completed_dialog_before = self
+            .model
+            .file_dialog
+            .as_ref()
+            .filter(|dialog| !dialog.active)
+            .map(|dialog| dialog.generation);
         let deferred_availability = self
             .settings
             .state()
@@ -139,8 +149,16 @@ impl App {
         {
             self.flush_settings_edits();
         }
+        let selection = if receives_dialog_result
+            && self.model.file_dialog.as_ref().is_some_and(|dialog| {
+                !dialog.active && Some(dialog.generation) > completed_dialog_before
+            }) {
+            self.select_model_artifact()
+        } else {
+            Task::none()
+        };
         self.advance_start();
-        self.dispatch_explore_viewport()
+        Task::batch([selection, self.dispatch_explore_viewport()])
     }
 
     pub(super) fn install_bootstrap(&mut self, bootstrap: Bootstrap) {

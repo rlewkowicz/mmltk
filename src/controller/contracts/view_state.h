@@ -126,19 +126,17 @@ struct TrainExecutionPaneState {
 };
 struct TrainViewState : TrainExecutionPaneState {
  TrainViewState() {
-  request.batch_size = 2;
-  request.epochs = 12;
   request.workers = 16;
   request.prefetch_factor = 3;
   request.progress_bar = true;
   request.lanes = 1;
-  request.val_batch_size = 8;
   request.device_ids = {0};
   request.train_compiled_path = "./compiled/train.bin";
   request.val_compiled_path = "./compiled/val.bin";
   request.output_dir.clear();
   request.preset_name = kDefaultModelPresetName;
   request.resolution = kDefaultModelResolution;
+  mmltk::backend::models::rfdetr::apply_preset_training_defaults(request, mmltk::backend::models::rfdetr::kPresetCatalog.front());
   request.gpu_augmentation.enabled = true;
  }
  mmltk::backend::models::rfdetr::TrainRequest request;

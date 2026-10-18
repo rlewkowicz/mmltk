@@ -26,6 +26,7 @@ mmltk_register_public_headers(
         preset_catalog.h
         prediction_limits.h
         execution_plan.h
+        train_hyperparameters.h
         train_recipe.h
         training_supervision.h
         weight_catalog.h

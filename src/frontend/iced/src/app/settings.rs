@@ -205,6 +205,43 @@ impl App {
         self.submit_file_dialog_open(target);
     }
 
+    pub(super) fn select_model_artifact(&mut self) -> Task<Message> {
+        use crate::generated::{FileDialogCancelledOrFileDialogSelectedVariant, FileDialogTarget};
+        use crate::view::{export, predict, router, train, validate, workflow::model_card};
+
+        let Some(dialog) = self
+            .model
+            .file_dialog
+            .as_ref()
+            .filter(|dialog| !dialog.active && !dialog.cancellationrequested)
+        else {
+            return Task::none();
+        };
+        let Some(selection) = dialog.selection.as_ref() else {
+            return Task::none();
+        };
+        let FileDialogTarget::ModelArtifactTarget(target) = &selection.target else {
+            return Task::none();
+        };
+        let FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(selected) =
+            &selection.result
+        else {
+            return Task::none();
+        };
+        let message = model_card::Message::ArtifactSelected {
+            path: selected.path.clone(),
+            generation: dialog.generation,
+        };
+        let message = match target.workflow {
+            FeatureId::Train => router::Message::Train(train::Message::Model(message)),
+            FeatureId::Validate => router::Message::Validate(validate::Message::Model(message)),
+            FeatureId::Predict => router::Message::Predict(predict::Message::Model(message)),
+            FeatureId::Export => router::Message::Export(export::Message::Model(message)),
+            _ => return Task::none(),
+        };
+        self.on_workspace(message)
+    }
+
     fn submit_file_dialog_open(&mut self, target: crate::generated::FileDialogTarget) {
         self.submit_intent(
             ApplicationIntentEndpoint::FileDialogOpen,

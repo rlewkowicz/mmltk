@@ -4,6 +4,7 @@
 #include "src/controller/services/settings/settings_system.h"
 #include "src/controller/contracts/model_selection.h"
 #include "src/controller/contracts/gui_settings.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include <catch2/catch_test_macros.hpp>
@@ -51,6 +52,79 @@ private:
  std::shared_ptr<mmltk::testsupport::StopGate> gate_;
  bool fail_ = false;
 };
+TEST_CASE("loading Train models applies catalog hyperparameters while later edits and Resume retain their settings", "[controller][settings][model_defaults]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ const mmltk::testsupport::ScopedTempDir root("model-training-defaults");
+ const auto location = install_settings(root.path());
+ SettingsSystem settings;
+ REQUIRE(settings.Load(location).applied());
+ contracts::SettingsUpdateRequest configure;
+ configure.training_model_count = 2;
+ configure.updates.push_back({"workflows.train.request.recipe.optimizer", Value{std::uint64_t{1}}});
+ configure.updates.push_back({"workflows.train.request.recipe.lr", Value{0.003}});
+ configure.updates.push_back({"workflows.train.request.epochs", Value{std::int64_t{7}}});
+ const auto configured = settings.Update(std::move(configure)).settings_state;
+ const auto models = configured.workflows.train.request.lane_configuration.models;
+ for (const auto& preset : r::kPresetCatalog) {
+  contracts::SettingsUpdateRequest select;
+  select.updates.push_back({"workflows.train.model_source", Value{std::uint64_t{0}}});
+  select.updates.push_back({"workflows.train.request.preset_name", *Value::text(preset.preset_name, 256)});
+  select.updates.push_back({"workflows.train.request.resolution", Value{std::int64_t{preset.resolution}}});
+  const auto loaded = settings.Update(select).settings_state;
+  const auto& request = loaded.workflows.train.request;
+  CHECK(static_cast<const r::TrainHyperparameters&>(request) == preset.training_defaults);
+  CHECK(static_cast<const r::TrainRecipeValues&>(request.recipe) == preset.training_defaults.recipe);
+  CHECK(request.recipe.optimizer == r::TrainOptimizerKind::AdamW);
+  CHECK(request.recipe.lr == 1e-4);
+  CHECK(request.recipe.lr_encoder == 1.5e-4);
+  CHECK(request.recipe.weight_decay == 1e-4);
+  CHECK(request.recipe.encoder_layer_decay == 0.8);
+  CHECK(request.recipe.lr_component_decay == 0.7);
+  CHECK(request.epochs == 100);
+  CHECK(request.batch_size == 4);
+  CHECK(request.val_batch_size == 0);
+  CHECK(request.grad_accum_steps == 1);
+  CHECK(request.use_ema);
+  CHECK(request.eval_max_dets == 500);
+  REQUIRE(request.lane_configuration.models.size() == models.size());
+  for (std::size_t index = 0; index < models.size(); ++index) {
+   CHECK(request.lane_configuration.models[index].model_id == models[index].model_id);
+   CHECK(request.lane_configuration.models[index].seed == models[index].seed);
+   CHECK(request.lane_configuration.models[index].recipe == request.recipe);
+  }
+  CHECK(request.train_compiled_path == configured.workflows.train.request.train_compiled_path);
+  CHECK(loaded.workflows.train.output == configured.workflows.train.output);
+  CHECK(loaded.workflows.validate.request == configured.workflows.validate.request);
+  // One atomic selection can include deliberate user values, in either order.
+  select.updates.insert(select.updates.begin(), {"workflows.train.request.recipe.lr", Value{0.00023}});
+  select.updates.push_back({"workflows.train.request.epochs", Value{std::int64_t{9}}});
+  const auto edited = settings.Update(std::move(select)).settings_state;
+  CHECK(edited.workflows.train.request.recipe.lr == 0.00023);
+  CHECK(edited.workflows.train.request.epochs == 9);
+  contracts::SettingsUpdateRequest unrelated;
+  unrelated.updates.push_back({"ui.dark_mode", Value{true}});
+  const auto retained = settings.Update(std::move(unrelated)).settings_state;
+  CHECK(retained.workflows.train.request == edited.workflows.train.request);
+ }
+ auto continuation = settings.snapshot().settings_state.workflows.train.request;
+ continuation.epochs = 17;
+ continuation.batch_size = 3;
+ continuation.use_ema = false;
+ settings.RestoreTrainingCheckpoint(continuation, "/saved/session.json");
+ const auto restored = settings.snapshot().settings_state.workflows.train.request;
+ CHECK(static_cast<const r::TrainHyperparameters&>(restored) == static_cast<const r::TrainHyperparameters&>(continuation));
+ CHECK(restored.recipe == continuation.recipe);
+ SettingsSystem reloaded;
+ REQUIRE(reloaded.Load(location).applied());
+ CHECK(reloaded.snapshot().settings_state == settings.snapshot().settings_state);
+ contracts::SettingsUpdateRequest custom;
+ custom.updates.push_back({"workflows.train.request.weights_path", *Value::text("/new/model.pt", 256)});
+ const auto transferred = settings.Update(std::move(custom)).settings_state.workflows.train.request;
+ CHECK(static_cast<const r::TrainHyperparameters&>(transferred) == r::kPresetCatalog.back().training_defaults);
+ CHECK(transferred.resume_path.empty());
+ CHECK(transferred.weights_path == "/new/model.pt");
+}
 TEST_CASE("scratch Train choice persists with legacy off and ordinary Resume restoration", "[controller][settings][encoder_pretraining]") {
  const auto root = mmltk::testsupport::make_temp_root("scratch-settings");
  SettingsSystem settings;

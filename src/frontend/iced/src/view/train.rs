@@ -334,7 +334,6 @@ impl Component {
                     crate::generated::FeatureId::Train,
                     settings.draft.as_ref(),
                     model.model_snapshot.as_ref(),
-                    model.file_dialog.as_ref(),
                     execution_edit_available,
                     settings_settled
                         && settings.draft.as_ref().is_some_and(|draft| {
@@ -541,7 +540,6 @@ mod tests {
                 feature,
                 settings.draft.as_ref(),
                 None,
-                None,
                 true,
                 true,
                 false,
@@ -557,10 +555,8 @@ mod tests {
             ),
             Message::Model,
         );
-        let mut validate = crate::view::workflow::model_card::view(
-            state(crate::generated::FeatureId::Validate),
-            0,
-        );
+        let mut validate =
+            crate::view::workflow::model_card::view(state(crate::generated::FeatureId::Validate));
         let mut train_tree = iced::advanced::widget::Tree::new(&train);
         let mut validate_tree = iced::advanced::widget::Tree::new(&validate);
         train_tree.diff(&mut train);
@@ -648,7 +644,7 @@ mod tests {
                 &mut model,
                 Some(&dialog),
                 Message::Model(
-                    crate::view::workflow::model_card::Message::ConfirmArtifact {
+                    crate::view::workflow::model_card::Message::ArtifactSelected {
                         path: draft.clone(),
                         generation: 1,
                     },

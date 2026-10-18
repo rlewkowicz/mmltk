@@ -280,7 +280,7 @@ impl App {
         ) {
             self.workspace.sync_workflows(&mut self.model);
         }
-        // A deliberate confirmation waits for admitted restoration/model replies
+        // A deliberate selection waits for admitted restoration/model replies
         // to settle before replacing the continuation selection.
         if self.model.workflow.train_continuation.refresh_requested
             && (self.model.workflow.pending_start.is_some() || self.model.training_family_pending())
@@ -817,7 +817,7 @@ impl App {
         outcome: crate::view::workflow::model_card::Outcome,
     ) -> Task<Message> {
         match outcome {
-            crate::view::workflow::model_card::Outcome::ArtifactConfirmed(schedule) => {
+            crate::view::workflow::model_card::Outcome::ArtifactSelected(schedule) => {
                 self.model
                     .notices
                     .clear_condition(crate::view_model::notices::Origin::Editor(workflow));
@@ -1379,6 +1379,89 @@ mod tests {
         intent
     }
 
+    #[test]
+    fn custom_file_results_apply_once_without_another_user_action() {
+        use crate::application_codec::IntoApplicationValue;
+        use crate::view_model::test_support::selected_model_dialog;
+        for workflow in [
+            FeatureId::Train,
+            FeatureId::Validate,
+            FeatureId::Predict,
+            FeatureId::Export,
+        ] {
+            for event_first in [false, true] {
+                let (mut app, mut capture) = start_app();
+                app.workspace.select(workflow);
+                let path = "/tmp/custom.pt";
+                let dialog =
+                    selected_model_dialog(app.settings.draft().unwrap(), workflow, path, 1);
+                app.open_model_dialog(dialog.target.clone());
+                let opened = next_intent(&mut capture, ApplicationIntentEndpoint::FileDialogOpen);
+                let reply = TransportEvent::IntentReply(IntentReply {
+                    correlation: opened.correlation,
+                    result: Ok(dialog.clone().into_application_transport_value()),
+                });
+                let event = TransportEvent::SystemEvent(SystemEvent {
+                    state_revision: 0,
+                    delivery: crate::generated::EventDelivery::Critical,
+                    event: crate::generated::ApplicationEvent::FileDialogFileDialogCompleted(
+                        crate::generated::FileDialogCompleted { snapshot: dialog },
+                    ),
+                });
+                let (first, duplicate) = if event_first {
+                    (event, reply)
+                } else {
+                    (reply, event)
+                };
+                drop(app.on_transport(first));
+                let selected = crate::view_model::model_settings_projection(
+                    app.settings.draft().unwrap(),
+                    workflow,
+                )
+                .unwrap();
+                assert_eq!(
+                    selected.selection.key.source,
+                    crate::generated::ModelSelectionSource::Custom
+                );
+                assert_eq!(selected.selection.artifact, path);
+                next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
+                assert!(app.model.workflow.pending_start.is_none());
+                assert!(capture.try_recv().is_err());
+                drop(app.on_transport(duplicate));
+                assert_eq!(app.settings.state().queued_len(), 0);
+                assert!(capture.try_recv().is_err());
+                assert!(app.model.notices.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_custom_file_results_preserve_the_selection() {
+        use crate::application_codec::IntoApplicationValue;
+        use crate::view_model::test_support::selected_model_dialog;
+        let (mut app, mut capture) = start_app();
+        let before = app.settings.draft().cloned();
+        let mut dialog = selected_model_dialog(
+            app.settings.draft().unwrap(),
+            FeatureId::Train,
+            "/tmp/custom.pt",
+            1,
+        );
+        dialog.selection.as_mut().unwrap().result =
+            crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::FileDialogCancelled(
+                crate::generated::FileDialogCancelled {},
+            );
+        app.open_model_dialog(dialog.target.clone());
+        let opened = next_intent(&mut capture, ApplicationIntentEndpoint::FileDialogOpen);
+        drop(app.on_transport(TransportEvent::IntentReply(IntentReply {
+            correlation: opened.correlation,
+            result: Ok(dialog.into_application_transport_value()),
+        })));
+        assert_eq!(app.settings.draft(), before.as_ref());
+        assert!(capture.try_recv().is_err());
+        assert!(!app.model.workflow.train_continuation.refresh_requested);
+    }
+
     fn validation_viewer() -> (App, Capture, crate::generated::UpscaleRequest) {
         use crate::generated::{PresentationSourceKind, UpscaleKernel};
         let (mut app, capture) = start_app();
@@ -1865,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn deliberate_same_path_confirmation_refreshes_once_without_starting() {
+    fn deliberate_same_path_selection_refreshes_once_without_starting() {
         for failed in [false, true] {
             let (mut app, mut capture) = start_app();
             let checkpoint = select_resumable(&mut app);
@@ -1892,7 +1975,7 @@ mod tests {
             assert!(capture.try_recv().is_err());
             drop(app.on_model(
                 FeatureId::Train,
-                crate::view::workflow::model_card::Outcome::ArtifactConfirmed(
+                crate::view::workflow::model_card::Outcome::ArtifactSelected(
                     EditSchedule::Debounce(1),
                 ),
             ));
@@ -1962,7 +2045,7 @@ mod tests {
             app.model.workflow.train_continuation = Default::default();
             drop(app.on_model(
                 FeatureId::Train,
-                crate::view::workflow::model_card::Outcome::ArtifactConfirmed(
+                crate::view::workflow::model_card::Outcome::ArtifactSelected(
                     EditSchedule::Debounce(1),
                 ),
             ));
@@ -1975,14 +2058,12 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_waits_for_cancelled_restore_and_validate_has_no_continuation_effect() {
+    fn selection_waits_for_cancelled_restore_and_validate_has_no_continuation_effect() {
         let (mut app, mut capture) = start_app();
         let checkpoint = select_resumable(&mut app);
         drop(app.on_model(
             FeatureId::Validate,
-            crate::view::workflow::model_card::Outcome::ArtifactConfirmed(EditSchedule::Debounce(
-                1,
-            )),
+            crate::view::workflow::model_card::Outcome::ArtifactSelected(EditSchedule::Debounce(1)),
         ));
         assert!(!app.model.workflow.train_continuation.refresh_requested);
         assert_eq!(
@@ -1997,11 +2078,9 @@ mod tests {
         );
         drop(app.on_model(
             FeatureId::Train,
-            crate::view::workflow::model_card::Outcome::ArtifactConfirmed(EditSchedule::Debounce(
-                1,
-            )),
+            crate::view::workflow::model_card::Outcome::ArtifactSelected(EditSchedule::Debounce(1)),
         ));
-        // CLEANUP-IGNORE: Same-path confirmation independently asserts cancellation before its distinct restore settlement.
+        // CLEANUP-IGNORE: Same-path selection independently asserts cancellation before its distinct restore settlement.
         assert!(
             app.model
                 .workflow

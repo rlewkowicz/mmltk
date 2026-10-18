@@ -167,8 +167,9 @@ cards have no separate backend-kind/Class layout controls. A new custom
 selection clears an unrelated descriptor; CLI/native descriptor routes remain.
 Only Train exposes From scratch and Transfer/Resume. From scratch keeps canonical
 preset selection and disables Custom Weights and both continuation radios.
-Dialog confirmation, pending selection and preparation are shared behavior with
-independent workflow widget identities.
+Choosing a custom file applies it immediately, without a confirmation dialog.
+Selection and preparation are shared behavior with independent workflow widget
+identities.
 Failures enter [session Status](gui-interaction.md#session-status).
 
 ## Training initialization
@@ -311,14 +312,14 @@ trajectories and frozen final selection/test. These are not accuracy guarantees.
 Individual archives/candidates/soups are Transfer/deployment inputs.
 Train's Transfer/Resume radios never start work. With From scratch off,
 catalog/weights-only inputs use Transfer; admitted resumable custom input defaults
-to Resume. Select and confirm `session.json` in Custom Weights; successful native
+to Resume. Select `session.json` in Custom Weights; successful native
 inspection enables Resume.
 Browse Output selects history only. Saved custom paths use the same inspection/
 Prepare Resume path; CLI accepts `--resume`.
 
 Inspection is worker-owned/cancellable and checks archive, continuation,
 optimizer/EMA inventory, immutable evidence and physical generation lease.
-Confirming the same path refreshes it; errors do not auto-retry. Resume Start
+Selecting the same path again refreshes it; errors do not auto-retry. Resume Start
 restores saved settings, settles them and passes retained admission directly to
 Training, bypassing ordinary weight preparation. Only the still-current explicit
 Start can proceed; a path/history manifest alone cannot authorize Resume.

@@ -24,7 +24,6 @@ pub(crate) enum Stage {
     AwaitMutation,
     SourceRemoved,
     Browse,
-    Confirm,
     Inspect,
     Resume,
     StartResume,
@@ -183,15 +182,6 @@ impl State {
                 driver,
                 crate::view::workflow::model_card::TRAIN_CUSTOM_ID,
             ),
-            Stage::Confirm
-                if settled
-                    && model
-                        .file_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| !dialog.active && dialog.selection.is_some()) =>
-            {
-                control(widgets, driver, "train.model.confirm")
-            }
             Stage::Inspect
                 if settled
                     && model.workflow.train_continuation.matches(train)
@@ -309,8 +299,7 @@ impl State {
             Stage::Prepare => Stage::Prepared,
             Stage::Start => Stage::Training,
             Stage::Stop => Stage::Stopped,
-            Stage::Browse => Stage::Confirm,
-            Stage::Confirm => Stage::Inspect,
+            Stage::Browse => Stage::Inspect,
             Stage::Resume => {
                 input.width = input.height;
                 Stage::StartResume

@@ -119,7 +119,6 @@ impl Component {
                     crate::generated::FeatureId::Validate,
                     settings.draft.as_ref(),
                     model.model_snapshot.as_ref(),
-                    model.file_dialog.as_ref(),
                     settings_edit_available,
                     settings_settled
                         && settings.draft.as_ref().is_some_and(|draft| {

@@ -376,12 +376,12 @@ pub fn view<'a>(
                 enabled,
                 Message::Ema
             ),
-            fields::toggle(
+            container(fields::toggle(
                 "Freeze encoder",
                 request.freezeencoder,
                 enabled,
                 Message::FreezeEncoder,
-            ),
+            )).id(crate::generated::constraint_workflowstrainrequestfreezeencoder().stable_field_id.to_string()),
             fields::number_i32("Unfreeze encoder: final epochs", request.unfreezeencoderlastepochs, crate::generated::constraint_workflowstrainrequestunfreezeencoderlastepochs(), enabled, Message::UnfreezeLast),
             ].spacing(crate::view::workflow::FIELD_SPACING)),
             divider(),
@@ -412,9 +412,14 @@ mod tests {
     use crate::view::settings::installed_settings_model;
 
     #[test]
-    fn ema_uses_the_canonical_false_default_and_round_trips_edits() {
+    fn ema_uses_the_catalog_default_and_round_trips_edits() {
         let mut model = installed_settings_model();
-        assert!(!model.draft.as_ref().unwrap().workflows.train.request.useema);
+        assert_eq!(
+            model.draft.as_ref().unwrap().workflows.train.request.useema,
+            crate::generated::RFDETR_PRESET_CATALOG[0]
+                .trainingdefaults
+                .useema,
+        );
         for enabled in [true, false] {
             update(&mut model, Message::Ema(enabled)).unwrap();
             assert_eq!(

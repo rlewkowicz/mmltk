@@ -6,7 +6,6 @@ use crate::generated::{ModelArtifactInputKind, SettingsFieldValue};
 #[derive(Clone)]
 pub(crate) struct ModelSettingsProjection {
     pub(crate) fields: &'static ModelArtifactDialogFact,
-    pub(crate) artifact_field: Option<&'static ModelArtifactDialogFact>,
     pub(crate) selection: crate::generated::ModelSettingsProjection,
 }
 
@@ -28,18 +27,10 @@ pub(crate) fn model_settings_projection(
     workflow: FeatureId,
 ) -> Option<ModelSettingsProjection> {
     let selection = crate::generated::project_model_settings(settings, workflow)?;
-    let matching = || {
-        crate::generated::MODEL_ARTIFACT_DIALOGS
-            .iter()
-            .filter(|dialog| dialog.target.workflow == workflow)
-    };
-    let fields = matching().next()?;
-    let artifact_field = matching().find(|dialog| dialog.target.input == selection.key.input);
-    Some(ModelSettingsProjection {
-        fields,
-        artifact_field,
-        selection,
-    })
+    let fields = crate::generated::MODEL_ARTIFACT_DIALOGS
+        .iter()
+        .find(|dialog| dialog.target.workflow == workflow)?;
+    Some(ModelSettingsProjection { fields, selection })
 }
 
 impl ModelSettingsProjection {
@@ -339,7 +330,6 @@ mod tests {
                 "/tmp/second.classes.json"
             );
             assert!(partial.selection.artifact.is_empty());
-            assert!(partial.artifact_field.is_none());
             assert!(!partial.can_prepare());
         }
         // Preserve a raw incomplete draft, including the existing signed cast.

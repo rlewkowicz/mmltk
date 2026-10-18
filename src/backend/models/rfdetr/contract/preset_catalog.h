@@ -7,6 +7,8 @@
 #include <limits>
 #include <string_view>
 #include "src/backend/models/rfdetr/contract/model_topology.h"
+#include "src/backend/models/rfdetr/contract/train_hyperparameters.h"
+#include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/backend/models/rfdetr/contract/weight_catalog.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
@@ -59,6 +61,8 @@ struct PresetCatalogEntry final {
  double keypoint_visible_loss_coefficient = 0.0;
  double keypoint_nll_loss_coefficient = 0.0;
  PresetTrainingCapabilities training_capabilities{};
+ // RF-DETR TrainConfig defaults shared by detection, segmentation, and keypoints.
+ PresetTrainingDefaults training_defaults{};
  constexpr bool operator==(const PresetCatalogEntry&) const noexcept = default;
 };
 MMLTK_REFLECT_FIELDS(PresetCatalogEntry)
@@ -122,7 +126,8 @@ inline constexpr auto kPresetCatalog = [] {
       preset.resolution > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) || backbone_encoder_name(preset.backbone.kind).empty() || preset.canonical_weight_filename.empty() ||
       preset.canonical_weight_url.empty() || preset.canonical_weight_md5.size() != 32U || preset.patch_size == 0U || preset.window_count == 0U || preset.positional_encoding_size == 0U ||
       (preset.decoder_layer_count == 0U && (!preset.two_stage || preset.task != ModelTask::Detection)) || preset.query_count == 0U || preset.selected_query_count == 0U ||
-      preset.selected_query_count > preset.query_count || preset.class_count == 0U || preset.hidden_dimension == 0U || preset.group_count == 0U) {
+      preset.selected_query_count > preset.query_count || preset.class_count == 0U || preset.hidden_dimension == 0U || preset.group_count == 0U ||
+      mmltk::frameworks::reflection::validate_reflected_fields(preset.training_defaults) || !train_recipe_values_valid(preset.training_defaults.recipe)) {
    return false;
   }
   if (preset.upstream_class.empty() || preset.self_attention_heads == 0U || preset.cross_attention_heads == 0U || preset.feedforward_dimension == 0U ||

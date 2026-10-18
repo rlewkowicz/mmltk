@@ -327,6 +327,21 @@ before ratios; each global microbatch/image counts once.
 
 ### Recipes and schedules
 
+The [model catalog](../src/backend/models/rfdetr/contract/preset_catalog.h) supplies
+Train defaults when selecting a preset or custom weights. The rows
+select the upstream `TrainConfig` AdamW recipe below, plus 100 epochs, batch 4,
+accumulation 1, inherited validation batch, gradient clipping `0.1`, EMA enabled
+with decay `0.993` and tau 100, mixed precision and fused optimization enabled,
+and an unfrozen encoder. Queries follow model topology; evaluation allows 500
+detections. Upstream detection, segmentation and keypoint classes share these
+defaults; task objective coefficients remain in their catalog rows.
+
+Selection replaces global and per-model recipes and clears their overrides,
+preserving lane membership, seeds, dataset/output paths and execution placement.
+Explicit edits submitted with selection take precedence. Later edits and saved
+settings retain their values; Resume restores the saved request without applying
+catalog defaults. Native augmentation and loading policy remain independent.
+
 [TrainRecipeSettings](../src/backend/models/rfdetr/contract/train_recipe.h)
 serves globals and each model. New entries copy settled globals; existing entries
 retain overrides through mode changes. Reset clears only the selected scope's

@@ -103,8 +103,8 @@ pub(crate) enum Stage {
     PoseCompiled,
     PreparePose,
     PosePrepared,
-    PoseEpochs,
-    PoseEpochsReady,
+    PoseSettings(u8),
+    PoseSettingsReady(u8),
     StartPose,
     PoseTraining,
     LiveDerivedPage,
@@ -1058,6 +1058,23 @@ impl State {
                             && source == ModelSelectionSource::Canonical
                     }) =>
             {
+                if stage == Stage::PoseSelected {
+                    let request = &settings.draft.as_ref().unwrap().workflows.train.request;
+                    let defaults = &RFDETR_PRESET_CATALOG[self.model_row].trainingdefaults;
+                    if request.recipe.optimizer != defaults.recipe.optimizer
+                        || request.recipe.lr != defaults.recipe.lr
+                        || request.recipe.lrencoder != defaults.recipe.lrencoder
+                        || request.recipe.weightdecay != defaults.recipe.weightdecay
+                        || request.epochs != defaults.epochs
+                        || request.batchsize != defaults.batchsize
+                        || request.gradaccumsteps != defaults.gradaccumsteps
+                        || request.valbatchsize != defaults.valbatchsize
+                        || request.useema != defaults.useema
+                    {
+                        driver.fail("Rendered catalog selection did not install the model training defaults");
+                        return Task::none();
+                    }
+                }
                 completed(
                     if stage != Stage::PeSelected {
                         "model-keypoint-selection"
@@ -1209,34 +1226,45 @@ impl State {
                 if !self.capture_catalog_selection(driver, model, FeatureId::Train) {
                     return Task::none();
                 }
-                phase(driver, Stage::PoseEpochs)
+                phase(driver, Stage::PoseSettings(0))
             }
-            Stage::PoseEpochs => {
-                if settled
-                    && settings
-                        .draft
-                        .as_ref()
-                        .is_some_and(|value| value.workflows.train.request.epochs == 1)
-                {
-                    phase(driver, Stage::PoseEpochsReady)
-                } else {
-                    control(
-                        widgets,
-                        driver,
-                        constraint_workflowstrainrequestepochs()
-                            .stable_field_id
-                            .to_string(),
-                    )
+            Stage::PoseSettings(index) | Stage::PoseSettingsReady(index) => {
+                if !settled {
+                    return Task::none();
                 }
-            }
-            Stage::PoseEpochsReady
-                if settled
-                    && settings
-                        .draft
-                        .as_ref()
-                        .is_some_and(|value| value.workflows.train.request.epochs == 1) =>
-            {
-                phase(driver, Stage::StartPose)
+                let request = &settings.draft.as_ref().unwrap().workflows.train.request;
+                let (ready, field) = match index {
+                    0 => (
+                        request.epochs == 1,
+                        constraint_workflowstrainrequestepochs().stable_field_id,
+                    ),
+                    1 => (
+                        request.batchsize == 1,
+                        constraint_workflowstrainrequestbatchsize().stable_field_id,
+                    ),
+                    2 => (
+                        request.freezeencoder,
+                        constraint_workflowstrainrequestfreezeencoder().stable_field_id,
+                    ),
+                    _ => {
+                        driver.fail("Unknown catalog training fixture setting");
+                        return Task::none();
+                    }
+                };
+                if ready {
+                    phase(
+                        driver,
+                        if index == 2 {
+                            Stage::StartPose
+                        } else {
+                            Stage::PoseSettings(index + 1)
+                        },
+                    )
+                } else if matches!(stage, Stage::PoseSettings(_)) {
+                    control(widgets, driver, field.to_string())
+                } else {
+                    Task::none()
+                }
             }
             Stage::StartPose => {
                 self.operation_generation = model
@@ -1963,12 +1991,17 @@ impl State {
             Stage::CompilePose => Stage::PoseCompiled,
             Stage::PreparePose => Stage::PosePrepared,
             Stage::StartPose => Stage::PoseTraining,
-            Stage::PoseEpochs => {
-                driver.phase = Phase::Workflows(Step::Keypoints(Stage::PoseEpochsReady));
-                if !widget_ops::replace_number_input(input, "1", 32) {
-                    driver.fail("Catalog epoch keyboard input failed");
+            Stage::PoseSettings(index) => {
+                if index < 2 {
+                    driver.phase =
+                        Phase::Workflows(Step::Keypoints(Stage::PoseSettingsReady(index)));
+                    if !widget_ops::replace_number_input(input, "1", 32) {
+                        driver.fail("Catalog training fixture keyboard input failed");
+                    }
+                    return;
                 }
-                return;
+                input.width = input.width.min(input.height);
+                Stage::PoseSettingsReady(index)
             }
             Stage::LiveDerivedPage => Stage::UpscaleLive,
             Stage::UpscaleLive => Stage::UpscaledLive,

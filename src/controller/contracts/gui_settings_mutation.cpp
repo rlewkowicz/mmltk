@@ -286,6 +286,23 @@ std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettings
   if (auto result = assign_flat_path(candidate, update.path, update.value); !result) { return result; }
   paths[count++] = update.path;
  }
+ const auto supplied = std::span{paths.data(), count};
+ using TrainSelection = TrainWeightsModelSelection;
+ constexpr auto preset_path = mmltk::frameworks::reflection::reflected_member_path<GuiSettingsState, TrainSelection::preset>();
+ const bool preset_selected = TrainSelection::source(candidate) == ModelSelectionSource::Canonical && std::ranges::contains(supplied, preset_path.view());
+ const bool custom_loaded = TrainSelection::source(candidate) == ModelSelectionSource::Custom && std::ranges::contains(supplied, TrainSelection::artifact_field_path.view());
+ if (preset_selected || custom_loaded) {
+  auto& training = candidate.workflows.train.request;
+  const auto* preset = mmltk::backend::models::rfdetr::find_preset_catalog_entry(training.preset_name);
+  if (!preset) return std::unexpected(SettingsMutationError::CrossFieldViolation);
+  mmltk::backend::models::rfdetr::apply_preset_training_defaults(training, *preset);
+  training.resume_path.clear();
+  training.encoder_weights_path.clear();
+  if (preset_selected) training.weights_path.clear();
+  // Explicit settings accompanying selection win over the catalog regardless of edit order.
+  for (const auto& update : updates)
+   if (auto result = assign_flat_path(candidate, update.path, update.value); !result) return result;
+ }
  const auto& installed_train = state.workflows.train.request;
  const auto& selected_train = candidate.workflows.train.request;
  if (selected_train.train_compiled_path != installed_train.train_compiled_path || selected_train.val_compiled_path != installed_train.val_compiled_path)

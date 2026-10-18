@@ -283,7 +283,7 @@ WorkflowScratchInputs::WorkflowScratchInputs(const std::filesystem::path& root)
  source_ = root_ / ".cache/mmltk/weights/encoders" / identity / asset.filename;
  std::filesystem::create_directories(source_.parent_path());
  std::filesystem::create_symlink(*evidence / "assets" / (std::string(mmltk::frameworks::reflection::enum_name(asset.backbone)) + ".safetensors"), source_);
- // The real file-dialog transport still owns selection and confirmation. Its
+ // The real file-dialog transport still owns the custom-file selection. Its
  // executable seam returns only the session admitted below by the parent.
  std::filesystem::create_directories(root_ / "fixture-bin");
  std::ofstream chooser(root_ / "fixture-bin/zenity");

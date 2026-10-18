@@ -588,7 +588,7 @@ void test_fresh_defaults_use_capture_only_annotate() {
  CHECK(validate.request.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
  CHECK_FALSE(train.request.gpu_augmentation.perceptual_downscale);
  REQUIRE((train.request.num_queries == 0));
- REQUIRE((train.request.eval_max_dets == 0));
+ REQUIRE((train.request.eval_max_dets == mmltk::backend::models::rfdetr::kPresetCatalog.front().training_defaults.eval_max_dets));
  REQUIRE((validate.model_input == ModelArtifactInputKind::Weights));
  REQUIRE((validate.request.candidate_count == 0));
  REQUIRE((validate.request.eval_max_dets == 0));

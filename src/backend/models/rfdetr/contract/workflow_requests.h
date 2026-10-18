@@ -17,6 +17,7 @@
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
+#include "src/backend/models/rfdetr/contract/train_hyperparameters.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 namespace mmltk::backend::models::rfdetr {
 inline constexpr std::size_t kMaximumCliImageInputs = 4096U;
@@ -138,7 +139,7 @@ struct GpuAugmentationConfig {
  MMLTK_MAXIMUM(float, kAugmentationScalarMaximum) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::UnitInterval) float copy_paste_probability = 0.80F;
 };
 // CLEANUP-IGNORE: Train is the canonical reflected training request; coincident field shapes remain domain-named.
-struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
+struct TrainRequest : mmltk::backend::data::DataLoadingOptions, TrainHyperparameters {
  bool operator==(const TrainRequest&) const = default;
  // Rank-ordered overrides correspond exactly to device_ids; -1 selects automatic locality.
  MMLTK_MAX_ITEMS(mmltk::backend::models::rfdetr::kMaximumTrainingDevices)
@@ -164,12 +165,6 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  MMLTK_MAX_PATH_BYTES std::filesystem::path test_compiled_path;
  MMLTK_MAX_PATH_BYTES std::filesystem::path distributed_store_path;
  MMLTK_MAX_NAME_BYTES std::string cpu_affinity;
- MMLTK_MINIMUM(std::size_t, 1U) std::size_t batch_size = 1U;
- std::size_t val_batch_size = 0U;
- std::size_t num_queries = 0U;
- std::size_t eval_max_dets = 0U;
- MMLTK_MINIMUM(int, 1) int epochs = 1;
- MMLTK_MINIMUM(int, 1) int grad_accum_steps = 1;
  MMLTK_MINIMUM(int, 1) int print_freq = 100;
  MMLTK_MINIMUM(int, 1) int prefetch_factor = 2;
  // CLEANUP-IGNORE: Seed and worker settings are separate generated fields despite adjacent scalar defaults.
@@ -181,14 +176,6 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  MMLTK_MAX_ITEMS(mmltk::backend::models::rfdetr::kMaximumTrainingDevices) std::vector<int> device_ids;
  MMLTK_MINIMUM(int, 0) int distributed_rank = 0;
  MMLTK_MINIMUM(int, 1) int distributed_world_size = 1;
- // CLEANUP-IGNORE: EMA and optimizer fields retain explicit reflected constraints at their canonical declarations.
- MMLTK_MINIMUM(int, 0) int ema_tau = 100;
- MMLTK_MINIMUM(double, 0.0)
- MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Norm) double
-  // CLEANUP-IGNORE: Gradient clipping is a nonnegative norm; adjacent optimizer scalars are bounded decay
-  // fractions.
-  clip_max_norm = 0.1;
- MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Decay) double ema_decay = 0.993;
  TrainRecipeSettings recipe;
  TrainLaneConfiguration lane_configuration;
  TrainDataPolicy data_policy;
@@ -197,16 +184,18 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  MMLTK_MINIMUM(int, 0) int disable_augmentation_last_epochs = 0;
  GpuAugmentationConfig gpu_augmentation;
  TrainingSupervisionConfig training_supervision;
- bool use_ema = false;
  bool validation_loss = false;
  bool validation_profile = false;
- bool amp = true;
  bool progress_bar = true;
- bool freeze_encoder = false;
- bool fused_optimizer = true;
  bool distributed_worker = false;
  CompilationMode compilation_mode = CompilationMode::kSelective;
 };
+inline constexpr void apply_preset_training_defaults(TrainRequest& request, const PresetCatalogEntry& preset) {
+ static_cast<TrainHyperparameters&>(request) = preset.training_defaults;
+ static_cast<TrainRecipeValues&>(request.recipe) = preset.training_defaults.recipe;
+ request.recipe.overrides = {};
+ for (auto& model : request.lane_configuration.models) model.recipe = request.recipe;
+}
 [[nodiscard]] std::string encode_train_request_json(const TrainRequest&);
 [[nodiscard]] TrainRequest decode_train_request_json(std::string_view);
 // Only the two additive initialization fields migrate at owned persistence boundaries.

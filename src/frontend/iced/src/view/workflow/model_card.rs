@@ -23,8 +23,7 @@ impl std::fmt::Display for crate::generated::PresetCatalogEntry {
 pub enum Message {
     PresetSelected(usize),
     BrowseRequested,
-    ConfirmArtifact { path: String, generation: u64 },
-    CancelArtifact(u64),
+    ArtifactSelected { path: String, generation: u64 },
     PrepareRequested,
     StopRequested,
 }
@@ -32,7 +31,7 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub enum Outcome {
     SettingsEdited(crate::view::settings::EditSchedule),
-    ArtifactConfirmed(crate::view::settings::EditSchedule),
+    ArtifactSelected(crate::view::settings::EditSchedule),
     BrowseRequested(crate::generated::FileDialogTarget),
     PrepareRequested,
     StopRequested,
@@ -40,7 +39,7 @@ pub enum Outcome {
 
 pub struct Component {
     workflow: FeatureId,
-    dismissed_dialog_generation: u64,
+    applied_dialog_generation: u64,
 }
 
 impl Default for Component {
@@ -53,7 +52,7 @@ impl Component {
     pub const fn new(workflow: FeatureId) -> Self {
         Self {
             workflow,
-            dismissed_dialog_generation: 0,
+            applied_dialog_generation: 0,
         }
     }
 
@@ -126,7 +125,7 @@ impl Component {
                     target,
                 ))
             }
-            Message::ConfirmArtifact { path, generation } => {
+            Message::ArtifactSelected { path, generation } => {
                 let workflow = self.workflow;
                 let draft = settings
                     .draft
@@ -137,15 +136,15 @@ impl Component {
                 if pending_artifact_selection(
                     file_dialog,
                     &opening.target,
-                    self.dismissed_dialog_generation,
+                    self.applied_dialog_generation,
                 ) != Some((path.as_str(), generation))
                 {
-                    return Err("The custom model confirmation is stale.".to_owned());
+                    return Err("The custom model selection is stale.".to_owned());
                 }
                 let row = artifact_row(workflow, &path)?;
                 let dialog = dialog_for_row(row)?;
                 let schedule = settings.edit_fields(
-                    EditCadence::Debounced,
+                    EditCadence::Immediate,
                     [
                         (
                             dialog.key_fields.source,
@@ -167,14 +166,9 @@ impl Component {
                         ),
                     ],
                 )?;
-                self.dismissed_dialog_generation = generation;
-                Outcome::ArtifactConfirmed(schedule)
+                self.applied_dialog_generation = generation;
+                Outcome::ArtifactSelected(schedule)
             }
-            Message::CancelArtifact(generation) => {
-                self.dismissed_dialog_generation = self.dismissed_dialog_generation.max(generation);
-                return Ok(None);
-            }
-
             Message::PrepareRequested => Outcome::PrepareRequested,
             Message::StopRequested => Outcome::StopRequested,
         };
@@ -183,7 +177,7 @@ impl Component {
 
     pub fn view<'a>(&'a self, state: State<'a>) -> Element<'a, Message> {
         debug_assert_eq!(self.workflow, state.workflow);
-        view(state, self.dismissed_dialog_generation)
+        view(state)
     }
     pub fn view_with<'a, M: Clone + 'a>(
         &'a self,
@@ -191,7 +185,7 @@ impl Component {
         content: Element<'a, M>,
         map: fn(Message) -> M,
     ) -> Element<'a, M> {
-        view_with(state, self.dismissed_dialog_generation, Some(content), map)
+        view_with(state, Some(content), map)
     }
 }
 
@@ -208,11 +202,8 @@ pub struct State<'a> {
     pub preset: Option<String>,
     pub source: ModelSelectionSource,
     pub from_scratch: bool,
-    pub input: ModelArtifactInputKind,
     pub artifact: String,
-    pub artifact_field_id: u64,
     pub model: Option<&'a ModelUiState>,
-    pub file_dialog: Option<&'a crate::generated::FileDialogSnapshot>,
     pub settings_enabled: bool,
     pub prepare_enabled: bool,
     pub stop_enabled: bool,
@@ -223,45 +214,20 @@ impl<'a> State<'a> {
         workflow: FeatureId,
         settings: Option<&'a crate::generated::GuiSettingsState>,
         model: Option<&'a ModelUiState>,
-        file_dialog: Option<&'a crate::generated::FileDialogSnapshot>,
         settings_enabled: bool,
         prepare_enabled: bool,
         stop_enabled: bool,
     ) -> Self {
         let projection = settings
             .and_then(|settings| crate::view_model::model_settings_projection(settings, workflow));
-        let custom_row = projection
-            .as_ref()
-            .and_then(|value| custom_compatible_row(value).ok());
         let source = projection
             .as_ref()
             .map_or(ModelSelectionSource::Canonical, |value| {
                 value.selection.key.source
             });
-        let input = projection.as_ref().map_or_else(
-            || {
-                if workflow == FeatureId::Export {
-                    ModelArtifactInputKind::None
-                } else {
-                    compatibility(workflow)
-                        .next()
-                        .map_or(ModelArtifactInputKind::None, |row| row.input)
-                }
-            },
-            |value| {
-                custom_row
-                    .filter(|_| value.selection.key.input == ModelArtifactInputKind::None)
-                    .map_or(value.selection.key.input, |row| row.input)
-            },
-        );
         let preset = projection
             .as_ref()
             .map(|value| value.selection.key.preset.clone());
-        let artifact_field_id = projection
-            .as_ref()
-            .and_then(|value| value.artifact_field)
-            .or_else(|| custom_row.and_then(|row| dialog_for_row(row).ok()))
-            .map_or(0, |dialog| dialog.stable_field_id);
         let model = model.filter(|model| {
             model.active
                 || model.terminal.outcome != crate::generated::ModelSelectionOutcome::Accepted
@@ -278,24 +244,12 @@ impl<'a> State<'a> {
             preset,
             source,
             from_scratch,
-            input,
             artifact,
-            artifact_field_id,
             model,
-            file_dialog,
             settings_enabled,
             prepare_enabled,
             stop_enabled,
         }
-    }
-}
-
-fn input_label(input: ModelArtifactInputKind) -> &'static str {
-    match input {
-        ModelArtifactInputKind::Weights => "Weights",
-        ModelArtifactInputKind::Onnx => "ONNX",
-        ModelArtifactInputKind::TensorRt => "TensorRT",
-        ModelArtifactInputKind::None => "Choose input",
     }
 }
 
@@ -572,12 +526,12 @@ fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, 
 fn pending_artifact_selection<'a>(
     file_dialog: Option<&'a crate::generated::FileDialogSnapshot>,
     target: &crate::generated::ModelArtifactTarget,
-    dismissed_dialog_generation: u64,
+    applied_dialog_generation: u64,
 ) -> Option<(&'a str, u64)> {
     let dialog = file_dialog.filter(|dialog| {
         !dialog.active
             && !dialog.cancellationrequested
-            && dialog.generation > dismissed_dialog_generation
+            && dialog.generation > applied_dialog_generation
             && matches!(
                 &dialog.target,
                 crate::generated::FileDialogTarget::ModelArtifactTarget(current)
@@ -595,27 +549,6 @@ fn pending_artifact_selection<'a>(
         return None;
     };
     Some((selected.path.as_str(), dialog.generation))
-}
-
-fn pending_artifact_confirmation<'a>(
-    state: &State<'a>,
-    dismissed_dialog_generation: u64,
-) -> Option<(&'a str, u64)> {
-    if state.from_scratch {
-        return None;
-    }
-    let target = crate::generated::MODEL_ARTIFACT_DIALOGS
-        .iter()
-        .find(|dialog| {
-            dialog.target.workflow == state.workflow
-                && dialog.target.input == state.input
-                && dialog.stable_field_id == state.artifact_field_id
-        })?;
-    pending_artifact_selection(
-        state.file_dialog,
-        &target.target,
-        dismissed_dialog_generation,
-    )
 }
 
 fn shared_selector<'a>(
@@ -680,27 +613,17 @@ fn shared_selector<'a>(
     .into()
 }
 
-pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, Message> {
-    view_with(state, dismissed_dialog_generation, None, |message| message)
+pub fn view(state: State<'_>) -> Element<'_, Message> {
+    view_with(state, None, |message| message)
 }
 fn view_with<'a, M: Clone + 'a>(
     state: State<'a>,
-    dismissed_dialog_generation: u64,
     content: Option<Element<'a, M>>,
     map: fn(Message) -> M,
 ) -> Element<'a, M> {
     const ROW_PADDING: f32 = 5.0;
     const TEXT_SIZE: f32 = 12.0;
     let card_id = stable_id(state.workflow);
-    let preset_resolution = state
-        .preset
-        .as_deref()
-        .and_then(|name| {
-            crate::generated::RFDETR_PRESET_CATALOG
-                .iter()
-                .find(|preset| preset.presetname.as_ref() == name)
-        })
-        .map_or(0, |preset| preset.resolution);
     let selected_index = crate::generated::RFDETR_PRESET_CATALOG
         .iter()
         .position(|preset| state.preset.as_deref() == Some(preset.presetname.as_ref()));
@@ -764,53 +687,6 @@ fn view_with<'a, M: Clone + 'a>(
             .on_press_maybe(state.prepare_enabled.then_some(Message::PrepareRequested))
             .style(crate::fluent_theme::button_primary)
     };
-    let confirmation = pending_artifact_confirmation(&state, dismissed_dialog_generation).map(
-        |(path, generation)| {
-            crate::view::shared::modal(
-                selector_id(
-                    state.workflow,
-                    "train.model.confirmation",
-                    "validate.model.confirmation",
-                    "predict.model.confirmation",
-                    "export.model.confirmation",
-                ),
-                460.0,
-                column![
-                    text("Use custom model?").size(24),
-                    text(format!("Workflow: {:?}", state.workflow)),
-                    text(format!(
-                        "Input: {}",
-                        input_label(
-                            artifact_row(state.workflow, path).map_or(state.input, |row| row.input)
-                        )
-                    )),
-                    text(format!(
-                        "Preset: {}",
-                        state.preset.as_deref().unwrap_or("Unspecified")
-                    )),
-                    text(format!("Resolution: {preset_resolution}")),
-                    status_text(path.to_owned()),
-                    row![
-                        button("Cancel").on_press(Message::CancelArtifact(generation)),
-                        container(button("Confirm").on_press(Message::ConfirmArtifact {
-                            path: path.to_owned(),
-                            generation
-                        }))
-                        .id(selector_id(
-                            state.workflow,
-                            "train.model.confirm",
-                            "validate.model.confirm",
-                            "predict.model.confirm",
-                            "export.model.confirm"
-                        )),
-                    ]
-                    .spacing(8),
-                    text("The selected artifact will be verified when you prepare the model."),
-                ]
-                .spacing(10),
-            )
-        },
-    );
     let title = card_title(state.workflow);
     let body = if supported_workflow(state.workflow) {
         let weights_selector = shared_selector(
@@ -879,18 +755,14 @@ fn view_with<'a, M: Clone + 'a>(
     if let Some(content) = content {
         body = body.push(content);
     }
-    let card = crate::view::shared::identified(
+    crate::view::shared::identified(
         card_id,
         crate::view::shared::card(
             title,
             "Select and prepare the exact artifact consumed by this workflow.",
             body,
         ),
-    );
-    match confirmation {
-        Some(modal) => iced::widget::stack![card, modal.map(map)].into(),
-        None => card,
-    }
+    )
 }
 
 #[cfg(test)]
@@ -903,18 +775,14 @@ mod tests {
     fn unsupported_workflows_construct_the_unavailable_card() {
         let settings = installed_settings_model();
         for workflow in [FeatureId::Live, FeatureId::Annotate, FeatureId::Explore] {
-            let mut card = view(
-                State::from_settings(
-                    workflow,
-                    settings.draft.as_ref(),
-                    None,
-                    None,
-                    true,
-                    false,
-                    false,
-                ),
-                0,
-            );
+            let mut card = view(State::from_settings(
+                workflow,
+                settings.draft.as_ref(),
+                None,
+                true,
+                false,
+                false,
+            ));
             let mut tree = iced::advanced::widget::Tree::new(&card);
             tree.diff(&mut card);
             assert!(!tree.children.is_empty());
@@ -993,7 +861,7 @@ mod tests {
             let mut component = Component::new(workflow);
             let path = "/tmp/model.pt";
             let dialog = selected_model_dialog(settings.draft.as_ref().unwrap(), workflow, path, 7);
-            let confirm = || Message::ConfirmArtifact {
+            let select = || Message::ArtifactSelected {
                 path: path.into(),
                 generation: 7,
             };
@@ -1004,59 +872,46 @@ mod tests {
             {
                 assert!(
                     component
-                        .update(confirm(), invalid.as_ref(), &mut settings)
+                        .update(select(), invalid.as_ref(), &mut settings)
                         .is_err(),
                     "{case}"
                 );
                 assert_eq!(settings.draft, before, "{case}");
                 assert_eq!(settings.clone().take_request([true; 3]), queued, "{case}");
-                assert_eq!(component.dismissed_dialog_generation, 0, "{case}");
+                assert_eq!(component.applied_dialog_generation, 0, "{case}");
             }
             // Unavailable settings must leave the selection available for retry.
             settings.draft = None;
             assert!(
                 component
-                    .update(confirm(), Some(&dialog), &mut settings)
+                    .update(select(), Some(&dialog), &mut settings)
                     .is_err()
             );
-            assert_eq!(component.dismissed_dialog_generation, 0);
+            assert_eq!(component.applied_dialog_generation, 0);
             assert_eq!(settings.clone().take_request([true; 3]), queued);
             settings.draft = before;
-            let state = State::from_settings(
-                workflow,
-                settings.draft.as_ref(),
-                None,
-                Some(&dialog),
-                true,
-                false,
-                false,
-            );
-            assert_eq!(pending_artifact_confirmation(&state, 0), Some((path, 7)));
             assert!(matches!(
                 component
-                    .update(confirm(), Some(&dialog), &mut settings)
+                    .update(select(), Some(&dialog), &mut settings)
                     .unwrap(),
-                Some(Outcome::ArtifactConfirmed(_))
+                Some(Outcome::ArtifactSelected(_))
             ));
-            let confirmed = settings.draft.clone();
+            let selected = settings.draft.clone();
             let edits = settings.clone().take_request([true; 3]);
-            component
-                .update(Message::CancelArtifact(3), Some(&dialog), &mut settings)
-                .unwrap();
             component.rebase(&crate::view_model::ApplicationModel::default(), workflow);
             assert!(
                 component
-                    .update(confirm(), Some(&dialog), &mut settings)
+                    .update(select(), Some(&dialog), &mut settings)
                     .is_err()
             );
-            assert_eq!(component.dismissed_dialog_generation, 7);
-            assert_eq!(settings.draft, confirmed);
+            assert_eq!(component.applied_dialog_generation, 7);
+            assert_eq!(settings.draft, selected);
             assert_eq!(settings.clone().take_request([true; 3]), edits);
         }
     }
 
     #[test]
-    fn only_successful_confirmation_emits_the_distinct_selection_outcome() {
+    fn only_successful_selection_emits_the_distinct_selection_outcome() {
         for workflow in [
             FeatureId::Train,
             FeatureId::Validate,
@@ -1069,7 +924,7 @@ mod tests {
                 assert!(matches!(
                     component
                         .update(
-                            Message::ConfirmArtifact {
+                            Message::ArtifactSelected {
                                 path: "/tmp/same.pt".into(),
                                 generation,
                             },
@@ -1082,21 +937,15 @@ mod tests {
                             &mut settings
                         )
                         .unwrap(),
-                    Some(Outcome::ArtifactConfirmed(_))
+                    Some(Outcome::ArtifactSelected(_))
                 ));
             }
             let before = settings.draft.clone();
             let queued = settings.queued_len();
             assert!(
                 component
-                    .update(Message::CancelArtifact(3), None, &mut settings)
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                component
                     .update(
-                        Message::ConfirmArtifact {
+                        Message::ArtifactSelected {
                             path: "/tmp/invalid.txt".into(),
                             generation: 4,
                         },
@@ -1115,7 +964,7 @@ mod tests {
             assert!(
                 component
                     .update(
-                        Message::ConfirmArtifact {
+                        Message::ArtifactSelected {
                             path: "/tmp/stale.pt".into(),
                             generation: 2
                         },
@@ -1163,7 +1012,7 @@ mod tests {
                     .unwrap();
                     component
                         .update(
-                            Message::ConfirmArtifact {
+                            Message::ArtifactSelected {
                                 path: path.clone(),
                                 generation,
                             },
@@ -1204,7 +1053,7 @@ mod tests {
             assert!(
                 component
                     .update(
-                        Message::ConfirmArtifact {
+                        Message::ArtifactSelected {
                             path: "/tmp/model.txt".into(),
                             generation: 2
                         },
@@ -1248,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn train_custom_weights_uses_the_existing_typed_dialog_before_atomic_confirmation() {
+    fn train_custom_weights_uses_the_existing_typed_dialog_for_atomic_selection() {
         for path in ["/tmp/custom.pth", "/tmp/run/session.json"] {
             let mut settings = installed_settings_model();
             let mut component = Component::new(FeatureId::Train);
@@ -1263,7 +1112,7 @@ mod tests {
             ));
             component
                 .update(
-                    Message::ConfirmArtifact {
+                    Message::ArtifactSelected {
                         path: path.into(),
                         generation: 1,
                     },
@@ -1356,7 +1205,7 @@ mod tests {
         if canonical.customallowed {
             Component::new(canonical.workflow)
                 .update(
-                    Message::ConfirmArtifact {
+                    Message::ArtifactSelected {
                         path: "/tmp/model.pt".into(),
                         generation: 1,
                     },
@@ -1380,7 +1229,7 @@ mod tests {
             assert!(
                 Component::new(canonical.workflow)
                     .update(
-                        Message::ConfirmArtifact {
+                        Message::ArtifactSelected {
                             path: "/tmp/model".into(),
                             generation: 1,
                         },
@@ -1422,7 +1271,7 @@ mod tests {
         assert!(
             Component::new(custom.workflow)
                 .update(
-                    Message::ConfirmArtifact {
+                    Message::ArtifactSelected {
                         path: "/tmp/model".into(),
                         generation: 1,
                     },
@@ -1450,7 +1299,7 @@ mod tests {
             assert!(
                 Component::new(unsupported.workflow)
                     .update(
-                        Message::ConfirmArtifact {
+                        Message::ArtifactSelected {
                             path: "/tmp/model".into(),
                             generation: 1,
                         },
@@ -1470,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn handled_dialog_generation_survives_settings_rebase_and_newer_selection_prompts() {
+    fn applied_dialog_generation_survives_settings_rebase_and_admits_newer_selections() {
         let row = crate::generated::MODEL_SELECTION_COMPATIBILITY_CATALOG
             .iter()
             .find(|row| row.workflow == FeatureId::Train && row.customallowed)
@@ -1479,7 +1328,7 @@ mod tests {
         let mut component = Component::new(FeatureId::Train);
         component
             .update(
-                Message::ConfirmArtifact {
+                Message::ArtifactSelected {
                     path: "/tmp/model.pt".into(),
                     generation: 7,
                 },
@@ -1496,7 +1345,7 @@ mod tests {
             &crate::view_model::ApplicationModel::default(),
             FeatureId::Train,
         );
-        assert_eq!(component.dismissed_dialog_generation, 7);
+        assert_eq!(component.applied_dialog_generation, 7);
         let snapshot = |generation, path: &str| {
             selected_model_dialog(
                 settings.draft.as_ref().unwrap(),
@@ -1506,31 +1355,15 @@ mod tests {
             )
         };
         let settled = snapshot(7, "/tmp/model.pt");
-        let state = State::from_settings(
-            FeatureId::Train,
-            settings.draft.as_ref(),
-            None,
-            Some(&settled),
-            true,
-            false,
-            false,
-        );
+        let target = &dialog_for_row(row).unwrap().target;
         assert!(
-            pending_artifact_confirmation(&state, component.dismissed_dialog_generation).is_none()
+            pending_artifact_selection(Some(&settled), target, component.applied_dialog_generation)
+                .is_none()
         );
         let newer = snapshot(8, "/tmp/newer-model.pth");
-        let state = State::from_settings(
-            FeatureId::Train,
-            settings.draft.as_ref(),
-            None,
-            Some(&newer),
-            true,
-            false,
-            false,
-        );
         assert_eq!(
-            pending_artifact_confirmation(&state, component.dismissed_dialog_generation),
-            Some(("/tmp/newer-model.pth".into(), 8))
+            pending_artifact_selection(Some(&newer), target, component.applied_dialog_generation),
+            Some(("/tmp/newer-model.pth", 8))
         );
         assert_eq!(row.input, ModelArtifactInputKind::Weights);
     }
